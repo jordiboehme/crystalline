@@ -21,6 +21,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use walkdir::WalkDir;
 
+use crate::embed::{ChunkParams, chunk_engram};
 use crate::error::{IndexError, Result};
 use crate::store::{EngramRecord, FileStamp, Store};
 
@@ -66,10 +67,28 @@ struct Hashed {
 }
 
 /// Sync one domain: walk `root`, reconcile the index and resolve forward refs.
+///
+/// Chunks are computed with the default parameters (the local model id). Use
+/// [`sync_domain_with`] to fingerprint chunks for a specific configured model.
 pub async fn sync_domain<S: Store + ?Sized>(
     store: &S,
     name: &str,
     root: &Path,
+) -> Result<SyncReport> {
+    sync_domain_with(store, name, root, &ChunkParams::default()).await
+}
+
+/// Sync one domain, fingerprinting embedding chunks for a specific model.
+///
+/// After each changed engram is upserted, its body is chunked and the chunk rows
+/// are reconciled through [`Store::replace_chunks`], which carries over any
+/// embedding whose fingerprint is unchanged. An unchanged file is skipped by the
+/// prefilter before this point, so it produces no chunk work at all.
+pub async fn sync_domain_with<S: Store + ?Sized>(
+    store: &S,
+    name: &str,
+    root: &Path,
+    chunk_params: &ChunkParams,
 ) -> Result<SyncReport> {
     let started = Instant::now();
     let domain = store.upsert_domain(name, &root.to_string_lossy()).await?;
@@ -194,7 +213,16 @@ pub async fn sync_domain<S: Store + ?Sized>(
     // collected in `failed` and do not abort the batch (they are pre-checked so
     // no failing statement runs). Other errors roll the batch back.
     store.begin().await?;
-    let apply = apply_changes(store, domain, moves, deleted_remaining, parsed, &mut report).await;
+    let apply = apply_changes(
+        store,
+        domain,
+        moves,
+        deleted_remaining,
+        parsed,
+        chunk_params,
+        &mut report,
+    )
+    .await;
     match apply {
         Ok(()) => {}
         Err(e) => {
@@ -229,6 +257,7 @@ async fn apply_changes<S: Store + ?Sized>(
     moves: Vec<(String, String)>,
     deleted: std::collections::HashSet<String>,
     parsed: Vec<Parsed>,
+    chunk_params: &ChunkParams,
     report: &mut SyncReport,
 ) -> Result<()> {
     for (from, to) in moves {
@@ -242,7 +271,17 @@ async fn apply_changes<S: Store + ?Sized>(
     for p in parsed {
         let existed = p.previously_indexed;
         match store.upsert_engram(domain, &p.record).await {
-            Ok(_) => {
+            Ok(id) => {
+                // Recompute the engram's chunk rows. replace_chunks keeps the
+                // embedding of any chunk whose fingerprint is unchanged, so an
+                // edit only re-embeds the paragraphs that changed.
+                let chunks = chunk_engram(
+                    &p.record.title,
+                    p.record.description.as_deref(),
+                    &p.record.content,
+                    chunk_params,
+                );
+                store.replace_chunks(id, &chunks).await?;
                 if existed {
                     report.updated += 1;
                 } else {

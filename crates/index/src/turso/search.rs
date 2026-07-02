@@ -17,76 +17,54 @@ use crate::store::{
     SearchHit, SearchMode, SearchQuery,
 };
 
-use super::{cell_i64, cell_text, query_all, query_first, scalar_i64};
+use super::{cell_i64, cell_real, cell_text, query_all, query_first, scalar_i64};
 
 const SNIPPET_MARGIN: usize = 70;
 const SNIPPET_LEAD: usize = 200;
 
+/// The default minimum cosine similarity for a semantic hit.
+pub(super) const DEFAULT_MIN_SIMILARITY: f32 = 0.55;
+/// How many nearest chunks the vector scan considers before the cutoff and paging.
+const SEMANTIC_TOPK: usize = 100;
+/// Hybrid blend weights: the semantic signal leads, the lexical signal supports.
+const HYBRID_TEXT_WEIGHT: f64 = 0.4;
+const HYBRID_SEMANTIC_WEIGHT: f64 = 0.6;
+/// A hit found by only one of the two signals keeps its normalized score scaled
+/// by this factor, so an equally strong hit corroborated by both signals ranks
+/// above it (a both-signal hit can reach 1.0, a single-signal hit at most 0.85).
+const SINGLE_SOURCE_PENALTY: f64 = 0.85;
+
 /// Run a search and return one page of hits plus the total match count.
 pub(super) async fn run_search(conn: &Connection, query: &SearchQuery) -> Result<Page<SearchHit>> {
-    if matches!(query.mode, SearchMode::Semantic | SearchMode::Hybrid) {
-        return Err(IndexError::Unsupported(
-            "semantic and hybrid search arrive in M4".into(),
-        ));
+    match query.mode {
+        SearchMode::Semantic => run_semantic(conn, query).await,
+        SearchMode::Hybrid => run_hybrid(conn, query).await,
+        _ => run_lexical(conn, query).await,
     }
+}
 
+/// The lexical modes: Text, Title and Permalink. A LIKE-candidate prefilter in
+/// SQL, ranked in Rust by a weighted term-frequency score.
+async fn run_lexical(conn: &Connection, query: &SearchQuery) -> Result<Page<SearchHit>> {
     let limit = if query.limit == 0 { 10 } else { query.limit };
     let page = query.page.max(1);
 
-    let mut clauses: Vec<String> = Vec::new();
-    let mut params: Vec<Value> = Vec::new();
-    let mut n = 1usize;
-
-    build_scalar_filters(query, &mut clauses, &mut params, &mut n);
-
     let terms: Vec<String> = query.text.as_deref().map(terms_of).unwrap_or_default();
 
-    if !terms.is_empty() {
-        let cols: &[&str] = match query.mode {
-            SearchMode::Title => &["title"],
-            SearchMode::Permalink => &["permalink"],
-            _ => &["title", "description", "content"],
-        };
-        for term in &terms {
-            let mut ors: Vec<String> = Vec::new();
-            for col in cols {
-                ors.push(format!("lower(e.{col}) LIKE ?{n} ESCAPE '\\'"));
-                params.push(Value::Text(like_pattern(term)));
-                n += 1;
-            }
-            clauses.push(format!("({})", ors.join(" OR ")));
-        }
-    }
-
-    let where_sql = if clauses.is_empty() {
-        String::new()
-    } else {
-        format!("WHERE {}", clauses.join(" AND "))
-    };
-
     if terms.is_empty() {
+        let mut clauses: Vec<String> = Vec::new();
+        let mut params: Vec<Value> = Vec::new();
+        let mut n = 1usize;
+        build_scalar_filters(query, &mut clauses, &mut params, &mut n);
+        let where_sql = if clauses.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", clauses.join(" AND "))
+        };
         return filter_only(conn, &where_sql, params, limit, page).await;
     }
 
-    // Text path: load candidate rows, score and page in Rust.
-    let sql = format!(
-        "SELECT e.id, d.name, e.permalink, e.title, e.engram_type, e.status, e.description, e.content \
-         FROM engram e JOIN domain d ON d.id=e.domain_id {where_sql}"
-    );
-    let rows = query_all(conn, &sql, params).await?;
-
-    let mut scored: Vec<(f64, Candidate)> = Vec::with_capacity(rows.len());
-    for r in &rows {
-        let c = Candidate::from_row(r);
-        let score = c.score(&terms);
-        scored.push((score, c));
-    }
-    scored.sort_by(|a, b| {
-        b.0.partial_cmp(&a.0)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.1.title.cmp(&b.1.title))
-    });
-
+    let scored = scored_lexical(conn, query, &terms).await?;
     let total = scored.len();
     let start = (page - 1) * limit;
     let mut items = Vec::new();
@@ -99,6 +77,58 @@ pub(super) async fn run_search(conn: &Connection, query: &SearchQuery) -> Result
         limit,
         total,
     })
+}
+
+/// Load the lexical candidate rows and score them, sorted best first. Shared by
+/// the lexical modes and the lexical half of hybrid search.
+async fn scored_lexical(
+    conn: &Connection,
+    query: &SearchQuery,
+    terms: &[String],
+) -> Result<Vec<(f64, Candidate)>> {
+    let mut clauses: Vec<String> = Vec::new();
+    let mut params: Vec<Value> = Vec::new();
+    let mut n = 1usize;
+    build_scalar_filters(query, &mut clauses, &mut params, &mut n);
+
+    let cols: &[&str] = match query.mode {
+        SearchMode::Title => &["title"],
+        SearchMode::Permalink => &["permalink"],
+        _ => &["title", "description", "content"],
+    };
+    for term in terms {
+        let mut ors: Vec<String> = Vec::new();
+        for col in cols {
+            ors.push(format!("lower(e.{col}) LIKE ?{n} ESCAPE '\\'"));
+            params.push(Value::Text(like_pattern(term)));
+            n += 1;
+        }
+        clauses.push(format!("({})", ors.join(" OR ")));
+    }
+
+    let where_sql = if clauses.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", clauses.join(" AND "))
+    };
+    let sql = format!(
+        "SELECT e.id, d.name, e.permalink, e.title, e.engram_type, e.status, e.description, e.content \
+         FROM engram e JOIN domain d ON d.id=e.domain_id {where_sql}"
+    );
+    let rows = query_all(conn, &sql, params).await?;
+
+    let mut scored: Vec<(f64, Candidate)> = Vec::with_capacity(rows.len());
+    for r in &rows {
+        let c = Candidate::from_row(r);
+        let score = c.score(terms);
+        scored.push((score, c));
+    }
+    scored.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.title.cmp(&b.1.title))
+    });
+    Ok(scored)
 }
 
 async fn filter_only(
@@ -150,6 +180,283 @@ async fn filter_only(
         limit,
         total,
     })
+}
+
+// --- semantic and hybrid search ----------------------------------------------
+
+/// Pack a query vector to the raw little-endian f32 blob that turso's vector
+/// functions read. `vector_distance_cos` infers the dimensionality from the blob
+/// length, so the same call works for any provider width.
+fn pack_vector(v: &[f32]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(v.len() * 4);
+    for f in v {
+        b.extend_from_slice(&f.to_le_bytes());
+    }
+    b
+}
+
+/// Semantic search over chunk embeddings. Requires the caller to have embedded
+/// the query and set the active model on the [`SearchQuery`].
+async fn run_semantic(conn: &Connection, query: &SearchQuery) -> Result<Page<SearchHit>> {
+    let qvec = query
+        .query_embedding
+        .as_deref()
+        .ok_or_else(|| IndexError::Invalid("semantic search requires a query embedding".into()))?;
+    let active = query
+        .active_model
+        .as_deref()
+        .ok_or_else(|| IndexError::Invalid("semantic search requires the active model".into()))?;
+    let dims = qvec.len();
+    let limit = if query.limit == 0 { 10 } else { query.limit };
+    let page = query.page.max(1);
+    let min_sim = query.min_similarity.unwrap_or(DEFAULT_MIN_SIMILARITY) as f64;
+
+    check_staleness(conn, active, dims).await?;
+
+    let mut hits = semantic_candidates(conn, query, qvec, active, dims).await?;
+    hits.retain(|(sim, _)| *sim >= min_sim);
+    hits.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.title.cmp(&b.1.title))
+    });
+
+    let total = hits.len();
+    let start = (page - 1) * limit;
+    let items: Vec<SearchHit> = hits
+        .into_iter()
+        .skip(start)
+        .take(limit)
+        .map(|(sim, cand)| {
+            let snippet = cand.lead_snippet();
+            cand.into_engram_hit(snippet, sim)
+        })
+        .collect();
+    Ok(Page {
+        items,
+        page,
+        limit,
+        total,
+    })
+}
+
+/// Hybrid search: a lexical candidate scan and a semantic top-k, each normalized
+/// to `[0, 1]`, then blended.
+///
+/// Normalization. The lexical term-frequency score is unbounded, so it is scaled
+/// by the top lexical score in this query's candidate set, mapping the best
+/// lexical hit to `1.0`. The semantic score is cosine similarity, already in
+/// `[-1, 1]` for unit vectors and clamped to `[0, 1]` (only hits at or above
+/// `min_similarity` survive, so retained values sit in `[min_similarity, 1]`).
+///
+/// Blend. An engram found by both signals scores
+/// `0.4 * lexical + 0.6 * semantic`. An engram found by only one keeps that
+/// signal's normalized score scaled by a `0.85` penalty, so a both-signal hit
+/// (up to `1.0`) can outrank an equally strong single-signal hit (up to `0.85`).
+/// Hits are deduplicated per engram, keeping the best score, and every filter is
+/// pushed into the SQL of both halves rather than dropped afterwards.
+async fn run_hybrid(conn: &Connection, query: &SearchQuery) -> Result<Page<SearchHit>> {
+    let qvec = query
+        .query_embedding
+        .as_deref()
+        .ok_or_else(|| IndexError::Invalid("hybrid search requires a query embedding".into()))?;
+    let active = query
+        .active_model
+        .as_deref()
+        .ok_or_else(|| IndexError::Invalid("hybrid search requires the active model".into()))?;
+    let dims = qvec.len();
+    let limit = if query.limit == 0 { 10 } else { query.limit };
+    let page = query.page.max(1);
+    let min_sim = query.min_similarity.unwrap_or(DEFAULT_MIN_SIMILARITY) as f64;
+
+    check_staleness(conn, active, dims).await?;
+
+    let terms: Vec<String> = query.text.as_deref().map(terms_of).unwrap_or_default();
+    let text_scored = if terms.is_empty() {
+        Vec::new()
+    } else {
+        scored_lexical(conn, query, &terms).await?
+    };
+    let mut sem = semantic_candidates(conn, query, qvec, active, dims).await?;
+    sem.retain(|(sim, _)| *sim >= min_sim);
+
+    let max_text = text_scored.iter().map(|(s, _)| *s).fold(0.0_f64, f64::max);
+
+    struct Merged {
+        cand: Candidate,
+        text: Option<f64>,
+        sem: Option<f64>,
+    }
+    let mut merged: std::collections::HashMap<(String, String), Merged> =
+        std::collections::HashMap::new();
+
+    for (score, cand) in text_scored {
+        let norm = if max_text > 0.0 {
+            score / max_text
+        } else {
+            0.0
+        };
+        let key = (cand.domain.clone(), cand.permalink.clone());
+        merged
+            .entry(key)
+            .and_modify(|m| m.text = Some(m.text.map_or(norm, |t| t.max(norm))))
+            .or_insert(Merged {
+                cand,
+                text: Some(norm),
+                sem: None,
+            });
+    }
+    for (sim, cand) in sem {
+        let norm = sim.clamp(0.0, 1.0);
+        let key = (cand.domain.clone(), cand.permalink.clone());
+        merged
+            .entry(key)
+            .and_modify(|m| m.sem = Some(m.sem.map_or(norm, |s| s.max(norm))))
+            .or_insert(Merged {
+                cand,
+                text: None,
+                sem: Some(norm),
+            });
+    }
+
+    let mut ranked: Vec<(f64, Merged)> = merged
+        .into_values()
+        .map(|m| {
+            let score = match (m.text, m.sem) {
+                (Some(t), Some(s)) => HYBRID_TEXT_WEIGHT * t + HYBRID_SEMANTIC_WEIGHT * s,
+                (Some(t), None) => t * SINGLE_SOURCE_PENALTY,
+                (None, Some(s)) => s * SINGLE_SOURCE_PENALTY,
+                (None, None) => 0.0,
+            };
+            (score, m)
+        })
+        .collect();
+    ranked.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.cand.title.cmp(&b.1.cand.title))
+    });
+
+    let total = ranked.len();
+    let start = (page - 1) * limit;
+    let items: Vec<SearchHit> = ranked
+        .into_iter()
+        .skip(start)
+        .take(limit)
+        .map(|(score, m)| {
+            let snippet = if !terms.is_empty() && m.text.is_some() {
+                m.cand.text_snippet(&terms)
+            } else {
+                m.cand.lead_snippet()
+            };
+            m.cand.into_engram_hit(snippet, score)
+        })
+        .collect();
+    Ok(Page {
+        items,
+        page,
+        limit,
+        total,
+    })
+}
+
+/// The nearest engrams to the query vector, as `(similarity, candidate)` pairs.
+/// One row per engram (the closest of its chunks), filtered by every scalar
+/// filter on the query, ordered by distance and capped at the top-k.
+async fn semantic_candidates(
+    conn: &Connection,
+    query: &SearchQuery,
+    qvec: &[f32],
+    active: &str,
+    dims: usize,
+) -> Result<Vec<(f64, Candidate)>> {
+    // ?1 is the query vector; scalar filters and the model and dims predicates
+    // take the placeholders after it.
+    let mut params: Vec<Value> = vec![Value::Blob(pack_vector(qvec))];
+    let mut clauses: Vec<String> = Vec::new();
+    let mut n = 2usize;
+    build_scalar_filters(query, &mut clauses, &mut params, &mut n);
+    let model_ph = n;
+    params.push(Value::Text(active.to_string()));
+    n += 1;
+    let dims_ph = n;
+    params.push(Value::Integer(dims as i64));
+    clauses.push(format!(
+        "c.embedding IS NOT NULL AND c.model = ?{model_ph} AND c.dims = ?{dims_ph}"
+    ));
+
+    let where_sql = format!("WHERE {}", clauses.join(" AND "));
+    let sql = format!(
+        "SELECT e.id, d.name, e.permalink, e.title, e.engram_type, e.status, e.description, e.content, \
+         min(vector_distance_cos(c.embedding, ?1)) AS dist \
+         FROM chunk c JOIN engram e ON e.id=c.engram_id JOIN domain d ON d.id=e.domain_id \
+         {where_sql} GROUP BY e.id ORDER BY dist ASC LIMIT {SEMANTIC_TOPK}"
+    );
+    let rows = query_all(conn, &sql, params).await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for r in &rows {
+        let dist = cell_real(r, 8).unwrap_or(1.0);
+        out.push((1.0 - dist, Candidate::from_row(r)));
+    }
+    Ok(out)
+}
+
+/// Refuse semantic search when the stored embeddings cannot be compared against
+/// the active provider's vector space. A different dimensionality is always
+/// unsafe (cosine across widths is meaningless), and a same-width model swap
+/// with nothing yet re-embedded means every stored vector is in the wrong space.
+/// Either case surfaces as [`IndexError::StaleEmbeddings`] so callers report
+/// "reindex in progress"; text search never calls this. When nothing is embedded
+/// yet, this is not an error: the semantic scan simply returns no hits.
+async fn check_staleness(conn: &Connection, active_model: &str, dims: usize) -> Result<()> {
+    let rows = query_all(
+        conn,
+        "SELECT model, dims, count(*) FROM chunk WHERE embedding IS NOT NULL GROUP BY model, dims",
+        vec![],
+    )
+    .await?;
+    let mut active_embedded = 0usize;
+    let mut total_embedded = 0usize;
+    let mut foreign_dims = false;
+    let mut other: Option<(String, usize)> = None;
+    for r in &rows {
+        let m = cell_text(r, 0).unwrap_or_default();
+        let d = cell_i64(r, 1).unwrap_or(0).max(0) as usize;
+        let c = cell_i64(r, 2).unwrap_or(0).max(0) as usize;
+        total_embedded += c;
+        if m == active_model && d == dims {
+            active_embedded += c;
+            continue;
+        }
+        if d != dims {
+            foreign_dims = true;
+        }
+        if other.as_ref().map(|(_, oc)| c > *oc).unwrap_or(true) {
+            let label = if m.is_empty() {
+                "unknown".to_string()
+            } else {
+                m
+            };
+            other = Some((label, c));
+        }
+    }
+
+    let stale = total_embedded > 0 && (foreign_dims || active_embedded == 0);
+    if stale {
+        let total_chunks = scalar_i64(conn, "SELECT count(*) FROM chunk", vec![])
+            .await?
+            .max(0) as usize;
+        let stored_model = other
+            .map(|(m, _)| m)
+            .unwrap_or_else(|| active_model.to_string());
+        return Err(IndexError::StaleEmbeddings {
+            stored_model,
+            active_model: active_model.to_string(),
+            embedded: active_embedded,
+            total: total_chunks,
+        });
+    }
+    Ok(())
 }
 
 fn build_scalar_filters(
@@ -409,6 +716,47 @@ impl Candidate {
             engram_type: self.engram_type,
             status: self.status,
         })
+    }
+
+    /// A lead-in snippet for a hit with no term to window around (the semantic
+    /// case): the description if present, else the body.
+    fn lead_snippet(&self) -> String {
+        match self.description.as_ref().filter(|d| !d.is_empty()) {
+            Some(d) => lead(d),
+            None => lead(&self.content),
+        }
+    }
+
+    /// A snippet windowed around the first matching term, for the lexical half
+    /// of a hybrid hit.
+    fn text_snippet(&self, terms: &[String]) -> String {
+        let src = if terms
+            .iter()
+            .any(|t| count_occ(&self.content.to_lowercase(), t) > 0)
+        {
+            &self.content
+        } else if let Some(d) = self.description.as_ref().filter(|d| !d.is_empty()) {
+            d
+        } else {
+            &self.title
+        };
+        make_snippet(src, terms)
+    }
+
+    /// Build an engram-level hit with a precomputed snippet and score. Used by
+    /// the semantic and hybrid paths, which rank whole engrams rather than
+    /// individual observations.
+    fn into_engram_hit(self, snippet: String, score: f64) -> SearchHit {
+        SearchHit {
+            domain: self.domain,
+            permalink: self.permalink,
+            title: self.title,
+            snippet,
+            score,
+            engram_type: self.engram_type,
+            status: self.status,
+            kind: HitKind::Engram,
+        }
     }
 }
 

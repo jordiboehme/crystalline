@@ -73,6 +73,9 @@ enum Command {
         /// Sync only this domain instead of every registered domain.
         #[arg(long)]
         domain: Option<String>,
+        /// After syncing, embed any chunks that need it for the active model.
+        #[arg(long)]
+        embed: bool,
         /// Load the global config from this file instead of the default path.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -82,12 +85,30 @@ enum Command {
         /// Wipe the index (rebuilding the file if it will not open) then resync.
         #[arg(long)]
         full: bool,
+        /// After reindexing, embed any chunks that need it for the active model.
+        #[arg(long)]
+        embed: bool,
         /// Load the global config from this file instead of the default path.
         #[arg(long)]
         config: Option<PathBuf>,
     },
     /// Show per-domain counts and index diagnostics.
     Status {
+        /// Load the global config from this file instead of the default path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Manage the local embedding model.
+    Model {
+        #[command(subcommand)]
+        command: ModelCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ModelCommand {
+    /// Pre-fetch the local embedding model into the cache for offline or CI use.
+    Download {
         /// Load the global config from this file instead of the default path.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -161,14 +182,24 @@ fn main() -> anyhow::Result<()> {
         }) => run_verify(paths, strict, format, config, cli.json),
         Some(Command::Prompt { workspace, config }) => run_prompt(workspace, config, cli.json),
         Some(Command::Domain { command }) => run_domain(command, cli.db, cli.json),
-        Some(Command::Sync { domain, config }) => on_runtime(cmd::sync(
+        Some(Command::Sync {
+            domain,
+            embed,
+            config,
+        }) => on_runtime(cmd::sync(
             domain.as_deref(),
+            embed,
             config.as_deref(),
             cli.db.as_deref(),
             cli.json,
         )),
-        Some(Command::Reindex { full, config }) => on_runtime(cmd::reindex(
+        Some(Command::Reindex {
             full,
+            embed,
+            config,
+        }) => on_runtime(cmd::reindex(
+            full,
+            embed,
             config.as_deref(),
             cli.db.as_deref(),
             cli.json,
@@ -176,6 +207,11 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Status { config }) => {
             on_runtime(cmd::status(config.as_deref(), cli.db.as_deref(), cli.json))
         }
+        Some(Command::Model { command }) => match command {
+            ModelCommand::Download { config } => {
+                on_runtime(cmd::model_download(config.as_deref(), cli.json))
+            }
+        },
     }
 }
 

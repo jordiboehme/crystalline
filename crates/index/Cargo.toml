@@ -11,6 +11,18 @@ description = "Storage and search index for Crystalline: the Store trait, the em
 name = "crystalline_index"
 path = "src/lib.rs"
 
+[features]
+# On by default so the shipped binary embeds locally with no external service.
+# `--no-default-features` drops candle entirely for a lean, network-only build.
+default = ["local-embeddings"]
+local-embeddings = [
+    "dep:candle-core",
+    "dep:candle-nn",
+    "dep:candle-transformers",
+    "dep:tokenizers",
+    "dep:hf-hub",
+]
+
 [dependencies]
 crystalline-core = { workspace = true }
 turso = { workspace = true }
@@ -24,7 +36,17 @@ serde_json = { workspace = true }
 indexmap = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+reqwest = { workspace = true }
+
+# Local embedding stack, gated by `local-embeddings`. CPU only (no metal or cuda
+# features) so the release artifacts stay portable static binaries.
+candle-core = { workspace = true, optional = true }
+candle-nn = { workspace = true, optional = true }
+candle-transformers = { workspace = true, optional = true }
+tokenizers = { workspace = true, optional = true }
+hf-hub = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true }
+async-trait = { workspace = true }

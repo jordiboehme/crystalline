@@ -8,8 +8,55 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
-use crystalline_core::config::{self, DomainEntry, GlobalConfig};
-use crystalline_index::{Store, TursoStore, sync_domain};
+use crystalline_core::config::{self, DomainEntry, EmbeddingsConfig, GlobalConfig};
+use crystalline_index::{
+    ChunkParams, Store, TursoStore, configured_model_id, download_local_model,
+    provider_from_config, run_embedding_pass, sync_domain_with,
+};
+
+/// The embeddings config to use: the configured one, or the local bge default.
+fn embeddings_config(cfg: &GlobalConfig) -> EmbeddingsConfig {
+    cfg.embeddings.clone().unwrap_or_else(|| EmbeddingsConfig {
+        provider: "local".to_string(),
+        model: crystalline_index::embed::DEFAULT_MODEL_ID.to_string(),
+        endpoint: None,
+        api_key_env: None,
+    })
+}
+
+/// Chunk parameters fingerprinted for the active model, so chunks written at
+/// sync time match the provider that later embeds them.
+fn chunk_params(cfg: &GlobalConfig) -> ChunkParams {
+    ChunkParams::for_model(configured_model_id(cfg.embeddings.as_ref()))
+}
+
+/// Build the provider and embed every chunk that needs it, printing one progress
+/// line per batch to stderr.
+async fn embed_pass(store: &TursoStore, cfg: &GlobalConfig) -> Result<()> {
+    let ecfg = embeddings_config(cfg);
+    let provider = provider_from_config(&ecfg).await.map_err(|e| {
+        anyhow!(
+            "could not initialize the '{}' embedding provider: {e}",
+            ecfg.provider
+        )
+    })?;
+    let report = run_embedding_pass(store, provider.as_ref(), |done, total| {
+        eprintln!("  embedding {done}/{total} chunks");
+    })
+    .await
+    .map_err(|e| anyhow!("embedding failed: {e}"))?;
+    if report.chunks == 0 {
+        eprintln!("  embeddings already up to date");
+    } else {
+        eprintln!(
+            "  embedded {} chunks in {} batches with model '{}'",
+            report.chunks,
+            report.batches,
+            provider.model_id()
+        );
+    }
+    Ok(())
+}
 
 /// Resolve the global config path from an optional override.
 fn config_path(override_path: Option<&Path>) -> Result<PathBuf> {
@@ -235,9 +282,10 @@ pub async fn domain_list(
 
 // --- sync --------------------------------------------------------------------
 
-/// Sync one or all registered domains.
+/// Sync one or all registered domains, optionally embedding new chunks after.
 pub async fn sync(
     only: Option<&str>,
+    embed: bool,
     config_override: Option<&Path>,
     db_override: Option<&Path>,
     json: bool,
@@ -245,11 +293,12 @@ pub async fn sync(
     let cfg = load_config(&config_path(config_override)?)?;
     let targets = select_domains(&cfg, only)?;
     let store = open_store(&db_path(db_override)?).await?;
+    let params = chunk_params(&cfg);
 
     let mut reports = Vec::new();
     for (name, entry) in targets {
         let path = resolve_domain_path(&entry);
-        let report = sync_domain(&store, &name, &path)
+        let report = sync_domain_with(&store, &name, &path, &params)
             .await
             .map_err(|e| anyhow!("sync of '{name}' failed: {e}"))?;
         reports.push(report);
@@ -262,6 +311,10 @@ pub async fn sync(
             print_report(r);
         }
     }
+
+    if embed {
+        embed_pass(&store, &cfg).await?;
+    }
     Ok(())
 }
 
@@ -271,6 +324,7 @@ pub async fn sync(
 /// path), opening resiliently so a database that will not open is rebuilt.
 pub async fn reindex(
     full: bool,
+    embed: bool,
     config_override: Option<&Path>,
     db_override: Option<&Path>,
     json: bool,
@@ -278,6 +332,7 @@ pub async fn reindex(
     let cfg = load_config(&config_path(config_override)?)?;
     let targets = select_domains(&cfg, None)?;
     let db = db_path(db_override)?;
+    let params = chunk_params(&cfg);
 
     let store = if full {
         if let Some(parent) = db.parent()
@@ -303,7 +358,7 @@ pub async fn reindex(
     let mut reports = Vec::new();
     for (name, entry) in targets {
         let path = resolve_domain_path(&entry);
-        let report = sync_domain(&store, &name, &path)
+        let report = sync_domain_with(&store, &name, &path, &params)
             .await
             .map_err(|e| anyhow!("reindex of '{name}' failed: {e}"))?;
         reports.push(report);
@@ -322,6 +377,10 @@ pub async fn reindex(
         for r in &reports {
             print_report(r);
         }
+    }
+
+    if embed {
+        embed_pass(&store, &cfg).await?;
     }
     Ok(())
 }
@@ -357,6 +416,16 @@ pub async fn status(
         .domain_stats()
         .await
         .map_err(|e| anyhow!("could not read domain stats: {e}"))?;
+    let coverage = store
+        .embedding_coverage()
+        .await
+        .map_err(|e| anyhow!("could not read embedding coverage: {e}"))?;
+
+    // Coverage for the active model: how many chunks are embedded with it, and
+    // whether hybrid search is therefore available.
+    let active_model = configured_model_id(cfg.embeddings.as_ref());
+    let active_embedded = coverage.embedded_for(&active_model);
+    let hybrid_available = coverage.has_active_embeddings(&active_model);
 
     if json {
         println!(
@@ -366,6 +435,13 @@ pub async fn status(
                 "store": info,
                 "domains": stats,
                 "registered": cfg.domains.keys().collect::<Vec<_>>(),
+                "embeddings": {
+                    "active_model": active_model,
+                    "embedded_chunks": active_embedded,
+                    "total_chunks": coverage.total_chunks,
+                    "hybrid_available": hybrid_available,
+                    "models": coverage.models,
+                },
             })
         );
         return Ok(());
@@ -381,6 +457,17 @@ pub async fn status(
             crystalline_index::FtsMode::CandidateScan => "candidate-scan",
         }
     );
+    println!(
+        "Embeddings: {active_embedded}/{} chunks embedded with '{active_model}' ({} dims), default search: {}",
+        coverage.total_chunks,
+        coverage
+            .models
+            .iter()
+            .find(|m| m.model == active_model)
+            .map(|m| m.dims)
+            .unwrap_or(0),
+        if hybrid_available { "hybrid" } else { "text" }
+    );
     if stats.is_empty() {
         println!("No domains indexed yet.");
     }
@@ -394,6 +481,33 @@ pub async fn status(
             d.unresolved_relations,
             d.last_sync.as_deref().unwrap_or("never")
         );
+    }
+    Ok(())
+}
+
+// --- model download ----------------------------------------------------------
+
+/// Pre-fetch the local embedding model, printing the cache path and size. Exits
+/// non-zero (via the returned error) when the fetch fails or the build has no
+/// local embedding support.
+pub async fn model_download(config_override: Option<&Path>, json: bool) -> Result<()> {
+    let cfg = load_config(&config_path(config_override)?)?;
+    let ecfg = embeddings_config(&cfg);
+    let download = download_local_model(&ecfg)
+        .await
+        .map_err(|e| anyhow!("model download failed: {e}"))?;
+
+    let mb = download.bytes as f64 / (1024.0 * 1024.0);
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "path": download.path.display().to_string(),
+                "bytes": download.bytes,
+            })
+        );
+    } else {
+        println!("Model ready at {} ({mb:.1} MB)", download.path.display());
     }
     Ok(())
 }

@@ -1,24 +1,35 @@
 //! `crystalline-index` is the derived, disposable index built from Engram files
 //! on disk. It holds the backend-agnostic [`Store`] trait, the Turso-backed
-//! implementation, the sync engine that keeps the index in step with the files
-//! and the search planner. The embedding pipeline lands in M4; the `chunk` table
-//! and the [`Store::chunks_needing_embedding`] and [`Store::store_embeddings`]
-//! hooks are in place but unpopulated.
+//! implementation, the sync engine that keeps the index in step with the files,
+//! the search planner and the embedding pipeline (chunking, the provider trait,
+//! local candle and remote OpenAI-compatible providers, and semantic and hybrid
+//! search).
+//!
+//! The local candle provider lives behind the `local-embeddings` feature (on by
+//! default). A `--no-default-features` build drops candle entirely and keeps the
+//! chunker, the remote provider and text search; asking for a local provider on
+//! such a build is an [`IndexError::Unsupported`].
 //!
 //! Files are the source of truth and the index is fully rebuildable, so a
 //! corrupt or stale index is never a data-loss risk: [`Store::wipe`] followed by
 //! a resync (the `reindex --full` path) recreates it from disk.
 
+pub mod embed;
 mod error;
 mod store;
 mod sync;
 pub mod turso;
 
+pub use embed::{
+    ChunkParams, EmbedReport, EmbeddingProvider, ModelDownload, chunk_engram, configured_model_id,
+    download_local_model, provider_from_config, run_embedding_pass,
+};
 pub use error::{IndexError, Result};
 pub use store::{
-    ChunkJob, DomainId, DomainStats, EdgeKind, EmbeddingRow, EngramId, EngramRecord, EngramSummary,
-    FileStamp, FilterOp, FtsMode, GraphEdge, GraphNode, GraphSlice, HitKind, MetadataFilter, Page,
-    RecentFilter, SearchHit, SearchMode, SearchQuery, Store, StoreInfo, parse_metadata_filters,
+    ChunkJob, ChunkModelCount, DomainId, DomainStats, EdgeKind, EmbeddingCoverage, EmbeddingRow,
+    EngramId, EngramRecord, EngramSummary, FileStamp, FilterOp, FtsMode, GraphEdge, GraphNode,
+    GraphSlice, HitKind, MetadataFilter, NewChunk, Page, RecentFilter, SearchHit, SearchMode,
+    SearchQuery, Store, StoreInfo, parse_metadata_filters,
 };
-pub use sync::{SyncReport, sync_domain};
+pub use sync::{SyncReport, sync_domain, sync_domain_with};
 pub use turso::TursoStore;

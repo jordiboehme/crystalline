@@ -212,10 +212,12 @@ impl EngramRecord {
 
 /// How a search query is matched.
 ///
-/// `Text`, `Title` and `Permalink` are the M3 modes. `Semantic` and `Hybrid`
-/// are declared now so the enum and the [`SearchQuery`] shape do not change when
-/// the embedding pipeline lands in M4; the store returns
-/// [`crate::IndexError::Unsupported`] for them until then.
+/// `Text`, `Title` and `Permalink` are the lexical modes. `Semantic` and
+/// `Hybrid` require [`SearchQuery::query_embedding`] and
+/// [`SearchQuery::active_model`] to be set by the caller (who owns the embedding
+/// provider). `Text` stays the enum default so lexical search never depends on a
+/// model; a caller picks `Hybrid` as the interactive default only when the active
+/// model has embeddings (see [`StoreInfo`] and the embedding coverage).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SearchMode {
     /// Match query terms against title, description and content.
@@ -225,9 +227,9 @@ pub enum SearchMode {
     Title,
     /// Match against the permalink only.
     Permalink,
-    /// Vector similarity search (M4).
+    /// Vector similarity search over chunk embeddings.
     Semantic,
-    /// Blended text and vector search (M4).
+    /// Blended lexical and vector search.
     Hybrid,
 }
 
@@ -352,6 +354,18 @@ pub struct SearchQuery {
     pub today: Option<String>,
     /// The match mode.
     pub mode: SearchMode,
+    /// Minimum cosine similarity for a semantic hit, `None` uses the store
+    /// default (`0.55`). Ignored by the text, title and permalink modes.
+    pub min_similarity: Option<f32>,
+    /// The query text already embedded by the active provider, required by the
+    /// semantic and hybrid modes. The caller owns the provider and embeds the
+    /// query (with the query instruction prefix) before calling the store, which
+    /// keeps the backend free of any model dependency. Its length is the active
+    /// dimensionality.
+    pub query_embedding: Option<Vec<f32>>,
+    /// The active provider's model id, paired with `query_embedding` for the
+    /// staleness check. Required by the semantic and hybrid modes.
+    pub active_model: Option<String>,
     /// Page size.
     pub limit: usize,
     /// One-based page number.
@@ -523,6 +537,60 @@ pub struct EmbeddingRow {
     pub dims: usize,
 }
 
+/// A freshly computed chunk to store against an engram. Produced by the chunker
+/// and handed to [`Store::replace_chunks`], which reconciles it against the
+/// engram's existing chunk rows and carries over any matching embedding.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewChunk {
+    /// The chunk sequence within the engram, zero-based.
+    pub seq: i64,
+    /// The chunk text.
+    pub text: String,
+    /// The chunk fingerprint `sha256(model_id + ":" + text)`.
+    pub text_hash: String,
+}
+
+/// Embedded-chunk counts for one `(model, dims)` pair.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ChunkModelCount {
+    /// The embedding model that produced these chunks.
+    pub model: String,
+    /// The vector dimensionality.
+    pub dims: usize,
+    /// The number of embedded chunks with this model and dimensionality.
+    pub count: usize,
+}
+
+/// Embedding coverage across the whole index: how many chunks exist and how many
+/// are embedded, broken down by model. Callers derive per-model coverage,
+/// staleness and the interactive default search mode from this.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+pub struct EmbeddingCoverage {
+    /// Total chunk rows in the index.
+    pub total_chunks: usize,
+    /// Chunk rows that carry an embedding, across all models.
+    pub embedded_chunks: usize,
+    /// Embedded-chunk counts per `(model, dims)`, most chunks first.
+    pub models: Vec<ChunkModelCount>,
+}
+
+impl EmbeddingCoverage {
+    /// Embedded chunks produced by the given model.
+    pub fn embedded_for(&self, model: &str) -> usize {
+        self.models
+            .iter()
+            .filter(|m| m.model == model)
+            .map(|m| m.count)
+            .sum()
+    }
+
+    /// Whether the given model has at least one embedded chunk, so a caller may
+    /// default interactive search to the hybrid mode.
+    pub fn has_active_embeddings(&self, model: &str) -> bool {
+        self.embedded_for(model) > 0
+    }
+}
+
 /// Which full-text path the store is using.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -605,11 +673,23 @@ pub trait Store: Send + Sync {
     /// Return recent engrams matching a filter, newest first.
     async fn recent(&self, filter: &RecentFilter) -> Result<Vec<EngramSummary>>;
 
-    /// Return chunks that need an embedding for the given model.
+    /// Replace an engram's chunk rows with a freshly computed set, carrying over
+    /// the embedding of any chunk whose fingerprint is unchanged so an edit only
+    /// re-embeds the paragraphs that actually changed. Called by the sync engine
+    /// after each upsert.
+    async fn replace_chunks(&self, engram_id: EngramId, chunks: &[NewChunk]) -> Result<()>;
+
+    /// Return chunks that need an embedding for the given model: those with no
+    /// embedding yet, plus those embedded by a different model (a model swap).
     async fn chunks_needing_embedding(&self, model: &str) -> Result<Vec<ChunkJob>>;
 
     /// Store a batch of embeddings against their chunks for the given model.
     async fn store_embeddings(&self, batch: &[EmbeddingRow], model: &str) -> Result<()>;
+
+    /// Embedding coverage across the index: total chunks, embedded chunks and a
+    /// per-model breakdown. Drives `status` reporting and the interactive
+    /// default search mode.
+    async fn embedding_coverage(&self) -> Result<EmbeddingCoverage>;
 
     /// Delete all indexed data, keeping the schema. The corruption-recovery and
     /// full-reindex path.

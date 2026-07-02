@@ -23,8 +23,9 @@ use turso::{Builder, Connection, Database, Row, Value};
 
 use crate::error::{IndexError, Result};
 use crate::store::{
-    ChunkJob, DomainId, DomainStats, EmbeddingRow, EngramId, EngramRecord, EngramSummary,
-    FileStamp, FtsMode, GraphSlice, Page, RecentFilter, SearchHit, SearchQuery, Store, StoreInfo,
+    ChunkJob, ChunkModelCount, DomainId, DomainStats, EmbeddingCoverage, EmbeddingRow, EngramId,
+    EngramRecord, EngramSummary, FileStamp, FtsMode, GraphSlice, NewChunk, Page, RecentFilter,
+    SearchHit, SearchQuery, Store, StoreInfo,
 };
 
 /// A Turso-backed store. Open one with [`TursoStore::open`].
@@ -131,6 +132,10 @@ impl TursoStore {
         Ok(rows.iter().filter_map(|r| cell_text(r, 3)).collect())
     }
 
+    /// Delete the child rows recreated on every upsert. Chunk rows are NOT
+    /// cleared here: an upsert preserves them so [`Store::replace_chunks`] can
+    /// carry over embeddings whose fingerprint is unchanged. Deleting an engram
+    /// clears its chunks explicitly in [`Store::delete_engram`].
     async fn delete_children(&self, engram_id: i64) -> Result<()> {
         let eid = vec![Value::Integer(engram_id)];
         self.conn
@@ -144,7 +149,6 @@ impl TursoStore {
             "DELETE FROM engram_tag WHERE engram_id=?1",
             "DELETE FROM relation WHERE engram_id=?1",
             "DELETE FROM link WHERE engram_id=?1",
-            "DELETE FROM chunk WHERE engram_id=?1",
         ] {
             self.conn.execute(sql, eid.clone()).await?;
         }
@@ -188,6 +192,14 @@ fn cell_text(row: &Row, idx: usize) -> Option<String> {
 fn cell_i64(row: &Row, idx: usize) -> Option<i64> {
     match row.get_value(idx) {
         Ok(Value::Integer(i)) => Some(i),
+        _ => None,
+    }
+}
+
+fn cell_real(row: &Row, idx: usize) -> Option<f64> {
+    match row.get_value(idx) {
+        Ok(Value::Real(f)) => Some(f),
+        Ok(Value::Integer(i)) => Some(i as f64),
         _ => None,
     }
 }
@@ -424,6 +436,12 @@ impl Store for TursoStore {
         if let Some(id) = id {
             self.delete_children(id).await?;
             self.conn
+                .execute(
+                    "DELETE FROM chunk WHERE engram_id=?1",
+                    vec![Value::Integer(id)],
+                )
+                .await?;
+            self.conn
                 .execute("DELETE FROM engram WHERE id=?1", vec![Value::Integer(id)])
                 .await?;
         }
@@ -553,11 +571,87 @@ impl Store for TursoStore {
         Ok(out)
     }
 
+    async fn replace_chunks(&self, engram_id: EngramId, chunks: &[NewChunk]) -> Result<()> {
+        let eid = engram_id.0;
+        // Carry over the embedding of any chunk whose fingerprint is unchanged so
+        // an edit only re-embeds the paragraphs that actually changed. The
+        // fingerprint folds in the model id, so a chunk embedded by a different
+        // model does not match and is left for re-embedding.
+        let existing = query_all(
+            &self.conn,
+            "SELECT text_hash, model, dims, embedding FROM chunk WHERE engram_id=?1 AND embedding IS NOT NULL",
+            vec![Value::Integer(eid)],
+        )
+        .await?;
+        let mut carry: HashMap<String, (Value, Value, Vec<u8>)> = HashMap::new();
+        for r in &existing {
+            let Some(hash) = cell_text(r, 0) else {
+                continue;
+            };
+            let model = match r.get_value(1) {
+                Ok(Value::Text(s)) => Value::Text(s),
+                _ => Value::Null,
+            };
+            let dims = match r.get_value(2) {
+                Ok(Value::Integer(i)) => Value::Integer(i),
+                _ => Value::Null,
+            };
+            let Ok(Value::Blob(emb)) = r.get_value(3) else {
+                continue;
+            };
+            carry.insert(hash, (model, dims, emb));
+        }
+
+        self.conn
+            .execute(
+                "DELETE FROM chunk WHERE engram_id=?1",
+                vec![Value::Integer(eid)],
+            )
+            .await?;
+
+        for c in chunks {
+            match carry.get(&c.text_hash) {
+                Some((model, dims, emb)) => {
+                    self.conn
+                        .execute(
+                            "INSERT INTO chunk(engram_id, seq, text, text_hash, model, dims, embedding) \
+                             VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                            vec![
+                                Value::Integer(eid),
+                                Value::Integer(c.seq),
+                                Value::Text(c.text.clone()),
+                                Value::Text(c.text_hash.clone()),
+                                model.clone(),
+                                dims.clone(),
+                                Value::Blob(emb.clone()),
+                            ],
+                        )
+                        .await?;
+                }
+                None => {
+                    self.conn
+                        .execute(
+                            "INSERT INTO chunk(engram_id, seq, text, text_hash) VALUES(?1,?2,?3,?4)",
+                            vec![
+                                Value::Integer(eid),
+                                Value::Integer(c.seq),
+                                Value::Text(c.text.clone()),
+                                Value::Text(c.text_hash.clone()),
+                            ],
+                        )
+                        .await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn chunks_needing_embedding(&self, model: &str) -> Result<Vec<ChunkJob>> {
         let rows = query_all(
             &self.conn,
             "SELECT id, engram_id, seq, text, text_hash FROM chunk \
-             WHERE model IS NULL OR model != ?1 OR embedding IS NULL",
+             WHERE embedding IS NULL OR model IS NULL OR model != ?1 \
+             ORDER BY engram_id, seq",
             vec![Value::Text(model.to_string())],
         )
         .await?;
@@ -575,6 +669,13 @@ impl Store for TursoStore {
 
     async fn store_embeddings(&self, batch: &[EmbeddingRow], model: &str) -> Result<()> {
         for row in batch {
+            if row.embedding.len() != row.dims {
+                return Err(IndexError::Invalid(format!(
+                    "embedding length {} does not match declared dims {}",
+                    row.embedding.len(),
+                    row.dims
+                )));
+            }
             let mut bytes = Vec::with_capacity(row.embedding.len() * 4);
             for f in &row.embedding {
                 bytes.extend_from_slice(&f.to_le_bytes());
@@ -592,6 +693,39 @@ impl Store for TursoStore {
                 .await?;
         }
         Ok(())
+    }
+
+    async fn embedding_coverage(&self) -> Result<EmbeddingCoverage> {
+        let total = scalar_i64(&self.conn, "SELECT count(*) FROM chunk", vec![])
+            .await?
+            .max(0) as usize;
+        let rows = query_all(
+            &self.conn,
+            "SELECT model, dims, count(*) FROM chunk WHERE embedding IS NOT NULL \
+             GROUP BY model, dims ORDER BY count(*) DESC",
+            vec![],
+        )
+        .await?;
+        let mut models = Vec::new();
+        let mut embedded = 0usize;
+        for r in &rows {
+            let count = cell_i64(r, 2).unwrap_or(0).max(0) as usize;
+            embedded += count;
+            let model = cell_text(r, 0).unwrap_or_default();
+            if model.is_empty() {
+                continue;
+            }
+            models.push(ChunkModelCount {
+                model,
+                dims: cell_i64(r, 1).unwrap_or(0).max(0) as usize,
+                count,
+            });
+        }
+        Ok(EmbeddingCoverage {
+            total_chunks: total,
+            embedded_chunks: embedded,
+            models,
+        })
     }
 
     async fn wipe(&self) -> Result<()> {

@@ -21,11 +21,18 @@ pub struct Migration {
 }
 
 /// The ordered list of migrations. Append-only: never edit a shipped migration.
-pub const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    label: "initial schema",
-    sql: SCHEMA_V1,
-}];
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        label: "initial schema",
+        sql: SCHEMA_V1,
+    },
+    Migration {
+        version: 2,
+        label: "vector chunk storage",
+        sql: SCHEMA_V2,
+    },
+];
 
 const SCHEMA_V1: &str = r#"
 CREATE TABLE domain (
@@ -129,6 +136,31 @@ CREATE TABLE chunk (
 );
 CREATE INDEX idx_chunk_engram ON chunk(engram_id);
 CREATE INDEX idx_chunk_hash ON chunk(text_hash);
+"#;
+
+// M4 gives the chunk table a native vector embedding column. The v1 table used
+// a placeholder `BLOB`; v2 recreates it with `F32_BLOB(384)` so `vector_distance_cos`
+// runs over it. The 384 matches the local bge default; turso 0.6.1 does not
+// enforce the declared width, so other providers (whose dims are recorded in the
+// `dims` column and validated in Rust) store their vectors here too. The chunk
+// table is a derived, rebuildable cache, so recreating it loses nothing that a
+// resync plus embed pass does not restore.
+const SCHEMA_V2: &str = r#"
+DROP TABLE IF EXISTS chunk;
+
+CREATE TABLE chunk (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    engram_id INTEGER NOT NULL REFERENCES engram(id),
+    seq INTEGER NOT NULL DEFAULT 0,
+    text TEXT NOT NULL DEFAULT '',
+    text_hash TEXT NOT NULL DEFAULT '',
+    model TEXT,
+    dims INTEGER,
+    embedding F32_BLOB(384)
+);
+CREATE INDEX idx_chunk_engram ON chunk(engram_id);
+CREATE INDEX idx_chunk_hash ON chunk(text_hash);
+CREATE INDEX idx_chunk_model ON chunk(model);
 "#;
 
 /// The tables cleared by `wipe()`, child rows first.

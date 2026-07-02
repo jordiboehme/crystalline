@@ -582,7 +582,7 @@ async fn store_info_reports_candidate_scan_fallback() {
     let store = open().await;
     let info = store.store_info().await.unwrap();
     assert_eq!(info.fts_mode, crystalline_index::FtsMode::CandidateScan);
-    assert_eq!(info.schema_version, 1);
+    assert_eq!(info.schema_version, 2);
 }
 
 #[tokio::test]

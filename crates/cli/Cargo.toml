@@ -11,6 +11,13 @@ description = "Local-first knowledge management for humans and AI agents."
 name = "crystalline"
 path = "src/main.rs"
 
+[features]
+# Forwarded to crystalline-index so `--no-default-features` on the workspace
+# drops candle from the binary while everything still compiles and text search,
+# the remote provider and chunking keep working.
+default = ["local-embeddings"]
+local-embeddings = ["crystalline-index/local-embeddings"]
+
 [dependencies]
 crystalline-service = { workspace = true }
 crystalline-index = { workspace = true }

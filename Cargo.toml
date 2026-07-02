@@ -16,7 +16,10 @@ repository = "https://github.com/jordiboehme/crystalline"
 
 [workspace.dependencies]
 crystalline-core = { path = "crates/core" }
-crystalline-index = { path = "crates/index" }
+# default-features off here so every dependent opts in to `local-embeddings`
+# explicitly; `cargo build --workspace --no-default-features` then drops candle
+# from the whole build rather than pulling it back in through a dependency edge.
+crystalline-index = { path = "crates/index", default-features = false }
 crystalline-service = { path = "crates/service" }
 
 clap = { version = "4.6.1", features = ["derive"] }
@@ -24,9 +27,16 @@ tokio = { version = "1.52.3", features = ["full"] }
 rmcp = "2.1.0"
 turso = "0.6.1"
 candle-core = "0.11.0"
+candle-nn = "0.11.0"
 candle-transformers = "0.11.0"
-hf-hub = "0.5.0"
-tokenizers = "0.23.1"
+# Blocking downloader over ureq, whose bundled rustls avoids any system OpenSSL
+# so the static release binaries stay self-contained. The local provider loads
+# and runs off the async runtime.
+hf-hub = { version = "0.5.0", default-features = false, features = ["ureq"] }
+# Pure-Rust regex backend (fancy-regex) instead of the onig C library, and no
+# esaxx C++ trainer or progress bar; keeps musl static builds clean. Only the
+# JSON tokenizer load and encode paths are used.
+tokenizers = { version = "0.23.1", default-features = false, features = ["fancy-regex"] }
 pulldown-cmark = "0.13.4"
 notify = "8.2.0"
 interprocess = "2.4.2"
@@ -35,7 +45,7 @@ chrono = "0.4.45"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 indexmap = "2.14.0"
-reqwest = { version = "0.13.4", default-features = false, features = ["rustls-tls", "json"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json"] }
 fs4 = "1.1.0"
 serde_yaml_ng = "0.10.0"
 async-trait = "0.1.89"
