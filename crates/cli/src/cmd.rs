@@ -59,7 +59,7 @@ async fn embed_pass(store: &TursoStore, cfg: &GlobalConfig) -> Result<()> {
 }
 
 /// Resolve the global config path from an optional override.
-fn config_path(override_path: Option<&Path>) -> Result<PathBuf> {
+pub(crate) fn config_path(override_path: Option<&Path>) -> Result<PathBuf> {
     match override_path {
         Some(p) => Ok(p.to_path_buf()),
         None => config::global_config_path()
@@ -68,7 +68,7 @@ fn config_path(override_path: Option<&Path>) -> Result<PathBuf> {
 }
 
 /// Load the global config, treating a missing file as an empty config.
-fn load_config(path: &Path) -> Result<GlobalConfig> {
+pub(crate) fn load_config(path: &Path) -> Result<GlobalConfig> {
     if path.is_file() {
         config::load_yaml(path)
             .map_err(|e| anyhow!("failed to load config {}: {e}", path.display()))
@@ -78,7 +78,7 @@ fn load_config(path: &Path) -> Result<GlobalConfig> {
 }
 
 /// Resolve the index database path from an optional override.
-fn db_path(override_path: Option<&Path>) -> Result<PathBuf> {
+pub(crate) fn db_path(override_path: Option<&Path>) -> Result<PathBuf> {
     match override_path {
         Some(p) => Ok(p.to_path_buf()),
         None => config::index_db_path()
@@ -103,7 +103,7 @@ async fn open_store(db: &Path) -> Result<TursoStore> {
 }
 
 /// The absolute, tilde-expanded path a domain entry points at.
-fn resolve_domain_path(entry: &DomainEntry) -> PathBuf {
+pub(crate) fn resolve_domain_path(entry: &DomainEntry) -> PathBuf {
     config::expand_tilde(&entry.path.to_string_lossy())
 }
 
@@ -510,6 +510,93 @@ pub async fn model_download(config_override: Option<&Path>, json: bool) -> Resul
         println!("Model ready at {} ({mb:.1} MB)", download.path.display());
     }
     Ok(())
+}
+
+// --- import --------------------------------------------------------------
+
+/// Import a markdown knowledge base with YAML frontmatter into a registered
+/// domain: normalize legacy `type` values, backfill temporal metadata, drop
+/// sentinel open-ended dates, strip a source permalink prefix and add a
+/// missing `timestamp`. Pure file transformation: never touches the index,
+/// the socket or the network.
+#[allow(clippy::too_many_arguments)]
+pub fn import(
+    src: &Path,
+    domain: &str,
+    map: Option<&Path>,
+    strip_prefix: Option<&str>,
+    dry_run: bool,
+    config_override: Option<&Path>,
+    json: bool,
+) -> Result<()> {
+    let cfg = load_config(&config_path(config_override)?)?;
+    let entry = cfg.domains.get(domain).ok_or_else(|| {
+        anyhow!(
+            "no domain named '{domain}' is registered. Register it first: crystalline domain add {domain} <path>"
+        )
+    })?;
+    let domain_dir = resolve_domain_path(entry);
+
+    let type_map = match map {
+        Some(p) => {
+            let file: crystalline_core::import::TypeMapFile = config::load_yaml(p)
+                .map_err(|e| anyhow!("failed to load --map {}: {e}", p.display()))?;
+            crystalline_core::import::merge_type_map(&file.mappings)
+        }
+        None => crystalline_core::import::default_type_map(),
+    };
+
+    let options = crystalline_core::import::ImportOptions {
+        src_dir: src.to_path_buf(),
+        domain_dir,
+        type_map,
+        strip_prefix: strip_prefix.map(str::to_string),
+        dry_run,
+    };
+    let report = crystalline_core::import::import_tree(&options)
+        .map_err(|e| anyhow!("import failed: {e}"))?;
+
+    if json {
+        println!("{}", serde_json::to_string(&report)?);
+    } else {
+        print_import_report(&report, dry_run);
+    }
+
+    // Printed to stderr, never stdout, so `--json` output stays a single
+    // parseable value. `import` never auto-syncs; this is only a hint.
+    if !dry_run {
+        eprintln!("Run: crystalline sync --domain {domain}");
+    }
+    Ok(())
+}
+
+fn print_import_report(r: &crystalline_core::import::ImportReport, dry_run: bool) {
+    if dry_run {
+        println!("Dry run: no files were written.");
+    }
+    println!(
+        "{} converted, {} copied, {} skipped",
+        r.files_converted, r.files_copied, r.files_skipped
+    );
+    println!(
+        "type mapped: {}, temporal backfilled: {}, sentinels dropped: {}, prefixes stripped: {}, collisions: {}",
+        r.type_mapped,
+        r.temporal_backfilled,
+        r.sentinels_dropped,
+        r.prefixes_stripped,
+        r.collisions
+    );
+    for w in &r.warnings {
+        println!("  warning: {w}");
+    }
+    for f in &r.files {
+        if !f.changes.is_empty() {
+            println!("  {}", f.path);
+            for c in &f.changes {
+                println!("    {c}");
+            }
+        }
+    }
 }
 
 // --- shared helpers ----------------------------------------------------------

@@ -906,9 +906,11 @@ dependencies = [
  "insta",
  "predicates",
  "reqwest",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "walkdir",
 ]
 
 [[package]]

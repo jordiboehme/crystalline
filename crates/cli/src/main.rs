@@ -14,6 +14,7 @@ use crystalline_core::config;
 use crystalline_core::verify::{self, VerifyOptions};
 
 mod cmd;
+mod doctor;
 
 /// Local-first knowledge management for humans and AI agents.
 #[derive(Parser, Debug)]
@@ -102,6 +103,44 @@ enum Command {
     Model {
         #[command(subcommand)]
         command: ModelCommand,
+    },
+    /// Import a markdown knowledge base with YAML frontmatter into a domain.
+    /// Pure file transformation: never touches the index, the socket or the
+    /// network.
+    Import {
+        /// The source directory to import from.
+        src: PathBuf,
+        /// The target domain. Must already be registered.
+        #[arg(long)]
+        domain: String,
+        /// Override or extend the built-in legacy type mapping with a YAML
+        /// file shaped `{ mappings: { old: new } }`.
+        #[arg(long)]
+        map: Option<PathBuf>,
+        /// The permalink prefix segment to strip. Defaults to the source
+        /// directory's own final path component.
+        #[arg(long)]
+        strip_prefix: Option<String>,
+        /// Print the full change report without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Load the global config from this file instead of the default path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Diagnose the index, registered domains and service state, optionally
+    /// repairing what can be repaired automatically.
+    Doctor {
+        /// Restrict checks to this domain instead of every registered domain.
+        #[arg(long)]
+        domain: Option<String>,
+        /// Repair what can be repaired automatically: orphan index rows and
+        /// stale service lock or socket files.
+        #[arg(long)]
+        fix: bool,
+        /// Load the global config from this file instead of the default path.
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
     /// Run the single-instance daemon: watch domains, embed and serve MCP and ctl
     /// over the socket, optionally over HTTP.
@@ -421,6 +460,27 @@ fn main() -> anyhow::Result<()> {
                 on_runtime(cmd::model_download(config.as_deref(), cli.json))
             }
         },
+        Some(Command::Import {
+            src,
+            domain,
+            map,
+            strip_prefix,
+            dry_run,
+            config,
+        }) => cmd::import(
+            &src,
+            &domain,
+            map.as_deref(),
+            strip_prefix.as_deref(),
+            dry_run,
+            config.as_deref(),
+            cli.json,
+        ),
+        Some(Command::Doctor {
+            domain,
+            fix,
+            config,
+        }) => on_runtime(run_doctor(domain, fix, config, cli.db, cli.json)),
         Some(Command::Serve {
             http,
             daemon,
@@ -546,6 +606,29 @@ async fn reindex_dispatch(
         return Ok(());
     }
     cmd::reindex(full, embed, config.as_deref(), db.as_deref(), json).await
+}
+
+/// `doctor`: diagnose the index, domains and service state. Exits 1 when
+/// unresolved problems remain, 0 otherwise (including with `--fix` once every
+/// fixable problem is fixed).
+async fn run_doctor(
+    domain: Option<String>,
+    fix: bool,
+    config: Option<PathBuf>,
+    db: Option<PathBuf>,
+    json: bool,
+) -> anyhow::Result<()> {
+    let report = doctor::run(domain.as_deref(), fix, config.as_deref(), db.as_deref()).await?;
+    if json {
+        print_value(&serde_json::to_value(&report)?, true);
+    } else {
+        print!("{}", doctor::render_human(&report));
+    }
+    std::process::exit(if report.remaining_problems() > 0 {
+        1
+    } else {
+        0
+    });
 }
 
 async fn run_ctl(command: CtlCommand, json: bool) -> anyhow::Result<()> {

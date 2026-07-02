@@ -17,6 +17,7 @@ pub mod address;
 pub mod config;
 pub mod emit;
 pub mod engram;
+pub mod import;
 pub mod manifest;
 pub mod parse;
 pub mod prompt;
