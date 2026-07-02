@@ -19,7 +19,9 @@ pub mod emit;
 pub mod engram;
 pub mod manifest;
 pub mod parse;
+pub mod prompt;
 pub mod schema;
+pub mod verify;
 pub mod yaml;
 
 pub use address::{CrystallineUrl, LinkResolver, LookupTable, Resolution, ResolvedRef, slugify};
@@ -30,9 +32,11 @@ pub use engram::{
 };
 pub use manifest::Manifest;
 pub use parse::{LosslessEngram, ParseError, parse_engram, parse_engram_lossless};
+pub use prompt::{PromptDomain, PromptOutput, generate_prompt, render_json, render_text};
 pub use schema::{
     FieldDecl, FieldType, ScalarType, Schema, SchemaDrift, SchemaIssue, ValidationMode,
 };
+pub use verify::{Issue, Severity, VerifyOptions, VerifyReport, verify_paths};
 pub use yaml::YamlValue;
 
 #[cfg(test)]

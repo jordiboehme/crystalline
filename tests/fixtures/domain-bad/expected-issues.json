@@ -1,0 +1,286 @@
+{
+  "version": 1,
+  "count": 56,
+  "issues": [
+    {
+      "path": "domain-bad/CHECKLIST.md",
+      "rule": "M004",
+      "severity": "error"
+    },
+    {
+      "path": "domain-bad/CHECKLIST.md",
+      "rule": "M102",
+      "severity": "warning"
+    },
+    {
+      "path": "domain-bad/GLOSSARY.md",
+      "rule": "M001",
+      "severity": "error"
+    },
+    {
+      "path": "domain-bad/MANIFEST.md",
+      "rule": "M002",
+      "severity": "error"
+    },
+    {
+      "path": "domain-bad/MANIFEST.md",
+      "rule": "M103",
+      "severity": "warning"
+    },
+    {
+      "path": "domain-bad/MANIFEST.md",
+      "rule": "Q003",
+      "severity": "warning"
+    },
+    {
+      "path": "domain-bad/RUNBOOK.md",
+      "rule": "M003",
+      "severity": "error"
+    },
+    {
+      "path": "domain-bad/RUNBOOK.md",
+      "rule": "M101",
+      "severity": "warning"
+    },
+    {
+      "path": "domain-bad/bad-permalink-and-tags.md",
+      "rule": "E005",
+      "severity": "error"
+    },
+    {
+      "path": "domain-bad/bad-permalink-and-tags.md",
+      "rule": "E007",
+      "severity": "warning"
+    },
+    {
+      "path": "domain-bad/bom.md",
+      "rule": "E006",
+      "severity": "error"
+    },
+    {
+      "path": "domain-bad/cross-domain-issues.md",
+      "rule": "L005",
+      "severity": "warning"
+    },
+    {
+      "path": "domain-bad/cross-domain-issues.md",
+      "rule": "L006",
+      "severity": "info"
+    },
+    {
+      "path": "domain-bad/dangling-schema-ref.md",
+      "rule": "S010",
+      "severity": "warning"
+    },
+    {
+      "path": "domain-bad/dup-permalink-b.md",
+      "rule": "L002",
+      "severity": "error"
+    },
+    {
+      "path": "domain-bad/dup-title-b.md",
+      "rule": "L003",
+      "severity": "warning"
+    },
+    {
+      "path": "domain-bad/frontmatter-invalid.md",
+      "rule": "E001",
+      "severity": "error"
+    },
+    {
+      "path": "domain-bad/link-broken-and-self.md",
+      "rule": "L001",
+      "severity": "warning"
+    },
+    {
+      "path": "domain-bad/link-broken-and-self.md",
+      "rule": "L004",
+      "severity": "warning"
+    },
+    {
+      "path": "domain-bad/missing-required-fields.md",
+      "rule": "E002",
+      "severity": "error"
+    },
+    {
+      "path": "domain-bad/missing-required-fields.md",
+      "rule": "E002",
+      "severity": "error"
+    },
+    {
+      "path": "domain-bad/missing-required-fields.md",
+      "rule": "E003",
+      "severity": "info"
+    },
+    {
+      "path": "domain-bad/missing-required-fields.md",
+      "rule": "E004",
+      "severity": "error"
+    },
+    {
+      "path": "domain-bad/null-byte.md",
+      "rule": "E006",
+      "severity": "error"
+    },
+    {
+      "path": "domain-bad/quality-dup-heading.md",
+      "rule": "Q003",
+      "severity": "warning"
+    },
+    {
+      "path": "domain-bad/quality-empty.md",
+      "rule": "Q001",
+      "severity": "error"
+    },
+    {
+      "path": "domain-bad/quality-near-miss.md",
+      "rule": "Q005",
+      "severity": "info"
+    },
+    {
+      "path": "domain-bad/quality-near-miss.md",
+      "rule": "Q005",
+      "severity": "info"
+    },
+    {
+      "path": "domain-bad/quality-near-miss.md",
+      "rule": "Q005",
+      "severity": "info"
+    },
+    {
+      "path": "domain-bad/quality-similar-sections.md",
+      "rule": "Q004",
+      "severity": "warning"
+    },
+    {
+      "path": "domain-bad/quality-token-budget.md",
+      "rule": "Q001",
+      "severity": "error"
+    },
+    {
+      "path": "domain-bad/quality-token-budget.md",
+      "rule": "Q002",
+      "severity": "error"
+    },
+    {
+      "path": "domain-bad/schema-malformed-declaration.md",
+      "rule": "S003",
+      "severity": "error"
+    },
+    {
+      "path": "domain-bad/schema-malformed-declaration.md",
+      "rule": "S004",
+      "severity": "error"
+    },
+    {
+      "path": "domain-bad/schema-missing-entity-and-mapping.md",
+      "rule": "S001",
+      "severity": "error"
+    },
+    {
+      "path": "domain-bad/schema-missing-entity-and-mapping.md",
+      "rule": "S002",
+      "severity": "error"
+    },
+    {
+      "path": "domain-bad/schema-violation-task-2.md",
+      "rule": "E003",
+      "severity": "info"
+    },
+    {
+      "path": "domain-bad/schema-violation-task-2.md",
+      "rule": "S031",
+      "severity": "warning"
+    },
+    {
+      "path": "domain-bad/schema-violation-task-2.md",
+      "rule": "S032",
+      "severity": "warning"
+    },
+    {
+      "path": "domain-bad/schema-violation-task-2.md",
+      "rule": "S033",
+      "severity": "warning"
+    },
+    {
+      "path": "domain-bad/schema-violation-task.md",
+      "rule": "E003",
+      "severity": "info"
+    },
+    {
+      "path": "domain-bad/schema-violation-task.md",
+      "rule": "S020",
+      "severity": "warning"
+    },
+    {
+      "path": "domain-bad/schema-violation-task.md",
+      "rule": "S021",
+      "severity": "warning"
+    },
+    {
+      "path": "domain-bad/schema-violation-task.md",
+      "rule": "S022",
+      "severity": "warning"
+    },
+    {
+      "path": "domain-bad/schema-violation-task.md",
+      "rule": "S023",
+      "severity": "warning"
+    },
+    {
+      "path": "domain-bad/schema-violation-task.md",
+      "rule": "S030",
+      "severity": "warning"
+    },
+    {
+      "path": "domain-bad/temporal-bad-dates.md",
+      "rule": "T003",
+      "severity": "error"
+    },
+    {
+      "path": "domain-bad/temporal-bad-dates.md",
+      "rule": "T003",
+      "severity": "error"
+    },
+    {
+      "path": "domain-bad/temporal-confidence-and-sentinel.md",
+      "rule": "T006",
+      "severity": "warning"
+    },
+    {
+      "path": "domain-bad/temporal-confidence-and-sentinel.md",
+      "rule": "T007",
+      "severity": "warning"
+    },
+    {
+      "path": "domain-bad/temporal-confidence-and-sentinel.md",
+      "rule": "T008",
+      "severity": "warning"
+    },
+    {
+      "path": "domain-bad/temporal-range-invalid.md",
+      "rule": "T004",
+      "severity": "error"
+    },
+    {
+      "path": "domain-bad/temporal-required-missing.md",
+      "rule": "T001",
+      "severity": "error"
+    },
+    {
+      "path": "domain-bad/temporal-required-missing.md",
+      "rule": "T001",
+      "severity": "error"
+    },
+    {
+      "path": "domain-bad/temporal-status-superseded.md",
+      "rule": "T005",
+      "severity": "warning"
+    },
+    {
+      "path": "domain-bad/temporal-status-unrecommended.md",
+      "rule": "T002",
+      "severity": "info"
+    }
+  ]
+}

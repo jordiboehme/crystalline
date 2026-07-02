@@ -1,0 +1,20 @@
+verify:
+  required_files:
+  - path: GLOSSARY.md
+    require_frontmatter: true
+    required_sections:
+    - Terms
+  - path: RUNBOOK.md
+    required_sections:
+    - Steps
+    sections:
+      Steps:
+        min_top_level_bullets: 2
+        fallback_section: Notes
+  - path: CHECKLIST.md
+    required_sections:
+    - Items
+    sections:
+      Items:
+        min_top_level_bullets: 3
+        max_bullet_length: 40

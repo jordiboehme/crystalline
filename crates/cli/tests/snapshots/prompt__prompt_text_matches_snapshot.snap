@@ -1,0 +1,16 @@
+---
+source: crates/cli/tests/prompt.rs
+expression: text
+---
+CRYSTALLINE KNOWLEDGE ROUTING
+
+You are being onboarded to the knowledge accumulated in this workspace. The domains below are registered and ready to use; route searches and reads through them instead of starting from zero.
+
+- gardening (preferred): (routing information unavailable: MANIFEST.md is missing or unreadable)
+- astronomy: When asked about moons or planets; When comparing orbital periods
+
+Behavior:
+- Narrow question, one domain clearly fits: search with domains=[that domain].
+- Broad or unclear question: default to an all-domain sweep (omit domains).
+- Writes always require an explicit domain; there is no default domain for writes.
+- Read a domain's MANIFEST only when the routing line above is not enough.

@@ -1,0 +1,25 @@
+---
+source: crates/cli/tests/prompt.rs
+expression: json
+---
+{
+  "version": 1,
+  "workspace": "workspace",
+  "domains": [
+    {
+      "name": "gardening",
+      "bullets": [
+        "(routing information unavailable: MANIFEST.md is missing or unreadable)"
+      ],
+      "preferred": true
+    },
+    {
+      "name": "astronomy",
+      "bullets": [
+        "When asked about moons or planets",
+        "When comparing orbital periods"
+      ],
+      "preferred": false
+    }
+  ]
+}

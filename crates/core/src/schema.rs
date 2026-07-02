@@ -125,6 +125,8 @@ pub enum SchemaIssueKind {
     FrontmatterEnumViolation,
     /// A frontmatter value did not match its scalar type.
     FrontmatterTypeMismatch,
+    /// A frontmatter field declared as an array held a non-array value.
+    FrontmatterNotArray,
 }
 
 /// A single schema validation issue.
@@ -459,8 +461,8 @@ fn validate_frontmatter(
                 }
             }
         }
-        FieldType::Array(inner) => {
-            if let (Some(seq), FieldType::Scalar(scalar)) = (value.as_sequence(), inner.as_ref()) {
+        FieldType::Array(inner) => match (value.as_sequence(), inner.as_ref()) {
+            (Some(seq), FieldType::Scalar(scalar)) => {
                 for item in seq {
                     if !value_matches_scalar(item, *scalar) {
                         issues.push(SchemaIssue {
@@ -475,7 +477,19 @@ fn validate_frontmatter(
                     }
                 }
             }
-        }
+            (None, FieldType::Scalar(_)) => {
+                issues.push(SchemaIssue {
+                    severity,
+                    kind: SchemaIssueKind::FrontmatterNotArray,
+                    field: path.clone(),
+                    message: format!(
+                        "frontmatter `{path}` is declared as an array but is not a list"
+                    ),
+                    line: None,
+                });
+            }
+            _ => {}
+        },
         FieldType::Entity(_) => {}
     }
 }

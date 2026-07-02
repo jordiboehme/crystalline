@@ -1,0 +1,192 @@
+name: 'Crystalline Verify'
+description: >-
+  Statically verify Crystalline knowledge Domains and, on a pull request,
+  post a single summary comment updated in place. Wraps the `crystalline
+  verify` rule catalog: no database, service or additional network
+  connection is used beyond downloading the pinned release binary itself.
+author: 'Crystalline'
+
+# Note: crystalline does not publish release binaries until milestone M7 of
+# the project plan. This action is forward-looking and syntactically valid
+# ahead of that release, but the download step below will fail with a 404
+# until a matching release exists. Pin `version` to a real tag once one is
+# published.
+
+inputs:
+  paths:
+    description: 'Space-separated Domain root paths to verify.'
+    required: false
+    default: '.'
+  version:
+    description: 'The crystalline release tag to download (for example v1.2.0), or "latest".'
+    required: false
+    default: 'latest'
+  strict:
+    description: 'Promote every rule whose default severity is Warning to Error.'
+    required: false
+    default: 'false'
+  comment:
+    description: 'Post or update a single summary comment on the pull request.'
+    required: false
+    default: 'true'
+  github-token:
+    description: 'Token used to download the release and to read and post the summary comment.'
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  exit-code:
+    description: 'The exit code `crystalline verify` produced (0 = clean, 1 = errors present).'
+    value: ${{ steps.verify.outputs.exit-code }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Resolve release version
+      id: resolve
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        VERSION_INPUT: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        if [ "$VERSION_INPUT" = "latest" ]; then
+          version=$(gh release view --repo "${{ github.action_repository || github.repository }}" --json tagName --jq .tagName)
+        else
+          version="$VERSION_INPUT"
+        fi
+        echo "version=$version" >> "$GITHUB_OUTPUT"
+
+    - name: Resolve platform target
+      id: platform
+      shell: bash
+      run: |
+        set -euo pipefail
+        case "${{ runner.os }}-${{ runner.arch }}" in
+          Linux-X64) target="x86_64-unknown-linux-musl"; ext="tar.gz" ;;
+          Linux-ARM64) target="aarch64-unknown-linux-musl"; ext="tar.gz" ;;
+          macOS-ARM64) target="aarch64-apple-darwin"; ext="tar.gz" ;;
+          Windows-X64) target="x86_64-pc-windows-msvc"; ext="zip" ;;
+          *)
+            echo "::error::unsupported runner os/arch combination: ${{ runner.os }}-${{ runner.arch }}"
+            exit 1
+            ;;
+        esac
+        echo "target=$target" >> "$GITHUB_OUTPUT"
+        echo "ext=$ext" >> "$GITHUB_OUTPUT"
+
+    - name: Download release artifact and checksums
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        set -euo pipefail
+        version="${{ steps.resolve.outputs.version }}"
+        target="${{ steps.platform.outputs.target }}"
+        archive="crystalline-${version}-${target}.${{ steps.platform.outputs.ext }}"
+        workdir="$RUNNER_TEMP/crystalline-download"
+        mkdir -p "$workdir"
+        cd "$workdir"
+        gh release download "$version" \
+          --repo "${{ github.action_repository || github.repository }}" \
+          --pattern "$archive" --pattern "SHA256SUMS" --clobber
+        echo "archive=$archive" >> "$GITHUB_ENV"
+        echo "crystalline_workdir=$workdir" >> "$GITHUB_ENV"
+
+    - name: Verify checksum
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$crystalline_workdir"
+        grep -F "$archive" SHA256SUMS > archive.sha256sums
+        sha256sum -c archive.sha256sums
+
+    - name: Extract archive
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$crystalline_workdir"
+        if [ "${{ steps.platform.outputs.ext }}" = "zip" ]; then
+          unzip -o "$archive"
+        else
+          tar -xzf "$archive"
+        fi
+        bin=$(find . -maxdepth 2 -type f \( -name 'crystalline' -o -name 'crystalline.exe' \) | head -n1)
+        chmod +x "$bin" 2>/dev/null || true
+        echo "crystalline_bin=$crystalline_workdir/${bin#./}" >> "$GITHUB_ENV"
+
+    - name: Run crystalline verify
+      id: verify
+      shell: bash
+      run: |
+        set +e
+        strict_flag=""
+        if [ "${{ inputs.strict }}" = "true" ]; then
+          strict_flag="--strict"
+        fi
+        "$crystalline_bin" verify ${{ inputs.paths }} $strict_flag --format github
+        code=$?
+        "$crystalline_bin" verify ${{ inputs.paths }} $strict_flag --format json > "$crystalline_workdir/crystalline-verify.json"
+        echo "exit-code=$code" >> "$GITHUB_OUTPUT"
+      continue-on-error: true
+
+    - name: Post or update summary comment
+      if: ${{ always() && inputs.comment == 'true' && github.event_name == 'pull_request' }}
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        REPO: ${{ github.repository }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+      run: |
+        set -euo pipefail
+        marker="<!-- crystalline-verify: managed comment, do not edit by hand -->"
+        report="$crystalline_workdir/crystalline-verify.json"
+
+        errors=$(jq '.summary.errors' "$report")
+        warnings=$(jq '.summary.warnings' "$report")
+        infos=$(jq '.summary.infos' "$report")
+        files=$(jq '.summary.files_scanned' "$report")
+        domains=$(jq '.summary.domains' "$report")
+        if [ "$errors" -gt 0 ]; then
+          status_line="Failed: $errors error(s), $warnings warning(s), $infos info"
+        else
+          status_line="Passed: $warnings warning(s), $infos info"
+        fi
+
+        body_file=$(mktemp)
+        {
+          echo "$marker"
+          echo "### Crystalline verify"
+          echo
+          echo "$status_line across $files file(s) in $domains domain(s)."
+          echo
+          echo "Full annotations are on the Checks tab for this run."
+          echo
+          total_issues=$(jq '.issues | length' "$report")
+          if [ "$total_issues" -gt 0 ]; then
+            jq -r '.issues[:20][] | "- `\(.severity)` `\(.rule)` \(.path)\(if .line then ":\(.line)" else "" end): \(.message)"' "$report"
+          fi
+          if [ "$total_issues" -gt 20 ]; then
+            echo "- ...and $((total_issues - 20)) more issue(s); see the full JSON report in the workflow run."
+          fi
+          echo
+          echo "_Note: crystalline release binaries ship starting at project milestone M7; until then this action downloads a release that may not exist yet._"
+        } > "$body_file"
+
+        existing_id=$(gh api "repos/$REPO/issues/$PR_NUMBER/comments" --paginate \
+          --jq "[.[] | select(.body | startswith(\"$marker\"))][0].id // empty")
+
+        if [ -n "$existing_id" ]; then
+          gh api "repos/$REPO/issues/comments/$existing_id" -X PATCH -f body=@"$body_file"
+        else
+          gh api "repos/$REPO/issues/$PR_NUMBER/comments" -X POST -f body=@"$body_file"
+        fi
+
+    - name: Fail on verify errors
+      shell: bash
+      run: |
+        code="${{ steps.verify.outputs.exit-code }}"
+        if [ "$code" != "0" ]; then
+          echo "::error::crystalline verify exited with code $code (errors present)"
+          exit 1
+        fi
