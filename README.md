@@ -1,5 +1,7 @@
 # Crystalline
 
+[![CI](https://github.com/jordiboehme/crystalline/actions/workflows/ci.yml/badge.svg)](https://github.com/jordiboehme/crystalline/actions/workflows/ci.yml)
+
 Local-first knowledge management for humans and AI agents.
 
 ## What is Crystalline
