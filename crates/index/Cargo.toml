@@ -1,0 +1,15 @@
+[package]
+name = "crystalline-index"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Storage and search index for Crystalline: the Store trait, the embedded database and the embedding pipeline."
+
+[lib]
+name = "crystalline_index"
+path = "src/lib.rs"
+
+[dependencies]
+crystalline-core = { workspace = true }

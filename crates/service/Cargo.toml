@@ -1,0 +1,15 @@
+[package]
+name = "crystalline-service"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Single-instance daemon and MCP server for Crystalline: lock and socket ownership, the file watcher, and the tool router."
+
+[lib]
+name = "crystalline_service"
+path = "src/lib.rs"
+
+[dependencies]
+crystalline-index = { workspace = true }

@@ -1,0 +1,17 @@
+[package]
+name = "crystalline"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Local-first knowledge management for humans and AI agents."
+
+[[bin]]
+name = "crystalline"
+path = "src/main.rs"
+
+[dependencies]
+crystalline-service = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }

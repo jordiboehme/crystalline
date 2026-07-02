@@ -1,0 +1,16 @@
+# Build artifacts
+/target/
+
+# Local research notes and plans (not part of the published repo)
+/research/
+/plans/
+
+# Source material
+Archive.zip
+
+# OS noise
+.DS_Store
+
+# Editor state
+.idea/
+.vscode/
