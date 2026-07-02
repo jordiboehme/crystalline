@@ -1,0 +1,160 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  # Manual dry run: exercises the full build-and-package matrix without
+  # publishing a GitHub Release (the publish job only runs for a tag push).
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            archive_ext: tar.gz
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            archive_ext: tar.gz
+            musl: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+            archive_ext: tar.gz
+            musl: true
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive_ext: zip
+            rustflags: '-C target-feature=+crt-static'
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - name: Add release target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Install musl-tools
+        if: matrix.musl
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Resolve release version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "version=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=v0.0.0-dev" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build crystalline
+        run: cargo build --release --target ${{ matrix.target }} -p crystalline
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+
+      - name: Locate the built binary
+        id: bin
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/crystalline"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            bin="target/${{ matrix.target }}/release/crystalline.exe"
+          fi
+          if [ ! -f "$bin" ]; then
+            echo "::error::built binary not found at $bin"
+            exit 1
+          fi
+          echo "path=$bin" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke test the binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          "${{ steps.bin.outputs.path }}" --version
+          "${{ steps.bin.outputs.path }}" verify --help
+
+      - name: Stage archive contents
+        id: stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          name="crystalline-${version}-${{ matrix.target }}"
+          stage="dist/$name"
+          mkdir -p "$stage"
+          cp "${{ steps.bin.outputs.path }}" "$stage/"
+          cp LICENSE "$stage/"
+          cp README.md "$stage/"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - name: Package archive (tar.gz)
+        if: matrix.archive_ext == 'tar.gz'
+        shell: bash
+        working-directory: dist
+        run: tar czf "${{ steps.stage.outputs.name }}.tar.gz" "${{ steps.stage.outputs.name }}"
+
+      - name: Package archive (zip)
+        if: matrix.archive_ext == 'zip'
+        shell: pwsh
+        working-directory: dist
+        run: Compress-Archive -Path "${{ steps.stage.outputs.name }}/*" -DestinationPath "${{ steps.stage.outputs.name }}.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: crystalline-${{ matrix.target }}
+          path: dist/${{ steps.stage.outputs.name }}.${{ matrix.archive_ext }}
+          if-no-files-found: error
+
+  publish:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    # Only a tag push produces a real GitHub Release; workflow_dispatch stops
+    # after the build matrix above so it can be used as a dry run.
+    if: github.ref_type == 'tag'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download all archives
+        uses: actions/download-artifact@v4
+        with:
+          path: downloads
+
+      - name: Collect archives and generate checksums
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          find downloads -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec cp {} release/ \;
+          cd release
+          sha256sum * > SHA256SUMS
+          ls -la
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "${{ github.ref_name }}" release/* \
+            --title "${{ github.ref_name }}" \
+            --generate-notes

@@ -1,24 +1,46 @@
 # Crystalline
 
 [![CI](https://github.com/jordiboehme/crystalline/actions/workflows/ci.yml/badge.svg)](https://github.com/jordiboehme/crystalline/actions/workflows/ci.yml)
+[![License: AGPL-3.0](https://img.shields.io/github/license/jordiboehme/crystalline)](LICENSE)
+[![Latest release](https://img.shields.io/github/v/release/jordiboehme/crystalline)](https://github.com/jordiboehme/crystalline/releases/latest)
 
-Local-first knowledge management for humans and AI agents.
+An AI agent starts every session as a stranger: no memory of yesterday's decisions, no sense of which conventions the team already settled on, everything re-derived from scratch or re-explained by a person. Crystalline gives an agent a durable memory instead. It is onboarded with a routing prompt at session start, taught curated knowledge organized into Domains and captures what it learns while it works as Engrams - so it becomes a more useful and productive peer over time instead of a stranger every time.
 
-## What is Crystalline
+Crystalline is a single Rust binary: a CLI for people, an MCP server for agents, and a local search index that sits on top of plain markdown files.
 
-Crystalline organizes knowledge as plain markdown files called Engrams, grouped into folders called Domains. Every Domain carries a MANIFEST.md that describes its scope and when it should be used. The files on disk are always the source of truth; Crystalline builds a local, disposable database on top of them as a derived index for fast search and graph traversal. A command-line tool and an MCP server sit on top of that index, so both people and AI agents can read, write and search the same knowledge base through the same rules.
+## How it works
 
-Status: early development. The on-disk format, storage layer and MCP tool surface are still being built out; expect breaking changes before a 1.0 release.
+- **Domains** are folders of knowledge. Each one carries a `MANIFEST.md` describing its scope and when an agent should route a task there.
+- **Engrams** are the unit of knowledge: one markdown file with YAML frontmatter, holding prose, observations (`- [category] a captured fact or lesson`) and relations (`- rel_type [[Other Engram]]`) to other engrams.
+- **MANIFEST routing** lets an agent (or a person) figure out which domain owns a task without reading every file: `crystalline prompt` turns each domain's `## When to Use` bullets into a compact session-start briefing.
+- **Files are truth.** Engrams on disk are the only durable state. Nothing is ever stored only in the database.
+- **The index is disposable.** Crystalline maintains a local embedded database for fast text, tag, temporal and semantic search, but it is fully derived from the markdown files and rebuilt on demand with `crystalline reindex --full`. Corruption or a schema change is never a data-loss event.
 
-## Planned features
+## Install
 
-- Markdown Engrams as the single source of truth, with the database rebuilt from files on demand
-- An embedded index combining hybrid text search and semantic search
-- An MCP server that gives AI agents structured read, write and search access to your knowledge
-- Static verification for CI, so malformed knowledge fails a pull request instead of a query
-- Routing prompt generation, so a session can be pointed at the right Domains automatically
+Download a prebuilt binary from the [latest release](https://github.com/jordiboehme/crystalline/releases/latest). Four targets are published:
 
-## Build from source
+| Platform | Target |
+|---|---|
+| macOS (Apple Silicon) | `aarch64-apple-darwin` |
+| Linux x86_64 (static, musl) | `x86_64-unknown-linux-musl` |
+| Linux arm64 (static, musl) | `aarch64-unknown-linux-musl` |
+| Windows x86_64 | `x86_64-pc-windows-msvc` |
+
+Each archive is named `crystalline-<version>-<target>.tar.gz` (`.zip` on Windows) and contains the `crystalline` binary alongside `LICENSE` and `README.md`. A `SHA256SUMS` file is attached to every release for verification.
+
+Shell one-liner (macOS/Linux, adjust `target` to match your platform):
+
+```sh
+version=$(curl -fsSL https://api.github.com/repos/jordiboehme/crystalline/releases/latest | grep -m1 '"tag_name"' | cut -d '"' -f4)
+target=aarch64-apple-darwin
+curl -fsSL "https://github.com/jordiboehme/crystalline/releases/download/${version}/crystalline-${version}-${target}.tar.gz" \
+  | tar xz -C /tmp
+sudo mv "/tmp/crystalline-${version}-${target}/crystalline" /usr/local/bin/crystalline
+crystalline --version
+```
+
+### Build from source
 
 ```sh
 git clone https://github.com/jordiboehme/crystalline.git
@@ -28,6 +50,158 @@ cargo build --release
 
 The resulting binary is at `target/release/crystalline`.
 
+## Quickstart
+
+This runs verbatim, start to finish, on a clean machine.
+
+```sh
+# 1. Create a domain: a folder of knowledge with a MANIFEST.md at its root.
+mkdir -p ~/knowledge/engineering
+crystalline domain init ~/knowledge/engineering --name engineering
+crystalline domain add engineering ~/knowledge/engineering
+
+# 2. Capture an engram: a unit of knowledge, with an observation bullet.
+crystalline write engineering "Retry queue gotcha" \
+  --content "- [gotcha] The retry queue drops jobs older than 24h #payments" \
+  --tags gotcha,payments
+
+# 3. Sync the domain into the local search index.
+crystalline sync
+
+# 4. Search it back (plain text, since no embeddings exist yet).
+crystalline search "retry queue"
+
+# 5. Fetch the local embedding model once, then re-sync with embeddings.
+crystalline model download
+crystalline sync --embed
+
+# 6. Search again: hybrid text-plus-semantic ranking now finds the engram
+#    from a differently worded description of the same problem.
+crystalline search "why does the payments queue lose jobs"
+
+# 7. See what got indexed.
+crystalline status
+```
+
+Edit `~/knowledge/engineering/MANIFEST.md`'s `## Scope` and `## When to Use` sections so routing and the session prompt describe the domain accurately - that file is what `crystalline prompt` and an agent's routing decisions read.
+
+## Connect your agent
+
+Crystalline runs as an MCP server over stdio. Any MCP-capable harness works; add this to its MCP server configuration (this is the shape Claude Code's `.mcp.json` uses):
+
+```json
+{
+  "mcpServers": {
+    "crystalline": {
+      "type": "stdio",
+      "command": "crystalline",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+The first agent to connect starts a background daemon that loads the embedding model once and watches every registered domain for changes; every later connection - other agents, other terminals, other harnesses - attaches to that same daemon instead of starting a second copy. One shared instance, one loaded model, one consistent view of the index, no matter how many agents are talking to it at once.
+
+## Session onboarding
+
+Run `crystalline prompt` at the start of a session and feed its output to the agent as context. It reads every registered domain's `MANIFEST.md` and renders a compact routing block: one line per domain summarizing when to use it, plus the behavior rules (narrow question -> search that domain; broad question -> sweep all of them; writes always name a domain explicitly).
+
+```sh
+crystalline prompt --workspace .
+```
+
+Wire it into a harness with a generic recipe: run `crystalline prompt` at session start and inject its stdout as context before the agent does anything else. In Claude Code, that is a `SessionStart` hook in `settings.json`:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup",
+        "hooks": [
+          { "type": "command", "command": "crystalline prompt" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Any harness with an equivalent session-start hook can run the same command the same way.
+
+## Teach and learn
+
+The MCP server exposes 12 tools; capturing knowledge as a byproduct of work is the core loop:
+
+- **`write_engram`** - capture a new engram. `domain` is always required (there is no default domain for writes, so an agent never writes into the wrong place). `permalink`, `status` and `recorded_at` are filled in for you.
+- **`search_engrams`** - search before writing, and search to recall what is already known. Defaults to hybrid text-plus-semantic ranking across every domain; pass `domains` to narrow it, or filter by `type`, `tags`, `status` or arbitrary `metadata_filters` with no query text at all.
+- **`edit_engram`** - refine an engram in place (`append`, `prepend`, `find_replace`, `replace_section`, `insert_before_section`, `insert_after_section`) instead of creating a duplicate for the same topic.
+- **`build_context`** - given a `crystalline://domain/permalink` anchor, follow its relations and links (across domains too) to assemble the neighbourhood around a task before diving in.
+
+Observations are the atomic unit of an engram's body: top-level bullets like `- [decision] we chose Postgres for the write path #database`. Categories are free text; useful ones include `decision`, `fact`, `pattern`, `gotcha`, `convention`, `lesson`, `risk` and `idea`. Relations connect engrams: `- depends_on [[Other Engram]]`, or `- "relates to" [[Other Engram]]` for a multi-word relation type.
+
+Temporal fields are plain and easy to get wrong by overthinking them: an absent `valid_from` means the engram has always been valid, an absent `valid_to` means it is valid forever. Never write a sentinel far-future date - just leave the field out. Set them only when a fact is genuinely time-bounded (a policy that changes on a known date, a temporary workaround). `status` and `type` have recommended value sets stated in the tool descriptions themselves (status: `current`, `draft`, `idea`, `deprecated`, `superseded`, and so on; type: `engram`, `guide`, `decision`, `architecture`, `runbook`, `reference`) - they exist so an agent can tell an idea apart from current fact, and they are guidance, never a global enum a write is rejected for.
+
+The CLI mirrors the mutating and read tools directly for scripting and quick edits outside an agent session: `crystalline write`, `read`, `edit`, `move`, `delete`, `search`, `context` and `recent` take the same parameters as their MCP counterparts.
+
+## Keep knowledge honest
+
+`crystalline verify` statically checks one or more domains against the full rule catalog - malformed frontmatter, broken links, missing MANIFEST sections, schema drift - with no database, service or network connection involved. Run it in CI with the bundled GitHub Action:
+
+```yaml
+- uses: jordiboehme/crystalline@v1
+  with:
+    paths: knowledge/
+    strict: 'false'
+```
+
+The action downloads a pinned release binary (checksum-verified), runs `crystalline verify`, annotates the run and, on a pull request, posts a single summary comment kept up to date in place.
+
+Two more commands keep a knowledge base trustworthy:
+
+- **`crystalline import <src> --domain <name>`** brings an existing markdown-plus-frontmatter knowledge base under Crystalline: normalizes legacy `type` values, backfills `status` and temporal metadata, drops sentinel far-future dates in favor of leaving the field open-ended, and adds a missing `timestamp` - all as a pure file transformation, with `--dry-run` to preview first.
+- **`crystalline doctor`** diagnoses the index, registered domains and service state (orphan index rows, encoding issues, stale service locks) and repairs what it safely can with `--fix`.
+
+## Skills
+
+The `skills/` folder ships three harness-agnostic agent skills that teach an agent how to use Crystalline well:
+
+- **`crystalline-routing`** - which domain(s) to search for a task, when to sweep every domain instead, temporal filtering for "what is true now", and when to fall back to reading a MANIFEST directly.
+- **`crystalline-capture`** - when captured knowledge is worth writing down, searching before writing to avoid duplicates, editing an existing engram instead of forking the topic, and the observation-category and temporal-field conventions that keep engrams useful later.
+- **`crystalline-schema`** - authoring a Picoschema schema engram for a domain that wants structure, inferring one from what is already captured, and validating conformance.
+
+Each is a plain folder with a `SKILL.md`; install by copying the folder into wherever your harness looks for skills. For Claude Code, that is `.claude/skills/` in a project or `~/.claude/skills/` globally:
+
+```sh
+cp -r skills/crystalline-routing skills/crystalline-capture skills/crystalline-schema ~/.claude/skills/
+```
+
+Other harnesses that support a similar skill or instruction-file convention can point at the same folders directly; the content only assumes the 12 MCP tools above, never a specific harness.
+
+## Architecture
+
+```
+crystalline-core     format layer: parser, emitter, Picoschema, verify, prompt
+       |              (no async runtime, no database, no ML - stays static)
+       v
+crystalline-index    Store trait, embedded database, sync engine, search, embeddings
+       |
+       v
+crystalline-service  single-instance daemon, MCP tool router, control protocol
+       |
+       v
+crystalline (cli)    the one user-facing binary
+```
+
+Exactly one process ever holds the database open: the first `crystalline mcp` or `crystalline serve` takes an advisory lock and becomes the daemon; every later CLI command or MCP connection attaches to it over a local socket, or opens the database directly for a brief operation when no daemon is running.
+
+## Roadmap
+
+- A PostgreSQL `Store` implementation for shared, multi-user deployments (the storage layer is already trait-based for this).
+- Versioning and collaboration on a knowledge base through git.
+- Authentication for the optional HTTP transport, which is localhost-only today.
+
 ## License
 
-GNU Affero General Public License v3.0 - see [LICENSE](LICENSE)
+GNU Affero General Public License v3.0 - see [LICENSE](LICENSE).
