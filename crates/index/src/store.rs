@@ -511,6 +511,49 @@ pub struct EngramSummary {
     pub tags: Vec<String>,
 }
 
+/// A lightweight engram descriptor, enough to locate its file and address it.
+///
+/// Returned by the service-layer lookup helpers on [`crate::TursoStore`] that
+/// back identifier resolution, browsing, validation and schema inference. It
+/// carries the ids so a caller can go straight to a graph traversal or a
+/// single-file upsert without a second query.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EngramDescriptor {
+    /// The engram id.
+    pub id: EngramId,
+    /// The owning domain id.
+    pub domain_id: DomainId,
+    /// The domain name.
+    pub domain: String,
+    /// The domain-relative file path, forward-slashed, with the `.md` suffix.
+    pub path: String,
+    /// The engram permalink.
+    pub permalink: String,
+    /// The engram title.
+    pub title: String,
+    /// The engram `type`.
+    pub engram_type: String,
+    /// The engram `status`.
+    pub status: String,
+}
+
+/// One inbound reference to an engram: a relation or a prose link that resolves
+/// to it. Used by the cross-domain move to rewrite linkers to the domain-prefixed
+/// form.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct InboundRef {
+    /// The linking engram's domain name.
+    pub src_domain: String,
+    /// The linking engram's domain id.
+    pub src_domain_id: DomainId,
+    /// The linking engram's domain-relative file path.
+    pub src_path: String,
+    /// The exact target text used in the link.
+    pub to_target: String,
+    /// Whether the reference came from a relation bullet or a prose link.
+    pub kind: EdgeKind,
+}
+
 /// A chunk awaiting an embedding. Populated by M4; the M3 store returns none.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChunkJob {

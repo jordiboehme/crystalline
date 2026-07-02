@@ -27,9 +27,9 @@ pub use embed::{
 pub use error::{IndexError, Result};
 pub use store::{
     ChunkJob, ChunkModelCount, DomainId, DomainStats, EdgeKind, EmbeddingCoverage, EmbeddingRow,
-    EngramId, EngramRecord, EngramSummary, FileStamp, FilterOp, FtsMode, GraphEdge, GraphNode,
-    GraphSlice, HitKind, MetadataFilter, NewChunk, Page, RecentFilter, SearchHit, SearchMode,
-    SearchQuery, Store, StoreInfo, parse_metadata_filters,
+    EngramDescriptor, EngramId, EngramRecord, EngramSummary, FileStamp, FilterOp, FtsMode,
+    GraphEdge, GraphNode, GraphSlice, HitKind, InboundRef, MetadataFilter, NewChunk, Page,
+    RecentFilter, SearchHit, SearchMode, SearchQuery, Store, StoreInfo, parse_metadata_filters,
 };
 pub use sync::{SyncReport, sync_domain, sync_domain_with};
 pub use turso::TursoStore;

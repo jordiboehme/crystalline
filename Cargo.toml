@@ -47,6 +47,8 @@ serde_json = "1.0.150"
 indexmap = "2.14.0"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json"] }
 fs4 = "1.1.0"
+axum = "0.8.9"
+libc = "0.2.180"
 serde_yaml_ng = "0.10.0"
 async-trait = "0.1.89"
 thiserror = "2.0.18"

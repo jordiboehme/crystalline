@@ -1,0 +1,473 @@
+//! Integration tests for the daemon, spawning the real `crystalline` binary.
+//!
+//! Each test runs in an isolated, deliberately short temp HOME (so the unix
+//! socket path stays under the platform limit). etcetera uses the XDG strategy
+//! on Linux and macOS, so setting the XDG_*_HOME variables redirects the state,
+//! config and cache directories. These tests are unix-only: they use unix domain
+//! sockets and `kill -9` for the stale-lock scenario.
+#![cfg(unix)]
+
+use std::io::{BufRead, BufReader, Write};
+use std::net::TcpStream;
+use std::path::PathBuf;
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use serde_json::{Value, json};
+
+fn bin() -> PathBuf {
+    assert_cmd::cargo::cargo_bin("crystalline")
+}
+
+/// An isolated, short-path environment for one test.
+struct Env {
+    dir: PathBuf,
+}
+
+impl Env {
+    fn new(tag: &str) -> Env {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        // A short base keeps the macOS unix-socket path within 104 bytes.
+        let dir = PathBuf::from("/tmp").join(format!("cq-{tag}-{nanos}"));
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        std::fs::create_dir_all(dir.join("state")).unwrap();
+        std::fs::create_dir_all(dir.join("cache")).unwrap();
+        Env { dir }
+    }
+
+    fn apply(&self, cmd: &mut Command) {
+        cmd.env("HOME", &self.dir)
+            .env("XDG_CONFIG_HOME", self.dir.join("config"))
+            .env("XDG_STATE_HOME", self.dir.join("state"))
+            .env("XDG_CACHE_HOME", self.dir.join("cache"));
+    }
+
+    fn state_dir(&self) -> PathBuf {
+        self.dir.join("state/crystalline")
+    }
+    fn lock_path(&self) -> PathBuf {
+        self.state_dir().join("service.lock")
+    }
+    fn sock_path(&self) -> PathBuf {
+        self.state_dir().join("service.sock")
+    }
+    fn config_path(&self) -> PathBuf {
+        self.dir.join("config/crystalline/config.yaml")
+    }
+
+    /// Create a domain directory with a MANIFEST and a seed engram, then register
+    /// it in the config.
+    fn setup_domain(&self, name: &str) {
+        let dir = self.dir.join(format!("kb-{name}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("MANIFEST.md"),
+            format!(
+                "---\ntype: manifest\ntitle: {name}\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# {name}\n\n## Scope\n\n- {name}\n\n## When to Use\n\n- Route here for {name}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("seed.md"),
+            "---\ntype: engram\ntitle: Seed\npermalink: seed\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nseed body token\n",
+        )
+        .unwrap();
+        let mut cmd = Command::new(bin());
+        self.apply(&mut cmd);
+        let ok = cmd
+            .args(["domain", "add", name])
+            .arg(&dir)
+            .arg("--config")
+            .arg(self.config_path())
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "domain add");
+    }
+
+    /// Run a one-shot command, returning (success, stdout).
+    fn run(&self, args: &[&str]) -> (bool, String) {
+        let mut cmd = Command::new(bin());
+        self.apply(&mut cmd);
+        let out = cmd.args(args).output().unwrap();
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+        )
+    }
+
+    /// Poll ctl status until the daemon answers, or panic after ~8s.
+    fn wait_ready(&self) {
+        let start = Instant::now();
+        loop {
+            let (ok, _) = self.run(&["ctl", "status", "--json"]);
+            if ok {
+                return;
+            }
+            if start.elapsed() > Duration::from_secs(8) {
+                panic!("daemon did not become ready");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    fn lock_pid(&self) -> Option<u64> {
+        let text = std::fs::read_to_string(self.lock_path()).ok()?;
+        let v: Value = serde_json::from_str(&text).ok()?;
+        v.get("pid").and_then(Value::as_u64)
+    }
+}
+
+impl Drop for Env {
+    fn drop(&mut self) {
+        // Best-effort: stop any daemon this test left running, then remove the dir.
+        if let Some(pid) = self.lock_pid() {
+            let _ = Command::new("kill").arg("-9").arg(pid.to_string()).status();
+        }
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// A `crystalline mcp` child driven with raw newline-delimited JSON-RPC.
+struct Mcp {
+    child: Child,
+    stdin: ChildStdin,
+    out: BufReader<ChildStdout>,
+    id: i64,
+}
+
+impl Mcp {
+    fn spawn(env: &Env) -> Mcp {
+        let mut cmd = Command::new(bin());
+        env.apply(&mut cmd);
+        let mut child = cmd
+            .args(["mcp", "--config"])
+            .arg(env.config_path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let out = BufReader::new(child.stdout.take().unwrap());
+        Mcp {
+            child,
+            stdin,
+            out,
+            id: 0,
+        }
+    }
+
+    fn send(&mut self, value: &Value) {
+        self.stdin.write_all(value.to_string().as_bytes()).unwrap();
+        self.stdin.write_all(b"\n").unwrap();
+        self.stdin.flush().unwrap();
+    }
+
+    fn read(&mut self) -> Value {
+        loop {
+            let mut line = String::new();
+            let n = self.out.read_line(&mut line).unwrap();
+            assert!(n > 0, "unexpected EOF from mcp child");
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            return serde_json::from_str(trimmed).unwrap();
+        }
+    }
+
+    fn initialize(&mut self) {
+        self.id += 1;
+        self.send(&json!({
+            "jsonrpc": "2.0",
+            "id": self.id,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": { "name": "it", "version": "0" }
+            }
+        }));
+        let resp = self.read();
+        assert!(resp.get("result").is_some(), "initialize: {resp}");
+        self.send(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }));
+    }
+
+    fn send_call(&mut self, tool: &str, args: Value) {
+        self.id += 1;
+        self.send(&json!({
+            "jsonrpc": "2.0",
+            "id": self.id,
+            "method": "tools/call",
+            "params": { "name": tool, "arguments": args }
+        }));
+    }
+
+    fn read_tool_value(&mut self) -> Value {
+        let resp = self.read();
+        let text = resp
+            .pointer("/result/content/0/text")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        serde_json::from_str(text).unwrap_or(Value::Null)
+    }
+}
+
+impl Drop for Mcp {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[test]
+fn single_daemon_two_clients_and_stale_recovery() {
+    let env = Env::new("share");
+    env.setup_domain("eng");
+
+    // The first client spawns the daemon and attaches.
+    let mut c1 = Mcp::spawn(&env);
+    c1.initialize();
+    env.wait_ready();
+
+    // A second client attaches to the same daemon.
+    let mut c2 = Mcp::spawn(&env);
+    c2.initialize();
+    std::thread::sleep(Duration::from_millis(300));
+
+    // ctl status shows two sessions and the pid matches the lock file.
+    let (ok, out) = env.run(&["ctl", "status", "--json"]);
+    assert!(ok, "ctl status");
+    let status: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        status["sessions"],
+        json!(2),
+        "two shared sessions: {status}"
+    );
+    let pid = status["pid"].as_u64().unwrap();
+    assert_eq!(env.lock_pid(), Some(pid), "lock pid equals daemon pid");
+
+    // Both clients search concurrently over the one daemon.
+    c1.send_call("search_engrams", json!({ "query": "token" }));
+    c2.send_call("search_engrams", json!({ "query": "token" }));
+    let r1 = c1.read_tool_value();
+    let r2 = c2.read_tool_value();
+    assert!(r1["total"].as_u64().unwrap() >= 1, "c1 search: {r1}");
+    assert!(r2["total"].as_u64().unwrap() >= 1, "c2 search: {r2}");
+
+    // Hard-kill the daemon; the next client recovers via stale-lock takeover.
+    drop(c1);
+    drop(c2);
+    Command::new("kill")
+        .arg("-9")
+        .arg(pid.to_string())
+        .status()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+
+    let mut c3 = Mcp::spawn(&env);
+    c3.initialize();
+    env.wait_ready();
+    let (ok, out) = env.run(&["ctl", "status", "--json"]);
+    assert!(ok);
+    let status: Value = serde_json::from_str(&out).unwrap();
+    let pid2 = status["pid"].as_u64().unwrap();
+    assert_ne!(pid2, pid, "a fresh daemon took over the stale lock");
+
+    // ctl shutdown stops the daemon and removes the lock and socket.
+    drop(c3);
+    let (ok, _) = env.run(&["ctl", "shutdown"]);
+    assert!(ok, "ctl shutdown");
+    let start = Instant::now();
+    while env.sock_path().exists() && start.elapsed() < Duration::from_secs(3) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!env.sock_path().exists(), "socket removed on shutdown");
+    assert!(!env.lock_path().exists(), "lock removed on shutdown");
+}
+
+#[test]
+fn watcher_indexes_external_write_without_duplicates() {
+    let env = Env::new("watch");
+    env.setup_domain("eng");
+
+    let mut c1 = Mcp::spawn(&env);
+    c1.initialize();
+    env.wait_ready();
+
+    // Write a new engram file directly into the domain folder.
+    std::fs::write(
+        env.dir.join("kb-eng/watched.md"),
+        "---\ntype: engram\ntitle: Watched\npermalink: watched\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nwatched unique body\n",
+    )
+    .unwrap();
+
+    // Poll search until the watcher has indexed it (bounded wait).
+    let mut found = false;
+    for _ in 0..60 {
+        c1.send_call(
+            "search_engrams",
+            json!({ "query": "watched", "domains": ["eng"] }),
+        );
+        let r = c1.read_tool_value();
+        let hits = r["hits"].as_array().cloned().unwrap_or_default();
+        let matching = hits
+            .iter()
+            .filter(|h| h["permalink"] == json!("watched"))
+            .count();
+        if matching >= 1 {
+            assert_eq!(matching, 1, "no duplicate rows for the indexed file: {r}");
+            found = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(found, "the watcher indexed the external write");
+
+    drop(c1);
+    let _ = env.run(&["ctl", "shutdown"]);
+}
+
+#[test]
+fn http_smoke_initialize_list_and_search() {
+    let env = Env::new("http");
+    env.setup_domain("eng");
+
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let mut serve = Command::new(bin());
+    env.apply(&mut serve);
+    let mut child = serve
+        .args(["serve", "--http", &addr, "--config"])
+        .arg(env.config_path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    wait_port(&addr);
+    // Give the router a moment after the port opens.
+    std::thread::sleep(Duration::from_millis(300));
+
+    let client = reqwest::blocking::Client::new();
+    let url = format!("http://{addr}/");
+
+    // initialize
+    let resp = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .body(
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": { "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": { "name": "http", "version": "0" } }
+            })
+            .to_string(),
+        )
+        .send()
+        .unwrap();
+    let session = resp
+        .headers()
+        .get("mcp-session-id")
+        .map(|v| v.to_str().unwrap().to_string());
+    let init = parse_jsonrpc(&resp.text().unwrap());
+    assert!(
+        init.pointer("/result/protocolVersion").is_some(),
+        "initialize over HTTP: {init}"
+    );
+    let session = session.expect("streamable HTTP returns a session id");
+
+    // initialized notification
+    let _ = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .header("mcp-session-id", &session)
+        .body(json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }).to_string())
+        .send()
+        .unwrap();
+
+    // tools/list
+    let list = parse_jsonrpc(
+        &client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .header("mcp-session-id", &session)
+            .body(
+                json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {} })
+                    .to_string(),
+            )
+            .send()
+            .unwrap()
+            .text()
+            .unwrap(),
+    );
+    let tools = list
+        .pointer("/result/tools")
+        .and_then(Value::as_array)
+        .unwrap();
+    assert_eq!(tools.len(), 12, "12 tools over HTTP");
+
+    // one search
+    let search = parse_jsonrpc(
+        &client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .header("mcp-session-id", &session)
+            .body(
+                json!({
+                    "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                    "params": { "name": "search_engrams", "arguments": { "query": "token" } }
+                })
+                .to_string(),
+            )
+            .send()
+            .unwrap()
+            .text()
+            .unwrap(),
+    );
+    assert!(
+        search.pointer("/result/content/0/text").is_some(),
+        "search over HTTP returns content: {search}"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Parse a JSON-RPC response that may be plain JSON or an SSE `data:` frame.
+fn parse_jsonrpc(body: &str) -> Value {
+    for line in body.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("data:")
+            && let Ok(v) = serde_json::from_str::<Value>(rest.trim())
+        {
+            return v;
+        }
+    }
+    serde_json::from_str(body).unwrap_or(Value::Null)
+}
+
+fn free_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap().port()
+}
+
+fn wait_port(addr: &str) {
+    let start = Instant::now();
+    loop {
+        if TcpStream::connect(addr).is_ok() {
+            return;
+        }
+        if start.elapsed() > Duration::from_secs(8) {
+            panic!("HTTP endpoint did not open on {addr}");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}

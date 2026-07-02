@@ -1,0 +1,1349 @@
+//! The shared service engine.
+//!
+//! Every data operation (the 12 MCP tools, the CLI data commands and the ctl
+//! sync and reindex) runs through one [`Engine`]. It owns the single
+//! [`TursoStore`] behind a [`tokio::sync::Mutex`] so turso's single-connection
+//! model is honoured across the daemon's many tasks, the optional embedding
+//! provider (built once), the resolved config and the chunk parameters.
+//!
+//! Files are the source of truth: every mutation writes the file first, then
+//! upserts that single file into the store using the on-disk file stamp, so the
+//! daemon's debounced watcher classifies the file as unchanged and never
+//! reprocesses it (the idempotency guard, see `research/single-instance-ipc.md`).
+
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use chrono::{DateTime, Duration, FixedOffset};
+use crystalline_core::config::{self, GlobalConfig};
+use crystalline_core::emit::{
+    append_body, insert_after_section, insert_before_section, prepend_body, replace_section,
+    touch_timestamp,
+};
+use crystalline_core::schema::{self, Schema};
+use crystalline_core::{
+    CrystallineUrl, Engram, Frontmatter, Manifest, YamlValue, parse_engram, slugify,
+};
+use crystalline_index::{
+    ChunkParams, DomainId, EmbeddingProvider, EngramDescriptor, EngramId, EngramRecord, FileStamp,
+    RecentFilter, SearchMode, SearchQuery, Store, TursoStore, chunk_engram, configured_model_id,
+    parse_metadata_filters, provider_from_config, sync_domain_with,
+};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use tokio::sync::Mutex;
+
+use crate::params::*;
+
+/// How many chunks are embedded per background batch.
+const EMBED_BATCH: usize = 16;
+
+/// An error from an engine operation, mapped to actionable tool errors.
+#[derive(Debug, thiserror::Error)]
+pub enum EngineError {
+    /// A referenced domain is not registered.
+    #[error("domain '{domain}' not registered; registered: [{}]", .registered.join(", "))]
+    UnknownDomain {
+        /// The requested domain.
+        domain: String,
+        /// The registered domain names.
+        registered: Vec<String>,
+    },
+    /// The engram or section was not found.
+    #[error("{0}")]
+    NotFound(String),
+    /// A bare identifier matched engrams in more than one domain.
+    #[error("{0}")]
+    Ambiguous(String),
+    /// A write would clobber an existing engram without `overwrite`.
+    #[error("{0}")]
+    Conflict(String),
+    /// The request was malformed.
+    #[error("{0}")]
+    Invalid(String),
+    /// A filesystem error.
+    #[error("io error at {path}: {source}")]
+    Io {
+        /// The path involved.
+        path: String,
+        /// The underlying error.
+        source: std::io::Error,
+    },
+    /// An error from the storage or parse layer.
+    #[error("{0}")]
+    Internal(String),
+}
+
+impl From<crystalline_index::IndexError> for EngineError {
+    fn from(e: crystalline_index::IndexError) -> Self {
+        match e {
+            crystalline_index::IndexError::Constraint(m) => EngineError::Conflict(m),
+            crystalline_index::IndexError::NotFound(m) => EngineError::NotFound(m),
+            crystalline_index::IndexError::Invalid(m) => EngineError::Invalid(m),
+            other => EngineError::Internal(other.to_string()),
+        }
+    }
+}
+
+/// The result type used across the engine.
+pub type Result<T> = std::result::Result<T, EngineError>;
+
+/// The shared service engine.
+pub struct Engine {
+    store: Arc<Mutex<TursoStore>>,
+    config: GlobalConfig,
+    // Swappable so the daemon can build the (possibly downloading) provider in the
+    // background without blocking readiness or text search.
+    provider: std::sync::RwLock<Option<Arc<dyn EmbeddingProvider>>>,
+    model_id: String,
+    chunk_params: ChunkParams,
+}
+
+impl Engine {
+    /// Build an engine around an already-open store, an optional provider and a
+    /// config. A `None` provider can be installed later with [`Engine::set_provider`].
+    pub fn new(
+        store: Arc<Mutex<TursoStore>>,
+        config: GlobalConfig,
+        provider: Option<Arc<dyn EmbeddingProvider>>,
+    ) -> Engine {
+        let model_id = configured_model_id(config.embeddings.as_ref());
+        let chunk_params = ChunkParams::for_model(model_id.clone());
+        Engine {
+            store,
+            config,
+            provider: std::sync::RwLock::new(provider),
+            model_id,
+            chunk_params,
+        }
+    }
+
+    /// The shared store handle, for the daemon's watcher and embed loop.
+    pub fn store(&self) -> Arc<Mutex<TursoStore>> {
+        self.store.clone()
+    }
+
+    /// The active embedding provider, if one has been installed.
+    pub fn provider(&self) -> Option<Arc<dyn EmbeddingProvider>> {
+        self.provider.read().unwrap().clone()
+    }
+
+    /// Install (or replace) the embedding provider. Used by the daemon after it
+    /// builds the provider in the background.
+    pub fn set_provider(&self, provider: Arc<dyn EmbeddingProvider>) {
+        *self.provider.write().unwrap() = Some(provider);
+    }
+
+    /// The registered config.
+    pub fn config(&self) -> &GlobalConfig {
+        &self.config
+    }
+
+    /// The active embedding model id.
+    pub fn model_id(&self) -> &str {
+        &self.model_id
+    }
+
+    // --- domain helpers ------------------------------------------------------
+
+    fn domain_root(&self, name: &str) -> Result<PathBuf> {
+        match self.config.domains.get(name) {
+            Some(entry) => Ok(config::expand_tilde(&entry.path.to_string_lossy())),
+            None => Err(EngineError::UnknownDomain {
+                domain: name.to_string(),
+                registered: self.config.domains.keys().cloned().collect(),
+            }),
+        }
+    }
+
+    /// Resolve an identifier (permalink, domain/permalink, title or
+    /// `crystalline://` URL) to a descriptor and its domain root.
+    async fn resolve(
+        &self,
+        identifier: &str,
+        domain: Option<&str>,
+    ) -> Result<(EngramDescriptor, PathBuf)> {
+        if let Some(url) = CrystallineUrl::parse(identifier) {
+            let root = self.domain_root(&url.domain)?;
+            let store = self.store.lock().await;
+            let d = store
+                .find_engram(&url.domain, &url.permalink)
+                .await?
+                .ok_or_else(|| {
+                    EngineError::NotFound(format!(
+                        "no engram '{}' in domain '{}'",
+                        url.permalink, url.domain
+                    ))
+                })?;
+            return Ok((d, root));
+        }
+
+        if let Some(dom) = domain {
+            let root = self.domain_root(dom)?;
+            let store = self.store.lock().await;
+            let d = store.find_engram(dom, identifier).await?.ok_or_else(|| {
+                EngineError::NotFound(format!("no engram '{identifier}' in domain '{dom}'"))
+            })?;
+            return Ok((d, root));
+        }
+
+        // `domain/permalink` form.
+        if let Some((maybe_dom, rest)) = identifier.split_once('/')
+            && self.config.domains.contains_key(maybe_dom)
+        {
+            let store = self.store.lock().await;
+            if let Some(d) = store.find_engram(maybe_dom, rest).await? {
+                let root = self.domain_root(maybe_dom)?;
+                return Ok((d, root));
+            }
+        }
+
+        // Bare identifier across all domains.
+        let store = self.store.lock().await;
+        let mut matches = store.find_engram_any(identifier).await?;
+        match matches.len() {
+            0 => Err(EngineError::NotFound(format!(
+                "no engram matches '{identifier}'"
+            ))),
+            1 => {
+                let d = matches.remove(0);
+                let root = self.domain_root(&d.domain)?;
+                Ok((d, root))
+            }
+            _ => {
+                let doms: Vec<String> = matches.iter().map(|d| d.domain.clone()).collect();
+                Err(EngineError::Ambiguous(format!(
+                    "'{identifier}' matches engrams in multiple domains: [{}]; pass a domain",
+                    doms.join(", ")
+                )))
+            }
+        }
+    }
+
+    /// Upsert a single file into the store from disk, carrying the on-disk stamp
+    /// so the watcher does not reprocess it. Runs in one transaction.
+    async fn reindex_file(
+        &self,
+        store: &TursoStore,
+        domain_id: DomainId,
+        root: &Path,
+        rel: &str,
+    ) -> Result<EngramId> {
+        let abs = join_rel(root, rel);
+        let bytes = std::fs::read(&abs).map_err(|source| EngineError::Io {
+            path: abs.display().to_string(),
+            source,
+        })?;
+        let meta = std::fs::metadata(&abs).map_err(|source| EngineError::Io {
+            path: abs.display().to_string(),
+            source,
+        })?;
+        let stamp = FileStamp {
+            mtime: mtime_secs(&meta),
+            size: meta.len(),
+            sha256: sha256_hex(&bytes),
+        };
+        let text = String::from_utf8(bytes)
+            .map_err(|_| EngineError::Invalid(format!("{} is not valid UTF-8", abs.display())))?;
+        let engram = parse_engram(&text).map_err(|e| EngineError::Invalid(e.to_string()))?;
+        let record = EngramRecord::from_engram(&engram, rel, stamp);
+
+        store.begin().await?;
+        let result = async {
+            let id = store.upsert_engram(domain_id, &record).await?;
+            let chunks = chunk_engram(
+                &record.title,
+                record.description.as_deref(),
+                &record.content,
+                &self.chunk_params,
+            );
+            store.replace_chunks(id, &chunks).await?;
+            store.resolve_pending_relations(domain_id).await?;
+            Ok::<EngramId, EngineError>(id)
+        }
+        .await;
+        match result {
+            Ok(id) => {
+                store.commit().await?;
+                Ok(id)
+            }
+            Err(e) => {
+                let _ = store.rollback().await;
+                Err(e)
+            }
+        }
+    }
+
+    // --- write ---------------------------------------------------------------
+
+    /// Create or overwrite an engram file, then index it.
+    pub async fn write_engram(&self, p: &WriteParams) -> Result<Value> {
+        let root = self.domain_root(&p.domain)?;
+        let engram_type = p
+            .engram_type
+            .clone()
+            .unwrap_or_else(|| "engram".to_string());
+        let status = p.status.clone().unwrap_or_else(|| "current".to_string());
+        let tags = p.tags.clone().unwrap_or_default();
+
+        let folder = p.folder.clone().unwrap_or_default();
+        let title_slug = slugify(&p.title);
+        if title_slug.is_empty() {
+            return Err(EngineError::Invalid(
+                "title does not slugify to a permalink; provide a title with letters or digits"
+                    .into(),
+            ));
+        }
+        let rel = if folder.trim_matches('/').is_empty() {
+            format!("{title_slug}.md")
+        } else {
+            format!("{}/{title_slug}.md", folder.trim_matches('/'))
+        };
+        let permalink = slugify(&rel);
+
+        // Enforce overwrite semantics against the existing permalink.
+        {
+            let store = self.store.lock().await;
+            if let Some(existing) = store.find_engram(&p.domain, &permalink).await?
+                && !p.overwrite
+            {
+                return Err(EngineError::Conflict(format!(
+                    "permalink '{permalink}' already exists in domain '{}' (at {}); pass overwrite=true to replace",
+                    p.domain, existing.path
+                )));
+            }
+        }
+
+        let today = chrono::Utc::now().date_naive();
+        let now = now_offset();
+        let markdown = build_markdown(
+            &engram_type,
+            &p.title,
+            &permalink,
+            &tags,
+            &status,
+            &today.format("%Y-%m-%d").to_string(),
+            &now.to_rfc3339(),
+            p.metadata.as_ref(),
+            &p.content,
+        )?;
+
+        let abs = join_rel(&root, &rel);
+        write_file(&abs, &markdown)?;
+
+        let store = self.store.lock().await;
+        let domain_id = store
+            .upsert_domain(&p.domain, &root.to_string_lossy())
+            .await?;
+        self.reindex_file(&store, domain_id, &root, &rel).await?;
+
+        Ok(json!({
+            "domain": p.domain,
+            "permalink": permalink,
+            "path": rel,
+            "title": p.title,
+            "type": engram_type,
+            "status": status,
+            "action": if p.overwrite { "written" } else { "created" },
+        }))
+    }
+
+    // --- read ----------------------------------------------------------------
+
+    /// Read an engram's full markdown and resolved frontmatter.
+    pub async fn read_engram(&self, p: &ReadParams) -> Result<Value> {
+        let (desc, root) = self.resolve(&p.identifier, p.domain.as_deref()).await?;
+        let abs = join_rel(&root, &desc.path);
+        let source = std::fs::read_to_string(&abs).map_err(|source| EngineError::Io {
+            path: abs.display().to_string(),
+            source,
+        })?;
+        let engram = parse_engram(&source).map_err(|e| EngineError::Invalid(e.to_string()))?;
+        Ok(json!({
+            "domain": desc.domain,
+            "permalink": desc.permalink,
+            "title": desc.title,
+            "type": desc.engram_type,
+            "status": desc.status,
+            "path": desc.path,
+            "url": format!("crystalline://{}/{}", desc.domain, desc.permalink),
+            "content": source,
+            "frontmatter": engram.frontmatter,
+            "observations": engram.observations,
+            "relations": engram.relations,
+        }))
+    }
+
+    // --- edit ----------------------------------------------------------------
+
+    /// Apply a surgical edit to an engram, then reindex it.
+    pub async fn edit_engram(&self, p: &EditParams) -> Result<Value> {
+        let (desc, root) = self.resolve(&p.identifier, Some(&p.domain)).await?;
+        let abs = join_rel(&root, &desc.path);
+        let source = std::fs::read_to_string(&abs).map_err(|source| EngineError::Io {
+            path: abs.display().to_string(),
+            source,
+        })?;
+
+        let edited = match p.operation.as_str() {
+            "append" => append_body(&source, &p.content),
+            "prepend" => prepend_body(&source, &p.content),
+            "find_replace" => {
+                let find = p.find_text.as_deref().ok_or_else(|| {
+                    EngineError::Invalid("find_replace requires find_text".into())
+                })?;
+                if find.is_empty() {
+                    return Err(EngineError::Invalid("find_text must not be empty".into()));
+                }
+                let count = source.matches(find).count();
+                if count == 0 {
+                    return Err(EngineError::NotFound(format!(
+                        "find_text '{find}' not found in '{}'",
+                        desc.permalink
+                    )));
+                }
+                if let Some(expected) = p.expected_replacements
+                    && expected != count
+                {
+                    return Err(EngineError::Invalid(format!(
+                        "expected {expected} replacements of '{find}' but found {count}"
+                    )));
+                }
+                source.replace(find, &p.content)
+            }
+            "replace_section" => {
+                let section = self.require_section(p)?;
+                replace_section(&source, section, &p.content, p.include_subsections)
+                    .map_err(section_err)?
+            }
+            "insert_before_section" => {
+                let section = self.require_section(p)?;
+                insert_before_section(&source, section, &p.content).map_err(section_err)?
+            }
+            "insert_after_section" => {
+                let section = self.require_section(p)?;
+                insert_after_section(&source, section, &p.content).map_err(section_err)?
+            }
+            other => {
+                return Err(EngineError::Invalid(format!(
+                    "unknown edit operation '{other}'; expected append, prepend, find_replace, replace_section, insert_before_section or insert_after_section"
+                )));
+            }
+        };
+
+        let edited = touch_timestamp(&edited, now_offset());
+        write_file(&abs, &edited)?;
+
+        let store = self.store.lock().await;
+        self.reindex_file(&store, desc.domain_id, &root, &desc.path)
+            .await?;
+
+        Ok(json!({
+            "domain": desc.domain,
+            "permalink": desc.permalink,
+            "path": desc.path,
+            "operation": p.operation,
+        }))
+    }
+
+    fn require_section<'a>(&self, p: &'a EditParams) -> Result<&'a str> {
+        p.section
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                EngineError::Invalid(format!("operation '{}' requires a section", p.operation))
+            })
+    }
+
+    // --- move ----------------------------------------------------------------
+
+    /// Move an engram to a new path or domain, rewriting inbound bare links on a
+    /// cross-domain move.
+    pub async fn move_engram(&self, p: &MoveParams) -> Result<Value> {
+        let (src, src_root) = self.resolve(&p.identifier, Some(&p.domain)).await?;
+        let dest_domain = p
+            .destination_domain
+            .clone()
+            .unwrap_or_else(|| p.domain.clone());
+        let dest_root = self.domain_root(&dest_domain)?;
+        let dest_rel = normalize_md(&p.destination);
+        if dest_rel.is_empty() {
+            return Err(EngineError::Invalid("destination path is empty".into()));
+        }
+        let cross = dest_domain != p.domain;
+
+        let src_abs = join_rel(&src_root, &src.path);
+        let dest_abs = join_rel(&dest_root, &dest_rel);
+        if dest_abs.exists() {
+            return Err(EngineError::Conflict(format!(
+                "destination '{dest_rel}' already exists in domain '{dest_domain}'"
+            )));
+        }
+
+        // Gather inbound refs before the move while `to_id` still points at src.
+        let inbound = if cross && p.update_links.unwrap_or(true) {
+            let store = self.store.lock().await;
+            store
+                .inbound_refs(src.id, src.domain_id, &src.permalink, &src.title)
+                .await?
+        } else {
+            Vec::new()
+        };
+
+        let content = std::fs::read(&src_abs).map_err(|source| EngineError::Io {
+            path: src_abs.display().to_string(),
+            source,
+        })?;
+        write_bytes(&dest_abs, &content)?;
+        std::fs::remove_file(&src_abs).map_err(|source| EngineError::Io {
+            path: src_abs.display().to_string(),
+            source,
+        })?;
+
+        {
+            let store = self.store.lock().await;
+            if cross {
+                store.delete_engram(src.domain_id, &src.path).await?;
+                let dest_domain_id = store
+                    .upsert_domain(&dest_domain, &dest_root.to_string_lossy())
+                    .await?;
+                self.reindex_file(&store, dest_domain_id, &dest_root, &dest_rel)
+                    .await?;
+            } else {
+                store
+                    .rename_engram(src.domain_id, &src.path, &dest_rel)
+                    .await?;
+            }
+        }
+
+        // Rewrite inbound bare links from other domains to the prefixed form.
+        let mut rewritten = 0usize;
+        for r in inbound {
+            if r.src_domain == dest_domain || r.to_target.contains(':') {
+                continue;
+            }
+            let Ok(linker_root) = self.domain_root(&r.src_domain) else {
+                continue;
+            };
+            let linker_abs = join_rel(&linker_root, &r.src_path);
+            let Ok(text) = std::fs::read_to_string(&linker_abs) else {
+                continue;
+            };
+            let needle = format!("[[{}]]", r.to_target);
+            if !text.contains(&needle) {
+                continue;
+            }
+            let replaced = text.replace(&needle, &format!("[[{dest_domain}:{}]]", r.to_target));
+            let replaced = touch_timestamp(&replaced, now_offset());
+            write_file(&linker_abs, &replaced)?;
+            let store = self.store.lock().await;
+            self.reindex_file(&store, r.src_domain_id, &linker_root, &r.src_path)
+                .await?;
+            rewritten += 1;
+        }
+
+        Ok(json!({
+            "from": { "domain": p.domain, "permalink": src.permalink, "path": src.path },
+            "to": { "domain": dest_domain, "path": dest_rel },
+            "cross_domain": cross,
+            "links_rewritten": rewritten,
+        }))
+    }
+
+    // --- delete --------------------------------------------------------------
+
+    /// Delete an engram file and its index rows.
+    pub async fn delete_engram(&self, p: &DeleteParams) -> Result<Value> {
+        let (desc, root) = self.resolve(&p.identifier, Some(&p.domain)).await?;
+        let abs = join_rel(&root, &desc.path);
+        std::fs::remove_file(&abs).map_err(|source| EngineError::Io {
+            path: abs.display().to_string(),
+            source,
+        })?;
+        let store = self.store.lock().await;
+        store.delete_engram(desc.domain_id, &desc.path).await?;
+        Ok(json!({
+            "domain": desc.domain,
+            "permalink": desc.permalink,
+            "path": desc.path,
+            "deleted": true,
+        }))
+    }
+
+    // --- search --------------------------------------------------------------
+
+    /// Search across domains, embedding the query when the mode needs it.
+    pub async fn search_engrams(&self, p: &SearchParams) -> Result<Value> {
+        let requested = parse_mode(p.search_type.as_deref())?;
+        let text = p.query.clone().filter(|s| !s.trim().is_empty());
+        let mut query = SearchQuery {
+            text: text.clone(),
+            domains: p.domains.clone().filter(|d| !d.is_empty()),
+            engram_type: p.engram_type.clone(),
+            status: p.status.clone(),
+            tags: p.tags.clone().filter(|t| !t.is_empty()),
+            after: p.after.clone(),
+            min_similarity: p.min_similarity,
+            limit: p.limit.unwrap_or(10).max(1),
+            page: p.page.unwrap_or(1).max(1),
+            ..SearchQuery::default()
+        };
+        if let Some(mf) = &p.metadata_filters {
+            query.metadata_filters =
+                parse_metadata_filters(mf).map_err(|e| EngineError::Invalid(e.to_string()))?;
+        }
+
+        let store = self.store.lock().await;
+        let effective = self
+            .effective_mode(&store, requested, text.is_some())
+            .await?;
+        query.mode = effective;
+        if matches!(effective, SearchMode::Semantic | SearchMode::Hybrid)
+            && let Some(provider) = self.provider()
+        {
+            let q = text.clone().unwrap_or_default();
+            let vecs = provider
+                .embed_queries(&[q])
+                .await
+                .map_err(|e| EngineError::Internal(e.to_string()))?;
+            query.query_embedding = vecs.into_iter().next();
+            query.active_model = Some(self.model_id.clone());
+        }
+
+        let page = store.search(&query).await?;
+        Ok(json!({
+            "mode": mode_str(effective),
+            "total": page.total,
+            "page": page.page,
+            "limit": page.limit,
+            "count": page.items.len(),
+            "hits": serde_json::to_value(&page.items).unwrap_or(Value::Null),
+        }))
+    }
+
+    async fn effective_mode(
+        &self,
+        store: &TursoStore,
+        requested: SearchMode,
+        has_text: bool,
+    ) -> Result<SearchMode> {
+        if !matches!(requested, SearchMode::Semantic | SearchMode::Hybrid) {
+            return Ok(requested);
+        }
+        if !has_text || self.provider().is_none() {
+            return Ok(SearchMode::Text);
+        }
+        let coverage = store.embedding_coverage().await?;
+        if coverage.has_active_embeddings(&self.model_id) {
+            Ok(requested)
+        } else {
+            Ok(SearchMode::Text)
+        }
+    }
+
+    // --- context -------------------------------------------------------------
+
+    /// Traverse the graph around a `crystalline://` anchor.
+    pub async fn build_context(&self, p: &ContextParams) -> Result<Value> {
+        let url = CrystallineUrl::parse(&p.anchor).ok_or_else(|| {
+            EngineError::Invalid(format!("anchor '{}' is not a crystalline:// URL", p.anchor))
+        })?;
+        let depth = p.depth.unwrap_or(1).clamp(1, 3);
+        let max_related = p.max_related.unwrap_or(10);
+        let domain_filter = p.domains.clone().filter(|d| !d.is_empty());
+
+        let store = self.store.lock().await;
+        let seeds: Vec<EngramDescriptor> = if url.glob {
+            store
+                .list_engrams(&url.domain, None, None)
+                .await?
+                .into_iter()
+                .filter(|d| url.matches(&d.domain, &d.permalink))
+                .collect()
+        } else {
+            match store.find_engram(&url.domain, &url.permalink).await? {
+                Some(d) => vec![d],
+                None => {
+                    return Err(EngineError::NotFound(format!(
+                        "no engram '{}' in domain '{}'",
+                        url.permalink, url.domain
+                    )));
+                }
+            }
+        };
+        if seeds.is_empty() {
+            return Err(EngineError::NotFound(format!(
+                "anchor '{}' matched no engrams",
+                p.anchor
+            )));
+        }
+        let seed_ids: HashSet<i64> = seeds.iter().map(|d| d.id.0).collect();
+        let ids: Vec<EngramId> = seeds.iter().map(|d| d.id).collect();
+        let slice = store.neighbors(&ids, depth).await?;
+
+        // Keep every seed, cap related nodes and apply the optional domain filter.
+        let mut kept: HashSet<i64> = HashSet::new();
+        let mut nodes = Vec::new();
+        let mut related = 0usize;
+        for node in &slice.nodes {
+            if let Some(filter) = &domain_filter
+                && !filter.contains(&node.domain)
+            {
+                continue;
+            }
+            let is_seed = seed_ids.contains(&node.id.0);
+            if !is_seed {
+                if related >= max_related {
+                    continue;
+                }
+                related += 1;
+            }
+            kept.insert(node.id.0);
+            nodes.push(json!({
+                "id": node.id.0,
+                "domain": node.domain,
+                "permalink": node.permalink,
+                "title": node.title,
+                "type": node.engram_type,
+                "seed": is_seed,
+            }));
+        }
+        let edges: Vec<Value> = slice
+            .edges
+            .iter()
+            .filter(|e| kept.contains(&e.from.0) && kept.contains(&e.to.0))
+            .map(|e| {
+                json!({
+                    "from": e.from.0,
+                    "to": e.to.0,
+                    "rel_type": e.rel_type,
+                    "kind": match e.kind {
+                        crystalline_index::EdgeKind::Relation => "relation",
+                        crystalline_index::EdgeKind::Link => "link",
+                    },
+                })
+            })
+            .collect();
+
+        Ok(json!({
+            "anchor": url.to_url(),
+            "depth": depth,
+            "timeframe": p.timeframe,
+            "nodes": nodes,
+            "edges": edges,
+        }))
+    }
+
+    // --- recent --------------------------------------------------------------
+
+    /// Recent engrams within a timeframe.
+    pub async fn recent_activity(&self, p: &RecentParams) -> Result<Value> {
+        let timeframe = p.timeframe.clone().unwrap_or_else(|| "7d".to_string());
+        let filter = RecentFilter {
+            domains: p.domains.clone().filter(|d| !d.is_empty()),
+            after: timeframe_cutoff(&timeframe),
+            engram_types: p.types.clone().filter(|t| !t.is_empty()),
+            limit: 50,
+        };
+        let store = self.store.lock().await;
+        let items = store.recent(&filter).await?;
+        Ok(json!({
+            "timeframe": timeframe,
+            "count": items.len(),
+            "engrams": serde_json::to_value(&items).unwrap_or(Value::Null),
+        }))
+    }
+
+    // --- list domains --------------------------------------------------------
+
+    /// List registered domains with counts and optional routing bullets.
+    pub async fn list_domains(&self, p: &ListDomainsParams) -> Result<Value> {
+        let store = self.store.lock().await;
+        let stats = store.domain_stats().await.unwrap_or_default();
+        drop(store);
+
+        let mut out = Vec::new();
+        for (name, entry) in &self.config.domains {
+            let root = config::expand_tilde(&entry.path.to_string_lossy());
+            let s = stats.iter().find(|d| &d.name == name);
+            let mut obj = json!({
+                "name": name,
+                "path": root.display().to_string(),
+                "engrams": s.map(|d| d.engrams),
+                "observations": s.map(|d| d.observations),
+                "relations": s.map(|d| d.relations),
+                "last_sync": s.and_then(|d| d.last_sync.clone()),
+            });
+            if p.include_routing {
+                obj["when_to_use"] = json!(routing_bullets(&root));
+            }
+            out.push(obj);
+        }
+        Ok(json!({ "domains": out }))
+    }
+
+    // --- browse --------------------------------------------------------------
+
+    /// Browse a domain's engrams under a folder path.
+    pub async fn browse_domain(&self, p: &BrowseParams) -> Result<Value> {
+        let _root = self.domain_root(&p.domain)?;
+        let raw = p.path.clone().unwrap_or_else(|| "/".to_string());
+        let prefix = raw.trim_start_matches("./").trim_matches('/').to_string();
+        let depth = p.depth.unwrap_or(1).max(1);
+        let matcher = match &p.glob {
+            Some(g) => Some(
+                globset::Glob::new(g)
+                    .map_err(|e| EngineError::Invalid(format!("invalid glob '{g}': {e}")))?
+                    .compile_matcher(),
+            ),
+            None => None,
+        };
+
+        let prefix_pat = if prefix.is_empty() {
+            None
+        } else {
+            Some(format!("{prefix}/"))
+        };
+        let store = self.store.lock().await;
+        let all = store
+            .list_engrams(&p.domain, prefix_pat.as_deref(), None)
+            .await?;
+        drop(store);
+
+        let mut entries = Vec::new();
+        let mut folders: HashSet<String> = HashSet::new();
+        for d in &all {
+            let rel: &str = if prefix.is_empty() {
+                d.path.as_str()
+            } else {
+                d.path
+                    .strip_prefix(&format!("{prefix}/"))
+                    .unwrap_or(&d.path)
+            };
+            if let Some(m) = &matcher
+                && !m.is_match(&d.path)
+            {
+                continue;
+            }
+            let segments: Vec<&str> = rel.split('/').collect();
+            if segments.len() > 1 {
+                folders.insert(segments[0].to_string());
+            }
+            if segments.len() <= depth {
+                entries.push(json!({
+                    "permalink": d.permalink,
+                    "title": d.title,
+                    "type": d.engram_type,
+                    "path": d.path,
+                }));
+            }
+        }
+        let mut folders: Vec<String> = folders.into_iter().collect();
+        folders.sort();
+
+        Ok(json!({
+            "domain": p.domain,
+            "path": raw,
+            "folders": folders,
+            "engrams": entries,
+        }))
+    }
+
+    // --- validate ------------------------------------------------------------
+
+    /// Validate a domain's engrams against its schema engrams.
+    pub async fn validate_engrams(&self, p: &ValidateParams) -> Result<Value> {
+        let root = self.domain_root(&p.domain)?;
+        let store = self.store.lock().await;
+        let schema_descs = store.list_engrams(&p.domain, None, Some("schema")).await?;
+        let targets = if let Some(id) = &p.identifier {
+            match store.find_engram(&p.domain, id).await? {
+                Some(d) => vec![d],
+                None => {
+                    return Err(EngineError::NotFound(format!(
+                        "no engram '{id}' in domain '{}'",
+                        p.domain
+                    )));
+                }
+            }
+        } else {
+            store
+                .list_engrams(&p.domain, None, p.engram_type.as_deref())
+                .await?
+        };
+        drop(store);
+
+        let mut schemas: Vec<Schema> = Vec::new();
+        for d in &schema_descs {
+            if let Some(engram) = read_engram_file(&root, &d.path)
+                && let Some(schema) = Schema::from_engram(&engram)
+            {
+                schemas.push(schema);
+            }
+        }
+
+        let mut issues = Vec::new();
+        let mut checked = 0usize;
+        for d in &targets {
+            let Some(engram) = read_engram_file(&root, &d.path) else {
+                continue;
+            };
+            checked += 1;
+            if let Some(schema) = schema::select_schema(&engram, &schemas) {
+                for issue in schema::validate(&engram, &schema) {
+                    issues.push(json!({
+                        "permalink": d.permalink,
+                        "path": d.path,
+                        "severity": issue.severity,
+                        "kind": issue.kind,
+                        "field": issue.field,
+                        "message": issue.message,
+                        "line": issue.line,
+                    }));
+                }
+            }
+        }
+
+        Ok(json!({
+            "domain": p.domain,
+            "checked": checked,
+            "schemas": schemas.len(),
+            "issue_count": issues.len(),
+            "issues": issues,
+        }))
+    }
+
+    // --- infer schema --------------------------------------------------------
+
+    /// Infer a Picoschema from a domain's engrams of a type.
+    pub async fn infer_schema(&self, p: &InferParams) -> Result<Value> {
+        let root = self.domain_root(&p.domain)?;
+        let store = self.store.lock().await;
+        let descs = store
+            .list_engrams(&p.domain, None, Some(&p.engram_type))
+            .await?;
+        drop(store);
+
+        let mut engrams = Vec::new();
+        for d in &descs {
+            if let Some(engram) = read_engram_file(&root, &d.path) {
+                engrams.push(engram);
+            }
+        }
+        let threshold = p.threshold.unwrap_or(0.25);
+        let schema = schema::infer(&engrams, threshold);
+        Ok(json!({
+            "domain": p.domain,
+            "type": p.engram_type,
+            "count": engrams.len(),
+            "threshold": threshold,
+            "schema": schema,
+        }))
+    }
+
+    // --- sync / reindex (ctl + CLI) ------------------------------------------
+
+    /// Sync one or all registered domains, returning per-domain reports.
+    pub async fn sync(&self, only: Option<&str>) -> Result<Value> {
+        let targets = self.sync_targets(only)?;
+        let store = self.store.lock().await;
+        let mut reports = Vec::new();
+        for (name, root) in &targets {
+            let report = sync_domain_with(&*store, name, root, &self.chunk_params)
+                .await
+                .map_err(|e| EngineError::Internal(format!("sync of '{name}' failed: {e}")))?;
+            reports.push(report);
+        }
+        Ok(json!({ "reports": serde_json::to_value(&reports).unwrap_or(Value::Null) }))
+    }
+
+    /// Reindex all domains. `full` wipes first.
+    pub async fn reindex(&self, full: bool) -> Result<Value> {
+        let targets = self.sync_targets(None)?;
+        let store = self.store.lock().await;
+        if full {
+            store.wipe().await?;
+        }
+        let mut reports = Vec::new();
+        for (name, root) in &targets {
+            let report = sync_domain_with(&*store, name, root, &self.chunk_params)
+                .await
+                .map_err(|e| EngineError::Internal(format!("reindex of '{name}' failed: {e}")))?;
+            reports.push(report);
+        }
+        Ok(json!({
+            "full": full,
+            "reports": serde_json::to_value(&reports).unwrap_or(Value::Null),
+        }))
+    }
+
+    fn sync_targets(&self, only: Option<&str>) -> Result<Vec<(String, PathBuf)>> {
+        match only {
+            Some(name) => {
+                let root = self.domain_root(name)?;
+                Ok(vec![(name.to_string(), root)])
+            }
+            None => Ok(self
+                .config
+                .domains
+                .keys()
+                .map(|name| {
+                    let root =
+                        config::expand_tilde(&self.config.domains[name].path.to_string_lossy());
+                    (name.clone(), root)
+                })
+                .collect()),
+        }
+    }
+
+    /// Diagnostics for ctl `status`: per-domain stats, embedding coverage and the
+    /// active full-text mode.
+    pub async fn status_report(&self) -> Result<Value> {
+        let store = self.store.lock().await;
+        let info = store.store_info().await?;
+        let stats = store.domain_stats().await?;
+        let coverage = store.embedding_coverage().await?;
+        drop(store);
+        let active_embedded = coverage.embedded_for(&self.model_id);
+        Ok(json!({
+            "fts_mode": info.fts_mode,
+            "schema_version": info.schema_version,
+            "db_path": info.db_path,
+            "db_size": info.db_size,
+            "domains": serde_json::to_value(&stats).unwrap_or(Value::Null),
+            "embeddings": {
+                "active_model": self.model_id,
+                "provider": self.provider().is_some(),
+                "embedded_chunks": active_embedded,
+                "total_chunks": coverage.total_chunks,
+                "hybrid_available": coverage.has_active_embeddings(&self.model_id),
+            },
+        }))
+    }
+
+    /// Embed outstanding chunks for the active model in bounded batches, locking
+    /// the store only to pull jobs and to store vectors so long embeds do not
+    /// block searches. Returns the number of chunks embedded.
+    pub async fn embed_pending(&self) -> Result<usize> {
+        let Some(provider) = self.provider() else {
+            return Ok(0);
+        };
+        let model = self.model_id.clone();
+        // One snapshot of outstanding chunks; the store lock is held only to pull
+        // jobs and to write vectors, never across the embed call.
+        let jobs = {
+            let store = self.store.lock().await;
+            store.chunks_needing_embedding(&model).await?
+        };
+        if jobs.is_empty() {
+            return Ok(0);
+        }
+        let mut embedded = 0usize;
+        for batch in jobs.chunks(EMBED_BATCH) {
+            let texts: Vec<String> = batch.iter().map(|j| j.text.clone()).collect();
+            let vectors = provider
+                .embed(&texts)
+                .await
+                .map_err(|e| EngineError::Internal(e.to_string()))?;
+            if vectors.len() != batch.len() {
+                return Err(EngineError::Internal(
+                    "embedding provider returned a mismatched vector count".into(),
+                ));
+            }
+            let rows: Vec<crystalline_index::EmbeddingRow> = batch
+                .iter()
+                .zip(vectors)
+                .map(|(job, embedding)| crystalline_index::EmbeddingRow {
+                    chunk_id: job.chunk_id,
+                    dims: embedding.len(),
+                    embedding,
+                })
+                .collect();
+            let store = self.store.lock().await;
+            store.store_embeddings(&rows, &model).await?;
+            embedded += batch.len();
+        }
+        Ok(embedded)
+    }
+}
+
+/// Build an engine that opens the store directly for a one-shot standalone CLI
+/// command. Builds the embedding provider only when the command may need it.
+pub async fn open_standalone(
+    config: GlobalConfig,
+    db: &Path,
+    want_embeddings: bool,
+) -> anyhow::Result<Engine> {
+    if let Some(parent) = db.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let store = TursoStore::open(db).await?;
+    let engine = Engine::new(Arc::new(Mutex::new(store)), config, None);
+    // Build the provider (which may download the model) only when the index
+    // already holds embeddings for the active model, so a text or filter search
+    // never triggers a surprise download. With no embeddings, search falls back
+    // to text without a provider anyway.
+    if want_embeddings {
+        let has_embeddings = {
+            let store = engine.store.lock().await;
+            store
+                .embedding_coverage()
+                .await
+                .map(|c| c.has_active_embeddings(&engine.model_id))
+                .unwrap_or(false)
+        };
+        if has_embeddings && let Some(provider) = build_provider(&engine.config).await {
+            engine.set_provider(provider);
+        }
+    }
+    Ok(engine)
+}
+
+/// Build the configured embedding provider, tolerating failure (the daemon logs
+/// and continues text-only). Returns `None` when no provider could be built.
+pub async fn build_provider(config: &GlobalConfig) -> Option<Arc<dyn EmbeddingProvider>> {
+    let ecfg =
+        config
+            .embeddings
+            .clone()
+            .unwrap_or_else(|| crystalline_core::config::EmbeddingsConfig {
+                provider: "local".to_string(),
+                model: crystalline_index::embed::DEFAULT_MODEL_ID.to_string(),
+                endpoint: None,
+                api_key_env: None,
+            });
+    match provider_from_config(&ecfg).await {
+        Ok(p) => Some(Arc::from(p)),
+        Err(e) => {
+            tracing::warn!("embedding provider unavailable, continuing text-only: {e}");
+            None
+        }
+    }
+}
+
+// --- free helpers ------------------------------------------------------------
+
+fn parse_mode(s: Option<&str>) -> Result<SearchMode> {
+    Ok(match s.unwrap_or("hybrid") {
+        "hybrid" => SearchMode::Hybrid,
+        "text" => SearchMode::Text,
+        "semantic" => SearchMode::Semantic,
+        "title" => SearchMode::Title,
+        "permalink" => SearchMode::Permalink,
+        other => {
+            return Err(EngineError::Invalid(format!(
+                "unknown search_type '{other}'; expected hybrid, text, semantic, title or permalink"
+            )));
+        }
+    })
+}
+
+fn mode_str(m: SearchMode) -> &'static str {
+    match m {
+        SearchMode::Hybrid => "hybrid",
+        SearchMode::Text => "text",
+        SearchMode::Semantic => "semantic",
+        SearchMode::Title => "title",
+        SearchMode::Permalink => "permalink",
+    }
+}
+
+fn section_err(e: crystalline_core::emit::EditError) -> EngineError {
+    match e {
+        crystalline_core::emit::EditError::SectionNotFound { path } => {
+            EngineError::NotFound(format!("no section found for heading path: {path}"))
+        }
+    }
+}
+
+fn routing_bullets(root: &Path) -> Vec<String> {
+    let manifest = root.join("MANIFEST.md");
+    let Ok(source) = std::fs::read_to_string(&manifest) else {
+        return Vec::new();
+    };
+    let Ok(engram) = parse_engram(&source) else {
+        return Vec::new();
+    };
+    Manifest::from_engram(&engram, &source)
+        .routing_bullets()
+        .to_vec()
+}
+
+fn read_engram_file(root: &Path, rel: &str) -> Option<Engram> {
+    let abs = join_rel(root, rel);
+    let source = std::fs::read_to_string(abs).ok()?;
+    parse_engram(&source).ok()
+}
+
+/// Join a forward-slashed domain-relative path onto a root, per-segment so it is
+/// correct on every platform.
+fn join_rel(root: &Path, rel: &str) -> PathBuf {
+    let mut p = root.to_path_buf();
+    for seg in rel.split('/').filter(|s| !s.is_empty()) {
+        p.push(seg);
+    }
+    p
+}
+
+/// Normalize a destination into a forward-slashed `.md` path.
+fn normalize_md(dest: &str) -> String {
+    let trimmed = dest.trim_start_matches("./").trim_matches('/');
+    let joined = trimmed
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("/");
+    if joined.is_empty() {
+        String::new()
+    } else if joined.to_lowercase().ends_with(".md") {
+        joined
+    } else {
+        format!("{joined}.md")
+    }
+}
+
+fn write_file(abs: &Path, contents: &str) -> Result<()> {
+    write_bytes(abs, contents.as_bytes())
+}
+
+fn write_bytes(abs: &Path, contents: &[u8]) -> Result<()> {
+    if let Some(parent) = abs.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| EngineError::Io {
+            path: parent.display().to_string(),
+            source,
+        })?;
+    }
+    // Write to a sibling temp then rename so the watcher never sees a partial file.
+    let tmp = abs.with_extension(format!("md.tmp.{}", std::process::id()));
+    std::fs::write(&tmp, contents).map_err(|source| EngineError::Io {
+        path: tmp.display().to_string(),
+        source,
+    })?;
+    std::fs::rename(&tmp, abs).map_err(|source| EngineError::Io {
+        path: abs.display().to_string(),
+        source,
+    })?;
+    Ok(())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    let mut s = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+fn mtime_secs(meta: &std::fs::Metadata) -> i64 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn now_offset() -> DateTime<FixedOffset> {
+    chrono::Utc::now().fixed_offset()
+}
+
+/// The ISO date `spec` before today, for `timeframe` windows like `7d`, `24h`,
+/// `2w`, `3m`, `1y`. Falls back to seven days on a parse failure.
+fn timeframe_cutoff(spec: &str) -> Option<String> {
+    let spec = spec.trim();
+    let (num, unit) = spec.split_at(spec.find(|c: char| c.is_alphabetic()).unwrap_or(spec.len()));
+    let n: i64 = num.trim().parse().unwrap_or(7);
+    let days = match unit.trim() {
+        "h" => (n + 23) / 24,
+        "d" | "" => n,
+        "w" => n * 7,
+        "m" => n * 30,
+        "y" => n * 365,
+        _ => 7,
+    };
+    let cutoff = chrono::Utc::now().date_naive() - Duration::days(days.max(0));
+    Some(cutoff.format("%Y-%m-%d").to_string())
+}
+
+/// Build engram markdown with auto-filled frontmatter via the core emitter.
+/// `valid_from` and `valid_to` are never written.
+#[allow(clippy::too_many_arguments)]
+fn build_markdown(
+    engram_type: &str,
+    title: &str,
+    permalink: &str,
+    tags: &[String],
+    status: &str,
+    recorded_at: &str,
+    timestamp: &str,
+    metadata: Option<&Value>,
+    body: &str,
+) -> Result<String> {
+    let mut fm = Frontmatter {
+        engram_type: engram_type.to_string(),
+        title: title.to_string(),
+        permalink: Some(permalink.to_string()),
+        tags: tags.to_vec(),
+        status: Some(status.to_string()),
+        ..Frontmatter::default()
+    };
+    fm.recorded_at = chrono::NaiveDate::parse_from_str(recorded_at, "%Y-%m-%d").ok();
+    fm.timestamp = DateTime::parse_from_rfc3339(timestamp).ok();
+    if let Some(Value::Object(map)) = metadata {
+        for (k, v) in map {
+            if is_reserved_key(k) {
+                continue;
+            }
+            fm.extra.insert(k.clone(), json_to_yaml(v));
+        }
+    } else if let Some(other) = metadata
+        && !other.is_null()
+    {
+        return Err(EngineError::Invalid("metadata must be an object".into()));
+    }
+
+    let engram = Engram {
+        frontmatter: fm,
+        body: format!("\n{}\n", body.trim_matches('\n')),
+        observations: Vec::new(),
+        relations: Vec::new(),
+        links: Vec::new(),
+        headings: Vec::new(),
+    };
+    Ok(crystalline_core::emit_engram(&engram))
+}
+
+/// Frontmatter keys the write tool owns; a caller cannot override them through
+/// `metadata`.
+fn is_reserved_key(key: &str) -> bool {
+    matches!(
+        key,
+        "type" | "title" | "permalink" | "tags" | "status" | "recorded_at" | "timestamp"
+    )
+}
+
+fn json_to_yaml(v: &Value) -> YamlValue {
+    match v {
+        Value::Null => YamlValue::Null,
+        Value::Bool(b) => YamlValue::Bool(*b),
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                YamlValue::Int(i)
+            } else {
+                YamlValue::Float(n.as_f64().unwrap_or(0.0))
+            }
+        }
+        Value::String(s) => YamlValue::String(s.clone()),
+        Value::Array(a) => YamlValue::Sequence(a.iter().map(json_to_yaml).collect()),
+        Value::Object(o) => YamlValue::Mapping(
+            o.iter()
+                .map(|(k, v)| (k.clone(), json_to_yaml(v)))
+                .collect(),
+        ),
+    }
+}

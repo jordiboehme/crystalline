@@ -34,3 +34,4 @@ predicates = "3.1.4"
 tempfile = { workspace = true }
 serde_json = { workspace = true }
 insta = { workspace = true }
+reqwest = { workspace = true, features = ["blocking"] }

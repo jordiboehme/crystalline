@@ -11,5 +11,43 @@ description = "Single-instance daemon and MCP server for Crystalline: lock and s
 name = "crystalline_service"
 path = "src/lib.rs"
 
+[features]
+# Forwarded to crystalline-index so a `--no-default-features` workspace build
+# drops candle while the daemon still compiles and serves text search.
+default = ["local-embeddings"]
+local-embeddings = ["crystalline-index/local-embeddings"]
+
 [dependencies]
+crystalline-core = { workspace = true }
 crystalline-index = { workspace = true }
+tokio = { workspace = true }
+rmcp = { workspace = true, features = [
+    "server",
+    "client",
+    "macros",
+    "transport-async-rw",
+    "transport-io",
+    "transport-streamable-http-server",
+    "transport-streamable-http-server-session",
+] }
+interprocess = { workspace = true, features = ["tokio"] }
+fs4 = { workspace = true }
+notify = { workspace = true }
+axum = { workspace = true }
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+sha2 = { workspace = true }
+globset = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+futures = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
