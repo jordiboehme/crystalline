@@ -28,4 +28,4 @@ The resulting binary is at `target/release/crystalline`.
 
 ## License
 
-MIT
+GNU Affero General Public License v3.0 - see [LICENSE](LICENSE)
