@@ -12,3 +12,13 @@ name = "crystalline_core"
 path = "src/lib.rs"
 
 [dependencies]
+serde = { workspace = true }
+serde_yaml_ng = { workspace = true }
+indexmap = { workspace = true, features = ["serde"] }
+chrono = { workspace = true, features = ["serde"] }
+thiserror = { workspace = true }
+etcetera = { workspace = true }
+
+[dev-dependencies]
+insta = { workspace = true }
+tempfile = { workspace = true }

@@ -1,0 +1,55 @@
+---
+source: crates/core/tests/structure.rs
+expression: e
+---
+frontmatter:
+  engram_type: guide
+  title: Seed Starting Notes
+  permalink: gardening/seed-starting-notes
+  tags:
+    - gardening
+    - seeds
+  status: current
+  recorded_at: 2026-03-12
+  valid_from: ~
+  valid_to: ~
+  timestamp: ~
+  description: ~
+  resource: ~
+  source_date: ~
+  last_verified: ~
+  review_after: ~
+  temporal_confidence: ~
+  schema_def: ~
+  extra: {}
+body: "\n# Seed Starting Notes\n\n- [technique] Pre-soak large seeds overnight before sowing #seeds (speeds germination)\n- [gotcha] Bottom heat dries the surface quickly (check twice daily)\n- [fact] Most warm-season crops germinate near twenty degrees Celsius #seeds\n- [requirement] Label every tray at sowing time #organization\n"
+observations:
+  - line: 14
+    category: technique
+    content: Pre-soak large seeds overnight before sowing
+    tags:
+      - seeds
+    context: speeds germination
+  - line: 15
+    category: gotcha
+    content: Bottom heat dries the surface quickly
+    tags: []
+    context: check twice daily
+  - line: 16
+    category: fact
+    content: Most warm-season crops germinate near twenty degrees Celsius
+    tags:
+      - seeds
+    context: ~
+  - line: 17
+    category: requirement
+    content: Label every tray at sowing time
+    tags:
+      - organization
+    context: ~
+relations: []
+links: []
+headings:
+  - line: 12
+    level: 1
+    text: Seed Starting Notes

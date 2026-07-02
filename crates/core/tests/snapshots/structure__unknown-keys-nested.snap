@@ -1,0 +1,58 @@
+---
+source: crates/core/tests/structure.rs
+expression: e
+---
+frontmatter:
+  engram_type: reference
+  title: Messier Catalogue Notes
+  permalink: astronomy/messier-notes
+  tags:
+    - astronomy
+    - catalogue
+  status: current
+  recorded_at: 2026-02-10
+  valid_from: ~
+  valid_to: ~
+  timestamp: ~
+  description: ~
+  resource: ~
+  source_date: ~
+  last_verified: ~
+  review_after: ~
+  temporal_confidence: ~
+  schema_def: ~
+  extra:
+    custom_source:
+      catalogue: Messier
+      edition: 3
+      editors:
+        - A. Astronomer
+        - B. Stargazer
+    related_ids:
+      - M31
+      - M45
+    priority: 2
+    verified: true
+body: "\n# Messier Catalogue Notes\n\nWorking notes on selected entries from a deep-sky catalogue.\n\n## Observations\n\n- [fact] M31 is the closest large spiral galaxy to our own #galaxies\n- [fact] M45 is an open star cluster visible to the unaided eye #clusters\n"
+observations:
+  - line: 29
+    category: fact
+    content: M31 is the closest large spiral galaxy to our own
+    tags:
+      - galaxies
+    context: ~
+  - line: 30
+    category: fact
+    content: M45 is an open star cluster visible to the unaided eye
+    tags:
+      - clusters
+    context: ~
+relations: []
+links: []
+headings:
+  - line: 23
+    level: 1
+    text: Messier Catalogue Notes
+  - line: 27
+    level: 2
+    text: Observations

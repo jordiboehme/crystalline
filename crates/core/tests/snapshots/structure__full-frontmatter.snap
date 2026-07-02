@@ -1,0 +1,56 @@
+---
+source: crates/core/tests/structure.rs
+expression: e
+---
+frontmatter:
+  engram_type: guide
+  title: Watering Schedules for Tomato Beds
+  permalink: gardening/watering-schedules
+  tags:
+    - gardening
+    - tomatoes
+    - watering
+  status: current
+  recorded_at: 2026-05-01
+  valid_from: 2026-05-01
+  valid_to: 2026-09-30
+  timestamp: "2026-05-01T09:15:00Z"
+  description: How often to water raised tomato beds through the season.
+  resource: "https://example.org/tomato-guide"
+  source_date: 2026-04-15
+  last_verified: 2026-05-01
+  review_after: 2026-08-01
+  temporal_confidence: explicit
+  schema_def: ~
+  extra: {}
+body: "\n# Watering Schedules for Tomato Beds\n\nRaised beds drain faster than open ground, so tomatoes need a steady rhythm\nrather than occasional soaking.\n\n## Observations\n\n- [requirement] Water deeply once per week during the growing season #watering\n- [gotcha] Shallow daily watering trains roots to stay near the surface #watering\n\n## Relations\n\n- relates_to [[Composting Basics]]\n"
+observations:
+  - line: 29
+    category: requirement
+    content: Water deeply once per week during the growing season
+    tags:
+      - watering
+    context: ~
+  - line: 30
+    category: gotcha
+    content: Shallow daily watering trains roots to stay near the surface
+    tags:
+      - watering
+    context: ~
+relations:
+  - line: 34
+    rel_type: relates_to
+    target:
+      domain: ~
+      target: Composting Basics
+links: []
+headings:
+  - line: 22
+    level: 1
+    text: Watering Schedules for Tomato Beds
+  - line: 27
+    level: 2
+    text: Observations
+  - line: 32
+    level: 2
+    text: Relations

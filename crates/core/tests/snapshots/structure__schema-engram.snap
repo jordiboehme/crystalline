@@ -1,0 +1,62 @@
+---
+source: crates/core/tests/structure.rs
+expression: e
+---
+frontmatter:
+  engram_type: schema
+  title: Task Schema
+  permalink: product/schemas/task-schema
+  tags:
+    - schema
+    - product
+  status: current
+  recorded_at: 2026-04-01
+  valid_from: 2026-04-01
+  valid_to: ~
+  timestamp: ~
+  description: ~
+  resource: ~
+  source_date: ~
+  last_verified: ~
+  review_after: ~
+  temporal_confidence: ~
+  schema_def:
+    entity: task
+    version: 1
+    schema:
+      summary: "string, one line summary"
+      priority(enum):
+        - low
+        - medium
+        - high
+      estimate?: integer
+      requirement?(array): string
+      blocked_by?(array): Task
+      part_of?: Note
+    settings:
+      validation: warn
+      frontmatter:
+        status(enum):
+          - current
+          - draft
+          - deprecated
+        owner: string
+        reviewers?(array): string
+  extra: {}
+body: "\n# Task Schema\n\nSchema for task engrams in the product domain.\n\n## Observations\n\n- [requirement] Task engrams carry a one line summary and a priority #schema\n"
+observations:
+  - line: 40
+    category: requirement
+    content: Task engrams carry a one line summary and a priority
+    tags:
+      - schema
+    context: ~
+relations: []
+links: []
+headings:
+  - line: 34
+    level: 1
+    text: Task Schema
+  - line: 38
+    level: 2
+    text: Observations
