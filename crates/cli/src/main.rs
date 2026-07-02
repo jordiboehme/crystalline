@@ -13,6 +13,8 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use crystalline_core::config;
 use crystalline_core::verify::{self, VerifyOptions};
 
+mod cmd;
+
 /// Local-first knowledge management for humans and AI agents.
 #[derive(Parser, Debug)]
 #[command(name = "crystalline", version, about, long_about = None)]
@@ -21,6 +23,11 @@ struct Cli {
     /// for `--format json` on subcommands that support it.
     #[arg(long, global = true)]
     json: bool,
+
+    /// Override the index database path. Defaults to the state-directory
+    /// `index.db`. Essential for tests and for pointing at a scratch index.
+    #[arg(long, global = true)]
+    db: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -56,6 +63,71 @@ enum Command {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// Manage the domains registered in the global config.
+    Domain {
+        #[command(subcommand)]
+        command: DomainCommand,
+    },
+    /// Sync one or all registered domains into the index.
+    Sync {
+        /// Sync only this domain instead of every registered domain.
+        #[arg(long)]
+        domain: Option<String>,
+        /// Load the global config from this file instead of the default path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Rebuild the index. `--full` wipes it first, the corruption-recovery path.
+    Reindex {
+        /// Wipe the index (rebuilding the file if it will not open) then resync.
+        #[arg(long)]
+        full: bool,
+        /// Load the global config from this file instead of the default path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Show per-domain counts and index diagnostics.
+    Status {
+        /// Load the global config from this file instead of the default path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum DomainCommand {
+    /// Scaffold a MANIFEST.md at a domain root. Does not touch the config.
+    Init {
+        /// The domain root directory. Created if it does not exist.
+        path: PathBuf,
+        /// The domain name. Defaults to the directory name.
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Register a domain in the global config. Refuses without a MANIFEST.md.
+    Add {
+        /// The domain name used everywhere it is referenced.
+        name: String,
+        /// The domain root directory.
+        path: PathBuf,
+        /// Load the global config from this file instead of the default path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// List registered domains, with engram counts when the index is present.
+    List {
+        /// Load the global config from this file instead of the default path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Remove a domain from the global config. Leaves its files untouched.
+    Remove {
+        /// The domain name to remove.
+        name: String,
+        /// Load the global config from this file instead of the default path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -88,6 +160,46 @@ fn main() -> anyhow::Result<()> {
             config,
         }) => run_verify(paths, strict, format, config, cli.json),
         Some(Command::Prompt { workspace, config }) => run_prompt(workspace, config, cli.json),
+        Some(Command::Domain { command }) => run_domain(command, cli.db, cli.json),
+        Some(Command::Sync { domain, config }) => on_runtime(cmd::sync(
+            domain.as_deref(),
+            config.as_deref(),
+            cli.db.as_deref(),
+            cli.json,
+        )),
+        Some(Command::Reindex { full, config }) => on_runtime(cmd::reindex(
+            full,
+            config.as_deref(),
+            cli.db.as_deref(),
+            cli.json,
+        )),
+        Some(Command::Status { config }) => {
+            on_runtime(cmd::status(config.as_deref(), cli.db.as_deref(), cli.json))
+        }
+    }
+}
+
+/// Run an async command body on a fresh multi-threaded Tokio runtime. Kept off
+/// the static `verify` and `prompt` paths so they never start a runtime.
+fn on_runtime<F: std::future::Future<Output = anyhow::Result<()>>>(fut: F) -> anyhow::Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(fut)
+}
+
+fn run_domain(command: DomainCommand, db: Option<PathBuf>, json: bool) -> anyhow::Result<()> {
+    match command {
+        DomainCommand::Init { path, name } => cmd::domain_init(&path, name.as_deref(), json),
+        DomainCommand::Add { name, path, config } => {
+            cmd::domain_add(&name, &path, config.as_deref(), json)
+        }
+        DomainCommand::List { config } => {
+            on_runtime(cmd::domain_list(config.as_deref(), db.as_deref(), json))
+        }
+        DomainCommand::Remove { name, config } => {
+            cmd::domain_remove(&name, config.as_deref(), json)
+        }
     }
 }
 
