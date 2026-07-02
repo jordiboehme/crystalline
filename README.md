@@ -18,7 +18,24 @@ Crystalline is a single Rust binary: a CLI for people, an MCP server for agents,
 
 ## Install
 
-Download a prebuilt binary from the [latest release](https://github.com/jordiboehme/crystalline/releases/latest). Four targets are published:
+macOS, via [Homebrew](https://brew.sh):
+
+```sh
+brew install jordiboehme/tap/crystalline
+```
+
+Linux, via `.deb` (Debian, Ubuntu and derivatives, amd64 or arm64):
+
+```sh
+version=$(curl -fsSL https://api.github.com/repos/jordiboehme/crystalline/releases/latest | grep -m1 '"tag_name"' | cut -d '"' -f4)
+arch=amd64   # or arm64
+curl -fsSLO "https://github.com/jordiboehme/crystalline/releases/download/${version}/crystalline_${version#v}_${arch}.deb"
+sudo dpkg -i "crystalline_${version#v}_${arch}.deb"
+# or: sudo apt install "./crystalline_${version#v}_${arch}.deb"
+crystalline --version
+```
+
+Anywhere else, download a prebuilt binary from the [latest release](https://github.com/jordiboehme/crystalline/releases/latest). Four targets are published:
 
 | Platform | Target |
 |---|---|
@@ -102,6 +119,33 @@ Crystalline runs as an MCP server over stdio. Any MCP-capable harness works; add
 ```
 
 The first agent to connect starts a background daemon that loads the embedding model once and watches every registered domain for changes; every later connection - other agents, other terminals, other harnesses - attaches to that same daemon instead of starting a second copy. One shared instance, one loaded model, one consistent view of the index, no matter how many agents are talking to it at once.
+
+## Run in a container
+
+Crystalline publishes a multi-arch OCI image (`linux/amd64` and `linux/arm64`) to GHCR on every release, for Linux server deployments. macOS and Windows have no OCI container runtime worth targeting here, so those platforms run the native binary from Install above; the container covers the Linux server case.
+
+```sh
+docker pull ghcr.io/jordiboehme/crystalline:latest
+
+docker run -d \
+  --name crystalline \
+  -p 7411:7411 \
+  -v "$(pwd)/knowledge:/knowledge" \
+  -v crystalline-data:/data \
+  ghcr.io/jordiboehme/crystalline:latest
+```
+
+What persists where:
+
+- `./knowledge` (bind mount) holds the engrams themselves, one subfolder per domain - this is the only data that matters, and it is exactly the same markdown-plus-frontmatter files the native binary reads.
+- `crystalline-data` (named volume, mounted at `/data`) holds the rebuildable search index and the embedding model cache. Losing it costs a `crystalline reindex --full` and a model re-download, never data.
+
+Two sample Compose files ship under [`examples/docker/`](examples/docker/):
+
+- **`compose.yaml`** - the single-container setup above, plus a commented one-shot `domain init` / `domain add` / `sync` recipe for bootstrapping a fresh domain.
+- **`compose.git-sync.yaml`** - a scale-deployment variant that adds a sidecar keeping the knowledge folder synced from a git remote every 60 seconds, mounted read-only into Crystalline. This is the pattern for a team that manages engrams as a reviewed git repository rather than writing into the container directly.
+
+Agents connect to the containerized daemon over its HTTP MCP endpoint, `http://localhost:7411` from the host (the image's default command is `serve --http 0.0.0.0:7411`, since a container has to bind every interface to be reachable at all - binding `127.0.0.1` inside a container is only reachable from inside that same container). The stdio `crystalline mcp` transport from Connect your agent above is for local, non-containerized processes; point a harness at the HTTP endpoint instead when Crystalline runs in a container.
 
 ## Session onboarding
 
@@ -200,7 +244,7 @@ Exactly one process ever holds the database open: the first `crystalline mcp` or
 
 - A PostgreSQL `Store` implementation for shared, multi-user deployments (the storage layer is already trait-based for this).
 - Versioning and collaboration on a knowledge base through git.
-- Authentication for the optional HTTP transport, which is localhost-only today.
+- Authentication for the optional HTTP transport, which is unauthenticated today regardless of bind address. That is fine on the `127.0.0.1` default; the container image binds `0.0.0.0` so agents on the host can reach it, so treat the network boundary around the container (a private network, a reverse proxy, firewall rules) as the access control until this ships.
 
 ## License
 

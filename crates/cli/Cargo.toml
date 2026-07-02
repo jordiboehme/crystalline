@@ -11,6 +11,27 @@ description = "Local-first knowledge management for humans and AI agents."
 name = "crystalline"
 path = "src/main.rs"
 
+[package.metadata.deb]
+maintainer = "Jordi Boehme <jordi@boehme-lopez.de>"
+copyright = "2026, Jordi Boehme <jordi@boehme-lopez.de>"
+license-file = ["../../LICENSE", "4"]
+section = "utils"
+priority = "optional"
+# Static musl binary: no shared-library dependencies to auto-detect, so this
+# stays empty rather than the "$auto" default.
+depends = ""
+extended-description = """
+Crystalline gives an AI agent the capability to learn and evolve instead of \
+starting from zero in every session. An agent is onboarded via a generated \
+routing prompt, taught information through curated domains and stores its \
+learnings and experiences as engrams while it works - becoming a useful and \
+productive peer over time."""
+assets = [
+    ["target/release/crystalline", "usr/bin/", "755"],
+    ["../../README.md", "usr/share/doc/crystalline/README.md", "644"],
+    ["../../LICENSE", "usr/share/doc/crystalline/LICENSE", "644"],
+]
+
 [features]
 # Forwarded to crystalline-index so `--no-default-features` on the workspace
 # drops candle from the binary while everything still compiles and text search,

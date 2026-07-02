@@ -1,0 +1,38 @@
+# Crystalline, single container.
+#
+# Engrams are the only data that matters and they live in the bind-mounted
+# `./knowledge` folder on the host, one subfolder per domain. Everything
+# under the named `crystalline-data` volume (the search index, the embedding
+# model cache, config) is derived or cached - the image's XDG_STATE_HOME,
+# XDG_CACHE_HOME and XDG_CONFIG_HOME all point under /data (see Dockerfile),
+# so a single volume covers all of it. Losing it costs a `crystalline
+# reindex --full` and a model re-download, never data.
+#
+# Agents connect over the HTTP MCP endpoint at http://localhost:7411 from
+# the host (or http://crystalline:7411 from another container on this
+# compose network) - stdio `crystalline mcp` is for local, non-containerized
+# processes.
+#
+# Start it:
+#   docker compose -f examples/docker/compose.yaml up -d
+#
+# One-shot initialization (run once, before or after the service is up - it
+# is a separate short-lived container each time, not a shell session):
+#
+#   docker compose -f examples/docker/compose.yaml run --rm crystalline domain init /knowledge/team --name team
+#   docker compose -f examples/docker/compose.yaml run --rm crystalline domain add team /knowledge/team
+#   docker compose -f examples/docker/compose.yaml run --rm crystalline sync
+
+services:
+  crystalline:
+    image: ghcr.io/jordiboehme/crystalline:latest
+    command: ["serve", "--http", "0.0.0.0:7411"]
+    ports:
+      - "7411:7411"
+    volumes:
+      - ./knowledge:/knowledge
+      - crystalline-data:/data
+    restart: unless-stopped
+
+volumes:
+  crystalline-data:

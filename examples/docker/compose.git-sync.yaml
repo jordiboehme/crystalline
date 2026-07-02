@@ -1,0 +1,58 @@
+# Crystalline with a git-sync sidecar - the scale-deployment pattern where a
+# team manages engrams as a git repository (review via pull request, history,
+# multiple contributors) instead of writing directly into the container.
+#
+# The sidecar clones the repo on first start and pulls it every 60 seconds
+# into the shared `knowledge` volume; `crystalline` mounts that same volume
+# read-only, so it only ever observes what git has already accepted. Set
+# GIT_REPO_URL (and GIT_BRANCH, if not `main`) to your knowledge repository -
+# it must already contain the registered domains with their MANIFEST.md
+# files, since nothing in this deployment writes to it.
+#
+# This trades the ability to write engrams from inside the deployment (an
+# agent's write_engram calls would fail against a read-only mount) for a
+# git-reviewed, git-audited knowledge base. If a deployment needs both git
+# sync and in-container writes, drop the `:ro` suffix below and push local
+# changes back to the remote out of band - understand that the next sync
+# will pull over anything not yet pushed.
+#
+# Start it:
+#   docker compose -f examples/docker/compose.git-sync.yaml up -d
+
+services:
+  git-sync:
+    image: alpine/git:latest
+    environment:
+      GIT_REPO_URL: "https://github.com/your-org/your-knowledge-repo.git"
+      GIT_BRANCH: "main"
+    volumes:
+      - knowledge:/knowledge
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        while true; do
+          if [ -d /knowledge/.git ]; then
+            git -C /knowledge pull --ff-only origin "$GIT_BRANCH"
+          else
+            git clone --branch "$GIT_BRANCH" --single-branch "$GIT_REPO_URL" /knowledge
+          fi
+          sleep 60
+        done
+    restart: unless-stopped
+
+  crystalline:
+    image: ghcr.io/jordiboehme/crystalline:latest
+    command: ["serve", "--http", "0.0.0.0:7411"]
+    depends_on:
+      - git-sync
+    ports:
+      - "7411:7411"
+    volumes:
+      - knowledge:/knowledge:ro
+      - crystalline-data:/data
+    restart: unless-stopped
+
+volumes:
+  knowledge:
+  crystalline-data:

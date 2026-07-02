@@ -5,7 +5,8 @@ on:
     tags:
       - 'v*'
   # Manual dry run: exercises the full build-and-package matrix without
-  # publishing a GitHub Release (the publish job only runs for a tag push).
+  # publishing a GitHub Release (the publish, images and homebrew jobs only
+  # run for a tag push).
   workflow_dispatch: {}
 
 env:
@@ -26,16 +27,18 @@ jobs:
             os: ubuntu-latest
             archive_ext: tar.gz
             musl: true
+            deb_arch: amd64
           - target: aarch64-unknown-linux-musl
             os: ubuntu-24.04-arm
             archive_ext: tar.gz
             musl: true
+            deb_arch: arm64
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             archive_ext: zip
             rustflags: '-C target-feature=+crt-static'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Install Rust toolchain
         run: rustup show
@@ -49,7 +52,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y musl-tools
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: release-${{ matrix.target }}
 
@@ -118,10 +121,39 @@ jobs:
         run: Compress-Archive -Path "${{ steps.stage.outputs.name }}/*" -DestinationPath "${{ steps.stage.outputs.name }}.zip"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: crystalline-${{ matrix.target }}
           path: dist/${{ steps.stage.outputs.name }}.${{ matrix.archive_ext }}
+          if-no-files-found: error
+
+      # .deb packages: only the two musl legs produce one, since a static
+      # musl binary needs no runtime shared-library dependencies (Depends is
+      # left empty in crates/cli/Cargo.toml's [package.metadata.deb] rather
+      # than the "$auto" default that would try to resolve them via ldd).
+      - name: Install cargo-deb
+        if: matrix.musl
+        run: cargo install cargo-deb --version 3.7.0 --locked
+
+      - name: Build .deb package
+        if: matrix.musl
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          deb_version="${version#v}"
+          cargo deb -p crystalline \
+            --target ${{ matrix.target }} \
+            --no-build \
+            --deb-version "$deb_version" \
+            --output "dist/crystalline_${deb_version}_${{ matrix.deb_arch }}.deb"
+
+      - name: Upload .deb artifact
+        if: matrix.musl
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: crystalline-deb-${{ matrix.deb_arch }}
+          path: dist/crystalline_*.deb
           if-no-files-found: error
 
   publish:
@@ -134,10 +166,10 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Download all archives
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: downloads
 
@@ -145,7 +177,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p release
-          find downloads -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec cp {} release/ \;
+          find downloads -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.deb' \) -exec cp {} release/ \;
           cd release
           sha256sum * > SHA256SUMS
           ls -la
@@ -158,3 +190,154 @@ jobs:
           gh release create "${{ github.ref_name }}" release/* \
             --title "${{ github.ref_name }}" \
             --generate-notes
+
+  images:
+    name: publish container images
+    needs: build
+    runs-on: ubuntu-latest
+    # Same tag guard as publish: workflow_dispatch is a build-matrix dry run
+    # only, it never pushes an image.
+    if: github.ref_type == 'tag'
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Download x86_64 musl artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: crystalline-x86_64-unknown-linux-musl
+          path: downloads/amd64
+
+      - name: Download aarch64 musl artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: crystalline-aarch64-unknown-linux-musl
+          path: downloads/arm64
+
+      - name: Stage per-arch binaries
+        run: |
+          set -euo pipefail
+          mkdir -p dist/linux-amd64 dist/linux-arm64
+          tar xzf downloads/amd64/*.tar.gz -C downloads/amd64
+          tar xzf downloads/arm64/*.tar.gz -C downloads/arm64
+          amd64_bin=$(find downloads/amd64 -type f -name crystalline | head -n1)
+          arm64_bin=$(find downloads/arm64 -type f -name crystalline | head -n1)
+          cp "$amd64_bin" dist/linux-amd64/crystalline
+          cp "$arm64_bin" dist/linux-arm64/crystalline
+          chmod +x dist/linux-amd64/crystalline dist/linux-arm64/crystalline
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c99871dec2022cc055c062a10cc1a1310835ceb4 # v4.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+
+      - name: Set up buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Generate image metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/jordiboehme/crystalline
+          tags: |
+            type=semver,pattern={{version}}
+            type=raw,value=latest
+          labels: |
+            org.opencontainers.image.title=Crystalline
+            org.opencontainers.image.description=Local-first knowledge management for humans and AI agents.
+            org.opencontainers.image.licenses=AGPL-3.0-or-later
+
+      - name: Build and push
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  homebrew:
+    name: update homebrew tap
+    needs: publish
+    runs-on: ubuntu-latest
+    if: github.ref_type == 'tag'
+    permissions:
+      contents: read
+    steps:
+      - name: Download release checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/release
+          gh release download "${{ github.ref_name }}" \
+            --repo "${{ github.repository }}" \
+            --pattern SHA256SUMS --dir /tmp/release
+
+      - name: Regenerate and push the formula
+        env:
+          TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ github.ref_name }}"
+          VERSION="${TAG#v}"
+          sums="/tmp/release/SHA256SUMS"
+
+          sha_macos_arm=$(grep "crystalline-${TAG}-aarch64-apple-darwin.tar.gz" "$sums" | awk '{print $1}')
+          sha_linux_amd64=$(grep "crystalline-${TAG}-x86_64-unknown-linux-musl.tar.gz" "$sums" | awk '{print $1}')
+          sha_linux_arm64=$(grep "crystalline-${TAG}-aarch64-unknown-linux-musl.tar.gz" "$sums" | awk '{print $1}')
+
+          git clone "https://x-access-token:${TAP_GITHUB_TOKEN}@github.com/jordiboehme/homebrew-tap.git" \
+            "${{ runner.temp }}/homebrew-tap"
+
+          mkdir -p "${{ runner.temp }}/homebrew-tap/Formula"
+
+          cat > "${{ runner.temp }}/homebrew-tap/Formula/crystalline.rb" << FORMULA
+          class Crystalline < Formula
+            desc "Local-first knowledge management for humans and AI agents"
+            homepage "https://github.com/jordiboehme/crystalline"
+            license "AGPL-3.0-or-later"
+            version "${VERSION}"
+
+            on_macos do
+              on_arm do
+                url "https://github.com/jordiboehme/crystalline/releases/download/v#{version}/crystalline-v#{version}-aarch64-apple-darwin.tar.gz"
+                sha256 "${sha_macos_arm}"
+              end
+            end
+
+            on_linux do
+              on_intel do
+                url "https://github.com/jordiboehme/crystalline/releases/download/v#{version}/crystalline-v#{version}-x86_64-unknown-linux-musl.tar.gz"
+                sha256 "${sha_linux_amd64}"
+              end
+
+              on_arm do
+                url "https://github.com/jordiboehme/crystalline/releases/download/v#{version}/crystalline-v#{version}-aarch64-unknown-linux-musl.tar.gz"
+                sha256 "${sha_linux_arm64}"
+              end
+            end
+
+            def install
+              bin.install "crystalline"
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/crystalline --version")
+            end
+          end
+          FORMULA
+
+          cd "${{ runner.temp }}/homebrew-tap"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/crystalline.rb
+          git commit -m "Update crystalline to ${VERSION}"
+          git push

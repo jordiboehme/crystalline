@@ -461,3 +461,63 @@ pub(crate) async fn open_store(db: &Path) -> anyhow::Result<crystalline_index::T
     }
     Ok(crystalline_index::TursoStore::open(db).await?)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // These pin down the exact `--http` semantics containers rely on: a
+    // container must bind 0.0.0.0 (not the 127.0.0.1 default) to be reachable
+    // from outside its network namespace, so `serve --http 0.0.0.0:7411` has
+    // to pass the address through unchanged rather than only accepting the
+    // bare toggle spellings.
+
+    #[test]
+    fn resolve_http_passes_through_an_explicit_non_loopback_address() {
+        let config = GlobalConfig::default();
+        assert_eq!(
+            resolve_http(Some("0.0.0.0:7411"), &config),
+            Some("0.0.0.0:7411".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_http_bare_toggle_still_defaults_to_loopback() {
+        let config = GlobalConfig::default();
+        assert_eq!(
+            resolve_http(Some(""), &config),
+            Some(DEFAULT_HTTP_ADDR.to_string())
+        );
+        assert_eq!(
+            resolve_http(Some("true"), &config),
+            Some(DEFAULT_HTTP_ADDR.to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_http_off_disables_regardless_of_config() {
+        let mut config = GlobalConfig::default();
+        config.service = Some(crystalline_core::config::ServiceConfig {
+            http: Some(HttpSetting::Address("0.0.0.0:7411".to_string())),
+        });
+        assert_eq!(resolve_http(Some("off"), &config), None);
+    }
+
+    #[test]
+    fn resolve_http_falls_back_to_config_address_without_a_flag() {
+        let mut config = GlobalConfig::default();
+        config.service = Some(crystalline_core::config::ServiceConfig {
+            http: Some(HttpSetting::Address("0.0.0.0:7411".to_string())),
+        });
+        assert_eq!(
+            resolve_http(None, &config),
+            Some("0.0.0.0:7411".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_http_none_without_flag_or_config() {
+        let config = GlobalConfig::default();
+        assert_eq!(resolve_http(None, &config), None);
+    }
+}
