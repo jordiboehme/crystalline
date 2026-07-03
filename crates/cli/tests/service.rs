@@ -312,8 +312,13 @@ fn single_daemon_two_clients_and_stale_recovery() {
     drop(c3);
     let (ok, _) = env.run(&["ctl", "shutdown"]);
     assert!(ok, "ctl shutdown");
+    // Shutdown cleanup is asynchronous and the daemon also releases its
+    // domain host locks on the way down, so the socket and the lock file
+    // disappear at slightly different moments; give both the same deadline.
     let start = Instant::now();
-    while env.sock_path().exists() && start.elapsed() < Duration::from_secs(3) {
+    while (env.sock_path().exists() || env.lock_path().exists())
+        && start.elapsed() < Duration::from_secs(5)
+    {
         std::thread::sleep(Duration::from_millis(50));
     }
     assert!(!env.sock_path().exists(), "socket removed on shutdown");
