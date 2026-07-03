@@ -29,7 +29,7 @@ use crate::store::{EngramRecord, FileStamp, Store};
 const CONCURRENCY: usize = 8;
 
 /// The outcome of a sync over one domain.
-#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SyncReport {
     /// The domain name.
     pub domain: String,

@@ -387,12 +387,16 @@ enum DomainCommand {
         #[arg(long)]
         name: Option<String>,
     },
-    /// Register a domain in the global config. Refuses without a MANIFEST.md.
+    /// Register a domain in the global config, then index it immediately.
+    /// Refuses without a MANIFEST.md.
     Add {
         /// The domain name used everywhere it is referenced.
         name: String,
         /// The domain root directory.
         path: PathBuf,
+        /// Register only; skip indexing (run `crystalline sync` later).
+        #[arg(long)]
+        no_sync: bool,
         /// Load the global config from this file instead of the default path.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -403,7 +407,8 @@ enum DomainCommand {
         #[arg(long)]
         config: Option<PathBuf>,
     },
-    /// Remove a domain from the global config. Leaves its files untouched.
+    /// Remove a domain from the global config. Leaves its files and index
+    /// rows untouched (the rows are dropped by a later full reindex).
     Remove {
         /// The domain name to remove.
         name: String,
@@ -829,16 +834,75 @@ fn on_runtime<F: std::future::Future<Output = anyhow::Result<()>>>(fut: F) -> an
 fn run_domain(command: DomainCommand, db: Option<PathBuf>, json: bool) -> anyhow::Result<()> {
     match command {
         DomainCommand::Init { path, name } => cmd::domain_init(&path, name.as_deref(), json),
-        DomainCommand::Add { name, path, config } => {
-            cmd::domain_add(&name, &path, config.as_deref(), json)
-        }
+        DomainCommand::Add {
+            name,
+            path,
+            no_sync,
+            config,
+        } => on_runtime(domain_add_dispatch(name, path, config, db, no_sync, json)),
         DomainCommand::List { config } => {
             on_runtime(cmd::domain_list(config.as_deref(), db.as_deref(), json))
         }
         DomainCommand::Remove { name, config } => {
-            cmd::domain_remove(&name, config.as_deref(), json)
+            on_runtime(domain_remove_dispatch(name, config, json))
         }
     }
+}
+
+/// `domain add`: register locally (always, regardless of a running daemon),
+/// then index immediately - routed to the daemon's ctl sync when one is
+/// running, else synced directly, the same dispatch `sync` itself uses.
+/// `--no-sync` registers only.
+async fn domain_add_dispatch(
+    name: String,
+    path: PathBuf,
+    config: Option<PathBuf>,
+    db: Option<PathBuf>,
+    no_sync: bool,
+    json: bool,
+) -> anyhow::Result<()> {
+    let abs = cmd::domain_add_register(&name, &path, config.as_deref())?;
+    if no_sync {
+        cmd::print_domain_add_no_sync(&name, &abs, json);
+        return Ok(());
+    }
+
+    use serde_json::json as j;
+    let report: crystalline_index::SyncReport = if let Some(data) =
+        crystalline_service::ctl_if_running(
+            j!({ "v": 1, "cmd": "sync", "domain": name, "embed": false }),
+        )
+        .await?
+    {
+        let first = data
+            .get("reports")
+            .and_then(|r| r.get(0))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        serde_json::from_value(first)
+            .map_err(|e| anyhow::anyhow!("could not parse the daemon's sync report: {e}"))?
+    } else {
+        cmd::sync_domain_direct(&name, &abs, config.as_deref(), db.as_deref()).await?
+    };
+
+    cmd::print_domain_add(&name, &abs, &report, json);
+    Ok(())
+}
+
+/// `domain remove`: drop it from the config, then best-effort tell a running
+/// daemon to stop watching its path. Never fails on the ctl round trip; the
+/// config edit already succeeded by the time it runs.
+async fn domain_remove_dispatch(
+    name: String,
+    config: Option<PathBuf>,
+    json: bool,
+) -> anyhow::Result<()> {
+    cmd::domain_remove(&name, config.as_deref(), json)?;
+    use serde_json::json as j;
+    let _ =
+        crystalline_service::ctl_if_running(j!({ "v": 1, "cmd": "forget_domain", "domain": name }))
+            .await;
+    Ok(())
 }
 
 fn run_verify(

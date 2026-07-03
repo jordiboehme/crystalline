@@ -29,7 +29,10 @@ fn engram(title: &str, permalink: &str) -> String {
     )
 }
 
-/// Scaffold and register a fresh domain, returning its root path.
+/// Scaffold and register a fresh domain, returning its root path. `domain add`
+/// now indexes on registration, so it needs the same `--db` the test's own
+/// later sync/doctor calls use (`work/index.db`), rather than the machine's
+/// default state directory.
 fn setup_domain(work: &Path, name: &str, config: &Path) -> PathBuf {
     let domain_dir = work.join(format!("kb-{name}"));
     bin()
@@ -43,6 +46,8 @@ fn setup_domain(work: &Path, name: &str, config: &Path) -> PathBuf {
         .arg(&domain_dir)
         .arg("--config")
         .arg(config)
+        .arg("--db")
+        .arg(work.join("index.db"))
         .assert()
         .success();
     domain_dir

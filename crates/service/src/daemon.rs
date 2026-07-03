@@ -15,7 +15,7 @@ use serde_json::Value;
 use tokio::sync::{Mutex as TokioMutex, watch};
 
 use crate::control::serve_ctl;
-use crate::engine::Engine;
+use crate::engine::{Engine, WatchEvent};
 use crate::instance::{acquire_ownership, read_mode_line};
 use crate::mcp::McpServer;
 
@@ -128,13 +128,21 @@ pub async fn run_serve(
     let ownership = acquire_ownership()?;
 
     let store = open_store(&db_path).await?;
+    // A channel the engine uses to tell the watcher (spawned below) about a
+    // domain registered after this daemon started, so it starts watching that
+    // root without a restart. See `Engine::domain_root`'s fresh-config fallback.
+    let (watch_tx, watch_rx) = tokio::sync::mpsc::unbounded_channel::<WatchEvent>();
     // The provider is built in the background (see below); text search and the
     // socket never wait on the model download.
-    let engine = Arc::new(Engine::new(
-        Arc::new(TokioMutex::new(store)),
-        config.clone(),
-        None,
-    ));
+    let engine = Arc::new(
+        Engine::new(
+            Arc::new(TokioMutex::new(store)),
+            config.clone(),
+            None,
+            config_path.clone(),
+        )
+        .with_watch_channel(watch_tx),
+    );
 
     // Bind the socket and publish the lock record: this is the readiness point,
     // reached before the provider build and the initial sync so clients attach
@@ -192,7 +200,7 @@ pub async fn run_serve(
         let watch_domains = domain_roots(&config);
         let rx = shared.watch();
         tokio::spawn(async move {
-            if let Err(err) = run_watcher(e, watch_domains, rx).await {
+            if let Err(err) = run_watcher(e, watch_domains, rx, watch_rx).await {
                 tracing::warn!("watcher stopped: {err}");
             }
         });
@@ -281,10 +289,16 @@ async fn handle_conn(mut stream: IpcStream, shared: Arc<Shared>) {
 /// Watch every domain root, debounce bursts by ~300ms and sync the touched
 /// domains, then embed. The store's on-disk stamp already matches any file a
 /// mutating tool just wrote, so those files are classified unchanged here.
+///
+/// `new_roots` carries domains discovered after startup (see
+/// `Engine::domain_root`'s fresh-config fallback): a `domain add` while this
+/// daemon is running adds a watch here without a restart, and a `domain
+/// remove` drops one the same way.
 async fn run_watcher(
     engine: Arc<Engine>,
     domains: Vec<(String, PathBuf)>,
     mut shutdown: watch::Receiver<bool>,
+    mut new_roots: tokio::sync::mpsc::UnboundedReceiver<WatchEvent>,
 ) -> anyhow::Result<()> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<PathBuf>();
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
@@ -294,6 +308,7 @@ async fn run_watcher(
             }
         }
     })?;
+    let mut domains = domains;
     for (_, root) in &domains {
         let _ = watcher.watch(root, RecursiveMode::Recursive);
     }
@@ -301,6 +316,27 @@ async fn run_watcher(
     loop {
         tokio::select! {
             _ = wait_true(&mut shutdown) => break,
+            event = new_roots.recv() => {
+                match event {
+                    Some(WatchEvent::Add(name, root)) => {
+                        if !domains.iter().any(|(n, _)| *n == name) {
+                            if let Err(err) = watcher.watch(&root, RecursiveMode::Recursive) {
+                                tracing::warn!("could not watch new domain '{name}' at {}: {err}", root.display());
+                            }
+                            domains.push((name, root));
+                        }
+                    }
+                    Some(WatchEvent::Remove(name)) => {
+                        if let Some(pos) = domains.iter().position(|(n, _)| *n == name) {
+                            let (_, root) = domains.remove(pos);
+                            let _ = watcher.unwatch(&root);
+                        }
+                    }
+                    // The engine that owns the sending half is gone, which only
+                    // happens alongside the daemon itself going away.
+                    None => break,
+                }
+            }
             first = rx.recv() => {
                 let Some(first) = first else { break };
                 let mut dirty: HashSet<String> =

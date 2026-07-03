@@ -69,11 +69,15 @@ async fn run_embedded_stdio(db: Option<&Path>, config_path: Option<&Path>) -> an
     let db_path = resolve_db(db)?;
     let store = open_store(&db_path).await?;
     // The provider is built in the background so the stdio session is ready and
-    // text search works before any model download completes.
+    // text search works before any model download completes. There is no
+    // watcher task in this mode, so `config_path` only helps a domain added
+    // mid-session resolve for data operations, not for picking up external
+    // file changes.
     let engine = Arc::new(Engine::new(
         Arc::new(TokioMutex::new(store)),
         config.clone(),
         None,
+        config_path.map(Path::to_path_buf),
     ));
 
     let bg = engine.clone();

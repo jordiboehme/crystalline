@@ -332,6 +332,71 @@ fn watcher_indexes_external_write_without_duplicates() {
     let _ = env.run(&["ctl", "shutdown"]);
 }
 
+/// The daemon gap this covers: a domain registered by `domain add` after the
+/// daemon started is not in its startup config snapshot, so its watcher never
+/// knew the root existed either. `domain add` must still route its own sync
+/// through the running daemon (ctl sync resolves the domain from a fresh
+/// config read) and that same resolution must add a live watch, with no
+/// daemon restart.
+#[test]
+fn domain_add_while_daemon_running_syncs_and_watches_the_new_domain() {
+    let env = Env::new("dyndom");
+    env.setup_domain("eng");
+
+    // The daemon starts against a config that only knows about "eng".
+    let mut c1 = Mcp::spawn(&env);
+    c1.initialize();
+    env.wait_ready();
+
+    // Register a second domain while that daemon is still running. This
+    // itself proves the ctl sync round trip succeeds for a domain the
+    // daemon has never heard of.
+    env.setup_domain("docs");
+
+    // The daemon's own MCP session finds the new domain's pre-existing seed
+    // file, without ever restarting the daemon.
+    c1.send_call(
+        "search_engrams",
+        json!({ "query": "seed body token", "domains": ["docs"] }),
+    );
+    let r = c1.read_tool_value();
+    assert!(
+        r["total"].as_u64().unwrap_or(0) >= 1,
+        "search over MCP finds the new domain's pre-existing files: {r}"
+    );
+
+    // An externally written file in the new domain is picked up by the
+    // watcher within a bounded wait, proving the dynamic watch (not just the
+    // one-off sync) is live for a domain discovered after startup.
+    std::fs::write(
+        env.dir.join("kb-docs/external.md"),
+        "---\ntype: engram\ntitle: External\npermalink: external\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-01-01\n---\n\ndocs external unique body\n",
+    )
+    .unwrap();
+
+    let mut found = false;
+    for _ in 0..60 {
+        c1.send_call(
+            "search_engrams",
+            json!({ "query": "external unique body", "domains": ["docs"] }),
+        );
+        let r = c1.read_tool_value();
+        let hits = r["hits"].as_array().cloned().unwrap_or_default();
+        if hits.iter().any(|h| h["permalink"] == json!("external")) {
+            found = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(
+        found,
+        "the watcher picked up an external write in a domain added after daemon start"
+    );
+
+    drop(c1);
+    let _ = env.run(&["ctl", "shutdown"]);
+}
+
 #[test]
 fn http_smoke_initialize_list_and_search() {
     let env = Env::new("http");

@@ -55,16 +55,41 @@ fn init_add_sync_status_end_to_end() {
         .assert()
         .failure();
 
-    bin()
-        .args(["domain", "add", "eng"])
+    // domain add registers the domain and indexes its existing files immediately.
+    let out = bin()
+        .args(["--json", "domain", "add", "eng"])
         .arg(&domain_dir)
         .args(["--config"])
         .arg(&config)
-        .assert()
-        .success();
+        .args(["--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
     assert!(config.exists(), "config written");
+    let add_report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        add_report["sync"]["added"],
+        serde_json::json!(2),
+        "manifest and engram indexed on add: {add_report}"
+    );
 
-    // sync indexes the manifest and the engram.
+    // A search finds the engram right away, with no explicit sync in between.
+    let out = bin()
+        .args(["--json", "search", "searchable token", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let search: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        search["total"].as_u64().unwrap() >= 1,
+        "search finds the engram indexed on add: {search}"
+    );
+
+    // An explicit sync afterward is a no-op: both files are already indexed.
     let out = bin()
         .args(["--json", "sync", "--config"])
         .arg(&config)
@@ -74,8 +99,11 @@ fn init_add_sync_status_end_to_end() {
         .unwrap();
     assert!(out.status.success());
     let reports: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    let added = reports[0]["added"].as_u64().unwrap();
-    assert_eq!(added, 2, "manifest and engram indexed");
+    assert_eq!(
+        reports[0]["unchanged"].as_u64().unwrap(),
+        2,
+        "domain add already indexed both files: {reports}"
+    );
 
     // status reports the counts and the active fts path.
     let out = bin()
@@ -127,4 +155,97 @@ fn init_add_sync_status_end_to_end() {
         .assert()
         .success();
     assert!(domain_dir.join("alpha.md").exists(), "files untouched");
+}
+
+#[test]
+fn domain_add_indexes_pre_existing_files_without_an_explicit_sync() {
+    let work = tempfile::tempdir().unwrap();
+    let domain_dir = work.path().join("kb-docs");
+    let config = work.path().join("config.yaml");
+    let db = work.path().join("state/index.db");
+
+    bin()
+        .args(["domain", "init"])
+        .arg(&domain_dir)
+        .args(["--name", "docs"])
+        .assert()
+        .success();
+    write(
+        &domain_dir,
+        "beta.md",
+        "---\ntype: engram\ntitle: Beta\npermalink: beta\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nBeta body with a distinct findable marker.\n",
+    );
+
+    bin()
+        .args(["domain", "add", "docs"])
+        .arg(&domain_dir)
+        .args(["--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .success();
+
+    let out = bin()
+        .args(["--json", "search", "distinct findable marker", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let search: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        search["total"].as_u64().unwrap() >= 1,
+        "search finds the pre-existing file without a sync command: {search}"
+    );
+}
+
+#[test]
+fn domain_add_no_sync_registers_without_indexing() {
+    let work = tempfile::tempdir().unwrap();
+    let domain_dir = work.path().join("kb-later");
+    let config = work.path().join("config.yaml");
+    let db = work.path().join("state/index.db");
+
+    bin()
+        .args(["domain", "init"])
+        .arg(&domain_dir)
+        .args(["--name", "later"])
+        .assert()
+        .success();
+    write(
+        &domain_dir,
+        "gamma.md",
+        "---\ntype: engram\ntitle: Gamma\npermalink: gamma\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nGamma body with an unindexed marker.\n",
+    );
+
+    let out = bin()
+        .args(["--json", "domain", "add", "later"])
+        .arg(&domain_dir)
+        .arg("--no-sync")
+        .args(["--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let add_report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(add_report["synced"], serde_json::json!(false));
+
+    let out = bin()
+        .args(["--json", "search", "unindexed marker", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let search: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        search["total"].as_u64().unwrap(),
+        0,
+        "--no-sync leaves the domain unindexed: {search}"
+    );
 }

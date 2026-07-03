@@ -3,8 +3,8 @@
 //! Each request is one JSON line `{ "v": 1, "cmd": ..., ... }`; each response is
 //! one line `{ "v": 1, "ok": true, "data": ... }` or
 //! `{ "v": 1, "ok": false, "error": ... }`. Commands: sync, status, reindex,
-//! sessions, shutdown. This is the operator channel; data operations go over the
-//! MCP handshake instead.
+//! sessions, forget_domain, shutdown. This is the operator channel; data
+//! operations go over the MCP handshake instead.
 
 use std::sync::Arc;
 
@@ -105,9 +105,18 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
             }
         }
         "shutdown" => (envelope_ok(json!({ "stopping": true })), true),
+        // Best-effort: `domain remove` calls this so a live daemon stops
+        // watching the removed path right away instead of on its next
+        // restart. Index rows are never touched here, only the watcher and
+        // the engine's discovered-domain cache.
+        "forget_domain" => {
+            let domain = req.get("domain").and_then(Value::as_str).unwrap_or("");
+            shared.engine.forget_domain(domain);
+            (envelope_ok(json!({ "forgotten": domain })), false)
+        }
         other => (
             envelope_err(format!(
-                "unknown ctl command '{other}'; expected status, sessions, sync, reindex or shutdown"
+                "unknown ctl command '{other}'; expected status, sessions, sync, reindex, forget_domain or shutdown"
             )),
             false,
         ),

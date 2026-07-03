@@ -18,7 +18,10 @@ fn bin() -> Command {
     Command::cargo_bin("crystalline").unwrap()
 }
 
-/// Scaffold and register a fresh domain, returning its root path.
+/// Scaffold and register a fresh domain, returning its root path. `import`
+/// never touches the index, but `domain add` now indexes on registration, so
+/// it needs a `--db` scoped to this test's own temp dir rather than the
+/// machine's default state directory.
 fn setup_domain(work: &Path, name: &str, config: &Path) -> std::path::PathBuf {
     let domain_dir = work.join(format!("kb-{name}"));
     bin()
@@ -32,6 +35,8 @@ fn setup_domain(work: &Path, name: &str, config: &Path) -> std::path::PathBuf {
         .arg(&domain_dir)
         .arg("--config")
         .arg(config)
+        .arg("--db")
+        .arg(work.join("index.db"))
         .assert()
         .success();
     domain_dir

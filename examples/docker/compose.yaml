@@ -17,11 +17,13 @@
 #   docker compose -f examples/docker/compose.yaml up -d
 #
 # One-shot initialization (run once, before or after the service is up - it
-# is a separate short-lived container each time, not a shell session):
+# is a separate short-lived container each time, not a shell session).
+# domain add indexes /knowledge/team immediately: routed to the running
+# service over the shared /data volume when it is already up, or indexed
+# directly otherwise:
 #
 #   docker compose -f examples/docker/compose.yaml run --rm crystalline domain init /knowledge/team --name team
 #   docker compose -f examples/docker/compose.yaml run --rm crystalline domain add team /knowledge/team
-#   docker compose -f examples/docker/compose.yaml run --rm crystalline sync
 
 services:
   crystalline:

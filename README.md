@@ -79,6 +79,8 @@ This runs verbatim, start to finish, on a clean machine.
 
 ```sh
 # 1. Create a domain: a folder of knowledge with a MANIFEST.md at its root.
+#    domain add indexes whatever is already there (the manifest, for now)
+#    right away, no separate sync step needed.
 mkdir -p ~/knowledge/engineering
 crystalline domain init ~/knowledge/engineering --name engineering
 crystalline domain add engineering ~/knowledge/engineering
@@ -88,23 +90,22 @@ crystalline write engineering "Retry queue gotcha" \
   --content "- [gotcha] The retry queue drops jobs older than 24h #payments" \
   --tags gotcha,payments
 
-# 3. Sync the domain into the local search index.
-crystalline sync
-
-# 4. Search it back (plain text, since no embeddings exist yet).
+# 3. Search it back (plain text, since no embeddings exist yet).
 crystalline search "retry queue"
 
-# 5. Fetch the local embedding model once, then re-sync with embeddings.
+# 4. Fetch the local embedding model once, then re-sync with embeddings.
 crystalline model download
 crystalline sync --embed
 
-# 6. Search again: hybrid text-plus-semantic ranking now finds the engram
+# 5. Search again: hybrid text-plus-semantic ranking now finds the engram
 #    from a differently worded description of the same problem.
 crystalline search "why does the payments queue lose jobs"
 
-# 7. See what got indexed.
+# 6. See what got indexed.
 crystalline status
 ```
+
+Engrams written through Crystalline are indexed immediately; `crystalline sync` only picks up files created outside it (an editor, a `git pull`) when no daemon is watching them.
 
 Edit `~/knowledge/engineering/MANIFEST.md`'s `## Scope` and `## When to Use` sections so routing and the session prompt describe the domain accurately - that file is what `crystalline prompt` and an agent's routing decisions read.
 
@@ -148,7 +149,7 @@ What persists where:
 
 Two sample Compose files ship under [`examples/docker/`](examples/docker/):
 
-- **`compose.yaml`** - the single-container setup above, plus a commented one-shot `domain init` / `domain add` / `sync` recipe for bootstrapping a fresh domain.
+- **`compose.yaml`** - the single-container setup above, plus a commented one-shot `domain init` / `domain add` recipe for bootstrapping a fresh domain (`domain add` indexes it immediately, routed to the running daemon over the shared `/data` volume).
 - **`compose.git-sync.yaml`** - a scale-deployment variant that adds a sidecar keeping the knowledge folder synced from a git remote every 60 seconds, mounted read-only into Crystalline. This is the pattern for a team that manages engrams as a reviewed git repository rather than writing into the container directly.
 
 Agents connect to the containerized daemon over its HTTP MCP endpoint, `http://localhost:7411` from the host (the image's default command is `serve --http 0.0.0.0:7411`, since a container has to bind every interface to be reachable at all - binding `127.0.0.1` inside a container is only reachable from inside that same container). The stdio `crystalline mcp` transport from Connect your agent above is for local, non-containerized processes; point a harness at the HTTP endpoint instead when Crystalline runs in a container.

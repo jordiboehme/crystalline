@@ -176,12 +176,14 @@ recorded_at: {today}\n\
 // --- domain add --------------------------------------------------------------
 
 /// Register a domain in the global config. Refuses without a MANIFEST.md.
-pub fn domain_add(
+/// Returns the canonicalized domain root; indexing is a separate step (see
+/// [`sync_domain_direct`]) so the daemon-dispatch decision stays in `main.rs`,
+/// alongside `sync` and `reindex`'s own dispatch.
+pub(crate) fn domain_add_register(
     name: &str,
     path: &Path,
     config_override: Option<&Path>,
-    json: bool,
-) -> Result<()> {
+) -> Result<PathBuf> {
     let manifest = path.join("MANIFEST.md");
     if !manifest.exists() {
         bail!(
@@ -198,21 +200,71 @@ pub fn domain_add(
         .insert(name.to_string(), DomainEntry { path: abs.clone() });
     config::save_yaml(&cfg_path, &cfg)
         .map_err(|e| anyhow!("failed to save config {}: {e}", cfg_path.display()))?;
+    Ok(abs)
+}
 
+/// Sync a single, just-registered domain directly (no daemon involved) and
+/// return its report. Parse failures in individual files land in the
+/// report's `failed` list rather than aborting; only a harder error (the
+/// store will not open, the transaction fails) is propagated.
+pub(crate) async fn sync_domain_direct(
+    name: &str,
+    root: &Path,
+    config_override: Option<&Path>,
+    db_override: Option<&Path>,
+) -> Result<crystalline_index::SyncReport> {
+    let cfg = load_config(&config_path(config_override)?)?;
+    let store = open_store(&db_path(db_override)?).await?;
+    let params = chunk_params(&cfg);
+    sync_domain_with(&store, name, root, &params)
+        .await
+        .map_err(|e| anyhow!("sync of '{name}' failed: {e}"))
+}
+
+/// Print `domain add`'s combined registration-and-index output.
+pub(crate) fn print_domain_add(
+    name: &str,
+    path: &Path,
+    report: &crystalline_index::SyncReport,
+    json: bool,
+) {
     if json {
         println!(
             "{}",
-            serde_json::json!({ "registered": name, "path": abs.display().to_string() })
+            serde_json::json!({
+                "registered": name,
+                "path": path.display().to_string(),
+                "synced": true,
+                "sync": report,
+            })
         );
     } else {
-        println!("Registered domain '{name}' at {}", abs.display());
+        println!("Registered domain '{name}' at {}", path.display());
+        print_report(report);
     }
-    Ok(())
+}
+
+/// Print `domain add --no-sync`'s registration-only output.
+pub(crate) fn print_domain_add_no_sync(name: &str, path: &Path, json: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "registered": name,
+                "path": path.display().to_string(),
+                "synced": false,
+            })
+        );
+    } else {
+        println!("Registered domain '{name}' at {}", path.display());
+        println!("Not synced (--no-sync); run: crystalline sync --domain {name}");
+    }
 }
 
 // --- domain remove -----------------------------------------------------------
 
-/// Remove a domain from the global config. Leaves its files untouched.
+/// Remove a domain from the global config. Leaves its files and index rows
+/// untouched; the rows are only dropped by a later full reindex.
 pub fn domain_remove(name: &str, config_override: Option<&Path>, json: bool) -> Result<()> {
     let cfg_path = config_path(config_override)?;
     let mut cfg = load_config(&cfg_path)?;
@@ -222,9 +274,16 @@ pub fn domain_remove(name: &str, config_override: Option<&Path>, json: bool) -> 
     config::save_yaml(&cfg_path, &cfg)
         .map_err(|e| anyhow!("failed to save config {}: {e}", cfg_path.display()))?;
     if json {
-        println!("{}", serde_json::json!({ "removed": name }));
+        println!(
+            "{}",
+            serde_json::json!({
+                "removed": name,
+                "note": "index rows for this domain remain until the next full reindex",
+            })
+        );
     } else {
-        println!("Removed domain '{name}' (files left untouched)");
+        println!("Removed domain '{name}' (files and index rows left untouched)");
+        println!("Run: crystalline reindex --full to drop its rows from the index");
     }
     Ok(())
 }

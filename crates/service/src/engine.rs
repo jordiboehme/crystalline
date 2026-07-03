@@ -11,7 +11,7 @@
 //! daemon's debounced watcher classifies the file as unchanged and never
 //! reprocesses it (the idempotency guard, see `research/single-instance-ipc.md`).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -89,10 +89,33 @@ impl From<crystalline_index::IndexError> for EngineError {
 /// The result type used across the engine.
 pub type Result<T> = std::result::Result<T, EngineError>;
 
+/// A message from the engine to the daemon's file watcher: a domain root to
+/// start or stop watching, raised when a domain registered after the daemon
+/// started is first resolved (see [`Engine::domain_root`]) or removed (see
+/// [`Engine::forget_domain`]). Only the daemon's watcher task consumes these;
+/// embedded stdio and standalone CLI commands never install a receiver.
+#[derive(Debug, Clone)]
+pub enum WatchEvent {
+    /// Start watching this domain's root.
+    Add(String, PathBuf),
+    /// Stop watching this domain's root.
+    Remove(String),
+}
+
 /// The shared service engine.
 pub struct Engine {
     store: Arc<Mutex<TursoStore>>,
     config: GlobalConfig,
+    // The `--config` override this engine was started with, so a domain
+    // registered after startup (`domain add` only ever touches the file on
+    // disk) can be found by re-reading the same file. See `refresh_domain`.
+    config_path: Option<PathBuf>,
+    // Domains discovered by re-reading the global config after startup,
+    // layered on top of the immutable `config` snapshot taken at construction.
+    discovered_domains: std::sync::RwLock<HashMap<String, PathBuf>>,
+    // Told about domains discovered this way so the daemon's watcher can pick
+    // them up without a restart. `None` outside the daemon.
+    watch_tx: Option<tokio::sync::mpsc::UnboundedSender<WatchEvent>>,
     // Swappable so the daemon can build the (possibly downloading) provider in the
     // background without blocking readiness or text search.
     provider: std::sync::RwLock<Option<Arc<dyn EmbeddingProvider>>>,
@@ -103,20 +126,38 @@ pub struct Engine {
 impl Engine {
     /// Build an engine around an already-open store, an optional provider and a
     /// config. A `None` provider can be installed later with [`Engine::set_provider`].
+    /// `config_path` is the `--config` override (if any) this engine started
+    /// with, used to re-read the config file when a domain is not in the
+    /// startup snapshot; pass `None` when the caller never re-reads (a
+    /// one-shot standalone CLI command already sees a fresh config).
     pub fn new(
         store: Arc<Mutex<TursoStore>>,
         config: GlobalConfig,
         provider: Option<Arc<dyn EmbeddingProvider>>,
+        config_path: Option<PathBuf>,
     ) -> Engine {
         let model_id = configured_model_id(config.embeddings.as_ref());
         let chunk_params = ChunkParams::for_model(model_id.clone());
         Engine {
             store,
             config,
+            config_path,
+            discovered_domains: std::sync::RwLock::new(HashMap::new()),
+            watch_tx: None,
             provider: std::sync::RwLock::new(provider),
             model_id,
             chunk_params,
         }
+    }
+
+    /// Install the channel the daemon's watcher listens on for domains
+    /// discovered after startup. Only wired by `run_serve`.
+    pub fn with_watch_channel(
+        mut self,
+        tx: tokio::sync::mpsc::UnboundedSender<WatchEvent>,
+    ) -> Engine {
+        self.watch_tx = Some(tx);
+        self
     }
 
     /// The shared store handle, for the daemon's watcher and embed loop.
@@ -148,12 +189,56 @@ impl Engine {
     // --- domain helpers ------------------------------------------------------
 
     fn domain_root(&self, name: &str) -> Result<PathBuf> {
-        match self.config.domains.get(name) {
-            Some(entry) => Ok(config::expand_tilde(&entry.path.to_string_lossy())),
-            None => Err(EngineError::UnknownDomain {
-                domain: name.to_string(),
-                registered: self.config.domains.keys().cloned().collect(),
-            }),
+        if let Some(entry) = self.config.domains.get(name) {
+            return Ok(config::expand_tilde(&entry.path.to_string_lossy()));
+        }
+        if let Some(root) = self.discovered_domains.read().unwrap().get(name) {
+            return Ok(root.clone());
+        }
+        if let Some(root) = self.refresh_domain(name) {
+            return Ok(root);
+        }
+        Err(EngineError::UnknownDomain {
+            domain: name.to_string(),
+            registered: self.known_domain_names(),
+        })
+    }
+
+    /// Re-read the global config from disk looking for a domain registered
+    /// after this engine started: `domain add` only ever edits the file, never
+    /// this in-memory snapshot. A hit is cached in `discovered_domains` and, on
+    /// the daemon, reported over `watch_tx` so the watcher starts watching its
+    /// root without a restart.
+    fn refresh_domain(&self, name: &str) -> Option<PathBuf> {
+        let fresh = crate::daemon::load_config(self.config_path.as_deref()).ok()?;
+        let entry = fresh.domains.get(name)?;
+        let root = config::expand_tilde(&entry.path.to_string_lossy());
+        self.discovered_domains
+            .write()
+            .unwrap()
+            .insert(name.to_string(), root.clone());
+        if let Some(tx) = &self.watch_tx {
+            let _ = tx.send(WatchEvent::Add(name.to_string(), root.clone()));
+        }
+        Some(root)
+    }
+
+    /// Every domain name this engine currently knows about: the startup
+    /// snapshot plus anything discovered since.
+    fn known_domain_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.config.domains.keys().cloned().collect();
+        names.extend(self.discovered_domains.read().unwrap().keys().cloned());
+        names
+    }
+
+    /// Forget a domain removed by `domain remove` while this engine is live:
+    /// drop it from the discovered overlay and, on the daemon, tell the
+    /// watcher to stop watching its root. The index rows are never touched
+    /// here; they are left for the next full reindex.
+    pub fn forget_domain(&self, name: &str) {
+        self.discovered_domains.write().unwrap().remove(name);
+        if let Some(tx) = &self.watch_tx {
+            let _ = tx.send(WatchEvent::Remove(name.to_string()));
         }
     }
 
@@ -984,16 +1069,26 @@ impl Engine {
                 let root = self.domain_root(name)?;
                 Ok(vec![(name.to_string(), root)])
             }
-            None => Ok(self
-                .config
-                .domains
-                .keys()
-                .map(|name| {
-                    let root =
-                        config::expand_tilde(&self.config.domains[name].path.to_string_lossy());
-                    (name.clone(), root)
-                })
-                .collect()),
+            None => {
+                let mut targets: Vec<(String, PathBuf)> = self
+                    .config
+                    .domains
+                    .keys()
+                    .map(|name| {
+                        let root =
+                            config::expand_tilde(&self.config.domains[name].path.to_string_lossy());
+                        (name.clone(), root)
+                    })
+                    .collect();
+                // A domain registered after startup and already resolved once
+                // (e.g. by a named `ctl sync`) rides along on a full sync too.
+                for (name, root) in self.discovered_domains.read().unwrap().iter() {
+                    if !self.config.domains.contains_key(name) {
+                        targets.push((name.clone(), root.clone()));
+                    }
+                }
+                Ok(targets)
+            }
         }
     }
 
@@ -1081,7 +1176,9 @@ pub async fn open_standalone(
         std::fs::create_dir_all(parent)?;
     }
     let store = TursoStore::open(db).await?;
-    let engine = Engine::new(Arc::new(Mutex::new(store)), config, None);
+    // No `config_path`: a standalone command is one-shot, so the config it
+    // already loaded is as fresh as any re-read would be.
+    let engine = Engine::new(Arc::new(Mutex::new(store)), config, None, None);
     // Build the provider (which may download the model) only when the index
     // already holds embeddings for the active model, so a text or filter search
     // never triggers a surprise download. With no embeddings, search falls back

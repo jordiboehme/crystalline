@@ -41,7 +41,7 @@ impl Harness {
             cfg.domains.insert(d.to_string(), DomainEntry { path: dir });
         }
         let store = TursoStore::open_in_memory().await.unwrap();
-        let engine = Arc::new(Engine::new(Arc::new(Mutex::new(store)), cfg, None));
+        let engine = Arc::new(Engine::new(Arc::new(Mutex::new(store)), cfg, None, None));
         engine.sync(None).await.unwrap();
         Harness {
             _tmp: tmp,
