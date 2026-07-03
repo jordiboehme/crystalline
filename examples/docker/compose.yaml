@@ -28,6 +28,11 @@
 services:
   crystalline:
     image: ghcr.io/jordiboehme/crystalline:latest
+    # Alternative: the with-model variant, with the BAAI/bge-small-en-v1.5
+    # embedding model baked in. Use it when the daemon needs semantic search
+    # ready on its very first start, or when this host has no egress to
+    # huggingface.co (air-gapped or otherwise offline deployments):
+    # image: ghcr.io/jordiboehme/crystalline:with-model
     command: ["serve", "--http", "0.0.0.0:7411"]
     ports:
       - "7411:7411"

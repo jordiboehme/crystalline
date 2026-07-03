@@ -1,8 +1,17 @@
 //! Config parsing, atomic save round-trip, tilde expansion and default paths.
 
+use std::sync::Mutex;
+
 use crystalline_core::config::{
     self, DomainEntry, GlobalConfig, HttpSetting, load_yaml, save_yaml,
 };
+
+/// Guards every test that reads or mutates `CRYSTALLINE_MODELS_DIR`. Env vars
+/// are process-global and cargo test runs functions from this file on
+/// multiple threads, so `default_paths_are_namespaced` and
+/// `models_dir_env_override` both take this lock for their duration to avoid
+/// observing each other's env var state.
+static MODELS_DIR_ENV_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
 fn parse_global_config_with_http_bool() {
@@ -92,6 +101,7 @@ fn expand_tilde_resolves_home() {
 
 #[test]
 fn default_paths_are_namespaced() {
+    let _guard = MODELS_DIR_ENV_LOCK.lock().unwrap();
     let config = config::config_dir().unwrap();
     assert!(config.ends_with("crystalline"));
     assert!(
@@ -155,4 +165,47 @@ fn repo_config_preferred_domains() {
     let yaml = "preferred_domains:\n- product\n- gardening\n";
     let cfg: config::RepoConfig = serde_yaml_ng::from_str(yaml).unwrap();
     assert_eq!(cfg.preferred_domains, ["product", "gardening"]);
+}
+
+#[test]
+fn models_dir_env_override() {
+    let _guard = MODELS_DIR_ENV_LOCK.lock().unwrap();
+    // Preserve and restore whatever the surrounding environment already had,
+    // so this test leaves no state behind for anything that runs after it.
+    let previous = std::env::var("CRYSTALLINE_MODELS_DIR").ok();
+
+    // Unset: falls back to the default cache-dir-based path.
+    unsafe {
+        std::env::remove_var("CRYSTALLINE_MODELS_DIR");
+    }
+    let default = config::models_dir().unwrap();
+    assert!(default.ends_with("crystalline/models"));
+
+    // Empty: treated the same as unset, not as a literal empty path.
+    unsafe {
+        std::env::set_var("CRYSTALLINE_MODELS_DIR", "");
+    }
+    let empty = config::models_dir().unwrap();
+    assert_eq!(empty, default);
+
+    // Set to an absolute path: used verbatim, taking priority over the default.
+    let dir = tempfile::tempdir().unwrap();
+    unsafe {
+        std::env::set_var("CRYSTALLINE_MODELS_DIR", dir.path());
+    }
+    let overridden = config::models_dir().unwrap();
+    assert_eq!(overridden, dir.path());
+
+    // Set with a leading tilde: expanded via the same helper as other paths.
+    unsafe {
+        std::env::set_var("CRYSTALLINE_MODELS_DIR", "~/kb/models-override");
+    }
+    let expanded = config::models_dir().unwrap();
+    assert!(expanded.is_absolute());
+    assert!(expanded.ends_with("kb/models-override"));
+
+    match previous {
+        Some(v) => unsafe { std::env::set_var("CRYSTALLINE_MODELS_DIR", v) },
+        None => unsafe { std::env::remove_var("CRYSTALLINE_MODELS_DIR") },
+    }
 }

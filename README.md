@@ -131,8 +131,18 @@ The first agent to connect starts a background daemon that loads the embedding m
 
 Crystalline publishes a multi-arch OCI image (`linux/amd64` and `linux/arm64`) to GHCR on every release, for Linux server deployments. macOS and Windows have no OCI container runtime worth targeting here, so those platforms run the native binary from Install above; the container covers the Linux server case.
 
+Two image variants ship under the same name, tag-selected:
+
+| Tag | Size | Embedding model | Best for |
+|---|---|---|---|
+| `latest` (or a pinned `vX.Y.Z`) | ~15 MB | Downloads in the background on first daemon start (needs egress to huggingface.co once) | The common case: a host with normal internet access, where a short model download on first start is fine |
+| `with-model` (or a pinned `vX.Y.Z-with-model`) | ~145 MB | Baked into the image, no download | Air-gapped or otherwise offline hosts, or anywhere semantic search must work from the very first `search` call with no warm-up delay |
+
+Pick `with-model` whenever the host has no outbound network access or the first-start download delay is unwanted; pick the slim `latest` otherwise, since it is the smaller image to pull and update.
+
 ```sh
 docker pull ghcr.io/jordiboehme/crystalline:latest
+# or: docker pull ghcr.io/jordiboehme/crystalline:with-model
 
 docker run -d \
   --name crystalline \
@@ -145,7 +155,9 @@ docker run -d \
 What persists where:
 
 - `./knowledge` (bind mount) holds the engrams themselves, one subfolder per domain - this is the only data that matters, and it is exactly the same markdown-plus-frontmatter files the native binary reads.
-- `crystalline-data` (named volume, mounted at `/data`) holds the rebuildable search index and the embedding model cache. Losing it costs a `crystalline reindex --full` and a model re-download, never data.
+- `crystalline-data` (named volume, mounted at `/data`) holds the rebuildable search index and the embedding model cache. Losing it costs a `crystalline reindex --full` and a model re-download (skipped entirely on `with-model`, since its model lives outside `/data` and is never affected by the volume), never data.
+
+The `with-model` variant sets `CRYSTALLINE_MODELS_DIR` (also settable directly, on any install, to relocate the model cache anywhere else) to a path outside `/data` so the baked model is never shadowed by the `/data` volume mount. The bundled model is [BAAI/bge-small-en-v1.5](https://huggingface.co/BAAI/bge-small-en-v1.5), MIT licensed.
 
 Two sample Compose files ship under [`examples/docker/`](examples/docker/):
 

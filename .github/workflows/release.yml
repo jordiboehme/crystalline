@@ -237,6 +237,20 @@ jobs:
           cp "$arm64_bin" dist/linux-arm64/crystalline
           chmod +x dist/linux-amd64/crystalline dist/linux-arm64/crystalline
 
+      # The model layer is arch-independent (weights, tokenizer and config
+      # files, no compiled code), so it is fetched once here on the runner
+      # rather than once per target platform in the buildx step below. The
+      # staged amd64 binary is statically linked (musl) and runs fine on this
+      # glibc runner. XDG_CACHE_HOME is redirected to a scratch directory so
+      # this never touches the runner's real cache, and the resulting
+      # `crystalline/models` directory is renamed to `dist/model` to match
+      # the layout `runtime-with-model` in the Dockerfile expects.
+      - name: Prefetch the embedding model
+        run: |
+          set -euo pipefail
+          XDG_CACHE_HOME="$PWD/dist/model-xdg" ./dist/linux-amd64/crystalline model download
+          mv dist/model-xdg/crystalline/models dist/model
+
       - name: Log in to GHCR
         uses: docker/login-action@c99871dec2022cc055c062a10cc1a1310835ceb4 # v4.3.0
         with:
@@ -267,10 +281,62 @@ jobs:
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
+          target: runtime
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Generate with-model image metadata
+        id: meta_with_model
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/jordiboehme/crystalline
+          tags: |
+            type=semver,pattern={{version}},suffix=-with-model
+            type=raw,value=with-model
+          labels: |
+            org.opencontainers.image.title=Crystalline (with model)
+            org.opencontainers.image.description=Local-first knowledge management for humans and AI agents, with the BAAI/bge-small-en-v1.5 embedding model (MIT licensed) baked in so semantic search is ready immediately with no runtime download.
+            org.opencontainers.image.licenses=AGPL-3.0-or-later
+
+      # Builds the variant for one platform and loads it into the local
+      # docker daemon (buildx --load does not support a multi-platform
+      # manifest) so it can be smoke tested below before anything is pushed.
+      - name: Build the with-model image for an offline smoke test
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          target: runtime-with-model
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: ${{ steps.meta_with_model.outputs.tags }}
+          labels: ${{ steps.meta_with_model.outputs.labels }}
+
+      # Proves the baked model is complete and usable with zero network
+      # access before the variant is published: `--network none` means
+      # `model download` can only succeed by finding every file already in
+      # place (including the hf-hub blob symlinks surviving the Dockerfile
+      # COPY intact), the same offline path a real air-gapped deployment
+      # depends on.
+      - name: Verify the with-model image works fully offline
+        run: |
+          set -euo pipefail
+          image="$(head -n1 <<< "${{ steps.meta_with_model.outputs.tags }}")"
+          output="$(docker run --rm --network none "$image" model download)"
+          echo "$output"
+          grep -q "Model ready" <<< "$output"
+
+      - name: Build and push the with-model image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          target: runtime-with-model
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta_with_model.outputs.tags }}
+          labels: ${{ steps.meta_with_model.outputs.labels }}
 
   homebrew:
     name: update homebrew tap

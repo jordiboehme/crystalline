@@ -282,7 +282,20 @@ pub fn cache_dir() -> Result<PathBuf, ConfigError> {
     Ok(base()?.cache_dir().join(APP))
 }
 
-/// The embedding model cache directory, `<cache_dir>/models`.
+/// The environment variable that overrides `models_dir()`. Container images
+/// that bake the embedding model in set this to a non-volume path so the
+/// baked files are never shadowed by a bind mount over the cache directory.
+const MODELS_DIR_ENV: &str = "CRYSTALLINE_MODELS_DIR";
+
+/// The embedding model cache directory. `<cache_dir>/models` by default, or
+/// the value of `CRYSTALLINE_MODELS_DIR` when that variable is set to a
+/// non-empty value (a leading `~` is expanded via `expand_tilde`). An unset
+/// or empty variable falls back to the default.
 pub fn models_dir() -> Result<PathBuf, ConfigError> {
+    if let Ok(dir) = std::env::var(MODELS_DIR_ENV)
+        && !dir.is_empty()
+    {
+        return Ok(expand_tilde(&dir));
+    }
     Ok(cache_dir()?.join("models"))
 }
