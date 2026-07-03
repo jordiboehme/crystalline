@@ -100,7 +100,7 @@ where
         let mut manifest_index = None;
         let mut scanned = Vec::with_capacity(files.len());
         for (i, path) in files.into_iter().enumerate() {
-            let rel_path = path.strip_prefix(&root).unwrap_or(&path).to_path_buf();
+            let rel_path = super::forward_slashes(path.strip_prefix(&root).unwrap_or(&path));
             if rel_path == Path::new("MANIFEST.md") {
                 manifest_index = Some(i);
             }

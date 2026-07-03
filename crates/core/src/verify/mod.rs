@@ -130,6 +130,19 @@ where
     Ok(run_rules(&domains, options))
 }
 
+/// Report paths are part of the stable output schema and must be identical
+/// on every platform, so they always use forward slashes.
+pub(crate) fn forward_slashes(path: &Path) -> std::path::PathBuf {
+    if std::path::MAIN_SEPARATOR == '/' {
+        path.to_path_buf()
+    } else {
+        std::path::PathBuf::from(
+            path.to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/"),
+        )
+    }
+}
+
 /// Routes resolved issues into the shared issue list and summary tally,
 /// applying config overrides and `--strict` promotion at the point of
 /// emission so every rule module has a single, consistent way to report a
@@ -179,7 +192,7 @@ impl<'a> Sink<'a> {
             Severity::Info => self.summary.infos += 1,
         }
         self.issues.push(Issue {
-            path: path.to_path_buf(),
+            path: forward_slashes(path),
             line,
             rule,
             severity,
