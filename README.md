@@ -372,10 +372,6 @@ Exactly one process ever holds the database open: the first `crystalline mcp` or
 
 ## Roadmap
 
-Shipped in 0.2.0: virtual domains that live in the database, a PostgreSQL backend for shared deployments and multi-instance collaboration with per-domain host locks.
-
-Ahead:
-
 - Versioning and collaboration on a knowledge base through git.
 - Authentication for the optional HTTP transport, which is unauthenticated today regardless of bind address. That is fine on the `127.0.0.1` default; the container image binds `0.0.0.0` so agents on the host can reach it, so treat the network boundary around the container (a private network, a reverse proxy, firewall rules) as the access control until this ships.
 
