@@ -59,7 +59,11 @@ pub async fn open_store(
             let store: Arc<Mutex<dyn Store>> = Arc::new(Mutex::new(store));
             Ok(store)
         }
-        DatabaseBackend::Postgres => open_postgres(cfg, resilient).await,
+        // Boxed so the caller's future is not sized for the sqlx open and
+        // migration machinery, whose inlined debug-build state machine is
+        // large enough to overflow the smaller default stacks on Windows
+        // main threads and tokio workers.
+        DatabaseBackend::Postgres => Box::pin(open_postgres(cfg, resilient)).await,
     }
 }
 
