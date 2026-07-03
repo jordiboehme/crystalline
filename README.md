@@ -81,6 +81,10 @@ sudo dpkg -i "crystalline_${version#v}_${arch}.deb"
 crystalline --version
 ```
 
+Claude Desktop, via MCP Bundle - one click, no terminal needed:
+
+Download the `.mcpb` file for your platform from the [latest release](https://github.com/jordiboehme/crystalline/releases/latest), then in Claude Desktop open Settings > Extensions > Advanced settings > Install Extension... and pick the file. Choose your knowledge folders in the extension settings; Crystalline prepares each folder as a domain automatically. See the Claude Desktop extension scenario under Deployment scenarios below.
+
 Anywhere else, download a prebuilt binary from the [latest release](https://github.com/jordiboehme/crystalline/releases/latest). Four platforms are published:
 
 | Platform | Archive |
@@ -165,13 +169,15 @@ Codex CLI:
 codex mcp add crystalline -- crystalline mcp
 ```
 
+Claude Desktop: install the `.mcpb` bundle from the Install section above - no manual configuration, knowledge folders are managed in Settings > Extensions.
+
 Any other harness: configure a stdio MCP server that runs `crystalline` with the argument `mcp`.
 
 The first agent to connect starts a background daemon that loads the embedding model once and watches every registered domain for changes; every later connection - other agents, other terminals, other harnesses - attaches to that same daemon instead of starting a second copy. One shared instance, one loaded model, one consistent view of the index, no matter how many agents are talking to it at once.
 
 ## Deployment scenarios
 
-Crystalline runs the same way in every scenario: a daemon in the middle keeps one search index in sync with knowledge files on disk, and one or more agents connect to it, whether that connection is a local stdio pipe or a network HTTP endpoint. The five scenarios below are variations on that one architecture.
+Crystalline runs the same way in every scenario: a daemon in the middle keeps one search index in sync with knowledge files on disk, and one or more agents connect to it, whether that connection is a local stdio pipe or a network HTTP endpoint. The six scenarios below are variations on that one architecture.
 
 ### Personal workstation
 
@@ -182,6 +188,18 @@ flowchart LR
     A1[Agent] -->|stdio| D[Daemon]
     A2[Agent] -->|stdio| D
     D --> K[Knowledge files]
+    D --> I[Index]
+```
+
+### Claude Desktop extension
+
+For someone who never opens a terminal, the `.mcpb` bundle wraps the same binary in a one-click Claude Desktop extension. Claude Desktop renders a native folder picker from the bundle manifest; every picked folder is prepared as a domain automatically, MANIFEST.md included, and `Documents/Crystalline/Personal` is created as the starter domain out of the box. Under the hood Claude Desktop spawns `crystalline mcp --domain <folder>` per picked folder over stdio, landing on the same daemon as the personal workstation shape. Removing a folder from the settings never deletes its knowledge.
+
+```mermaid
+flowchart LR
+    U[Folder picker in Settings] --> CD[Claude Desktop]
+    CD -->|stdio, one-click install| D[Daemon]
+    D --> K[Knowledge folders]
     D --> I[Index]
 ```
 
