@@ -134,19 +134,21 @@ Edit `~/knowledge/engineering/MANIFEST.md`'s `## Scope` and `## When to Use` sec
 
 ## Connect your agent
 
-Crystalline runs as an MCP server over stdio. Any MCP-capable harness works; add this to its MCP server configuration (this is the shape Claude Code's `.mcp.json` uses):
+Crystalline runs as an MCP server over stdio. Any MCP-capable harness works - the server command is always `crystalline mcp`.
 
-```json
-{
-  "mcpServers": {
-    "crystalline": {
-      "type": "stdio",
-      "command": "crystalline",
-      "args": ["mcp"]
-    }
-  }
-}
+Claude Code (registered for all your projects):
+
+```sh
+claude mcp add crystalline --scope user crystalline mcp
 ```
+
+Codex CLI:
+
+```sh
+codex mcp add crystalline -- crystalline mcp
+```
+
+Any other harness: configure a stdio MCP server that runs `crystalline` with the argument `mcp`.
 
 The first agent to connect starts a background daemon that loads the embedding model once and watches every registered domain for changes; every later connection - other agents, other terminals, other harnesses - attaches to that same daemon instead of starting a second copy. One shared instance, one loaded model, one consistent view of the index, no matter how many agents are talking to it at once.
 
