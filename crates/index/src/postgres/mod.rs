@@ -18,6 +18,12 @@
 //!   to it until `commit()`/`rollback()`. Because the engine serializes all store
 //!   access behind one mutex, this reproduces Turso's single-connection model and
 //!   gives the CAS the same atomicity.
+//! - Unlike Turso's unenforced `F32_BLOB`, pgvector enforces the `chunk.embedding`
+//!   column's declared width at insert. `store_embeddings` resizes it to the
+//!   active provider's `dims` on the fly (see `ensure_embedding_width`), so any
+//!   provider works on either backend; a dims change already invalidates every
+//!   stored vector through the existing staleness machinery, so the resize rides
+//!   that invalidation instead of adding a new one.
 
 mod migrations;
 mod search;
@@ -57,6 +63,11 @@ pub struct PostgresStore {
     // Tag name to id, to avoid re-interning tags during a sync. Cleared on
     // rollback and wipe so a rolled-back tag id is never served stale.
     tag_cache: Mutex<HashMap<String, i64>>,
+    // The `chunk.embedding` column width last confirmed by this store, so a
+    // same-width `store_embeddings` call skips the catalog lookup. `None`
+    // until the first call; set by `ensure_embedding_width`, never by wipe
+    // (wiping rows never changes the column type).
+    embedding_width: Mutex<Option<i64>>,
 }
 
 /// A connection handle for one store method: either the pinned transaction
@@ -121,6 +132,7 @@ impl PostgresStore {
             schema_version,
             schema,
             tag_cache: Mutex::new(HashMap::new()),
+            embedding_width: Mutex::new(None),
         })
     }
 
@@ -173,6 +185,63 @@ impl PostgresStore {
             .unwrap()
             .insert(name.to_string(), row.0);
         Ok(row.0)
+    }
+
+    /// Make the `chunk.embedding` column's width match `dims`, resizing it
+    /// first when it does not. `dims` always comes from the active provider,
+    /// so a resize means the provider (or its model) changed, which already
+    /// invalidates every stored vector through the staleness machinery in
+    /// [`crate::postgres::search`]: stored embeddings at another width or
+    /// model are already treated as stale and re-embedded in the background,
+    /// so this resize rides that invalidation rather than adding a new one.
+    /// The `USING NULL` clears every existing vector regardless of its old
+    /// width, since none of them are valid at the new one anyway. The HNSW
+    /// index is dropped first and recreated after, because Postgres refuses
+    /// to change a column's type while an index depends on it.
+    ///
+    /// Idempotent and cheap once the width is known: a single cached
+    /// comparison, or failing that one `pg_attribute` lookup, on every call
+    /// that already matches.
+    async fn ensure_embedding_width(&self, conn: &mut PgConnection, dims: usize) -> Result<()> {
+        let dims = dims as i64;
+        if *self.embedding_width.lock().unwrap() == Some(dims) {
+            return Ok(());
+        }
+        // `atttypmod` on a pgvector column is the declared dimension count
+        // itself (pgvector stores it unmodified, unlike the `length + 4`
+        // convention `char(n)`/`varchar(n)` use), so no decoding is needed.
+        // `to_regclass` resolves through the connection's `search_path`, so
+        // this finds the right `chunk` table under per-test schema isolation
+        // without any schema-qualification.
+        let current: Option<(i32,)> = sqlx::query_as(
+            "SELECT atttypmod FROM pg_attribute \
+             WHERE attrelid = to_regclass('chunk') AND attname = 'embedding' AND NOT attisdropped",
+        )
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(IndexError::from)?;
+        if current.map(|(t,)| t as i64) == Some(dims) {
+            *self.embedding_width.lock().unwrap() = Some(dims);
+            return Ok(());
+        }
+        sqlx::query("DROP INDEX IF EXISTS idx_chunk_embedding")
+            .execute(&mut *conn)
+            .await
+            .map_err(IndexError::from)?;
+        sqlx::query(AssertSqlSafe(format!(
+            "ALTER TABLE chunk ALTER COLUMN embedding TYPE vector({dims}) USING NULL"
+        )))
+        .execute(&mut *conn)
+        .await
+        .map_err(IndexError::from)?;
+        sqlx::query(
+            "CREATE INDEX idx_chunk_embedding ON chunk USING hnsw (embedding vector_cosine_ops)",
+        )
+        .execute(&mut *conn)
+        .await
+        .map_err(IndexError::from)?;
+        *self.embedding_width.lock().unwrap() = Some(dims);
+        Ok(())
     }
 }
 
@@ -1004,6 +1073,7 @@ impl Store for PostgresStore {
                     row.dims
                 )));
             }
+            self.ensure_embedding_width(&mut *c, row.dims).await?;
             let vector = pgvector::Vector::from(row.embedding.clone());
             sqlx::query("UPDATE chunk SET embedding=$1, dims=$2, model=$3 WHERE id=$4")
                 .bind(vector)

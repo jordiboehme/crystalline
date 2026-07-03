@@ -47,9 +47,10 @@ pub const MIGRATIONS: &[Migration] = &[
 // strings, not `date`/`timestamptz`, so the canonical current filter and every
 // lexical comparison are byte-identical to Turso and the shared parity suite
 // ports directly. `metadata` is JSONB so filters use native `->>` operators.
-// The chunk embedding is `vector(384)` with an HNSW cosine index; the 384 width
-// is enforced by Postgres (unlike Turso's unenforced `F32_BLOB(384)`), so
-// alternate-dimension providers require the Turso backend in v0.2.0.
+// The chunk embedding starts at `vector(384)` with an HNSW cosine index,
+// matching the local default model; `PostgresStore::ensure_embedding_width`
+// resizes the column (and its index) to whatever the active provider's dims
+// are, so this starting width is just the initial value, not a fixed limit.
 const SCHEMA_V1: &str = r#"
 CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public;
 

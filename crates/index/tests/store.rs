@@ -12,8 +12,8 @@
 use std::path::Path;
 
 use crystalline_index::{
-    DomainKind, EngramId, EngramRecord, FileStamp, FilterOp, HostClaim, IndexError, MetadataFilter,
-    RecentFilter, SearchMode, SearchQuery, Store, TursoStore, sync_domain,
+    DomainKind, EmbeddingRow, EngramId, EngramRecord, FileStamp, FilterOp, HostClaim, IndexError,
+    MetadataFilter, RecentFilter, SearchMode, SearchQuery, Store, TursoStore, sync_domain,
 };
 
 fn write(dir: &Path, rel: &str, content: &str) {
@@ -1000,3 +1000,151 @@ async fn seed_ids_stable(store: &dyn Store) {
     assert!(matches!(id1, Some(EngramId(_))));
 }
 parity!(seed_ids_are_stable_across_lookups, seed_ids_stable);
+
+// --- embedding column width -------------------------------------------------
+
+/// A deterministic, network-free embedding: hashes each word into one of
+/// `dims` buckets and L2-normalizes, so texts sharing vocabulary get similar
+/// vectors. Parameterized on `dims` so the same corpus can stand in for a
+/// narrow remote provider and for the local default width in the same test.
+fn embed_one(text: &str, dims: usize) -> Vec<f32> {
+    let mut v = vec![0f32; dims];
+    for tok in text
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|s| !s.is_empty())
+    {
+        let mut h: u64 = 0;
+        for byte in tok.to_lowercase().bytes() {
+            h = h.wrapping_mul(31).wrapping_add(byte as u64);
+        }
+        v[(h % dims as u64) as usize] += 1.0;
+    }
+    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm == 0.0 {
+        let mut z = vec![0f32; dims];
+        z[0] = 1.0;
+        return z;
+    }
+    v.iter().map(|x| x / norm).collect()
+}
+
+fn semantic_query(text: &str, dims: usize, model: &str) -> SearchQuery {
+    SearchQuery {
+        text: Some(text.to_string()),
+        mode: SearchMode::Semantic,
+        query_embedding: Some(embed_one(text, dims)),
+        active_model: Some(model.to_string()),
+        min_similarity: Some(0.0),
+        limit: 10,
+        page: 1,
+        ..SearchQuery::default()
+    }
+}
+
+/// The `chunk.embedding` column follows the active provider's width rather
+/// than being fixed at whatever the initial migration picked. A narrow
+/// (8-dim) provider stores and searches fine even though the Postgres column
+/// starts at 384; switching to a 384-dim provider resizes it back, also
+/// without error. A dims change already invalidates every stored vector
+/// through the existing staleness machinery (mixed dims already refuse
+/// semantic search and already mark chunks pending re-embedding), so the
+/// resize rides that invalidation rather than adding a new failure mode. On
+/// Turso this is unchanged behavior (its blob column was never width
+/// enforced); the point of running it here is that the same body now passes
+/// on Postgres too.
+async fn embedding_width_follows_provider(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "db.md",
+        &engram(
+            "Databases",
+            "databases",
+            "engram",
+            "",
+            "postgres postgres index index query query",
+        ),
+    );
+    write(
+        root,
+        "cook.md",
+        &engram(
+            "Cooking",
+            "cooking",
+            "engram",
+            "",
+            "recipe recipe kitchen kitchen food food",
+        ),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+
+    // A narrow provider stores fine even though the column starts at 384: no
+    // error surfaces on either backend.
+    let jobs = store
+        .chunks_needing_embedding("narrow-8", None)
+        .await
+        .unwrap();
+    assert!(!jobs.is_empty(), "chunks await embedding after sync");
+    let pending = jobs.len();
+    let rows: Vec<EmbeddingRow> = jobs
+        .iter()
+        .map(|j| EmbeddingRow {
+            chunk_id: j.chunk_id,
+            embedding: embed_one(&j.text, 8),
+            dims: 8,
+        })
+        .collect();
+    store.store_embeddings(&rows, "narrow-8").await.unwrap();
+
+    let narrow_hits = store
+        .search(&semantic_query("postgres index query", 8, "narrow-8"))
+        .await
+        .unwrap();
+    assert_eq!(
+        narrow_hits.items[0].permalink, "databases",
+        "8-dim embeddings rank correctly once the column narrows"
+    );
+
+    // A 384-dim provider resizes the column back and stores fine too. The
+    // model swap makes every chunk pending again, dims aside.
+    let jobs = store
+        .chunks_needing_embedding("wide-384", None)
+        .await
+        .unwrap();
+    assert_eq!(
+        jobs.len(),
+        pending,
+        "the model swap makes every chunk pending again"
+    );
+    let rows: Vec<EmbeddingRow> = jobs
+        .iter()
+        .map(|j| EmbeddingRow {
+            chunk_id: j.chunk_id,
+            embedding: embed_one(&j.text, 384),
+            dims: 384,
+        })
+        .collect();
+    store.store_embeddings(&rows, "wide-384").await.unwrap();
+
+    let wide_hits = store
+        .search(&semantic_query("postgres index query", 384, "wide-384"))
+        .await
+        .unwrap();
+    assert_eq!(
+        wide_hits.items[0].permalink, "databases",
+        "384-dim embeddings rank correctly once the column widens back"
+    );
+    assert!(
+        store
+            .chunks_needing_embedding("wide-384", None)
+            .await
+            .unwrap()
+            .is_empty(),
+        "nothing left pending for the active model"
+    );
+}
+parity!(
+    embedding_column_width_follows_provider_dims,
+    embedding_width_follows_provider
+);
