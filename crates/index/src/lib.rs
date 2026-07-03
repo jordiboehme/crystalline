@@ -16,6 +16,7 @@
 
 pub mod embed;
 mod error;
+mod factory;
 mod store;
 mod sync;
 pub mod turso;
@@ -25,6 +26,7 @@ pub use embed::{
     download_local_model, provider_from_config, run_embedding_pass,
 };
 pub use error::{IndexError, Result};
+pub use factory::open_store;
 pub use store::{
     ChunkJob, ChunkModelCount, DomainId, DomainStats, EdgeKind, EmbeddingCoverage, EmbeddingRow,
     EngramDescriptor, EngramId, EngramRecord, EngramSummary, FileStamp, FilterOp, FtsMode,

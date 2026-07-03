@@ -10,7 +10,6 @@ use rmcp::model::{CallToolRequestParams, CallToolResult};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::Mutex as TokioMutex;
 
 use crate::daemon::{load_config, open_store, resolve_db};
 use crate::engine::{Engine, open_standalone};
@@ -76,7 +75,7 @@ async fn run_embedded_stdio(
     let config = load_config(config_path)?;
     let read_only = read_only || config.read_only();
     let db_path = resolve_db(db)?;
-    let store = open_store(&db_path).await?;
+    let store = open_store(&config, Some(&db_path)).await?;
     // The provider is built in the background so the stdio session is ready and
     // text search works before any model download completes. There is no
     // watcher task in this mode, so `config_path` only helps a domain added
@@ -84,7 +83,7 @@ async fn run_embedded_stdio(
     // file changes.
     let engine = Arc::new(
         Engine::new(
-            Arc::new(TokioMutex::new(store)),
+            store,
             config.clone(),
             None,
             config_path.map(Path::to_path_buf),

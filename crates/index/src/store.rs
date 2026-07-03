@@ -513,10 +513,10 @@ pub struct EngramSummary {
 
 /// A lightweight engram descriptor, enough to locate its file and address it.
 ///
-/// Returned by the service-layer lookup helpers on [`crate::TursoStore`] that
-/// back identifier resolution, browsing, validation and schema inference. It
-/// carries the ids so a caller can go straight to a graph traversal or a
-/// single-file upsert without a second query.
+/// Returned by the [`Store`] lookup methods that back identifier resolution,
+/// browsing, validation and schema inference. It carries the ids so a caller can
+/// go straight to a graph traversal or a single-file upsert without a second
+/// query.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EngramDescriptor {
     /// The engram id.
@@ -705,6 +705,45 @@ pub trait Store: Send + Sync {
     /// matching the target text against permalink then title within the target
     /// domain. Returns the number of relations newly resolved.
     async fn resolve_pending_relations(&self, domain: DomainId) -> Result<u64>;
+
+    // --- lookups -------------------------------------------------------------
+    // Repository-level addressing helpers used by the service layer to turn a
+    // tool identifier or a `crystalline://` anchor into ids and a file path.
+    // They are on the trait (not backend-specific) so the engine can hold a
+    // `dyn Store` and a second backend reimplements them in its own dialect.
+
+    /// Resolve a `(domain, permalink)` pair to an engram id. Backs graph anchors
+    /// and `crystalline://` resolution.
+    async fn lookup_id(&self, domain: &str, permalink: &str) -> Result<Option<EngramId>>;
+
+    /// Resolve an identifier within one domain to a descriptor. Matches the
+    /// permalink first, then the title case-insensitively.
+    async fn find_engram(&self, domain: &str, key: &str) -> Result<Option<EngramDescriptor>>;
+
+    /// Resolve an identifier across every domain, permalink first then title.
+    /// Returns all matches so the caller can detect an ambiguous bare identifier.
+    async fn find_engram_any(&self, key: &str) -> Result<Vec<EngramDescriptor>>;
+
+    /// List engrams in a domain, optionally under a domain-relative path prefix
+    /// and optionally of a given type, ordered by path. Backs browse, validate
+    /// and schema inference.
+    async fn list_engrams(
+        &self,
+        domain: &str,
+        path_prefix: Option<&str>,
+        engram_type: Option<&str>,
+    ) -> Result<Vec<EngramDescriptor>>;
+
+    /// Every relation or prose link that points at the given engram, with the
+    /// linking engram's path and the exact target text. Used by the cross-domain
+    /// move to rewrite inbound links.
+    async fn inbound_refs(
+        &self,
+        engram_id: EngramId,
+        domain_id: DomainId,
+        permalink: &str,
+        title: &str,
+    ) -> Result<Vec<InboundRef>>;
 
     /// Run a search and return one page of hits plus the total match count.
     async fn search(&self, query: &SearchQuery) -> Result<Page<SearchHit>>;

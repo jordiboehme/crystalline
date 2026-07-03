@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use crystalline_core::config::{self, GlobalConfig, HttpSetting};
+use crystalline_index::Store;
 use interprocess::local_socket::tokio::Stream as IpcStream;
 use notify::{RecursiveMode, Watcher};
 use serde_json::Value;
@@ -130,7 +131,7 @@ pub async fn run_serve(
     // Take ownership first so a second daemon fails fast with the live pid.
     let ownership = acquire_ownership()?;
 
-    let store = open_store(&db_path).await?;
+    let store = open_store(&config, Some(&db_path)).await?;
     // A channel the engine uses to tell the watcher (spawned below) about a
     // domain registered after this daemon started, so it starts watching that
     // root without a restart. See `Engine::domain_root`'s fresh-config fallback.
@@ -138,14 +139,9 @@ pub async fn run_serve(
     // The provider is built in the background (see below); text search and the
     // socket never wait on the model download.
     let engine = Arc::new(
-        Engine::new(
-            Arc::new(TokioMutex::new(store)),
-            config.clone(),
-            None,
-            config_path.clone(),
-        )
-        .with_watch_channel(watch_tx)
-        .with_read_only(read_only),
+        Engine::new(store, config.clone(), None, config_path.clone())
+            .with_watch_channel(watch_tx)
+            .with_read_only(read_only),
     );
 
     // Bind the socket and publish the lock record: this is the readiness point,
@@ -542,13 +538,11 @@ pub(crate) fn resolve_db(db: Option<&Path>) -> anyhow::Result<PathBuf> {
     }
 }
 
-pub(crate) async fn open_store(db: &Path) -> anyhow::Result<crystalline_index::TursoStore> {
-    if let Some(parent) = db.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)?;
-    }
-    Ok(crystalline_index::TursoStore::open(db).await?)
+pub(crate) async fn open_store(
+    cfg: &GlobalConfig,
+    db: Option<&Path>,
+) -> anyhow::Result<Arc<TokioMutex<dyn Store>>> {
+    Ok(crystalline_index::open_store(&cfg.database(), db, false).await?)
 }
 
 #[cfg(test)]

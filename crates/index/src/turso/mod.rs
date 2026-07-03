@@ -112,134 +112,6 @@ impl TursoStore {
         Ok(id)
     }
 
-    /// Resolve a `(domain, permalink)` pair to an engram id. Used by graph
-    /// anchors and by tests; the M5 daemon resolves `crystalline://` anchors
-    /// through this.
-    pub async fn lookup_id(&self, domain: &str, permalink: &str) -> Result<Option<EngramId>> {
-        let row = query_first(
-            &self.conn,
-            "SELECT e.id FROM engram e JOIN domain d ON d.id=e.domain_id WHERE d.name=?1 AND e.permalink=?2",
-            vec![Value::Text(domain.to_string()), Value::Text(permalink.to_string())],
-        )
-        .await?;
-        Ok(row.and_then(|r| cell_i64(&r, 0)).map(EngramId))
-    }
-
-    /// Resolve an identifier within one domain to a descriptor. Matches the
-    /// permalink first, then the title case-insensitively. Used by the service
-    /// layer to turn a tool identifier into a file path and ids.
-    pub async fn find_engram(&self, domain: &str, key: &str) -> Result<Option<EngramDescriptor>> {
-        let rows = query_all(
-            &self.conn,
-            "SELECT e.id, e.domain_id, d.name, e.path, e.permalink, e.title, e.engram_type, e.status \
-             FROM engram e JOIN domain d ON d.id=e.domain_id \
-             WHERE d.name=?1 AND (e.permalink=?2 OR lower(e.title)=lower(?2)) \
-             ORDER BY CASE WHEN e.permalink=?2 THEN 0 ELSE 1 END, e.path LIMIT 1",
-            vec![Value::Text(domain.to_string()), Value::Text(key.to_string())],
-        )
-        .await?;
-        Ok(rows.first().map(descriptor_from_row))
-    }
-
-    /// Resolve an identifier across every domain, permalink first then title.
-    /// Returns all matches so the caller can detect an ambiguous bare identifier.
-    pub async fn find_engram_any(&self, key: &str) -> Result<Vec<EngramDescriptor>> {
-        let rows = query_all(
-            &self.conn,
-            "SELECT e.id, e.domain_id, d.name, e.path, e.permalink, e.title, e.engram_type, e.status \
-             FROM engram e JOIN domain d ON d.id=e.domain_id \
-             WHERE e.permalink=?1 OR lower(e.title)=lower(?1) \
-             ORDER BY CASE WHEN e.permalink=?1 THEN 0 ELSE 1 END, d.name, e.path",
-            vec![Value::Text(key.to_string())],
-        )
-        .await?;
-        Ok(rows.iter().map(descriptor_from_row).collect())
-    }
-
-    /// List engrams in a domain, optionally under a domain-relative path prefix
-    /// and optionally of a given type, ordered by path. Backs browse, validate
-    /// and schema inference.
-    pub async fn list_engrams(
-        &self,
-        domain: &str,
-        path_prefix: Option<&str>,
-        engram_type: Option<&str>,
-    ) -> Result<Vec<EngramDescriptor>> {
-        let mut clauses = vec!["d.name=?1".to_string()];
-        let mut params = vec![Value::Text(domain.to_string())];
-        let mut n = 2;
-        if let Some(prefix) = path_prefix.filter(|p| !p.is_empty()) {
-            clauses.push(format!("e.path LIKE ?{n} ESCAPE '\\'"));
-            params.push(Value::Text(format!("{}%", like_escape(prefix))));
-            n += 1;
-        }
-        if let Some(t) = engram_type {
-            clauses.push(format!("e.engram_type=?{n}"));
-            params.push(Value::Text(t.to_string()));
-        }
-        let sql = format!(
-            "SELECT e.id, e.domain_id, d.name, e.path, e.permalink, e.title, e.engram_type, e.status \
-             FROM engram e JOIN domain d ON d.id=e.domain_id WHERE {} ORDER BY e.path",
-            clauses.join(" AND ")
-        );
-        let rows = query_all(&self.conn, &sql, params).await?;
-        Ok(rows.iter().map(descriptor_from_row).collect())
-    }
-
-    /// Every relation or prose link that points at the given engram, with the
-    /// linking engram's path and the exact target text. Used by the cross-domain
-    /// move to rewrite inbound links.
-    ///
-    /// Matches both already-resolved references (`to_id`) and unresolved *bare*
-    /// references in the engram's own domain whose target text is the engram's
-    /// permalink or title. Prose wikilinks are never assigned a `to_id`, so the
-    /// text match is what catches them; `to_domain IS NULL` restricts the rewrite
-    /// to bare links that would otherwise dangle after the move.
-    pub async fn inbound_refs(
-        &self,
-        engram_id: EngramId,
-        domain_id: DomainId,
-        permalink: &str,
-        title: &str,
-    ) -> Result<Vec<InboundRef>> {
-        let params = vec![
-            Value::Integer(engram_id.0),
-            Value::Integer(domain_id.0),
-            Value::Text(permalink.to_string()),
-            Value::Text(title.to_string()),
-        ];
-        let rows = query_all(
-            &self.conn,
-            "SELECT d.name, r.domain_id, e.path, r.to_target, 0 \
-             FROM relation r JOIN engram e ON e.id=r.engram_id JOIN domain d ON d.id=e.domain_id \
-             WHERE r.to_id=?1 \
-                OR (r.to_id IS NULL AND r.domain_id=?2 AND r.to_domain IS NULL \
-                    AND (r.to_target=?3 OR lower(r.to_target)=lower(?4))) \
-             UNION ALL \
-             SELECT d.name, l.domain_id, e.path, l.to_target, 1 \
-             FROM link l JOIN engram e ON e.id=l.engram_id JOIN domain d ON d.id=e.domain_id \
-             WHERE l.to_id=?1 \
-                OR (l.to_id IS NULL AND l.domain_id=?2 AND l.to_domain IS NULL \
-                    AND (l.to_target=?3 OR lower(l.to_target)=lower(?4)))",
-            params,
-        )
-        .await?;
-        Ok(rows
-            .iter()
-            .map(|r| InboundRef {
-                src_domain: cell_text(r, 0).unwrap_or_default(),
-                src_domain_id: DomainId(cell_i64(r, 1).unwrap_or(0)),
-                src_path: cell_text(r, 2).unwrap_or_default(),
-                to_target: cell_text(r, 3).unwrap_or_default(),
-                kind: if cell_i64(r, 4).unwrap_or(0) == 0 {
-                    EdgeKind::Relation
-                } else {
-                    EdgeKind::Link
-                },
-            })
-            .collect())
-    }
-
     /// Return the `EXPLAIN QUERY PLAN` detail lines for a query. Diagnostic; used
     /// by the temporal-index test to assert the current filter is an index seek.
     pub async fn explain_query_plan(&self, sql: &str) -> Result<Vec<String>> {
@@ -631,6 +503,120 @@ impl Store for TursoStore {
             .execute(&sql, vec![Value::Integer(domain.0)])
             .await?;
         Ok(n)
+    }
+
+    async fn lookup_id(&self, domain: &str, permalink: &str) -> Result<Option<EngramId>> {
+        let row = query_first(
+            &self.conn,
+            "SELECT e.id FROM engram e JOIN domain d ON d.id=e.domain_id WHERE d.name=?1 AND e.permalink=?2",
+            vec![Value::Text(domain.to_string()), Value::Text(permalink.to_string())],
+        )
+        .await?;
+        Ok(row.and_then(|r| cell_i64(&r, 0)).map(EngramId))
+    }
+
+    async fn find_engram(&self, domain: &str, key: &str) -> Result<Option<EngramDescriptor>> {
+        let rows = query_all(
+            &self.conn,
+            "SELECT e.id, e.domain_id, d.name, e.path, e.permalink, e.title, e.engram_type, e.status \
+             FROM engram e JOIN domain d ON d.id=e.domain_id \
+             WHERE d.name=?1 AND (e.permalink=?2 OR lower(e.title)=lower(?2)) \
+             ORDER BY CASE WHEN e.permalink=?2 THEN 0 ELSE 1 END, e.path LIMIT 1",
+            vec![Value::Text(domain.to_string()), Value::Text(key.to_string())],
+        )
+        .await?;
+        Ok(rows.first().map(descriptor_from_row))
+    }
+
+    async fn find_engram_any(&self, key: &str) -> Result<Vec<EngramDescriptor>> {
+        let rows = query_all(
+            &self.conn,
+            "SELECT e.id, e.domain_id, d.name, e.path, e.permalink, e.title, e.engram_type, e.status \
+             FROM engram e JOIN domain d ON d.id=e.domain_id \
+             WHERE e.permalink=?1 OR lower(e.title)=lower(?1) \
+             ORDER BY CASE WHEN e.permalink=?1 THEN 0 ELSE 1 END, d.name, e.path",
+            vec![Value::Text(key.to_string())],
+        )
+        .await?;
+        Ok(rows.iter().map(descriptor_from_row).collect())
+    }
+
+    async fn list_engrams(
+        &self,
+        domain: &str,
+        path_prefix: Option<&str>,
+        engram_type: Option<&str>,
+    ) -> Result<Vec<EngramDescriptor>> {
+        let mut clauses = vec!["d.name=?1".to_string()];
+        let mut params = vec![Value::Text(domain.to_string())];
+        let mut n = 2;
+        if let Some(prefix) = path_prefix.filter(|p| !p.is_empty()) {
+            clauses.push(format!("e.path LIKE ?{n} ESCAPE '\\'"));
+            params.push(Value::Text(format!("{}%", like_escape(prefix))));
+            n += 1;
+        }
+        if let Some(t) = engram_type {
+            clauses.push(format!("e.engram_type=?{n}"));
+            params.push(Value::Text(t.to_string()));
+        }
+        let sql = format!(
+            "SELECT e.id, e.domain_id, d.name, e.path, e.permalink, e.title, e.engram_type, e.status \
+             FROM engram e JOIN domain d ON d.id=e.domain_id WHERE {} ORDER BY e.path",
+            clauses.join(" AND ")
+        );
+        let rows = query_all(&self.conn, &sql, params).await?;
+        Ok(rows.iter().map(descriptor_from_row).collect())
+    }
+
+    async fn inbound_refs(
+        &self,
+        engram_id: EngramId,
+        domain_id: DomainId,
+        permalink: &str,
+        title: &str,
+    ) -> Result<Vec<InboundRef>> {
+        // Matches both already-resolved references (`to_id`) and unresolved
+        // *bare* references in the engram's own domain whose target text is the
+        // engram's permalink or title. Prose wikilinks are never assigned a
+        // `to_id`, so the text match is what catches them; `to_domain IS NULL`
+        // restricts the rewrite to bare links that would otherwise dangle after
+        // the move.
+        let params = vec![
+            Value::Integer(engram_id.0),
+            Value::Integer(domain_id.0),
+            Value::Text(permalink.to_string()),
+            Value::Text(title.to_string()),
+        ];
+        let rows = query_all(
+            &self.conn,
+            "SELECT d.name, r.domain_id, e.path, r.to_target, 0 \
+             FROM relation r JOIN engram e ON e.id=r.engram_id JOIN domain d ON d.id=e.domain_id \
+             WHERE r.to_id=?1 \
+                OR (r.to_id IS NULL AND r.domain_id=?2 AND r.to_domain IS NULL \
+                    AND (r.to_target=?3 OR lower(r.to_target)=lower(?4))) \
+             UNION ALL \
+             SELECT d.name, l.domain_id, e.path, l.to_target, 1 \
+             FROM link l JOIN engram e ON e.id=l.engram_id JOIN domain d ON d.id=e.domain_id \
+             WHERE l.to_id=?1 \
+                OR (l.to_id IS NULL AND l.domain_id=?2 AND l.to_domain IS NULL \
+                    AND (l.to_target=?3 OR lower(l.to_target)=lower(?4)))",
+            params,
+        )
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| InboundRef {
+                src_domain: cell_text(r, 0).unwrap_or_default(),
+                src_domain_id: DomainId(cell_i64(r, 1).unwrap_or(0)),
+                src_path: cell_text(r, 2).unwrap_or_default(),
+                to_target: cell_text(r, 3).unwrap_or_default(),
+                kind: if cell_i64(r, 4).unwrap_or(0) == 0 {
+                    EdgeKind::Relation
+                } else {
+                    EdgeKind::Link
+                },
+            })
+            .collect())
     }
 
     async fn search(&self, query: &SearchQuery) -> Result<Page<SearchHit>> {

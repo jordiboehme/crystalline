@@ -18,7 +18,7 @@ use std::path::Path;
 use anyhow::{Result, anyhow};
 use crystalline_core::config::{self, DomainEntry, GlobalConfig};
 use crystalline_core::verify::{self, VerifyOptions};
-use crystalline_index::{Store, TursoStore, configured_model_id};
+use crystalline_index::{Store, configured_model_id};
 use crystalline_service::instance;
 use serde::Serialize;
 
@@ -124,22 +124,29 @@ pub async fn run(
 
     let store = if db.is_file() {
         Some(
-            TursoStore::open(&db)
+            crystalline_index::open_store(&cfg.database(), Some(&db), false)
                 .await
                 .map_err(|e| anyhow!("could not open the index at {}: {e}", db.display()))?,
         )
     } else {
         None
     };
+    // Lock once for the whole diagnostic pass: a one-shot CLI command has no
+    // concurrent store users, and the helpers take a plain `&dyn Store`.
+    let guard = match &store {
+        Some(s) => Some(s.lock().await),
+        None => None,
+    };
+    let store_ref: Option<&dyn Store> = guard.as_ref().map(|g| &**g as &dyn Store);
 
     let mut domains = Vec::with_capacity(targets.len());
     for (name, entry) in &targets {
-        domains.push(check_domain(name, entry, store.as_ref(), fix).await?);
+        domains.push(check_domain(name, entry, store_ref, fix).await?);
     }
 
     let service = check_service(fix)?;
 
-    let embeddings = match &store {
+    let embeddings = match store_ref {
         Some(store) => Some(embedding_summary(store, &cfg).await?),
         None => None,
     };
@@ -172,7 +179,7 @@ fn select_domains(cfg: &GlobalConfig, only: Option<&str>) -> Result<Vec<(String,
 async fn check_domain(
     name: &str,
     entry: &DomainEntry,
-    store: Option<&TursoStore>,
+    store: Option<&dyn Store>,
     fix: bool,
 ) -> Result<DomainDoctor> {
     let path = cmd::resolve_domain_path(entry);
@@ -316,7 +323,7 @@ fn check_service(fix: bool) -> Result<ServiceDoctor> {
     Ok(s)
 }
 
-async fn embedding_summary(store: &TursoStore, cfg: &GlobalConfig) -> Result<serde_json::Value> {
+async fn embedding_summary(store: &dyn Store, cfg: &GlobalConfig) -> Result<serde_json::Value> {
     let coverage = store
         .embedding_coverage()
         .await

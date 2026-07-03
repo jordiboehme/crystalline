@@ -29,6 +29,11 @@ pub enum ConfigError {
     /// The home directory could not be resolved.
     #[error("could not resolve the home directory: {0}")]
     Home(String),
+    /// The database configuration is invalid, for example a Postgres backend
+    /// without a `postgres://` url. Surfaced at store-factory time, never at
+    /// parse time.
+    #[error("invalid database configuration: {0}")]
+    Database(String),
 }
 
 // --- global config -----------------------------------------------------------
@@ -48,6 +53,10 @@ pub struct GlobalConfig {
     /// Prompt routing settings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<PromptConfig>,
+    /// Storage backend settings. Absent means the Turso backend at the default
+    /// `index.db` path, so every existing config keeps working untouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database: Option<DatabaseConfig>,
 }
 
 impl GlobalConfig {
@@ -61,6 +70,13 @@ impl GlobalConfig {
             .and_then(|s| s.read_only)
             .unwrap_or(false)
     }
+
+    /// The effective database configuration: the configured `database` block,
+    /// or the Turso default when absent. The store factory validates this
+    /// before opening a backend.
+    pub fn database(&self) -> DatabaseConfig {
+        self.database.clone().unwrap_or_default()
+    }
 }
 
 /// A registered domain.
@@ -68,6 +84,54 @@ impl GlobalConfig {
 pub struct DomainEntry {
     /// The domain root path.
     pub path: PathBuf,
+}
+
+/// Which storage backend backs the derived index.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DatabaseBackend {
+    /// The embedded Turso (SQLite-compatible) backend. The default.
+    #[default]
+    Turso,
+    /// An external PostgreSQL backend.
+    Postgres,
+}
+
+/// The `database` block: which backend backs the derived index and, for
+/// PostgreSQL, its connection URL.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DatabaseConfig {
+    /// The storage backend. Absent means Turso.
+    #[serde(default)]
+    pub backend: DatabaseBackend,
+    /// The backend URL. Required for Postgres (`postgres://` or `postgresql://`);
+    /// an optional file-path override for Turso, secondary to the `--db` flag
+    /// and the default `index.db` path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
+impl DatabaseConfig {
+    /// Validate the backend and URL combination. Called at store-factory time,
+    /// not at config parse time, so `verify` and `prompt` never trip on it. A
+    /// Postgres backend requires a non-empty URL beginning `postgres://` or
+    /// `postgresql://`; a Turso backend accepts any URL as a file-path override.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.backend == DatabaseBackend::Postgres {
+            match self.url.as_deref() {
+                Some(u) if u.starts_with("postgres://") || u.starts_with("postgresql://") => Ok(()),
+                Some(_) => Err(ConfigError::Database(
+                    "the postgres backend requires a url beginning postgres:// or postgresql://"
+                        .to_string(),
+                )),
+                None => Err(ConfigError::Database(
+                    "the postgres backend requires a url".to_string(),
+                )),
+            }
+        } else {
+            Ok(())
+        }
+    }
 }
 
 /// Service configuration.
@@ -317,4 +381,85 @@ pub fn models_dir() -> Result<PathBuf, ConfigError> {
         return Ok(expand_tilde(&dir));
     }
     Ok(cache_dir()?.join("models"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn database_absent_defaults_to_turso() {
+        let cfg: GlobalConfig = serde_yaml_ng::from_str("domains: {}").unwrap();
+        assert!(cfg.database.is_none());
+        let effective = cfg.database();
+        assert_eq!(effective.backend, DatabaseBackend::Turso);
+        assert_eq!(effective.url, None);
+        assert!(effective.validate().is_ok());
+    }
+
+    #[test]
+    fn database_block_parses_postgres_with_url() {
+        let yaml = "database:\n  backend: postgres\n  url: postgres://u:p@db:5432/crystalline\n";
+        let cfg: GlobalConfig = serde_yaml_ng::from_str(yaml).unwrap();
+        let db = cfg.database.expect("database block");
+        assert_eq!(db.backend, DatabaseBackend::Postgres);
+        assert_eq!(
+            db.url.as_deref(),
+            Some("postgres://u:p@db:5432/crystalline")
+        );
+        assert!(db.validate().is_ok());
+    }
+
+    #[test]
+    fn turso_default_round_trips_without_a_database_key() {
+        // An absent database block must never write a `database:` line, so old
+        // configs stay byte-identical.
+        let cfg = GlobalConfig::default();
+        let yaml = serde_yaml_ng::to_string(&cfg).unwrap();
+        assert!(
+            !yaml.contains("database"),
+            "default config should not serialize a database block: {yaml}"
+        );
+    }
+
+    #[test]
+    fn database_backend_serializes_lowercase() {
+        let cfg = GlobalConfig {
+            database: Some(DatabaseConfig {
+                backend: DatabaseBackend::Postgres,
+                url: Some("postgresql://localhost/db".to_string()),
+            }),
+            ..GlobalConfig::default()
+        };
+        let yaml = serde_yaml_ng::to_string(&cfg).unwrap();
+        assert!(yaml.contains("backend: postgres"), "{yaml}");
+        assert!(yaml.contains("url: postgresql://localhost/db"), "{yaml}");
+    }
+
+    #[test]
+    fn turso_url_is_an_optional_path_override_and_always_valid() {
+        let db = DatabaseConfig {
+            backend: DatabaseBackend::Turso,
+            url: Some("/tmp/custom-index.db".to_string()),
+        };
+        assert!(db.validate().is_ok());
+    }
+
+    #[test]
+    fn postgres_without_url_fails_validation() {
+        let db = DatabaseConfig {
+            backend: DatabaseBackend::Postgres,
+            url: None,
+        };
+        assert!(db.validate().is_err());
+    }
+
+    #[test]
+    fn postgres_with_a_non_postgres_url_fails_validation() {
+        let db = DatabaseConfig {
+            backend: DatabaseBackend::Postgres,
+            url: Some("mysql://localhost/db".to_string()),
+        };
+        assert!(db.validate().is_err());
+    }
 }

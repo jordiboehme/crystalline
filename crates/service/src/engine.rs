@@ -1,10 +1,12 @@
 //! The shared service engine.
 //!
 //! Every data operation (the 12 MCP tools, the CLI data commands and the ctl
-//! sync and reindex) runs through one [`Engine`]. It owns the single
-//! [`TursoStore`] behind a [`tokio::sync::Mutex`] so turso's single-connection
-//! model is honoured across the daemon's many tasks, the optional embedding
-//! provider (built once), the resolved config and the chunk parameters.
+//! sync and reindex) runs through one [`Engine`]. It owns a single boxed
+//! [`Store`] (`dyn Store`) behind a [`tokio::sync::Mutex`] so the backend's
+//! single-connection model is honoured across the daemon's many tasks, the
+//! optional embedding provider (built once), the resolved config and the chunk
+//! parameters. The concrete backend is chosen at open time by the store factory
+//! from the `database` config block.
 //!
 //! Files are the source of truth: every mutation writes the file first, then
 //! upserts that single file into the store using the on-disk file stamp, so the
@@ -27,7 +29,7 @@ use crystalline_core::{
 };
 use crystalline_index::{
     ChunkParams, DomainId, EmbeddingProvider, EngramDescriptor, EngramId, EngramRecord, FileStamp,
-    RecentFilter, SearchMode, SearchQuery, Store, TursoStore, chunk_engram, configured_model_id,
+    RecentFilter, SearchMode, SearchQuery, Store, chunk_engram, configured_model_id,
     parse_metadata_filters, provider_from_config, sync_domain_with,
 };
 use serde_json::{Value, json};
@@ -107,7 +109,7 @@ pub enum WatchEvent {
 
 /// The shared service engine.
 pub struct Engine {
-    store: Arc<Mutex<TursoStore>>,
+    store: Arc<Mutex<dyn Store>>,
     config: GlobalConfig,
     // The `--config` override this engine was started with, so a domain
     // registered after startup (`domain add` only ever touches the file on
@@ -138,7 +140,7 @@ impl Engine {
     /// startup snapshot; pass `None` when the caller never re-reads (a
     /// one-shot standalone CLI command already sees a fresh config).
     pub fn new(
-        store: Arc<Mutex<TursoStore>>,
+        store: Arc<Mutex<dyn Store>>,
         config: GlobalConfig,
         provider: Option<Arc<dyn EmbeddingProvider>>,
         config_path: Option<PathBuf>,
@@ -182,7 +184,7 @@ impl Engine {
     }
 
     /// The shared store handle, for the daemon's watcher and embed loop.
-    pub fn store(&self) -> Arc<Mutex<TursoStore>> {
+    pub fn store(&self) -> Arc<Mutex<dyn Store>> {
         self.store.clone()
     }
 
@@ -331,7 +333,7 @@ impl Engine {
     /// so the watcher does not reprocess it. Runs in one transaction.
     async fn reindex_file(
         &self,
-        store: &TursoStore,
+        store: &dyn Store,
         domain_id: DomainId,
         root: &Path,
         rel: &str,
@@ -445,7 +447,7 @@ impl Engine {
         let domain_id = store
             .upsert_domain(&p.domain, &root.to_string_lossy())
             .await?;
-        self.reindex_file(&store, domain_id, &root, &rel).await?;
+        self.reindex_file(&*store, domain_id, &root, &rel).await?;
 
         Ok(json!({
             "domain": p.domain,
@@ -548,7 +550,7 @@ impl Engine {
         write_file(&abs, &edited)?;
 
         let store = self.store.lock().await;
-        self.reindex_file(&store, desc.domain_id, &root, &desc.path)
+        self.reindex_file(&*store, desc.domain_id, &root, &desc.path)
             .await?;
 
         Ok(json!({
@@ -623,7 +625,7 @@ impl Engine {
                 let dest_domain_id = store
                     .upsert_domain(&dest_domain, &dest_root.to_string_lossy())
                     .await?;
-                self.reindex_file(&store, dest_domain_id, &dest_root, &dest_rel)
+                self.reindex_file(&*store, dest_domain_id, &dest_root, &dest_rel)
                     .await?;
             } else {
                 store
@@ -653,7 +655,7 @@ impl Engine {
             let replaced = touch_timestamp(&replaced, now_offset());
             write_file(&linker_abs, &replaced)?;
             let store = self.store.lock().await;
-            self.reindex_file(&store, r.src_domain_id, &linker_root, &r.src_path)
+            self.reindex_file(&*store, r.src_domain_id, &linker_root, &r.src_path)
                 .await?;
             rewritten += 1;
         }
@@ -714,7 +716,7 @@ impl Engine {
 
         let store = self.store.lock().await;
         let effective = self
-            .effective_mode(&store, requested, text.is_some())
+            .effective_mode(&*store, requested, text.is_some())
             .await?;
         query.mode = effective;
         if matches!(effective, SearchMode::Semantic | SearchMode::Hybrid)
@@ -742,7 +744,7 @@ impl Engine {
 
     async fn effective_mode(
         &self,
-        store: &TursoStore,
+        store: &dyn Store,
         requested: SearchMode,
         has_text: bool,
     ) -> Result<SearchMode> {
@@ -1203,20 +1205,17 @@ pub async fn open_standalone(
     db: &Path,
     want_embeddings: bool,
 ) -> anyhow::Result<Engine> {
-    if let Some(parent) = db.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)?;
-    }
-    let store = TursoStore::open(db).await?;
+    // The factory resolves the backend from `database`, creates the parent
+    // directory for a Turso file and unsizes the concrete store into a
+    // `dyn Store`. `db` is the resolved `--db` override for the Turso arm.
+    let store = crystalline_index::open_store(&config.database(), Some(db), false).await?;
     // No `config_path`: a standalone command is one-shot, so the config it
     // already loaded is as fresh as any re-read would be. A standalone data
     // command has no `--read-only` flag of its own, so the mode comes purely
     // from `service.read_only`; a read-only config refuses CLI writes here the
     // same way the daemon refuses them over the socket.
     let read_only = config.read_only();
-    let engine =
-        Engine::new(Arc::new(Mutex::new(store)), config, None, None).with_read_only(read_only);
+    let engine = Engine::new(store, config, None, None).with_read_only(read_only);
     // Build the provider (which may download the model) only when the index
     // already holds embeddings for the active model, so a text or filter search
     // never triggers a surprise download. With no embeddings, search falls back
