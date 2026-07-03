@@ -2,8 +2,8 @@
 //! the Engram markdown format, permalink and address logic, the Manifest
 //! model, Picoschema and configuration types. This crate intentionally has
 //! no async, database or ML dependencies, so `crystalline verify` and
-//! `crystalline prompt` can run without a service, a socket or a network
-//! connection.
+//! `crystalline prompt system` can run without a service, a socket or a
+//! network connection.
 //!
 //! The format is Google OKF v0.1 (markdown plus YAML frontmatter, only
 //! `type` required, unknown keys preserved) extended with Crystalline

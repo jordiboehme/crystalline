@@ -52,17 +52,11 @@ enum Command {
         #[arg(long)]
         config: Option<PathBuf>,
     },
-    /// Generate the session-start knowledge routing prompt for a workspace.
-    /// No database, service or network connection is used.
+    /// Generate a session-start knowledge routing prompt. No database,
+    /// service or network connection is used.
     Prompt {
-        /// The workspace path to route for. Defaults to the current
-        /// directory.
-        #[arg(long)]
-        workspace: Option<PathBuf>,
-        /// Load the global config from this file instead of the default
-        /// config path.
-        #[arg(long)]
-        config: Option<PathBuf>,
+        #[command(subcommand)]
+        kind: PromptKind,
     },
     /// Manage the domains registered in the global config.
     Domain {
@@ -339,6 +333,25 @@ enum Command {
     },
 }
 
+/// The kind of prompt to generate. `system` is the only kind today; future
+/// kinds attach here without reshaping the `prompt` command again.
+#[derive(Subcommand, Debug)]
+enum PromptKind {
+    /// Generate the knowledge routing prompt for a workspace: registered
+    /// domains, their routing bullets and the crystalline MCP tool names
+    /// that read and write them.
+    System {
+        /// The workspace path to route for. Defaults to the current
+        /// directory.
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Load the global config from this file instead of the default
+        /// config path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+}
+
 #[derive(Subcommand, Debug)]
 enum CtlCommand {
     /// Show daemon status: pid, uptime, sessions, per-domain stats and embeddings.
@@ -447,7 +460,9 @@ fn main() -> anyhow::Result<()> {
             format,
             config,
         }) => run_verify(paths, strict, format, config, cli.json),
-        Some(Command::Prompt { workspace, config }) => run_prompt(workspace, config, cli.json),
+        Some(Command::Prompt { kind }) => match kind {
+            PromptKind::System { workspace, config } => run_prompt(workspace, config, cli.json),
+        },
         Some(Command::Domain { command }) => run_domain(command, cli.db, cli.json),
         Some(Command::Sync {
             domain,
@@ -971,7 +986,7 @@ fn run_prompt(
 
     let output = crystalline_core::generate_prompt(&global, &workspace);
     for w in &output.warnings {
-        eprintln!("crystalline prompt: warning: {w}");
+        eprintln!("crystalline prompt system: warning: {w}");
     }
 
     if json_flag {

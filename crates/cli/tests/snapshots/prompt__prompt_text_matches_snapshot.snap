@@ -4,13 +4,14 @@ expression: text
 ---
 CRYSTALLINE KNOWLEDGE ROUTING
 
-You are being onboarded to the knowledge accumulated in this workspace. The domains below are registered and ready to use; route searches and reads through them instead of starting from zero.
+You are being onboarded to the knowledge accumulated in this workspace. It is served by the crystalline MCP server; these instructions govern its tools (your harness may prefix tool names, for example mcp__crystalline__search_engrams). The domains below are registered and ready to use; route searches and reads through them instead of starting from zero.
 
 - gardening (preferred): (routing information unavailable: MANIFEST.md is missing or unreadable)
 - astronomy: When asked about moons or planets; When comparing orbital periods
 
 Behavior:
-- Narrow question, one domain clearly fits: search with domains=[that domain].
-- Broad or unclear question: default to an all-domain sweep (omit domains).
-- Writes always require an explicit domain; there is no default domain for writes.
-- Read a domain's MANIFEST only when the routing line above is not enough.
+- Narrow question, one domain clearly fits: search_engrams with domains=[that domain].
+- Broad or unclear question: search_engrams without domains is an all-domain sweep.
+- write_engram, edit_engram, move_engram and delete_engram always require an explicit domain; there is no default domain for writes.
+- build_context on a crystalline:// anchor assembles related knowledge around a task.
+- Read a domain's MANIFEST via read_engram only when its routing line above is not enough; list_domains with include_routing=true re-fetches this index mid-session.

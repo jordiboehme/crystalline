@@ -9,7 +9,7 @@ Crystalline organizes what you have been taught into Domains, each with a `MANIF
 
 ## Start from the routing prompt
 
-At session start you are typically handed the output of `crystalline prompt`: one line per registered domain summarizing when to use it, built from that domain's `MANIFEST.md` `## When to Use` bullets. Treat it as a targeting aid, not a complete catalog - a domain's one-line summary cannot capture everything inside it, and a domain that looks unrelated at a glance may still hold the answer.
+At session start you are typically handed the output of `crystalline prompt system`: one routing line per registered domain summarizing when to use it, built from that domain's `MANIFEST.md` `## When to Use` bullets, plus the crystalline MCP tool names (`search_engrams`, `write_engram` and the rest) those domains route through. Treat each routing line as a targeting aid, not a complete catalog - it cannot capture everything inside a domain, and a domain that looks unrelated at a glance may still hold the answer.
 
 If you were not handed a routing prompt, call `list_domains` with `include_routing: true` to get the same information mid-session.
 
@@ -71,7 +71,7 @@ For an ordinary present-day question, `status: current` alone is both correct an
 
 Read a domain's `MANIFEST.md` (via `read_engram` or `browse_domain`) only when:
 
-- the routing prompt's one-liner for that domain is too ambiguous to act on,
+- the routing line for that domain is too ambiguous to act on,
 - the task is about the domain's own structure or conventions, or
 - you are about to write or reorganize engrams inside it.
 
@@ -93,7 +93,7 @@ A `/*` suffix on the anchor globs a permalink prefix, useful for pulling in an e
 ## Quick reference
 
 - One domain obviously owns it -> `search_engrams` with `domains: ["that-domain"]`.
-- Broad, unclear or cross-domain -> `search_engrams` with `domains` omitted.
+- Broad, unclear or cross-domain -> `search_engrams` with `domains` omitted (an all-domain sweep).
 - "What is true now" -> `status: "current"`; add `valid_from`/`valid_to` filters only for a specific bounded-in-time question.
 - Need the shape of a domain, not its content -> `browse_domain` or its `MANIFEST.md`.
 - Need what surrounds a known engram -> `build_context`.

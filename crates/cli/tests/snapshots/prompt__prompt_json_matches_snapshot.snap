@@ -4,6 +4,7 @@ expression: json
 ---
 {
   "version": 1,
+  "kind": "system",
   "workspace": "workspace",
   "domains": [
     {

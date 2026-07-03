@@ -18,7 +18,7 @@ Once knowledge grows into the thousands or tens of thousands of units, reading a
 
 - **Domains** are folders of knowledge. Each one carries a `MANIFEST.md` describing its scope and when an agent should route a task there.
 - **Engrams** are the unit of knowledge: one markdown file with YAML frontmatter, holding prose, observations (`- [category] a captured fact or lesson`) and relations (`- rel_type [[Other Engram]]`) to other engrams.
-- **MANIFEST routing** lets an agent (or a person) figure out which domain owns a task without reading every file: `crystalline prompt` turns each domain's `## When to Use` bullets into a compact session-start briefing.
+- **MANIFEST routing** lets an agent (or a person) figure out which domain owns a task without reading every file: `crystalline prompt system` turns each domain's `## When to Use` bullets into a compact session-start briefing.
 - **Files are truth.** Engrams on disk are the only durable state. Nothing is ever stored only in the database.
 - **The index is disposable.** Crystalline maintains a local embedded database for fast text, tag, temporal and semantic search, but it is fully derived from the markdown files and rebuilt on demand with `crystalline reindex --full`. Corruption or a schema change is never a data-loss event.
 
@@ -107,7 +107,7 @@ crystalline status
 
 Engrams written through Crystalline are indexed immediately; `crystalline sync` only picks up files created outside it (an editor, a `git pull`) when no daemon is watching them.
 
-Edit `~/knowledge/engineering/MANIFEST.md`'s `## Scope` and `## When to Use` sections so routing and the session prompt describe the domain accurately - that file is what `crystalline prompt` and an agent's routing decisions read.
+Edit `~/knowledge/engineering/MANIFEST.md`'s `## Scope` and `## When to Use` sections so routing and the session prompt describe the domain accurately - that file is what `crystalline prompt system` and an agent's routing decisions read.
 
 ## Connect your agent
 
@@ -168,13 +168,13 @@ Agents connect to the containerized daemon over its HTTP MCP endpoint, `http://l
 
 ## Session onboarding
 
-Run `crystalline prompt` at the start of a session and feed its output to the agent as context. It reads every registered domain's `MANIFEST.md` and renders a compact routing block: one line per domain summarizing when to use it, plus the behavior rules (narrow question -> search that domain; broad question -> sweep all of them; writes always name a domain explicitly).
+Run `crystalline prompt system` at the start of a session and feed its output to the agent as context. It reads every registered domain's `MANIFEST.md` and renders a compact routing block: one line per domain summarizing when to use it, plus the behavior rules (narrow question -> search that domain; broad question -> sweep all of them; writes always name a domain explicitly). The output names the exact crystalline MCP tools each rule refers to (`search_engrams`, `write_engram` and the rest), so an agent with several MCP servers connected knows exactly which tool on which server to call. `prompt` takes a subcommand naming the kind of prompt to generate; `system` is the only kind today.
 
 ```sh
-crystalline prompt --workspace .
+crystalline prompt system --workspace .
 ```
 
-Wire it into a harness with a generic recipe: run `crystalline prompt` at session start and inject its stdout as context before the agent does anything else. In Claude Code, that is a `SessionStart` hook in `settings.json`:
+Wire it into a harness with a generic recipe: run `crystalline prompt system` at session start and inject its stdout as context before the agent does anything else. In Claude Code, that is a `SessionStart` hook in `settings.json`:
 
 ```json
 {
@@ -183,7 +183,7 @@ Wire it into a harness with a generic recipe: run `crystalline prompt` at sessio
       {
         "matcher": "startup",
         "hooks": [
-          { "type": "command", "command": "crystalline prompt" }
+          { "type": "command", "command": "crystalline prompt system" }
         ]
       }
     ]
