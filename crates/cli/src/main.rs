@@ -176,6 +176,13 @@ enum Command {
         /// already-running daemon uses that daemon's mode instead.
         #[arg(long)]
         read_only: bool,
+        /// Ensure each folder is registered as a domain (creating it and a
+        /// MANIFEST.md when needed) before serving. Repeatable, and a single
+        /// occurrence may itself list more than one path, matching how Claude
+        /// Desktop expands an MCPB bundle's picked-folders array into
+        /// `--domain a b`. A restart with the same folders is a cheap no-op.
+        #[arg(long, num_args = 1.., action = clap::ArgAction::Append)]
+        domain: Vec<PathBuf>,
         /// Load the global config from this file instead of the default path.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -599,13 +606,9 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Mcp {
             embedded,
             read_only,
+            domain,
             config,
-        }) => on_runtime(crystalline_service::run_mcp(
-            embedded,
-            cli.db.as_deref(),
-            config.as_deref(),
-            read_only,
-        )),
+        }) => on_runtime(mcp_dispatch(domain, embedded, read_only, config, cli.db)),
         Some(Command::Ctl { command }) => on_runtime(run_ctl(command, cli.json)),
         Some(
             cmd @ (Command::Write { .. }
@@ -1047,6 +1050,53 @@ async fn domain_export_dispatch(
     .await?;
     print_value(&data, json);
     Ok(())
+}
+
+/// `mcp`: ensure every `--domain` folder is registered (the Claude Desktop
+/// MCPB bundle entry point) before deciding whether to attach to a running
+/// daemon or start one, so both paths see the registration - a freshly
+/// spawned daemon reads it from its own fresh config load, an already-running
+/// one is told to sync (and start watching) it here, mirroring
+/// `domain_add_dispatch`. A folder that fails to register (a bad path, an
+/// unwritable parent) or fails to sync with a live daemon is reported to
+/// stderr and skipped rather than aborting: the MCP server must still start
+/// even when one picked folder is broken.
+async fn mcp_dispatch(
+    domains: Vec<PathBuf>,
+    embedded: bool,
+    read_only: bool,
+    config: Option<PathBuf>,
+    db: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    use serde_json::json;
+    for path in &domains {
+        match cmd::ensure_domain_registered(path, config.as_deref()) {
+            Ok(Some(name)) => {
+                eprintln!(
+                    "crystalline mcp: registered domain '{name}' at {}",
+                    path.display()
+                );
+                if let Err(e) = crystalline_service::ctl_if_running(
+                    json!({ "v": 1, "cmd": "sync", "domain": name, "embed": false }),
+                )
+                .await
+                {
+                    eprintln!(
+                        "crystalline mcp: warning: could not sync newly registered domain '{name}' with the running daemon: {e}"
+                    );
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!(
+                    "crystalline mcp: warning: could not register domain at {}: {e}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    crystalline_service::run_mcp(embedded, db.as_deref(), config.as_deref(), read_only).await
 }
 
 /// `domain add`: register locally (always, regardless of a running daemon),

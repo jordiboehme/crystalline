@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crystalline_core::config::{self, GlobalConfig};
 use serde_json::{Value, json};
 
 fn bin() -> PathBuf {
@@ -141,20 +142,31 @@ struct Mcp {
 
 impl Mcp {
     fn spawn(env: &Env) -> Mcp {
-        Mcp::spawn_inner(env, false)
+        Mcp::spawn_inner(env, false, &[])
     }
 
     /// Spawn an `mcp` client that starts a read-only daemon when none is running.
     fn spawn_read_only(env: &Env) -> Mcp {
-        Mcp::spawn_inner(env, true)
+        Mcp::spawn_inner(env, true, &[])
     }
 
-    fn spawn_inner(env: &Env, read_only: bool) -> Mcp {
+    /// Spawn an `mcp` client with `--domain` folders: the Claude Desktop MCPB
+    /// bundle entry point. Each folder is registered as a domain (created and
+    /// scaffolded with a MANIFEST.md when it does not exist yet) before the
+    /// daemon attach-or-spawn decision.
+    fn spawn_with_domains(env: &Env, domains: &[PathBuf]) -> Mcp {
+        Mcp::spawn_inner(env, false, domains)
+    }
+
+    fn spawn_inner(env: &Env, read_only: bool, domains: &[PathBuf]) -> Mcp {
         let mut cmd = Command::new(bin());
         env.apply(&mut cmd);
         cmd.arg("mcp");
         if read_only {
             cmd.arg("--read-only");
+        }
+        for d in domains {
+            cmd.arg("--domain").arg(d);
         }
         cmd.arg("--config").arg(env.config_path());
         let mut child = cmd
@@ -483,6 +495,93 @@ fn domain_add_while_daemon_running_syncs_and_watches_the_new_domain() {
 
     drop(c1);
     let _ = env.run(&["ctl", "shutdown"]);
+}
+
+/// `crystalline mcp --domain <path>` is the entry point Claude Desktop MCPB
+/// bundles use: a user-picked folder is registered as a domain (creating it
+/// and scaffolding a MANIFEST.md when it does not exist yet) before the
+/// daemon attach-or-spawn decision, so it is watched and listed from the very
+/// first launch. A restart with the same folder must be a cheap no-op: no
+/// duplicate registration, and the server still answers `list_domains`.
+#[test]
+fn mcp_domain_flag_registers_folder_and_is_idempotent_across_restarts() {
+    let env = Env::new("mcpdom");
+    let knowledge = env.dir.join("knowledge");
+    assert!(!knowledge.exists(), "the folder must not pre-exist");
+    let domains = vec![knowledge.clone()];
+
+    // First launch: the folder does not exist on disk yet.
+    let mut c1 = Mcp::spawn_with_domains(&env, &domains);
+    c1.initialize();
+    env.wait_ready();
+
+    c1.send_call("list_domains", json!({}));
+    let r = c1.read_tool_value();
+    let names = domain_names(&r);
+    assert!(
+        names.contains(&"knowledge".to_string()),
+        "domain 'knowledge' listed: {r}"
+    );
+
+    assert!(
+        knowledge.join("MANIFEST.md").exists(),
+        "MANIFEST.md scaffolded for the bundle's folder"
+    );
+    let cfg: GlobalConfig = config::load_yaml(&env.config_path()).unwrap();
+    assert!(
+        cfg.domains.contains_key("knowledge"),
+        "config.yaml registers 'knowledge': {cfg:?}"
+    );
+    assert_eq!(cfg.domains.len(), 1, "exactly one domain registered");
+
+    // Shut the daemon down cleanly and wait for the lock and socket to clear
+    // before the second launch, so it does not race a stale-lock takeover.
+    drop(c1);
+    let (ok, _) = env.run(&["ctl", "shutdown"]);
+    assert!(ok, "ctl shutdown");
+    let start = Instant::now();
+    while (env.sock_path().exists() || env.lock_path().exists())
+        && start.elapsed() < Duration::from_secs(5)
+    {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!env.sock_path().exists(), "socket removed on shutdown");
+    assert!(!env.lock_path().exists(), "lock removed on shutdown");
+
+    // Second launch with the same flag: no duplicate registration, and the
+    // server still answers list_domains.
+    let mut c2 = Mcp::spawn_with_domains(&env, &domains);
+    c2.initialize();
+    env.wait_ready();
+
+    c2.send_call("list_domains", json!({}));
+    let r2 = c2.read_tool_value();
+    let names2 = domain_names(&r2);
+    assert!(
+        names2.contains(&"knowledge".to_string()),
+        "domain 'knowledge' still listed after restart: {r2}"
+    );
+
+    let cfg2: GlobalConfig = config::load_yaml(&env.config_path()).unwrap();
+    assert_eq!(
+        cfg2.domains.len(),
+        1,
+        "restart with the same --domain flag did not duplicate the registration: {cfg2:?}"
+    );
+
+    drop(c2);
+    let _ = env.run(&["ctl", "shutdown"]);
+}
+
+/// The domain names in a `list_domains` result value.
+fn domain_names(value: &Value) -> Vec<String> {
+    value["domains"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|d| d["name"].as_str().map(str::to_string))
+        .collect()
 }
 
 #[test]

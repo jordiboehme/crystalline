@@ -320,6 +320,108 @@ pub(crate) fn print_domain_add_no_sync(name: &str, path: &Path, json: bool) {
     }
 }
 
+// --- mcp domain auto-registration ---------------------------------------------
+
+/// Ensure a Claude Desktop MCPB bundle's picked folder is registered as a
+/// domain before `crystalline mcp` decides whether to attach to a running
+/// daemon or start one. Returns the domain name a *new* registration used, or
+/// `None` when the canonicalized path was already registered under some name -
+/// the no-op path that keeps a restart with the same `--domain` flags cheap.
+///
+/// Order: create the folder (a bundle's default folder may not exist yet),
+/// canonicalize it and check every registered domain's canonicalized path for
+/// a match, scaffold a MANIFEST.md from the same template `domain init` and
+/// `domain add --virtual` use when this will be a fresh domain, derive a name
+/// from the folder's basename (falling back to `<name>-2`, `<name>-3`... on a
+/// collision with a *different* path) and finally register it exactly like
+/// `domain add` does. Must run before the daemon attach-or-spawn decision so
+/// both paths see the registration: a freshly spawned daemon reads it from its
+/// own fresh config load, and the caller is responsible for telling an
+/// already-running daemon to sync (and start watching) it, mirroring
+/// `domain_add_dispatch`.
+pub(crate) fn ensure_domain_registered(
+    path: &Path,
+    config_override: Option<&Path>,
+) -> Result<Option<String>> {
+    std::fs::create_dir_all(path)
+        .with_context(|| format!("creating domain directory {}", path.display()))?;
+    let canonical =
+        std::fs::canonicalize(path).with_context(|| format!("resolving {}", path.display()))?;
+
+    let cfg = load_config(&config_path(config_override)?)?;
+    let already_registered = cfg
+        .domains
+        .values()
+        .any(|entry| canonicalized_file_path(entry).as_deref() == Some(canonical.as_path()));
+    if already_registered {
+        return Ok(None);
+    }
+
+    let name = unique_domain_name(&canonical, &cfg);
+
+    let manifest = canonical.join("MANIFEST.md");
+    if !manifest.exists() {
+        let today = chrono::Utc::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        std::fs::write(&manifest, manifest_template(&name, &today))
+            .with_context(|| format!("writing {}", manifest.display()))?;
+    }
+
+    domain_add_register(&name, &canonical, config_override)?;
+    Ok(Some(name))
+}
+
+/// A registered domain entry's filesystem root, canonicalized. Falls back to
+/// the expanded (non-canonical) path when it no longer resolves, so a domain
+/// whose folder moved away still compares by its last-known path instead of
+/// silently dropping out of the comparison.
+fn canonicalized_file_path(entry: &DomainEntry) -> Option<PathBuf> {
+    let path = entry.file_path()?;
+    Some(std::fs::canonicalize(&path).unwrap_or(path))
+}
+
+/// Derive a domain name from a folder's basename using the same slug rules as
+/// a permalink: lowercased, every run outside `[a-z0-9-]` collapsed to a
+/// single hyphen, leading and trailing hyphens trimmed. Falls back to
+/// `domain` for a basename that slugifies to nothing (a root path, or one made
+/// only of punctuation). Appends `-2`, `-3`... when the name is already
+/// registered to a *different* path.
+fn unique_domain_name(canonical: &Path, cfg: &GlobalConfig) -> String {
+    let basename = canonical
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| canonical.display().to_string());
+    let base = crystalline_core::slugify(&basename);
+    let base = if base.is_empty() {
+        "domain".to_string()
+    } else {
+        base
+    };
+
+    if !name_taken_by_other(&base, canonical, cfg) {
+        return base;
+    }
+    let mut n = 2;
+    loop {
+        let candidate = format!("{base}-{n}");
+        if !name_taken_by_other(&candidate, canonical, cfg) {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
+/// Whether `name` is registered to a path other than `canonical`. A virtual
+/// domain already using `name` counts as taken since it has no path to compare.
+fn name_taken_by_other(name: &str, canonical: &Path, cfg: &GlobalConfig) -> bool {
+    match cfg.domains.get(name) {
+        None => false,
+        Some(entry) => canonicalized_file_path(entry).as_deref() != Some(canonical),
+    }
+}
+
 // --- domain remove -----------------------------------------------------------
 
 /// Remove a domain from the global config. Leaves its files and index rows
