@@ -127,6 +127,56 @@ Crystalline runs as an MCP server over stdio. Any MCP-capable harness works; add
 
 The first agent to connect starts a background daemon that loads the embedding model once and watches every registered domain for changes; every later connection - other agents, other terminals, other harnesses - attaches to that same daemon instead of starting a second copy. One shared instance, one loaded model, one consistent view of the index, no matter how many agents are talking to it at once.
 
+## Deployment scenarios
+
+Crystalline runs the same way in every scenario: a daemon in the middle keeps one search index in sync with knowledge files on disk, and one or more agents connect to it, whether that connection is a local stdio pipe or a network HTTP endpoint. The four scenarios below are variations on that one architecture.
+
+### Personal workstation
+
+The default shape: install the binary, point one or more agents at `crystalline mcp` over stdio, and the first connection spawns a background daemon that loads the embedding model once and watches every registered domain. Knowledge lives in ordinary local folders, read-write, so capturing what an agent learns as it works is the entire point. See Connect your agent above for the stdio setup.
+
+```mermaid
+flowchart LR
+    A1[Agent] -->|stdio| D[Daemon]
+    A2[Agent] -->|stdio| D
+    D --> K[Knowledge files]
+    D --> I[Index]
+```
+
+### Team server
+
+For a team, run the GHCR image from Run in a container below via `examples/docker/compose.yaml`: the daemon listens on `--http 0.0.0.0:7411` and every agent on the network reaches it over streamable HTTP instead of stdio. Knowledge is bind-mounted from the host so it stays exactly the same markdown files, a `/data` volume holds the disposable index, and the slim `latest` image downloads the model into that same volume once (pick `with-model` instead to skip the download). See Run in a container below for the compose file and image tags.
+
+```mermaid
+flowchart LR
+    A1[Agent] -->|HTTP :7411| D[Daemon]
+    A2[Agent] -->|HTTP :7411| D
+    D -->|bind mount| K[Knowledge files]
+    D -->|volume| I[Index]
+```
+
+### Published read-only knowledge base
+
+When a team curates knowledge as a reviewed git repository instead of writing into the container directly, `examples/docker/compose.git-sync.yaml` adds a sidecar that pulls the repository into a shared volume every 60 seconds and mounts it read-only into Crystalline. The daemon runs with `--read-only`, so the four content-mutating tools disappear from the MCP tool list and agents can only search and read, while sync, the file watcher and embedding keep following every pull. See Read-only deployments below for the full behavior.
+
+```mermaid
+flowchart LR
+    G[Git repository] -->|pull every 60s| S[Sidecar]
+    S --> K[Knowledge files]
+    K -->|read only| D[Daemon]
+    D -->|HTTP, read and search only| A[Agent]
+```
+
+### Air-gapped or egress-restricted
+
+When a host has no outbound network access, or the first-start model download delay is unwanted for any other reason, use the `with-model` image, or set `CRYSTALLINE_MODELS_DIR` on any install to point at a model directory fetched ahead of time, so nothing in the runtime path ever needs the network. This is orthogonal to read access: combine it with either the read-write team server shape above or the read-only git-sync shape, since air-gapping is about the model rather than about who can write. See Run in a container below for the image variants and `CRYSTALLINE_MODELS_DIR`.
+
+```mermaid
+flowchart LR
+    M[Model] -->|baked into image| D[Daemon]
+    D -->|HTTP, no egress| A[Agent]
+```
+
 ## Run in a container
 
 Crystalline publishes a multi-arch OCI image (`linux/amd64` and `linux/arm64`) to GHCR on every release, for Linux server deployments. macOS and Windows have no OCI container runtime worth targeting here, so those platforms run the native binary from Install above; the container covers the Linux server case.

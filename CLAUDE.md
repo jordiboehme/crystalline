@@ -46,3 +46,4 @@ Dependency direction: core <- index <- service <- cli.
 - `status` and `type` frontmatter fields are required and non-empty but free form - recommended value sets are guidance, never enforced globally
 - Commit after each completed milestone or task
 - Use the latest stable versions of dependencies and standards; verify on crates.io rather than assuming
+- README has a Deployment scenarios section (text plus one mermaid chart per scenario). Any change that adds or alters a deployment mode (new serve flag, new image variant, new compose example, new transport) must update that section in the same change
