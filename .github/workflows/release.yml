@@ -21,14 +21,17 @@ jobs:
       matrix:
         include:
           - target: aarch64-apple-darwin
+            platform: macos-arm64
             os: macos-latest
             archive_ext: tar.gz
           - target: x86_64-unknown-linux-musl
+            platform: linux-amd64
             os: ubuntu-latest
             archive_ext: tar.gz
             musl: true
             deb_arch: amd64
           - target: aarch64-unknown-linux-musl
+            platform: linux-arm64
             os: ubuntu-24.04-arm
             archive_ext: tar.gz
             musl: true
@@ -39,6 +42,7 @@ jobs:
             # enables +fp16 by default so only this Linux arm64 leg needs it.
             rustflags: '-C target-feature=+fp16'
           - target: x86_64-pc-windows-msvc
+            platform: windows-amd64
             os: windows-latest
             archive_ext: zip
             rustflags: '-C target-feature=+crt-static'
@@ -105,7 +109,7 @@ jobs:
         run: |
           set -euo pipefail
           version="${{ steps.version.outputs.version }}"
-          name="crystalline-${version}-${{ matrix.target }}"
+          name="crystalline-${version}-${{ matrix.platform }}"
           stage="dist/$name"
           mkdir -p "$stage"
           cp "${{ steps.bin.outputs.path }}" "$stage/"
@@ -128,7 +132,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: crystalline-${{ matrix.target }}
+          name: crystalline-${{ matrix.platform }}
           path: dist/${{ steps.stage.outputs.name }}.${{ matrix.archive_ext }}
           if-no-files-found: error
 
@@ -212,13 +216,13 @@ jobs:
       - name: Download x86_64 musl artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: crystalline-x86_64-unknown-linux-musl
+          name: crystalline-linux-amd64
           path: downloads/amd64
 
       - name: Download aarch64 musl artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: crystalline-aarch64-unknown-linux-musl
+          name: crystalline-linux-arm64
           path: downloads/arm64
 
       - name: Stage per-arch binaries
@@ -295,9 +299,9 @@ jobs:
           VERSION="${TAG#v}"
           sums="/tmp/release/SHA256SUMS"
 
-          sha_macos_arm=$(grep "crystalline-${TAG}-aarch64-apple-darwin.tar.gz" "$sums" | awk '{print $1}')
-          sha_linux_amd64=$(grep "crystalline-${TAG}-x86_64-unknown-linux-musl.tar.gz" "$sums" | awk '{print $1}')
-          sha_linux_arm64=$(grep "crystalline-${TAG}-aarch64-unknown-linux-musl.tar.gz" "$sums" | awk '{print $1}')
+          sha_macos_arm=$(grep "crystalline-${TAG}-macos-arm64.tar.gz" "$sums" | awk '{print $1}')
+          sha_linux_amd64=$(grep "crystalline-${TAG}-linux-amd64.tar.gz" "$sums" | awk '{print $1}')
+          sha_linux_arm64=$(grep "crystalline-${TAG}-linux-arm64.tar.gz" "$sums" | awk '{print $1}')
 
           git clone "https://x-access-token:${TAP_GITHUB_TOKEN}@github.com/jordiboehme/homebrew-tap.git" \
             "${{ runner.temp }}/homebrew-tap"
@@ -313,19 +317,19 @@ jobs:
 
             on_macos do
               on_arm do
-                url "https://github.com/jordiboehme/crystalline/releases/download/v#{version}/crystalline-v#{version}-aarch64-apple-darwin.tar.gz"
+                url "https://github.com/jordiboehme/crystalline/releases/download/v#{version}/crystalline-v#{version}-macos-arm64.tar.gz"
                 sha256 "${sha_macos_arm}"
               end
             end
 
             on_linux do
               on_intel do
-                url "https://github.com/jordiboehme/crystalline/releases/download/v#{version}/crystalline-v#{version}-x86_64-unknown-linux-musl.tar.gz"
+                url "https://github.com/jordiboehme/crystalline/releases/download/v#{version}/crystalline-v#{version}-linux-amd64.tar.gz"
                 sha256 "${sha_linux_amd64}"
               end
 
               on_arm do
-                url "https://github.com/jordiboehme/crystalline/releases/download/v#{version}/crystalline-v#{version}-aarch64-unknown-linux-musl.tar.gz"
+                url "https://github.com/jordiboehme/crystalline/releases/download/v#{version}/crystalline-v#{version}-linux-arm64.tar.gz"
                 sha256 "${sha_linux_arm64}"
               end
             end

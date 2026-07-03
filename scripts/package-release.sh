@@ -17,7 +17,20 @@ cd "$repo_root"
 target="${1:-$(rustc -vV | awk '/^host:/ { print $2 }')}"
 version="v$(awk -F'"' '/^version = /{ print $2; exit }' Cargo.toml)"
 
-echo "Building crystalline ${version} for ${target}..."
+# Friendly platform name for the archive, matching .github/workflows/release.yml's
+# matrix.platform. The Rust target triple keeps driving the actual build below.
+case "$target" in
+    aarch64-apple-darwin) platform="macos-arm64" ;;
+    x86_64-unknown-linux-musl) platform="linux-amd64" ;;
+    aarch64-unknown-linux-musl) platform="linux-arm64" ;;
+    x86_64-pc-windows-msvc) platform="windows-amd64" ;;
+    *)
+        echo "package-release: no friendly platform name mapped for target $target" >&2
+        exit 1
+        ;;
+esac
+
+echo "Building crystalline ${version} for ${target} (${platform})..."
 cargo build --release --target "$target" -p crystalline
 
 bin="target/$target/release/crystalline"
@@ -32,7 +45,7 @@ if [[ ! -f "$bin" ]]; then
     exit 1
 fi
 
-name="crystalline-${version}-${target}"
+name="crystalline-${version}-${platform}"
 stage="dist/$name"
 rm -rf "$stage"
 mkdir -p "$stage"

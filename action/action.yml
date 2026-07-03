@@ -57,22 +57,22 @@ runs:
         fi
         echo "version=$version" >> "$GITHUB_OUTPUT"
 
-    - name: Resolve platform target
+    - name: Resolve platform name
       id: platform
       shell: bash
       run: |
         set -euo pipefail
         case "${{ runner.os }}-${{ runner.arch }}" in
-          Linux-X64) target="x86_64-unknown-linux-musl"; ext="tar.gz" ;;
-          Linux-ARM64) target="aarch64-unknown-linux-musl"; ext="tar.gz" ;;
-          macOS-ARM64) target="aarch64-apple-darwin"; ext="tar.gz" ;;
-          Windows-X64) target="x86_64-pc-windows-msvc"; ext="zip" ;;
+          Linux-X64) platform="linux-amd64"; ext="tar.gz" ;;
+          Linux-ARM64) platform="linux-arm64"; ext="tar.gz" ;;
+          macOS-ARM64) platform="macos-arm64"; ext="tar.gz" ;;
+          Windows-X64) platform="windows-amd64"; ext="zip" ;;
           *)
             echo "::error::unsupported runner os/arch combination: ${{ runner.os }}-${{ runner.arch }}"
             exit 1
             ;;
         esac
-        echo "target=$target" >> "$GITHUB_OUTPUT"
+        echo "platform=$platform" >> "$GITHUB_OUTPUT"
         echo "ext=$ext" >> "$GITHUB_OUTPUT"
 
     - name: Download release artifact and checksums
@@ -82,8 +82,8 @@ runs:
       run: |
         set -euo pipefail
         version="${{ steps.resolve.outputs.version }}"
-        target="${{ steps.platform.outputs.target }}"
-        archive="crystalline-${version}-${target}.${{ steps.platform.outputs.ext }}"
+        platform="${{ steps.platform.outputs.platform }}"
+        archive="crystalline-${version}-${platform}.${{ steps.platform.outputs.ext }}"
         workdir="$RUNNER_TEMP/crystalline-download"
         mkdir -p "$workdir"
         cd "$workdir"

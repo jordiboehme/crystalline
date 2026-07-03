@@ -41,25 +41,25 @@ sudo dpkg -i "crystalline_${version#v}_${arch}.deb"
 crystalline --version
 ```
 
-Anywhere else, download a prebuilt binary from the [latest release](https://github.com/jordiboehme/crystalline/releases/latest). Four targets are published:
+Anywhere else, download a prebuilt binary from the [latest release](https://github.com/jordiboehme/crystalline/releases/latest). Four platforms are published:
 
-| Platform | Target |
+| Platform | Archive |
 |---|---|
-| macOS (Apple Silicon) | `aarch64-apple-darwin` |
-| Linux x86_64 (static, musl) | `x86_64-unknown-linux-musl` |
-| Linux arm64 (static, musl) | `aarch64-unknown-linux-musl` |
-| Windows x86_64 | `x86_64-pc-windows-msvc` |
+| macOS (Apple Silicon) | `macos-arm64` |
+| Linux x86_64 (statically linked) | `linux-amd64` |
+| Linux arm64 (statically linked) | `linux-arm64` |
+| Windows x86_64 | `windows-amd64` |
 
-Each archive is named `crystalline-<version>-<target>.tar.gz` (`.zip` on Windows) and contains the `crystalline` binary alongside `LICENSE` and `README.md`. A `SHA256SUMS` file is attached to every release for verification.
+Each archive is named `crystalline-<version>-<platform>.tar.gz` (`.zip` on Windows) and contains the `crystalline` binary alongside `LICENSE` and `README.md`. A `SHA256SUMS` file is attached to every release for verification.
 
-Shell one-liner (macOS/Linux, adjust `target` to match your platform):
+Shell one-liner (macOS/Linux, adjust `platform` to match your platform):
 
 ```sh
 version=$(curl -fsSL https://api.github.com/repos/jordiboehme/crystalline/releases/latest | grep -m1 '"tag_name"' | cut -d '"' -f4)
-target=aarch64-apple-darwin
-curl -fsSL "https://github.com/jordiboehme/crystalline/releases/download/${version}/crystalline-${version}-${target}.tar.gz" \
+platform=macos-arm64
+curl -fsSL "https://github.com/jordiboehme/crystalline/releases/download/${version}/crystalline-${version}-${platform}.tar.gz" \
   | tar xz -C /tmp
-sudo mv "/tmp/crystalline-${version}-${target}/crystalline" /usr/local/bin/crystalline
+sudo mv "/tmp/crystalline-${version}-${platform}/crystalline" /usr/local/bin/crystalline
 crystalline --version
 ```
 
