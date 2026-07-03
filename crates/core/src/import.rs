@@ -228,7 +228,14 @@ fn copy_verbatim(
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent).map_err(io_err(parent))?;
         }
-        std::fs::copy(&entry.abs, &dest).map_err(io_err(&entry.abs))?;
+        // Copying a file onto itself truncates on some platforms and is a
+        // sharing violation on Windows, so a re-import where source and
+        // target coincide must leave the file alone.
+        let same_file = dest.exists()
+            && std::fs::canonicalize(&entry.abs).ok() == std::fs::canonicalize(&dest).ok();
+        if !same_file {
+            std::fs::copy(&entry.abs, &dest).map_err(io_err(&entry.abs))?;
+        }
     }
     report.files_copied += 1;
     report.files.push(FileChange {
