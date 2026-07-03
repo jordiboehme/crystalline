@@ -13,8 +13,8 @@ use crystalline_core::config::{
     self, DatabaseBackend, DomainEntry, EmbeddingsConfig, GlobalConfig,
 };
 use crystalline_index::{
-    ChunkParams, Store, configured_model_id, download_local_model, provider_from_config,
-    run_embedding_pass, sync_domain_with,
+    ChunkParams, DomainKind, Store, configured_model_id, download_local_model,
+    provider_from_config, run_embedding_pass, sync_domain_with,
 };
 use tokio::sync::Mutex as TokioMutex;
 
@@ -114,9 +114,10 @@ fn backend_is_turso(cfg: &GlobalConfig) -> bool {
     cfg.database().backend == DatabaseBackend::Turso
 }
 
-/// The absolute, tilde-expanded path a domain entry points at.
-pub(crate) fn resolve_domain_path(entry: &DomainEntry) -> PathBuf {
-    config::expand_tilde(&entry.path.to_string_lossy())
+/// The absolute, tilde-expanded filesystem root a file domain points at, or
+/// `None` for a virtual domain (which has no path).
+pub(crate) fn resolve_domain_path(entry: &DomainEntry) -> Option<PathBuf> {
+    entry.file_path().filter(|_| !entry.is_virtual())
 }
 
 // --- domain init -------------------------------------------------------------
@@ -209,10 +210,55 @@ pub(crate) fn domain_add_register(
     let cfg_path = config_path(config_override)?;
     let mut cfg = load_config(&cfg_path)?;
     cfg.domains
-        .insert(name.to_string(), DomainEntry { path: abs.clone() });
+        .insert(name.to_string(), DomainEntry::file(abs.clone()));
     config::save_yaml(&cfg_path, &cfg)
         .map_err(|e| anyhow!("failed to save config {}: {e}", cfg_path.display()))?;
     Ok(abs)
+}
+
+/// Register a virtual domain in the global config (database-backed, no path).
+/// Returns the MANIFEST markdown to scaffold into the database.
+pub(crate) fn domain_add_register_virtual(
+    name: &str,
+    config_override: Option<&Path>,
+) -> Result<String> {
+    let cfg_path = config_path(config_override)?;
+    let mut cfg = load_config(&cfg_path)?;
+    cfg.domains
+        .insert(name.to_string(), DomainEntry::virtual_domain());
+    config::save_yaml(&cfg_path, &cfg)
+        .map_err(|e| anyhow!("failed to save config {}: {e}", cfg_path.display()))?;
+    let today = chrono::Utc::now()
+        .date_naive()
+        .format("%Y-%m-%d")
+        .to_string();
+    Ok(manifest_template(name, &today))
+}
+
+/// Print the `domain add --virtual` result.
+pub(crate) fn print_domain_add_virtual(name: &str, scaffold: &serde_json::Value, json: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "registered": name,
+                "kind": "virtual",
+                "manifest": scaffold,
+            })
+        );
+    } else {
+        println!("Registered virtual domain '{name}' (database-backed, no files)");
+        let created = scaffold
+            .get("created")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if created {
+            println!("Scaffolded MANIFEST.md into the database");
+        } else {
+            println!("MANIFEST.md already present in the database");
+        }
+        println!("Capture engrams with: crystalline write {name} \"<title>\" --content \"...\"");
+    }
 }
 
 /// Sync a single, just-registered domain directly (no daemon involved) and
@@ -333,7 +379,8 @@ pub async fn domain_list(
             .map(|(name, entry)| {
                 serde_json::json!({
                     "name": name,
-                    "path": entry.path.display().to_string(),
+                    "kind": if entry.is_virtual() { "virtual" } else { "file" },
+                    "path": entry.file_path().map(|p| p.display().to_string()),
                     "engrams": count_for(name),
                 })
             })
@@ -347,9 +394,14 @@ pub async fn domain_list(
         return Ok(());
     }
     for (name, entry) in &cfg.domains {
+        // A virtual domain reports "(virtual)" where a file domain shows its root.
+        let location = entry
+            .file_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(virtual)".to_string());
         match count_for(name) {
-            Some(n) => println!("{name}\t{}\t{n} engrams", entry.path.display()),
-            None => println!("{name}\t{}\t(not indexed)", entry.path.display()),
+            Some(n) => println!("{name}\t{location}\t{n} engrams"),
+            None => println!("{name}\t{location}\t(not indexed)"),
         }
     }
     Ok(())
@@ -373,7 +425,10 @@ pub async fn sync(
 
     let mut reports = Vec::new();
     for (name, entry) in targets {
-        let path = resolve_domain_path(&entry);
+        // Virtual domains have no files to sync.
+        let Some(path) = resolve_domain_path(&entry) else {
+            continue;
+        };
         let report = sync_domain_with(&*store, &name, &path, &params)
             .await
             .map_err(|e| anyhow!("sync of '{name}' failed: {e}"))?;
@@ -410,20 +465,32 @@ pub async fn reindex(
     let params = chunk_params(&cfg);
 
     // `--full` opens resiliently (Turso rebuilds a database that will not open;
-    // a no-op for Postgres) then wipes the index before reindexing from disk.
+    // a no-op for Postgres). Rather than a global wipe, it clears each file
+    // domain's rows per-domain and resyncs, so virtual-domain rows, whose only
+    // source of truth is the database, survive the reindex.
     let store = open_backend(&cfg, db_override, full).await?;
     let store = store.lock().await;
+    // Only the file domains have files to (re)index.
+    let file_targets: Vec<(String, PathBuf)> = targets
+        .into_iter()
+        .filter_map(|(name, entry)| resolve_domain_path(&entry).map(|p| (name, p)))
+        .collect();
     if full {
-        store
-            .wipe()
-            .await
-            .map_err(|e| anyhow!("failed to wipe the index: {e}"))?;
+        for (name, path) in &file_targets {
+            let domain_id = store
+                .upsert_domain(name, Some(&path.to_string_lossy()), DomainKind::File)
+                .await
+                .map_err(|e| anyhow!("failed to resolve domain '{name}': {e}"))?;
+            store
+                .clear_domain(domain_id)
+                .await
+                .map_err(|e| anyhow!("failed to clear domain '{name}': {e}"))?;
+        }
     }
 
     let mut reports = Vec::new();
-    for (name, entry) in targets {
-        let path = resolve_domain_path(&entry);
-        let report = sync_domain_with(&*store, &name, &path, &params)
+    for (name, path) in &file_targets {
+        let report = sync_domain_with(&*store, name, path, &params)
             .await
             .map_err(|e| anyhow!("reindex of '{name}' failed: {e}"))?;
         reports.push(report);
@@ -605,7 +672,13 @@ pub fn import(
             "no domain named '{domain}' is registered. Register it first: crystalline domain add {domain} <path>"
         )
     })?;
-    let domain_dir = resolve_domain_path(entry);
+    // The legacy converter targets a file domain's directory. A virtual domain
+    // has no directory, so point the user at `crystalline domain import`.
+    let domain_dir = resolve_domain_path(entry).ok_or_else(|| {
+        anyhow!(
+            "domain '{domain}' is virtual and has no directory; load engrams into it with `crystalline domain import <path> --domain {domain}` instead"
+        )
+    })?;
 
     let type_map = match map {
         Some(p) => {

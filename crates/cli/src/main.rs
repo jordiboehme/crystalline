@@ -243,6 +243,11 @@ enum Command {
         /// Replace deeper subsections too when replacing a section.
         #[arg(long)]
         include_subsections: bool,
+        /// The checksum from a prior read (guards a virtual-domain edit against a
+        /// change since it was read; the edit is refused as a conflict if it
+        /// changed). Omit for last-write-wins.
+        #[arg(long)]
+        expected_checksum: Option<String>,
         /// Load the global config from this file instead of the default path.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -416,14 +421,20 @@ enum DomainCommand {
         #[arg(long)]
         name: Option<String>,
     },
-    /// Register a domain in the global config, then index it immediately.
-    /// Refuses without a MANIFEST.md.
+    /// Register a domain in the global config, then index it immediately. A file
+    /// domain refuses without a MANIFEST.md; `--virtual` registers a
+    /// database-backed domain (no path) and scaffolds its MANIFEST in the index.
     Add {
         /// The domain name used everywhere it is referenced.
         name: String,
-        /// The domain root directory.
-        path: PathBuf,
-        /// Register only; skip indexing (run `crystalline sync` later).
+        /// The domain root directory. Omitted for a virtual domain.
+        path: Option<PathBuf>,
+        /// Register a virtual domain: engrams live in the database, not on disk.
+        /// Incompatible with a path argument.
+        #[arg(long = "virtual")]
+        is_virtual: bool,
+        /// Register only; skip indexing (run `crystalline sync` later). Applies
+        /// to file domains only.
         #[arg(long)]
         no_sync: bool,
         /// Load the global config from this file instead of the default path.
@@ -432,6 +443,44 @@ enum DomainCommand {
     },
     /// List registered domains, with engram counts when the index is present.
     List {
+        /// Load the global config from this file instead of the default path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Load already-well-formed engram files into a virtual domain, verbatim.
+    /// Distinct from `crystalline import`, which converts a legacy tree into a
+    /// file domain's directory.
+    Import {
+        /// The source directory of engram `.md` files.
+        path: PathBuf,
+        /// The target virtual domain. Must already be registered.
+        #[arg(long)]
+        domain: String,
+        /// Overwrite engrams whose path or permalink already exists.
+        #[arg(long)]
+        overwrite: bool,
+        /// Report what would be imported without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Load the global config from this file instead of the default path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Materialize a domain's engrams from the index to a filesystem folder.
+    /// Works for both file and virtual domains; most useful for taking a virtual
+    /// domain's data out so `crystalline verify` can run on the snapshot.
+    Export {
+        /// The destination directory. Created if absent.
+        path: PathBuf,
+        /// The domain to export.
+        #[arg(long)]
+        domain: String,
+        /// Write into a non-empty directory.
+        #[arg(long)]
+        force: bool,
+        /// Report what would be exported without writing anything.
+        #[arg(long)]
+        dry_run: bool,
         /// Load the global config from this file instead of the default path.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -481,7 +530,7 @@ fn main() -> anyhow::Result<()> {
                 workspace,
                 read_only,
                 config,
-            } => run_prompt(workspace, read_only, config, cli.json),
+            } => run_prompt(workspace, read_only, config, cli.db, cli.json),
         },
         Some(Command::Domain { command }) => run_domain(command, cli.db, cli.json),
         Some(Command::Sync {
@@ -754,6 +803,7 @@ async fn run_data(command: Command, db: Option<PathBuf>, json: bool) -> anyhow::
             find_text,
             expected_replacements,
             include_subsections,
+            expected_checksum,
             config,
         } => {
             let body = content_or_stdin(content)?;
@@ -768,6 +818,7 @@ async fn run_data(command: Command, db: Option<PathBuf>, json: bool) -> anyhow::
                     "find_text": find_text,
                     "expected_replacements": expected_replacements,
                     "include_subsections": include_subsections,
+                    "expected_checksum": expected_checksum,
                 }),
                 config,
             )
@@ -874,36 +925,138 @@ fn on_runtime<F: std::future::Future<Output = anyhow::Result<()>>>(fut: F) -> an
         .block_on(fut)
 }
 
+/// Like [`on_runtime`] but for a future that yields a plain value. Used by
+/// `prompt system` to resolve virtual-domain routing bullets only when the
+/// config actually has a virtual domain, so the common all-file path never
+/// starts a runtime.
+fn on_runtime_value<T, F: std::future::Future<Output = T>>(fut: F) -> anyhow::Result<T> {
+    Ok(tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(fut))
+}
+
 fn run_domain(command: DomainCommand, db: Option<PathBuf>, json: bool) -> anyhow::Result<()> {
     match command {
         DomainCommand::Init { path, name } => cmd::domain_init(&path, name.as_deref(), json),
         DomainCommand::Add {
             name,
             path,
+            is_virtual,
             no_sync,
             config,
-        } => on_runtime(domain_add_dispatch(name, path, config, db, no_sync, json)),
+        } => on_runtime(domain_add_dispatch(
+            name, path, is_virtual, config, db, no_sync, json,
+        )),
         DomainCommand::List { config } => {
             on_runtime(cmd::domain_list(config.as_deref(), db.as_deref(), json))
         }
+        DomainCommand::Import {
+            path,
+            domain,
+            overwrite,
+            dry_run,
+            config,
+        } => on_runtime(domain_import_dispatch(
+            domain, path, overwrite, dry_run, config, db, json,
+        )),
+        DomainCommand::Export {
+            path,
+            domain,
+            force,
+            dry_run,
+            config,
+        } => on_runtime(domain_export_dispatch(
+            domain, path, force, dry_run, config, db, json,
+        )),
         DomainCommand::Remove { name, config } => {
             on_runtime(domain_remove_dispatch(name, config, json))
         }
     }
 }
 
+/// `domain import`: verbatim load engram files into a virtual domain, over the
+/// daemon when one owns the index, else against a directly opened store.
+async fn domain_import_dispatch(
+    domain: String,
+    path: PathBuf,
+    overwrite: bool,
+    dry_run: bool,
+    config: Option<PathBuf>,
+    db: Option<PathBuf>,
+    json: bool,
+) -> anyhow::Result<()> {
+    let data = crystalline_service::domain_import(
+        &domain,
+        &path,
+        overwrite,
+        dry_run,
+        db.as_deref(),
+        config.as_deref(),
+    )
+    .await?;
+    print_value(&data, json);
+    Ok(())
+}
+
+/// `domain export`: materialize a domain's engrams to a filesystem folder, over
+/// the daemon when one owns the index, else against a directly opened store.
+async fn domain_export_dispatch(
+    domain: String,
+    path: PathBuf,
+    force: bool,
+    dry_run: bool,
+    config: Option<PathBuf>,
+    db: Option<PathBuf>,
+    json: bool,
+) -> anyhow::Result<()> {
+    let data = crystalline_service::domain_export(
+        &domain,
+        &path,
+        force,
+        dry_run,
+        db.as_deref(),
+        config.as_deref(),
+    )
+    .await?;
+    print_value(&data, json);
+    Ok(())
+}
+
 /// `domain add`: register locally (always, regardless of a running daemon),
 /// then index immediately - routed to the daemon's ctl sync when one is
 /// running, else synced directly, the same dispatch `sync` itself uses.
-/// `--no-sync` registers only.
+/// `--no-sync` registers only. `--virtual` registers a database-backed domain
+/// and scaffolds its MANIFEST into the index instead of syncing files.
 async fn domain_add_dispatch(
     name: String,
-    path: PathBuf,
+    path: Option<PathBuf>,
+    is_virtual: bool,
     config: Option<PathBuf>,
     db: Option<PathBuf>,
     no_sync: bool,
     json: bool,
 ) -> anyhow::Result<()> {
+    if is_virtual {
+        if path.is_some() {
+            anyhow::bail!(
+                "`domain add --virtual` takes no path; a virtual domain has no directory"
+            );
+        }
+        let markdown = cmd::domain_add_register_virtual(&name, config.as_deref())?;
+        let scaffold = crystalline_service::scaffold_virtual_manifest(
+            &name,
+            &markdown,
+            db.as_deref(),
+            config.as_deref(),
+        )
+        .await?;
+        cmd::print_domain_add_virtual(&name, &scaffold, json);
+        return Ok(());
+    }
+
+    let path =
+        path.ok_or_else(|| anyhow::anyhow!("`domain add` requires a path (or use --virtual)"))?;
     let abs = cmd::domain_add_register(&name, &path, config.as_deref())?;
     if no_sync {
         cmd::print_domain_add_no_sync(&name, &abs, json);
@@ -997,6 +1150,7 @@ fn run_prompt(
     workspace: Option<PathBuf>,
     read_only_flag: bool,
     config_path: Option<PathBuf>,
+    db: Option<PathBuf>,
     json_flag: bool,
 ) -> anyhow::Result<()> {
     let workspace = workspace.unwrap_or_else(|| PathBuf::from("."));
@@ -1013,7 +1167,19 @@ fn run_prompt(
         config::GlobalConfig::default()
     };
 
-    let mut output = crystalline_core::generate_prompt(&global, &workspace);
+    // Virtual domains have no MANIFEST on disk; their routing bullets come from
+    // the daemon (warm) or a direct store read. The all-file common case never
+    // opens a runtime, so it stays as fast and deterministic as before.
+    let virtual_bullets = if global.domains.values().any(|e| e.is_virtual()) {
+        on_runtime_value(crystalline_service::virtual_routing_bullets(
+            &global,
+            db.as_deref(),
+        ))?
+    } else {
+        std::collections::BTreeMap::new()
+    };
+
+    let mut output = crystalline_core::generate_prompt(&global, &workspace, &virtual_bullets);
     // The flag forces the read-only variant on top of service.read_only; it can
     // only turn the mode on, matching the daemon precedence.
     if read_only_flag {

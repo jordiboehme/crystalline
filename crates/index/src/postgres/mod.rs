@@ -34,9 +34,10 @@ use tokio::sync::{Mutex as TokioMutex, MutexGuard};
 
 use crate::error::{IndexError, Result};
 use crate::store::{
-    ChunkJob, ChunkModelCount, DomainId, DomainStats, EdgeKind, EmbeddingCoverage, EmbeddingRow,
-    EngramDescriptor, EngramId, EngramRecord, EngramSummary, FileStamp, FtsMode, GraphSlice,
-    InboundRef, NewChunk, Page, RecentFilter, SearchHit, SearchQuery, Store, StoreInfo,
+    ChunkJob, ChunkModelCount, DomainId, DomainKind, DomainStats, EdgeKind, EmbeddingCoverage,
+    EmbeddingRow, EngramDescriptor, EngramId, EngramRecord, EngramSummary, FileStamp, FtsMode,
+    GraphSlice, InboundRef, NewChunk, Page, RecentFilter, SearchHit, SearchQuery, Store, StoreInfo,
+    StoredEngram,
 };
 
 /// A PostgreSQL-backed store. Open one with [`PostgresStore::open`].
@@ -277,6 +278,14 @@ fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
+/// The stored discriminator string for a domain kind.
+fn kind_str(kind: DomainKind) -> &'static str {
+    match kind {
+        DomainKind::File => "file",
+        DomainKind::Virtual => "virtual",
+    }
+}
+
 /// Strip the scheme, any credentials and the query string from a connection url,
 /// leaving `host:port/dbname` for display. Never returns credentials.
 fn sanitize_url(url: &str) -> Option<String> {
@@ -323,13 +332,22 @@ impl Store for PostgresStore {
         Ok(())
     }
 
-    async fn upsert_domain(&self, name: &str, path: &str) -> Result<DomainId> {
+    async fn upsert_domain(
+        &self,
+        name: &str,
+        path: Option<&str>,
+        kind: DomainKind,
+    ) -> Result<DomainId> {
+        // A virtual domain stores `path = NULL`; `kind` discriminates on both
+        // backends.
         let mut conn = self.acquire().await?;
         let row: (i64,) = sqlx::query_as(
-            "INSERT INTO domain(name, path) VALUES($1,$2) ON CONFLICT(name) DO UPDATE SET path=EXCLUDED.path RETURNING id",
+            "INSERT INTO domain(name, path, kind) VALUES($1,$2,$3) \
+             ON CONFLICT(name) DO UPDATE SET path=EXCLUDED.path, kind=EXCLUDED.kind RETURNING id",
         )
         .bind(name)
         .bind(path)
+        .bind(kind_str(kind))
         .fetch_one(conn.as_mut())
         .await
         .map_err(IndexError::from)?;
@@ -498,6 +516,93 @@ impl Store for PostgresStore {
         }
 
         Ok(EngramId(engram_id))
+    }
+
+    async fn upsert_engram_checked(
+        &self,
+        domain: DomainId,
+        record: &EngramRecord,
+        expected_sha: Option<&str>,
+    ) -> Result<EngramId> {
+        // Compare-and-swap: if a row exists at this path and the caller's
+        // expected sha no longer matches the stored one, refuse. The engine
+        // holds the transaction open (the pinned connection), so the compare and
+        // the write are one atomic unit.
+        if let Some(expected) = expected_sha {
+            let mut conn = self.acquire().await?;
+            let stored = sqlx::query("SELECT sha256 FROM engram WHERE domain_id=$1 AND path=$2")
+                .bind(domain.0)
+                .bind(&record.path)
+                .fetch_optional(conn.as_mut())
+                .await
+                .map_err(IndexError::from)?
+                .and_then(|r| cell_text(&r, 0));
+            drop(conn);
+            if let Some(found) = stored
+                && found != expected
+            {
+                return Err(IndexError::StaleEdit {
+                    expected: expected.to_string(),
+                    found,
+                });
+            }
+        }
+        self.upsert_engram(domain, record).await
+    }
+
+    async fn engram_content(&self, domain: DomainId, path: &str) -> Result<Option<String>> {
+        let mut conn = self.acquire().await?;
+        let row = sqlx::query("SELECT content FROM engram WHERE domain_id=$1 AND path=$2")
+            .bind(domain.0)
+            .bind(path)
+            .fetch_optional(conn.as_mut())
+            .await
+            .map_err(IndexError::from)?;
+        Ok(row.and_then(|r| cell_text(&r, 0)))
+    }
+
+    async fn all_engram_contents(&self, domain: DomainId) -> Result<Vec<StoredEngram>> {
+        let mut conn = self.acquire().await?;
+        let rows = sqlx::query(
+            "SELECT path, permalink, content, sha256 FROM engram WHERE domain_id=$1 ORDER BY path",
+        )
+        .bind(domain.0)
+        .fetch_all(conn.as_mut())
+        .await
+        .map_err(IndexError::from)?;
+        Ok(rows
+            .iter()
+            .map(|r| StoredEngram {
+                path: cell_text(r, 0).unwrap_or_default(),
+                permalink: cell_text(r, 1).unwrap_or_default(),
+                content: cell_text(r, 2).unwrap_or_default(),
+                sha256: cell_text(r, 3).unwrap_or_default(),
+            })
+            .collect())
+    }
+
+    async fn clear_domain(&self, domain: DomainId) -> Result<()> {
+        // Delete a single domain's engram and child rows, keeping the domain
+        // row. Child rows first so the enforced foreign keys are satisfied.
+        let mut conn = self.acquire().await?;
+        let c = conn.as_mut();
+        for sql in [
+            "DELETE FROM observation_tag WHERE observation_id IN \
+             (SELECT o.id FROM observation o JOIN engram e ON e.id=o.engram_id WHERE e.domain_id=$1)",
+            "DELETE FROM engram_tag WHERE engram_id IN (SELECT id FROM engram WHERE domain_id=$1)",
+            "DELETE FROM chunk WHERE engram_id IN (SELECT id FROM engram WHERE domain_id=$1)",
+            "DELETE FROM observation WHERE engram_id IN (SELECT id FROM engram WHERE domain_id=$1)",
+            "DELETE FROM relation WHERE domain_id=$1",
+            "DELETE FROM link WHERE domain_id=$1",
+            "DELETE FROM engram WHERE domain_id=$1",
+        ] {
+            sqlx::query(sql)
+                .bind(domain.0)
+                .execute(&mut *c)
+                .await
+                .map_err(IndexError::from)?;
+        }
+        Ok(())
     }
 
     async fn delete_engram(&self, domain: DomainId, path: &str) -> Result<()> {

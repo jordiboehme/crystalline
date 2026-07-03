@@ -15,6 +15,18 @@ pub enum IndexError {
     /// A constraint was violated, for example a duplicate permalink.
     #[error("constraint violation: {0}")]
     Constraint(String),
+    /// A compare-and-swap write found the stored engram already changed since
+    /// the caller last read it. Raised only by [`crate::Store::upsert_engram_checked`]
+    /// when an `expected_sha` is supplied and differs from the stored one; the
+    /// engine surfaces it as a conflict so a stale virtual edit is refused rather
+    /// than silently clobbering a concurrent change.
+    #[error("stale edit: engram changed since it was read (expected {expected}, found {found})")]
+    StaleEdit {
+        /// The sha256 the caller expected the stored row to still have.
+        expected: String,
+        /// The sha256 actually stored now.
+        found: String,
+    },
     /// A referenced entity was not found.
     #[error("not found: {0}")]
     NotFound(String),

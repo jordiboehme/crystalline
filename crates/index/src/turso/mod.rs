@@ -23,9 +23,10 @@ use turso::{Builder, Connection, Database, Row, Value};
 
 use crate::error::{IndexError, Result};
 use crate::store::{
-    ChunkJob, ChunkModelCount, DomainId, DomainStats, EdgeKind, EmbeddingCoverage, EmbeddingRow,
-    EngramDescriptor, EngramId, EngramRecord, EngramSummary, FileStamp, FtsMode, GraphSlice,
-    InboundRef, NewChunk, Page, RecentFilter, SearchHit, SearchQuery, Store, StoreInfo,
+    ChunkJob, ChunkModelCount, DomainId, DomainKind, DomainStats, EdgeKind, EmbeddingCoverage,
+    EmbeddingRow, EngramDescriptor, EngramId, EngramRecord, EngramSummary, FileStamp, FtsMode,
+    GraphSlice, InboundRef, NewChunk, Page, RecentFilter, SearchHit, SearchQuery, Store, StoreInfo,
+    StoredEngram,
 };
 
 /// A Turso-backed store. Open one with [`TursoStore::open`].
@@ -223,6 +224,14 @@ fn opt_text(o: &Option<String>) -> Value {
     }
 }
 
+/// The stored discriminator string for a domain kind.
+fn kind_str(kind: DomainKind) -> &'static str {
+    match kind {
+        DomainKind::File => "file",
+        DomainKind::Virtual => "virtual",
+    }
+}
+
 async fn probe_fts(conn: &Connection) -> bool {
     // Attempt a native FTS5 virtual table. Turso 0.6.1 rejects it, so this is
     // expected to fail and the candidate-scan fallback stays active. When a
@@ -249,11 +258,25 @@ impl Store for TursoStore {
         Ok(())
     }
 
-    async fn upsert_domain(&self, name: &str, path: &str) -> Result<DomainId> {
+    async fn upsert_domain(
+        &self,
+        name: &str,
+        path: Option<&str>,
+        kind: DomainKind,
+    ) -> Result<DomainId> {
+        // Virtual domains have no filesystem root; SQLite keeps `path NOT NULL`,
+        // so an absent path stores the empty string and `kind` discriminates.
+        let path = path.unwrap_or("");
+        let kind = kind_str(kind);
         self.conn
             .execute(
-                "INSERT INTO domain(name, path) VALUES(?1, ?2) ON CONFLICT(name) DO UPDATE SET path=excluded.path",
-                vec![Value::Text(name.to_string()), Value::Text(path.to_string())],
+                "INSERT INTO domain(name, path, kind) VALUES(?1, ?2, ?3) \
+                 ON CONFLICT(name) DO UPDATE SET path=excluded.path, kind=excluded.kind",
+                vec![
+                    Value::Text(name.to_string()),
+                    Value::Text(path.to_string()),
+                    Value::Text(kind.to_string()),
+                ],
             )
             .await?;
         let id = scalar_i64(
@@ -435,6 +458,83 @@ impl Store for TursoStore {
         }
 
         Ok(EngramId(engram_id))
+    }
+
+    async fn upsert_engram_checked(
+        &self,
+        domain: DomainId,
+        record: &EngramRecord,
+        expected_sha: Option<&str>,
+    ) -> Result<EngramId> {
+        // Compare-and-swap: if a row exists at this path and the caller supplied
+        // an expected sha that no longer matches the stored one, refuse. The
+        // engine holds the transaction open around this, so the compare and the
+        // subsequent write are one atomic unit.
+        if let Some(expected) = expected_sha {
+            let stored = query_first(
+                &self.conn,
+                "SELECT sha256 FROM engram WHERE domain_id=?1 AND path=?2",
+                vec![Value::Integer(domain.0), Value::Text(record.path.clone())],
+            )
+            .await?
+            .and_then(|r| cell_text(&r, 0));
+            if let Some(found) = stored
+                && found != expected
+            {
+                return Err(IndexError::StaleEdit {
+                    expected: expected.to_string(),
+                    found,
+                });
+            }
+        }
+        self.upsert_engram(domain, record).await
+    }
+
+    async fn engram_content(&self, domain: DomainId, path: &str) -> Result<Option<String>> {
+        let row = query_first(
+            &self.conn,
+            "SELECT content FROM engram WHERE domain_id=?1 AND path=?2",
+            vec![Value::Integer(domain.0), Value::Text(path.to_string())],
+        )
+        .await?;
+        Ok(row.and_then(|r| cell_text(&r, 0)))
+    }
+
+    async fn all_engram_contents(&self, domain: DomainId) -> Result<Vec<StoredEngram>> {
+        let rows = query_all(
+            &self.conn,
+            "SELECT path, permalink, content, sha256 FROM engram WHERE domain_id=?1 ORDER BY path",
+            vec![Value::Integer(domain.0)],
+        )
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| StoredEngram {
+                path: cell_text(r, 0).unwrap_or_default(),
+                permalink: cell_text(r, 1).unwrap_or_default(),
+                content: cell_text(r, 2).unwrap_or_default(),
+                sha256: cell_text(r, 3).unwrap_or_default(),
+            })
+            .collect())
+    }
+
+    async fn clear_domain(&self, domain: DomainId) -> Result<()> {
+        // Delete a single domain's engram and child rows, keeping the domain
+        // row. Child rows first, then chunks, then the engram rows themselves.
+        let did = vec![Value::Integer(domain.0)];
+        for sql in [
+            "DELETE FROM observation_tag WHERE observation_id IN \
+             (SELECT o.id FROM observation o JOIN engram e ON e.id=o.engram_id WHERE e.domain_id=?1)",
+            "DELETE FROM engram_tag WHERE engram_id IN (SELECT id FROM engram WHERE domain_id=?1)",
+            "DELETE FROM chunk WHERE engram_id IN (SELECT id FROM engram WHERE domain_id=?1)",
+            "DELETE FROM observation WHERE engram_id IN (SELECT id FROM engram WHERE domain_id=?1)",
+            "DELETE FROM relation WHERE domain_id=?1",
+            "DELETE FROM link WHERE domain_id=?1",
+            "DELETE FROM engram WHERE domain_id=?1",
+        ] {
+            self.conn.execute(sql, did.clone()).await?;
+        }
+        Ok(())
     }
 
     async fn delete_engram(&self, domain: DomainId, path: &str) -> Result<()> {

@@ -47,7 +47,7 @@ impl Harness {
                 ),
             )
             .unwrap();
-            cfg.domains.insert(d.to_string(), DomainEntry { path: dir });
+            cfg.domains.insert(d.to_string(), DomainEntry::file(dir));
         }
         let store = TursoStore::open_in_memory().await.unwrap();
         let engine = Arc::new(

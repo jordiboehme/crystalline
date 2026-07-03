@@ -16,7 +16,10 @@ pub mod instance;
 pub mod mcp;
 pub mod params;
 
-pub use client::{ctl_if_running, ctl_required, run_mcp, run_tool};
+pub use client::{
+    ctl_if_running, ctl_required, domain_export, domain_import, run_mcp, run_tool,
+    scaffold_virtual_manifest, virtual_routing_bullets,
+};
 pub use daemon::run_serve;
 pub use engine::{Engine, EngineError};
 pub use mcp::McpServer;

@@ -91,7 +91,13 @@ pub async fn sync_domain_with<S: Store + ?Sized>(
     chunk_params: &ChunkParams,
 ) -> Result<SyncReport> {
     let started = Instant::now();
-    let domain = store.upsert_domain(name, &root.to_string_lossy()).await?;
+    let domain = store
+        .upsert_domain(
+            name,
+            Some(&root.to_string_lossy()),
+            crate::store::DomainKind::File,
+        )
+        .await?;
     let existing = store.file_stamps(domain).await?;
 
     // Walk the folder, skipping dot-directories, dot-files and non-markdown.

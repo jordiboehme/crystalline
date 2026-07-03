@@ -80,6 +80,12 @@ pub struct EditParams {
     /// Replace deeper subsections too when replacing a section.
     #[serde(default)]
     pub include_subsections: bool,
+    /// The checksum from a prior `read_engram`, guarding a virtual-domain edit
+    /// against a change since it was read: the edit is refused as a conflict if
+    /// the stored checksum no longer matches. Omit for last-write-wins. Ignored
+    /// by file domains, whose single-writer host owns the file on disk.
+    #[serde(default)]
+    pub expected_checksum: Option<String>,
 }
 
 /// Parameters for `move_engram`.

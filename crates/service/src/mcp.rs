@@ -90,7 +90,7 @@ impl McpServer {
 
     #[tool(
         name = "edit_engram",
-        description = "Refine an existing engram in place as understanding evolves, rather than rewriting it. Sections are addressed by heading path such as '## API > ### Auth'; replace_section keeps deeper subsections unless include_subsections is set. operation is one of append, prepend, find_replace, replace_section, insert_before_section, insert_after_section. find_replace takes find_text and an optional expected_replacements guard that fails on a count mismatch. The timestamp is refreshed. Recommended status values to reflect a changed lifecycle: current, implemented, draft, proposed, idea, poc, deprecated, superseded, archived, legacy."
+        description = "Refine an existing engram in place as understanding evolves, rather than rewriting it. Sections are addressed by heading path such as '## API > ### Auth'; replace_section keeps deeper subsections unless include_subsections is set. operation is one of append, prepend, find_replace, replace_section, insert_before_section, insert_after_section. find_replace takes find_text and an optional expected_replacements guard that fails on a count mismatch. Pass expected_checksum (the checksum returned by read_engram) to guard a virtual-domain edit against a change since you last read it: the edit is refused as a conflict if it changed, so re-read and retry; omit it for last-write-wins. The timestamp is refreshed. Recommended status values to reflect a changed lifecycle: current, implemented, draft, proposed, idea, poc, deprecated, superseded, archived, legacy."
     )]
     async fn edit_engram(
         &self,

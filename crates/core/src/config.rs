@@ -79,11 +79,71 @@ impl GlobalConfig {
     }
 }
 
-/// A registered domain.
+/// Which side of the one-truth-per-domain rule a domain lives on: files on
+/// disk (the default) or the database.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DomainKind {
+    /// Engrams are markdown files on disk; the database is a derived index.
+    #[default]
+    File,
+    /// Engrams live only in the database; there is no filesystem root. Portable
+    /// and scale-out friendly, and `crystalline domain export` hands the files
+    /// back at any time.
+    Virtual,
+}
+
+impl DomainKind {
+    /// Whether this is the default file kind. Used to keep `kind` out of a
+    /// serialized file-domain entry so old configs round-trip byte-for-byte.
+    pub fn is_file(&self) -> bool {
+        matches!(self, DomainKind::File)
+    }
+}
+
+/// A registered domain. A file domain carries its root `path`; a virtual domain
+/// carries no path and elects the database as its source of truth.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DomainEntry {
-    /// The domain root path.
-    pub path: PathBuf,
+    /// The domain kind. Absent (the default `file`) is never serialized, so a
+    /// file-domain entry writes only its `path` exactly as before.
+    #[serde(default, skip_serializing_if = "DomainKind::is_file")]
+    pub kind: DomainKind,
+    /// The domain root path. Present for a file domain, absent for a virtual
+    /// domain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
+}
+
+impl DomainEntry {
+    /// A file-backed domain entry rooted at `path`.
+    pub fn file(path: impl Into<PathBuf>) -> DomainEntry {
+        DomainEntry {
+            kind: DomainKind::File,
+            path: Some(path.into()),
+        }
+    }
+
+    /// A virtual domain entry (database-backed, no path).
+    pub fn virtual_domain() -> DomainEntry {
+        DomainEntry {
+            kind: DomainKind::Virtual,
+            path: None,
+        }
+    }
+
+    /// Whether this domain keeps its engrams in the database rather than on disk.
+    pub fn is_virtual(&self) -> bool {
+        matches!(self.kind, DomainKind::Virtual)
+    }
+
+    /// The tilde-expanded filesystem root for a file domain, or `None` for a
+    /// virtual domain (which has no path).
+    pub fn file_path(&self) -> Option<PathBuf> {
+        self.path
+            .as_ref()
+            .map(|p| expand_tilde(&p.to_string_lossy()))
+    }
 }
 
 /// Which storage backend backs the derived index.
@@ -461,5 +521,56 @@ mod tests {
             url: Some("mysql://localhost/db".to_string()),
         };
         assert!(db.validate().is_err());
+    }
+
+    #[test]
+    fn file_domain_entry_round_trips_without_a_kind_line() {
+        // A file domain must serialize only its path, no `kind:`, so old
+        // configs stay byte-identical.
+        let mut domains = IndexMap::new();
+        domains.insert("eng".to_string(), DomainEntry::file("/knowledge/eng"));
+        let cfg = GlobalConfig {
+            domains,
+            ..GlobalConfig::default()
+        };
+        let yaml = serde_yaml_ng::to_string(&cfg).unwrap();
+        assert!(
+            !yaml.contains("kind"),
+            "no kind line for a file domain: {yaml}"
+        );
+        assert!(yaml.contains("path: /knowledge/eng"), "{yaml}");
+        let back: GlobalConfig = serde_yaml_ng::from_str(&yaml).unwrap();
+        assert_eq!(back, cfg);
+    }
+
+    #[test]
+    fn virtual_domain_entry_serializes_kind_and_no_path() {
+        let mut domains = IndexMap::new();
+        domains.insert("notes".to_string(), DomainEntry::virtual_domain());
+        let cfg = GlobalConfig {
+            domains,
+            ..GlobalConfig::default()
+        };
+        let yaml = serde_yaml_ng::to_string(&cfg).unwrap();
+        assert!(yaml.contains("kind: virtual"), "{yaml}");
+        assert!(
+            !yaml.contains("path"),
+            "a virtual domain writes no path: {yaml}"
+        );
+        let back: GlobalConfig = serde_yaml_ng::from_str(&yaml).unwrap();
+        let entry = back.domains.get("notes").unwrap();
+        assert!(entry.is_virtual());
+        assert_eq!(entry.file_path(), None);
+    }
+
+    #[test]
+    fn legacy_bare_path_entry_parses_as_a_file_domain() {
+        // The historical shape (`name: { path: ... }`) still parses to a file
+        // domain with the default kind.
+        let yaml = "domains:\n  eng:\n    path: /knowledge/eng\n";
+        let cfg: GlobalConfig = serde_yaml_ng::from_str(yaml).unwrap();
+        let entry = cfg.domains.get("eng").unwrap();
+        assert!(!entry.is_virtual());
+        assert_eq!(entry.file_path(), Some(PathBuf::from("/knowledge/eng")));
     }
 }

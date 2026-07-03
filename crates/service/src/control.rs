@@ -105,6 +105,61 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                 Err(e) => (envelope_err(e.to_string()), false),
             }
         }
+        // Virtual-domain routing bullets for `prompt system`, served from the
+        // daemon's warm state so the prompt stays inside its latency budget.
+        "routing_bullets" => (
+            envelope_ok(
+                serde_json::to_value(shared.engine.virtual_routing_bullets().await)
+                    .unwrap_or(Value::Null),
+            ),
+            false,
+        ),
+        // Scaffold a virtual domain's MANIFEST from markdown the CLI built.
+        "scaffold_manifest" => {
+            let domain = req.get("domain").and_then(Value::as_str).unwrap_or("");
+            let markdown = req.get("markdown").and_then(Value::as_str).unwrap_or("");
+            match shared
+                .engine
+                .scaffold_virtual_manifest(domain, markdown)
+                .await
+            {
+                Ok(data) => (envelope_ok(data), false),
+                Err(e) => (envelope_err(e.to_string()), false),
+            }
+        }
+        // Load engram files into a virtual domain verbatim.
+        "domain_import" => {
+            let domain = req.get("domain").and_then(Value::as_str).unwrap_or("");
+            let path = req.get("path").and_then(Value::as_str).unwrap_or("");
+            let overwrite = req
+                .get("overwrite")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let dry_run = req.get("dry_run").and_then(Value::as_bool).unwrap_or(false);
+            match shared
+                .engine
+                .import_domain(domain, std::path::Path::new(path), overwrite, dry_run)
+                .await
+            {
+                Ok(data) => (envelope_ok(data), false),
+                Err(e) => (envelope_err(e.to_string()), false),
+            }
+        }
+        // Export a domain's engrams to a filesystem folder.
+        "domain_export" => {
+            let domain = req.get("domain").and_then(Value::as_str).unwrap_or("");
+            let path = req.get("path").and_then(Value::as_str).unwrap_or("");
+            let force = req.get("force").and_then(Value::as_bool).unwrap_or(false);
+            let dry_run = req.get("dry_run").and_then(Value::as_bool).unwrap_or(false);
+            match shared
+                .engine
+                .export_domain(domain, std::path::Path::new(path), force, dry_run)
+                .await
+            {
+                Ok(data) => (envelope_ok(data), false),
+                Err(e) => (envelope_err(e.to_string()), false),
+            }
+        }
         "shutdown" => (envelope_ok(json!({ "stopping": true })), true),
         // Best-effort: `domain remove` calls this so a live daemon stops
         // watching the removed path right away instead of on its next
@@ -117,7 +172,8 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
         }
         other => (
             envelope_err(format!(
-                "unknown ctl command '{other}'; expected status, sessions, sync, reindex, forget_domain or shutdown"
+                "unknown ctl command '{other}'; expected status, sessions, sync, reindex, \
+                 routing_bullets, scaffold_manifest, domain_import, domain_export, forget_domain or shutdown"
             )),
             false,
         ),

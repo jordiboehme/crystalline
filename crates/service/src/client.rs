@@ -126,6 +126,107 @@ pub async fn run_tool(
     dispatch_engine(&engine, tool, args).await
 }
 
+/// Scaffold a virtual domain's MANIFEST from prebuilt markdown: over the daemon
+/// when one owns the index, else against a directly opened store.
+pub async fn scaffold_virtual_manifest(
+    domain: &str,
+    markdown: &str,
+    db: Option<&Path>,
+    config_path: Option<&Path>,
+) -> anyhow::Result<Value> {
+    use serde_json::json;
+    if let Some(data) = ctl_if_running(json!({
+        "v": 1, "cmd": "scaffold_manifest", "domain": domain, "markdown": markdown,
+    }))
+    .await?
+    {
+        return Ok(data);
+    }
+    let config = load_config(config_path)?;
+    let db_path = resolve_db(db)?;
+    let engine = open_standalone(config, &db_path, false).await?;
+    Ok(engine.scaffold_virtual_manifest(domain, markdown).await?)
+}
+
+/// Import engram files into a virtual domain: over the daemon when one owns the
+/// index, else against a directly opened store.
+pub async fn domain_import(
+    domain: &str,
+    src: &Path,
+    overwrite: bool,
+    dry_run: bool,
+    db: Option<&Path>,
+    config_path: Option<&Path>,
+) -> anyhow::Result<Value> {
+    use serde_json::json;
+    if let Some(data) = ctl_if_running(json!({
+        "v": 1, "cmd": "domain_import", "domain": domain,
+        "path": src.display().to_string(), "overwrite": overwrite, "dry_run": dry_run,
+    }))
+    .await?
+    {
+        return Ok(data);
+    }
+    let config = load_config(config_path)?;
+    let db_path = resolve_db(db)?;
+    let engine = open_standalone(config, &db_path, false).await?;
+    Ok(engine
+        .import_domain(domain, src, overwrite, dry_run)
+        .await?)
+}
+
+/// Export a domain's engrams to a filesystem folder: over the daemon when one
+/// owns the index, else against a directly opened store.
+pub async fn domain_export(
+    domain: &str,
+    dest: &Path,
+    force: bool,
+    dry_run: bool,
+    db: Option<&Path>,
+    config_path: Option<&Path>,
+) -> anyhow::Result<Value> {
+    use serde_json::json;
+    if let Some(data) = ctl_if_running(json!({
+        "v": 1, "cmd": "domain_export", "domain": domain,
+        "path": dest.display().to_string(), "force": force, "dry_run": dry_run,
+    }))
+    .await?
+    {
+        return Ok(data);
+    }
+    let config = load_config(config_path)?;
+    let db_path = resolve_db(db)?;
+    let engine = open_standalone(config, &db_path, false).await?;
+    Ok(engine.export_domain(domain, dest, force, dry_run).await?)
+}
+
+/// Resolve virtual-domain routing bullets for `prompt system`: over the daemon
+/// when one is running (its warm state), else against a directly opened store.
+/// Returns an empty map when the config has no virtual domains, so the common
+/// all-file case never opens a store or a socket.
+pub async fn virtual_routing_bullets(
+    config: &crystalline_core::config::GlobalConfig,
+    db: Option<&Path>,
+) -> std::collections::BTreeMap<String, Vec<String>> {
+    use serde_json::json;
+    if !config.domains.values().any(|e| e.is_virtual()) {
+        return std::collections::BTreeMap::new();
+    }
+    if let Ok(Some(data)) = ctl_if_running(json!({ "v": 1, "cmd": "routing_bullets" })).await
+        && let Ok(map) = serde_json::from_value(data)
+    {
+        return map;
+    }
+    let db_path = match resolve_db(db) {
+        Ok(p) => p,
+        Err(_) => return std::collections::BTreeMap::new(),
+    };
+    match open_standalone(config.clone(), &db_path, false).await {
+        Ok(engine) => engine.virtual_routing_bullets().await,
+        Err(_) => std::collections::BTreeMap::new(),
+    }
+}
+
 /// Call a tool over an MCP client on a socket stream and return its JSON value.
 async fn call_tool_over_stream(
     stream: IpcStream,

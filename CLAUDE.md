@@ -1,6 +1,6 @@
 # Crystalline
 
-Local-first knowledge management for humans and AI agents. Markdown files (Engrams) grouped in Domains are the source of truth; an embedded database is a disposable derived index; an MCP server and CLI sit on top.
+Local-first knowledge management for humans and AI agents. Every Domain has exactly one source of truth: by default Markdown files (Engrams) on disk, or, for a virtual domain, the database itself. The search index is always a disposable derived layer; an MCP server and CLI sit on top.
 
 ## Purpose
 

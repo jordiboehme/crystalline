@@ -477,15 +477,16 @@ async fn wait_signal() {
     }
 }
 
-/// The registered domains as `(name, canonical root)` pairs for the watcher.
+/// The registered file domains as `(name, canonical root)` pairs for the
+/// watcher. Virtual domains have no filesystem root, so they are never watched.
 fn domain_roots(config: &GlobalConfig) -> Vec<(String, PathBuf)> {
     config
         .domains
         .iter()
-        .map(|(name, entry)| {
-            let root = config::expand_tilde(&entry.path.to_string_lossy());
+        .filter_map(|(name, entry)| {
+            let root = entry.file_path().filter(|_| !entry.is_virtual())?;
             let canonical = std::fs::canonicalize(&root).unwrap_or(root);
-            (name.clone(), canonical)
+            Some((name.clone(), canonical))
         })
         .collect()
 }

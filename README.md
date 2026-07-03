@@ -20,8 +20,30 @@ Once knowledge grows into the thousands or tens of thousands of units, reading a
 - **Engrams** are the unit of knowledge: one markdown file with YAML frontmatter, holding prose, observations (`- [category] a captured fact or lesson`) and relations (`- rel_type [[Other Engram]]`) to other engrams.
 - **Built on an open format.** The engram format extends [Google's Open Knowledge Format (OKF)](https://github.com/GoogleCloudPlatform/knowledge-catalog/tree/main/okf): plain markdown with YAML frontmatter where unknown keys are always preserved. Crystalline layers its routing, temporal and knowledge-graph conventions on top, so engrams stay readable by any OKF tooling and OKF documents drop into a domain with minimal ceremony.
 - **MANIFEST routing** lets an agent (or a person) figure out which domain owns a task without reading every file: `crystalline prompt system` turns each domain's `## When to Use` bullets into a compact session-start briefing.
-- **Files are truth.** Engrams on disk are the only durable state. Nothing is ever stored only in the database.
-- **The index is disposable.** Crystalline maintains a local embedded database for fast text, tag, temporal and semantic search, but it is fully derived from the markdown files and rebuilt on demand with `crystalline reindex --full`. Corruption or a schema change is never a data-loss event.
+- **One truth per domain.** By default files are truth: engrams on disk are the durable state and nothing lives only in the database.* The search index is always derived and disposable, whichever side holds the truth.
+
+  *Unless you ask for exactly that: a virtual domain keeps its engrams in the database instead of on disk, for deployments where a filesystem is baggage rather than a feature. The principle does not bend - it just lets you pick which side of it your domain lives on, and `crystalline domain export` hands the files back whenever you change your mind.
+- **The index is disposable.** Crystalline maintains a database for fast text, tag, temporal and semantic search. For a file domain it is fully derived from the markdown files and rebuilt on demand with `crystalline reindex --full`; for a virtual domain the same tables hold the source of truth, so `reindex --full` rebuilds the file domains around it and never touches it. Corruption or a schema change is never a data-loss event.
+
+### Virtual domains
+
+Most domains are folders of files. A virtual domain is the other option: its engrams live in the database, with no filesystem root. Reach for one where a filesystem is baggage rather than a feature - a container with no writable volume, a PostgreSQL backend shared across machines, or a domain you would rather not mirror to disk at all.
+
+```sh
+# Register a database-backed domain and scaffold its MANIFEST into the index.
+crystalline domain add notes --virtual
+
+# It works with the same tools as any domain.
+crystalline write notes "First note" --content "captured straight into the database"
+crystalline search "captured"
+```
+
+Two commands move engrams between the two kinds of truth:
+
+- `crystalline domain import <path> --domain <name>` loads already-well-formed engram files into a virtual domain, verbatim. It is distinct from `crystalline import`, which converts a legacy tree into a *file* domain's directory.
+- `crystalline domain export <path> --domain <name>` writes any domain's engrams back out as a normal markdown folder. This is how you take a virtual domain's data out to run `crystalline verify` on it, or convert it back to files whenever you change your mind.
+
+Concurrent edits to the same virtual engram are guarded: `read_engram` returns a checksum, and passing it back as `expected_checksum` on `edit_engram` refuses the edit if the engram changed since you read it, so a stale write conflicts instead of clobbering. Omit it for last-write-wins.
 
 ## Install
 
@@ -205,8 +227,8 @@ docker run -d \
 
 What persists where:
 
-- `./knowledge` (bind mount) holds the engrams themselves, one subfolder per domain - this is the only data that matters, and it is exactly the same markdown-plus-frontmatter files the native binary reads.
-- `crystalline-data` (named volume, mounted at `/data`) holds the rebuildable search index and the embedding model cache. Losing it costs a `crystalline reindex --full` and a model re-download (skipped entirely on `with-model`, since its model lives outside `/data` and is never affected by the volume), never data.
+- `./knowledge` (bind mount) holds the engrams of every file domain, one subfolder per domain - the durable state for file-backed knowledge, exactly the same markdown-plus-frontmatter files the native binary reads.
+- `crystalline-data` (named volume, mounted at `/data`) holds the search index and the embedding model cache. For file domains it is fully rebuildable: losing it costs a `crystalline reindex --full` and a model re-download (skipped entirely on `with-model`, since its model lives outside `/data` and is never affected by the volume), never data. If you run virtual domains, their engrams are the source of truth and live here too, so back this volume up or `crystalline domain export` them to the bind mount to keep a file copy.
 
 The `with-model` variant sets `CRYSTALLINE_MODELS_DIR` (also settable directly, on any install, to relocate the model cache anywhere else) to a path outside `/data` so the baked model is never shadowed by the `/data` volume mount. The bundled model is [BAAI/bge-small-en-v1.5](https://huggingface.co/BAAI/bge-small-en-v1.5), MIT licensed.
 

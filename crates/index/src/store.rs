@@ -15,6 +15,7 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 use chrono::NaiveDate;
+pub use crystalline_core::config::DomainKind;
 use crystalline_core::{Engram, slugify};
 use serde::Serialize;
 
@@ -537,6 +538,22 @@ pub struct EngramDescriptor {
     pub status: String,
 }
 
+/// A stored engram's addressing plus its full markdown content and checksum.
+/// Returned by [`Store::all_engram_contents`] to materialize a whole domain for
+/// `domain export`, and shaped so an export writes each engram back to disk
+/// verbatim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StoredEngram {
+    /// The domain-relative file path, forward-slashed, with the `.md` suffix.
+    pub path: String,
+    /// The engram permalink.
+    pub permalink: String,
+    /// The full markdown content (frontmatter plus body) as stored.
+    pub content: String,
+    /// The lowercase hex SHA-256 of `content`, the CAS token.
+    pub sha256: String,
+}
+
 /// One inbound reference to an engram: a relation or a prose link that resolves
 /// to it. Used by the cross-domain move to rewrite linkers to the domain-prefixed
 /// form.
@@ -683,8 +700,15 @@ pub trait Store: Send + Sync {
     /// Apply any pending schema migrations. Idempotent.
     async fn migrate(&self) -> Result<()>;
 
-    /// Register or update a domain by name and root path, returning its id.
-    async fn upsert_domain(&self, name: &str, path: &str) -> Result<DomainId>;
+    /// Register or update a domain by name, root path and kind, returning its
+    /// id. A file domain passes `Some(path)`; a virtual domain passes `None`,
+    /// since its engrams live in the database with no filesystem root.
+    async fn upsert_domain(
+        &self,
+        name: &str,
+        path: Option<&str>,
+        kind: DomainKind,
+    ) -> Result<DomainId>;
 
     /// The recorded file stamps for a domain, keyed by domain-relative path.
     async fn file_stamps(&self, domain: DomainId) -> Result<HashMap<String, FileStamp>>;
@@ -693,6 +717,37 @@ pub trait Store: Send + Sync {
     /// and tags. Returns the engram id. A duplicate permalink (a different path
     /// already owning the permalink) is a [`crate::IndexError::Constraint`].
     async fn upsert_engram(&self, domain: DomainId, record: &EngramRecord) -> Result<EngramId>;
+
+    /// Like [`Store::upsert_engram`], but a compare-and-swap on the stored
+    /// content. When `expected_sha` is `Some` and a row already exists at
+    /// `record.path` whose stored `sha256` differs, this returns
+    /// [`crate::IndexError::StaleEdit`] instead of writing; otherwise it behaves
+    /// exactly like `upsert_engram`. The compare and the write are one atomic
+    /// unit (the engine wraps the call in a transaction). This is the guard that
+    /// makes a stale virtual edit a conflict rather than a silent clobber.
+    async fn upsert_engram_checked(
+        &self,
+        domain: DomainId,
+        record: &EngramRecord,
+        expected_sha: Option<&str>,
+    ) -> Result<EngramId>;
+
+    /// The full markdown content stored for the engram at a domain-relative
+    /// path, or `None` when no such row exists. Serves the database read path
+    /// (virtual domains and non-host reads) and reads current content for a
+    /// virtual edit.
+    async fn engram_content(&self, domain: DomainId, path: &str) -> Result<Option<String>>;
+
+    /// Every engram in a domain with its path, permalink, content and checksum,
+    /// ordered by path. Streams a whole domain for `domain export`.
+    async fn all_engram_contents(&self, domain: DomainId) -> Result<Vec<StoredEngram>>;
+
+    /// Delete every engram (and its child and chunk rows) in a single domain,
+    /// keeping the domain row itself. This is the scoped clear the full reindex
+    /// uses per file domain so virtual-domain rows, whose only source of truth is
+    /// the database, are never destroyed. Contrast [`Store::wipe`], which clears
+    /// everything.
+    async fn clear_domain(&self, domain: DomainId) -> Result<()>;
 
     /// Delete the engram at a domain-relative path and all its child rows.
     async fn delete_engram(&self, domain: DomainId, path: &str) -> Result<()>;

@@ -66,12 +66,8 @@ fn atomic_save_round_trips() {
     let path = dir.path().join("nested").join("config.yaml");
 
     let mut cfg = GlobalConfig::default();
-    cfg.domains.insert(
-        "gardening".into(),
-        DomainEntry {
-            path: "/data/gardening".into(),
-        },
-    );
+    cfg.domains
+        .insert("gardening".into(), DomainEntry::file("/data/gardening"));
     save_yaml(&path, &cfg).unwrap();
     assert!(path.exists());
 

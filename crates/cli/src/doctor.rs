@@ -29,8 +29,17 @@ use crate::cmd;
 pub struct DomainDoctor {
     /// The domain name.
     pub name: String,
-    /// The domain's resolved root path.
+    /// The domain kind, `file` or `virtual`.
+    pub kind: String,
+    /// The domain's resolved root path, or `(virtual)` for a virtual domain.
     pub path: String,
+    /// Whether this is a virtual (database-backed) domain, whose on-disk checks
+    /// do not apply.
+    pub is_virtual: bool,
+    /// The database engram count, reported for a virtual domain in place of the
+    /// on-disk orphan and unindexed checks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub engrams: Option<i64>,
     /// Whether the path exists on disk.
     pub path_exists: bool,
     /// Whether `MANIFEST.md` is present at the root.
@@ -182,13 +191,40 @@ async fn check_domain(
     store: Option<&dyn Store>,
     fix: bool,
 ) -> Result<DomainDoctor> {
-    let path = cmd::resolve_domain_path(entry);
+    // A virtual domain has no filesystem, so the on-disk checks (path, MANIFEST,
+    // orphans, unindexed, encoding) do not apply. Report its database engram
+    // count instead.
+    if entry.is_virtual() {
+        let mut d = DomainDoctor {
+            name: name.to_string(),
+            kind: "virtual".to_string(),
+            path: "(virtual)".to_string(),
+            is_virtual: true,
+            path_exists: true,
+            manifest_present: true,
+            ..Default::default()
+        };
+        if let Some(store) = store {
+            let count = store
+                .list_engrams(name, None, None)
+                .await
+                .map(|e| e.len() as i64)
+                .unwrap_or(0);
+            d.engrams = Some(count);
+        }
+        return Ok(d);
+    }
+
+    let path = cmd::resolve_domain_path(entry).unwrap_or_default();
     let path_exists = path.is_dir();
     let manifest_present = path_exists && path.join("MANIFEST.md").is_file();
 
     let mut d = DomainDoctor {
         name: name.to_string(),
+        kind: "file".to_string(),
         path: path.display().to_string(),
+        is_virtual: false,
+        engrams: None,
         path_exists,
         manifest_present,
         ..Default::default()
@@ -216,7 +252,11 @@ async fn check_domain(
     // (a) + (b): DB orphans and unindexed files.
     if let Some(store) = store {
         let domain_id = store
-            .upsert_domain(name, &path.to_string_lossy())
+            .upsert_domain(
+                name,
+                Some(&path.to_string_lossy()),
+                crystalline_index::DomainKind::File,
+            )
             .await
             .map_err(|e| anyhow!("could not read domain '{name}': {e}"))?;
         let stamps = store
@@ -352,6 +392,14 @@ pub fn render_human(report: &DoctorReport) -> String {
 
     for d in &report.domains {
         let _ = writeln!(out, "{} ({})", d.name, d.path);
+        if d.is_virtual {
+            let _ = writeln!(
+                out,
+                "  ok (virtual, {} engram(s) in the database)",
+                d.engrams.unwrap_or(0)
+            );
+            continue;
+        }
         if !d.path_exists {
             let _ = writeln!(out, "  [problem] domain path does not exist");
             continue;

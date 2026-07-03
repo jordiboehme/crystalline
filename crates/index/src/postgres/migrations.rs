@@ -25,11 +25,18 @@ pub struct Migration {
 }
 
 /// The ordered list of migrations. Append-only: never edit a shipped migration.
-pub const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    label: "initial schema",
-    sql: SCHEMA_V1,
-}];
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        label: "initial schema",
+        sql: SCHEMA_V1,
+    },
+    Migration {
+        version: 2,
+        label: "domain kind",
+        sql: SCHEMA_V2,
+    },
+];
 
 // The whole current schema in one step. The temporal columns stay TEXT ISO
 // strings, not `date`/`timestamptz`, so the canonical current filter and every
@@ -144,6 +151,16 @@ CREATE INDEX idx_chunk_engram ON chunk(engram_id);
 CREATE INDEX idx_chunk_hash ON chunk(text_hash);
 CREATE INDEX idx_chunk_model ON chunk(model);
 CREATE INDEX idx_chunk_embedding ON chunk USING hnsw (embedding vector_cosine_ops);
+"#;
+
+// A domain gains a `kind` discriminator so a virtual domain (engrams in the
+// database, no filesystem root) is told apart from a file domain. Unlike Turso,
+// Postgres can drop the `path NOT NULL` cheaply, so a virtual domain stores
+// `path = NULL`; `kind` is still the authoritative discriminator. Existing rows
+// default to 'file'.
+const SCHEMA_V2: &str = r#"
+ALTER TABLE domain ADD COLUMN kind TEXT NOT NULL DEFAULT 'file';
+ALTER TABLE domain ALTER COLUMN path DROP NOT NULL;
 "#;
 
 /// The tables cleared by `wipe()`, child rows first so the enforced foreign

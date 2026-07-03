@@ -39,7 +39,7 @@
 //! stays inside the budget. Design every new prompt kind against the
 //! latency budget, not against a hard ban on any particular data source.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -84,7 +84,18 @@ pub struct PromptOutput {
 /// Build the routing prompt for a workspace: apply `prompt.rules`
 /// include/exclude glob filters, then a repo-local `preferred_domains`
 /// reorder, then read each included domain's MANIFEST.
-pub fn generate_prompt(global: &GlobalConfig, workspace: &Path) -> PromptOutput {
+///
+/// A file domain's routing bullets come from its `MANIFEST.md` on disk, kept
+/// fast and dependency-free. A virtual domain has no disk root, so the caller
+/// (which may reach a running daemon or the store) supplies its bullets in
+/// `virtual_bullets`, keyed by domain name; this crate never touches a database.
+/// The determinism contract holds: identical config plus identical MANIFEST
+/// content (disk and supplied) render byte-identical output.
+pub fn generate_prompt(
+    global: &GlobalConfig,
+    workspace: &Path,
+    virtual_bullets: &BTreeMap<String, Vec<String>>,
+) -> PromptOutput {
     let included = included_domain_names(global, workspace);
     let repo_cfg = load_repo_config(workspace);
     let preferred: Vec<String> = repo_cfg.map(|c| c.preferred_domains).unwrap_or_default();
@@ -109,7 +120,14 @@ pub fn generate_prompt(global: &GlobalConfig, workspace: &Path) -> PromptOutput 
     for name in ordered {
         let entry = &global.domains[name];
         let is_preferred = preferred.iter().any(|p| p == name);
-        let (bullets, warning) = load_routing_bullets(name, &entry.path);
+        let (bullets, warning) = if entry.is_virtual() {
+            virtual_routing_bullets(name, virtual_bullets.get(name))
+        } else {
+            match &entry.path {
+                Some(path) => load_routing_bullets(name, path),
+                None => virtual_routing_bullets(name, virtual_bullets.get(name)),
+            }
+        };
         if let Some(w) = warning {
             warnings.push(w);
         }
@@ -125,6 +143,26 @@ pub fn generate_prompt(global: &GlobalConfig, workspace: &Path) -> PromptOutput 
         domains,
         warnings,
         read_only: global.read_only(),
+    }
+}
+
+/// Routing bullets for a virtual domain, supplied by the caller from the
+/// database. An absent or empty set gets a placeholder line and a warning,
+/// mirroring the missing-MANIFEST path for file domains.
+fn virtual_routing_bullets(
+    name: &str,
+    supplied: Option<&Vec<String>>,
+) -> (Vec<String>, Option<String>) {
+    match supplied {
+        Some(bullets) if !bullets.is_empty() => (bullets.clone(), None),
+        _ => (
+            vec![placeholder(
+                "add `## When to Use` or `## Scope` bullets to the virtual MANIFEST",
+            )],
+            Some(format!(
+                "domain `{name}`: virtual MANIFEST has no Scope or When to Use bullets"
+            )),
+        ),
     }
 }
 
@@ -343,8 +381,8 @@ mod tests {
         .unwrap();
 
         let mut domains = indexmap::IndexMap::new();
-        domains.insert("alpha".to_string(), DomainEntry { path: alpha });
-        domains.insert("beta".to_string(), DomainEntry { path: beta });
+        domains.insert("alpha".to_string(), DomainEntry::file(alpha));
+        domains.insert("beta".to_string(), DomainEntry::file(beta));
 
         let global = GlobalConfig {
             domains,
@@ -359,23 +397,23 @@ mod tests {
     #[test]
     fn generate_and_render_text_is_byte_identical_across_repeated_runs() {
         let (tmp, global) = fixture();
-        let first = render_text(&generate_prompt(&global, tmp.path()));
-        let second = render_text(&generate_prompt(&global, tmp.path()));
+        let first = render_text(&generate_prompt(&global, tmp.path(), &BTreeMap::new()));
+        let second = render_text(&generate_prompt(&global, tmp.path(), &BTreeMap::new()));
         assert_eq!(first.as_bytes(), second.as_bytes());
     }
 
     #[test]
     fn generate_and_render_json_is_byte_identical_across_repeated_runs() {
         let (tmp, global) = fixture();
-        let first = render_json(&generate_prompt(&global, tmp.path()));
-        let second = render_json(&generate_prompt(&global, tmp.path()));
+        let first = render_json(&generate_prompt(&global, tmp.path(), &BTreeMap::new()));
+        let second = render_json(&generate_prompt(&global, tmp.path(), &BTreeMap::new()));
         assert_eq!(first.as_bytes(), second.as_bytes());
     }
 
     #[test]
     fn render_text_names_the_mcp_server_and_exact_tool_names() {
         let (tmp, global) = fixture();
-        let text = render_text(&generate_prompt(&global, tmp.path()));
+        let text = render_text(&generate_prompt(&global, tmp.path(), &BTreeMap::new()));
         assert!(text.contains("crystalline MCP server"));
         for tool in [
             "search_engrams",
@@ -397,7 +435,7 @@ mod tests {
     #[test]
     fn render_json_reports_kind_system() {
         let (tmp, global) = fixture();
-        let json = render_json(&generate_prompt(&global, tmp.path()));
+        let json = render_json(&generate_prompt(&global, tmp.path(), &BTreeMap::new()));
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(value["version"], 1);
         assert_eq!(value["kind"], "system");
@@ -406,7 +444,7 @@ mod tests {
     /// Generate a prompt and force the read-only variant on, the way the
     /// `--read-only` flag does at the CLI boundary.
     fn read_only_output(tmp: &tempfile::TempDir, global: &GlobalConfig) -> PromptOutput {
-        let mut output = generate_prompt(global, tmp.path());
+        let mut output = generate_prompt(global, tmp.path(), &BTreeMap::new());
         output.read_only = true;
         output
     }
@@ -414,7 +452,7 @@ mod tests {
     #[test]
     fn read_write_default_names_the_mutating_tools() {
         let (tmp, global) = fixture();
-        let output = generate_prompt(&global, tmp.path());
+        let output = generate_prompt(&global, tmp.path(), &BTreeMap::new());
         assert!(!output.read_only, "default mode is read-write");
         let text = render_text(&output);
         assert!(text.contains("write_engram, edit_engram, move_engram and delete_engram"));
@@ -450,7 +488,7 @@ mod tests {
     fn render_json_carries_the_read_only_flag_in_both_modes() {
         let (tmp, global) = fixture();
 
-        let rw = render_json(&generate_prompt(&global, tmp.path()));
+        let rw = render_json(&generate_prompt(&global, tmp.path(), &BTreeMap::new()));
         let rw_value: serde_json::Value = serde_json::from_str(&rw).unwrap();
         assert_eq!(rw_value["read_only"], serde_json::json!(false));
 

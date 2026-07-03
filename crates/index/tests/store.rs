@@ -12,8 +12,8 @@
 use std::path::Path;
 
 use crystalline_index::{
-    EngramId, FilterOp, MetadataFilter, RecentFilter, SearchMode, SearchQuery, Store, TursoStore,
-    sync_domain,
+    DomainKind, EngramId, EngramRecord, FileStamp, FilterOp, IndexError, MetadataFilter,
+    RecentFilter, SearchMode, SearchQuery, Store, TursoStore, sync_domain,
 };
 
 fn write(dir: &Path, rel: &str, content: &str) {
@@ -29,6 +29,35 @@ fn engram(title: &str, permalink: &str, ftype: &str, extra_fm: &str, body: &str)
     format!(
         "---\ntype: {ftype}\ntitle: {title}\npermalink: {permalink}\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-01-01\n{extra_fm}---\n\n# {title}\n\n{body}\n"
     )
+}
+
+/// A minimal engram record with an explicit content and checksum, built without
+/// parsing so the store methods can be exercised directly on both backends. The
+/// `sha` is the CAS token stored in the stamp.
+fn record(path: &str, permalink: &str, content: &str, sha: &str) -> EngramRecord {
+    EngramRecord {
+        path: path.to_string(),
+        permalink: permalink.to_string(),
+        title: "Title".to_string(),
+        engram_type: "engram".to_string(),
+        status: "current".to_string(),
+        recorded_at: Some("2026-01-01".to_string()),
+        valid_from: None,
+        valid_to: None,
+        timestamp: None,
+        description: None,
+        content: content.to_string(),
+        metadata: serde_json::json!({}),
+        tags: Vec::new(),
+        observations: Vec::new(),
+        relations: Vec::new(),
+        links: Vec::new(),
+        stamp: FileStamp {
+            mtime: 0,
+            size: content.len() as u64,
+            sha256: sha.to_string(),
+        },
+    }
 }
 
 // --- backend runner ----------------------------------------------------------
@@ -674,6 +703,145 @@ async fn title_and_permalink_modes(store: &dyn Store) {
     assert_eq!(perma.total, 1);
 }
 parity!(title_and_permalink_search_modes, title_and_permalink_modes);
+
+async fn cas_guarded_upsert(store: &dyn Store) {
+    // A virtual domain (no path) holds one engram written straight through the
+    // store, no filesystem involved.
+    let did = store
+        .upsert_domain("v", None, DomainKind::Virtual)
+        .await
+        .unwrap();
+    store
+        .upsert_engram_checked(did, &record("n.md", "n", "v1", "sha-v1"), None)
+        .await
+        .unwrap();
+
+    // A checked write with the matching expected sha succeeds and advances the
+    // stored sha.
+    store
+        .upsert_engram_checked(did, &record("n.md", "n", "v2", "sha-v2"), Some("sha-v1"))
+        .await
+        .unwrap();
+    assert_eq!(
+        store.engram_content(did, "n.md").await.unwrap().as_deref(),
+        Some("v2")
+    );
+
+    // A checked write with a stale expected sha is refused as StaleEdit and does
+    // not clobber the stored content.
+    let err = store
+        .upsert_engram_checked(did, &record("n.md", "n", "v3", "sha-v3"), Some("sha-v1"))
+        .await
+        .unwrap_err();
+    match err {
+        IndexError::StaleEdit { expected, found } => {
+            assert_eq!(expected, "sha-v1");
+            assert_eq!(found, "sha-v2");
+        }
+        other => panic!("expected StaleEdit, got {other:?}"),
+    }
+    assert_eq!(
+        store.engram_content(did, "n.md").await.unwrap().as_deref(),
+        Some("v2"),
+        "stale edit must not overwrite"
+    );
+
+    // A first write at a brand-new path with an expected sha still succeeds
+    // (nothing stored to compare against).
+    store
+        .upsert_engram_checked(
+            did,
+            &record("fresh.md", "fresh", "hi", "sha-f"),
+            Some("anything"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .engram_content(did, "fresh.md")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("hi")
+    );
+}
+parity!(cas_guarded_upsert_detects_stale_edits, cas_guarded_upsert);
+
+async fn content_roundtrip(store: &dyn Store) {
+    let did = store
+        .upsert_domain("v", None, DomainKind::Virtual)
+        .await
+        .unwrap();
+    store
+        .upsert_engram(did, &record("a.md", "a", "alpha body", "sha-a"))
+        .await
+        .unwrap();
+    store
+        .upsert_engram(did, &record("notes/b.md", "b", "beta body", "sha-b"))
+        .await
+        .unwrap();
+
+    // engram_content returns the stored content, or None for an absent path.
+    assert_eq!(
+        store.engram_content(did, "a.md").await.unwrap().as_deref(),
+        Some("alpha body")
+    );
+    assert!(
+        store
+            .engram_content(did, "missing.md")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // all_engram_contents streams the whole domain, ordered by path, with the
+    // permalink, content and checksum needed to export it verbatim.
+    let all = store.all_engram_contents(did).await.unwrap();
+    assert_eq!(all.len(), 2);
+    assert_eq!(all[0].path, "a.md");
+    assert_eq!(all[0].permalink, "a");
+    assert_eq!(all[0].content, "alpha body");
+    assert_eq!(all[0].sha256, "sha-a");
+    assert_eq!(all[1].path, "notes/b.md");
+}
+parity!(content_roundtrips_through_the_store, content_roundtrip);
+
+async fn clear_domain_is_scoped(store: &dyn Store) {
+    let keep = store
+        .upsert_domain("keep", None, DomainKind::Virtual)
+        .await
+        .unwrap();
+    let gone = store
+        .upsert_domain("gone", None, DomainKind::Virtual)
+        .await
+        .unwrap();
+    store
+        .upsert_engram(keep, &record("k.md", "k", "keepterm body", "sha-k"))
+        .await
+        .unwrap();
+    store
+        .upsert_engram(gone, &record("g.md", "g", "goneterm body", "sha-g"))
+        .await
+        .unwrap();
+
+    // Clearing one domain leaves the other, and the domain rows themselves,
+    // untouched.
+    store.clear_domain(gone).await.unwrap();
+    assert!(store.all_engram_contents(gone).await.unwrap().is_empty());
+    assert_eq!(store.all_engram_contents(keep).await.unwrap().len(), 1);
+    assert_eq!(
+        store.domain_stats().await.unwrap().len(),
+        2,
+        "clear_domain keeps the domain rows"
+    );
+
+    // The kept domain's engram is still searchable; the cleared one's is gone.
+    let kept = store.search(&SearchQuery::text("keepterm")).await.unwrap();
+    assert_eq!(kept.total, 1);
+    let cleared = store.search(&SearchQuery::text("goneterm")).await.unwrap();
+    assert_eq!(cleared.total, 0);
+}
+parity!(clear_domain_scopes_to_one_domain, clear_domain_is_scoped);
 
 async fn seed_ids_stable(store: &dyn Store) {
     let dir = tempfile::tempdir().unwrap();

@@ -32,6 +32,11 @@ pub const MIGRATIONS: &[Migration] = &[
         label: "vector chunk storage",
         sql: SCHEMA_V2,
     },
+    Migration {
+        version: 3,
+        label: "domain kind",
+        sql: SCHEMA_V3,
+    },
 ];
 
 const SCHEMA_V1: &str = r#"
@@ -161,6 +166,15 @@ CREATE TABLE chunk (
 CREATE INDEX idx_chunk_engram ON chunk(engram_id);
 CREATE INDEX idx_chunk_hash ON chunk(text_hash);
 CREATE INDEX idx_chunk_model ON chunk(model);
+"#;
+
+// A domain gains a `kind` discriminator so a virtual domain (engrams live in the
+// database, no filesystem root) is told apart from a file domain. SQLite cannot
+// cheaply drop the existing `path NOT NULL`, so a virtual domain stores `path=''`
+// and the `kind` column is the authoritative discriminator. Existing rows default
+// to 'file', so a resync is not required.
+const SCHEMA_V3: &str = r#"
+ALTER TABLE domain ADD COLUMN kind TEXT NOT NULL DEFAULT 'file';
 "#;
 
 /// The tables cleared by `wipe()`, child rows first.

@@ -30,7 +30,8 @@ async fn store_info_reports_turso_schema_version() {
     let store = open().await;
     let info = store.store_info().await.unwrap();
     assert_eq!(info.fts_mode, crystalline_index::FtsMode::CandidateScan);
-    assert_eq!(info.schema_version, 2);
+    // v1 initial, v2 vector chunk storage, v3 domain kind.
+    assert_eq!(info.schema_version, 3);
 }
 
 #[tokio::test]
