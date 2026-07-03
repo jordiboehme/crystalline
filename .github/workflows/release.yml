@@ -33,6 +33,11 @@ jobs:
             archive_ext: tar.gz
             musl: true
             deb_arch: arm64
+            # candle-core pulls in gemm-f16, whose aarch64 NEON kernels emit
+            # fullfp16 asm without gating it behind a target-feature check
+            # (upstream bug, see research notes). aarch64-apple-darwin
+            # enables +fp16 by default so only this Linux arm64 leg needs it.
+            rustflags: '-C target-feature=+fp16'
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             archive_ext: zip

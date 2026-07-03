@@ -16,6 +16,15 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+        include:
+          # candle-core pulls in gemm-f16, whose aarch64 NEON kernels emit
+          # fullfp16 asm without gating it behind a target-feature check
+          # (upstream bug, see research notes). aarch64-apple-darwin enables
+          # +fp16 by default so only this Linux arm64 leg needs the flag.
+          - os: ubuntu-24.04-arm
+            rustflags: '-C target-feature=+fp16'
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
