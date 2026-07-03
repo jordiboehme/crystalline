@@ -3,6 +3,7 @@
 //! connections and optionally serves the same tool router over streamable HTTP.
 
 use std::collections::{HashMap, HashSet};
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -22,6 +23,26 @@ use crate::mcp::McpServer;
 
 /// The default HTTP bind address when HTTP is enabled without an explicit one.
 const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:7411";
+
+/// Startup banner, shown on a foreground start when stderr is a terminal.
+const BANNER: &str = r"
+                                   ·              *
+                                 ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄
+                                ▐░░░▒▒▒▒▓▓▓█▓▓▓▒▒▒▒░░░▌
+                                 ▀█░░░▒▒▒▓▓█▓▓▒▒▒░░░█▀   ·
+                                   ▀█░░▒▒▒▓█▓▒▒▒░░█▀
+                            *        ▀█░▒▒▓█▓▒▒░█▀
+                                       ▀█▒▒█▒▒█▀
+                                         ▀███▀     ·
+                                           ▀
+
+ ██████╗██████╗ ██╗   ██╗███████╗████████╗ █████╗ ██╗     ██╗     ██╗███╗   ██╗███████╗
+██╔════╝██╔══██╗╚██╗ ██╔╝██╔════╝╚══██╔══╝██╔══██╗██║     ██║     ██║████╗  ██║██╔════╝
+██║     ██████╔╝ ╚████╔╝ ███████╗   ██║   ███████║██║     ██║     ██║██╔██╗ ██║█████╗
+██║     ██╔══██╗  ╚██╔╝  ╚════██║   ██║   ██╔══██║██║     ██║     ██║██║╚██╗██║██╔══╝
+╚██████╗██║  ██║   ██║   ███████║   ██║   ██║  ██║███████╗███████╗██║██║ ╚████║███████╗
+ ╚═════╝╚═╝  ╚═╝   ╚═╝   ╚══════╝   ╚═╝   ╚═╝  ╚═╝╚══════╝╚══════╝╚═╝╚═╝  ╚═══╝╚══════╝
+";
 
 /// A tracked live session.
 #[derive(Clone, serde::Serialize)]
@@ -172,8 +193,12 @@ pub async fn run_serve(
     });
 
     if !daemon_flag {
+        if std::io::stderr().is_terminal() {
+            eprintln!("{BANNER}");
+        }
         eprintln!(
-            "crystalline serving on {} (pid {})",
+            "crystalline {} serving on {} (pid {})",
+            env!("CARGO_PKG_VERSION"),
             ownership.socket_display(),
             shared.pid
         );
