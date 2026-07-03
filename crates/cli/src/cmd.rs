@@ -365,11 +365,20 @@ pub async fn domain_list(
     } else {
         None
     };
-    let count_for = |name: &str| -> Option<i64> {
+    let stat_for = |name: &str| {
         stats
             .as_ref()
             .and_then(|s| s.iter().find(|d| d.name == name))
-            .map(|d| d.engrams)
+    };
+    let count_for = |name: &str| -> Option<i64> { stat_for(name).map(|d| d.engrams) };
+    // The current host of a file domain in a shared database, `None` when
+    // unhosted (every domain in a single-instance deployment, every virtual one).
+    let host_for = |name: &str| -> Option<(String, Option<String>)> {
+        stat_for(name).and_then(|d| {
+            d.host_instance_id
+                .clone()
+                .map(|id| (id, d.host_heartbeat_at.clone()))
+        })
     };
 
     if json {
@@ -382,6 +391,10 @@ pub async fn domain_list(
                     "kind": if entry.is_virtual() { "virtual" } else { "file" },
                     "path": entry.file_path().map(|p| p.display().to_string()),
                     "engrams": count_for(name),
+                    "host": host_for(name).map(|(id, hb)| serde_json::json!({
+                        "instance_id": id,
+                        "heartbeat_at": hb,
+                    })),
                 })
             })
             .collect();
@@ -399,9 +412,13 @@ pub async fn domain_list(
             .file_path()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "(virtual)".to_string());
+        // In a shared database a file domain names the instance that hosts it.
+        let host = host_for(name)
+            .map(|(id, _)| format!("\thosted by {id}"))
+            .unwrap_or_default();
         match count_for(name) {
-            Some(n) => println!("{name}\t{location}\t{n} engrams"),
-            None => println!("{name}\t{location}\t(not indexed)"),
+            Some(n) => println!("{name}\t{location}\t{n} engrams{host}"),
+            None => println!("{name}\t{location}\t(not indexed){host}"),
         }
     }
     Ok(())

@@ -1,0 +1,88 @@
+# Crystalline on a shared PostgreSQL database - the federation pattern where
+# several instances share one index instead of each keeping its own.
+#
+# The `db` service runs Postgres with pgvector; Crystalline points at it via the
+# mounted config.postgres.yaml (backend: postgres). Every instance searches and
+# reads everything in the shared database. Writes follow the single-writer rule:
+# each file domain has exactly one hosting instance that syncs and watches it
+# (arbitrated by a host lock with a heartbeat), while a virtual domain keeps its
+# engrams in the database itself, so any instance may write to it under a
+# per-engram compare-and-swap guard. A second instance is included commented out
+# below to show the collaboration shape.
+#
+# The vector extension is created by Crystalline on first open, so the stock
+# pgvector image needs no init SQL. Losing the Postgres volume loses virtual
+# domains (their engrams are the source of truth and live only in the database),
+# so back it up or `crystalline domain export` them to a file copy; file domains
+# rebuild from ./knowledge with `crystalline reindex --full`.
+#
+# Start it:
+#   docker compose -f examples/docker/compose.postgres.yaml up -d
+#
+# Bootstrap a file domain (hosted by this instance) and a shared virtual domain
+# (its engrams live in Postgres, every instance sees them). domain add rewrites
+# the mounted config, so pass the same --config every time:
+#   docker compose -f examples/docker/compose.postgres.yaml run --rm crystalline \
+#     domain init /knowledge/team --name team
+#   docker compose -f examples/docker/compose.postgres.yaml run --rm crystalline \
+#     domain add team /knowledge/team --config /config/config.yaml
+#   docker compose -f examples/docker/compose.postgres.yaml run --rm crystalline \
+#     domain add shared --virtual --config /config/config.yaml
+
+services:
+  db:
+    image: pgvector/pgvector:0.8.2-pg17-bookworm
+    environment:
+      POSTGRES_USER: crystalline
+      POSTGRES_PASSWORD: crystalline
+      POSTGRES_DB: crystalline
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U crystalline -d crystalline"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  crystalline:
+    image: ghcr.io/jordiboehme/crystalline:latest
+    # Alternative with the embedding model baked in (no first-start download):
+    # image: ghcr.io/jordiboehme/crystalline:with-model
+    command: ["serve", "--http", "0.0.0.0:7411", "--config", "/config/config.yaml"]
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "7411:7411"
+    volumes:
+      - ./config.postgres.yaml:/config/config.yaml
+      - ./knowledge:/knowledge
+      - crystalline-data:/data
+    restart: unless-stopped
+
+  # A second instance sharing the same Postgres, the collaboration case. It
+  # searches and reads everything the first instance indexed and can host its own
+  # file domains and write the shared virtual domains, while the host lock keeps
+  # exactly one instance syncing each file domain. Give it its own config and, if
+  # it hosts file domains, its own knowledge mount. `serve --take-over` migrates
+  # hosting of a domain to this instance on purpose.
+  #
+  # crystalline-b:
+  #   image: ghcr.io/jordiboehme/crystalline:latest
+  #   command: ["serve", "--http", "0.0.0.0:7411", "--config", "/config/config.yaml"]
+  #   depends_on:
+  #     db:
+  #       condition: service_healthy
+  #   ports:
+  #     - "7412:7411"
+  #   volumes:
+  #     - ./config.postgres.b.yaml:/config/config.yaml
+  #     - ./knowledge-b:/knowledge
+  #     - crystalline-data-b:/data
+  #   restart: unless-stopped
+
+volumes:
+  pgdata:
+  crystalline-data:
+  # crystalline-data-b:

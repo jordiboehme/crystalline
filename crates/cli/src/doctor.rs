@@ -52,6 +52,14 @@ pub struct DomainDoctor {
     pub unindexed: Vec<String>,
     /// Encoding problems, sourced from `verify`'s `E006` rule.
     pub encoding_issues: Vec<EncodingIssue>,
+    /// The instance currently hosting this file domain in a shared database, or
+    /// `None` when unhosted (single-instance deployments, and virtual domains,
+    /// which never take a host lock).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_instance_id: Option<String>,
+    /// The host's last heartbeat, RFC 3339, when hosted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_heartbeat_at: Option<String>,
 }
 
 /// One `E006` encoding finding, reported by `doctor`, fixed by `verify`.
@@ -287,6 +295,13 @@ async fn check_domain(
         }
         d.orphans = orphans;
         d.unindexed = unindexed;
+
+        // Ownership: who hosts this file domain in a shared database. Unhosted
+        // (single-instance) domains leave this `None`.
+        if let Ok(Some(host)) = store.domain_host(domain_id).await {
+            d.host_instance_id = Some(host.instance_id);
+            d.host_heartbeat_at = Some(host.heartbeat_at);
+        }
     }
 
     Ok(d)
@@ -392,6 +407,16 @@ pub fn render_human(report: &DoctorReport) -> String {
 
     for d in &report.domains {
         let _ = writeln!(out, "{} ({})", d.name, d.path);
+        // Ownership in a shared database: who hosts this file domain. Unhosted
+        // domains print nothing extra.
+        if let Some(host) = &d.host_instance_id {
+            let hb = d
+                .host_heartbeat_at
+                .as_deref()
+                .map(|h| format!(" (last heartbeat {h})"))
+                .unwrap_or_default();
+            let _ = writeln!(out, "  hosted by instance {host}{hb}");
+        }
         if d.is_virtual {
             let _ = writeln!(
                 out,

@@ -152,7 +152,7 @@ The first agent to connect starts a background daemon that loads the embedding m
 
 ## Deployment scenarios
 
-Crystalline runs the same way in every scenario: a daemon in the middle keeps one search index in sync with knowledge files on disk, and one or more agents connect to it, whether that connection is a local stdio pipe or a network HTTP endpoint. The four scenarios below are variations on that one architecture.
+Crystalline runs the same way in every scenario: a daemon in the middle keeps one search index in sync with knowledge files on disk, and one or more agents connect to it, whether that connection is a local stdio pipe or a network HTTP endpoint. The five scenarios below are variations on that one architecture.
 
 ### Personal workstation
 
@@ -200,6 +200,20 @@ flowchart LR
     D -->|HTTP, no egress| A[Agent]
 ```
 
+### Shared database collaboration
+
+When several instances should share one index instead of each keeping its own, point them at a shared PostgreSQL database with pgvector using `examples/docker/compose.postgres.yaml`. Every instance searches and reads everything in the shared database, so knowledge one instance captures is immediately visible to the rest. Writes follow a single-writer-per-domain rule: each file domain has exactly one hosting instance that syncs and watches its files. Hosting is arbitrated by a host lock with a 30 second heartbeat and a 90 second stale takeover, so a second instance that tries to sync a domain it does not host is refused with the name of the current host and serves that domain read-from-database only. A virtual domain keeps its engrams in the database itself rather than on disk, so it is shared truth that any instance may write, guarded per engram by a compare-and-swap on the checksum so a stale edit is refused rather than silently clobbered. The local-first guarantees hold for a running daemon against a local database; a remote database trades some latency for the federation payoff.
+
+```mermaid
+flowchart LR
+    A1[Agent] --> D1[Daemon A]
+    A2[Agent] --> D2[Daemon B]
+    D1 -->|hosts and syncs domain X| K[Knowledge files X]
+    D1 --> PG[(PostgreSQL + pgvector)]
+    D2 --> PG
+    D2 -.->|reads X from DB, hosts virtual domain Y| PG
+```
+
 ## Run in a container
 
 Crystalline publishes a multi-arch OCI image (`linux/amd64` and `linux/arm64`) to GHCR on every release, for Linux server deployments. macOS and Windows have no OCI container runtime worth targeting here, so those platforms run the native binary from Install above; the container covers the Linux server case.
@@ -236,6 +250,7 @@ Two sample Compose files ship under [`examples/docker/`](examples/docker/):
 
 - **`compose.yaml`** - the single-container setup above, plus a commented one-shot `domain init` / `domain add` recipe for bootstrapping a fresh domain (`domain add` indexes it immediately, routed to the running daemon over the shared `/data` volume).
 - **`compose.git-sync.yaml`** - a scale-deployment variant that adds a sidecar keeping the knowledge folder synced from a git remote every 60 seconds, mounted read-only into Crystalline. This is the pattern for a team that manages engrams as a reviewed git repository rather than writing into the container directly.
+- **`compose.postgres.yaml`** - the shared database collaboration setup above: a Postgres service with pgvector plus a Crystalline instance pointed at it via a mounted config, and a commented second instance showing how a second worker shares the same database. Reach for it when several instances should share one federated index instead of each keeping its own.
 
 ### Read-only deployments
 

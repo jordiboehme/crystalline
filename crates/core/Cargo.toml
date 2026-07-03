@@ -21,6 +21,7 @@ thiserror = { workspace = true }
 etcetera = { workspace = true }
 walkdir = { workspace = true }
 globset = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 insta = { workspace = true }

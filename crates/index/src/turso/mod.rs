@@ -23,10 +23,10 @@ use turso::{Builder, Connection, Database, Row, Value};
 
 use crate::error::{IndexError, Result};
 use crate::store::{
-    ChunkJob, ChunkModelCount, DomainId, DomainKind, DomainStats, EdgeKind, EmbeddingCoverage,
-    EmbeddingRow, EngramDescriptor, EngramId, EngramRecord, EngramSummary, FileStamp, FtsMode,
-    GraphSlice, InboundRef, NewChunk, Page, RecentFilter, SearchHit, SearchQuery, Store, StoreInfo,
-    StoredEngram,
+    ChunkJob, ChunkModelCount, DomainHost, DomainId, DomainKind, DomainStats, EdgeKind,
+    EmbeddingCoverage, EmbeddingRow, EngramDescriptor, EngramId, EngramRecord, EngramSummary,
+    FileStamp, FtsMode, GraphSlice, HostClaim, InboundRef, NewChunk, Page, RecentFilter, SearchHit,
+    SearchQuery, Store, StoreInfo, StoredEngram,
 };
 
 /// A Turso-backed store. Open one with [`TursoStore::open`].
@@ -872,15 +872,41 @@ impl Store for TursoStore {
         Ok(())
     }
 
-    async fn chunks_needing_embedding(&self, model: &str) -> Result<Vec<ChunkJob>> {
-        let rows = query_all(
-            &self.conn,
+    async fn chunks_needing_embedding(
+        &self,
+        model: &str,
+        domains: Option<&[DomainId]>,
+    ) -> Result<Vec<ChunkJob>> {
+        // The base predicate is unchanged; an optional domain scope adds an
+        // `engram_id IN (SELECT id FROM engram WHERE domain_id IN (...))` clause
+        // so a non-host embeds only the chunks it owns. An empty scope matches
+        // nothing (this instance hosts nothing embeddable).
+        let mut sql = String::from(
             "SELECT id, engram_id, seq, text, text_hash FROM chunk \
-             WHERE embedding IS NULL OR model IS NULL OR model != ?1 \
-             ORDER BY engram_id, seq",
-            vec![Value::Text(model.to_string())],
-        )
-        .await?;
+             WHERE (embedding IS NULL OR model IS NULL OR model != ?1)",
+        );
+        let mut params = vec![Value::Text(model.to_string())];
+        if let Some(ids) = domains {
+            if ids.is_empty() {
+                return Ok(Vec::new());
+            }
+            let mut n = 2;
+            let placeholders: Vec<String> = ids
+                .iter()
+                .map(|id| {
+                    params.push(Value::Integer(id.0));
+                    let p = format!("?{n}");
+                    n += 1;
+                    p
+                })
+                .collect();
+            sql.push_str(&format!(
+                " AND engram_id IN (SELECT id FROM engram WHERE domain_id IN ({}))",
+                placeholders.join(",")
+            ));
+        }
+        sql.push_str(" ORDER BY engram_id, seq");
+        let rows = query_all(&self.conn, &sql, params).await?;
         Ok(rows
             .iter()
             .map(|r| ChunkJob {
@@ -998,12 +1024,13 @@ impl Store for TursoStore {
     async fn domain_stats(&self) -> Result<Vec<DomainStats>> {
         let rows = query_all(
             &self.conn,
-            "SELECT d.id, d.name, d.path, d.last_sync, \
+            "SELECT d.id, d.name, d.path, d.kind, d.last_sync, \
              (SELECT count(*) FROM engram e WHERE e.domain_id=d.id), \
              (SELECT count(*) FROM observation o JOIN engram e ON e.id=o.engram_id WHERE e.domain_id=d.id), \
              (SELECT count(*) FROM relation r WHERE r.domain_id=d.id), \
-             (SELECT count(*) FROM relation r WHERE r.domain_id=d.id AND r.to_id IS NULL) \
-             FROM domain d ORDER BY d.id",
+             (SELECT count(*) FROM relation r WHERE r.domain_id=d.id AND r.to_id IS NULL), \
+             dl.holder_instance_id, dl.holder_label, dl.heartbeat_at \
+             FROM domain d LEFT JOIN domain_lock dl ON dl.domain_id=d.id ORDER BY d.id",
             vec![],
         )
         .await?;
@@ -1012,13 +1039,106 @@ impl Store for TursoStore {
             .map(|r| DomainStats {
                 name: cell_text(r, 1).unwrap_or_default(),
                 path: cell_text(r, 2).unwrap_or_default(),
-                last_sync: cell_text(r, 3),
-                engrams: cell_i64(r, 4).unwrap_or(0),
-                observations: cell_i64(r, 5).unwrap_or(0),
-                relations: cell_i64(r, 6).unwrap_or(0),
-                unresolved_relations: cell_i64(r, 7).unwrap_or(0),
+                kind: DomainKind::from_stored(&cell_text(r, 3).unwrap_or_default()),
+                last_sync: cell_text(r, 4),
+                engrams: cell_i64(r, 5).unwrap_or(0),
+                observations: cell_i64(r, 6).unwrap_or(0),
+                relations: cell_i64(r, 7).unwrap_or(0),
+                unresolved_relations: cell_i64(r, 8).unwrap_or(0),
+                host_instance_id: cell_text(r, 9),
+                host_label: cell_text(r, 10),
+                host_heartbeat_at: cell_text(r, 11),
             })
             .collect())
+    }
+
+    async fn claim_domain_host(
+        &self,
+        domain: DomainId,
+        instance_id: &str,
+        label: &str,
+        now: &str,
+        stale_before: &str,
+        take_over: bool,
+    ) -> Result<HostClaim> {
+        // One atomic upsert: insert when unheld, or take over when this instance
+        // already holds it (a re-claim, refreshing the heartbeat), or when
+        // `take_over` is set, or when the current heartbeat is older than
+        // `stale_before`. The guarded `ON CONFLICT ... DO UPDATE ... WHERE` leaves
+        // a live holder untouched; the re-read then tells us who holds it now.
+        self.conn
+            .execute(
+                "INSERT INTO domain_lock(domain_id, holder_instance_id, holder_label, acquired_at, heartbeat_at) \
+                 VALUES(?1, ?2, ?3, ?4, ?5) \
+                 ON CONFLICT(domain_id) DO UPDATE SET \
+                 holder_instance_id=excluded.holder_instance_id, holder_label=excluded.holder_label, \
+                 acquired_at=excluded.acquired_at, heartbeat_at=excluded.heartbeat_at \
+                 WHERE domain_lock.holder_instance_id=excluded.holder_instance_id \
+                    OR ?6 \
+                    OR domain_lock.heartbeat_at < ?7",
+                vec![
+                    Value::Integer(domain.0),
+                    Value::Text(instance_id.to_string()),
+                    Value::Text(label.to_string()),
+                    Value::Text(now.to_string()),
+                    Value::Text(now.to_string()),
+                    Value::Integer(if take_over { 1 } else { 0 }),
+                    Value::Text(stale_before.to_string()),
+                ],
+            )
+            .await?;
+        match self.domain_host(domain).await? {
+            Some(h) if h.instance_id == instance_id => Ok(HostClaim::Acquired),
+            Some(h) => Ok(HostClaim::HeldByOther(h)),
+            None => Ok(HostClaim::Acquired),
+        }
+    }
+
+    async fn renew_domain_host(
+        &self,
+        domain: DomainId,
+        instance_id: &str,
+        now: &str,
+    ) -> Result<bool> {
+        let n = self
+            .conn
+            .execute(
+                "UPDATE domain_lock SET heartbeat_at=?1 WHERE domain_id=?2 AND holder_instance_id=?3",
+                vec![
+                    Value::Text(now.to_string()),
+                    Value::Integer(domain.0),
+                    Value::Text(instance_id.to_string()),
+                ],
+            )
+            .await?;
+        Ok(n > 0)
+    }
+
+    async fn release_domain_host(&self, domain: DomainId, instance_id: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM domain_lock WHERE domain_id=?1 AND holder_instance_id=?2",
+                vec![
+                    Value::Integer(domain.0),
+                    Value::Text(instance_id.to_string()),
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn domain_host(&self, domain: DomainId) -> Result<Option<DomainHost>> {
+        let row = query_first(
+            &self.conn,
+            "SELECT holder_instance_id, holder_label, heartbeat_at FROM domain_lock WHERE domain_id=?1",
+            vec![Value::Integer(domain.0)],
+        )
+        .await?;
+        Ok(row.map(|r| DomainHost {
+            instance_id: cell_text(&r, 0).unwrap_or_default(),
+            label: cell_text(&r, 1).unwrap_or_default(),
+            heartbeat_at: cell_text(&r, 2).unwrap_or_default(),
+        }))
     }
 
     async fn begin(&self) -> Result<()> {

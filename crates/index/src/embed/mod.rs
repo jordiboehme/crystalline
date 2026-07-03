@@ -148,7 +148,11 @@ pub async fn run_embedding_pass(
     provider: &dyn EmbeddingProvider,
     mut progress: impl FnMut(usize, usize),
 ) -> Result<EmbedReport> {
-    let jobs = store.chunks_needing_embedding(provider.model_id()).await?;
+    // The standalone `sync --embed` / `reindex --embed` fill embeds every domain
+    // (`None`); the daemon's background queue scopes its own pass instead.
+    let jobs = store
+        .chunks_needing_embedding(provider.model_id(), None)
+        .await?;
     let total = jobs.len();
     if total == 0 {
         return Ok(EmbedReport::default());

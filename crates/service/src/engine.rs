@@ -28,9 +28,9 @@ use crystalline_core::{
     CrystallineUrl, Engram, Frontmatter, Manifest, YamlValue, parse_engram, slugify,
 };
 use crystalline_index::{
-    ChunkParams, DomainId, DomainKind, EmbeddingProvider, EngramDescriptor, EngramId, EngramRecord,
-    FileStamp, RecentFilter, SearchMode, SearchQuery, Store, chunk_engram, configured_model_id,
-    parse_metadata_filters, provider_from_config, sync_domain_with,
+    ChunkParams, DomainHost, DomainId, DomainKind, EmbeddingProvider, EngramDescriptor, EngramId,
+    EngramRecord, FileStamp, HostClaim, RecentFilter, SearchMode, SearchQuery, Store, chunk_engram,
+    configured_model_id, parse_metadata_filters, provider_from_config, sync_domain_with,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -40,6 +40,24 @@ use crate::params::*;
 
 /// How many chunks are embedded per background batch.
 const EMBED_BATCH: usize = 16;
+
+/// The default host-lock heartbeat interval, seconds. Overridable via
+/// `CRYSTALLINE_HEARTBEAT_SECS` (used to drive fast multi-instance verification).
+const DEFAULT_HEARTBEAT_SECS: i64 = 30;
+/// The default host-lock stale threshold, seconds (three missed heartbeats). A
+/// lock whose last heartbeat is older than this is takeable by another instance.
+/// Overridable via `CRYSTALLINE_STALE_SECS`.
+const DEFAULT_STALE_SECS: i64 = 90;
+
+/// Read a positive-integer seconds value from an environment variable, falling
+/// back to `default` when unset, empty, unparseable or non-positive.
+fn env_secs(key: &str, default: i64) -> i64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(default)
+}
 
 /// An error from an engine operation, mapped to actionable tool errors.
 #[derive(Debug, thiserror::Error)]
@@ -154,6 +172,23 @@ pub struct Engine {
     // `EngineError::ReadOnly`. Set at construction from the effective mode
     // (explicit flag or `service.read_only`). Index maintenance is unaffected.
     read_only: bool,
+    // This instance's stable id for shared-database collaboration, or empty when
+    // collaboration is off (standalone commands and the embedded stdio stack).
+    // Only a non-empty id claims host locks, scopes embedding and refuses a
+    // non-host sync; the `serve` daemon sets it via `with_instance_id`.
+    instance_id: String,
+    // The human label recorded alongside the host lock (currently the instance
+    // id; a stable, greppable handle in a shared database).
+    label: String,
+    // The file domains this instance currently hosts, name to id, populated by a
+    // successful `claim_domain_host` and renewed by the heartbeat timer. Drives
+    // embed scoping, heartbeat renewal and graceful release.
+    hosted: std::sync::RwLock<HashMap<String, DomainId>>,
+    // The heartbeat interval and stale threshold, seconds. Defaults 30 and 90,
+    // overridable via `CRYSTALLINE_HEARTBEAT_SECS`/`CRYSTALLINE_STALE_SECS` (a
+    // short threshold makes multi-instance stale-takeover verification fast).
+    heartbeat_secs: i64,
+    stale_secs: i64,
 }
 
 impl Engine {
@@ -181,7 +216,25 @@ impl Engine {
             model_id,
             chunk_params,
             read_only: false,
+            instance_id: String::new(),
+            label: String::new(),
+            hosted: std::sync::RwLock::new(HashMap::new()),
+            heartbeat_secs: env_secs("CRYSTALLINE_HEARTBEAT_SECS", DEFAULT_HEARTBEAT_SECS),
+            stale_secs: env_secs("CRYSTALLINE_STALE_SECS", DEFAULT_STALE_SECS),
         }
+    }
+
+    /// Turn on shared-database collaboration for this engine by giving it a
+    /// stable instance id (the `serve` daemon supplies the persisted one from
+    /// `config::read_or_create_instance_id`). With an id set, syncing a file
+    /// domain first claims its host lock: acquired domains sync and embed here, a
+    /// domain held by another live instance is skipped on a full sync and refused
+    /// on a named one, and this instance renews its locks on the heartbeat timer.
+    /// An empty id (the default) leaves collaboration off.
+    pub fn with_instance_id(mut self, instance_id: String) -> Engine {
+        self.label = instance_id.clone();
+        self.instance_id = instance_id;
+        self
     }
 
     /// Install the channel the daemon's watcher listens on for domains
@@ -231,6 +284,130 @@ impl Engine {
     /// The active embedding model id.
     pub fn model_id(&self) -> &str {
         &self.model_id
+    }
+
+    /// This instance's collaboration id, or empty when collaboration is off.
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+
+    /// The host-lock heartbeat interval in seconds, for the daemon's timer.
+    pub fn heartbeat_secs(&self) -> u64 {
+        self.heartbeat_secs.max(1) as u64
+    }
+
+    // --- host locks ----------------------------------------------------------
+
+    /// Claim the host lock for one file domain against a locked store. Records
+    /// the domain in `hosted` on success and drops it on a loss, so the heartbeat
+    /// timer and embed scoping stay in step with what this instance actually
+    /// hosts.
+    async fn claim_file_host(
+        &self,
+        store: &dyn Store,
+        name: &str,
+        root: &Path,
+        take_over: bool,
+    ) -> Result<HostClaim> {
+        let id = store
+            .upsert_domain(name, Some(&root.to_string_lossy()), DomainKind::File)
+            .await?;
+        let now = now_offset().to_rfc3339();
+        let stale_before = (now_offset() - Duration::seconds(self.stale_secs)).to_rfc3339();
+        let claim = store
+            .claim_domain_host(
+                id,
+                &self.instance_id,
+                &self.label,
+                &now,
+                &stale_before,
+                take_over,
+            )
+            .await?;
+        match &claim {
+            HostClaim::Acquired => {
+                self.hosted.write().unwrap().insert(name.to_string(), id);
+            }
+            HostClaim::HeldByOther(_) => {
+                self.hosted.write().unwrap().remove(name);
+            }
+        }
+        Ok(claim)
+    }
+
+    /// Claim the host lock for a file domain by name (resolving its root and
+    /// locking the store), for the daemon's watch-arming path. A no-op that
+    /// reports `Acquired` when collaboration is off or the domain is virtual, so
+    /// the caller arms the watch uniformly.
+    pub async fn claim_host(&self, name: &str, take_over: bool) -> Result<HostClaim> {
+        if self.instance_id.is_empty() {
+            return Ok(HostClaim::Acquired);
+        }
+        let ContentSource::File { root } = self.content_source(name)? else {
+            return Ok(HostClaim::Acquired);
+        };
+        let store = self.store.lock().await;
+        self.claim_file_host(&*store, name, &root, take_over).await
+    }
+
+    /// Renew this instance's heartbeat on every host lock it holds. A lock that
+    /// no longer belongs to this instance (another took it over) is dropped from
+    /// `hosted` so this instance stops renewing and hosting it. Called on the
+    /// daemon's periodic timer and a no-op when collaboration is off.
+    pub async fn renew_hosts(&self) {
+        if self.instance_id.is_empty() {
+            return;
+        }
+        let hosted: Vec<(String, DomainId)> = self
+            .hosted
+            .read()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        if hosted.is_empty() {
+            return;
+        }
+        let now = now_offset().to_rfc3339();
+        let store = self.store.lock().await;
+        for (name, id) in hosted {
+            match store.renew_domain_host(id, &self.instance_id, &now).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::warn!(
+                        "lost the host lock for domain '{name}'; another instance took over"
+                    );
+                    self.hosted.write().unwrap().remove(&name);
+                }
+                Err(e) => tracing::warn!("failed to renew the host lock for '{name}': {e}"),
+            }
+        }
+    }
+
+    /// Release every host lock this instance holds, for a graceful shutdown, so a
+    /// successor acquires immediately instead of waiting out the stale threshold.
+    /// A no-op when collaboration is off.
+    pub async fn release_hosts(&self) {
+        if self.instance_id.is_empty() {
+            return;
+        }
+        let hosted: Vec<(String, DomainId)> = self
+            .hosted
+            .read()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        if hosted.is_empty() {
+            return;
+        }
+        {
+            let store = self.store.lock().await;
+            for (_, id) in &hosted {
+                let _ = store.release_domain_host(*id, &self.instance_id).await;
+            }
+        }
+        self.hosted.write().unwrap().clear();
     }
 
     // --- domain helpers ------------------------------------------------------
@@ -1193,6 +1370,17 @@ impl Engine {
                 "relations": s.map(|d| d.relations),
                 "last_sync": s.and_then(|d| d.last_sync.clone()),
             });
+            // In a shared database a file domain names its current host so an
+            // agent and an operator see who syncs what; `hosted_here` is true when
+            // this instance holds the lock.
+            if let Some(host) = s.and_then(|d| d.host_instance_id.clone()) {
+                let hosted_here = !self.instance_id.is_empty() && host == self.instance_id;
+                obj["host"] = json!({
+                    "instance_id": host,
+                    "heartbeat_at": s.and_then(|d| d.host_heartbeat_at.clone()),
+                    "hosted_here": hosted_here,
+                });
+            }
             if p.include_routing {
                 let bullets = match &source {
                     ContentSource::File { root } => routing_bullets(root),
@@ -1607,26 +1795,85 @@ impl Engine {
 
     /// Sync one or all registered domains, returning per-domain reports.
     pub async fn sync(&self, only: Option<&str>) -> Result<Value> {
+        self.sync_take_over(only, false).await
+    }
+
+    /// Sync like [`Engine::sync`], but with an explicit host-takeover flag for the
+    /// `sync --take-over` and `serve --take-over` migration paths. In
+    /// collaboration mode (a non-empty instance id) each file domain is claimed
+    /// before syncing: an acquired domain syncs, a domain held by another live
+    /// instance is skipped on a full sync (`only` is `None`) and refused on a
+    /// named one, and `take_over` forces the claim. Outside collaboration mode
+    /// (standalone, single-instance) nothing is claimed and every target syncs.
+    pub async fn sync_take_over(&self, only: Option<&str>, take_over: bool) -> Result<Value> {
         let targets = self.sync_targets(only)?;
+        let collab = !self.instance_id.is_empty();
         let store = self.store.lock().await;
         let mut reports = Vec::new();
+        let mut skipped = Vec::new();
         for (name, root) in &targets {
+            if collab {
+                match self.claim_file_host(&*store, name, root, take_over).await? {
+                    HostClaim::Acquired => {}
+                    HostClaim::HeldByOther(host) => {
+                        if only.is_some() {
+                            return Err(EngineError::Conflict(host_refusal(name, &host)));
+                        }
+                        tracing::info!(
+                            "domain '{name}' is hosted by instance {} (last heartbeat {}); serving it read-from-database only",
+                            host.instance_id,
+                            host.heartbeat_at
+                        );
+                        skipped.push(json!({
+                            "domain": name,
+                            "hosted_by": host.instance_id,
+                            "heartbeat_at": host.heartbeat_at,
+                        }));
+                        continue;
+                    }
+                }
+            }
             let report = sync_domain_with(&*store, name, root, &self.chunk_params)
                 .await
                 .map_err(|e| EngineError::Internal(format!("sync of '{name}' failed: {e}")))?;
             reports.push(report);
         }
-        Ok(json!({ "reports": serde_json::to_value(&reports).unwrap_or(Value::Null) }))
+        Ok(json!({
+            "reports": serde_json::to_value(&reports).unwrap_or(Value::Null),
+            "skipped": skipped,
+        }))
     }
 
     /// Reindex all file domains. `full` clears each file domain's rows first
     /// (per-domain, not a global wipe) and resyncs from disk, so virtual-domain
-    /// rows, whose only source of truth is the database, are never destroyed.
+    /// rows, whose only source of truth is the database, are never destroyed. In
+    /// collaboration mode a domain hosted by another live instance is left
+    /// untouched (neither cleared nor resynced), so a non-host never rebuilds the
+    /// host's rows out from under it.
     pub async fn reindex(&self, full: bool) -> Result<Value> {
         let targets = self.sync_targets(None)?;
+        let collab = !self.instance_id.is_empty();
         let store = self.store.lock().await;
+        // In collaboration mode reduce to the domains this instance may rebuild
+        // (the ones it hosts); outside it, every file domain is fair game.
+        let mut active: Vec<(String, PathBuf)> = Vec::new();
+        for (name, root) in targets {
+            if collab {
+                match self.claim_file_host(&*store, &name, &root, false).await? {
+                    HostClaim::Acquired => active.push((name, root)),
+                    HostClaim::HeldByOther(host) => {
+                        tracing::info!(
+                            "skipping reindex of '{name}' hosted by instance {}",
+                            host.instance_id
+                        );
+                    }
+                }
+            } else {
+                active.push((name, root));
+            }
+        }
         if full {
-            for (name, root) in &targets {
+            for (name, root) in &active {
                 let domain_id = store
                     .upsert_domain(name, Some(&root.to_string_lossy()), DomainKind::File)
                     .await?;
@@ -1634,7 +1881,7 @@ impl Engine {
             }
         }
         let mut reports = Vec::new();
-        for (name, root) in &targets {
+        for (name, root) in &active {
             let report = sync_domain_with(&*store, name, root, &self.chunk_params)
                 .await
                 .map_err(|e| EngineError::Internal(format!("reindex of '{name}' failed: {e}")))?;
@@ -1686,12 +1933,29 @@ impl Engine {
         let coverage = store.embedding_coverage().await?;
         drop(store);
         let active_embedded = coverage.embedded_for(&self.model_id);
+        // Annotate each domain with its ownership relative to this instance so an
+        // operator sees at a glance which domains this daemon hosts in a shared
+        // database and which it serves read-from-database. `hosted_here` is true
+        // only for a file domain whose host lock this instance holds.
+        let domains: Vec<Value> = stats
+            .iter()
+            .map(|s| {
+                let mut v = serde_json::to_value(s).unwrap_or(Value::Null);
+                if let Value::Object(map) = &mut v {
+                    let hosted_here = !self.instance_id.is_empty()
+                        && s.host_instance_id.as_deref() == Some(self.instance_id.as_str());
+                    map.insert("hosted_here".to_string(), json!(hosted_here));
+                }
+                v
+            })
+            .collect();
         Ok(json!({
             "fts_mode": info.fts_mode,
             "schema_version": info.schema_version,
             "db_path": info.db_path,
             "db_size": info.db_size,
-            "domains": serde_json::to_value(&stats).unwrap_or(Value::Null),
+            "instance_id": if self.instance_id.is_empty() { Value::Null } else { json!(self.instance_id) },
+            "domains": serde_json::to_value(&domains).unwrap_or(Value::Null),
             "embeddings": {
                 "active_model": self.model_id,
                 "provider": self.provider().is_some(),
@@ -1700,6 +1964,40 @@ impl Engine {
                 "hybrid_available": coverage.has_active_embeddings(&self.model_id),
             },
         }))
+    }
+
+    /// The domain-id set this instance should embed, or `None` for "all domains".
+    /// Outside collaboration mode it is `None` (embed everything). In
+    /// collaboration mode it is the file domains this instance hosts plus every
+    /// virtual domain (whose single source of truth is the shared database, so
+    /// every instance is jointly responsible for keeping them embedded). An empty
+    /// set is returned as `Some([])`, which the store treats as "nothing to do".
+    async fn embed_scope(&self, store: &dyn Store) -> Result<Option<Vec<DomainId>>> {
+        if self.instance_id.is_empty() {
+            return Ok(None);
+        }
+        let mut ids: Vec<DomainId> = self.hosted.read().unwrap().values().copied().collect();
+        let mut virtuals: Vec<String> = self
+            .config
+            .domains
+            .iter()
+            .filter(|(_, e)| e.is_virtual())
+            .map(|(n, _)| n.clone())
+            .collect();
+        for (name, entry) in self.discovered_domains.read().unwrap().iter() {
+            if entry.is_virtual() && !self.config.domains.contains_key(name) {
+                virtuals.push(name.clone());
+            }
+        }
+        for name in virtuals {
+            let id = store
+                .upsert_domain(&name, None, DomainKind::Virtual)
+                .await?;
+            ids.push(id);
+        }
+        ids.sort_by_key(|d| d.0);
+        ids.dedup_by_key(|d| d.0);
+        Ok(Some(ids))
     }
 
     /// Embed outstanding chunks for the active model in bounded batches, locking
@@ -1711,10 +2009,16 @@ impl Engine {
         };
         let model = self.model_id.clone();
         // One snapshot of outstanding chunks; the store lock is held only to pull
-        // jobs and to write vectors, never across the embed call.
+        // jobs and to write vectors, never across the embed call. In
+        // collaboration mode the scan is scoped to the file domains this instance
+        // hosts plus all virtual domains, so a non-host does not wastefully
+        // re-embed a chunk another instance owns; standalone it embeds everything.
         let jobs = {
             let store = self.store.lock().await;
-            store.chunks_needing_embedding(&model).await?
+            let scope = self.embed_scope(&*store).await?;
+            store
+                .chunks_needing_embedding(&model, scope.as_deref())
+                .await?
         };
         if jobs.is_empty() {
             return Ok(0);
@@ -1833,6 +2137,15 @@ fn mode_str(m: SearchMode) -> &'static str {
         SearchMode::Title => "title",
         SearchMode::Permalink => "permalink",
     }
+}
+
+/// The refusal message for a named sync of a file domain hosted by another live
+/// instance: names the host and its last heartbeat and points at `--take-over`.
+fn host_refusal(name: &str, host: &DomainHost) -> String {
+    format!(
+        "domain '{name}' is hosted by instance {} (last heartbeat {}); this instance serves it read-from-database only. Pass --take-over to migrate hosting here.",
+        host.instance_id, host.heartbeat_at
+    )
 }
 
 fn section_err(e: crystalline_core::emit::EditError) -> EngineError {

@@ -681,6 +681,8 @@ pub struct DomainStats {
     pub name: String,
     /// The domain root path as registered.
     pub path: String,
+    /// The domain kind, `file` (default) or `virtual`.
+    pub kind: DomainKind,
     /// Number of engrams.
     pub engrams: i64,
     /// Number of observations.
@@ -691,6 +693,43 @@ pub struct DomainStats {
     pub unresolved_relations: i64,
     /// Last successful sync, RFC 3339, or `None` if never synced.
     pub last_sync: Option<String>,
+    /// The instance id currently hosting this file domain in a shared database,
+    /// or `None` when unhosted (every domain in a single-instance deployment, and
+    /// every virtual domain, which never take a host lock).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_instance_id: Option<String>,
+    /// The host's human label, when hosted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_label: Option<String>,
+    /// The host's last heartbeat, RFC 3339, when hosted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_heartbeat_at: Option<String>,
+}
+
+/// The instance currently holding a file domain's host lock in a shared
+/// database. Returned by [`Store::domain_host`] and carried by
+/// [`HostClaim::HeldByOther`] so a refused sync can name the host and its last
+/// heartbeat.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DomainHost {
+    /// The holding instance's stable id.
+    pub instance_id: String,
+    /// The holding instance's human label.
+    pub label: String,
+    /// The host's last heartbeat, RFC 3339.
+    pub heartbeat_at: String,
+}
+
+/// The outcome of a [`Store::claim_domain_host`]: this instance acquired (or
+/// renewed, or took over) the host lock, or another live instance still holds
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub enum HostClaim {
+    /// This instance holds the host lock now.
+    Acquired,
+    /// Another instance holds it and the claim did not qualify for takeover
+    /// (not stale, no `take_over`).
+    HeldByOther(DomainHost),
 }
 
 /// The backend-agnostic storage interface. All methods are async so a network
@@ -818,7 +857,18 @@ pub trait Store: Send + Sync {
 
     /// Return chunks that need an embedding for the given model: those with no
     /// embedding yet, plus those embedded by a different model (a model swap).
-    async fn chunks_needing_embedding(&self, model: &str) -> Result<Vec<ChunkJob>>;
+    /// `domains`, when `Some`, restricts the scan to those domains: the daemon
+    /// scopes each instance's embed pass to the file domains it hosts plus all
+    /// virtual domains, so a non-host does not wastefully re-embed a chunk
+    /// another instance owns. `None` scans every domain (the single-instance and
+    /// standalone default). Duplicate embedding across instances is always safe
+    /// (the chunk fingerprint folds in the model id, so two instances converge
+    /// on the same vector), just wasteful, and this filter avoids the waste.
+    async fn chunks_needing_embedding(
+        &self,
+        model: &str,
+        domains: Option<&[DomainId]>,
+    ) -> Result<Vec<ChunkJob>>;
 
     /// Store a batch of embeddings against their chunks for the given model.
     async fn store_embeddings(&self, batch: &[EmbeddingRow], model: &str) -> Result<()>;
@@ -840,6 +890,48 @@ pub trait Store: Send + Sync {
 
     /// Per-domain counts, in registration order.
     async fn domain_stats(&self) -> Result<Vec<DomainStats>>;
+
+    // --- host locks ----------------------------------------------------------
+    // The single-writer-per-file-domain rule for shared-database collaboration.
+    // Only file domains take a host lock; a virtual domain's concurrency is
+    // engram-level compare-and-swap, so the daemon never claims one. All four
+    // are backend-agnostic: an atomic upsert plus a re-read on Turso, the same
+    // with `RETURNING` on Postgres, over a `domain_lock` table.
+
+    /// Claim the host lock for a file domain. Inserts when unheld; takes over
+    /// when `take_over` is set or the current holder's `heartbeat_at` is older
+    /// than `stale_before`; otherwise leaves the existing holder untouched. Times
+    /// (`now`, `stale_before`) are RFC 3339 strings the caller computes from its
+    /// stale threshold, so the comparison stays a plain lexical one, matching the
+    /// temporal columns. Returns [`HostClaim::Acquired`] when this instance holds
+    /// the lock afterward, else [`HostClaim::HeldByOther`] naming the live holder.
+    async fn claim_domain_host(
+        &self,
+        domain: DomainId,
+        instance_id: &str,
+        label: &str,
+        now: &str,
+        stale_before: &str,
+        take_over: bool,
+    ) -> Result<HostClaim>;
+
+    /// Refresh this instance's heartbeat on a lock it holds. Returns `true` when
+    /// a row was updated (this instance still holds it), `false` when it does not
+    /// (another instance took over), which tells the daemon to stop hosting.
+    async fn renew_domain_host(
+        &self,
+        domain: DomainId,
+        instance_id: &str,
+        now: &str,
+    ) -> Result<bool>;
+
+    /// Release a lock this instance holds (graceful shutdown). A no-op when this
+    /// instance is not the current holder, so a released takeover never deletes
+    /// the new host's lock.
+    async fn release_domain_host(&self, domain: DomainId, instance_id: &str) -> Result<()>;
+
+    /// The current holder of a file domain's host lock, or `None` when unheld.
+    async fn domain_host(&self, domain: DomainId) -> Result<Option<DomainHost>>;
 
     // --- batch control -------------------------------------------------------
     // These let the sync engine wrap its whole write phase in one transaction

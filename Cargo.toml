@@ -61,6 +61,7 @@ axum = "0.8.9"
 libc = "0.2.180"
 serde_yaml_ng = "0.10.0"
 async-trait = "0.1.89"
+uuid = { version = "1.23.4", features = ["v4"] }
 thiserror = "2.0.18"
 anyhow = "1.0.103"
 etcetera = "0.11.0"

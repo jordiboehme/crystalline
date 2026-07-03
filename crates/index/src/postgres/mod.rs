@@ -34,10 +34,10 @@ use tokio::sync::{Mutex as TokioMutex, MutexGuard};
 
 use crate::error::{IndexError, Result};
 use crate::store::{
-    ChunkJob, ChunkModelCount, DomainId, DomainKind, DomainStats, EdgeKind, EmbeddingCoverage,
-    EmbeddingRow, EngramDescriptor, EngramId, EngramRecord, EngramSummary, FileStamp, FtsMode,
-    GraphSlice, InboundRef, NewChunk, Page, RecentFilter, SearchHit, SearchQuery, Store, StoreInfo,
-    StoredEngram,
+    ChunkJob, ChunkModelCount, DomainHost, DomainId, DomainKind, DomainStats, EdgeKind,
+    EmbeddingCoverage, EmbeddingRow, EngramDescriptor, EngramId, EngramRecord, EngramSummary,
+    FileStamp, FtsMode, GraphSlice, HostClaim, InboundRef, NewChunk, Page, RecentFilter, SearchHit,
+    SearchQuery, Store, StoreInfo, StoredEngram,
 };
 
 /// A PostgreSQL-backed store. Open one with [`PostgresStore::open`].
@@ -945,17 +945,42 @@ impl Store for PostgresStore {
         Ok(())
     }
 
-    async fn chunks_needing_embedding(&self, model: &str) -> Result<Vec<ChunkJob>> {
-        let mut conn = self.acquire().await?;
-        let rows = sqlx::query(
+    async fn chunks_needing_embedding(
+        &self,
+        model: &str,
+        domains: Option<&[DomainId]>,
+    ) -> Result<Vec<ChunkJob>> {
+        // The base predicate is unchanged; an optional domain scope adds an
+        // `engram_id IN (SELECT id FROM engram WHERE domain_id IN (...))` clause
+        // so a non-host embeds only the chunks it owns. An empty scope matches
+        // nothing (this instance hosts nothing embeddable).
+        let mut sql = String::from(
             "SELECT id, engram_id, seq, text, text_hash FROM chunk \
-             WHERE embedding IS NULL OR model IS NULL OR model != $1 \
-             ORDER BY engram_id, seq",
-        )
-        .bind(model)
-        .fetch_all(conn.as_mut())
-        .await
-        .map_err(IndexError::from)?;
+             WHERE (embedding IS NULL OR model IS NULL OR model != $1)",
+        );
+        let mut params = vec![Param::Text(model.to_string())];
+        if let Some(ids) = domains {
+            if ids.is_empty() {
+                return Ok(Vec::new());
+            }
+            let mut n = 2;
+            let placeholders: Vec<String> = ids
+                .iter()
+                .map(|id| {
+                    params.push(Param::Int(id.0));
+                    let p = format!("${n}");
+                    n += 1;
+                    p
+                })
+                .collect();
+            sql.push_str(&format!(
+                " AND engram_id IN (SELECT id FROM engram WHERE domain_id IN ({}))",
+                placeholders.join(",")
+            ));
+        }
+        sql.push_str(" ORDER BY engram_id, seq");
+        let mut conn = self.acquire().await?;
+        let rows = query_all(conn.as_mut(), &sql, params).await?;
         Ok(rows
             .iter()
             .map(|r| ChunkJob {
@@ -1076,12 +1101,13 @@ impl Store for PostgresStore {
     async fn domain_stats(&self) -> Result<Vec<DomainStats>> {
         let mut conn = self.acquire().await?;
         let rows = sqlx::query(
-            "SELECT d.id, d.name, d.path, d.last_sync, \
+            "SELECT d.id, d.name, d.path, d.kind, d.last_sync, \
              (SELECT count(*) FROM engram e WHERE e.domain_id=d.id), \
              (SELECT count(*) FROM observation o JOIN engram e ON e.id=o.engram_id WHERE e.domain_id=d.id), \
              (SELECT count(*) FROM relation r WHERE r.domain_id=d.id), \
-             (SELECT count(*) FROM relation r WHERE r.domain_id=d.id AND r.to_id IS NULL) \
-             FROM domain d ORDER BY d.id",
+             (SELECT count(*) FROM relation r WHERE r.domain_id=d.id AND r.to_id IS NULL), \
+             dl.holder_instance_id, dl.holder_label, dl.heartbeat_at \
+             FROM domain d LEFT JOIN domain_lock dl ON dl.domain_id=d.id ORDER BY d.id",
         )
         .fetch_all(conn.as_mut())
         .await
@@ -1091,13 +1117,120 @@ impl Store for PostgresStore {
             .map(|r| DomainStats {
                 name: cell_text(r, 1).unwrap_or_default(),
                 path: cell_text(r, 2).unwrap_or_default(),
-                last_sync: cell_text(r, 3),
-                engrams: cell_i64(r, 4).unwrap_or(0),
-                observations: cell_i64(r, 5).unwrap_or(0),
-                relations: cell_i64(r, 6).unwrap_or(0),
-                unresolved_relations: cell_i64(r, 7).unwrap_or(0),
+                kind: DomainKind::from_stored(&cell_text(r, 3).unwrap_or_default()),
+                last_sync: cell_text(r, 4),
+                engrams: cell_i64(r, 5).unwrap_or(0),
+                observations: cell_i64(r, 6).unwrap_or(0),
+                relations: cell_i64(r, 7).unwrap_or(0),
+                unresolved_relations: cell_i64(r, 8).unwrap_or(0),
+                host_instance_id: cell_text(r, 9),
+                host_label: cell_text(r, 10),
+                host_heartbeat_at: cell_text(r, 11),
             })
             .collect())
+    }
+
+    async fn claim_domain_host(
+        &self,
+        domain: DomainId,
+        instance_id: &str,
+        label: &str,
+        now: &str,
+        stale_before: &str,
+        take_over: bool,
+    ) -> Result<HostClaim> {
+        // One atomic upsert (insert, or take over on a re-claim, an explicit
+        // `take_over` or a stale heartbeat), then a re-read on the same
+        // connection so we see our own write and never re-enter the tx mutex.
+        let mut conn = self.acquire().await?;
+        let c = conn.as_mut();
+        sqlx::query(
+            "INSERT INTO domain_lock(domain_id, holder_instance_id, holder_label, acquired_at, heartbeat_at) \
+             VALUES($1,$2,$3,$4,$4) \
+             ON CONFLICT(domain_id) DO UPDATE SET \
+             holder_instance_id=EXCLUDED.holder_instance_id, holder_label=EXCLUDED.holder_label, \
+             acquired_at=EXCLUDED.acquired_at, heartbeat_at=EXCLUDED.heartbeat_at \
+             WHERE domain_lock.holder_instance_id=EXCLUDED.holder_instance_id \
+                OR $5 \
+                OR domain_lock.heartbeat_at < $6",
+        )
+        .bind(domain.0)
+        .bind(instance_id)
+        .bind(label)
+        .bind(now)
+        .bind(take_over)
+        .bind(stale_before)
+        .execute(&mut *c)
+        .await
+        .map_err(IndexError::from)?;
+        let row = sqlx::query(
+            "SELECT holder_instance_id, holder_label, heartbeat_at FROM domain_lock WHERE domain_id=$1",
+        )
+        .bind(domain.0)
+        .fetch_optional(&mut *c)
+        .await
+        .map_err(IndexError::from)?;
+        Ok(match row {
+            Some(r) => {
+                let host = DomainHost {
+                    instance_id: cell_text(&r, 0).unwrap_or_default(),
+                    label: cell_text(&r, 1).unwrap_or_default(),
+                    heartbeat_at: cell_text(&r, 2).unwrap_or_default(),
+                };
+                if host.instance_id == instance_id {
+                    HostClaim::Acquired
+                } else {
+                    HostClaim::HeldByOther(host)
+                }
+            }
+            None => HostClaim::Acquired,
+        })
+    }
+
+    async fn renew_domain_host(
+        &self,
+        domain: DomainId,
+        instance_id: &str,
+        now: &str,
+    ) -> Result<bool> {
+        let mut conn = self.acquire().await?;
+        let done = sqlx::query(
+            "UPDATE domain_lock SET heartbeat_at=$1 WHERE domain_id=$2 AND holder_instance_id=$3",
+        )
+        .bind(now)
+        .bind(domain.0)
+        .bind(instance_id)
+        .execute(conn.as_mut())
+        .await
+        .map_err(IndexError::from)?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    async fn release_domain_host(&self, domain: DomainId, instance_id: &str) -> Result<()> {
+        let mut conn = self.acquire().await?;
+        sqlx::query("DELETE FROM domain_lock WHERE domain_id=$1 AND holder_instance_id=$2")
+            .bind(domain.0)
+            .bind(instance_id)
+            .execute(conn.as_mut())
+            .await
+            .map_err(IndexError::from)?;
+        Ok(())
+    }
+
+    async fn domain_host(&self, domain: DomainId) -> Result<Option<DomainHost>> {
+        let mut conn = self.acquire().await?;
+        let row = sqlx::query(
+            "SELECT holder_instance_id, holder_label, heartbeat_at FROM domain_lock WHERE domain_id=$1",
+        )
+        .bind(domain.0)
+        .fetch_optional(conn.as_mut())
+        .await
+        .map_err(IndexError::from)?;
+        Ok(row.map(|r| DomainHost {
+            instance_id: cell_text(&r, 0).unwrap_or_default(),
+            label: cell_text(&r, 1).unwrap_or_default(),
+            heartbeat_at: cell_text(&r, 2).unwrap_or_default(),
+        }))
     }
 
     async fn begin(&self) -> Result<()> {

@@ -12,7 +12,7 @@
 use std::path::Path;
 
 use crystalline_index::{
-    DomainKind, EngramId, EngramRecord, FileStamp, FilterOp, IndexError, MetadataFilter,
+    DomainKind, EngramId, EngramRecord, FileStamp, FilterOp, HostClaim, IndexError, MetadataFilter,
     RecentFilter, SearchMode, SearchQuery, Store, TursoStore, sync_domain,
 };
 
@@ -842,6 +842,152 @@ async fn clear_domain_is_scoped(store: &dyn Store) {
     assert_eq!(cleared.total, 0);
 }
 parity!(clear_domain_scopes_to_one_domain, clear_domain_is_scoped);
+
+// --- host locks (shared-database collaboration) ------------------------------
+
+async fn host_claim_and_contest(store: &dyn Store) {
+    // The lock FKs to a real domain row, so register a file domain first. Two
+    // instances are simulated by two instance-id strings against one store,
+    // exactly the single-writer-per-domain rule the daemon relies on. Times are
+    // fixed-width ISO strings, compared lexically like every temporal column.
+    let did = store
+        .upsert_domain("eng", Some("/k/eng"), DomainKind::File)
+        .await
+        .unwrap();
+
+    // No lock yet.
+    assert!(store.domain_host(did).await.unwrap().is_none());
+
+    // First claim on an unheld lock: instance A acquires.
+    let a_at = "2026-07-03T10:00:00+00:00";
+    let stale_before = "2026-07-03T09:59:00+00:00"; // nothing is stale relative to this
+    let claim = store
+        .claim_domain_host(did, "inst-a", "node-a", a_at, stale_before, false)
+        .await
+        .unwrap();
+    assert_eq!(claim, HostClaim::Acquired);
+    let host = store.domain_host(did).await.unwrap().unwrap();
+    assert_eq!(host.instance_id, "inst-a");
+    assert_eq!(host.label, "node-a");
+    assert_eq!(host.heartbeat_at, a_at);
+
+    // Contested claim: B tries while A's heartbeat is fresh and no takeover is
+    // asked, so B is refused and A keeps the lock unchanged.
+    let b_at = "2026-07-03T10:00:20+00:00";
+    let stale_fresh = "2026-07-03T09:59:30+00:00"; // A's 10:00:00 is after this: fresh
+    match store
+        .claim_domain_host(did, "inst-b", "node-b", b_at, stale_fresh, false)
+        .await
+        .unwrap()
+    {
+        HostClaim::HeldByOther(h) => {
+            assert_eq!(h.instance_id, "inst-a");
+            assert_eq!(h.heartbeat_at, a_at);
+        }
+        HostClaim::Acquired => panic!("B must not acquire a domain A holds with a fresh heartbeat"),
+    }
+    assert_eq!(
+        store.domain_host(did).await.unwrap().unwrap().instance_id,
+        "inst-a",
+        "A still holds it after a refused contest"
+    );
+
+    // domain_stats surfaces the kind and the current host.
+    let stats = store.domain_stats().await.unwrap();
+    let s = stats.iter().find(|d| d.name == "eng").unwrap();
+    assert_eq!(s.kind, DomainKind::File);
+    assert_eq!(s.host_instance_id.as_deref(), Some("inst-a"));
+    assert_eq!(s.host_heartbeat_at.as_deref(), Some(a_at));
+}
+parity!(host_claim_acquires_and_contests, host_claim_and_contest);
+
+async fn host_renew_takeover_release(store: &dyn Store) {
+    let did = store
+        .upsert_domain("eng", Some("/k/eng"), DomainKind::File)
+        .await
+        .unwrap();
+    let a_at = "2026-07-03T10:00:00+00:00";
+    let stale_before = "2026-07-03T09:59:00+00:00";
+    store
+        .claim_domain_host(did, "inst-a", "node-a", a_at, stale_before, false)
+        .await
+        .unwrap();
+
+    // Renew: the holder refreshes its heartbeat; a stranger's renew is a no-op.
+    let a_beat = "2026-07-03T10:00:25+00:00";
+    assert!(
+        store
+            .renew_domain_host(did, "inst-a", a_beat)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        store.domain_host(did).await.unwrap().unwrap().heartbeat_at,
+        a_beat
+    );
+    assert!(
+        !store
+            .renew_domain_host(did, "inst-b", a_beat)
+            .await
+            .unwrap(),
+        "a non-holder renew updates nothing"
+    );
+
+    // Stale takeover: B claims with a stale_before after A's last heartbeat, so
+    // A reads as stale and B acquires without a takeover flag.
+    let b_at = "2026-07-03T10:05:00+00:00";
+    let stale_past = "2026-07-03T10:04:00+00:00"; // A's 10:00:25 is before this: stale
+    let claim = store
+        .claim_domain_host(did, "inst-b", "node-b", b_at, stale_past, false)
+        .await
+        .unwrap();
+    assert_eq!(claim, HostClaim::Acquired);
+    assert_eq!(
+        store.domain_host(did).await.unwrap().unwrap().instance_id,
+        "inst-b"
+    );
+
+    // Explicit takeover: A forces the claim back even though B is fresh.
+    let a2_at = "2026-07-03T10:05:10+00:00";
+    let stale_fresh = "2026-07-03T10:04:59+00:00"; // B's 10:05:00 is fresh vs this
+    let claim = store
+        .claim_domain_host(did, "inst-a", "node-a", a2_at, stale_fresh, true)
+        .await
+        .unwrap();
+    assert_eq!(claim, HostClaim::Acquired);
+    assert_eq!(
+        store.domain_host(did).await.unwrap().unwrap().instance_id,
+        "inst-a"
+    );
+
+    // A same-holder re-claim is idempotent and refreshes the heartbeat.
+    let a3_at = "2026-07-03T10:05:20+00:00";
+    let claim = store
+        .claim_domain_host(did, "inst-a", "node-a", a3_at, stale_fresh, false)
+        .await
+        .unwrap();
+    assert_eq!(claim, HostClaim::Acquired);
+    assert_eq!(
+        store.domain_host(did).await.unwrap().unwrap().heartbeat_at,
+        a3_at
+    );
+
+    // Release: a non-holder's release leaves the lock; the holder's clears it.
+    store.release_domain_host(did, "inst-b").await.unwrap();
+    assert!(
+        store.domain_host(did).await.unwrap().is_some(),
+        "a non-holder release does not clear the lock"
+    );
+    store.release_domain_host(did, "inst-a").await.unwrap();
+    assert!(
+        store.domain_host(did).await.unwrap().is_none(),
+        "the holder's release clears the lock"
+    );
+}
+parity!(
+    host_renews_takes_over_and_releases,
+    host_renew_takeover_release
+);
 
 async fn seed_ids_stable(store: &dyn Store) {
     let dir = tempfile::tempdir().unwrap();

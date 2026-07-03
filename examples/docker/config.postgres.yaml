@@ -1,0 +1,11 @@
+# Crystalline configuration for the Postgres compose example.
+#
+# Mounted read-write into the container at /config/config.yaml so `crystalline
+# domain add` can register domains into it at runtime (it rewrites this file).
+# The database block points every instance at the shared `db` service; the
+# vector extension is created by Crystalline itself on first open, so no init
+# SQL is needed.
+database:
+  backend: postgres
+  url: postgres://crystalline:crystalline@db:5432/crystalline
+domains: {}

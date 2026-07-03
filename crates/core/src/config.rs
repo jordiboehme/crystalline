@@ -99,6 +99,15 @@ impl DomainKind {
     pub fn is_file(&self) -> bool {
         matches!(self, DomainKind::File)
     }
+
+    /// Parse the stored discriminator string a backend keeps in its `domain`
+    /// table (`file` or `virtual`); any unknown value reads back as `File`.
+    pub fn from_stored(s: &str) -> DomainKind {
+        match s {
+            "virtual" => DomainKind::Virtual,
+            _ => DomainKind::File,
+        }
+    }
 }
 
 /// A registered domain. A file domain carries its root `path`; a virtual domain
@@ -418,6 +427,40 @@ pub fn service_lock_path() -> Result<PathBuf, ConfigError> {
 /// The service socket path, `<state_dir>/service.sock`.
 pub fn service_sock_path() -> Result<PathBuf, ConfigError> {
     Ok(state_dir()?.join("service.sock"))
+}
+
+/// The instance-id path, `<state_dir>/instance-id`. Holds this machine and
+/// state-directory's stable identity for shared-database collaboration.
+pub fn instance_id_path() -> Result<PathBuf, ConfigError> {
+    Ok(state_dir()?.join("instance-id"))
+}
+
+/// Read this instance's stable id, generating and persisting a fresh UUID v4 on
+/// first use. The id lives at `<state_dir>/instance-id` and is stable across
+/// restarts, so a shared-database deployment can tell one worker from another
+/// (host locks, ownership surfacing). Two state directories on one machine (two
+/// isolated `HOME`s) get two ids, exactly the isolation multi-instance testing
+/// needs.
+pub fn read_or_create_instance_id() -> Result<String, ConfigError> {
+    let path = instance_id_path()?;
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let trimmed = existing.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| ConfigError::Io {
+            path: parent.display().to_string(),
+            source,
+        })?;
+    }
+    std::fs::write(&path, id.as_bytes()).map_err(|source| ConfigError::Io {
+        path: path.display().to_string(),
+        source,
+    })?;
+    Ok(id)
 }
 
 /// The application cache directory, for example `~/.cache/crystalline`.

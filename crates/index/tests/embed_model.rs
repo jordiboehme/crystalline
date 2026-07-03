@@ -172,7 +172,7 @@ async fn semantic_query_without_term_overlap_ranks_related_engram_top_three() {
     // Re-syncing the unchanged corpus embeds nothing.
     sync_domain_with(&store, "d", root, &params).await.unwrap();
     let pending = store
-        .chunks_needing_embedding(provider.model_id())
+        .chunks_needing_embedding(provider.model_id(), None)
         .await
         .unwrap();
     assert!(pending.is_empty(), "a warm resync re-embeds nothing");

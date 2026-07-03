@@ -86,7 +86,11 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
         "sync" => {
             let domain = req.get("domain").and_then(Value::as_str);
             let embed = req.get("embed").and_then(Value::as_bool).unwrap_or(false);
-            match shared.engine.sync(domain).await {
+            let take_over = req
+                .get("take_over")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            match shared.engine.sync_take_over(domain, take_over).await {
                 Ok(mut data) => {
                     maybe_embed(shared, embed, &mut data).await;
                     (envelope_ok(data), false)

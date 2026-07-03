@@ -37,6 +37,11 @@ pub const MIGRATIONS: &[Migration] = &[
         label: "domain kind",
         sql: SCHEMA_V3,
     },
+    Migration {
+        version: 4,
+        label: "domain host lock",
+        sql: SCHEMA_V4,
+    },
 ];
 
 const SCHEMA_V1: &str = r#"
@@ -177,7 +182,24 @@ const SCHEMA_V3: &str = r#"
 ALTER TABLE domain ADD COLUMN kind TEXT NOT NULL DEFAULT 'file';
 "#;
 
-/// The tables cleared by `wipe()`, child rows first.
+// The single-writer-per-file-domain host lock for shared-database
+// collaboration. One row per hosted file domain records the holding instance
+// and its last heartbeat; a stale heartbeat or an explicit takeover lets another
+// instance claim it. Virtual domains never take a row here (their concurrency is
+// engram-level compare-and-swap). Times are TEXT ISO strings, compared
+// lexically, matching every other temporal column.
+const SCHEMA_V4: &str = r#"
+CREATE TABLE domain_lock (
+    domain_id INTEGER PRIMARY KEY REFERENCES domain(id),
+    holder_instance_id TEXT NOT NULL,
+    holder_label TEXT NOT NULL DEFAULT '',
+    acquired_at TEXT NOT NULL,
+    heartbeat_at TEXT NOT NULL
+);
+"#;
+
+/// The tables cleared by `wipe()`, child rows first. `domain_lock` references
+/// `domain(id)`, so it is cleared before `domain`.
 pub const WIPE_TABLES: &[&str] = &[
     "observation_tag",
     "engram_tag",
@@ -187,6 +209,7 @@ pub const WIPE_TABLES: &[&str] = &[
     "link",
     "tag",
     "engram",
+    "domain_lock",
     "domain",
 ];
 

@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use crystalline_core::config::{self, GlobalConfig, HttpSetting};
-use crystalline_index::Store;
+use crystalline_index::{HostClaim, Store};
 use interprocess::local_socket::tokio::Stream as IpcStream;
 use notify::{RecursiveMode, Watcher};
 use serde_json::Value;
@@ -109,14 +109,17 @@ impl Shared {
     }
 }
 
-/// Run the daemon: `crystalline serve [--daemon] [--http <addr>] [--read-only]`.
-/// The effective mode is the explicit flag or `service.read_only`.
+/// Run the daemon: `crystalline serve [--daemon] [--http <addr>] [--read-only]
+/// [--take-over]`. The effective read-only mode is the explicit flag or
+/// `service.read_only`; `take_over` forces host-lock claims for a deliberate host
+/// migration in a shared database.
 pub async fn run_serve(
     daemon_flag: bool,
     http_flag: Option<String>,
     db: Option<PathBuf>,
     config_path: Option<PathBuf>,
     read_only: bool,
+    take_over: bool,
 ) -> anyhow::Result<()> {
     let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -127,6 +130,10 @@ pub async fn run_serve(
     let read_only = read_only || config.read_only();
     let db_path = resolve_db(db.as_deref())?;
     let http_addr = resolve_http(http_flag.as_deref(), &config);
+    // This machine and state-directory's stable identity, generated on first use.
+    // It turns on shared-database collaboration: the daemon claims a host lock per
+    // file domain, renews it on a timer and releases it on shutdown.
+    let instance_id = config::read_or_create_instance_id()?;
 
     // Take ownership first so a second daemon fails fast with the live pid.
     let ownership = acquire_ownership()?;
@@ -141,7 +148,8 @@ pub async fn run_serve(
     let engine = Arc::new(
         Engine::new(store, config.clone(), None, config_path.clone())
             .with_watch_channel(watch_tx)
-            .with_read_only(read_only),
+            .with_read_only(read_only)
+            .with_instance_id(instance_id),
     );
 
     // Bind the socket and publish the lock record: this is the readiness point,
@@ -195,7 +203,10 @@ pub async fn run_serve(
             // Hold the first scan until the watcher has armed the startup
             // watches; a dropped sender (watcher failed to start) lets it run.
             let _ = watches_ready_rx.await;
-            if let Err(err) = e.sync(None).await {
+            // The startup sync claims each file domain's host lock (take_over
+            // forces a migration); a domain held by another live instance is
+            // skipped and served read-from-database.
+            if let Err(err) = e.sync_take_over(None, take_over).await {
                 tracing::warn!("initial sync failed: {err}");
             }
             if let Some(provider) = crate::engine::build_provider(&cfg).await {
@@ -215,9 +226,23 @@ pub async fn run_serve(
         let watch_domains = domain_roots(&config);
         let rx = shared.watch();
         tokio::spawn(async move {
-            if let Err(err) = run_watcher(e, watch_domains, rx, watch_rx, watches_ready_tx).await {
+            if let Err(err) =
+                run_watcher(e, watch_domains, take_over, rx, watch_rx, watches_ready_tx).await
+            {
                 tracing::warn!("watcher stopped: {err}");
             }
+        });
+    }
+
+    // The host-lock heartbeat timer: renews every lock this instance holds so
+    // another instance does not take over a live host. A no-op when this instance
+    // hosts nothing (uncontended single-instance deployments).
+    {
+        let e = engine.clone();
+        let rx = shared.watch();
+        let secs = engine.heartbeat_secs();
+        tokio::spawn(async move {
+            run_heartbeat(e, secs, rx).await;
         });
     }
 
@@ -241,6 +266,11 @@ pub async fn run_serve(
     }
     shared.trigger_shutdown();
     let _ = accept.await;
+
+    // Release every host lock this instance holds so a successor daemon acquires
+    // immediately instead of waiting out the stale threshold. A no-op when this
+    // instance hosts nothing.
+    engine.release_hosts().await;
 
     // Dropping ownership releases the lock and removes the socket and lock files.
     drop(ownership);
@@ -322,6 +352,7 @@ async fn handle_conn(mut stream: IpcStream, shared: Arc<Shared>) {
 async fn run_watcher(
     engine: Arc<Engine>,
     domains: Vec<(String, PathBuf)>,
+    take_over: bool,
     mut shutdown: watch::Receiver<bool>,
     mut new_roots: tokio::sync::mpsc::UnboundedReceiver<WatchEvent>,
     watches_ready: tokio::sync::oneshot::Sender<()>,
@@ -334,9 +365,34 @@ async fn run_watcher(
             }
         }
     })?;
-    let mut domains = domains;
-    for (_, root) in &domains {
-        let _ = watcher.watch(root, RecursiveMode::Recursive);
+    // Claim the host lock for each startup file domain before arming its watch:
+    // an acquired domain is watched (and synced) here, a domain held by another
+    // live instance is skipped and served read-from-database only. Claiming
+    // before arming keeps the watch-before-scan ordering the invariant needs.
+    let startup = domains;
+    let mut domains: Vec<(String, PathBuf)> = Vec::new();
+    for (name, root) in startup {
+        match engine.claim_host(&name, take_over).await {
+            Ok(HostClaim::Acquired) => {
+                if let Err(err) = watcher.watch(&root, RecursiveMode::Recursive) {
+                    tracing::warn!(
+                        "could not watch domain '{name}' at {}: {err}",
+                        root.display()
+                    );
+                }
+                domains.push((name, root));
+            }
+            Ok(HostClaim::HeldByOther(host)) => {
+                tracing::info!(
+                    "domain '{name}' is hosted by instance {} (last heartbeat {}); not watching, serving read-from-database only",
+                    host.instance_id,
+                    host.heartbeat_at
+                );
+            }
+            Err(err) => {
+                tracing::warn!("could not claim host for domain '{name}': {err}; not watching");
+            }
+        }
     }
     // Every startup watch is now armed, so the initial sync in `run_serve` may
     // safely scan (see the ordering invariant above). A dropped receiver just
@@ -350,27 +406,44 @@ async fn run_watcher(
                 match event {
                     Some(WatchEvent::Add(name, root)) => {
                         if !domains.iter().any(|(n, _)| *n == name) {
-                            let armed = match watcher.watch(&root, RecursiveMode::Recursive) {
-                                Ok(()) => true,
+                            // Claim the host lock before arming, as at startup: a
+                            // domain another live instance hosts is not watched
+                            // here and is served read-from-database only.
+                            match engine.claim_host(&name, false).await {
+                                Ok(HostClaim::Acquired) => {
+                                    let armed = match watcher.watch(&root, RecursiveMode::Recursive) {
+                                        Ok(()) => true,
+                                        Err(err) => {
+                                            tracing::warn!("could not watch new domain '{name}' at {}: {err}", root.display());
+                                            false
+                                        }
+                                    };
+                                    domains.push((name.clone(), root));
+                                    // Catch-up sync now that the watch is armed:
+                                    // it closes the window between the ctl sync
+                                    // that discovered this domain and the watch
+                                    // going live, during which an external write
+                                    // would be invisible to inotify. Reuses the
+                                    // engine sync path the debounced arm below
+                                    // uses, so lock discipline and idempotency are
+                                    // unchanged.
+                                    if armed {
+                                        if let Err(err) = engine.sync(Some(name.as_str())).await {
+                                            tracing::warn!("catch-up sync of new domain '{name}' failed: {err}");
+                                        }
+                                        if let Err(err) = engine.embed_pending().await {
+                                            tracing::warn!("catch-up embed of new domain '{name}' failed: {err}");
+                                        }
+                                    }
+                                }
+                                Ok(HostClaim::HeldByOther(host)) => {
+                                    tracing::info!(
+                                        "new domain '{name}' is hosted by instance {}; not watching, serving read-from-database only",
+                                        host.instance_id
+                                    );
+                                }
                                 Err(err) => {
-                                    tracing::warn!("could not watch new domain '{name}' at {}: {err}", root.display());
-                                    false
-                                }
-                            };
-                            domains.push((name.clone(), root));
-                            // Catch-up sync now that the watch is armed: it
-                            // closes the window between the ctl sync that
-                            // discovered this domain and the watch going live,
-                            // during which an external write would be invisible
-                            // to inotify. Reuses the engine sync path the
-                            // debounced arm below uses, so lock discipline and
-                            // idempotency are unchanged.
-                            if armed {
-                                if let Err(err) = engine.sync(Some(name.as_str())).await {
-                                    tracing::warn!("catch-up sync of new domain '{name}' failed: {err}");
-                                }
-                                if let Err(err) = engine.embed_pending().await {
-                                    tracing::warn!("catch-up embed of new domain '{name}' failed: {err}");
+                                    tracing::warn!("could not claim host for new domain '{name}': {err}; not watching");
                                 }
                             }
                         }
@@ -439,6 +512,20 @@ async fn run_http(
         .with_graceful_shutdown(async move { wait_true(&mut shutdown).await })
         .await?;
     Ok(())
+}
+
+/// Renew this instance's host locks every `secs` seconds until shutdown, so a
+/// live host is never mistaken for stale. The first tick is consumed so renewal
+/// starts one interval in, after the startup claims have settled.
+async fn run_heartbeat(engine: Arc<Engine>, secs: u64, mut shutdown: watch::Receiver<bool>) {
+    let mut ticker = tokio::time::interval(Duration::from_secs(secs.max(1)));
+    ticker.tick().await;
+    loop {
+        tokio::select! {
+            _ = wait_true(&mut shutdown) => break,
+            _ = ticker.tick() => engine.renew_hosts().await,
+        }
+    }
 }
 
 // --- shutdown + watcher helpers ---------------------------------------------

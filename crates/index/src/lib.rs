@@ -30,11 +30,11 @@ pub use embed::{
 pub use error::{IndexError, Result};
 pub use factory::open_store;
 pub use store::{
-    ChunkJob, ChunkModelCount, DomainId, DomainKind, DomainStats, EdgeKind, EmbeddingCoverage,
-    EmbeddingRow, EngramDescriptor, EngramId, EngramRecord, EngramSummary, FileStamp, FilterOp,
-    FtsMode, GraphEdge, GraphNode, GraphSlice, HitKind, InboundRef, MetadataFilter, NewChunk, Page,
-    RecentFilter, SearchHit, SearchMode, SearchQuery, Store, StoreInfo, StoredEngram,
-    parse_metadata_filters,
+    ChunkJob, ChunkModelCount, DomainHost, DomainId, DomainKind, DomainStats, EdgeKind,
+    EmbeddingCoverage, EmbeddingRow, EngramDescriptor, EngramId, EngramRecord, EngramSummary,
+    FileStamp, FilterOp, FtsMode, GraphEdge, GraphNode, GraphSlice, HitKind, HostClaim, InboundRef,
+    MetadataFilter, NewChunk, Page, RecentFilter, SearchHit, SearchMode, SearchQuery, Store,
+    StoreInfo, StoredEngram, parse_metadata_filters,
 };
 pub use sync::{SyncReport, sync_domain, sync_domain_with};
 pub use turso::TursoStore;

@@ -36,6 +36,11 @@ pub const MIGRATIONS: &[Migration] = &[
         label: "domain kind",
         sql: SCHEMA_V2,
     },
+    Migration {
+        version: 3,
+        label: "domain host lock",
+        sql: SCHEMA_V3,
+    },
 ];
 
 // The whole current schema in one step. The temporal columns stay TEXT ISO
@@ -163,8 +168,24 @@ ALTER TABLE domain ADD COLUMN kind TEXT NOT NULL DEFAULT 'file';
 ALTER TABLE domain ALTER COLUMN path DROP NOT NULL;
 "#;
 
+// The single-writer-per-file-domain host lock for shared-database
+// collaboration, the Postgres twin of Turso's v4. One row per hosted file domain
+// records the holding instance and its last heartbeat; a stale heartbeat or an
+// explicit takeover lets another instance claim it. Times are TEXT ISO strings,
+// compared lexically, matching every other temporal column.
+const SCHEMA_V3: &str = r#"
+CREATE TABLE domain_lock (
+    domain_id BIGINT PRIMARY KEY REFERENCES domain(id),
+    holder_instance_id TEXT NOT NULL,
+    holder_label TEXT NOT NULL DEFAULT '',
+    acquired_at TEXT NOT NULL,
+    heartbeat_at TEXT NOT NULL
+);
+"#;
+
 /// The tables cleared by `wipe()`, child rows first so the enforced foreign
-/// keys are satisfied at every step.
+/// keys are satisfied at every step. `domain_lock` references `domain(id)`, so
+/// it is cleared before `domain`.
 pub const WIPE_TABLES: &[&str] = &[
     "observation_tag",
     "engram_tag",
@@ -174,6 +195,7 @@ pub const WIPE_TABLES: &[&str] = &[
     "link",
     "tag",
     "engram",
+    "domain_lock",
     "domain",
 ];
 

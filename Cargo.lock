@@ -975,6 +975,7 @@ dependencies = [
  "serde_yaml_ng",
  "tempfile",
  "thiserror 2.0.18",
+ "uuid",
  "walkdir",
 ]
 

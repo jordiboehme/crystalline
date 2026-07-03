@@ -223,7 +223,7 @@ async fn store_and_retrieve_roundtrip() {
     // Nothing left to embed.
     assert!(
         store
-            .chunks_needing_embedding("fake-8")
+            .chunks_needing_embedding("fake-8", None)
             .await
             .unwrap()
             .is_empty()
@@ -459,7 +459,7 @@ async fn unchanged_files_do_zero_reembedding_work() {
     assert_eq!(report.unchanged, 5);
     assert!(
         store
-            .chunks_needing_embedding("fake-8")
+            .chunks_needing_embedding("fake-8", None)
             .await
             .unwrap()
             .is_empty(),
@@ -486,7 +486,7 @@ async fn editing_one_paragraph_only_reembeds_that_chunk() {
     run_embedding_pass(&store, &fake, |_, _| {}).await.unwrap();
     assert!(
         store
-            .chunks_needing_embedding("fake-8")
+            .chunks_needing_embedding("fake-8", None)
             .await
             .unwrap()
             .is_empty()
@@ -501,7 +501,10 @@ async fn editing_one_paragraph_only_reembeds_that_chunk() {
 
     // Only the changed chunk (and the title-bearing first chunk if it moved) lost
     // its embedding; the fingerprint carry-over kept the untouched ones.
-    let pending = store.chunks_needing_embedding("fake-8").await.unwrap();
+    let pending = store
+        .chunks_needing_embedding("fake-8", None)
+        .await
+        .unwrap();
     assert!(
         !pending.is_empty(),
         "the edited paragraph needs re-embedding"

@@ -71,6 +71,11 @@ enum Command {
         /// After syncing, embed any chunks that need it for the active model.
         #[arg(long)]
         embed: bool,
+        /// Force the host-lock claim in a shared database, migrating hosting of
+        /// the synced domain to this instance even when another holds a live
+        /// lock. Only meaningful when a daemon owns the shared index.
+        #[arg(long)]
+        take_over: bool,
         /// Load the global config from this file instead of the default path.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -151,6 +156,11 @@ enum Command {
         /// daemon's lifetime.
         #[arg(long)]
         read_only: bool,
+        /// Force host-lock claims for every file domain, migrating hosting to
+        /// this instance in a shared database even when another instance holds a
+        /// live lock. For a deliberate host migration.
+        #[arg(long)]
+        take_over: bool,
         /// Load the global config from this file instead of the default path.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -387,6 +397,10 @@ enum CtlCommand {
         /// Embed new chunks after syncing.
         #[arg(long)]
         embed: bool,
+        /// Force the host-lock claim, migrating hosting of the synced domain to
+        /// this daemon in a shared database.
+        #[arg(long)]
+        take_over: bool,
     },
     /// Ask the daemon to reindex. `--full` wipes first.
     Reindex {
@@ -536,8 +550,11 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Sync {
             domain,
             embed,
+            take_over,
             config,
-        }) => on_runtime(sync_dispatch(domain, embed, config, cli.db, cli.json)),
+        }) => on_runtime(sync_dispatch(
+            domain, embed, take_over, config, cli.db, cli.json,
+        )),
         Some(Command::Reindex {
             full,
             embed,
@@ -574,9 +591,10 @@ fn main() -> anyhow::Result<()> {
             http,
             daemon,
             read_only,
+            take_over,
             config,
         }) => on_runtime(crystalline_service::run_serve(
-            daemon, http, cli.db, config, read_only,
+            daemon, http, cli.db, config, read_only, take_over,
         )),
         Some(Command::Mcp {
             embedded,
@@ -659,16 +677,20 @@ async fn status_dispatch(
 }
 
 /// `sync`: route to the daemon when one owns the index, else sync directly.
+/// `take_over` forces the daemon's host-lock claim for a shared-database host
+/// migration; it is meaningless without a daemon (standalone sync holds no host
+/// lock), so the direct path ignores it.
 async fn sync_dispatch(
     domain: Option<String>,
     embed: bool,
+    take_over: bool,
     config: Option<PathBuf>,
     db: Option<PathBuf>,
     json: bool,
 ) -> anyhow::Result<()> {
     use serde_json::json;
     if let Some(data) = crystalline_service::ctl_if_running(
-        json!({ "v": 1, "cmd": "sync", "domain": domain, "embed": embed }),
+        json!({ "v": 1, "cmd": "sync", "domain": domain, "embed": embed, "take_over": take_over }),
     )
     .await?
     {
@@ -733,8 +755,12 @@ async fn run_ctl(command: CtlCommand, json: bool) -> anyhow::Result<()> {
     let request = match &command {
         CtlCommand::Status => json!({ "v": 1, "cmd": "status" }),
         CtlCommand::Sessions => json!({ "v": 1, "cmd": "sessions" }),
-        CtlCommand::Sync { domain, embed } => {
-            json!({ "v": 1, "cmd": "sync", "domain": domain, "embed": embed })
+        CtlCommand::Sync {
+            domain,
+            embed,
+            take_over,
+        } => {
+            json!({ "v": 1, "cmd": "sync", "domain": domain, "embed": embed, "take_over": take_over })
         }
         CtlCommand::Reindex { full, embed } => {
             json!({ "v": 1, "cmd": "reindex", "full": full, "embed": embed })
