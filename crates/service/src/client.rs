@@ -25,11 +25,14 @@ pub async fn run_mcp(
     embedded: bool,
     db: Option<&Path>,
     config_path: Option<&Path>,
+    read_only: bool,
 ) -> anyhow::Result<()> {
     if embedded {
-        return run_embedded_stdio(db, config_path).await;
+        return run_embedded_stdio(db, config_path, read_only).await;
     }
-    match ensure_daemon(true, db, config_path).await {
+    // `read_only` is forwarded only to a daemon this call spawns; attaching to
+    // an already-running daemon uses that daemon's own mode.
+    match ensure_daemon(true, db, config_path, read_only).await {
         Ok(conn) => {
             let stream = conn.into_mcp().await?;
             pump_stdio(stream).await
@@ -37,7 +40,7 @@ pub async fn run_mcp(
         Err(e) => {
             init_tracing();
             tracing::warn!("no daemon available ({e}); running embedded");
-            run_embedded_stdio(db, config_path).await
+            run_embedded_stdio(db, config_path, read_only).await
         }
     }
 }
@@ -61,11 +64,17 @@ async fn pump_stdio(stream: IpcStream) -> anyhow::Result<()> {
 }
 
 /// The full in-process stack over stdio. Takes the lock; refuses if held.
-async fn run_embedded_stdio(db: Option<&Path>, config_path: Option<&Path>) -> anyhow::Result<()> {
+/// The effective mode is the explicit flag or `service.read_only`.
+async fn run_embedded_stdio(
+    db: Option<&Path>,
+    config_path: Option<&Path>,
+    read_only: bool,
+) -> anyhow::Result<()> {
     init_tracing();
     let ownership = acquire_ownership()
         .map_err(|e| anyhow::anyhow!("cannot run an embedded MCP server: {e}"))?;
     let config = load_config(config_path)?;
+    let read_only = read_only || config.read_only();
     let db_path = resolve_db(db)?;
     let store = open_store(&db_path).await?;
     // The provider is built in the background so the stdio session is ready and
@@ -73,12 +82,15 @@ async fn run_embedded_stdio(db: Option<&Path>, config_path: Option<&Path>) -> an
     // watcher task in this mode, so `config_path` only helps a domain added
     // mid-session resolve for data operations, not for picking up external
     // file changes.
-    let engine = Arc::new(Engine::new(
-        Arc::new(TokioMutex::new(store)),
-        config.clone(),
-        None,
-        config_path.map(Path::to_path_buf),
-    ));
+    let engine = Arc::new(
+        Engine::new(
+            Arc::new(TokioMutex::new(store)),
+            config.clone(),
+            None,
+            config_path.map(Path::to_path_buf),
+        )
+        .with_read_only(read_only),
+    );
 
     let bg = engine.clone();
     tokio::spawn(async move {

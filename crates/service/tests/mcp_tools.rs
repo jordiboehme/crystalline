@@ -25,6 +25,15 @@ struct Harness {
 
 impl Harness {
     async fn new(domains: &[&str]) -> Harness {
+        Harness::build(domains, false).await
+    }
+
+    /// A harness whose engine serves the content API read-only.
+    async fn new_read_only(domains: &[&str]) -> Harness {
+        Harness::build(domains, true).await
+    }
+
+    async fn build(domains: &[&str], read_only: bool) -> Harness {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();
         let mut cfg = GlobalConfig::default();
@@ -41,7 +50,9 @@ impl Harness {
             cfg.domains.insert(d.to_string(), DomainEntry { path: dir });
         }
         let store = TursoStore::open_in_memory().await.unwrap();
-        let engine = Arc::new(Engine::new(Arc::new(Mutex::new(store)), cfg, None, None));
+        let engine = Arc::new(
+            Engine::new(Arc::new(Mutex::new(store)), cfg, None, None).with_read_only(read_only),
+        );
         engine.sync(None).await.unwrap();
         Harness {
             _tmp: tmp,
@@ -112,6 +123,92 @@ async fn list_tools_exposes_all_twelve() {
         assert!(names.contains(&expected.to_string()), "missing {expected}");
     }
     assert_eq!(names.len(), 12, "exactly 12 tools: {names:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn read_only_hides_the_four_mutating_tools() {
+    let h = Harness::new_read_only(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let tools = client.peer().list_tools(Default::default()).await.unwrap();
+    let names: Vec<String> = tools.tools.iter().map(|t| t.name.to_string()).collect();
+
+    // The four content-mutating tools are absent from the surface.
+    for hidden in [
+        "write_engram",
+        "edit_engram",
+        "move_engram",
+        "delete_engram",
+    ] {
+        assert!(
+            !names.contains(&hidden.to_string()),
+            "{hidden} must be hidden in read-only mode: {names:?}"
+        );
+    }
+    // The eight read tools remain.
+    for expected in [
+        "read_engram",
+        "search_engrams",
+        "build_context",
+        "recent_activity",
+        "list_domains",
+        "browse_domain",
+        "validate_engrams",
+        "infer_schema",
+    ] {
+        assert!(names.contains(&expected.to_string()), "missing {expected}");
+    }
+    assert_eq!(names.len(), 8, "exactly 8 tools in read-only: {names:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn read_only_call_by_name_returns_the_read_only_error() {
+    let h = Harness::new_read_only(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    // Calling a hidden tool by name is dispatched to the engine guard, which
+    // returns the read-only error rather than a bare "tool not found".
+    let err = call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Nope", "content": "no" }),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("read-only"), "read-only error expected: {err}");
+    // Nothing was written.
+    assert!(!h.root.join("eng/nope.md").exists());
+}
+
+/// The engine guard is defense in depth: it refuses the four mutating methods
+/// regardless of the MCP layer, so the embedded CLI dispatch is covered too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn read_only_engine_guard_refuses_mutations() {
+    use crystalline_service::EngineError;
+    use crystalline_service::params::{DeleteParams, WriteParams};
+
+    let h = Harness::new_read_only(&["eng"]).await;
+
+    let write: WriteParams =
+        serde_json::from_value(json!({ "domain": "eng", "title": "Blocked", "content": "body" }))
+            .unwrap();
+    assert!(
+        matches!(
+            h.engine.write_engram(&write).await,
+            Err(EngineError::ReadOnly)
+        ),
+        "write_engram must refuse on a read-only engine"
+    );
+
+    let delete: DeleteParams =
+        serde_json::from_value(json!({ "identifier": "anything", "domain": "eng" })).unwrap();
+    assert!(
+        matches!(
+            h.engine.delete_engram(&delete).await,
+            Err(EngineError::ReadOnly)
+        ),
+        "delete_engram must refuse on a read-only engine"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

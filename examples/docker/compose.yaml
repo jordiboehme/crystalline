@@ -34,6 +34,11 @@ services:
     # huggingface.co (air-gapped or otherwise offline deployments):
     # image: ghcr.io/jordiboehme/crystalline:with-model
     command: ["serve", "--http", "0.0.0.0:7411"]
+    # Read-only variant: hide and refuse the four content-mutating tools so
+    # agents can only search and read this deployment's knowledge. Sync,
+    # watching and embedding still run, so the index keeps following external
+    # edits to ./knowledge. Swap the command line above for:
+    # command: ["serve", "--http", "0.0.0.0:7411", "--read-only"]
     ports:
       - "7411:7411"
     volumes:

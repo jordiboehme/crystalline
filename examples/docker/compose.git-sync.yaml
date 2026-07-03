@@ -9,12 +9,14 @@
 # it must already contain the registered domains with their MANIFEST.md
 # files, since nothing in this deployment writes to it.
 #
-# This trades the ability to write engrams from inside the deployment (an
-# agent's write_engram calls would fail against a read-only mount) for a
-# git-reviewed, git-audited knowledge base. If a deployment needs both git
-# sync and in-container writes, drop the `:ro` suffix below and push local
-# changes back to the remote out of band - understand that the next sync
-# will pull over anything not yet pushed.
+# This trades the ability to write engrams from inside the deployment for a
+# git-reviewed, git-audited knowledge base. The crystalline command runs with
+# `--read-only`, so the four content-mutating tools are hidden from the tool
+# list and refused rather than failing messily against the read-only mount;
+# sync, watching and embedding still follow every git pull. If a deployment
+# needs both git sync and in-container writes, drop both `--read-only` and the
+# `:ro` suffix below and push local changes back to the remote out of band -
+# understand that the next sync will pull over anything not yet pushed.
 #
 # Start it:
 #   docker compose -f examples/docker/compose.git-sync.yaml up -d
@@ -43,7 +45,7 @@ services:
 
   crystalline:
     image: ghcr.io/jordiboehme/crystalline:latest
-    command: ["serve", "--http", "0.0.0.0:7411"]
+    command: ["serve", "--http", "0.0.0.0:7411", "--read-only"]
     depends_on:
       - git-sync
     ports:

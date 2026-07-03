@@ -50,6 +50,19 @@ pub struct GlobalConfig {
     pub prompt: Option<PromptConfig>,
 }
 
+impl GlobalConfig {
+    /// Whether the served content API is read-only, from `service.read_only`.
+    /// Absent config or an absent key means read-write (false). This is the
+    /// config layer of the effective mode; an explicit `--read-only` flag on
+    /// `serve` or `mcp` can force it true on top of this, never false.
+    pub fn read_only(&self) -> bool {
+        self.service
+            .as_ref()
+            .and_then(|s| s.read_only)
+            .unwrap_or(false)
+    }
+}
+
 /// A registered domain.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DomainEntry {
@@ -63,6 +76,12 @@ pub struct ServiceConfig {
     /// The HTTP setting: a bool, or a `host:port` string.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http: Option<HttpSetting>,
+    /// Serve the content API read-only: the four content-mutating tools are
+    /// hidden from the MCP surface and refused by the engine, while sync,
+    /// reindex, watching and embedding still follow external file changes.
+    /// Absent means read-write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_only: Option<bool>,
 }
 
 /// The `service.http` value: either enabled/disabled, or a bind address.

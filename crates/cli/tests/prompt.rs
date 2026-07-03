@@ -58,6 +58,65 @@ fn prompt_json_matches_snapshot() {
 }
 
 #[test]
+fn prompt_text_read_only_matches_snapshot() {
+    let output = Command::cargo_bin("crystalline")
+        .unwrap()
+        .current_dir(fixtures_dir().join("prompt-fixture"))
+        .args([
+            "prompt",
+            "system",
+            "--workspace",
+            "workspace",
+            "--config",
+            "config.yaml",
+            "--read-only",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let text = String::from_utf8(output).unwrap();
+    // The read-only variant drops the write-tools line and names none of the
+    // four content-mutating tools.
+    for tool in [
+        "write_engram",
+        "edit_engram",
+        "move_engram",
+        "delete_engram",
+    ] {
+        assert!(!text.contains(tool), "{tool} must not appear:\n{text}");
+    }
+    insta::assert_snapshot!(text);
+}
+
+#[test]
+fn prompt_json_read_only_matches_snapshot() {
+    let output = Command::cargo_bin("crystalline")
+        .unwrap()
+        .current_dir(fixtures_dir().join("prompt-fixture"))
+        .args([
+            "prompt",
+            "system",
+            "--workspace",
+            "workspace",
+            "--config",
+            "config.yaml",
+            "--read-only",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let json = String::from_utf8(output).unwrap();
+    insta::assert_snapshot!(json);
+}
+
+#[test]
 fn missing_manifest_warns_on_stderr_but_still_exits_0() {
     Command::cargo_bin("crystalline")
         .unwrap()

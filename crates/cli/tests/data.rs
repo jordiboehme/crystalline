@@ -202,6 +202,46 @@ fn domain_add_indexes_pre_existing_files_without_an_explicit_sync() {
 }
 
 #[test]
+fn read_only_config_refuses_a_cli_write() {
+    let work = tempfile::tempdir().unwrap();
+    let domain_dir = work.path().join("kb");
+    let db = work.path().join("state/index.db");
+    let config = work.path().join("config.yaml");
+
+    // A registered domain with a manifest, and a config that serves read-only.
+    bin()
+        .args(["domain", "init"])
+        .arg(&domain_dir)
+        .args(["--name", "eng"])
+        .assert()
+        .success();
+    std::fs::write(
+        &config,
+        format!(
+            "domains:\n  eng:\n    path: {}\nservice:\n  read_only: true\n",
+            domain_dir.display()
+        ),
+    )
+    .unwrap();
+
+    // A standalone `crystalline write` (no daemon) refuses over the engine
+    // guard, with the friendly read-only message on stderr, and writes nothing.
+    bin()
+        .args(["write", "eng", "Blocked", "--content", "- [fact] nope #eng"])
+        .args(["--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("read-only"));
+    assert!(
+        !domain_dir.join("blocked.md").exists(),
+        "the refused write left no file"
+    );
+}
+
+#[test]
 fn domain_add_no_sync_registers_without_indexing() {
     let work = tempfile::tempdir().unwrap();
     let domain_dir = work.path().join("kb-later");

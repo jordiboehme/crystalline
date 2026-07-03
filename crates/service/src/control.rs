@@ -64,6 +64,7 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                 "sessions": shared.session_count(),
                 "http": shared.http_addr.clone(),
                 "http_sessions": shared.http_session_count(),
+                "read_only": shared.engine.read_only(),
             });
             match shared.engine.status_report().await {
                 Ok(report) => {

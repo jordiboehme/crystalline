@@ -159,11 +159,14 @@ pub async fn try_attach() -> Option<Connection> {
 }
 
 /// Attach to a daemon, spawning one detached and polling for readiness (up to
-/// ~2s) when none is running and `spawn` is set.
+/// ~2s) when none is running and `spawn` is set. `read_only` is passed through
+/// only to a daemon this call spawns; attaching to an already-running daemon
+/// uses that daemon's own mode, never this flag.
 pub async fn ensure_daemon(
     spawn: bool,
     db: Option<&Path>,
     config_path: Option<&Path>,
+    read_only: bool,
 ) -> anyhow::Result<Connection> {
     if let Some(conn) = try_attach().await {
         return Ok(conn);
@@ -171,7 +174,7 @@ pub async fn ensure_daemon(
     if !spawn {
         anyhow::bail!("no Crystalline daemon is running; start one with `crystalline serve`");
     }
-    spawn_daemon(db, config_path)?;
+    spawn_daemon(db, config_path, read_only)?;
     // Poll readiness: lock record present and socket connectable.
     for _ in 0..40 {
         if let Some(conn) = try_attach().await {
@@ -182,14 +185,22 @@ pub async fn ensure_daemon(
     anyhow::bail!("spawned a daemon but it did not become ready within 2s")
 }
 
-/// Spawn `current_exe serve --daemon` fully detached.
-fn spawn_daemon(db: Option<&Path>, config_path: Option<&Path>) -> anyhow::Result<()> {
+/// Spawn `current_exe serve --daemon` fully detached, forwarding `--read-only`
+/// when this instance was asked to serve read-only.
+fn spawn_daemon(
+    db: Option<&Path>,
+    config_path: Option<&Path>,
+    read_only: bool,
+) -> anyhow::Result<()> {
     let exe = std::env::current_exe()?;
     let mut cmd = std::process::Command::new(exe);
     if let Some(db) = db {
         cmd.arg("--db").arg(db);
     }
     cmd.arg("serve").arg("--daemon");
+    if read_only {
+        cmd.arg("--read-only");
+    }
     if let Some(cfg) = config_path {
         cmd.arg("--config").arg(cfg);
     }

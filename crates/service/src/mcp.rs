@@ -6,13 +6,38 @@
 //! experience. The recommended `type` and `status` value sets are stated in the
 //! `write_engram` and `edit_engram` descriptions as guidance; they are never
 //! enforced. Every mutating tool requires an explicit domain.
+//!
+//! In read-only mode (the engine's `read_only` flag) the four content-mutating
+//! tools are filtered out of `list_tools` and `get_tool`, so the surface is the
+//! eight read tools; the routes stay registered so a client that calls a hidden
+//! tool by name reaches the engine's read-only guard and gets a clean error.
 
 use std::sync::Arc;
 
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ContentBlock, ErrorData, ServerCapabilities, ServerInfo};
-use rmcp::{ServerHandler, tool, tool_handler, tool_router};
+use rmcp::model::{
+    CallToolResult, ContentBlock, ErrorData, ListToolsResult, PaginatedRequestParams,
+    ServerCapabilities, ServerInfo, Tool,
+};
+use rmcp::service::RequestContext;
+use rmcp::{RoleServer, ServerHandler, tool, tool_handler, tool_router};
 use serde_json::Value;
+
+/// The four content-mutating tools. In read-only mode they are hidden from
+/// `list_tools` and `get_tool`, while their routes stay registered so a client
+/// that calls one by name still reaches the engine guard and gets the read-only
+/// error rather than a bare "tool not found".
+const WRITE_TOOLS: [&str; 4] = [
+    "write_engram",
+    "edit_engram",
+    "move_engram",
+    "delete_engram",
+];
+
+/// Whether a tool name is one of the four content-mutating tools.
+fn is_write_tool(name: &str) -> bool {
+    WRITE_TOOLS.contains(&name)
+}
 
 use crate::engine::{Engine, EngineError};
 use crate::params::*;
@@ -218,11 +243,43 @@ impl McpServer {
 impl ServerHandler for McpServer {
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::default();
-        info.instructions = Some(
-            "Crystalline gives you a durable memory across sessions. Domains hold curated knowledge; engrams are the units you read, write and refine as you work. Search before you write, capture decisions and learnings as engrams, and always name the domain when writing.".to_string(),
-        );
+        info.instructions = Some(if self.engine.read_only() {
+            // Read-only surface: no capture language. Knowledge is curated
+            // externally; the agent searches and reads.
+            "Crystalline gives you a durable memory across sessions. Domains hold curated knowledge; engrams are the units you read to recall what is known. This deployment is read-only: its knowledge is curated externally, so search and read to learn and do not attempt to write.".to_string()
+        } else {
+            "Crystalline gives you a durable memory across sessions. Domains hold curated knowledge; engrams are the units you read, write and refine as you work. Search before you write, capture decisions and learnings as engrams, and always name the domain when writing.".to_string()
+        });
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info
+    }
+
+    /// List the exposed tools. In read-only mode the four content-mutating
+    /// tools are filtered out so they are absent from `tools/list`, while their
+    /// routes stay registered for the call-by-name guard (see `WRITE_TOOLS`).
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, ErrorData> {
+        let mut tools = Self::tool_router().list_all();
+        if self.engine.read_only() {
+            tools.retain(|t| !is_write_tool(&t.name));
+        }
+        Ok(ListToolsResult {
+            tools,
+            meta: None,
+            next_cursor: None,
+        })
+    }
+
+    /// Resolve a tool definition by name, hiding the content-mutating tools in
+    /// read-only mode so they never surface through `get_tool` either.
+    fn get_tool(&self, name: &str) -> Option<Tool> {
+        if self.engine.read_only() && is_write_tool(name) {
+            return None;
+        }
+        Self::tool_router().get(name).cloned()
     }
 }
 
@@ -241,7 +298,8 @@ fn to_error(e: EngineError) -> ErrorData {
         | EngineError::NotFound(_)
         | EngineError::Ambiguous(_)
         | EngineError::Conflict(_)
-        | EngineError::Invalid(_) => ErrorData::invalid_params(e.to_string(), None),
+        | EngineError::Invalid(_)
+        | EngineError::ReadOnly => ErrorData::invalid_params(e.to_string(), None),
         EngineError::Io { .. } | EngineError::Internal(_) => {
             ErrorData::internal_error(e.to_string(), None)
         }

@@ -145,6 +145,12 @@ enum Command {
         /// Run as a background daemon (quiet output).
         #[arg(long)]
         daemon: bool,
+        /// Serve the content API read-only: the four content-mutating tools are
+        /// hidden and refused, while sync, watching and embedding still run.
+        /// Overrides service.read_only when set; the mode is fixed for the
+        /// daemon's lifetime.
+        #[arg(long)]
+        read_only: bool,
         /// Load the global config from this file instead of the default path.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -155,6 +161,11 @@ enum Command {
         /// Run the full stack in-process instead of attaching to a daemon.
         #[arg(long)]
         embedded: bool,
+        /// Serve the content API read-only. Applies when this command runs the
+        /// stack in-process or spawns a new daemon; attaching to an
+        /// already-running daemon uses that daemon's mode instead.
+        #[arg(long)]
+        read_only: bool,
         /// Load the global config from this file instead of the default path.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -345,6 +356,11 @@ enum PromptKind {
         /// directory.
         #[arg(long)]
         workspace: Option<PathBuf>,
+        /// Render the read-only variant: drop the write-tools line and state
+        /// that this deployment's knowledge is curated externally. Forces the
+        /// mode on regardless of service.read_only.
+        #[arg(long)]
+        read_only: bool,
         /// Load the global config from this file instead of the default
         /// config path.
         #[arg(long)]
@@ -461,7 +477,11 @@ fn main() -> anyhow::Result<()> {
             config,
         }) => run_verify(paths, strict, format, config, cli.json),
         Some(Command::Prompt { kind }) => match kind {
-            PromptKind::System { workspace, config } => run_prompt(workspace, config, cli.json),
+            PromptKind::System {
+                workspace,
+                read_only,
+                config,
+            } => run_prompt(workspace, read_only, config, cli.json),
         },
         Some(Command::Domain { command }) => run_domain(command, cli.db, cli.json),
         Some(Command::Sync {
@@ -504,12 +524,20 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Serve {
             http,
             daemon,
+            read_only,
             config,
-        }) => on_runtime(crystalline_service::run_serve(daemon, http, cli.db, config)),
-        Some(Command::Mcp { embedded, config }) => on_runtime(crystalline_service::run_mcp(
+        }) => on_runtime(crystalline_service::run_serve(
+            daemon, http, cli.db, config, read_only,
+        )),
+        Some(Command::Mcp {
+            embedded,
+            read_only,
+            config,
+        }) => on_runtime(crystalline_service::run_mcp(
             embedded,
             cli.db.as_deref(),
             config.as_deref(),
+            read_only,
         )),
         Some(Command::Ctl { command }) => on_runtime(run_ctl(command, cli.json)),
         Some(
@@ -967,6 +995,7 @@ fn run_verify(
 
 fn run_prompt(
     workspace: Option<PathBuf>,
+    read_only_flag: bool,
     config_path: Option<PathBuf>,
     json_flag: bool,
 ) -> anyhow::Result<()> {
@@ -984,7 +1013,12 @@ fn run_prompt(
         config::GlobalConfig::default()
     };
 
-    let output = crystalline_core::generate_prompt(&global, &workspace);
+    let mut output = crystalline_core::generate_prompt(&global, &workspace);
+    // The flag forces the read-only variant on top of service.read_only; it can
+    // only turn the mode on, matching the daemon precedence.
+    if read_only_flag {
+        output.read_only = true;
+    }
     for w in &output.warnings {
         eprintln!("crystalline prompt system: warning: {w}");
     }

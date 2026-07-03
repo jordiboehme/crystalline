@@ -108,12 +108,14 @@ impl Shared {
     }
 }
 
-/// Run the daemon: `crystalline serve [--daemon] [--http <addr>]`.
+/// Run the daemon: `crystalline serve [--daemon] [--http <addr>] [--read-only]`.
+/// The effective mode is the explicit flag or `service.read_only`.
 pub async fn run_serve(
     daemon_flag: bool,
     http_flag: Option<String>,
     db: Option<PathBuf>,
     config_path: Option<PathBuf>,
+    read_only: bool,
 ) -> anyhow::Result<()> {
     let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -121,6 +123,7 @@ pub async fn run_serve(
         .try_init();
 
     let config = load_config(config_path.as_deref())?;
+    let read_only = read_only || config.read_only();
     let db_path = resolve_db(db.as_deref())?;
     let http_addr = resolve_http(http_flag.as_deref(), &config);
 
@@ -141,7 +144,8 @@ pub async fn run_serve(
             None,
             config_path.clone(),
         )
-        .with_watch_channel(watch_tx),
+        .with_watch_channel(watch_tx)
+        .with_read_only(read_only),
     );
 
     // Bind the socket and publish the lock record: this is the readiness point,
@@ -171,6 +175,9 @@ pub async fn run_serve(
         );
         if let Some(addr) = &http_addr {
             eprintln!("crystalline HTTP endpoint on http://{addr}");
+        }
+        if read_only {
+            eprintln!("crystalline serving read-only: content-mutating tools are disabled");
         }
     }
 
@@ -581,6 +588,7 @@ mod tests {
         let mut config = GlobalConfig::default();
         config.service = Some(crystalline_core::config::ServiceConfig {
             http: Some(HttpSetting::Address("0.0.0.0:7411".to_string())),
+            ..Default::default()
         });
         assert_eq!(resolve_http(Some("off"), &config), None);
     }
@@ -590,6 +598,7 @@ mod tests {
         let mut config = GlobalConfig::default();
         config.service = Some(crystalline_core::config::ServiceConfig {
             http: Some(HttpSetting::Address("0.0.0.0:7411".to_string())),
+            ..Default::default()
         });
         assert_eq!(
             resolve_http(None, &config),

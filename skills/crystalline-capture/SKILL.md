@@ -7,6 +7,8 @@ description: Use when durable knowledge is learned while working, when the user 
 
 Capturing what you learn while you work, as engrams, is the core of Crystalline. Treat it as a normal byproduct of the task, not a separate chore to remember at the end.
 
+Some deployments are read-only: if the routing prompt says this deployment's knowledge is read-only and curated externally, stand down on capture. The write tools are not exposed there and this whole skill does not apply; search and read instead.
+
 ## What to capture
 
 Capture durable knowledge: decisions, confirmed facts, repeatable patterns, gotchas, conventions, lessons learned the hard way, known risks and explicitly speculative ideas or proposals. Do not capture transient debugging steps, one-off scratch state, or knowledge so narrow it only ever matters to the current session.

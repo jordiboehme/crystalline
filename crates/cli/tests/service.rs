@@ -141,11 +141,23 @@ struct Mcp {
 
 impl Mcp {
     fn spawn(env: &Env) -> Mcp {
+        Mcp::spawn_inner(env, false)
+    }
+
+    /// Spawn an `mcp` client that starts a read-only daemon when none is running.
+    fn spawn_read_only(env: &Env) -> Mcp {
+        Mcp::spawn_inner(env, true)
+    }
+
+    fn spawn_inner(env: &Env, read_only: bool) -> Mcp {
         let mut cmd = Command::new(bin());
         env.apply(&mut cmd);
+        cmd.arg("mcp");
+        if read_only {
+            cmd.arg("--read-only");
+        }
+        cmd.arg("--config").arg(env.config_path());
         let mut child = cmd
-            .args(["mcp", "--config"])
-            .arg(env.config_path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -159,6 +171,24 @@ impl Mcp {
             out,
             id: 0,
         }
+    }
+
+    /// Send `tools/list` and return the tool names.
+    fn list_tools(&mut self) -> Vec<String> {
+        self.id += 1;
+        self.send(&json!({
+            "jsonrpc": "2.0", "id": self.id, "method": "tools/list", "params": {}
+        }));
+        let resp = self.read();
+        resp.pointer("/result/tools")
+            .and_then(Value::as_array)
+            .map(|tools| {
+                tools
+                    .iter()
+                    .filter_map(|t| t["name"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn send(&mut self, value: &Value) {
@@ -288,6 +318,59 @@ fn single_daemon_two_clients_and_stale_recovery() {
     }
     assert!(!env.sock_path().exists(), "socket removed on shutdown");
     assert!(!env.lock_path().exists(), "lock removed on shutdown");
+}
+
+/// End to end: a daemon started read-only reports it over ctl status, hides
+/// the four content-mutating tools from tools/list and refuses a write call by
+/// name with the read-only error.
+#[test]
+fn read_only_daemon_reports_hides_and_refuses() {
+    let env = Env::new("ro");
+    env.setup_domain("eng");
+
+    // `mcp --read-only` spawns the daemon in read-only mode, then attaches.
+    let mut c1 = Mcp::spawn_read_only(&env);
+    c1.initialize();
+    env.wait_ready();
+
+    // ctl status reports the mode.
+    let (ok, out) = env.run(&["ctl", "status", "--json"]);
+    assert!(ok, "ctl status");
+    let status: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(status["read_only"], json!(true), "status: {status}");
+
+    // tools/list hides the four content-mutating tools and keeps the eight reads.
+    let names = c1.list_tools();
+    assert_eq!(names.len(), 8, "read-only exposes 8 tools: {names:?}");
+    for hidden in [
+        "write_engram",
+        "edit_engram",
+        "move_engram",
+        "delete_engram",
+    ] {
+        assert!(
+            !names.contains(&hidden.to_string()),
+            "{hidden} hidden: {names:?}"
+        );
+    }
+
+    // Calling a hidden tool by name returns the read-only error, not a panic.
+    c1.send_call(
+        "write_engram",
+        json!({ "domain": "eng", "title": "Nope", "content": "no" }),
+    );
+    let resp = c1.read();
+    let msg = resp
+        .pointer("/error/message")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        msg.contains("read-only"),
+        "read-only error expected: {resp}"
+    );
+
+    drop(c1);
+    let _ = env.run(&["ctl", "shutdown"]);
 }
 
 #[test]

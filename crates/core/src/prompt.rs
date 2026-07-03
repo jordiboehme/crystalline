@@ -74,6 +74,11 @@ pub struct PromptOutput {
     /// Non-fatal problems (an unreadable or unparseable MANIFEST) meant for
     /// stderr, never a crash.
     pub warnings: Vec<String>,
+    /// Whether the deployment serves the content API read-only. In the
+    /// read-only variant the behavior block drops the write-tools line and
+    /// states the knowledge is curated externally. Seeded from
+    /// `service.read_only`; a `--read-only` flag can force it on.
+    pub read_only: bool,
 }
 
 /// Build the routing prompt for a workspace: apply `prompt.rules`
@@ -119,6 +124,7 @@ pub fn generate_prompt(global: &GlobalConfig, workspace: &Path) -> PromptOutput 
         workspace: workspace.to_path_buf(),
         domains,
         warnings,
+        read_only: global.read_only(),
     }
 }
 
@@ -243,9 +249,17 @@ pub fn render_text(output: &PromptOutput) -> String {
     out.push_str(
         "- Broad or unclear question: search_engrams without domains is an all-domain sweep.\n",
     );
-    out.push_str(
-        "- write_engram, edit_engram, move_engram and delete_engram always require an explicit domain; there is no default domain for writes.\n",
-    );
+    if output.read_only {
+        // Read-only variant: no write-tools line and no capture language; the
+        // knowledge is maintained outside this deployment.
+        out.push_str(
+            "- This deployment's knowledge is read-only and curated externally; search and read to learn and do not attempt to capture or change anything.\n",
+        );
+    } else {
+        out.push_str(
+            "- write_engram, edit_engram, move_engram and delete_engram always require an explicit domain; there is no default domain for writes.\n",
+        );
+    }
     out.push_str(
         "- build_context on a crystalline:// anchor assembles related knowledge around a task.\n",
     );
@@ -266,17 +280,19 @@ struct JsonPromptDomain<'a> {
 struct JsonPrompt<'a> {
     version: u32,
     kind: &'static str,
+    read_only: bool,
     workspace: String,
     domains: Vec<JsonPromptDomain<'a>>,
 }
 
-/// Render the prompt as JSON: `{version: 1, kind: "system", workspace,
-/// domains: [{name, bullets, preferred}]}`. `kind` is additive; `version`
-/// stays 1.
+/// Render the prompt as JSON: `{version: 1, kind: "system", read_only,
+/// workspace, domains: [{name, bullets, preferred}]}`. `read_only` is always
+/// present; `kind` is additive and `version` stays 1.
 pub fn render_json(output: &PromptOutput) -> String {
     let wrapped = JsonPrompt {
         version: 1,
         kind: "system",
+        read_only: output.read_only,
         workspace: output.workspace.display().to_string(),
         domains: output
             .domains
@@ -385,5 +401,73 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(value["version"], 1);
         assert_eq!(value["kind"], "system");
+    }
+
+    /// Generate a prompt and force the read-only variant on, the way the
+    /// `--read-only` flag does at the CLI boundary.
+    fn read_only_output(tmp: &tempfile::TempDir, global: &GlobalConfig) -> PromptOutput {
+        let mut output = generate_prompt(global, tmp.path());
+        output.read_only = true;
+        output
+    }
+
+    #[test]
+    fn read_write_default_names_the_mutating_tools() {
+        let (tmp, global) = fixture();
+        let output = generate_prompt(&global, tmp.path());
+        assert!(!output.read_only, "default mode is read-write");
+        let text = render_text(&output);
+        assert!(text.contains("write_engram, edit_engram, move_engram and delete_engram"));
+    }
+
+    #[test]
+    fn read_only_text_drops_the_write_line_and_names_no_mutating_tools() {
+        let (tmp, global) = fixture();
+        let text = render_text(&read_only_output(&tmp, &global));
+        // The read-only line is present.
+        assert!(
+            text.contains("read-only and curated externally"),
+            "read-only line expected:\n{text}"
+        );
+        // None of the four content-mutating tool names appear anywhere.
+        for tool in [
+            "write_engram",
+            "edit_engram",
+            "move_engram",
+            "delete_engram",
+        ] {
+            assert!(
+                !text.contains(tool),
+                "{tool} must not appear in the read-only prompt:\n{text}"
+            );
+        }
+        // The read tools an agent still needs are named.
+        assert!(text.contains("search_engrams"));
+        assert!(text.contains("build_context"));
+    }
+
+    #[test]
+    fn render_json_carries_the_read_only_flag_in_both_modes() {
+        let (tmp, global) = fixture();
+
+        let rw = render_json(&generate_prompt(&global, tmp.path()));
+        let rw_value: serde_json::Value = serde_json::from_str(&rw).unwrap();
+        assert_eq!(rw_value["read_only"], serde_json::json!(false));
+
+        let ro = render_json(&read_only_output(&tmp, &global));
+        let ro_value: serde_json::Value = serde_json::from_str(&ro).unwrap();
+        assert_eq!(ro_value["read_only"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn determinism_holds_in_read_only_mode() {
+        let (tmp, global) = fixture();
+        let first_text = render_text(&read_only_output(&tmp, &global));
+        let second_text = render_text(&read_only_output(&tmp, &global));
+        assert_eq!(first_text.as_bytes(), second_text.as_bytes());
+
+        let first_json = render_json(&read_only_output(&tmp, &global));
+        let second_json = render_json(&read_only_output(&tmp, &global));
+        assert_eq!(first_json.as_bytes(), second_json.as_bytes());
     }
 }

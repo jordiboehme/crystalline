@@ -62,6 +62,9 @@ pub enum EngineError {
     /// The request was malformed.
     #[error("{0}")]
     Invalid(String),
+    /// A content mutation was attempted against a read-only instance.
+    #[error("this instance is read-only; content mutations are disabled")]
+    ReadOnly,
     /// A filesystem error.
     #[error("io error at {path}: {source}")]
     Io {
@@ -121,6 +124,10 @@ pub struct Engine {
     provider: std::sync::RwLock<Option<Arc<dyn EmbeddingProvider>>>,
     model_id: String,
     chunk_params: ChunkParams,
+    // When true the four content-mutating methods refuse early with
+    // `EngineError::ReadOnly`. Set at construction from the effective mode
+    // (explicit flag or `service.read_only`). Index maintenance is unaffected.
+    read_only: bool,
 }
 
 impl Engine {
@@ -147,6 +154,7 @@ impl Engine {
             provider: std::sync::RwLock::new(provider),
             model_id,
             chunk_params,
+            read_only: false,
         }
     }
 
@@ -158,6 +166,19 @@ impl Engine {
     ) -> Engine {
         self.watch_tx = Some(tx);
         self
+    }
+
+    /// Set the read-only mode. In read-only mode the four content-mutating
+    /// methods refuse with `EngineError::ReadOnly`; every read path and all
+    /// index maintenance (sync, reindex, embedding) run unchanged.
+    pub fn with_read_only(mut self, read_only: bool) -> Engine {
+        self.read_only = read_only;
+        self
+    }
+
+    /// Whether this engine serves the content API read-only.
+    pub fn read_only(&self) -> bool {
+        self.read_only
     }
 
     /// The shared store handle, for the daemon's watcher and embed loop.
@@ -364,6 +385,9 @@ impl Engine {
 
     /// Create or overwrite an engram file, then index it.
     pub async fn write_engram(&self, p: &WriteParams) -> Result<Value> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
         let root = self.domain_root(&p.domain)?;
         let engram_type = p
             .engram_type
@@ -464,6 +488,9 @@ impl Engine {
 
     /// Apply a surgical edit to an engram, then reindex it.
     pub async fn edit_engram(&self, p: &EditParams) -> Result<Value> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
         let (desc, root) = self.resolve(&p.identifier, Some(&p.domain)).await?;
         let abs = join_rel(&root, &desc.path);
         let source = std::fs::read_to_string(&abs).map_err(|source| EngineError::Io {
@@ -546,6 +573,9 @@ impl Engine {
     /// Move an engram to a new path or domain, rewriting inbound bare links on a
     /// cross-domain move.
     pub async fn move_engram(&self, p: &MoveParams) -> Result<Value> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
         let (src, src_root) = self.resolve(&p.identifier, Some(&p.domain)).await?;
         let dest_domain = p
             .destination_domain
@@ -640,6 +670,9 @@ impl Engine {
 
     /// Delete an engram file and its index rows.
     pub async fn delete_engram(&self, p: &DeleteParams) -> Result<Value> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
         let (desc, root) = self.resolve(&p.identifier, Some(&p.domain)).await?;
         let abs = join_rel(&root, &desc.path);
         std::fs::remove_file(&abs).map_err(|source| EngineError::Io {
@@ -1177,8 +1210,13 @@ pub async fn open_standalone(
     }
     let store = TursoStore::open(db).await?;
     // No `config_path`: a standalone command is one-shot, so the config it
-    // already loaded is as fresh as any re-read would be.
-    let engine = Engine::new(Arc::new(Mutex::new(store)), config, None, None);
+    // already loaded is as fresh as any re-read would be. A standalone data
+    // command has no `--read-only` flag of its own, so the mode comes purely
+    // from `service.read_only`; a read-only config refuses CLI writes here the
+    // same way the daemon refuses them over the socket.
+    let read_only = config.read_only();
+    let engine =
+        Engine::new(Arc::new(Mutex::new(store)), config, None, None).with_read_only(read_only);
     // Build the provider (which may download the model) only when the index
     // already holds embeddings for the active model, so a text or filter search
     // never triggers a surprise download. With no embeddings, search falls back
