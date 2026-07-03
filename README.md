@@ -18,6 +18,7 @@ Once knowledge grows into the thousands or tens of thousands of units, reading a
 
 - **Domains** are folders of knowledge. Each one carries a `MANIFEST.md` describing its scope and when an agent should route a task there.
 - **Engrams** are the unit of knowledge: one markdown file with YAML frontmatter, holding prose, observations (`- [category] a captured fact or lesson`) and relations (`- rel_type [[Other Engram]]`) to other engrams.
+- **Built on an open format.** The engram format extends [Google's Open Knowledge Format (OKF)](https://github.com/GoogleCloudPlatform/knowledge-catalog/tree/main/okf): plain markdown with YAML frontmatter where unknown keys are always preserved. Crystalline layers its routing, temporal and knowledge-graph conventions on top, so engrams stay readable by any OKF tooling and OKF documents drop into a domain with minimal ceremony.
 - **MANIFEST routing** lets an agent (or a person) figure out which domain owns a task without reading every file: `crystalline prompt system` turns each domain's `## When to Use` bullets into a compact session-start briefing.
 - **Files are truth.** Engrams on disk are the only durable state. Nothing is ever stored only in the database.
 - **The index is disposable.** Crystalline maintains a local embedded database for fast text, tag, temporal and semantic search, but it is fully derived from the markdown files and rebuilt on demand with `crystalline reindex --full`. Corruption or a schema change is never a data-loss event.
