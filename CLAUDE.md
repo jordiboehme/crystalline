@@ -47,3 +47,7 @@ Dependency direction: core <- index <- service <- cli.
 - Commit after each completed milestone or task
 - Use the latest stable versions of dependencies and standards; verify on crates.io rather than assuming
 - README has a Deployment scenarios section (text plus one mermaid chart per scenario). Any change that adds or alters a deployment mode (new serve flag, new image variant, new compose example, new transport) must update that section in the same change
+
+## Known upstream workarounds
+
+- **"Wait for upstream" (gemm fp16)**: the `gemm-common` crate (a transitive dependency of the embedding runtime via candle) emits aarch64 fp16 NEON asm without per-function `#[target_feature(enable = "fp16")]` annotations, which fails to assemble against the default arm64 Linux baseline (upstream issue: sarah-quinones/gemm#31). Workaround in place: `-C target-feature=+fp16` scoped to the arm64 Linux matrix legs in `.github/workflows/ci.yml` and `.github/workflows/release.yml`, which raises the arm64 Linux binary baseline to ARMv8.2+ (Raspberry Pi 5 yes, Pi 4 and older ARMv8.0 boards unsupported in principle). When the upstream fix ships in a released gemm version: update the dependency, remove the `rustflags` entry from BOTH matrix legs, confirm the ubuntu-24.04-arm CI leg builds and tests green without it and drop any ARMv8.2 notes from user-facing docs. The crate's runtime feature detection already gates the fp16 kernels correctly, so ARMv8.0 hardware works at full fidelity once the flag is gone
