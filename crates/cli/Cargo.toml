@@ -34,10 +34,11 @@ assets = [
 
 [features]
 # Forwarded to crystalline-index so `--no-default-features` on the workspace
-# drops candle from the binary while everything still compiles and text search,
-# the remote provider and chunking keep working.
-default = ["local-embeddings"]
+# drops candle and sqlx from the binary while everything still compiles and text
+# search, the remote provider and chunking keep working over Turso.
+default = ["local-embeddings", "postgres"]
 local-embeddings = ["crystalline-index/local-embeddings"]
+postgres = ["crystalline-index/postgres"]
 
 [dependencies]
 crystalline-service = { workspace = true }

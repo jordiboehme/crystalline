@@ -17,6 +17,8 @@
 pub mod embed;
 mod error;
 mod factory;
+#[cfg(feature = "postgres")]
+pub mod postgres;
 mod store;
 mod sync;
 pub mod turso;
@@ -35,3 +37,6 @@ pub use store::{
 };
 pub use sync::{SyncReport, sync_domain, sync_domain_with};
 pub use turso::TursoStore;
+
+#[cfg(feature = "postgres")]
+pub use postgres::PostgresStore;

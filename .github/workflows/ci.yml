@@ -42,6 +42,41 @@ jobs:
       - name: cargo test
         run: cargo test --workspace
 
+  postgres-parity:
+    name: postgres-parity
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:0.8.2-pg17-bookworm
+        env:
+          POSTGRES_PASSWORD: crystalline
+          POSTGRES_DB: crystalline_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      CRYSTALLINE_TEST_POSTGRES_URL: postgres://postgres:crystalline@localhost:5432/crystalline_test
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Create the pgvector extension
+        # Pre-create it in public so the migration's defensive CREATE EXTENSION
+        # is always a no-op and the parallel per-test schema creation is race
+        # free. psql ships on the ubuntu-latest runner image.
+        run: PGPASSWORD=crystalline psql -h localhost -U postgres -d crystalline_test -c "CREATE EXTENSION IF NOT EXISTS vector;"
+
+      - name: cargo test (parity suite on both backends)
+        run: cargo test -p crystalline-index
+
   style:
     name: style
     runs-on: ubuntu-latest

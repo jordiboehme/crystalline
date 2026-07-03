@@ -77,6 +77,22 @@ impl From<serde_json::Error> for IndexError {
     }
 }
 
+#[cfg(feature = "postgres")]
+impl From<sqlx::Error> for IndexError {
+    fn from(e: sqlx::Error) -> Self {
+        // A unique-violation (SQLSTATE 23505) is a constraint the sync engine
+        // collects into `SyncReport.failed` rather than aborting the batch, so
+        // it maps to `Constraint` the same way Turso's constraint error does.
+        // Everything else is a plain database error.
+        if let sqlx::Error::Database(db) = &e
+            && db.code().as_deref() == Some("23505")
+        {
+            return IndexError::Constraint(db.message().to_string());
+        }
+        IndexError::Db(e.to_string())
+    }
+}
+
 impl From<reqwest::Error> for IndexError {
     fn from(e: reqwest::Error) -> Self {
         IndexError::Remote(e.to_string())

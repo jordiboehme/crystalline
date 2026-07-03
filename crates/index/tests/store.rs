@@ -1,4 +1,13 @@
-//! Integration tests for the store, sync engine and search planner.
+//! Cross-backend behavioral parity suite for the store, sync engine and search
+//! planner.
+//!
+//! Every test body is a pure function of a `&dyn Store`, so the same assertions
+//! run against both backends. Turso (in-memory) always runs. Postgres runs when
+//! `CRYSTALLINE_TEST_POSTGRES_URL` is set (each test gets its own schema via
+//! `search_path`, dropped afterwards); when it is unset the Postgres leg is
+//! skipped with a one-time note and the suite stays green. Backend-specific
+//! assertions (Turso schema version, the query-plan index seek, the on-disk file)
+//! live in `turso_only.rs`.
 
 use std::path::Path;
 
@@ -22,12 +31,67 @@ fn engram(title: &str, permalink: &str, ftype: &str, extra_fm: &str, body: &str)
     )
 }
 
-async fn open() -> TursoStore {
-    TursoStore::open_in_memory().await.unwrap()
+// --- backend runner ----------------------------------------------------------
+
+#[cfg(feature = "postgres")]
+fn pg_url() -> Option<String> {
+    use std::sync::Once;
+    static NOTE: Once = Once::new();
+    match std::env::var("CRYSTALLINE_TEST_POSTGRES_URL") {
+        Ok(u) if !u.is_empty() => Some(u),
+        _ => {
+            NOTE.call_once(|| {
+                eprintln!(
+                    "note: skipping the postgres parity leg (CRYSTALLINE_TEST_POSTGRES_URL is unset); turso only"
+                )
+            });
+            None
+        }
+    }
 }
 
-#[tokio::test]
-async fn full_sync_counts_engrams_observations_relations() {
+/// A distinct schema name per test invocation. The pid keeps runs apart, the
+/// counter keeps tests within a run apart; both stay well under Postgres's
+/// 63-byte identifier limit.
+#[cfg(feature = "postgres")]
+fn unique_schema() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("ct_{}_{}", std::process::id(), n)
+}
+
+/// Run a parity body against Turso (always) and Postgres (when configured),
+/// giving each backend a fresh, isolated store.
+macro_rules! parity {
+    ($name:ident, $body:path) => {
+        #[tokio::test]
+        async fn $name() {
+            {
+                let store = TursoStore::open_in_memory().await.unwrap();
+                $body(&store).await;
+            }
+            #[cfg(feature = "postgres")]
+            {
+                if let Some(url) = pg_url() {
+                    let schema = unique_schema();
+                    let store = crystalline_index::PostgresStore::open_in_schema(&url, &schema)
+                        .await
+                        .expect("open the postgres test schema");
+                    $body(&store).await;
+                    store
+                        .drop_schema()
+                        .await
+                        .expect("drop the postgres test schema");
+                }
+            }
+        }
+    };
+}
+
+// --- parity bodies -----------------------------------------------------------
+
+async fn full_sync_counts(store: &dyn Store) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     write(
@@ -58,8 +122,7 @@ async fn full_sync_counts_engrams_observations_relations() {
         &engram("Beta", "beta", "engram", "", "Beta body content.\n"),
     );
 
-    let store = open().await;
-    let report = sync_domain(&store, "eng", root).await.unwrap();
+    let report = sync_domain(store, "eng", root).await.unwrap();
     assert_eq!(report.added, 3, "three files added");
     assert_eq!(report.updated, 0);
     assert_eq!(report.failed.len(), 0, "no failures: {:?}", report.failed);
@@ -74,23 +137,25 @@ async fn full_sync_counts_engrams_observations_relations() {
     assert_eq!(s.unresolved_relations, 0);
     assert!(s.last_sync.is_some());
 }
+parity!(
+    full_sync_counts_engrams_observations_relations,
+    full_sync_counts
+);
 
-#[tokio::test]
-async fn warm_sync_reports_all_unchanged() {
+async fn warm_sync_unchanged(store: &dyn Store) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     write(root, "a.md", &engram("A", "a", "engram", "", "body a\n"));
     write(root, "b.md", &engram("B", "b", "engram", "", "body b\n"));
-    let store = open().await;
-    sync_domain(&store, "d", root).await.unwrap();
-    let warm = sync_domain(&store, "d", root).await.unwrap();
+    sync_domain(store, "d", root).await.unwrap();
+    let warm = sync_domain(store, "d", root).await.unwrap();
     assert_eq!(warm.added, 0);
     assert_eq!(warm.updated, 0);
     assert_eq!(warm.unchanged, 2);
 }
+parity!(warm_sync_reports_all_unchanged, warm_sync_unchanged);
 
-#[tokio::test]
-async fn edit_then_sync_updates() {
+async fn edit_then_sync(store: &dyn Store) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     write(
@@ -98,8 +163,7 @@ async fn edit_then_sync_updates() {
         "a.md",
         &engram("A", "a", "engram", "", "original body\n"),
     );
-    let store = open().await;
-    sync_domain(&store, "d", root).await.unwrap();
+    sync_domain(store, "d", root).await.unwrap();
 
     // Rewrite with different content and bump the mtime past the prefilter.
     std::thread::sleep(std::time::Duration::from_millis(1100));
@@ -108,32 +172,31 @@ async fn edit_then_sync_updates() {
         "a.md",
         &engram("A", "a", "engram", "", "revised body\n"),
     );
-    let report = sync_domain(&store, "d", root).await.unwrap();
+    let report = sync_domain(store, "d", root).await.unwrap();
     assert_eq!(report.updated, 1);
     assert_eq!(report.added, 0);
 
     let page = store.search(&SearchQuery::text("revised")).await.unwrap();
     assert_eq!(page.total, 1);
 }
+parity!(edit_then_sync_updates, edit_then_sync);
 
-#[tokio::test]
-async fn delete_then_sync_removes() {
+async fn delete_then_sync(store: &dyn Store) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     write(root, "a.md", &engram("A", "a", "engram", "", "body a\n"));
     write(root, "b.md", &engram("B", "b", "engram", "", "body b\n"));
-    let store = open().await;
-    sync_domain(&store, "d", root).await.unwrap();
+    sync_domain(store, "d", root).await.unwrap();
 
     std::fs::remove_file(root.join("b.md")).unwrap();
-    let report = sync_domain(&store, "d", root).await.unwrap();
+    let report = sync_domain(store, "d", root).await.unwrap();
     assert_eq!(report.deleted, 1);
     let stats = store.domain_stats().await.unwrap();
     assert_eq!(stats[0].engrams, 1);
 }
+parity!(delete_then_sync_removes, delete_then_sync);
 
-#[tokio::test]
-async fn move_is_rename_without_reparse() {
+async fn move_is_rename(store: &dyn Store) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     // No explicit permalink, so it is derived from the path.
@@ -145,14 +208,13 @@ async fn move_is_rename_without_reparse() {
             "---\ntype: engram\ntitle: Mover\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n{body}"
         ),
     );
-    let store = open().await;
-    sync_domain(&store, "d", root).await.unwrap();
+    sync_domain(store, "d", root).await.unwrap();
     assert!(store.lookup_id("d", "old/name").await.unwrap().is_some());
 
     // Move the file: identical bytes at a new path.
     std::fs::create_dir_all(root.join("new")).unwrap();
     std::fs::rename(root.join("old/name.md"), root.join("new/name.md")).unwrap();
-    let report = sync_domain(&store, "d", root).await.unwrap();
+    let report = sync_domain(store, "d", root).await.unwrap();
     assert_eq!(report.moved, 1, "classified as a move");
     assert_eq!(report.added, 0, "not reparsed as an add");
     assert_eq!(report.updated, 0, "not reparsed as an update");
@@ -167,9 +229,9 @@ async fn move_is_rename_without_reparse() {
         .unwrap();
     assert_eq!(page.total, 1, "content preserved through the move");
 }
+parity!(move_is_rename_without_reparse, move_is_rename);
 
-#[tokio::test]
-async fn forward_reference_resolves_on_later_sync() {
+async fn forward_reference_resolves(store: &dyn Store) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     write(
@@ -177,8 +239,7 @@ async fn forward_reference_resolves_on_later_sync() {
         "a.md",
         &engram("A", "a", "engram", "", "- depends_on [[target-b]]\n"),
     );
-    let store = open().await;
-    let first = sync_domain(&store, "d", root).await.unwrap();
+    let first = sync_domain(store, "d", root).await.unwrap();
     assert_eq!(first.relations_resolved, 0, "target absent, unresolved");
     assert_eq!(
         store.domain_stats().await.unwrap()[0].unresolved_relations,
@@ -191,16 +252,19 @@ async fn forward_reference_resolves_on_later_sync() {
         "b.md",
         &engram("B", "target-b", "engram", "", "body b\n"),
     );
-    let second = sync_domain(&store, "d", root).await.unwrap();
+    let second = sync_domain(store, "d", root).await.unwrap();
     assert_eq!(second.relations_resolved, 1, "now resolved");
     assert_eq!(
         store.domain_stats().await.unwrap()[0].unresolved_relations,
         0
     );
 }
+parity!(
+    forward_reference_resolves_on_later_sync,
+    forward_reference_resolves
+);
 
-#[tokio::test]
-async fn duplicate_permalink_is_collected_as_failure() {
+async fn duplicate_permalink_fails(store: &dyn Store) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     write(
@@ -213,8 +277,7 @@ async fn duplicate_permalink_is_collected_as_failure() {
         "two.md",
         &engram("Two", "shared", "engram", "", "body two\n"),
     );
-    let store = open().await;
-    let report = sync_domain(&store, "d", root).await.unwrap();
+    let report = sync_domain(store, "d", root).await.unwrap();
     assert_eq!(report.added, 1, "one wins");
     assert_eq!(
         report.failed.len(),
@@ -224,9 +287,12 @@ async fn duplicate_permalink_is_collected_as_failure() {
     );
     assert!(report.failed[0].1.contains("permalink"));
 }
+parity!(
+    duplicate_permalink_is_collected_as_failure,
+    duplicate_permalink_fails
+);
 
-#[tokio::test]
-async fn search_finds_by_title_content_and_observation() {
+async fn search_finds_across_fields(store: &dyn Store) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     write(
@@ -262,8 +328,7 @@ async fn search_finds_by_title_content_and_observation() {
             "- [fact] tardigrades survive vacuum #biology\n",
         ),
     );
-    let store = open().await;
-    sync_domain(&store, "d", root).await.unwrap();
+    sync_domain(store, "d", root).await.unwrap();
 
     let by_title = store
         .search(&SearchQuery::text("photosynthesis"))
@@ -287,9 +352,12 @@ async fn search_finds_by_title_content_and_observation() {
         crystalline_index::HitKind::Engram => panic!("expected an observation-level hit"),
     }
 }
+parity!(
+    search_finds_by_title_content_and_observation,
+    search_finds_across_fields
+);
 
-#[tokio::test]
-async fn search_applies_type_status_tag_and_metadata_filters() {
+async fn search_applies_filters(store: &dyn Store) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     write(
@@ -302,8 +370,7 @@ async fn search_applies_type_status_tag_and_metadata_filters() {
         "b.md",
         "---\ntype: guide\ntitle: Guide B\npermalink: guide-b\ntags:\n  - arch\nstatus: draft\nrecorded_at: 2026-02-01\nevent_date: \"2026-09-01\"\n---\n\nbody\n",
     );
-    let store = open().await;
-    sync_domain(&store, "d", root).await.unwrap();
+    sync_domain(store, "d", root).await.unwrap();
 
     let by_type = store
         .search(&SearchQuery {
@@ -341,8 +408,8 @@ async fn search_applies_type_status_tag_and_metadata_filters() {
     assert_eq!(by_tag.total, 1);
     assert_eq!(by_tag.items[0].permalink, "dec-a");
 
-    // $between on a custom date field routed through json_extract, parsed from
-    // the JSON wire form the M5 tools will hand in.
+    // $between on a custom date field: json_extract on Turso, metadata->> on
+    // Postgres, both ISO-string comparisons, parsed from the JSON wire form.
     let wire = serde_json::json!({ "event_date": { "$between": ["2026-01-01", "2026-06-01"] } });
     let filters = crystalline_index::parse_metadata_filters(&wire).unwrap();
     assert_eq!(
@@ -364,9 +431,12 @@ async fn search_applies_type_status_tag_and_metadata_filters() {
     assert_eq!(by_between.total, 1, "only the March event is in range");
     assert_eq!(by_between.items[0].permalink, "dec-a");
 }
+parity!(
+    search_applies_type_status_tag_and_metadata_filters,
+    search_applies_filters
+);
 
-#[tokio::test]
-async fn canonical_temporal_filter_returns_only_currently_valid() {
+async fn canonical_temporal_filter(store: &dyn Store) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     // Unbounded (valid): no valid_to.
@@ -399,8 +469,7 @@ async fn canonical_temporal_filter_returns_only_currently_valid() {
         "draft.md",
         "---\ntype: engram\ntitle: Draft\npermalink: draft\ntags:\n  - t\nstatus: draft\nrecorded_at: 2026-01-01\n---\n\nbody\n",
     );
-    let store = open().await;
-    sync_domain(&store, "d", root).await.unwrap();
+    sync_domain(store, "d", root).await.unwrap();
 
     let page = store
         .search(&SearchQuery {
@@ -416,9 +485,12 @@ async fn canonical_temporal_filter_returns_only_currently_valid() {
     perms.sort();
     assert_eq!(perms, vec!["always".to_string(), "future".to_string()]);
 }
+parity!(
+    canonical_temporal_filter_returns_only_currently_valid,
+    canonical_temporal_filter
+);
 
-#[tokio::test]
-async fn search_paginates() {
+async fn search_pages(store: &dyn Store) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     for i in 0..7 {
@@ -434,8 +506,7 @@ async fn search_paginates() {
             ),
         );
     }
-    let store = open().await;
-    sync_domain(&store, "d", root).await.unwrap();
+    sync_domain(store, "d", root).await.unwrap();
 
     let page1 = store
         .search(&SearchQuery {
@@ -460,9 +531,9 @@ async fn search_paginates() {
         .unwrap();
     assert_eq!(page3.items.len(), 1, "7 items, page 3 of size 3 has 1");
 }
+parity!(search_paginates, search_pages);
 
-#[tokio::test]
-async fn neighbors_depth_and_cross_domain() {
+async fn neighbors_cross_domain(store: &dyn Store) {
     // domain2 holds the cross-domain target C.
     let d2 = tempfile::tempdir().unwrap();
     write(
@@ -483,10 +554,9 @@ async fn neighbors_depth_and_cross_domain() {
         &engram("B", "b", "engram", "", "- relates_to [[domain2:c]]\n"),
     );
 
-    let store = open().await;
     // Sync the target domain first so the cross-domain ref resolves.
-    sync_domain(&store, "domain2", d2.path()).await.unwrap();
-    let r1 = sync_domain(&store, "domain1", d1.path()).await.unwrap();
+    sync_domain(store, "domain2", d2.path()).await.unwrap();
+    let r1 = sync_domain(store, "domain1", d1.path()).await.unwrap();
     assert_eq!(r1.relations_resolved, 2, "A->B and B->C both resolve");
 
     let a = store.lookup_id("domain1", "a").await.unwrap().unwrap();
@@ -515,9 +585,9 @@ async fn neighbors_depth_and_cross_domain() {
     assert!(has_cross, "C is labeled with its own domain");
     assert!(d2_slice.edges.len() >= 2, "A-B and B-C edges present");
 }
+parity!(neighbors_depth_and_cross_domain, neighbors_cross_domain);
 
-#[tokio::test]
-async fn recent_returns_newest_first() {
+async fn recent_newest_first(store: &dyn Store) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     write(root, "old.md", &engram("Old", "old", "engram", "", "b\n"));
@@ -526,8 +596,7 @@ async fn recent_returns_newest_first() {
         "new.md",
         "---\ntype: engram\ntitle: New\npermalink: new\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-06-01\n---\n\nb\n",
     );
-    let store = open().await;
-    sync_domain(&store, "d", root).await.unwrap();
+    sync_domain(store, "d", root).await.unwrap();
     let recent = store
         .recent(&RecentFilter {
             limit: 10,
@@ -537,56 +606,33 @@ async fn recent_returns_newest_first() {
         .unwrap();
     assert_eq!(recent[0].permalink, "new", "2026-06-01 before 2026-01-01");
 }
+parity!(recent_returns_newest_first, recent_newest_first);
 
-#[tokio::test]
-async fn temporal_current_filter_uses_the_promoted_index() {
-    let store = open().await;
-    // Seed a domain so the query is over a real table.
-    let dir = tempfile::tempdir().unwrap();
-    write(dir.path(), "a.md", &engram("A", "a", "engram", "", "b\n"));
-    sync_domain(&store, "d", dir.path()).await.unwrap();
-
-    let plan = store
-        .explain_query_plan(
-            "SELECT id FROM engram WHERE status='current' AND (valid_from IS NULL OR valid_from <= '2026-07-02') AND (valid_to IS NULL OR valid_to > '2026-07-02')",
-        )
-        .await
-        .unwrap();
-    let joined = plan.join(" | ");
-    assert!(
-        joined.contains("USING INDEX") && joined.contains("idx_engram_current"),
-        "current filter should seek the promoted index, plan was: {joined}"
-    );
-    assert!(
-        !joined.contains("SCAN engram") || joined.contains("USING INDEX"),
-        "current filter should not be a bare full scan, plan was: {joined}"
-    );
-}
-
-#[tokio::test]
-async fn wipe_clears_everything() {
+async fn wipe_clears(store: &dyn Store) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     write(root, "a.md", &engram("A", "a", "engram", "", "b\n"));
-    let store = open().await;
-    sync_domain(&store, "d", root).await.unwrap();
+    sync_domain(store, "d", root).await.unwrap();
     assert_eq!(store.domain_stats().await.unwrap()[0].engrams, 1);
     store.wipe().await.unwrap();
     assert!(store.domain_stats().await.unwrap().is_empty());
     let page = store.search(&SearchQuery::text("b")).await.unwrap();
     assert_eq!(page.total, 0);
 }
+parity!(wipe_clears_everything, wipe_clears);
 
-#[tokio::test]
-async fn store_info_reports_candidate_scan_fallback() {
-    let store = open().await;
+async fn store_info_reports_candidate_scan(store: &dyn Store) {
+    // Both backends run the LIKE-candidate scan, so hybrid ranking and every
+    // search test match. The Turso-only schema version lives in turso_only.rs.
     let info = store.store_info().await.unwrap();
     assert_eq!(info.fts_mode, crystalline_index::FtsMode::CandidateScan);
-    assert_eq!(info.schema_version, 2);
 }
+parity!(
+    store_info_reports_candidate_scan_fallback,
+    store_info_reports_candidate_scan
+);
 
-#[tokio::test]
-async fn title_and_permalink_search_modes() {
+async fn title_and_permalink_modes(store: &dyn Store) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     write(
@@ -600,8 +646,7 @@ async fn title_and_permalink_search_modes() {
             "the body says beta\n",
         ),
     );
-    let store = open().await;
-    sync_domain(&store, "d", root).await.unwrap();
+    sync_domain(store, "d", root).await.unwrap();
 
     // Title mode ignores a term that is only in the body.
     let title_miss = store
@@ -628,16 +673,16 @@ async fn title_and_permalink_search_modes() {
         .unwrap();
     assert_eq!(perma.total, 1);
 }
+parity!(title_and_permalink_search_modes, title_and_permalink_modes);
 
-#[tokio::test]
-async fn seed_ids_are_stable_across_lookups() {
+async fn seed_ids_stable(store: &dyn Store) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     write(root, "a.md", &engram("A", "a", "engram", "", "b\n"));
-    let store = open().await;
-    sync_domain(&store, "d", root).await.unwrap();
+    sync_domain(store, "d", root).await.unwrap();
     let id1 = store.lookup_id("d", "a").await.unwrap();
     let id2 = store.lookup_id("d", "a").await.unwrap();
     assert_eq!(id1, id2);
     assert!(matches!(id1, Some(EngramId(_))));
 }
+parity!(seed_ids_are_stable_across_lookups, seed_ids_stable);

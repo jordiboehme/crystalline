@@ -13,9 +13,11 @@ path = "src/lib.rs"
 
 [features]
 # Forwarded to crystalline-index so a `--no-default-features` workspace build
-# drops candle while the daemon still compiles and serves text search.
-default = ["local-embeddings"]
+# drops candle and sqlx while the daemon still compiles and serves text search
+# over Turso.
+default = ["local-embeddings", "postgres"]
 local-embeddings = ["crystalline-index/local-embeddings"]
+postgres = ["crystalline-index/postgres"]
 
 [dependencies]
 crystalline-core = { workspace = true }

@@ -6,13 +6,17 @@
 //! spot where that dispatch slots in is [`open_store`].
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
-use crystalline_core::config::{self, DomainEntry, EmbeddingsConfig, GlobalConfig};
-use crystalline_index::{
-    ChunkParams, Store, TursoStore, configured_model_id, download_local_model,
-    provider_from_config, run_embedding_pass, sync_domain_with,
+use crystalline_core::config::{
+    self, DatabaseBackend, DomainEntry, EmbeddingsConfig, GlobalConfig,
 };
+use crystalline_index::{
+    ChunkParams, Store, configured_model_id, download_local_model, provider_from_config,
+    run_embedding_pass, sync_domain_with,
+};
+use tokio::sync::Mutex as TokioMutex;
 
 /// The embeddings config to use: the configured one, or the local bge default.
 fn embeddings_config(cfg: &GlobalConfig) -> EmbeddingsConfig {
@@ -32,7 +36,7 @@ fn chunk_params(cfg: &GlobalConfig) -> ChunkParams {
 
 /// Build the provider and embed every chunk that needs it, printing one progress
 /// line per batch to stderr.
-async fn embed_pass(store: &TursoStore, cfg: &GlobalConfig) -> Result<()> {
+async fn embed_pass(store: &dyn Store, cfg: &GlobalConfig) -> Result<()> {
     let ecfg = embeddings_config(cfg);
     let provider = provider_from_config(&ecfg).await.map_err(|e| {
         anyhow!(
@@ -86,20 +90,28 @@ pub(crate) fn db_path(override_path: Option<&Path>) -> Result<PathBuf> {
     }
 }
 
-/// Open (creating if needed) the store at the resolved database path.
+/// Open the configured backend as a `dyn Store` through the shared factory, so
+/// these standalone commands honor `backend: postgres` (or a Turso file at the
+/// resolved path) without a running daemon, exactly like the daemon and doctor
+/// paths do. `resilient` selects the corruption-recovery open for Turso (the
+/// `reindex --full` recovery path) and is ignored by Postgres.
 ///
-/// The M5 daemon dispatch slots in here: when a service socket is live this
-/// would attach to it instead of opening the database in-process.
-async fn open_store(db: &Path) -> Result<TursoStore> {
-    if let Some(parent) = db.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating state directory {}", parent.display()))?;
-    }
-    TursoStore::open(db)
+/// The M5 daemon dispatch still slots in above this: when a service socket is
+/// live the command routes over it instead of opening the database in-process.
+async fn open_backend(
+    cfg: &GlobalConfig,
+    db_override: Option<&Path>,
+    resilient: bool,
+) -> Result<Arc<TokioMutex<dyn Store>>> {
+    crystalline_index::open_store(&cfg.database(), db_override, resilient)
         .await
-        .map_err(|e| anyhow!("could not open the index at {}: {e}", db.display()))
+        .map_err(|e| anyhow!("could not open the index: {e}"))
+}
+
+/// Whether the effective backend is the local Turso file (so an absent file
+/// means "no index yet"). Postgres has no local file and is always opened.
+fn backend_is_turso(cfg: &GlobalConfig) -> bool {
+    cfg.database().backend == DatabaseBackend::Turso
 }
 
 /// The absolute, tilde-expanded path a domain entry points at.
@@ -214,9 +226,10 @@ pub(crate) async fn sync_domain_direct(
     db_override: Option<&Path>,
 ) -> Result<crystalline_index::SyncReport> {
     let cfg = load_config(&config_path(config_override)?)?;
-    let store = open_store(&db_path(db_override)?).await?;
+    let store = open_backend(&cfg, db_override, false).await?;
+    let store = store.lock().await;
     let params = chunk_params(&cfg);
-    sync_domain_with(&store, name, root, &params)
+    sync_domain_with(&*store, name, root, &params)
         .await
         .map_err(|e| anyhow!("sync of '{name}' failed: {e}"))
 }
@@ -297,9 +310,12 @@ pub async fn domain_list(
     json: bool,
 ) -> Result<()> {
     let cfg = load_config(&config_path(config_override)?)?;
-    let db = db_path(db_override)?;
-    let stats = if db.exists() {
-        open_store(&db).await?.domain_stats().await.ok()
+    let should_open = !backend_is_turso(&cfg) || db_path(db_override)?.exists();
+    let stats = if should_open {
+        match open_backend(&cfg, db_override, false).await {
+            Ok(store) => store.lock().await.domain_stats().await.ok(),
+            Err(_) => None,
+        }
     } else {
         None
     };
@@ -351,13 +367,14 @@ pub async fn sync(
 ) -> Result<()> {
     let cfg = load_config(&config_path(config_override)?)?;
     let targets = select_domains(&cfg, only)?;
-    let store = open_store(&db_path(db_override)?).await?;
+    let store = open_backend(&cfg, db_override, false).await?;
+    let store = store.lock().await;
     let params = chunk_params(&cfg);
 
     let mut reports = Vec::new();
     for (name, entry) in targets {
         let path = resolve_domain_path(&entry);
-        let report = sync_domain_with(&store, &name, &path, &params)
+        let report = sync_domain_with(&*store, &name, &path, &params)
             .await
             .map_err(|e| anyhow!("sync of '{name}' failed: {e}"))?;
         reports.push(report);
@@ -372,7 +389,7 @@ pub async fn sync(
     }
 
     if embed {
-        embed_pass(&store, &cfg).await?;
+        embed_pass(&*store, &cfg).await?;
     }
     Ok(())
 }
@@ -390,34 +407,23 @@ pub async fn reindex(
 ) -> Result<()> {
     let cfg = load_config(&config_path(config_override)?)?;
     let targets = select_domains(&cfg, None)?;
-    let db = db_path(db_override)?;
     let params = chunk_params(&cfg);
 
-    let store = if full {
-        if let Some(parent) = db.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent).ok();
-        }
-        let store = TursoStore::open_resilient(&db).await.map_err(|e| {
-            anyhow!(
-                "could not open or rebuild the index at {}: {e}",
-                db.display()
-            )
-        })?;
+    // `--full` opens resiliently (Turso rebuilds a database that will not open;
+    // a no-op for Postgres) then wipes the index before reindexing from disk.
+    let store = open_backend(&cfg, db_override, full).await?;
+    let store = store.lock().await;
+    if full {
         store
             .wipe()
             .await
             .map_err(|e| anyhow!("failed to wipe the index: {e}"))?;
-        store
-    } else {
-        open_store(&db).await?
-    };
+    }
 
     let mut reports = Vec::new();
     for (name, entry) in targets {
         let path = resolve_domain_path(&entry);
-        let report = sync_domain_with(&store, &name, &path, &params)
+        let report = sync_domain_with(&*store, &name, &path, &params)
             .await
             .map_err(|e| anyhow!("reindex of '{name}' failed: {e}"))?;
         reports.push(report);
@@ -439,7 +445,7 @@ pub async fn reindex(
     }
 
     if embed {
-        embed_pass(&store, &cfg).await?;
+        embed_pass(&*store, &cfg).await?;
     }
     Ok(())
 }
@@ -453,20 +459,25 @@ pub async fn status(
     json: bool,
 ) -> Result<()> {
     let cfg = load_config(&config_path(config_override)?)?;
-    let db = db_path(db_override)?;
-    if !db.exists() {
-        if json {
-            println!(
-                "{}",
-                serde_json::json!({ "indexed": false, "db_path": db.display().to_string() })
-            );
-        } else {
-            println!("No index at {} yet. Run: crystalline sync", db.display());
+    // Only the Turso backend has a local file whose absence means "no index
+    // yet"; Postgres is always opened.
+    if backend_is_turso(&cfg) {
+        let db = db_path(db_override)?;
+        if !db.exists() {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({ "indexed": false, "db_path": db.display().to_string() })
+                );
+            } else {
+                println!("No index at {} yet. Run: crystalline sync", db.display());
+            }
+            return Ok(());
         }
-        return Ok(());
     }
 
-    let store = open_store(&db).await?;
+    let store = open_backend(&cfg, db_override, false).await?;
+    let store = store.lock().await;
     let info = store
         .store_info()
         .await

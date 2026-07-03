@@ -5,8 +5,8 @@
 //! `database` config block. This module is the single place that decision is
 //! made. The Turso arm reproduces the historical open behaviour exactly (the
 //! `--db` override, the default `index.db` path, the corruption-recovery
-//! reopen); the Postgres arm is a placeholder until the backend lands in the
-//! next milestone slice.
+//! reopen); the Postgres arm opens an sqlx pool at `database.url` and migrates,
+//! behind the `postgres` cargo feature.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -59,12 +59,36 @@ pub async fn open_store(
             let store: Arc<Mutex<dyn Store>> = Arc::new(Mutex::new(store));
             Ok(store)
         }
-        DatabaseBackend::Postgres => Err(IndexError::Unsupported(
-            "the postgres backend arrives in the next milestone slice (M-A2); \
-             use backend: turso for now"
-                .to_string(),
-        )),
+        DatabaseBackend::Postgres => open_postgres(cfg, resilient).await,
     }
+}
+
+/// Open the Postgres backend. `validate()` already guaranteed a good `url`, so
+/// the pool open is the only failure point here. `resilient` is a no-op for
+/// Postgres: corruption recovery is a Turso file concern, so the branch is kept
+/// for a uniform signature but ignored.
+#[cfg(feature = "postgres")]
+async fn open_postgres(cfg: &DatabaseConfig, resilient: bool) -> Result<Arc<Mutex<dyn Store>>> {
+    let _ = resilient;
+    let url = cfg
+        .url
+        .as_deref()
+        .ok_or_else(|| IndexError::Invalid("the postgres backend requires a url".to_string()))?;
+    let store = crate::postgres::PostgresStore::open(url).await?;
+    let store: Arc<Mutex<dyn Store>> = Arc::new(Mutex::new(store));
+    Ok(store)
+}
+
+/// Without the `postgres` feature the backend code is not compiled in, so a
+/// `backend: postgres` config on a Turso-only build is an actionable error
+/// rather than a silent fallback.
+#[cfg(not(feature = "postgres"))]
+async fn open_postgres(_cfg: &DatabaseConfig, _resilient: bool) -> Result<Arc<Mutex<dyn Store>>> {
+    Err(IndexError::Unsupported(
+        "this build has no postgres backend; rebuild with the postgres feature \
+         or use backend: turso"
+            .to_string(),
+    ))
 }
 
 /// Resolve the Turso database file path: the `--db` override first, then a

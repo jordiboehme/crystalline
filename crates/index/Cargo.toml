@@ -12,9 +12,10 @@ name = "crystalline_index"
 path = "src/lib.rs"
 
 [features]
-# On by default so the shipped binary embeds locally with no external service.
-# `--no-default-features` drops candle entirely for a lean, network-only build.
-default = ["local-embeddings"]
+# Both on by default so the shipped binary embeds locally with no external
+# service and can honor `backend: postgres` at runtime. `--no-default-features`
+# drops candle and sqlx entirely for a lean, Turso-only build.
+default = ["local-embeddings", "postgres"]
 local-embeddings = [
     "dep:candle-core",
     "dep:candle-nn",
@@ -22,6 +23,11 @@ local-embeddings = [
     "dep:tokenizers",
     "dep:hf-hub",
 ]
+# The PostgreSQL backend: the sqlx pool, pgvector and the parallel store module.
+# Runtime is selected from config, so a release binary must carry this to honor
+# `backend: postgres` at all; `--no-default-features` produces a Turso-only
+# build that drops sqlx.
+postgres = ["dep:sqlx", "dep:pgvector"]
 
 [dependencies]
 crystalline-core = { workspace = true }
@@ -45,6 +51,11 @@ candle-nn = { workspace = true, optional = true }
 candle-transformers = { workspace = true, optional = true }
 tokenizers = { workspace = true, optional = true }
 hf-hub = { workspace = true, optional = true }
+
+# PostgreSQL backend, gated by `postgres`. The runtime query API only, so no
+# live database is needed at build time and the trait object stays object-safe.
+sqlx = { workspace = true, optional = true }
+pgvector = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

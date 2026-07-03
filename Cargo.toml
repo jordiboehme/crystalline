@@ -38,6 +38,16 @@ hf-hub = { version = "0.5.0", default-features = false, features = ["ureq"] }
 # JSON tokenizer load and encode paths are used.
 tokenizers = { version = "0.23.1", default-features = false, features = ["fancy-regex"] }
 pulldown-cmark = "0.13.4"
+# The PostgreSQL backend. `tls-rustls` shares reqwest's rustls (ring provider)
+# rather than pulling OpenSSL, so the musl static release binaries stay
+# self-contained; the runtime query API is used (no compile-time macros) so no
+# live database is needed at build time. Gated behind the `postgres` feature.
+sqlx = { version = "0.9.0", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls",
+    "postgres",
+] }
+pgvector = { version = "0.4.2", default-features = false, features = ["sqlx"] }
 notify = "8.2.0"
 interprocess = "2.4.2"
 sha2 = "0.11.0"
