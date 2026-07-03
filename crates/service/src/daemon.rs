@@ -174,12 +174,24 @@ pub async fn run_serve(
         }
     }
 
+    // The watcher arms every startup domain's watch and only then fires this
+    // one-shot; the initial sync below waits on it so its first scan never
+    // begins before the watches are live. That watch-first-then-scan order
+    // closes the startup twin of the dynamic-watch race: an external write into
+    // a startup domain landing between the scan and the watch would otherwise be
+    // lost, because inotify reports only events registered after `watch()`. See
+    // the ordering invariant on `run_watcher`.
+    let (watches_ready_tx, watches_ready_rx) = tokio::sync::oneshot::channel::<()>();
+
     // Initial sync, provider build and embed run in the background so readiness
     // is immediate. Sync needs no provider; the embed pass waits for it.
     {
         let e = engine.clone();
         let cfg = config.clone();
         tokio::spawn(async move {
+            // Hold the first scan until the watcher has armed the startup
+            // watches; a dropped sender (watcher failed to start) lets it run.
+            let _ = watches_ready_rx.await;
             if let Err(err) = e.sync(None).await {
                 tracing::warn!("initial sync failed: {err}");
             }
@@ -200,7 +212,7 @@ pub async fn run_serve(
         let watch_domains = domain_roots(&config);
         let rx = shared.watch();
         tokio::spawn(async move {
-            if let Err(err) = run_watcher(e, watch_domains, rx, watch_rx).await {
+            if let Err(err) = run_watcher(e, watch_domains, rx, watch_rx, watches_ready_tx).await {
                 tracing::warn!("watcher stopped: {err}");
             }
         });
@@ -294,11 +306,22 @@ async fn handle_conn(mut stream: IpcStream, shared: Arc<Shared>) {
 /// `Engine::domain_root`'s fresh-config fallback): a `domain add` while this
 /// daemon is running adds a watch here without a restart, and a `domain
 /// remove` drops one the same way.
+///
+/// Ordering invariant: a watch is always armed before the matching sync scans
+/// the same root, never after. On Linux inotify reports only events registered
+/// after `watch()`, so a file written into a root between its scan and its
+/// watch would be lost forever. The startup roots satisfy this by arming every
+/// watch below and only then firing `watches_ready` to release the initial sync
+/// in `run_serve`; a root added later satisfies it by arming its watch and then
+/// running one catch-up sync in the `WatchEvent::Add` arm. Sync is checksum
+/// idempotent so a file caught by both the catch-up and an inotify event is
+/// never processed twice.
 async fn run_watcher(
     engine: Arc<Engine>,
     domains: Vec<(String, PathBuf)>,
     mut shutdown: watch::Receiver<bool>,
     mut new_roots: tokio::sync::mpsc::UnboundedReceiver<WatchEvent>,
+    watches_ready: tokio::sync::oneshot::Sender<()>,
 ) -> anyhow::Result<()> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<PathBuf>();
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
@@ -312,6 +335,10 @@ async fn run_watcher(
     for (_, root) in &domains {
         let _ = watcher.watch(root, RecursiveMode::Recursive);
     }
+    // Every startup watch is now armed, so the initial sync in `run_serve` may
+    // safely scan (see the ordering invariant above). A dropped receiver just
+    // means the sync runs unblocked.
+    let _ = watches_ready.send(());
 
     loop {
         tokio::select! {
@@ -320,10 +347,29 @@ async fn run_watcher(
                 match event {
                     Some(WatchEvent::Add(name, root)) => {
                         if !domains.iter().any(|(n, _)| *n == name) {
-                            if let Err(err) = watcher.watch(&root, RecursiveMode::Recursive) {
-                                tracing::warn!("could not watch new domain '{name}' at {}: {err}", root.display());
+                            let armed = match watcher.watch(&root, RecursiveMode::Recursive) {
+                                Ok(()) => true,
+                                Err(err) => {
+                                    tracing::warn!("could not watch new domain '{name}' at {}: {err}", root.display());
+                                    false
+                                }
+                            };
+                            domains.push((name.clone(), root));
+                            // Catch-up sync now that the watch is armed: it
+                            // closes the window between the ctl sync that
+                            // discovered this domain and the watch going live,
+                            // during which an external write would be invisible
+                            // to inotify. Reuses the engine sync path the
+                            // debounced arm below uses, so lock discipline and
+                            // idempotency are unchanged.
+                            if armed {
+                                if let Err(err) = engine.sync(Some(name.as_str())).await {
+                                    tracing::warn!("catch-up sync of new domain '{name}' failed: {err}");
+                                }
+                                if let Err(err) = engine.embed_pending().await {
+                                    tracing::warn!("catch-up embed of new domain '{name}' failed: {err}");
+                                }
                             }
-                            domains.push((name, root));
                         }
                     }
                     Some(WatchEvent::Remove(name)) => {
