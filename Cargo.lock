@@ -942,7 +942,7 @@ dependencies = [
 
 [[package]]
 name = "crystalline"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -963,7 +963,7 @@ dependencies = [
 
 [[package]]
 name = "crystalline-core"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "etcetera",
@@ -981,7 +981,7 @@ dependencies = [
 
 [[package]]
 name = "crystalline-index"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "candle-core",
@@ -1008,7 +1008,7 @@ dependencies = [
 
 [[package]]
 name = "crystalline-service"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
