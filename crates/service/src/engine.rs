@@ -16,8 +16,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
-use chrono::{DateTime, Duration, FixedOffset};
+use chrono::{DateTime, Duration, FixedOffset, Utc};
 use crystalline_core::config::{
     DomainEntry, DomainKind as CoreDomainKind, GlobalConfig, OriginConfig,
 };
@@ -42,6 +43,7 @@ use tokio::sync::Mutex;
 
 use crate::origin;
 use crate::params::*;
+use crate::poller;
 use crate::settings;
 
 /// How many chunks are embedded per background batch.
@@ -316,6 +318,14 @@ pub struct Engine {
     // actual credential store. `None` (production) uses the real
     // `TokenStore::resolve`.
     token_store_dir_override: Option<PathBuf>,
+    // The background origin poller's observable state: every domain's poll
+    // schedule and most recent result, plus the poller's one shared
+    // rate-limit pause. Always present (not an `Option`), whether or not
+    // `run_origin_poller` is actually spawned, so `status_report`'s offline
+    // `origins` block reads the same field in a daemon or a one-shot
+    // standalone engine alike; it simply stays at its empty default when no
+    // poller ever ticks.
+    origin_poller: poller::OriginPollerState,
 }
 
 impl Engine {
@@ -354,6 +364,7 @@ impl Engine {
             connect_auth: Arc::new(RealConnectAuth),
             pending_connect: std::sync::Mutex::new(None),
             token_store_dir_override: None,
+            origin_poller: poller::OriginPollerState::default(),
         }
     }
 
@@ -2133,7 +2144,7 @@ impl Engine {
                 v
             })
             .collect();
-        Ok(json!({
+        let mut result = json!({
             "fts_mode": info.fts_mode,
             "schema_version": info.schema_version,
             "db_path": info.db_path,
@@ -2147,7 +2158,15 @@ impl Engine {
                 "total_chunks": coverage.total_chunks,
                 "hybrid_available": coverage.has_active_embeddings(&self.model_id),
             },
-        }))
+        });
+        // Omitted entirely while collaboration is off, so pre-feature output
+        // stays byte-stable for an install that never touches GitHub.
+        if self.config.read().unwrap().github_enabled()
+            && let Value::Object(map) = &mut result
+        {
+            map.insert("origins".to_string(), self.origins_status_block().await);
+        }
+        Ok(result)
     }
 
     /// The domain-id set this instance should embed, or `None` for "all domains".
@@ -2532,6 +2551,192 @@ impl Engine {
             }
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Runs one scheduling pass of the background origin poller: checks
+    /// whether collaboration is enabled, connected and not paused for a
+    /// shared rate limit, then brings every due origin-connected domain up
+    /// to date via [`Engine::origin_update_one`], the same per-domain pull
+    /// an on-demand `origin_update` runs, under the same per-domain lock, so
+    /// a poll tick and a concurrent on-demand update on the same domain
+    /// never interleave. This method never talks to GitHub itself; it only
+    /// decides which domains are due and delegates the actual pull, so
+    /// polling and on-demand updating stay exactly one code path.
+    ///
+    /// `now` drives every due/not-due decision and `wall_now` is its
+    /// wall-clock mirror, recorded alongside every reschedule so
+    /// `status_report`'s offline `origins` block can show `next_due` without
+    /// ever touching an `Instant` (which carries no epoch and cannot be
+    /// serialized). Passing both in, rather than reading `Instant::now()`
+    /// and `Utc::now()` here, is what lets a test drive several ticks
+    /// deterministically with no real waiting.
+    ///
+    /// A tick does nothing when collaboration is off (so enabling it later
+    /// starts polling on the very next tick, no restart needed), when the
+    /// shared rate-limit pause has not yet elapsed, or when no GitHub token
+    /// is on file (so a `connect` lands and the next tick picks it up
+    /// automatically; a debug line notes this at most once an hour). A
+    /// domain hitting `RemoteError::RateLimited` pauses every domain until
+    /// the reported reset (defaulting an hour out when GitHub reports none)
+    /// and ends the tick immediately, since GitHub rate limits are
+    /// per-token, not per-repository. Any other per-domain failure (offline,
+    /// a revoked token, a corrupt state directory) is recorded quietly and
+    /// never stops the tick from moving on to the next due domain.
+    pub async fn origin_poll_tick(&self, now: Instant, wall_now: DateTime<Utc>) {
+        if !self.config.read().unwrap().github_enabled() {
+            return;
+        }
+        if let Some(until) = self.origin_poller.rate_limited_until() {
+            if wall_now < until {
+                return;
+            }
+            self.origin_poller.set_rate_limited_until(None);
+        }
+        if !self.origin_connection_offline().0 {
+            if self.origin_poller.should_log_no_token(now) {
+                tracing::debug!(
+                    "origin poll: no GitHub connection yet; waiting for connect to resume polling"
+                );
+            }
+            return;
+        }
+        let Ok(targets) = self.origin_targets(None) else {
+            return;
+        };
+        let github_poll_secs = self
+            .config
+            .read()
+            .unwrap()
+            .github
+            .as_ref()
+            .and_then(|g| g.poll_secs);
+
+        for (name, entry) in targets {
+            if !self.origin_poller.is_due(&name, now) {
+                continue;
+            }
+            let domain_poll_secs = entry.origin.as_ref().and_then(|o| o.poll_secs);
+            let interval_secs = poller::effective_interval_secs(domain_poll_secs, github_poll_secs);
+            let tick = self.origin_poller.next_tick();
+            let jitter = poller::jittered_interval(interval_secs, &name, tick);
+            let jitter_chrono =
+                Duration::from_std(jitter).unwrap_or(Duration::seconds(interval_secs as i64));
+            self.origin_poller
+                .schedule(&name, now + jitter, wall_now + jitter_chrono);
+
+            match self.origin_update_one(&name, &entry).await {
+                Ok(v) => {
+                    let up_to_date = v["up_to_date"].as_bool().unwrap_or(false);
+                    let applied = v["applied"].as_array().map(Vec::len).unwrap_or(0);
+                    let empty = Vec::new();
+                    let new_conflicts = v["conflicts"].as_array().unwrap_or(&empty);
+                    if !new_conflicts.is_empty() {
+                        let paths: Vec<&str> = new_conflicts
+                            .iter()
+                            .filter_map(|c| c["path"].as_str())
+                            .collect();
+                        tracing::info!(
+                            "origin poll: '{name}' has new conflict(s): {}",
+                            paths.join(", ")
+                        );
+                    } else if !up_to_date {
+                        tracing::info!("origin poll: '{name}' applied {applied} file(s)");
+                    } else {
+                        tracing::debug!("origin poll: '{name}' is up to date");
+                    }
+                    let outcome = if up_to_date {
+                        poller::DomainPollOutcome::UpToDate
+                    } else {
+                        poller::DomainPollOutcome::Applied {
+                            applied,
+                            conflicts: new_conflicts.len(),
+                        }
+                    };
+                    self.origin_poller.record_result(&name, outcome);
+                }
+                Err(EngineError::Remote(RemoteError::RateLimited { reset })) => {
+                    let until = reset.unwrap_or_else(|| wall_now + Duration::hours(1));
+                    tracing::warn!(
+                        "origin poll: GitHub is rate limiting this machine; pausing every domain until {until}"
+                    );
+                    self.origin_poller.set_rate_limited_until(Some(until));
+                    return;
+                }
+                Err(e) => {
+                    tracing::debug!("origin poll: '{name}' failed: {e}");
+                    self.origin_poller
+                        .record_result(&name, poller::DomainPollOutcome::Error(e.to_string()));
+                }
+            }
+        }
+    }
+
+    /// This machine's GitHub connection for `status_report`'s offline
+    /// `origins` block: `(connected, token_store)`. Unlike
+    /// `origin_connection_json` (used by the live `origin_status` operation,
+    /// which reflects an injected test provider's own identity as always
+    /// connected), this never special-cases an injected provider: it is a
+    /// plain token-store lookup, exactly the same check the poller itself
+    /// makes before spending a tick on any domain, so the two never
+    /// disagree about whether this machine is connected.
+    fn origin_connection_offline(&self) -> (bool, Option<&'static str>) {
+        let api_url = self
+            .config
+            .read()
+            .unwrap()
+            .github
+            .as_ref()
+            .and_then(|g| g.api_url.clone());
+        let host = origin::token_host(api_url.as_deref());
+        let Ok(store) = self.resolve_token_store(host.as_deref()) else {
+            return (false, None);
+        };
+        match store.load() {
+            Ok(Some(_)) => (true, Some(store.kind())),
+            _ => (false, None),
+        }
+    }
+
+    /// Builds `status_report`'s `origins` block entirely offline: this
+    /// machine's GitHub connection, the poller's shared rate-limit pause
+    /// and, per origin-connected domain, its repo, branch, proposal and
+    /// conflict counts and local change count from a probe-free
+    /// `ops::status` call (the same state-only read `origin_status` itself
+    /// falls back to when a live probe fails), plus the poller's own
+    /// schedule and last result for that domain. Every read here is local:
+    /// the token store and each domain's saved origin state, never a GitHub
+    /// call, so `status` never blocks on the network even when
+    /// collaboration is on.
+    async fn origins_status_block(&self) -> Value {
+        let (connected, token_store) = self.origin_connection_offline();
+        let rate_limit_wait_until = self.origin_poller.rate_limited_until();
+        let targets = self.origin_targets(None).unwrap_or_default();
+
+        let mut domains = Vec::new();
+        for (name, entry) in targets {
+            let Ok((spec, root, state_dir)) = self.origin_spec_for(&name, &entry) else {
+                continue;
+            };
+            let Ok(report) = ops::status(&spec, &root, &state_dir, None).await else {
+                continue;
+            };
+            let next_due = self.origin_poller.next_due_at(&name);
+            let last_result = self.origin_poller.last_result(&name);
+            domains.push(origin::origin_poll_status_json(
+                &name,
+                &report,
+                next_due,
+                last_result.as_ref(),
+            ));
+        }
+
+        json!({
+            "enabled": true,
+            "connected": connected,
+            "token_store": token_store,
+            "rate_limit_wait_until": rate_limit_wait_until,
+            "domains": domains,
+        })
     }
 
     /// Proposes one domain's local changes as a pull request against its

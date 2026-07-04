@@ -56,6 +56,11 @@ struct Inner {
     /// `RemoteError::Offline`, simulating a live network outage. Set through
     /// `MockProvider::fail_branch_head_offline`.
     offline_branches: HashSet<String>,
+    /// Branches whose `branch_head` probe should fail with
+    /// `RemoteError::RateLimited`, simulating GitHub throttling this
+    /// machine. Set through `MockProvider::fail_branch_head_rate_limited`,
+    /// cleared through `MockProvider::clear_branch_head_rate_limited`.
+    rate_limited_branches: HashMap<String, Option<chrono::DateTime<chrono::Utc>>>,
     /// The lifecycle state `proposal_state` reports for a given proposal
     /// number, set through `MockProvider::set_proposal_state`. A number with
     /// no entry here errors as unknown, matching a genuinely nonexistent
@@ -67,6 +72,12 @@ struct Inner {
     trees: HashMap<String, BTreeMap<String, Vec<u8>>>,
     tree_counter: u64,
     proposal_counter: u64,
+    /// How many times `branch_head` has been called, for the daemon poller
+    /// tests: it is always the first call any `origin_update`/`origin_status`
+    /// makes, so a count of zero after a tick proves the poller made no
+    /// provider call at all (disabled, unauthenticated, or paused for a rate
+    /// limit).
+    branch_head_calls: usize,
 }
 
 /// An in-memory forge implementing [`Provider`] for the origin engine tests.
@@ -129,6 +140,34 @@ impl MockProvider {
         inner.offline_branches.insert(branch.to_string());
     }
 
+    /// Marks `branch` as rate limited: every subsequent `branch_head` probe
+    /// against it returns `Err(RemoteError::RateLimited { reset })`,
+    /// simulating GitHub throttling this machine. `reset` is the reported
+    /// reset instant, `None` when the mock forge reports no reset (the
+    /// poller then falls back to its own default pause).
+    pub fn fail_branch_head_rate_limited(
+        &self,
+        branch: &str,
+        reset: Option<chrono::DateTime<chrono::Utc>>,
+    ) {
+        let mut inner = self.inner.lock().unwrap();
+        inner
+            .rate_limited_branches
+            .insert(branch.to_string(), reset);
+    }
+
+    /// Clears a previously injected rate limit for `branch`, simulating
+    /// GitHub's rate limit window resetting.
+    pub fn clear_branch_head_rate_limited(&self, branch: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.rate_limited_branches.remove(branch);
+    }
+
+    /// How many times `branch_head` has been called so far.
+    pub fn branch_head_calls(&self) -> usize {
+        self.inner.lock().unwrap().branch_head_calls
+    }
+
     /// Sets the lifecycle state `proposal_state` reports for `number`, so a
     /// `pull`'s open-proposal refresh can observe a proposal moving to
     /// merged or declined.
@@ -153,9 +192,13 @@ impl Provider for MockProvider {
         origin: &OriginSpec,
         etag: Option<&str>,
     ) -> Result<HeadProbe, RemoteError> {
-        let inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
+        inner.branch_head_calls += 1;
         if inner.offline_branches.contains(&origin.branch) {
             return Err(RemoteError::Offline);
+        }
+        if let Some(reset) = inner.rate_limited_branches.get(&origin.branch) {
+            return Err(RemoteError::RateLimited { reset: *reset });
         }
         let commit = inner.branches.get(&origin.branch).cloned().ok_or_else(|| {
             RemoteError::RepoNotFound {

@@ -16,6 +16,7 @@ pub mod instance;
 pub mod mcp;
 mod origin;
 pub mod params;
+mod poller;
 pub mod settings;
 
 pub use client::{

@@ -271,6 +271,21 @@ pub async fn run_serve(
         });
     }
 
+    // The background origin poller: brings origin-connected domains up to
+    // date on its own schedule, with no user call, by running one scheduling
+    // pass (`Engine::origin_poll_tick`) on a short heartbeat. A no-op tick
+    // when collaboration is off, unconnected or paused for a rate limit; see
+    // that method for the full gating and backoff rules. Runs even on a
+    // read-only instance: a pull is a derived-truth update, not a user
+    // content write.
+    {
+        let e = engine.clone();
+        let rx = shared.watch();
+        tokio::spawn(async move {
+            run_origin_poller(e, rx).await;
+        });
+    }
+
     // The optional HTTP endpoint.
     if let Some(addr) = http_addr.clone() {
         let e = engine.clone();
@@ -549,6 +564,32 @@ async fn run_heartbeat(engine: Arc<Engine>, secs: u64, mut shutdown: watch::Rece
         tokio::select! {
             _ = wait_true(&mut shutdown) => break,
             _ = ticker.tick() => engine.renew_hosts().await,
+        }
+    }
+}
+
+/// How often the origin poller wakes up to ask the engine which domains are
+/// due. This is only the scheduler's own heartbeat, not the poll interval
+/// any domain actually keeps: `Engine::origin_poll_tick` tracks each
+/// domain's own due instant (its `poll_secs`, else `github.poll_secs`, else
+/// 300 seconds, floored at 60 with jitter) and this loop just checks on it
+/// often enough that a newly due domain is never kept waiting long.
+const POLLER_HEARTBEAT: Duration = Duration::from_secs(5);
+
+/// Run the background origin poller until shutdown: every
+/// [`POLLER_HEARTBEAT`], ask the engine to run one scheduling pass. All the
+/// actual gating (collaboration on, connected, not rate-limited), due/not-due
+/// bookkeeping, jitter and per-domain pulling live in
+/// [`Engine::origin_poll_tick`], which this loop never reimplements; it only
+/// wakes it on a modest cadence and exits promptly on shutdown.
+async fn run_origin_poller(engine: Arc<Engine>, mut shutdown: watch::Receiver<bool>) {
+    let mut ticker = tokio::time::interval(POLLER_HEARTBEAT);
+    loop {
+        tokio::select! {
+            _ = wait_true(&mut shutdown) => break,
+            _ = ticker.tick() => {
+                engine.origin_poll_tick(Instant::now(), chrono::Utc::now()).await;
+            }
         }
     }
 }

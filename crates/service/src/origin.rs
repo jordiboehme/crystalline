@@ -14,12 +14,14 @@
 
 use std::path::PathBuf;
 
+use chrono::{DateTime, Utc};
 use crystalline_remote::RemoteError;
 use crystalline_remote::ops::{self, OriginStatusReport, ProposeOutcome, PullReport};
 use crystalline_remote::state::{OriginState, ProposalStatus};
 use serde_json::{Value, json};
 
 use crate::engine::EngineError;
+use crate::poller::DomainPollOutcome;
 
 /// The domain name `origin_add` uses when the caller does not supply one: the
 /// repository's own name segment (the part after the last `/`), run through
@@ -158,6 +160,55 @@ pub(crate) fn is_probe_transport_error(err: &RemoteError) -> bool {
         err,
         RemoteError::Offline | RemoteError::RateLimited { .. } | RemoteError::AuthExpired
     )
+}
+
+/// Shapes one domain's offline [`OriginStatusReport`] together with the
+/// poller's own schedule and last result into `status_report`'s `origins`
+/// block entry: `{ domain, repo, branch, last_checked, last_result,
+/// next_due, open_proposals, declined_proposals, conflicts, local_changes
+/// }`. `next_due` and `last_result` are `null` for a domain the poller has
+/// not scheduled or completed a tick for yet: a freshly enabled or freshly
+/// added domain, or any domain when no daemon runs the poller at all.
+/// Unlike [`status_report_json`] (which embeds the full open and declined
+/// proposal records for `origin_status`'s detailed view), this counts them:
+/// the status overview stays a glance rather than a second copy of
+/// `origin_status`.
+pub(crate) fn origin_poll_status_json(
+    domain: &str,
+    report: &OriginStatusReport,
+    next_due: Option<DateTime<Utc>>,
+    last_result: Option<&DomainPollOutcome>,
+) -> Value {
+    json!({
+        "domain": domain,
+        "repo": report.repo,
+        "branch": report.branch,
+        "last_checked": report.last_checked,
+        "last_result": last_result.map(poll_outcome_json),
+        "next_due": next_due,
+        "open_proposals": report.open_proposals.len(),
+        "declined_proposals": report.declined_proposals.len(),
+        "conflicts": report.conflicts.len(),
+        "local_changes": report.local_changes,
+    })
+}
+
+/// Shapes one [`DomainPollOutcome`] for `origin_poll_status_json`: `{
+/// outcome: "up_to_date" }`, `{ outcome: "applied", applied, conflicts }` or
+/// `{ outcome: "error", error }`.
+fn poll_outcome_json(outcome: &DomainPollOutcome) -> Value {
+    match outcome {
+        DomainPollOutcome::UpToDate => json!({ "outcome": "up_to_date" }),
+        DomainPollOutcome::Applied { applied, conflicts } => json!({
+            "outcome": "applied",
+            "applied": applied,
+            "conflicts": conflicts,
+        }),
+        DomainPollOutcome::Error(message) => json!({
+            "outcome": "error",
+            "error": message,
+        }),
+    }
 }
 
 /// Shapes [`ops::propose`]'s outcome into `origin_share`'s JSON: `{ outcome:
@@ -419,6 +470,72 @@ mod tests {
         let message = RemoteError::Offline.to_string();
         let v = status_report_json("eng", &report, Some(message.clone()));
         assert_eq!(v["probe_error"], message);
+    }
+
+    fn poll_status_fixture() -> OriginStatusReport {
+        OriginStatusReport {
+            repo: "acme/brand-knowledge".to_string(),
+            branch: "main".to_string(),
+            base_commit: "abc123".to_string(),
+            behind: None,
+            local_changes: 3,
+            skipped_large: vec![],
+            open_proposals: vec![proposal_fixture(
+                1,
+                "https://github.com/acme/brand-knowledge/pull/1",
+                "Share glossary edits",
+            )],
+            declined_proposals: vec![],
+            conflicts: vec![],
+            last_checked: None,
+        }
+    }
+
+    #[test]
+    fn origin_poll_status_json_carries_the_domain_and_every_field() {
+        let report = poll_status_fixture();
+        let next_due = Utc::now();
+        let outcome = DomainPollOutcome::Applied {
+            applied: 2,
+            conflicts: 0,
+        };
+        let v = origin_poll_status_json("eng", &report, Some(next_due), Some(&outcome));
+        assert_eq!(v["domain"], "eng");
+        assert_eq!(v["repo"], "acme/brand-knowledge");
+        assert_eq!(v["branch"], "main");
+        assert_eq!(v["open_proposals"], 1);
+        assert_eq!(v["declined_proposals"], 0);
+        assert_eq!(v["conflicts"], 0);
+        assert_eq!(v["local_changes"], 3);
+        assert_eq!(v["next_due"], serde_json::to_value(next_due).unwrap());
+        assert_eq!(v["last_result"]["outcome"], "applied");
+        assert_eq!(v["last_result"]["applied"], 2);
+    }
+
+    #[test]
+    fn origin_poll_status_json_is_null_for_next_due_and_last_result_when_absent() {
+        let report = poll_status_fixture();
+        let v = origin_poll_status_json("eng", &report, None, None);
+        assert!(v["next_due"].is_null());
+        assert!(v["last_result"].is_null());
+    }
+
+    #[test]
+    fn poll_outcome_json_shapes_every_variant() {
+        assert_eq!(
+            poll_outcome_json(&DomainPollOutcome::UpToDate)["outcome"],
+            "up_to_date"
+        );
+        let applied = poll_outcome_json(&DomainPollOutcome::Applied {
+            applied: 4,
+            conflicts: 1,
+        });
+        assert_eq!(applied["outcome"], "applied");
+        assert_eq!(applied["applied"], 4);
+        assert_eq!(applied["conflicts"], 1);
+        let error = poll_outcome_json(&DomainPollOutcome::Error("offline".to_string()));
+        assert_eq!(error["outcome"], "error");
+        assert_eq!(error["error"], "offline");
     }
 
     #[test]
