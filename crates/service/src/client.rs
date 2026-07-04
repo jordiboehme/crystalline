@@ -200,6 +200,78 @@ pub async fn domain_export(
     Ok(engine.export_domain(domain, dest, force, dry_run).await?)
 }
 
+/// Connect a new domain to a GitHub repository: over the daemon when one owns
+/// the index, else against a directly opened store. `want_embeddings` is
+/// `false` in the standalone fallback, matching `domain_import` and
+/// `domain_export`: a one-shot command never triggers a surprise embedding
+/// model download, and the domain is searchable via text immediately either
+/// way; embedding follows whenever the daemon (or a later `sync --embed`)
+/// gets to it.
+pub async fn origin_add(
+    repo: &str,
+    domain: Option<&str>,
+    path: Option<&str>,
+    branch: Option<&str>,
+    folder: Option<&str>,
+    db: Option<&Path>,
+    config_path: Option<&Path>,
+) -> anyhow::Result<Value> {
+    use serde_json::json;
+    if let Some(data) = ctl_if_running(json!({
+        "v": 1, "cmd": "origin_add", "repo": repo, "domain": domain,
+        "path": path, "branch": branch, "folder": folder,
+    }))
+    .await?
+    {
+        return Ok(data);
+    }
+    let config = load_config(config_path)?;
+    let db_path = resolve_db(db)?;
+    let engine = open_standalone(config, &db_path, false).await?;
+    Ok(engine
+        .origin_add(repo, domain, path, branch, folder)
+        .await?)
+}
+
+/// Bring one origin-connected domain (or every one) up to date: over the
+/// daemon when one owns the index, else against a directly opened store.
+pub async fn origin_update(
+    domain: Option<&str>,
+    db: Option<&Path>,
+    config_path: Option<&Path>,
+) -> anyhow::Result<Value> {
+    use serde_json::json;
+    if let Some(data) =
+        ctl_if_running(json!({ "v": 1, "cmd": "origin_update", "domain": domain })).await?
+    {
+        return Ok(data);
+    }
+    let config = load_config(config_path)?;
+    let db_path = resolve_db(db)?;
+    let engine = open_standalone(config, &db_path, false).await?;
+    Ok(engine.origin_update(domain).await?)
+}
+
+/// Report where one origin-connected domain (or every one) stands relative to
+/// its origin, plus this machine's GitHub connection: over the daemon when
+/// one owns the index, else against a directly opened store.
+pub async fn origin_status(
+    domain: Option<&str>,
+    db: Option<&Path>,
+    config_path: Option<&Path>,
+) -> anyhow::Result<Value> {
+    use serde_json::json;
+    if let Some(data) =
+        ctl_if_running(json!({ "v": 1, "cmd": "origin_status", "domain": domain })).await?
+    {
+        return Ok(data);
+    }
+    let config = load_config(config_path)?;
+    let db_path = resolve_db(db)?;
+    let engine = open_standalone(config, &db_path, false).await?;
+    Ok(engine.origin_status(domain).await?)
+}
+
 /// Show, set or reset an agent-adjustable setting from the [`crate::settings`]
 /// registry: over the daemon when one is running, else against the config
 /// file directly (no index store is opened either way, unlike every data
