@@ -111,6 +111,20 @@ pub enum RemoteError {
     /// an unexpected shape. A plain read or write failure is `Io`, not this.
     #[error("the origin state is corrupt: {0}")]
     State(String),
+
+    /// The saved GitHub credential, in the OS keychain or the local token
+    /// file, could not be read, written or deleted: a credential backend
+    /// refusing the operation (locked, revoked permissions, no backend
+    /// available at all) or a token file whose content is not valid JSON.
+    /// A plain filesystem error opening or creating the token file itself
+    /// is `Io`, not this.
+    #[error(
+        "The saved GitHub sign-in could not be read or written: {detail}. Use configure to sign in again."
+    )]
+    Credential {
+        /// A short, human-readable description of what went wrong.
+        detail: String,
+    },
 }
 
 /// Renders where a MANIFEST.md was expected, for the `NotADomain` message.
@@ -258,6 +272,16 @@ mod tests {
     }
 
     #[test]
+    fn credential_error_carries_its_detail_and_points_to_signing_in_again() {
+        let err = RemoteError::Credential {
+            detail: "the keychain is locked".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("the keychain is locked"), "{msg}");
+        assert!(msg.contains("configure to sign in again"), "{msg}");
+    }
+
+    #[test]
     fn no_style_lint_violations_in_messages() {
         // A cheap in-process guard mirroring scripts/style-lint.sh: no em
         // dash, no en dash and no Oxford-comma list in any rendered message.
@@ -287,6 +311,10 @@ mod tests {
             }
             .to_string(),
             RemoteError::State("bad".to_string()).to_string(),
+            RemoteError::Credential {
+                detail: "boom".to_string(),
+            }
+            .to_string(),
         ];
         for msg in samples {
             assert!(!msg.contains(em_dash), "{msg}");

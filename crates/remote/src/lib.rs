@@ -19,10 +19,13 @@
 pub mod error;
 pub mod github;
 pub mod provider;
+pub mod token;
 
 pub use error::RemoteError;
 pub use github::GitHubProvider;
+pub use github::auth::{DeviceFlowStart, DevicePoll, GITHUB_CLIENT_ID};
 pub use provider::{
     ChangeKind, CompareResult, HeadProbe, OriginSpec, ProposalHandle, ProposalRequest,
     ProposalState, Provider, TreeWrite, UpstreamChange,
 };
+pub use token::{StoredToken, TokenStore};

@@ -3,9 +3,11 @@
 //!
 //! Every request carries the standard GitHub REST headers (an explicit API
 //! version, the `+json` media type and a `User-Agent`) plus a bearer token
-//! when one is configured; the token itself is out of scope here (a later
-//! task owns the device flow and where it is stored), so [`GitHubProvider`]
-//! just carries whatever `Option<String>` it is handed.
+//! when one is configured; [`GitHubProvider`] just carries whatever
+//! `Option<String>` it is handed, and stays agnostic of where that token
+//! came from. [`auth`] owns getting one (the OAuth device flow, or
+//! validating a pasted-in personal access token) and [`crate::token`] owns
+//! keeping it between runs.
 //!
 //! **Compare pagination.** GitHub's own documentation for the compare
 //! endpoint says the changed-file list is only ever returned on the first
@@ -17,6 +19,7 @@
 //! costs at most one harmless extra request, and it is the shape covered by
 //! the pagination test in `tests/github_client.rs`.
 
+pub mod auth;
 mod types;
 
 use std::time::Duration;
