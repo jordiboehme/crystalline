@@ -14,7 +14,13 @@
 //!
 //! Relative paths are always forward-slash normalized in [`OriginState`] and
 //! on the wire; the platform path separator only appears at the filesystem
-//! boundary, in [`base_path`] and the conflict helpers below it.
+//! boundary, in [`base_path`] and the conflict helpers below it. Every rel
+//! path crossing that boundary is validated there: anything shaped like a
+//! traversal, an absolute path or a Windows drive-prefix component is
+//! rejected with [`RemoteError::State`] naming the offending path rather than
+//! turned into a write outside the base tree. Upstream repository content is
+//! untrusted input in this feature's threat model, so this validation is not
+//! optional hardening, it is the boundary the rest of the crate relies on.
 //!
 //! Every operation here is plain, synchronous `std::fs`: this module knows
 //! nothing about async runtimes, and callers on an async runtime wrap calls
@@ -240,15 +246,27 @@ impl OriginState {
 ///
 /// `rel` always uses forward slashes (the convention `OriginState` and every
 /// other function in this module follow); this is the one place that gets
-/// translated to the platform's own separator.
-pub fn base_path(dir: &Path, rel: &str) -> PathBuf {
-    dir.join(BASE_DIR_NAME).join(to_platform_path(rel))
+/// translated to the platform's own separator, via [`to_platform_path`],
+/// which also validates it. A `rel` that is empty, absolute, normalizes to
+/// no components at all, or has a `.`, `..`, `:` or `\` component is
+/// rejected with [`RemoteError::State`] naming the offending path rather
+/// than joined onto `dir`. Every base-tree writer and reader in this module
+/// funnels through here, so this is the one place upstream content shaped
+/// like a path-traversal or a Windows drive-prefix attempt is turned away
+/// before it ever reaches the filesystem.
+pub fn base_path(dir: &Path, rel: &str) -> Result<PathBuf, RemoteError> {
+    Ok(dir.join(BASE_DIR_NAME).join(to_platform_path(rel)?))
 }
 
 /// Writes `bytes` as `rel`'s base snapshot copy under `dir`, creating any
 /// parent directories it needs.
+///
+/// `rel` is validated by [`base_path`] before anything is written: a path
+/// shaped like a traversal, an absolute path or a Windows drive-prefix
+/// attempt is rejected with [`RemoteError::State`] naming the offending
+/// path, and nothing is written.
 pub fn write_base_file(dir: &Path, rel: &str, bytes: &[u8]) -> Result<(), RemoteError> {
-    let path = base_path(dir, rel);
+    let path = base_path(dir, rel)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -258,8 +276,12 @@ pub fn write_base_file(dir: &Path, rel: &str, bytes: &[u8]) -> Result<(), Remote
 
 /// Reads `rel`'s base snapshot copy under `dir`, or `None` if it has never
 /// been written.
+///
+/// `rel` is validated by [`base_path`]: a path shaped like a traversal, an
+/// absolute path or a Windows drive-prefix attempt is rejected with
+/// [`RemoteError::State`] naming the offending path rather than read.
 pub fn read_base_file(dir: &Path, rel: &str) -> Result<Option<Vec<u8>>, RemoteError> {
-    match std::fs::read(base_path(dir, rel)) {
+    match std::fs::read(base_path(dir, rel)?) {
         Ok(bytes) => Ok(Some(bytes)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.into()),
@@ -270,8 +292,12 @@ pub fn read_base_file(dir: &Path, rel: &str) -> Result<Option<Vec<u8>>, RemoteEr
 /// directory left empty by the removal, all the way up to (but not
 /// including) `base/` itself. Removing a file that was never written is not
 /// an error.
+///
+/// `rel` is validated by [`base_path`]: a path shaped like a traversal, an
+/// absolute path or a Windows drive-prefix attempt is rejected with
+/// [`RemoteError::State`] naming the offending path rather than acted on.
 pub fn remove_base_file(dir: &Path, rel: &str) -> Result<(), RemoteError> {
-    let path = base_path(dir, rel);
+    let path = base_path(dir, rel)?;
     match std::fs::remove_file(&path) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -302,6 +328,12 @@ pub fn remove_base_file(dir: &Path, rel: &str) -> Result<(), RemoteError> {
 ///
 /// Writes the new tree to a sibling `base.tmp/` directory first, then swaps
 /// it in for `base/`, so a reader never sees a half-replaced tree.
+///
+/// Every key in `files` is validated by [`to_platform_path`] before
+/// anything is written: the first one shaped like a traversal, an absolute
+/// path or a Windows drive-prefix attempt fails the whole call with
+/// [`RemoteError::State`] naming the offending path, and the previous
+/// `base/` is left untouched.
 pub fn replace_base_tree(dir: &Path, files: &BTreeMap<String, Vec<u8>>) -> Result<(), RemoteError> {
     let tmp_root = dir.join(BASE_TMP_DIR_NAME);
     if tmp_root.exists() {
@@ -309,7 +341,7 @@ pub fn replace_base_tree(dir: &Path, files: &BTreeMap<String, Vec<u8>>) -> Resul
     }
     std::fs::create_dir_all(&tmp_root)?;
     for (rel, bytes) in files {
-        let path = tmp_root.join(to_platform_path(rel));
+        let path = tmp_root.join(to_platform_path(rel)?);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -328,13 +360,18 @@ pub fn replace_base_tree(dir: &Path, files: &BTreeMap<String, Vec<u8>>) -> Resul
 /// returning the relative paths that are missing or whose size or content no
 /// longer match the recorded [`BaseStamp`]. An empty result means the base
 /// snapshot is fully intact. Used by recovery, orchestrated by a later task.
+///
+/// Every key in `files` is validated by [`base_path`]: the first one shaped
+/// like a traversal, an absolute path or a Windows drive-prefix attempt
+/// fails the whole call with [`RemoteError::State`] naming the offending
+/// path.
 pub fn verify_base(
     dir: &Path,
     files: &BTreeMap<String, BaseStamp>,
 ) -> Result<Vec<String>, RemoteError> {
     let mut bad = Vec::new();
     for (rel, stamp) in files {
-        let path = base_path(dir, rel);
+        let path = base_path(dir, rel)?;
         match std::fs::metadata(&path) {
             Ok(meta) => {
                 if meta.len() != stamp.size {
@@ -429,14 +466,47 @@ pub fn new_conflict_id() -> String {
 /// Converts a forward-slash relative path (the only form `OriginState` and
 /// the wire ever use) into a platform-native [`PathBuf`], so paths compare
 /// and serialize identically across every platform this compiles for.
-fn to_platform_path(rel: &str) -> PathBuf {
-    let mut path = PathBuf::new();
-    for part in rel.split('/') {
-        if !part.is_empty() {
-            path.push(part);
-        }
+///
+/// This is the single chokepoint every base-tree writer and reader in this
+/// module funnels through before a `rel` path ever touches the filesystem,
+/// so the validation lives here once rather than being repeated at each
+/// call site. Rejected with [`RemoteError::State`] naming the offending
+/// path:
+///
+/// - an empty path, or one that normalizes to no components at all (for
+///   example `"."`)
+/// - a leading `/` (an absolute path, not a relative one)
+/// - any `.` or `..` component
+/// - any component containing `:` (a Windows drive-prefix former) or `\`
+///   (kept out even though `archive.rs` already normalizes backslashes
+///   before content reaches this layer, so this module's own guarantee
+///   never depends on a caller upstream having done so)
+fn to_platform_path(rel: &str) -> Result<PathBuf, RemoteError> {
+    if rel.is_empty() || rel.starts_with('/') {
+        return Err(RemoteError::State(format!(
+            "rejected path outside the domain tree: {rel}"
+        )));
     }
-    path
+    let mut path = PathBuf::new();
+    let mut has_component = false;
+    for part in rel.split('/') {
+        if part.is_empty() {
+            continue;
+        }
+        if part == "." || part == ".." || part.contains(':') || part.contains('\\') {
+            return Err(RemoteError::State(format!(
+                "rejected path outside the domain tree: {rel}"
+            )));
+        }
+        path.push(part);
+        has_component = true;
+    }
+    if !has_component {
+        return Err(RemoteError::State(format!(
+            "rejected path outside the domain tree: {rel}"
+        )));
+    }
+    Ok(path)
 }
 
 /// The lowercase hex SHA-256 digest of `bytes`, encoded exactly like
@@ -562,6 +632,96 @@ mod tests {
     fn read_base_file_returns_none_when_absent() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(read_base_file(dir.path(), "missing.md").unwrap(), None);
+    }
+
+    #[test]
+    fn write_base_file_still_accepts_a_nested_happy_path() {
+        let dir = tempfile::tempdir().unwrap();
+        write_base_file(dir.path(), "deep/nested/path/file.md", b"content").unwrap();
+        assert_eq!(
+            read_base_file(dir.path(), "deep/nested/path/file.md").unwrap(),
+            Some(b"content".to_vec())
+        );
+    }
+
+    #[test]
+    fn write_base_file_rejects_a_parent_traversal_component() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = write_base_file(dir.path(), "../x.md", b"nope").unwrap_err();
+        assert!(matches!(err, RemoteError::State(_)));
+    }
+
+    #[test]
+    fn read_base_file_rejects_a_parent_traversal_component() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = read_base_file(dir.path(), "../x.md").unwrap_err();
+        assert!(matches!(err, RemoteError::State(_)));
+    }
+
+    #[test]
+    fn remove_base_file_rejects_a_parent_traversal_component() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = remove_base_file(dir.path(), "../x.md").unwrap_err();
+        assert!(matches!(err, RemoteError::State(_)));
+    }
+
+    #[test]
+    fn replace_base_tree_rejects_a_parent_traversal_component() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut files = BTreeMap::new();
+        files.insert("../x.md".to_string(), b"nope".to_vec());
+        let err = replace_base_tree(dir.path(), &files).unwrap_err();
+        assert!(matches!(err, RemoteError::State(_)));
+    }
+
+    #[test]
+    fn verify_base_rejects_a_parent_traversal_component() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manifest = BTreeMap::new();
+        manifest.insert(
+            "../x.md".to_string(),
+            BaseStamp {
+                sha256: sha256_hex(b"x"),
+                size: 1,
+            },
+        );
+        let err = verify_base(dir.path(), &manifest).unwrap_err();
+        assert!(matches!(err, RemoteError::State(_)));
+    }
+
+    #[test]
+    fn write_base_file_rejects_a_windows_drive_prefix_component() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = write_base_file(dir.path(), "notes/C:evil.md", b"nope").unwrap_err();
+        assert!(matches!(err, RemoteError::State(_)));
+    }
+
+    #[test]
+    fn write_base_file_rejects_a_backslash_component() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = write_base_file(dir.path(), "a\\b.md", b"nope").unwrap_err();
+        assert!(matches!(err, RemoteError::State(_)));
+    }
+
+    #[test]
+    fn write_base_file_rejects_an_absolute_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = write_base_file(dir.path(), "/abs.md", b"nope").unwrap_err();
+        assert!(matches!(err, RemoteError::State(_)));
+    }
+
+    #[test]
+    fn write_base_file_rejects_an_empty_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = write_base_file(dir.path(), "", b"nope").unwrap_err();
+        assert!(matches!(err, RemoteError::State(_)));
+    }
+
+    #[test]
+    fn write_base_file_rejects_a_path_that_normalizes_to_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = write_base_file(dir.path(), ".", b"nope").unwrap_err();
+        assert!(matches!(err, RemoteError::State(_)));
     }
 
     #[test]

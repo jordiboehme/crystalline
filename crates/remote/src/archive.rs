@@ -38,8 +38,13 @@ pub type ExtractedFiles = (BTreeMap<String, Vec<u8>>, Vec<(String, u64)>);
 /// archive rather than content to trust.
 ///
 /// An entry whose normalized path would escape the archive root (any `..`
-/// path component) is rejected with [`RemoteError::State`]: extraction never
-/// writes outside the tree it is asked to produce.
+/// path component) or could be mistaken for a Windows drive-prefixed path
+/// (any component containing `:`) is rejected with [`RemoteError::State`]:
+/// extraction never writes outside the tree it is asked to produce. The
+/// second check is belt and braces here since [`crate::state`]'s own
+/// filesystem writers reject the same shapes independently; catching them at
+/// extraction time means a bad entry gets one clear error rather than
+/// surfacing later as a write failure with less context.
 pub fn extract_tarball(bytes: &[u8], subpath: Option<&str>) -> Result<ExtractedFiles, RemoteError> {
     let decoder = GzDecoder::new(bytes);
     let mut archive = Archive::new(decoder);
@@ -65,9 +70,18 @@ pub fn extract_tarball(bytes: &[u8], subpath: Option<&str>) -> Result<ExtractedF
         let path = entry
             .path()
             .map_err(|e| RemoteError::State(format!("invalid tarball entry path: {e}")))?;
+        // Tar itself only defines `/` as a path separator, but a hand-crafted
+        // archive could still use `\` to try to slip a Windows-style path
+        // (`notes\..\..\evil`, `C:\evil`) past a check that only looks for
+        // `/` components. Normalizing `\` to `/` before validation runs is a
+        // deliberate, conservative choice: treat every backslash as a
+        // separator rather than trust that it never is one.
         let path_str = path.to_string_lossy().replace('\\', "/");
 
-        if path_str.split('/').any(|component| component == "..") {
+        if path_str
+            .split('/')
+            .any(|component| component == ".." || component.contains(':'))
+        {
             return Err(RemoteError::State(format!(
                 "tarball entry escapes its root: {path_str}"
             )));
@@ -254,6 +268,20 @@ mod tests {
     fn path_escape_is_rejected() {
         let bytes = TarballBuilder::new("acme-brand-knowledge-abc123")
             .add_raw_path("acme-brand-knowledge-abc123/../../etc/passwd", b"nope")
+            .finish_gz();
+
+        let err = extract_tarball(&bytes, None).unwrap_err();
+        assert!(matches!(err, crate::error::RemoteError::State(_)));
+    }
+
+    #[test]
+    fn colon_component_is_rejected() {
+        // Not a `..` traversal, but a component that could be read as a
+        // Windows drive prefix (`C:`); rejecting it outright rather than
+        // silently skipping it matches the existing `..` behavior and gives
+        // one clear error instead of a later, less specific write failure.
+        let bytes = TarballBuilder::new("acme-brand-knowledge-abc123")
+            .add_file("notes/C:evil.md", b"nope")
             .finish_gz();
 
         let err = extract_tarball(&bytes, None).unwrap_err();
