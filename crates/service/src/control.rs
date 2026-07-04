@@ -3,8 +3,9 @@
 //! Each request is one JSON line `{ "v": 1, "cmd": ..., ... }`; each response is
 //! one line `{ "v": 1, "ok": true, "data": ... }` or
 //! `{ "v": 1, "ok": false, "error": ... }`. Commands: sync, status, reindex,
-//! sessions, configure, forget_domain, shutdown. This is the operator channel;
-//! data operations go over the MCP handshake instead.
+//! sessions, configure, origin_add, origin_update, origin_status,
+//! forget_domain, shutdown. This is the operator channel; data operations go
+//! over the MCP handshake instead.
 
 use std::sync::Arc;
 
@@ -201,6 +202,40 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                 Err(e) => (envelope_err(e.to_string()), false),
             }
         }
+        // Connect a new domain to a GitHub repository: downloads its tracked
+        // subtree, registers it in the global config and indexes it.
+        "origin_add" => {
+            let repo = req.get("repo").and_then(Value::as_str).unwrap_or("");
+            let domain = req.get("domain").and_then(Value::as_str);
+            let path = req.get("path").and_then(Value::as_str);
+            let branch = req.get("branch").and_then(Value::as_str);
+            let folder = req.get("folder").and_then(Value::as_str);
+            match shared
+                .engine
+                .origin_add(repo, domain, path, branch, folder)
+                .await
+            {
+                Ok(data) => (envelope_ok(data), false),
+                Err(e) => (envelope_err(e.to_string()), false),
+            }
+        }
+        // Pull one origin-connected domain (or every one) up to date.
+        "origin_update" => {
+            let domain = req.get("domain").and_then(Value::as_str);
+            match shared.engine.origin_update(domain).await {
+                Ok(data) => (envelope_ok(data), false),
+                Err(e) => (envelope_err(e.to_string()), false),
+            }
+        }
+        // Report where one origin-connected domain (or every one) stands
+        // relative to its origin, plus this machine's GitHub connection.
+        "origin_status" => {
+            let domain = req.get("domain").and_then(Value::as_str);
+            match shared.engine.origin_status(domain).await {
+                Ok(data) => (envelope_ok(data), false),
+                Err(e) => (envelope_err(e.to_string()), false),
+            }
+        }
         "shutdown" => (envelope_ok(json!({ "stopping": true })), true),
         // Best-effort: `domain remove` calls this so a live daemon stops
         // watching the removed path right away instead of on its next
@@ -215,7 +250,7 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
             envelope_err(format!(
                 "unknown ctl command '{other}'; expected status, sessions, sync, reindex, \
                  routing_bullets, scaffold_manifest, domain_import, domain_export, configure, \
-                 forget_domain or shutdown"
+                 origin_add, origin_update, origin_status, forget_domain or shutdown"
             )),
             false,
         ),
