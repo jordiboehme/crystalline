@@ -5,6 +5,7 @@
 //! never touches the real OS keychain.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::Json;
 use axum::Router;
@@ -13,8 +14,8 @@ use axum::http::HeaderMap;
 use axum::routing::{get, post};
 use crystalline_remote::RemoteError;
 use crystalline_remote::github::auth::{
-    DeviceFlowStart, DevicePoll, poll_device_flow_once, run_device_flow, start_device_flow,
-    validate_token,
+    DeviceFlowStart, DevicePoll, poll_device_flow_once, run_device_flow,
+    run_device_flow_with_backoff, start_device_flow, validate_token,
 };
 use tokio::net::TcpListener;
 
@@ -217,6 +218,15 @@ async fn poll_device_flow_once_maps_connection_refused_to_offline() {
 
 // --- run_device_flow ---------------------------------------------------------
 
+// These three tests keep `interval_secs: 0` so `run_device_flow`'s
+// between-poll sleeps cost no real wall time; the one test that also
+// exercises the `slow_down` backoff calls `run_device_flow_with_backoff`
+// with a near-zero backoff instead of the real, hardcoded five seconds, so
+// it stays sub-second too. A `#[tokio::test(start_paused = true)]` clock
+// was tried first, but the mock axum server and the client both run real
+// HTTP round-trips over loopback on the same runtime, and the auto-advanced
+// clock races ahead of those before they complete, turning two of the three
+// tests into spurious `RemoteError::Offline` failures.
 #[tokio::test]
 async fn run_device_flow_polls_until_a_token_arrives() {
     let calls = Arc::new(Mutex::new(0u32));
@@ -241,7 +251,7 @@ async fn run_device_flow_polls_until_a_token_arrives() {
         device_code: "devicecode".to_string(),
         user_code: "WDJB-MJHT".to_string(),
         verification_url: "https://github.com/login/device".to_string(),
-        interval_secs: 1,
+        interval_secs: 0,
         expires_in_secs: 30,
     };
 
@@ -274,11 +284,13 @@ async fn run_device_flow_backs_off_on_slow_down_then_succeeds() {
         device_code: "devicecode".to_string(),
         user_code: "WDJB-MJHT".to_string(),
         verification_url: "https://github.com/login/device".to_string(),
-        interval_secs: 1,
+        interval_secs: 0,
         expires_in_secs: 30,
     };
 
-    let token = run_device_flow(&base, "client", &start).await.unwrap();
+    let token = run_device_flow_with_backoff(&base, "client", &start, Duration::from_millis(1))
+        .await
+        .unwrap();
 
     assert_eq!(token, "tok-after-slowdown");
 }
@@ -294,7 +306,7 @@ async fn run_device_flow_reports_auth_expired_once_the_window_elapses() {
         device_code: "devicecode".to_string(),
         user_code: "WDJB-MJHT".to_string(),
         verification_url: "https://github.com/login/device".to_string(),
-        interval_secs: 1,
+        interval_secs: 0,
         expires_in_secs: 0,
     };
 

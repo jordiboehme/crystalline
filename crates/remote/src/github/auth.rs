@@ -225,6 +225,23 @@ pub async fn run_device_flow(
     client_id: &str,
     start: &DeviceFlowStart,
 ) -> Result<String, RemoteError> {
+    run_device_flow_with_backoff(auth_base, client_id, start, SLOW_DOWN_BACKOFF).await
+}
+
+/// The device flow loop behind [`run_device_flow`], with the slow-down
+/// backoff taken as a parameter instead of hardcoded, so the test suite can
+/// shrink it and keep its `slow_down` coverage sub-second without pausing
+/// the tokio clock (which races ahead of the real HTTP round-trips the
+/// mock-server tests make, once verified against this crate's suite).
+/// [`run_device_flow`] always calls this with the real
+/// [`SLOW_DOWN_BACKOFF`]; not meant to be called directly outside tests.
+#[doc(hidden)]
+pub async fn run_device_flow_with_backoff(
+    auth_base: &str,
+    client_id: &str,
+    start: &DeviceFlowStart,
+    slow_down_backoff: Duration,
+) -> Result<String, RemoteError> {
     let started = tokio::time::Instant::now();
     let expires_in = Duration::from_secs(start.expires_in_secs);
     let mut interval = Duration::from_secs(start.interval_secs);
@@ -236,7 +253,7 @@ pub async fn run_device_flow(
         match poll_device_flow_once(auth_base, client_id, &start.device_code).await? {
             DevicePoll::Token(token) => return Ok(token),
             DevicePoll::Pending => {}
-            DevicePoll::SlowDown => interval += SLOW_DOWN_BACKOFF,
+            DevicePoll::SlowDown => interval += slow_down_backoff,
         }
     }
 }

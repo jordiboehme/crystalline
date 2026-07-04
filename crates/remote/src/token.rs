@@ -10,6 +10,7 @@
 //! whose keychain the probe judged unusable.
 
 use std::path::{Path, PathBuf};
+use std::sync::Once;
 
 use serde::{Deserialize, Serialize};
 
@@ -128,6 +129,7 @@ fn account_for(host: Option<&str>) -> String {
 /// Opens a keyring entry, mapping the (rare) failure to build one at all to
 /// [`RemoteError::Credential`].
 fn keyring_entry(account: &str) -> Result<keyring::Entry, RemoteError> {
+    install_keyring_store();
     keyring::Entry::new(KEYRING_SERVICE, account).map_err(|e| credential_error("open", e))
 }
 
@@ -145,17 +147,23 @@ fn keyring_entry(account: &str) -> Result<keyring::Entry, RemoteError> {
 /// place that distinction is made, so both `resolve` and anyone reasoning
 /// about it later only need to look here.
 ///
-/// As of the `keyring` 4.1.3 release pinned in the workspace, this probe
-/// currently reports "unavailable" on every platform: `keyring::Entry::new`
-/// always returns `NoDefaultStore`, because the crate's own v1
-/// compatibility layer never actually installs a default store (its
-/// `SET_CREDENTIAL_STORE.compare_exchange(false, true, ..) == Ok(true)`
-/// check can never be true, since `compare_exchange` returns `Ok` of the
-/// *previous* value on success, so the branch that would call
-/// `set_credential_store()` is dead code). This falls back to the file
-/// store safely, just without the OS keychain until upstream ships a fix;
-/// nothing here needs to change once it does.
+/// As of the `keyring` 4.1.3 release pinned in the workspace,
+/// `keyring::Entry::new` never installs a default store on its own: the
+/// crate's `v1` compatibility layer guards its one-shot installer with
+/// `SET_CREDENTIAL_STORE.compare_exchange(false, true, ..) == Ok(true)`, but
+/// `compare_exchange` returns `Ok` of the *previous* value on success, so
+/// that check can never be true and the branch that would call
+/// `set_credential_store()` is dead code; every `Entry::new` call returns
+/// `NoDefaultStore` instead. This probe works around that (see
+/// [`install_keyring_store`]) by installing the platform-native store
+/// itself first, through `keyring_core::set_default_store`, exactly the way
+/// keyring's own `cli` feature does. A headless machine with no native
+/// store to install (Linux with no session bus) still falls back to the
+/// file store safely, just as it did before; nothing here needs to change
+/// once upstream ships a fixed one-shot guard, beyond deleting the
+/// workaround.
 fn keyring_probe_ok(account: &str) -> bool {
+    install_keyring_store();
     match keyring::Entry::new(KEYRING_SERVICE, account) {
         Ok(entry) => !matches!(
             entry.get_password(),
@@ -163,6 +171,44 @@ fn keyring_probe_ok(account: &str) -> bool {
         ),
         Err(_) => false,
     }
+}
+
+/// Installs the platform-native store as `keyring-core`'s default, once per
+/// process, working around the `keyring` 4.1.3 bug documented on
+/// [`keyring_probe_ok`]. Safe to call as often as needed: only the first
+/// call does anything, and every `keyring::Entry::new` call site in this
+/// module calls it first.
+fn install_keyring_store() {
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        // Nothing to do if this platform has no native store to install
+        // (headless Linux with no session bus): `keyring::Entry::new` then
+        // keeps returning `NoDefaultStore`, which `keyring_probe_ok` already
+        // treats as "keyring unavailable, use the file store instead."
+        let _ = install_native_store();
+    });
+}
+
+/// Builds the platform-native credential store and installs it as
+/// `keyring-core`'s default: the Apple Keychain on macOS, the Windows
+/// Credential Manager on Windows, the Secret Service over `zbus` on other
+/// Unix platforms. Mirrors the cfg structure of `keyring::v1`'s own (broken)
+/// `set_credential_store` helper and `keyring::cli`'s
+/// `use_apple_keychain_store` / `use_windows_native_store` /
+/// `use_zbus_secret_service_store` functions.
+fn install_native_store() -> keyring_core::Result<()> {
+    #[cfg(target_os = "macos")]
+    let store = apple_native_keyring_store::keychain::Store::new()?;
+    #[cfg(target_os = "windows")]
+    let store = windows_native_keyring_store::Store::new()?;
+    #[cfg(all(
+        unix,
+        not(any(target_os = "macos", target_os = "ios", target_os = "android"))
+    ))]
+    let store = zbus_secret_service_keyring_store::Store::new()?;
+    #[cfg(all(any(unix, windows), not(any(target_os = "ios", target_os = "android"))))]
+    keyring_core::set_default_store(store);
+    Ok(())
 }
 
 /// Builds a [`RemoteError::Credential`] naming the attempted `operation`.
