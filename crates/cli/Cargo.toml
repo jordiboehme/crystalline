@@ -44,6 +44,11 @@ postgres = ["crystalline-index/postgres"]
 crystalline-service = { workspace = true }
 crystalline-index = { workspace = true }
 crystalline-core = { workspace = true }
+# Only `connect github` (inherently local: signing in is machine identity, not
+# content) uses this crate directly. Every other origin verb routes through
+# crystalline-service's socket-first client entry points, never linking this
+# crate for its in-process fallback.
+crystalline-remote = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }

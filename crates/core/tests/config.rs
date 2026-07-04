@@ -3,7 +3,7 @@
 use std::sync::Mutex;
 
 use crystalline_core::config::{
-    self, DomainEntry, GlobalConfig, HttpSetting, load_yaml, save_yaml,
+    self, DomainEntry, GitHubConfig, GlobalConfig, HttpSetting, OriginConfig, load_yaml, save_yaml,
 };
 
 /// Guards every test that reads or mutates `CRYSTALLINE_MODELS_DIR`. Env vars
@@ -161,6 +161,120 @@ fn repo_config_preferred_domains() {
     let yaml = "preferred_domains:\n- product\n- gardening\n";
     let cfg: config::RepoConfig = serde_yaml_ng::from_str(yaml).unwrap();
     assert_eq!(cfg.preferred_domains, ["product", "gardening"]);
+}
+
+#[test]
+fn legacy_config_without_origin_or_github_round_trips_byte_identical() {
+    // A config predating this feature (bare domain paths, no origin or github
+    // blocks) must serialize back exactly as before: no origin or github keys
+    // anywhere in the output.
+    let mut domains = std::collections::BTreeMap::new();
+    domains.insert("eng", "/knowledge/eng");
+    let mut cfg = GlobalConfig::default();
+    for (name, path) in domains {
+        cfg.domains
+            .insert(name.to_string(), DomainEntry::file(path));
+    }
+    let yaml = serde_yaml_ng::to_string(&cfg).unwrap();
+    assert_eq!(yaml, "domains:\n  eng:\n    path: /knowledge/eng\n");
+    let back: GlobalConfig = serde_yaml_ng::from_str(&yaml).unwrap();
+    assert_eq!(back, cfg);
+}
+
+#[test]
+fn origin_and_github_config_round_trip() {
+    let yaml = "\
+domains:
+  brand:
+    path: ~/Documents/Crystalline/brand
+    origin:
+      repo: acme/brand-knowledge
+      path: knowledge
+      branch: main
+      poll_secs: 600
+github:
+  enabled: true
+  poll_secs: 300
+  api_url: https://github.example.com/api/v3
+  oauth_client_id: abc123
+";
+    let cfg: GlobalConfig = serde_yaml_ng::from_str(yaml).unwrap();
+
+    let entry = cfg.domains.get("brand").unwrap();
+    let origin = entry.origin.as_ref().expect("origin block");
+    assert_eq!(origin.repo, "acme/brand-knowledge");
+    assert_eq!(origin.path.as_deref(), Some("knowledge"));
+    assert_eq!(origin.branch.as_deref(), Some("main"));
+    assert_eq!(origin.poll_secs, Some(600));
+
+    let gh = cfg.github.as_ref().expect("github block");
+    assert_eq!(gh.enabled, Some(true));
+    assert_eq!(gh.poll_secs, Some(300));
+    assert_eq!(
+        gh.api_url.as_deref(),
+        Some("https://github.example.com/api/v3")
+    );
+    assert_eq!(gh.oauth_client_id.as_deref(), Some("abc123"));
+
+    // Re-serializing and re-parsing reaches a fixed point.
+    let re_yaml = serde_yaml_ng::to_string(&cfg).unwrap();
+    let back: GlobalConfig = serde_yaml_ng::from_str(&re_yaml).unwrap();
+    assert_eq!(back, cfg);
+}
+
+#[test]
+fn github_enabled_defaults_false_and_reflects_explicit_value() {
+    let cfg = GlobalConfig::default();
+    assert!(!cfg.github_enabled());
+
+    let enabled_cfg = GlobalConfig {
+        github: Some(GitHubConfig {
+            enabled: Some(true),
+            ..GitHubConfig::default()
+        }),
+        ..GlobalConfig::default()
+    };
+    assert!(enabled_cfg.github_enabled());
+
+    let explicit_false = GlobalConfig {
+        github: Some(GitHubConfig {
+            enabled: Some(false),
+            ..GitHubConfig::default()
+        }),
+        ..GlobalConfig::default()
+    };
+    assert!(!explicit_false.github_enabled());
+}
+
+#[test]
+fn origin_branch_defaults_to_main_when_absent() {
+    let origin = OriginConfig {
+        repo: "acme/brand-knowledge".to_string(),
+        path: None,
+        branch: None,
+        poll_secs: None,
+    };
+    assert_eq!(origin.branch(), "main");
+
+    let origin_explicit = OriginConfig {
+        branch: Some("develop".to_string()),
+        ..origin
+    };
+    assert_eq!(origin_explicit.branch(), "develop");
+}
+
+#[test]
+fn origin_state_paths_are_namespaced_under_the_state_dir() {
+    assert!(
+        config::origins_state_dir()
+            .unwrap()
+            .ends_with("crystalline/origins")
+    );
+    assert!(
+        config::origin_state_dir("brand")
+            .unwrap()
+            .ends_with("crystalline/origins/brand")
+    );
 }
 
 #[test]

@@ -200,6 +200,230 @@ pub async fn domain_export(
     Ok(engine.export_domain(domain, dest, force, dry_run).await?)
 }
 
+/// Connect a new domain to a GitHub repository: over the daemon when one owns
+/// the index, else against a directly opened store. `want_embeddings` is
+/// `false` in the standalone fallback, matching `domain_import` and
+/// `domain_export`: a one-shot command never triggers a surprise embedding
+/// model download, and the domain is searchable via text immediately either
+/// way; embedding follows whenever the daemon (or a later `sync --embed`)
+/// gets to it.
+pub async fn origin_add(
+    repo: &str,
+    domain: Option<&str>,
+    path: Option<&str>,
+    branch: Option<&str>,
+    folder: Option<&str>,
+    db: Option<&Path>,
+    config_path: Option<&Path>,
+) -> anyhow::Result<Value> {
+    use serde_json::json;
+    if let Some(data) = ctl_if_running(json!({
+        "v": 1, "cmd": "origin_add", "repo": repo, "domain": domain,
+        "path": path, "branch": branch, "folder": folder,
+    }))
+    .await?
+    {
+        return Ok(data);
+    }
+    let config = load_config(config_path)?;
+    let db_path = resolve_db(db)?;
+    let engine = open_standalone(config, &db_path, false).await?;
+    Ok(engine
+        .origin_add(repo, domain, path, branch, folder)
+        .await?)
+}
+
+/// Bring one origin-connected domain (or every one) up to date: over the
+/// daemon when one owns the index, else against a directly opened store.
+pub async fn origin_update(
+    domain: Option<&str>,
+    db: Option<&Path>,
+    config_path: Option<&Path>,
+) -> anyhow::Result<Value> {
+    use serde_json::json;
+    if let Some(data) =
+        ctl_if_running(json!({ "v": 1, "cmd": "origin_update", "domain": domain })).await?
+    {
+        return Ok(data);
+    }
+    let config = load_config(config_path)?;
+    let db_path = resolve_db(db)?;
+    let engine = open_standalone(config, &db_path, false).await?;
+    Ok(engine.origin_update(domain).await?)
+}
+
+/// Report where one origin-connected domain (or every one) stands relative to
+/// its origin, plus this machine's GitHub connection: over the daemon when
+/// one owns the index, else against a directly opened store.
+pub async fn origin_status(
+    domain: Option<&str>,
+    db: Option<&Path>,
+    config_path: Option<&Path>,
+) -> anyhow::Result<Value> {
+    use serde_json::json;
+    if let Some(data) =
+        ctl_if_running(json!({ "v": 1, "cmd": "origin_status", "domain": domain })).await?
+    {
+        return Ok(data);
+    }
+    let config = load_config(config_path)?;
+    let db_path = resolve_db(db)?;
+    let engine = open_standalone(config, &db_path, false).await?;
+    Ok(engine.origin_status(domain).await?)
+}
+
+/// Propose one team domain's local changes as a pull request against its
+/// origin: over the daemon when one owns the index, else against a directly
+/// opened store. `want_embeddings` is `false` in the standalone fallback: a
+/// share never touches the working tree, so there is nothing new to embed.
+pub async fn origin_share(
+    domain: &str,
+    title: Option<&str>,
+    description: Option<&str>,
+    db: Option<&Path>,
+    config_path: Option<&Path>,
+) -> anyhow::Result<Value> {
+    use serde_json::json;
+    if let Some(data) = ctl_if_running(json!({
+        "v": 1, "cmd": "origin_share", "domain": domain,
+        "title": title, "description": description,
+    }))
+    .await?
+    {
+        return Ok(data);
+    }
+    let config = load_config(config_path)?;
+    let db_path = resolve_db(db)?;
+    let engine = open_standalone(config, &db_path, false).await?;
+    Ok(engine.origin_share(domain, title, description).await?)
+}
+
+/// Discard a declined, or still-open, share proposal for one team domain,
+/// restoring local files that were not changed since sharing them: over the
+/// daemon when one owns the index, else against a directly opened store.
+pub async fn origin_discard(
+    domain: &str,
+    proposal: u64,
+    db: Option<&Path>,
+    config_path: Option<&Path>,
+) -> anyhow::Result<Value> {
+    use serde_json::json;
+    if let Some(data) = ctl_if_running(json!({
+        "v": 1, "cmd": "origin_discard", "domain": domain, "proposal": proposal,
+    }))
+    .await?
+    {
+        return Ok(data);
+    }
+    let config = load_config(config_path)?;
+    let db_path = resolve_db(db)?;
+    let engine = open_standalone(config, &db_path, false).await?;
+    Ok(engine.origin_discard(domain, proposal).await?)
+}
+
+/// Resolve one recorded conflict for a team domain: over the daemon when one
+/// owns the index, else against a directly opened store. `content` (a
+/// caller-supplied merge) travels over the ctl socket base64-encoded, since
+/// the JSON envelope carries text only and a resolved asset may be binary;
+/// the in-process fallback passes the bytes straight through.
+pub async fn origin_resolve(
+    domain: &str,
+    path: &str,
+    keep: Option<&str>,
+    content: Option<&[u8]>,
+    db: Option<&Path>,
+    config_path: Option<&Path>,
+) -> anyhow::Result<Value> {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+    use serde_json::json;
+    let content_b64 = content.map(|c| BASE64.encode(c));
+    if let Some(data) = ctl_if_running(json!({
+        "v": 1, "cmd": "origin_resolve", "domain": domain, "path": path,
+        "keep": keep, "content_b64": content_b64,
+    }))
+    .await?
+    {
+        return Ok(data);
+    }
+    let config = load_config(config_path)?;
+    let db_path = resolve_db(db)?;
+    let engine = open_standalone(config, &db_path, false).await?;
+    Ok(engine.origin_resolve(domain, path, keep, content).await?)
+}
+
+/// Show, set or reset an agent-adjustable setting from the [`crate::settings`]
+/// registry: over the daemon when one is running, else against the config
+/// file directly (no index store is opened either way, unlike every data
+/// command above). `action` is `show`, `set` or `unset`; `key` and `value`
+/// are required for `set`, `key` alone for `unset`, and both are ignored for
+/// `show`.
+pub async fn configure(
+    action: &str,
+    key: Option<&str>,
+    value: Option<&str>,
+    config_path: Option<&Path>,
+) -> anyhow::Result<Value> {
+    use serde_json::json;
+    if let Some(data) = ctl_if_running(json!({
+        "v": 1, "cmd": "configure", "action": action, "key": key, "value": value,
+    }))
+    .await?
+    {
+        return Ok(data);
+    }
+
+    let mut config = load_config(config_path)?;
+    match action {
+        "show" => Ok(json!({ "settings": crate::settings::snapshot(&config) })),
+        "set" => {
+            if config.read_only() {
+                anyhow::bail!("{}", crate::engine::EngineError::ReadOnly);
+            }
+            let key = key.ok_or_else(|| anyhow::anyhow!("configure set requires a key"))?;
+            let value = value.ok_or_else(|| anyhow::anyhow!("configure set requires a value"))?;
+            crate::settings::apply(&mut config, key, value)?;
+            save_config(config_path, &config)?;
+            Ok(setting_view(&config, key))
+        }
+        "unset" => {
+            if config.read_only() {
+                anyhow::bail!("{}", crate::engine::EngineError::ReadOnly);
+            }
+            let key = key.ok_or_else(|| anyhow::anyhow!("configure unset requires a key"))?;
+            crate::settings::unset(&mut config, key)?;
+            save_config(config_path, &config)?;
+            Ok(setting_view(&config, key))
+        }
+        other => anyhow::bail!("unknown configure action '{other}'; expected show, set or unset"),
+    }
+}
+
+/// The just-applied setting's snapshot entry, as a JSON value. `key` has
+/// already been validated against the registry by `apply`/`unset`, so it is
+/// always found.
+fn setting_view(config: &crystalline_core::config::GlobalConfig, key: &str) -> Value {
+    crate::settings::snapshot(config)
+        .into_iter()
+        .find(|v| v.key == key)
+        .map(|v| serde_json::to_value(v).unwrap_or(Value::Null))
+        .unwrap_or(Value::Null)
+}
+
+/// Save a config back to the path it was loaded from: the `--config`
+/// override, or the default global config path when none was given.
+fn save_config(
+    config_path: Option<&Path>,
+    config: &crystalline_core::config::GlobalConfig,
+) -> anyhow::Result<()> {
+    let path = match config_path {
+        Some(p) => p.to_path_buf(),
+        None => crystalline_core::config::global_config_path()?,
+    };
+    crystalline_core::config::save_yaml(&path, config)
+        .map_err(|e| anyhow::anyhow!("failed to save config {}: {e}", path.display()))
+}
+
 /// Resolve virtual-domain routing bullets for `prompt system`: over the daemon
 /// when one is running (its warm state), else against a directly opened store.
 /// Returns an empty map when the config has no virtual domains, so the common

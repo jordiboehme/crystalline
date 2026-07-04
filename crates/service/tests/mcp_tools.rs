@@ -101,7 +101,10 @@ async fn call(peer: &Peer<RoleClient>, tool: &str, args: Value) -> Result<Value,
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn list_tools_exposes_all_twelve() {
+async fn list_tools_exposes_the_twelve_core_tools_plus_configure() {
+    // With GitHub collaboration off (the default), `configure` is the only
+    // one of the six collaboration tools that is ever visible: see
+    // `crate::mcp::hidden_collab_tool` and its dedicated gating matrix tests.
     let h = Harness::new(&["eng"]).await;
     let (client, _server) = h.connect().await;
     let tools = client.peer().list_tools(Default::default()).await.unwrap();
@@ -119,10 +122,23 @@ async fn list_tools_exposes_all_twelve() {
         "browse_domain",
         "validate_engrams",
         "infer_schema",
+        "configure",
     ] {
         assert!(names.contains(&expected.to_string()), "missing {expected}");
     }
-    assert_eq!(names.len(), 12, "exactly 12 tools: {names:?}");
+    for hidden in [
+        "add_domain",
+        "share_changes",
+        "update_domain",
+        "origin_status",
+        "resolve_conflict",
+    ] {
+        assert!(
+            !names.contains(&hidden.to_string()),
+            "{hidden} must be hidden while github.enabled is off: {names:?}"
+        );
+    }
+    assert_eq!(names.len(), 13, "exactly 13 tools: {names:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -156,6 +172,22 @@ async fn read_only_hides_the_four_mutating_tools() {
         "infer_schema",
     ] {
         assert!(names.contains(&expected.to_string()), "missing {expected}");
+    }
+    // Read-only and GitHub collaboration off together hide all six
+    // collaboration tools too (the full gating matrix lives in
+    // tests/mcp_collab.rs).
+    for hidden in [
+        "configure",
+        "add_domain",
+        "share_changes",
+        "update_domain",
+        "origin_status",
+        "resolve_conflict",
+    ] {
+        assert!(
+            !names.contains(&hidden.to_string()),
+            "{hidden} must be hidden read-only: {names:?}"
+        );
     }
     assert_eq!(names.len(), 8, "exactly 8 tools in read-only: {names:?}");
 }

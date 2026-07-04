@@ -16,9 +16,12 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
-use chrono::{DateTime, Duration, FixedOffset};
-use crystalline_core::config::{DomainEntry, GlobalConfig};
+use chrono::{DateTime, Duration, FixedOffset, Utc};
+use crystalline_core::config::{
+    DomainEntry, DomainKind as CoreDomainKind, GlobalConfig, OriginConfig,
+};
 use crystalline_core::emit::{
     append_body, insert_after_section, insert_before_section, prepend_body, replace_section,
     touch_timestamp,
@@ -32,11 +35,16 @@ use crystalline_index::{
     EngramRecord, FileStamp, HostClaim, RecentFilter, SearchMode, SearchQuery, Store, chunk_engram,
     configured_model_id, parse_metadata_filters, provider_from_config, sync_domain_with,
 };
+use crystalline_remote::ops;
+use crystalline_remote::{GitHubProvider, OriginSpec, Provider, RemoteError, TokenStore};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
+use crate::origin;
 use crate::params::*;
+use crate::poller;
+use crate::settings;
 
 /// How many chunks are embedded per background batch.
 const EMBED_BATCH: usize = 16;
@@ -96,6 +104,24 @@ pub enum EngineError {
     /// An error from the storage or parse layer.
     #[error("{0}")]
     Internal(String),
+    /// A GitHub collaboration error from the remote origin engine, surfaced
+    /// with its message verbatim: every `RemoteError` variant is already
+    /// actionable product copy (see `crystalline_remote::error`), so this
+    /// never re-wraps or restates it. Deliberately not `#[from]`: thiserror
+    /// would then also derive `source()` pointing back at the same
+    /// `RemoteError`, and since its text is identical to this variant's own
+    /// `Display`, a top-level `anyhow` printer would show the message twice
+    /// (once as the error, once as its "caused by"). The manual `From` impl
+    /// below converts without that, mirroring `IndexError`'s and
+    /// `SettingsError`'s conversions in this file.
+    #[error("{0}")]
+    Remote(crystalline_remote::RemoteError),
+}
+
+impl From<crystalline_remote::RemoteError> for EngineError {
+    fn from(e: crystalline_remote::RemoteError) -> Self {
+        EngineError::Remote(e)
+    }
 }
 
 impl From<crystalline_index::IndexError> for EngineError {
@@ -118,6 +144,73 @@ impl From<crystalline_index::IndexError> for EngineError {
 
 /// The result type used across the engine.
 pub type Result<T> = std::result::Result<T, EngineError>;
+
+// --- connect auth (a testable seam over crystalline_remote::github::auth) ---
+
+/// The GitHub identity calls the `configure` tool's connect actions need:
+/// validating a token and running a device flow to completion. Production
+/// always uses [`RealConnectAuth`], a thin pass-through to
+/// `crystalline_remote::github::auth`; tests inject a fake so the
+/// pending-connect state machine (one flow at a time, a landed outcome
+/// reported once, the slot cleared after) can be driven deterministically,
+/// with no real device flow, network access or OS keychain interaction.
+#[async_trait::async_trait]
+pub trait ConnectAuth: Send + Sync {
+    /// Starts a device-flow sign-in, returning the code to show the user.
+    async fn start_device_flow(
+        &self,
+        auth_base: &str,
+        client_id: &str,
+    ) -> std::result::Result<crystalline_remote::DeviceFlowStart, RemoteError>;
+
+    /// Runs a started device flow to completion, returning the access token.
+    async fn run_device_flow(
+        &self,
+        auth_base: &str,
+        client_id: &str,
+        start: &crystalline_remote::DeviceFlowStart,
+    ) -> std::result::Result<String, RemoteError>;
+
+    /// Validates a token (freshly issued by a device flow, or a pasted
+    /// personal access token), returning the signed-in login.
+    async fn validate_token(
+        &self,
+        api_url: Option<&str>,
+        token: &str,
+    ) -> std::result::Result<String, RemoteError>;
+}
+
+/// The production [`ConnectAuth`]: delegates straight to
+/// `crystalline_remote::github::auth`.
+struct RealConnectAuth;
+
+#[async_trait::async_trait]
+impl ConnectAuth for RealConnectAuth {
+    async fn start_device_flow(
+        &self,
+        auth_base: &str,
+        client_id: &str,
+    ) -> std::result::Result<crystalline_remote::DeviceFlowStart, RemoteError> {
+        crystalline_remote::github::auth::start_device_flow(auth_base, client_id).await
+    }
+
+    async fn run_device_flow(
+        &self,
+        auth_base: &str,
+        client_id: &str,
+        start: &crystalline_remote::DeviceFlowStart,
+    ) -> std::result::Result<String, RemoteError> {
+        crystalline_remote::github::auth::run_device_flow(auth_base, client_id, start).await
+    }
+
+    async fn validate_token(
+        &self,
+        api_url: Option<&str>,
+        token: &str,
+    ) -> std::result::Result<String, RemoteError> {
+        crystalline_remote::github::auth::validate_token(api_url, token).await
+    }
+}
 
 /// A message from the engine to the daemon's file watcher: a domain root to
 /// start or stop watching, raised when a domain registered after the daemon
@@ -149,7 +242,11 @@ enum ContentSource {
 /// The shared service engine.
 pub struct Engine {
     store: Arc<Mutex<dyn Store>>,
-    config: GlobalConfig,
+    // The resolved config this engine was constructed with. Behind a lock (not
+    // an immutable snapshot) so `configure` can update a setting and every
+    // later read (including a concurrent one) sees it, mirroring the
+    // `discovered_domains`/`provider` interior-mutability pattern below.
+    config: std::sync::RwLock<GlobalConfig>,
     // The `--config` override this engine was started with, so a domain
     // registered after startup (`domain add` only ever touches the file on
     // disk) can be found by re-reading the same file. See `refresh_domain`.
@@ -189,6 +286,46 @@ pub struct Engine {
     // short threshold makes multi-instance stale-takeover verification fast).
     heartbeat_secs: i64,
     stale_secs: i64,
+    // Per-domain lock serializing `origin_add`, `origin_update` and
+    // `origin_status` against each other for one domain, so a connect and a
+    // pull racing on the same domain never interleave. Created lazily, one
+    // `tokio::sync::Mutex` per domain name ever operated on; held across the
+    // whole call rather than reasoning about which sub-step actually needs
+    // it, simplest and cheap since these calls are already rare and short.
+    origin_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    // A fixed provider used by every origin operation instead of the
+    // production per-operation `GitHubProvider` build, for tests: an engine
+    // built this way never reads config or the token store to decide who to
+    // talk to, and `origin_status`'s connection block reflects the injected
+    // provider's own identity rather than a real, untestable OS credential
+    // store. Production code never sets this.
+    origin_provider_override: Option<Arc<dyn Provider>>,
+    // Overrides where per-domain origin state (the base snapshot, conflict
+    // records, `state.json`) is read and written, for tests: `None` means the
+    // real `crystalline_core::config::origin_state_dir`, a real machine path
+    // no test may touch.
+    origins_dir_override: Option<PathBuf>,
+    // The `configure` tool's connect actions: production always resolves a
+    // fresh `RealConnectAuth`; tests inject a fake so the pending-connect
+    // state machine runs with no real device flow or network access.
+    connect_auth: Arc<dyn ConnectAuth>,
+    // The one in-flight device-flow sign-in this engine is tracking, if any.
+    // See `PendingConnect` and `Engine::start_device_connect`.
+    pending_connect: std::sync::Mutex<Option<PendingConnect>>,
+    // Forces the GitHub token store to a plain file under this directory
+    // instead of probing the real OS keychain, for tests: connect and
+    // configure tests must never read, write or prompt for the developer's
+    // actual credential store. `None` (production) uses the real
+    // `TokenStore::resolve`.
+    token_store_dir_override: Option<PathBuf>,
+    // The background origin poller's observable state: every domain's poll
+    // schedule and most recent result, plus the poller's one shared
+    // rate-limit pause. Always present (not an `Option`), whether or not
+    // `run_origin_poller` is actually spawned, so `status_report`'s offline
+    // `origins` block reads the same field in a daemon or a one-shot
+    // standalone engine alike; it simply stays at its empty default when no
+    // poller ever ticks.
+    origin_poller: poller::OriginPollerState,
 }
 
 impl Engine {
@@ -208,7 +345,7 @@ impl Engine {
         let chunk_params = ChunkParams::for_model(model_id.clone());
         Engine {
             store,
-            config,
+            config: std::sync::RwLock::new(config),
             config_path,
             discovered_domains: std::sync::RwLock::new(HashMap::new()),
             watch_tx: None,
@@ -221,6 +358,13 @@ impl Engine {
             hosted: std::sync::RwLock::new(HashMap::new()),
             heartbeat_secs: env_secs("CRYSTALLINE_HEARTBEAT_SECS", DEFAULT_HEARTBEAT_SECS),
             stale_secs: env_secs("CRYSTALLINE_STALE_SECS", DEFAULT_STALE_SECS),
+            origin_locks: std::sync::Mutex::new(HashMap::new()),
+            origin_provider_override: None,
+            origins_dir_override: None,
+            connect_auth: Arc::new(RealConnectAuth),
+            pending_connect: std::sync::Mutex::new(None),
+            token_store_dir_override: None,
+            origin_poller: poller::OriginPollerState::default(),
         }
     }
 
@@ -229,7 +373,7 @@ impl Engine {
     /// `config::read_or_create_instance_id`). With an id set, syncing a file
     /// domain first claims its host lock: acquired domains sync and embed here, a
     /// domain held by another live instance is skipped on a full sync and refused
-    /// on a named one, and this instance renews its locks on the heartbeat timer.
+    /// on a named one and this instance renews its locks on the heartbeat timer.
     /// An empty id (the default) leaves collaboration off.
     pub fn with_instance_id(mut self, instance_id: String) -> Engine {
         self.label = instance_id.clone();
@@ -260,6 +404,44 @@ impl Engine {
         self.read_only
     }
 
+    /// Inject a fixed provider for every origin operation (`origin_add`,
+    /// `origin_update`, `origin_status`), bypassing the production
+    /// per-operation `GitHubProvider` build from config and the token store.
+    /// Test-only: production code always leaves this unset so a fresh token
+    /// is read on every operation and a new `connect` is picked up without a
+    /// restart.
+    pub fn with_origin_provider(mut self, provider: Arc<dyn Provider>) -> Engine {
+        self.origin_provider_override = Some(provider);
+        self
+    }
+
+    /// Override the base directory per-domain origin state is read and
+    /// written under, in place of the real
+    /// `crystalline_core::config::origin_state_dir`. Test-only: lets origin
+    /// tests use a tempdir instead of touching the real machine's state
+    /// directory.
+    pub fn with_origins_dir(mut self, dir: PathBuf) -> Engine {
+        self.origins_dir_override = Some(dir);
+        self
+    }
+
+    /// Inject a fake [`ConnectAuth`] for the `configure` tool's connect
+    /// actions, bypassing the real device flow and token validation.
+    /// Test-only: production code always leaves this at the default
+    /// `RealConnectAuth`.
+    pub fn with_connect_auth(mut self, auth: Arc<dyn ConnectAuth>) -> Engine {
+        self.connect_auth = auth;
+        self
+    }
+
+    /// Force the GitHub token store to a plain file under `dir`, never the
+    /// real OS keychain. Test-only: a connect or configure test must never
+    /// read, write or prompt for the developer's actual credential store.
+    pub fn with_token_store_dir(mut self, dir: PathBuf) -> Engine {
+        self.token_store_dir_override = Some(dir);
+        self
+    }
+
     /// The shared store handle, for the daemon's watcher and embed loop.
     pub fn store(&self) -> Arc<Mutex<dyn Store>> {
         self.store.clone()
@@ -276,9 +458,10 @@ impl Engine {
         *self.provider.write().unwrap() = Some(provider);
     }
 
-    /// The registered config.
-    pub fn config(&self) -> &GlobalConfig {
-        &self.config
+    /// A snapshot of the registered config as of now, reflecting any
+    /// `configure` set or unset applied since construction.
+    pub fn config(&self) -> GlobalConfig {
+        self.config.read().unwrap().clone()
     }
 
     /// The active embedding model id.
@@ -446,7 +629,7 @@ impl Engine {
     /// discovered overlay, then a fresh re-read of the config from disk (a
     /// `domain add` only ever edits the file, never this in-memory snapshot).
     fn domain_entry(&self, name: &str) -> Result<DomainEntry> {
-        if let Some(entry) = self.config.domains.get(name) {
+        if let Some(entry) = self.config.read().unwrap().domains.get(name) {
             return Ok(entry.clone());
         }
         if let Some(entry) = self.discovered_domains.read().unwrap().get(name) {
@@ -485,7 +668,14 @@ impl Engine {
     /// Every domain name this engine currently knows about: the startup
     /// snapshot plus anything discovered since.
     fn known_domain_names(&self) -> Vec<String> {
-        let mut names: Vec<String> = self.config.domains.keys().cloned().collect();
+        let mut names: Vec<String> = self
+            .config
+            .read()
+            .unwrap()
+            .domains
+            .keys()
+            .cloned()
+            .collect();
         names.extend(self.discovered_domains.read().unwrap().keys().cloned());
         names
     }
@@ -1358,7 +1548,10 @@ impl Engine {
         drop(store);
 
         let mut out = Vec::new();
-        for (name, entry) in &self.config.domains {
+        // Cloned out from behind the lock before any `.await` below, matching
+        // the `hosted`/`discovered_domains` convention elsewhere in this file.
+        let domains = self.config.read().unwrap().domains.clone();
+        for (name, entry) in &domains {
             let source = self.source_of(entry);
             let s = stats.iter().find(|d| &d.name == name);
             let mut obj = json!({
@@ -1424,7 +1617,8 @@ impl Engine {
     /// inside its latency budget for virtual domains too.
     pub async fn virtual_routing_bullets(&self) -> BTreeMap<String, Vec<String>> {
         let mut out = BTreeMap::new();
-        for (name, entry) in &self.config.domains {
+        let domains = self.config.read().unwrap().domains.clone();
+        for (name, entry) in &domains {
             if entry.is_virtual() {
                 out.insert(name.clone(), self.virtual_routing_bullets_for(name).await);
             }
@@ -1803,7 +1997,7 @@ impl Engine {
     /// collaboration mode (a non-empty instance id) each file domain is claimed
     /// before syncing: an acquired domain syncs, a domain held by another live
     /// instance is skipped on a full sync (`only` is `None`) and refused on a
-    /// named one, and `take_over` forces the claim. Outside collaboration mode
+    /// named one and `take_over` forces the claim. Outside collaboration mode
     /// (standalone, single-instance) nothing is claimed and every target syncs.
     pub async fn sync_take_over(&self, only: Option<&str>, take_over: bool) -> Result<Value> {
         let targets = self.sync_targets(only)?;
@@ -1904,7 +2098,8 @@ impl Engine {
             },
             None => {
                 let mut targets: Vec<(String, PathBuf)> = Vec::new();
-                for (name, entry) in &self.config.domains {
+                let config = self.config.read().unwrap();
+                for (name, entry) in &config.domains {
                     if let Some(root) = entry.file_path().filter(|_| !entry.is_virtual()) {
                         targets.push((name.clone(), root));
                     }
@@ -1912,7 +2107,7 @@ impl Engine {
                 // A domain registered after startup and already resolved once
                 // (e.g. by a named `ctl sync`) rides along on a full sync too.
                 for (name, entry) in self.discovered_domains.read().unwrap().iter() {
-                    if self.config.domains.contains_key(name) {
+                    if config.domains.contains_key(name) {
                         continue;
                     }
                     if let Some(root) = entry.file_path().filter(|_| !entry.is_virtual()) {
@@ -1949,7 +2144,7 @@ impl Engine {
                 v
             })
             .collect();
-        Ok(json!({
+        let mut result = json!({
             "fts_mode": info.fts_mode,
             "schema_version": info.schema_version,
             "db_path": info.db_path,
@@ -1963,7 +2158,15 @@ impl Engine {
                 "total_chunks": coverage.total_chunks,
                 "hybrid_available": coverage.has_active_embeddings(&self.model_id),
             },
-        }))
+        });
+        // Omitted entirely while collaboration is off, so pre-feature output
+        // stays byte-stable for an install that never touches GitHub.
+        if self.config.read().unwrap().github_enabled()
+            && let Value::Object(map) = &mut result
+        {
+            map.insert("origins".to_string(), self.origins_status_block().await);
+        }
+        Ok(result)
     }
 
     /// The domain-id set this instance should embed, or `None` for "all domains".
@@ -1979,13 +2182,15 @@ impl Engine {
         let mut ids: Vec<DomainId> = self.hosted.read().unwrap().values().copied().collect();
         let mut virtuals: Vec<String> = self
             .config
+            .read()
+            .unwrap()
             .domains
             .iter()
             .filter(|(_, e)| e.is_virtual())
             .map(|(n, _)| n.clone())
             .collect();
         for (name, entry) in self.discovered_domains.read().unwrap().iter() {
-            if entry.is_virtual() && !self.config.domains.contains_key(name) {
+            if entry.is_virtual() && !self.config.read().unwrap().domains.contains_key(name) {
                 virtuals.push(name.clone());
             }
         }
@@ -2050,6 +2255,1059 @@ impl Engine {
         }
         Ok(embedded)
     }
+
+    // --- configure -------------------------------------------------------------
+
+    /// Show, set or reset an agent-adjustable setting from the
+    /// [`crate::settings`] registry. `show` takes only the config's read lock
+    /// and is always allowed, even on a read-only instance; `set` and `unset`
+    /// refuse with `EngineError::ReadOnly` on a read-only instance (config is
+    /// frozen the same way the four content-mutating methods are), otherwise
+    /// they validate and apply the change, persist the config file this engine
+    /// was started with (or the default path) and update the in-memory config
+    /// so a later read (including a concurrent one, once the write lock
+    /// releases) sees it.
+    pub async fn configure(&self, action: &ConfigureAction) -> Result<Value> {
+        match action {
+            ConfigureAction::Show => {
+                let config = self.config.read().unwrap();
+                Ok(json!({ "settings": settings::snapshot(&config) }))
+            }
+            ConfigureAction::Set { key, value } => {
+                if self.read_only {
+                    return Err(EngineError::ReadOnly);
+                }
+                // Acquire write lock first to serialize against concurrent configure calls.
+                // This prevents two tasks from both cloning the old config and clobbering
+                // each other's changes. persist_config is synchronous (no .await), so
+                // holding the write guard across it is safe and legal.
+                let mut guard = self.config.write().unwrap();
+                let mut config = guard.clone();
+                settings::apply(&mut config, key, value)?;
+                self.persist_config(&config)?;
+                let view = self.setting_view_json(&config, key);
+                *guard = config;
+                Ok(view)
+            }
+            ConfigureAction::Unset { key } => {
+                if self.read_only {
+                    return Err(EngineError::ReadOnly);
+                }
+                // Acquire write lock first to serialize against concurrent configure calls.
+                // This prevents two tasks from both cloning the old config and clobbering
+                // each other's changes. persist_config is synchronous (no .await), so
+                // holding the write guard across it is safe and legal.
+                let mut guard = self.config.write().unwrap();
+                let mut config = guard.clone();
+                settings::unset(&mut config, key)?;
+                self.persist_config(&config)?;
+                let view = self.setting_view_json(&config, key);
+                *guard = config;
+                Ok(view)
+            }
+        }
+    }
+
+    /// The just-applied setting's snapshot entry, as a JSON value. `key` has
+    /// already been validated against the registry by `apply`/`unset`, so it
+    /// is always found.
+    fn setting_view_json(&self, config: &GlobalConfig, key: &str) -> Value {
+        settings::snapshot(config)
+            .into_iter()
+            .find(|v| v.key == key)
+            .map(|v| serde_json::to_value(v).unwrap_or(Value::Null))
+            .unwrap_or(Value::Null)
+    }
+
+    /// Persist a config to the path this engine was started with (its
+    /// `--config` override), or the default global config path when none was
+    /// given. Never touches unrelated content: the caller always passes the
+    /// current, load-modify-save typed config, so the serde round trip keeps
+    /// every other key byte-for-byte.
+    fn persist_config(&self, config: &GlobalConfig) -> Result<()> {
+        let path = match &self.config_path {
+            Some(p) => p.clone(),
+            None => crystalline_core::config::global_config_path()
+                .map_err(|e| EngineError::Internal(e.to_string()))?,
+        };
+        crystalline_core::config::save_yaml(&path, config).map_err(|e| {
+            EngineError::Internal(format!("failed to save config {}: {e}", path.display()))
+        })
+    }
+
+    // --- origin (GitHub collaboration) ----------------------------------------
+
+    /// Connects a new domain to a GitHub repository: downloads its tracked
+    /// subtree, registers it in the global config and brings it into the
+    /// index, mirroring what `domain add` does for a local folder.
+    ///
+    /// `domain` defaults to the repository's own name segment; `folder`
+    /// defaults to `~/Documents/Crystalline/<domain>`. `path` is the
+    /// subfolder within the repository that is the domain root (absent means
+    /// the repository root); `branch` defaults to `main`.
+    ///
+    /// Refuses with `github.enabled`'s message when collaboration is off,
+    /// and with `EngineError::ReadOnly` on a read-only instance (this both
+    /// writes content and mutates config, exactly the two things read-only
+    /// mode protects). Returns `{ domain, root, engrams, base_commit }` on
+    /// success.
+    pub async fn origin_add(
+        &self,
+        repo: &str,
+        domain: Option<&str>,
+        path: Option<&str>,
+        branch: Option<&str>,
+        folder: Option<&str>,
+    ) -> Result<Value> {
+        if !self.config.read().unwrap().github_enabled() {
+            return Err(RemoteError::NotEnabled.into());
+        }
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+
+        let domain_name = match domain {
+            Some(d) => d.to_string(),
+            None => origin::default_domain_name(repo),
+        };
+        if self.domain_entry(&domain_name).is_ok() {
+            return Err(EngineError::Conflict(format!(
+                "domain '{domain_name}' is already registered; pass a domain name to connect this origin under a different one"
+            )));
+        }
+
+        let lock = self.origin_lock(&domain_name);
+        let _guard = lock.lock().await;
+
+        let root = match folder {
+            Some(f) => crystalline_core::config::expand_tilde(f),
+            None => origin::default_domain_folder(&domain_name),
+        };
+        let branch_name = branch.unwrap_or("main").to_string();
+        let spec = OriginSpec {
+            repo: repo.to_string(),
+            subpath: path.map(str::to_string),
+            branch: branch_name,
+        };
+        let state_dir = self.origin_state_dir(&domain_name)?;
+
+        let provider = self.resolve_origin_provider()?;
+        let report = ops::subscribe(provider.as_ref(), &spec, &root, &state_dir).await?;
+
+        // Register the domain and persist, mirroring `configure`'s
+        // write-lock-first pattern so a concurrent read never observes a
+        // half-applied config.
+        {
+            let mut guard = self.config.write().unwrap();
+            let mut config = guard.clone();
+            config.domains.insert(
+                domain_name.clone(),
+                DomainEntry {
+                    kind: CoreDomainKind::File,
+                    path: Some(root.clone()),
+                    origin: Some(OriginConfig {
+                        repo: repo.to_string(),
+                        path: path.map(str::to_string),
+                        branch: branch.map(str::to_string),
+                        poll_secs: None,
+                    }),
+                },
+            );
+            self.persist_config(&config)?;
+            *guard = config;
+        }
+
+        // Tell a running daemon's watcher to start watching the new root; it
+        // also runs its own catch-up sync and embed once the watch is armed.
+        // This engine's own sync just below runs regardless, so the domain is
+        // searchable immediately even outside a daemon (a standalone CLI
+        // command, or a race with the watcher's async catch-up); sync is
+        // checksum idempotent, so the watcher repeating it moments later is a
+        // harmless no-op.
+        if let Some(tx) = &self.watch_tx {
+            let _ = tx.send(WatchEvent::Add(domain_name.clone(), root.clone()));
+        }
+
+        self.sync(Some(&domain_name)).await?;
+        if let Err(e) = self.embed_pending().await {
+            tracing::warn!("embedding after connecting '{domain_name}' failed: {e}");
+        }
+
+        Ok(json!({
+            "domain": domain_name,
+            "root": root.display().to_string(),
+            "engrams": report.engrams,
+            "base_commit": report.base_commit,
+        }))
+    }
+
+    /// Brings one origin-connected domain (or every one, when `domain` is
+    /// `None`) up to date with its origin. Errors when a named domain is not
+    /// registered or has no origin; one domain failing (offline, revoked)
+    /// never aborts the others, each per-domain failure is collected into the
+    /// `errors` array instead. Allowed on a read-only instance: a pull is a
+    /// derived-truth update like sync, not a user-authored content write.
+    pub async fn origin_update(&self, domain: Option<&str>) -> Result<Value> {
+        if !self.config.read().unwrap().github_enabled() {
+            return Err(RemoteError::NotEnabled.into());
+        }
+        let targets = self.origin_targets(domain)?;
+
+        let mut domains = Vec::new();
+        let mut errors = Vec::new();
+        for (name, entry) in targets {
+            match self.origin_update_one(&name, &entry).await {
+                Ok(v) => domains.push(v),
+                Err(e) => errors.push(json!({ "domain": name, "error": e.to_string() })),
+            }
+        }
+        Ok(json!({ "domains": domains, "errors": errors }))
+    }
+
+    /// Pulls and syncs one domain, under its origin lock. The per-domain body
+    /// behind `origin_update`'s aggregate loop.
+    async fn origin_update_one(&self, name: &str, entry: &DomainEntry) -> Result<Value> {
+        let lock = self.origin_lock(name);
+        let _guard = lock.lock().await;
+
+        let (spec, root, state_dir) = self.origin_spec_for(name, entry)?;
+        let provider = self.resolve_origin_provider()?;
+        let report = ops::pull(provider.as_ref(), &spec, &root, &state_dir).await?;
+
+        self.sync(Some(name)).await?;
+        if let Err(e) = self.embed_pending().await {
+            tracing::warn!("embedding after updating '{name}' failed: {e}");
+        }
+
+        // `ops::pull` already saved the post-pull state to `state_dir`; reload
+        // it fresh so each transition's url and title can be joined in for
+        // the caller. A reload failure only degrades the proposal entries to
+        // number and status (see `origin::proposal_transitions_json`), it
+        // never fails an update that has already landed on disk.
+        let state = crystalline_remote::state::OriginState::load(&state_dir)
+            .ok()
+            .flatten();
+        let proposals = origin::proposal_transitions_json(&report.proposals, state.as_ref());
+
+        Ok(origin::pull_report_json(name, &report, proposals))
+    }
+
+    /// Reports where one origin-connected domain (or every one, when
+    /// `domain` is `None`) stands relative to its origin, plus this
+    /// machine's GitHub connection. Never hard-fails just because the
+    /// machine is offline or has no saved connection: each domain's `behind`
+    /// is `None` and the connection block reports `connected: false` rather
+    /// than erroring. One domain's genuine failure (corrupt state, a missing
+    /// filesystem root) never aborts the others: it is collected into the
+    /// `errors` array instead, mirroring `origin_update`. Allowed on a
+    /// read-only instance (a pure read).
+    pub async fn origin_status(&self, domain: Option<&str>) -> Result<Value> {
+        if !self.config.read().unwrap().github_enabled() {
+            return Err(RemoteError::NotEnabled.into());
+        }
+        let targets = self.origin_targets(domain)?;
+        let connection = self.origin_connection_json().await?;
+
+        let mut domains = Vec::new();
+        let mut errors = Vec::new();
+        for (name, entry) in targets {
+            match self.origin_status_one(&name, &entry).await {
+                Ok(v) => domains.push(v),
+                Err(e) => errors.push(json!({ "domain": name, "error": e.to_string() })),
+            }
+        }
+        Ok(json!({ "connection": connection, "domains": domains, "errors": errors }))
+    }
+
+    /// Reports one domain's status, under its origin lock. The per-domain
+    /// body behind `origin_status`'s aggregate loop.
+    ///
+    /// A live probe is best-effort in two layers: no connection, or a
+    /// provider that fails to build, degrades straight to `probe: None`
+    /// (unchanged from before). When a provider was resolved but the probe
+    /// call itself fails for a transport reason - offline, rate limited, an
+    /// expired connection, see [`origin::is_probe_transport_error`] - the
+    /// same domain is retried once with no probe at all, so the
+    /// offline-capable report still comes back; the probe's own error
+    /// message rides along verbatim as `probe_error` instead of aborting
+    /// the domain. Any other failure (corrupt local state, and so on) is a
+    /// genuine per-domain error, propagated to the caller's `errors` array.
+    async fn origin_status_one(&self, name: &str, entry: &DomainEntry) -> Result<Value> {
+        let lock = self.origin_lock(name);
+        let _guard = lock.lock().await;
+        let (spec, root, state_dir) = self.origin_spec_for(name, entry)?;
+        // A probe is best-effort: no connection, or a provider that fails to
+        // build, must never turn a status call into a hard failure.
+        let probe = self.resolve_origin_provider().ok();
+        match ops::status(&spec, &root, &state_dir, probe.as_deref()).await {
+            Ok(report) => Ok(origin::status_report_json(name, &report, None)),
+            Err(e) if probe.is_some() && origin::is_probe_transport_error(&e) => {
+                let report = ops::status(&spec, &root, &state_dir, None).await?;
+                Ok(origin::status_report_json(
+                    name,
+                    &report,
+                    Some(e.to_string()),
+                ))
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Runs one scheduling pass of the background origin poller: checks
+    /// whether collaboration is enabled, connected and not paused for a
+    /// shared rate limit, then brings every due origin-connected domain up
+    /// to date via [`Engine::origin_update_one`], the same per-domain pull
+    /// an on-demand `origin_update` runs, under the same per-domain lock, so
+    /// a poll tick and a concurrent on-demand update on the same domain
+    /// never interleave. This method never talks to GitHub itself; it only
+    /// decides which domains are due and delegates the actual pull, so
+    /// polling and on-demand updating stay exactly one code path.
+    ///
+    /// `now` drives every due/not-due decision and `wall_now` is its
+    /// wall-clock mirror, recorded alongside every reschedule so
+    /// `status_report`'s offline `origins` block can show `next_due` without
+    /// ever touching an `Instant` (which carries no epoch and cannot be
+    /// serialized). Passing both in, rather than reading `Instant::now()`
+    /// and `Utc::now()` here, is what lets a test drive several ticks
+    /// deterministically with no real waiting.
+    ///
+    /// A tick does nothing when collaboration is off (so enabling it later
+    /// starts polling on the very next tick, no restart needed), when the
+    /// shared rate-limit pause has not yet elapsed or when no GitHub token
+    /// is on file (so a `connect` lands and the next tick picks it up
+    /// automatically; a debug line notes this at most once an hour). A
+    /// domain hitting `RemoteError::RateLimited` pauses every domain until
+    /// the reported reset (defaulting an hour out when GitHub reports none)
+    /// and ends the tick immediately, since GitHub rate limits are
+    /// per-token, not per-repository. Any other per-domain failure (offline,
+    /// a revoked token, a corrupt state directory) is recorded quietly and
+    /// never stops the tick from moving on to the next due domain.
+    pub async fn origin_poll_tick(&self, now: Instant, wall_now: DateTime<Utc>) {
+        if !self.config.read().unwrap().github_enabled() {
+            return;
+        }
+        if let Some(until) = self.origin_poller.rate_limited_until() {
+            if wall_now < until {
+                return;
+            }
+            self.origin_poller.set_rate_limited_until(None);
+        }
+        if !self.origin_connection_offline().0 {
+            if self.origin_poller.should_log_no_token(now) {
+                tracing::debug!(
+                    "origin poll: no GitHub connection yet; waiting for connect to resume polling"
+                );
+            }
+            return;
+        }
+        let Ok(targets) = self.origin_targets(None) else {
+            return;
+        };
+        let github_poll_secs = self
+            .config
+            .read()
+            .unwrap()
+            .github
+            .as_ref()
+            .and_then(|g| g.poll_secs);
+
+        for (name, entry) in targets {
+            if !self.origin_poller.is_due(&name, now) {
+                continue;
+            }
+            let domain_poll_secs = entry.origin.as_ref().and_then(|o| o.poll_secs);
+            let interval_secs = poller::effective_interval_secs(domain_poll_secs, github_poll_secs);
+            let tick = self.origin_poller.next_tick();
+            let jitter = poller::jittered_interval(interval_secs, &name, tick);
+            let jitter_chrono =
+                Duration::from_std(jitter).unwrap_or(Duration::seconds(interval_secs as i64));
+            self.origin_poller
+                .schedule(&name, now + jitter, wall_now + jitter_chrono);
+
+            match self.origin_update_one(&name, &entry).await {
+                Ok(v) => {
+                    let up_to_date = v["up_to_date"].as_bool().unwrap_or(false);
+                    let applied = v["applied"].as_array().map(Vec::len).unwrap_or(0);
+                    let conflict_paths: Vec<&str> = v["conflicts"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|c| c["path"].as_str())
+                        .collect();
+                    // A share proposal can transition (merged, declined) with
+                    // no file in this domain changing at all, so it needs its
+                    // own info line even when the pull otherwise reports
+                    // `up_to_date`: `PullReport::proposals` (see
+                    // `crystalline_remote::ops::settle_up_to_date`) is
+                    // refreshed on every pull regardless of whether the
+                    // branch itself moved.
+                    let proposal_lines: Vec<String> = v["proposals"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .map(|p| {
+                            let number = p["number"].as_u64().unwrap_or(0);
+                            let status = p["status"].as_str().unwrap_or("?");
+                            format!("#{number} {status}")
+                        })
+                        .collect();
+                    if !conflict_paths.is_empty() {
+                        tracing::info!(
+                            "origin poll: '{name}' has new conflict(s): {}",
+                            conflict_paths.join(", ")
+                        );
+                    } else if !proposal_lines.is_empty() {
+                        tracing::info!(
+                            "origin poll: '{name}' proposal update: {}",
+                            proposal_lines.join(", ")
+                        );
+                    } else if !up_to_date {
+                        tracing::info!("origin poll: '{name}' applied {applied} file(s)");
+                    } else {
+                        tracing::debug!("origin poll: '{name}' is up to date");
+                    }
+                    let outcome = if up_to_date {
+                        poller::DomainPollOutcome::UpToDate
+                    } else {
+                        poller::DomainPollOutcome::Applied {
+                            applied,
+                            conflicts: conflict_paths.len(),
+                        }
+                    };
+                    self.origin_poller.record_result(&name, outcome);
+                }
+                Err(EngineError::Remote(RemoteError::RateLimited { reset })) => {
+                    let until = reset.unwrap_or_else(|| wall_now + Duration::hours(1));
+                    tracing::warn!(
+                        "origin poll: GitHub is rate limiting this machine; pausing every domain until {until}"
+                    );
+                    self.origin_poller.set_rate_limited_until(Some(until));
+                    return;
+                }
+                Err(e) => {
+                    tracing::debug!("origin poll: '{name}' failed: {e}");
+                    self.origin_poller
+                        .record_result(&name, poller::DomainPollOutcome::Error(e.to_string()));
+                }
+            }
+        }
+    }
+
+    /// This machine's GitHub connection for `status_report`'s offline
+    /// `origins` block: `(connected, token_store)`. Unlike
+    /// `origin_connection_json` (used by the live `origin_status` operation,
+    /// which reflects an injected test provider's own identity as always
+    /// connected), this never special-cases an injected provider: it is a
+    /// plain token-store lookup, exactly the same check the poller itself
+    /// makes before spending a tick on any domain, so the two never
+    /// disagree about whether this machine is connected.
+    fn origin_connection_offline(&self) -> (bool, Option<&'static str>) {
+        let api_url = self
+            .config
+            .read()
+            .unwrap()
+            .github
+            .as_ref()
+            .and_then(|g| g.api_url.clone());
+        let host = origin::token_host(api_url.as_deref());
+        let Ok(store) = self.resolve_token_store(host.as_deref()) else {
+            return (false, None);
+        };
+        match store.load() {
+            Ok(Some(_)) => (true, Some(store.kind())),
+            _ => (false, None),
+        }
+    }
+
+    /// Builds `status_report`'s `origins` block entirely offline: this
+    /// machine's GitHub connection, the poller's shared rate-limit pause
+    /// and, per origin-connected domain, its repo, branch, proposal and
+    /// conflict counts and local change count from a probe-free
+    /// `ops::status` call (the same state-only read `origin_status` itself
+    /// falls back to when a live probe fails), plus the poller's own
+    /// schedule and last result for that domain. Every read here is local:
+    /// the token store and each domain's saved origin state, never a GitHub
+    /// call, so `status` never blocks on the network even when
+    /// collaboration is on.
+    async fn origins_status_block(&self) -> Value {
+        let (connected, token_store) = self.origin_connection_offline();
+        let rate_limit_wait_until = self.origin_poller.rate_limited_until();
+        let targets = self.origin_targets(None).unwrap_or_default();
+
+        let mut domains = Vec::new();
+        for (name, entry) in targets {
+            let Ok((spec, root, state_dir)) = self.origin_spec_for(&name, &entry) else {
+                continue;
+            };
+            let Ok(report) = ops::status(&spec, &root, &state_dir, None).await else {
+                continue;
+            };
+            let next_due = self.origin_poller.next_due_at(&name);
+            let last_result = self.origin_poller.last_result(&name);
+            domains.push(origin::origin_poll_status_json(
+                &name,
+                &report,
+                next_due,
+                last_result.as_ref(),
+            ));
+        }
+
+        json!({
+            "enabled": true,
+            "connected": connected,
+            "token_store": token_store,
+            "rate_limit_wait_until": rate_limit_wait_until,
+            "domains": domains,
+        })
+    }
+
+    /// Proposes one domain's local changes as a pull request against its
+    /// origin, under its origin lock.
+    ///
+    /// Refuses with `github.enabled`'s message when collaboration is off,
+    /// and with `EngineError::ReadOnly` on a read-only instance (a share
+    /// publishes content, exactly what read-only mode protects). When
+    /// `ops::propose` refuses because conflicts are still pending, this
+    /// degrades that refusal into a `conflicts_pending` outcome carrying the
+    /// actual conflict paths (reloaded from the domain's now-current state,
+    /// durable on disk since the inline pull inside `propose` already
+    /// persisted them) rather than the bare count `RemoteError` alone
+    /// carries, so a caller never needs to make a second round trip to learn
+    /// what needs resolving. Nothing local changes on a share, so no sync
+    /// runs afterward.
+    pub async fn origin_share(
+        &self,
+        domain: &str,
+        title: Option<&str>,
+        description: Option<&str>,
+    ) -> Result<Value> {
+        if !self.config.read().unwrap().github_enabled() {
+            return Err(RemoteError::NotEnabled.into());
+        }
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        let lock = self.origin_lock(domain);
+        let _guard = lock.lock().await;
+        let (spec, root, state_dir) = self.origin_spec_for_domain(domain)?;
+        let provider = self.resolve_origin_provider()?;
+        match ops::propose(
+            provider.as_ref(),
+            &spec,
+            &root,
+            domain,
+            &state_dir,
+            title,
+            description,
+        )
+        .await
+        {
+            Ok(outcome) => Ok(origin::propose_outcome_json(&outcome)),
+            Err(RemoteError::ConflictsPending { count }) => {
+                let conflicts = crystalline_remote::state::OriginState::load(&state_dir)
+                    .ok()
+                    .flatten()
+                    .map(|s| s.conflicts)
+                    .unwrap_or_default();
+                Ok(json!({
+                    "outcome": "conflicts_pending",
+                    "count": count,
+                    "conflicts": conflicts,
+                }))
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Discards a declined, or still-open ("never mind"), share proposal for
+    /// one domain, under its origin lock, then syncs the domain (and
+    /// embeds) since discarding can restore or delete working-tree files.
+    ///
+    /// Refuses with `github.enabled`'s message when collaboration is off,
+    /// and with `EngineError::ReadOnly` on a read-only instance (a discard
+    /// writes the working tree).
+    pub async fn origin_discard(&self, domain: &str, proposal_number: u64) -> Result<Value> {
+        if !self.config.read().unwrap().github_enabled() {
+            return Err(RemoteError::NotEnabled.into());
+        }
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        let lock = self.origin_lock(domain);
+        let _guard = lock.lock().await;
+        let (_, root, state_dir) = self.origin_spec_for_domain(domain)?;
+        let report = ops::discard(&root, &state_dir, proposal_number)?;
+
+        self.sync(Some(domain)).await?;
+        if let Err(e) = self.embed_pending().await {
+            tracing::warn!(
+                "embedding after discarding proposal #{proposal_number} for '{domain}' failed: {e}"
+            );
+        }
+
+        Ok(json!({
+            "restored": report.restored,
+            "deleted": report.deleted,
+            "skipped_diverged": report.skipped_diverged,
+        }))
+    }
+
+    /// Resolves one recorded conflict for one domain, under its origin lock,
+    /// then syncs the domain (and embeds) since resolving writes the
+    /// working tree.
+    ///
+    /// `keep` is `"mine"` or `"theirs"`; exactly one of `keep` or `content`
+    /// must be supplied (see [`origin::resolution_from`]). Refuses with
+    /// `github.enabled`'s message when collaboration is off, and with
+    /// `EngineError::ReadOnly` on a read-only instance.
+    pub async fn origin_resolve(
+        &self,
+        domain: &str,
+        path: &str,
+        keep: Option<&str>,
+        content: Option<&[u8]>,
+    ) -> Result<Value> {
+        if !self.config.read().unwrap().github_enabled() {
+            return Err(RemoteError::NotEnabled.into());
+        }
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        let resolution = origin::resolution_from(keep, content)?;
+        let lock = self.origin_lock(domain);
+        let _guard = lock.lock().await;
+        let (_, root, state_dir) = self.origin_spec_for_domain(domain)?;
+        let report = ops::resolve(&root, &state_dir, path, resolution)?;
+
+        self.sync(Some(domain)).await?;
+        if let Err(e) = self.embed_pending().await {
+            tracing::warn!("embedding after resolving a conflict for '{domain}' failed: {e}");
+        }
+
+        Ok(json!({
+            "resolved": report.resolved,
+            "remaining": report.remaining,
+        }))
+    }
+
+    /// Resolves a single domain's `OriginSpec`, root and state directory for
+    /// `origin_share`, `origin_discard` and `origin_resolve`: each a
+    /// single-domain operation unlike `origin_update`/`origin_status`'s
+    /// optional "every domain" mode. Errors with `UnknownDomain` when
+    /// unregistered, and with the same "has no origin" message
+    /// `origin_spec_for` raises when registered but not origin-connected.
+    fn origin_spec_for_domain(&self, domain: &str) -> Result<(OriginSpec, PathBuf, PathBuf)> {
+        let entry = self.domain_entry(domain)?;
+        self.origin_spec_for(domain, &entry)
+    }
+
+    /// The domains `origin_update`/`origin_status` operate on: the one named
+    /// (erroring if it is not registered or has no origin) or every
+    /// registered domain with an origin, mirroring `sync_targets`'s
+    /// config-then-discovered layering.
+    fn origin_targets(&self, domain: Option<&str>) -> Result<Vec<(String, DomainEntry)>> {
+        match domain {
+            Some(name) => {
+                let entry = self.domain_entry(name)?;
+                if entry.origin.is_none() {
+                    return Err(EngineError::Invalid(format!(
+                        "domain '{name}' has no origin; connect it with `crystalline domain add --origin`"
+                    )));
+                }
+                Ok(vec![(name.to_string(), entry)])
+            }
+            None => {
+                let mut out: Vec<(String, DomainEntry)> = Vec::new();
+                let config = self.config.read().unwrap();
+                for (name, entry) in &config.domains {
+                    if entry.origin.is_some() {
+                        out.push((name.clone(), entry.clone()));
+                    }
+                }
+                for (name, entry) in self.discovered_domains.read().unwrap().iter() {
+                    if config.domains.contains_key(name) {
+                        continue;
+                    }
+                    if entry.origin.is_some() {
+                        out.push((name.clone(), entry.clone()));
+                    }
+                }
+                Ok(out)
+            }
+        }
+    }
+
+    /// The `OriginSpec`, domain root and origin state directory for a
+    /// registered domain's origin.
+    fn origin_spec_for(
+        &self,
+        name: &str,
+        entry: &DomainEntry,
+    ) -> Result<(OriginSpec, PathBuf, PathBuf)> {
+        let origin_cfg = entry
+            .origin
+            .as_ref()
+            .ok_or_else(|| EngineError::Invalid(format!("domain '{name}' has no origin")))?;
+        let root = entry.file_path().ok_or_else(|| {
+            EngineError::Invalid(format!(
+                "domain '{name}' has no filesystem root to sync an origin into"
+            ))
+        })?;
+        let state_dir = self.origin_state_dir(name)?;
+        let spec = OriginSpec {
+            repo: origin_cfg.repo.clone(),
+            subpath: origin_cfg.path.clone(),
+            branch: origin_cfg.branch().to_string(),
+        };
+        Ok((spec, root, state_dir))
+    }
+
+    /// The per-domain lock serializing origin operations for one domain
+    /// name, created lazily on first use.
+    fn origin_lock(&self, domain: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.origin_locks.lock().unwrap();
+        locks
+            .entry(domain.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    /// The base directory per-domain origin state lives under: the test
+    /// override, or the real state directory.
+    fn origins_base_dir(&self) -> Result<PathBuf> {
+        match &self.origins_dir_override {
+            Some(p) => Ok(p.clone()),
+            None => crystalline_core::config::origins_state_dir()
+                .map_err(|e| EngineError::Internal(e.to_string())),
+        }
+    }
+
+    /// One domain's origin state directory (base snapshot, conflict records,
+    /// `state.json`).
+    fn origin_state_dir(&self, domain: &str) -> Result<PathBuf> {
+        Ok(self.origins_base_dir()?.join(domain))
+    }
+
+    /// Resolves the provider an origin operation runs its GitHub calls
+    /// through: the injected test provider when one is set, or a fresh
+    /// `GitHubProvider` built from the current config and a token read from
+    /// the token store right now, so a `connect` earlier this same process
+    /// is picked up without a restart. Errors with `RemoteError::NotConnected`
+    /// when no token has been saved and no test provider is injected.
+    fn resolve_origin_provider(&self) -> Result<Arc<dyn Provider>> {
+        if let Some(p) = &self.origin_provider_override {
+            return Ok(p.clone());
+        }
+        let api_url = self
+            .config
+            .read()
+            .unwrap()
+            .github
+            .as_ref()
+            .and_then(|g| g.api_url.clone());
+        let host = origin::token_host(api_url.as_deref());
+        let store = self.resolve_token_store(host.as_deref())?;
+        let token = store.load()?.ok_or(RemoteError::NotConnected)?;
+        Ok(Arc::new(GitHubProvider::new(
+            api_url,
+            Some(token.access_token),
+        )))
+    }
+
+    /// This machine's GitHub connection, for `origin_status`: `{ connected,
+    /// user, token_store }`. With an injected test provider, reflects the
+    /// mock's own identity instead of the real token store, so origin tests
+    /// never touch the OS keychain or a real credential file.
+    async fn origin_connection_json(&self) -> Result<Value> {
+        if let Some(provider) = &self.origin_provider_override {
+            let user = provider.current_user().await.ok();
+            return Ok(json!({ "connected": true, "user": user, "token_store": "file" }));
+        }
+        let api_url = self
+            .config
+            .read()
+            .unwrap()
+            .github
+            .as_ref()
+            .and_then(|g| g.api_url.clone());
+        let host = origin::token_host(api_url.as_deref());
+        let store = self.resolve_token_store(host.as_deref())?;
+        let token = store.load()?;
+        Ok(json!({
+            "connected": token.is_some(),
+            "user": token.as_ref().map(|t| t.user.clone()),
+            "token_store": store.kind(),
+        }))
+    }
+
+    /// Resolves the `TokenStore` backend for `host`: the test override when
+    /// one is set (see [`Engine::with_token_store_dir`]), a plain file store
+    /// that never touches the real OS keychain, otherwise the real
+    /// `TokenStore::resolve` (the keyring when a cheap probe says it works,
+    /// else a file under the origins state directory).
+    fn resolve_token_store(&self, host: Option<&str>) -> Result<TokenStore> {
+        if let Some(dir) = &self.token_store_dir_override {
+            return Ok(TokenStore::File {
+                path: dir.join("github-token.json"),
+            });
+        }
+        let base = self.origins_base_dir()?;
+        Ok(TokenStore::resolve(host, &base))
+    }
+
+    // --- configure: GitHub connect ------------------------------------------
+
+    /// The api url a connect action uses for this one call: `host`
+    /// (formatted as a GitHub Enterprise Server api base) when supplied,
+    /// otherwise the durable `github.api_url` setting. `host` never persists;
+    /// durable Enterprise Server setup is `set github.api_url`.
+    fn connect_api_url(&self, host: Option<&str>) -> Option<String> {
+        host.map(|h| format!("https://{h}/api/v3")).or_else(|| {
+            self.config
+                .read()
+                .unwrap()
+                .github
+                .as_ref()
+                .and_then(|g| g.api_url.clone())
+        })
+    }
+
+    /// The OAuth App client id a connect action authenticates as: the
+    /// self-hosted override from `github.oauth_client_id` when set, else the
+    /// embedded Crystalline client id.
+    fn oauth_client_id(&self) -> String {
+        self.config
+            .read()
+            .unwrap()
+            .github
+            .as_ref()
+            .and_then(|g| g.oauth_client_id.clone())
+            .unwrap_or_else(|| crystalline_remote::GITHUB_CLIENT_ID.to_string())
+    }
+
+    /// The pending device flow's display view, `{ pending: true, user_code,
+    /// verification_url, expires_in_secs }`, or `None` when no flow is
+    /// running.
+    fn pending_view(&self) -> Option<Value> {
+        self.pending_connect.lock().unwrap().as_ref().map(|p| {
+            json!({
+                "pending": true,
+                "user_code": p.user_code,
+                "verification_url": p.verification_url,
+                "expires_in_secs": p.expires_in_secs,
+            })
+        })
+    }
+
+    /// Takes the pending flow's outcome if it has landed, clearing the slot
+    /// so a later connect starts fresh. Returns `None` both when no flow is
+    /// pending at all and when one is pending but still waiting on the
+    /// user; a caller distinguishes those with [`Engine::pending_view`].
+    fn take_finished_pending(&self) -> Option<std::result::Result<String, RemoteError>> {
+        let mut guard = self.pending_connect.lock().unwrap();
+        let landed = guard
+            .as_ref()
+            .and_then(|p| p.outcome.lock().unwrap().take());
+        if landed.is_some() {
+            *guard = None;
+        }
+        landed
+    }
+
+    /// The `github` block of the `configure` tool's snapshot: `{ connected,
+    /// user, token_store, pending_connect }`. A flow still waiting on the
+    /// user reports `pending_connect`; one that landed since the last call
+    /// is reported here exactly once and the slot is cleared - a successful
+    /// sign-in folds into `connected`/`user`, while an expired or declined
+    /// one surfaces as an error (its message is already actionable) instead
+    /// of being silently swallowed.
+    async fn configure_connection_block(&self) -> Result<Value> {
+        if let Some(outcome) = self.take_finished_pending() {
+            return match outcome {
+                Ok(_user) => {
+                    let mut github = self.origin_connection_json().await?;
+                    github["pending_connect"] = Value::Null;
+                    Ok(github)
+                }
+                Err(e) => Err(e.into()),
+            };
+        }
+        if let Some(view) = self.pending_view() {
+            return Ok(json!({
+                "connected": false,
+                "user": Value::Null,
+                "token_store": Value::Null,
+                "pending_connect": view,
+            }));
+        }
+        let mut github = self.origin_connection_json().await?;
+        github["pending_connect"] = Value::Null;
+        Ok(github)
+    }
+
+    /// Wraps a `github` block with the settings registry snapshot, the full
+    /// shape the `configure` tool always returns.
+    fn configure_snapshot_with(&self, github: Value) -> Result<Value> {
+        let config = self.config.read().unwrap().clone();
+        Ok(json!({ "settings": settings::snapshot(&config), "github": github }))
+    }
+
+    /// The `configure` tool's plain snapshot: every registry setting plus
+    /// the GitHub connection block. Used for a bare call and after applying
+    /// `set`/`unset`.
+    pub async fn configure_snapshot(&self) -> Result<Value> {
+        let github = self.configure_connection_block().await?;
+        self.configure_snapshot_with(github)
+    }
+
+    /// The `configure` tool's personal-access-token path: validates `token`
+    /// against GitHub (or `host`, for this call only), saves it and reports
+    /// the connection. Drops any unrelated pending device flow, since a PAT
+    /// connect settles identity immediately and a later-landing background
+    /// flow must never overwrite that with a stale report.
+    pub async fn connect_with_token(&self, token: &str, host: Option<&str>) -> Result<Value> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        let api_url = self.connect_api_url(host);
+        let user = self
+            .connect_auth
+            .validate_token(api_url.as_deref(), token)
+            .await?;
+        let token_host = origin::token_host(api_url.as_deref());
+        let store = self.resolve_token_store(token_host.as_deref())?;
+        store.save(&crystalline_remote::StoredToken {
+            access_token: token.to_string(),
+            host: token_host.unwrap_or_else(|| "github.com".to_string()),
+            user: user.clone(),
+            created_at: chrono::Utc::now(),
+        })?;
+        *self.pending_connect.lock().unwrap() = None;
+
+        let mut github = self.origin_connection_json().await?;
+        github["pending_connect"] = Value::Null;
+        self.configure_snapshot_with(github)
+    }
+
+    /// The `configure` tool's device-flow path: starts a new sign-in, or
+    /// reports the one already running (or just finished), so a second
+    /// connect call never starts a second flow. A fresh start spawns a
+    /// background task that runs the flow to completion, validates the
+    /// token and saves it, stashing the outcome in the pending slot for a
+    /// later `configure` call to report and clear (see
+    /// [`Engine::configure_connection_block`]). Returns immediately either
+    /// way: the caller sees `pending_connect` in the same call that starts
+    /// the flow, never blocking on the user confirming the code.
+    pub async fn start_device_connect(&self, host: Option<&str>) -> Result<Value> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        if self.pending_connect.lock().unwrap().is_some() {
+            let github = self.configure_connection_block().await?;
+            return self.configure_snapshot_with(github);
+        }
+
+        let api_url = self.connect_api_url(host);
+        let auth_base = crystalline_remote::github::auth::auth_base(api_url.as_deref());
+        let client_id = self.oauth_client_id();
+        let start = self
+            .connect_auth
+            .start_device_flow(&auth_base, &client_id)
+            .await?;
+
+        let outcome_slot: Arc<std::sync::Mutex<Option<std::result::Result<String, RemoteError>>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let pending = PendingConnect {
+            user_code: start.user_code.clone(),
+            verification_url: start.verification_url.clone(),
+            expires_in_secs: start.expires_in_secs,
+            outcome: outcome_slot.clone(),
+        };
+        let view = json!({
+            "pending": true,
+            "user_code": pending.user_code,
+            "verification_url": pending.verification_url,
+            "expires_in_secs": pending.expires_in_secs,
+        });
+        *self.pending_connect.lock().unwrap() = Some(pending);
+
+        let auth = self.connect_auth.clone();
+        let token_host = origin::token_host(api_url.as_deref());
+        let store = self.resolve_token_store(token_host.as_deref())?;
+        tokio::spawn(async move {
+            let result: std::result::Result<String, RemoteError> = async {
+                let access_token = auth.run_device_flow(&auth_base, &client_id, &start).await?;
+                let user = auth
+                    .validate_token(api_url.as_deref(), &access_token)
+                    .await?;
+                store.save(&crystalline_remote::StoredToken {
+                    access_token,
+                    host: token_host
+                        .clone()
+                        .unwrap_or_else(|| "github.com".to_string()),
+                    user: user.clone(),
+                    created_at: chrono::Utc::now(),
+                })?;
+                Ok(user)
+            }
+            .await;
+            *outcome_slot.lock().unwrap() = Some(result);
+        });
+
+        self.configure_snapshot_with(json!({
+            "connected": false,
+            "user": Value::Null,
+            "token_store": Value::Null,
+            "pending_connect": view,
+        }))
+    }
+}
+
+/// One in-flight GitHub device-flow sign-in, held by
+/// [`Engine::pending_connect`] so a second `configure` connect call while
+/// one is running reports the same code instead of starting another. The
+/// background task started by [`Engine::start_device_connect`] writes its
+/// result into `outcome` once, for the next `configure` call (any call, not
+/// just a connect) to observe and clear.
+struct PendingConnect {
+    /// The short code the user types in at `verification_url`.
+    user_code: String,
+    /// Where the user confirms the code.
+    verification_url: String,
+    /// How many seconds from when the flow started it stops being valid.
+    expires_in_secs: u64,
+    /// `None` while still waiting on the user; set once by the background
+    /// task that runs the flow to completion, to either the signed-in login
+    /// or the error that ended the flow (expired, declined, offline).
+    outcome: Arc<std::sync::Mutex<Option<std::result::Result<String, RemoteError>>>>,
+}
+
+/// The requested settings action for [`Engine::configure`], mirroring the
+/// ctl `configure` command's `action` field. The MCP `configure` tool also
+/// drives `Set`/`Unset` through this same method, once per key, for its
+/// richer `set`/`unset` maps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigureAction {
+    /// Show every registry setting's effective value.
+    Show,
+    /// Set `key` to the string `value`, validating type and bounds.
+    Set {
+        /// The dotted setting key.
+        key: String,
+        /// The value to parse and apply.
+        value: String,
+    },
+    /// Reset `key` to its default.
+    Unset {
+        /// The dotted setting key.
+        key: String,
+    },
+}
+
+impl From<settings::SettingsError> for EngineError {
+    fn from(e: settings::SettingsError) -> Self {
+        EngineError::Invalid(e.to_string())
+    }
 }
 
 /// Build an engine that opens the store directly for a one-shot standalone CLI
@@ -2083,7 +3341,8 @@ pub async fn open_standalone(
                 .map(|c| c.has_active_embeddings(&engine.model_id))
                 .unwrap_or(false)
         };
-        if has_embeddings && let Some(provider) = build_provider(&engine.config).await {
+        let snapshot = engine.config.read().unwrap().clone();
+        if has_embeddings && let Some(provider) = build_provider(&snapshot).await {
             engine.set_provider(provider);
         }
     }

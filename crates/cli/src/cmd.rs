@@ -320,6 +320,159 @@ pub(crate) fn print_domain_add_no_sync(name: &str, path: &Path, json: bool) {
     }
 }
 
+// --- domain add --origin ------------------------------------------------------
+
+/// Parses a `domain add --origin owner/repo[/subpath...]` value into
+/// `(owner/repo, subpath)`: the first segment is the owner, the second the
+/// repository name and everything after the second `/` (if any) is the
+/// subpath within the repository the team domain roots at.
+pub(crate) fn parse_origin_spec(spec: &str) -> Result<(String, Option<String>)> {
+    let mut parts = spec.splitn(3, '/');
+    let owner = parts.next().filter(|s| !s.is_empty());
+    let repo = parts.next().filter(|s| !s.is_empty());
+    let (owner, repo) = match (owner, repo) {
+        (Some(o), Some(r)) => (o, r),
+        _ => bail!("--origin must look like owner/repo or owner/repo/subpath, got '{spec}'"),
+    };
+    let subpath = parts.next().filter(|s| !s.is_empty()).map(str::to_string);
+    Ok((format!("{owner}/{repo}"), subpath))
+}
+
+/// Resolves `path` to an absolute path against the current directory,
+/// without requiring it to exist (`std::fs::canonicalize` refuses a path
+/// that is not there yet, which is exactly the common case for a team
+/// domain's destination folder before it has been downloaded into).
+pub(crate) fn absolute_path(path: &Path) -> Result<PathBuf> {
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    let cwd = std::env::current_dir().context("resolving the current directory")?;
+    Ok(cwd.join(path))
+}
+
+/// Print `domain add --origin`'s result: the connected team domain, its
+/// downloaded root, how many engrams it holds and the base commit it is
+/// synced to.
+pub(crate) fn print_origin_add(repo: &str, data: &serde_json::Value, json: bool) {
+    if json {
+        println!("{data}");
+        return;
+    }
+    let name = data["domain"].as_str().unwrap_or("");
+    println!("Connected team domain '{name}' to {repo}");
+    println!("  root: {}", data["root"].as_str().unwrap_or(""));
+    println!(
+        "  {} engrams at {}",
+        data["engrams"].as_u64().unwrap_or(0),
+        data["base_commit"].as_str().unwrap_or("")
+    );
+    println!("Run: crystalline origin status --domain {name}");
+}
+
+// --- origin share, discard and resolve ----------------------------------------
+
+/// Print `origin share`'s result: the proposal URL and change summary when
+/// one was opened, the friendly "nothing to share" line when the team
+/// already has everything the domain knows, or (when conflicts are still
+/// pending) every conflicting path plus a pointer at `origin resolve`.
+pub(crate) fn print_origin_share(domain: &str, data: &serde_json::Value, json: bool) {
+    if json {
+        println!("{data}");
+        return;
+    }
+    let empty = Vec::new();
+    match data["outcome"].as_str().unwrap_or("") {
+        "proposed" => {
+            println!("Shared: {}", data["url"].as_str().unwrap_or(""));
+            if let Some(summary) = data["summary"].as_str() {
+                println!("  {summary}");
+            }
+            let added = data["added"].as_array().map(Vec::len).unwrap_or(0);
+            let updated = data["updated"].as_array().map(Vec::len).unwrap_or(0);
+            let deleted = data["deleted"].as_array().map(Vec::len).unwrap_or(0);
+            println!("  {added} added, {updated} updated, {deleted} deleted");
+            print_skipped_large(&data["skipped_large"]);
+        }
+        "nothing_to_share" => {
+            println!("Nothing to share: '{domain}' already matches its origin.");
+            print_skipped_large(&data["skipped_large"]);
+        }
+        "conflicts_pending" => {
+            println!(
+                "Cannot share '{domain}': {} conflict(s) need to be resolved first.",
+                data["count"].as_u64().unwrap_or(0)
+            );
+            for c in data["conflicts"].as_array().unwrap_or(&empty) {
+                println!("  conflict: {}", c["path"].as_str().unwrap_or(""));
+            }
+            println!("Run: crystalline origin resolve {domain} <path> --keep mine|theirs");
+        }
+        other => println!("origin share '{domain}': unexpected outcome '{other}'"),
+    }
+}
+
+fn print_skipped_large(skipped_large: &serde_json::Value) {
+    let empty = Vec::new();
+    for s in skipped_large.as_array().unwrap_or(&empty) {
+        println!(
+            "  skipped (too large): {} ({} bytes)",
+            s[0].as_str().unwrap_or(""),
+            s[1].as_u64().unwrap_or(0)
+        );
+    }
+}
+
+/// Print `origin discard`'s result: the restored, deleted and skipped
+/// (diverged since sharing) paths, or a friendly line when there was
+/// nothing to discard.
+pub(crate) fn print_origin_discard(data: &serde_json::Value, json: bool) {
+    if json {
+        println!("{data}");
+        return;
+    }
+    let empty = Vec::new();
+    let restored = data["restored"].as_array().unwrap_or(&empty);
+    let deleted = data["deleted"].as_array().unwrap_or(&empty);
+    let skipped = data["skipped_diverged"].as_array().unwrap_or(&empty);
+    if restored.is_empty() && deleted.is_empty() && skipped.is_empty() {
+        println!("Nothing to discard.");
+        return;
+    }
+    for p in restored {
+        println!("restored: {}", p.as_str().unwrap_or(""));
+    }
+    for p in deleted {
+        println!("deleted: {}", p.as_str().unwrap_or(""));
+    }
+    for p in skipped {
+        println!(
+            "left alone (diverged since sharing): {}",
+            p.as_str().unwrap_or("")
+        );
+    }
+}
+
+/// Print `origin resolve`'s result: the resolved path and how many
+/// conflicts remain open.
+pub(crate) fn print_origin_resolve(data: &serde_json::Value, json: bool) {
+    if json {
+        println!("{data}");
+        return;
+    }
+    println!("Resolved: {}", data["resolved"].as_str().unwrap_or(""));
+    println!(
+        "Remaining conflicts: {}",
+        data["remaining"].as_u64().unwrap_or(0)
+    );
+}
+
+/// Reads `--content-file`'s bytes for `origin resolve --content-file`, as raw
+/// bytes rather than a UTF-8 string: a resolved file may be a binary asset,
+/// and the merge must round-trip byte for byte.
+pub(crate) fn read_resolve_content(path: &Path) -> Result<Vec<u8>> {
+    std::fs::read(path).with_context(|| format!("reading {}", path.display()))
+}
+
 // --- mcp domain auto-registration ---------------------------------------------
 
 /// Ensure a Claude Desktop MCPB bundle's picked folder is registered as a
@@ -858,6 +1011,140 @@ fn print_import_report(r: &crystalline_core::import::ImportReport, dry_run: bool
                 println!("    {c}");
             }
         }
+    }
+}
+
+// --- connect github ------------------------------------------------------------
+
+/// `crystalline connect github`: sign this machine in to GitHub, always
+/// in-process (no daemon involved - signing in is this machine's identity,
+/// not content, so there is nothing for a daemon to route). A personal
+/// access token skips the browser sign-in entirely; otherwise runs the OAuth
+/// device flow, printing the short code and verification url unmissably
+/// before waiting on it to be confirmed. Works whether or not team domains
+/// are turned on yet; prints a one-line hint to turn them on when they are
+/// currently off.
+pub async fn connect_github(
+    token: Option<&str>,
+    host: Option<&str>,
+    config_override: Option<&Path>,
+    json: bool,
+) -> Result<()> {
+    let cfg = load_config(&config_path(config_override)?)?;
+    let api_url = host
+        .map(|h| format!("https://{h}/api/v3"))
+        .or_else(|| cfg.github.as_ref().and_then(|g| g.api_url.clone()));
+    let auth_base = crystalline_remote::github::auth::auth_base(api_url.as_deref());
+    let token_host = bare_host(&auth_base);
+    let client_id = cfg
+        .github
+        .as_ref()
+        .and_then(|g| g.oauth_client_id.clone())
+        .unwrap_or_else(|| crystalline_remote::GITHUB_CLIENT_ID.to_string());
+
+    let (access_token, login) = match token {
+        Some(pat) => {
+            let login = crystalline_remote::github::auth::validate_token(api_url.as_deref(), pat)
+                .await
+                .map_err(|e| anyhow!("{e}"))?;
+            (pat.to_string(), login)
+        }
+        None => device_flow_sign_in(&auth_base, &client_id, api_url.as_deref()).await?,
+    };
+
+    let state_dir = config::origins_state_dir()
+        .map_err(|e| anyhow!("could not resolve the state directory: {e}"))?;
+    let store = crystalline_remote::TokenStore::resolve(token_host.as_deref(), &state_dir);
+    store
+        .save(&crystalline_remote::StoredToken {
+            access_token,
+            host: token_host.unwrap_or_else(|| "github.com".to_string()),
+            user: login.clone(),
+            created_at: chrono::Utc::now(),
+        })
+        .map_err(|e| anyhow!("{e}"))?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "connected": login,
+                "token_store": store.kind(),
+                "github_enabled": cfg.github_enabled(),
+            })
+        );
+    } else {
+        println!(
+            "Connected to GitHub as {login} ({} token store).",
+            store.kind()
+        );
+        if !cfg.github_enabled() {
+            println!("Run: crystalline config set github.enabled true to turn on team domains");
+        }
+    }
+    Ok(())
+}
+
+/// Runs the OAuth device flow to completion: prints the user code and
+/// verification url, ticks a progress indicator while waiting for it to be
+/// confirmed in the browser, then validates the issued token to learn the
+/// signed-in login. Returns `(access_token, login)`.
+async fn device_flow_sign_in(
+    auth_base: &str,
+    client_id: &str,
+    api_url: Option<&str>,
+) -> Result<(String, String)> {
+    let start = crystalline_remote::github::auth::start_device_flow(auth_base, client_id)
+        .await
+        .map_err(|e| anyhow!("{e}"))?;
+    print_device_code(&start);
+
+    let ticker = tokio::spawn(async {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            eprint!(".");
+            let _ = std::io::Write::flush(&mut std::io::stderr());
+        }
+    });
+    let poll =
+        crystalline_remote::github::auth::run_device_flow(auth_base, client_id, &start).await;
+    ticker.abort();
+    eprintln!();
+    let access_token = poll.map_err(|e| anyhow!("{e}"))?;
+
+    let login = crystalline_remote::github::auth::validate_token(api_url, &access_token)
+        .await
+        .map_err(|e| anyhow!("{e}"))?;
+    Ok((access_token, login))
+}
+
+/// Prints the device flow's user code and verification url unmissably: this
+/// is the moment a non-engineer copies a code into a browser.
+fn print_device_code(start: &crystalline_remote::DeviceFlowStart) {
+    eprintln!();
+    eprintln!("================================================");
+    eprintln!("  Go to: {}", start.verification_url);
+    eprintln!("  Enter this code: {}", start.user_code);
+    eprintln!("================================================");
+    eprint!("Waiting for confirmation");
+}
+
+/// The bare host `TokenStore::resolve` addresses, derived from an auth base
+/// the same way the engine's origin operations derive it from
+/// `github.api_url`: `None` for GitHub.com, the bare host for a GitHub
+/// Enterprise Server auth base. Kept in step with
+/// `crystalline_service::origin`'s private twin of this function so a token
+/// saved here is found again by a later origin operation reading
+/// `github.api_url` back from config. `pub(crate)` so `doctor` can resolve the
+/// same token store it reports on without duplicating the derivation.
+pub(crate) fn bare_host(auth_base: &str) -> Option<String> {
+    let bare = auth_base
+        .trim_start_matches("https://")
+        .trim_start_matches("http://");
+    if bare == "github.com" {
+        None
+    } else {
+        Some(bare.to_string())
     }
 }
 
