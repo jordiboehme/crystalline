@@ -19,6 +19,8 @@
 
 mod types;
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -51,6 +53,11 @@ const COMPARE_PER_PAGE: usize = 100;
 /// callers fall back to a tarball diff against the base snapshot.
 const COMPARE_FILES_CAP: usize = 300;
 
+/// The per-request timeout. Generous enough for a large tarball download,
+/// short enough that a stalled connection is reported as
+/// [`RemoteError::Offline`] rather than hanging forever.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// A [`Provider`] backed by the GitHub REST and Git Data APIs over HTTP.
 pub struct GitHubProvider {
     client: reqwest::Client,
@@ -66,8 +73,12 @@ impl GitHubProvider {
         let api_url = api_url
             .map(|url| url.trim_end_matches('/').to_string())
             .unwrap_or_else(|| DEFAULT_API_URL.to_string());
+        let client = reqwest::Client::builder()
+            .timeout(REQUEST_TIMEOUT)
+            .build()
+            .expect("the client config here is static and always valid");
         GitHubProvider {
-            client: reqwest::Client::new(),
+            client,
             api_url,
             token,
         }
