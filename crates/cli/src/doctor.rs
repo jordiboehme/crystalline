@@ -8,9 +8,12 @@
 //! dead pid or a socket file left behind by a killed daemon; (e) config
 //! sanity, a registered domain whose path is missing or lacks a
 //! `MANIFEST.md`; (f) an embedding staleness summary, the stored model
-//! against the configured one. `--fix` removes orphan rows and stale service
-//! artifacts; the rest are report-only, each pointing at the right next
-//! command.
+//! against the configured one; (g) when `github.enabled`, whether this
+//! machine is connected to GitHub and, per team domain, whether its local
+//! origin state is present and its base snapshot still matches what was
+//! recorded (`verify_base`). `--fix` removes orphan rows and stale service
+//! artifacts; the rest, including the whole GitHub section, are report-only,
+//! each pointing at the right next command.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -19,6 +22,9 @@ use anyhow::{Result, anyhow};
 use crystalline_core::config::{self, DomainEntry, GlobalConfig};
 use crystalline_core::verify::{self, VerifyOptions};
 use crystalline_index::{Store, configured_model_id};
+use crystalline_remote::TokenStore;
+use crystalline_remote::github::auth::auth_base;
+use crystalline_remote::state::{OriginState, verify_base};
 use crystalline_service::instance;
 use serde::Serialize;
 
@@ -92,6 +98,42 @@ pub struct ServiceDoctor {
     pub socket_removed: bool,
 }
 
+/// One team domain's origin diagnostics: whether its local origin state is
+/// present and, when it is, whether the base snapshot `verify_base` checks
+/// against still matches what was recorded.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct OriginDoctor {
+    /// The domain name.
+    pub name: String,
+    /// The GitHub repository this domain tracks, `owner/name`.
+    pub repo: String,
+    /// Whether `state.json` is present for this domain. Absent means the
+    /// origin state was lost or the domain was never fully connected.
+    pub state_present: bool,
+    /// Base snapshot paths that are missing or no longer match their
+    /// recorded checksum, from `verify_base`. Empty when the base tree is
+    /// fully intact, or when `state_present` is false (nothing to check).
+    pub base_mismatches: Vec<String>,
+}
+
+/// GitHub collaboration diagnostics, present only when `github.enabled` is
+/// true (`doctor` skips the whole section rather than showing it empty
+/// otherwise, matching how `embeddings` is `None` with no index yet).
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct GithubDoctor {
+    /// Whether a GitHub token is on file for this machine.
+    pub connected: bool,
+    /// The connected user's login, `None` when not connected.
+    pub user: Option<String>,
+    /// Which backend holds (or would hold) the token: `"keyring"` or
+    /// `"file"`, from `TokenStore::kind`. Reported regardless of whether a
+    /// token is actually saved yet, mirroring `origin_status`.
+    pub token_store: String,
+    /// Diagnostics for every domain connected to an origin (filtered by
+    /// `--domain` like every other section).
+    pub origins: Vec<OriginDoctor>,
+}
+
 /// The full `doctor` report.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct DoctorReport {
@@ -99,6 +141,9 @@ pub struct DoctorReport {
     pub domains: Vec<DomainDoctor>,
     /// Service lock and socket diagnostics.
     pub service: ServiceDoctor,
+    /// GitHub collaboration diagnostics, `None` when `github.enabled` is
+    /// false.
+    pub github: Option<GithubDoctor>,
     /// Embedding staleness summary, `None` when there is no index yet.
     pub embeddings: Option<serde_json::Value>,
     /// Whether this report was produced with `--fix`.
@@ -123,6 +168,17 @@ impl DoctorReport {
         }
         if self.service.socket_orphaned && !self.service.socket_removed {
             n += 1;
+        }
+        // Not being connected to GitHub is not itself a problem (an
+        // unconnected machine is a normal, expected state); missing or
+        // corrupt origin state for an already-connected team domain is.
+        if let Some(g) = &self.github {
+            for o in &g.origins {
+                if !o.state_present {
+                    n += 1;
+                }
+                n += o.base_mismatches.len();
+            }
         }
         n
     }
@@ -163,6 +219,12 @@ pub async fn run(
 
     let service = check_service(fix)?;
 
+    let github = if cfg.github_enabled() {
+        Some(check_github(&cfg, &targets)?)
+    } else {
+        None
+    };
+
     let embeddings = match store_ref {
         Some(store) => Some(embedding_summary(store, &cfg).await?),
         None => None,
@@ -171,6 +233,7 @@ pub async fn run(
     Ok(DoctorReport {
         domains,
         service,
+        github,
         embeddings,
         fix,
     })
@@ -378,6 +441,54 @@ fn check_service(fix: bool) -> Result<ServiceDoctor> {
     Ok(s)
 }
 
+/// GitHub collaboration diagnostics: this machine's connection and, per team
+/// domain in `targets`, whether its local origin state is present and its
+/// base snapshot still matches what was recorded. Read-only: resolving the
+/// token store and calling `verify_base` never write anything, so this runs
+/// the same whether or not `--fix` is set.
+fn check_github(cfg: &GlobalConfig, targets: &[(String, DomainEntry)]) -> Result<GithubDoctor> {
+    let api_url = cfg.github.as_ref().and_then(|g| g.api_url.clone());
+    let host = cmd::bare_host(&auth_base(api_url.as_deref()));
+    let state_base = config::origins_state_dir()
+        .map_err(|e| anyhow!("could not resolve the origins state directory: {e}"))?;
+    let store = TokenStore::resolve(host.as_deref(), &state_base);
+    let token = store
+        .load()
+        .map_err(|e| anyhow!("could not read the saved GitHub token: {e}"))?;
+
+    let mut origins = Vec::new();
+    for (name, entry) in targets {
+        let Some(origin) = &entry.origin else {
+            continue;
+        };
+        let dir = config::origin_state_dir(name)
+            .map_err(|e| anyhow!("could not resolve origin state for '{name}': {e}"))?;
+        let state = OriginState::load(&dir)
+            .map_err(|e| anyhow!("could not read origin state for '{name}': {e}"))?;
+        let (state_present, base_mismatches) = match &state {
+            Some(s) => {
+                let bad = verify_base(&dir, &s.files)
+                    .map_err(|e| anyhow!("could not verify the base snapshot for '{name}': {e}"))?;
+                (true, bad)
+            }
+            None => (false, Vec::new()),
+        };
+        origins.push(OriginDoctor {
+            name: name.clone(),
+            repo: origin.repo.clone(),
+            state_present,
+            base_mismatches,
+        });
+    }
+
+    Ok(GithubDoctor {
+        connected: token.is_some(),
+        user: token.as_ref().map(|t| t.user.clone()),
+        token_store: store.kind().to_string(),
+        origins,
+    })
+}
+
 async fn embedding_summary(store: &dyn Store, cfg: &GlobalConfig) -> Result<serde_json::Value> {
     let coverage = store
         .embedding_coverage()
@@ -502,6 +613,47 @@ pub fn render_human(report: &DoctorReport) -> String {
     }
     if !s.lock_stale && !s.socket_orphaned {
         let _ = writeln!(out, "  ok");
+    }
+
+    if let Some(g) = &report.github {
+        let _ = writeln!(out, "github:");
+        if g.connected {
+            let _ = writeln!(
+                out,
+                "  connected as {} ({} token store)",
+                g.user.as_deref().unwrap_or("?"),
+                g.token_store
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "  not connected ({} token store). Run: crystalline connect github",
+                g.token_store
+            );
+        }
+        if g.origins.is_empty() {
+            let _ = writeln!(out, "  no team domains connected to an origin");
+        }
+        for o in &g.origins {
+            if !o.state_present {
+                let _ = writeln!(
+                    out,
+                    "  [problem] {} ({}): no origin state on disk; add the domain from its origin first",
+                    o.name, o.repo
+                );
+            } else if !o.base_mismatches.is_empty() {
+                let _ = writeln!(
+                    out,
+                    "  [problem] {} ({}): {} base snapshot file(s) missing or modified: {}",
+                    o.name,
+                    o.repo,
+                    o.base_mismatches.len(),
+                    o.base_mismatches.join(", ")
+                );
+            } else {
+                let _ = writeln!(out, "  {} ({}): ok", o.name, o.repo);
+            }
+        }
     }
 
     if let Some(e) = &report.embeddings {

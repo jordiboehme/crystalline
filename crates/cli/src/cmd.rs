@@ -1135,8 +1135,9 @@ fn print_device_code(start: &crystalline_remote::DeviceFlowStart) {
 /// Enterprise Server auth base. Kept in step with
 /// `crystalline_service::origin`'s private twin of this function so a token
 /// saved here is found again by a later origin operation reading
-/// `github.api_url` back from config.
-fn bare_host(auth_base: &str) -> Option<String> {
+/// `github.api_url` back from config. `pub(crate)` so `doctor` can resolve the
+/// same token store it reports on without duplicating the derivation.
+pub(crate) fn bare_host(auth_base: &str) -> Option<String> {
     let bare = auth_base
         .trim_start_matches("https://")
         .trim_start_matches("http://");

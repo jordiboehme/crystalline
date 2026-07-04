@@ -329,3 +329,184 @@ fn detects_and_fixes_a_stale_lock_and_orphaned_socket() {
 
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// Origin state (like the service lock/socket above) lives under the state
+/// directory, reachable only through `HOME`/`XDG_*`, never a CLI flag, so the
+/// three tests below isolate a short-path temp `HOME` the same way.
+fn isolated_home(tag: &str) -> (PathBuf, PathBuf) {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let home = PathBuf::from("/tmp").join(format!("cq-doctor-{tag}-{nanos}"));
+    std::fs::create_dir_all(home.join("config")).unwrap();
+    std::fs::create_dir_all(home.join("state")).unwrap();
+    std::fs::create_dir_all(home.join("cache")).unwrap();
+    let state_dir = home.join("state/crystalline");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    (home, state_dir)
+}
+
+fn apply_home(cmd: &mut Command, home: &Path) {
+    cmd.env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("XDG_STATE_HOME", home.join("state"))
+        .env("XDG_CACHE_HOME", home.join("cache"));
+}
+
+/// A team domain's config entry, with a real MANIFEST.md at `domain_dir` so
+/// the ordinary per-domain checks report clean and the assertions below stay
+/// focused on the github section.
+fn write_team_domain_config(config: &Path, domain_dir: &Path) {
+    std::fs::create_dir_all(domain_dir).unwrap();
+    std::fs::write(domain_dir.join("MANIFEST.md"), "# Manifest\n").unwrap();
+    std::fs::write(
+        config,
+        format!(
+            "domains:\n  brand:\n    path: {}\n    origin:\n      repo: acme/brand-knowledge\n      branch: main\ngithub:\n  enabled: true\n",
+            domain_dir.display()
+        ),
+    )
+    .unwrap();
+}
+
+#[test]
+#[cfg(unix)]
+fn github_section_reports_disconnected_and_an_intact_origin_as_clean() {
+    let (home, state_dir) = isolated_home("intact");
+    let work = tempfile::tempdir().unwrap();
+    let config = work.path().join("config.yaml");
+    write_team_domain_config(&config, &work.path().join("kb-brand"));
+
+    // A base snapshot matching its recorded stamp exactly (sha256 and size of
+    // the literal bytes written below).
+    let origin_dir = state_dir.join("origins/brand");
+    std::fs::create_dir_all(origin_dir.join("base")).unwrap();
+    std::fs::write(origin_dir.join("base/a.md"), "# Team\n\nHello.\n").unwrap();
+    std::fs::write(
+        origin_dir.join("state.json"),
+        r#"{"version":1,"repo":"acme/brand-knowledge","branch":"main","base_commit":"abc123","ref_etag":null,"last_checked":null,"files":{"a.md":{"sha256":"c3c11220a2499569be3fefd408a950e49125ad33d587a26dadbcb210127098fc","size":15}},"proposals":[],"history":[],"conflicts":[]}"#,
+    )
+    .unwrap();
+
+    let mut cmd = bin();
+    apply_home(&mut cmd, &home);
+    let out = cmd
+        .args(["--json", "doctor", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(work.path().join("index.db"))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(report["github"]["connected"], serde_json::json!(false));
+    assert_eq!(
+        report["github"]["origins"][0]["name"],
+        serde_json::json!("brand")
+    );
+    assert_eq!(
+        report["github"]["origins"][0]["repo"],
+        serde_json::json!("acme/brand-knowledge")
+    );
+    assert_eq!(
+        report["github"]["origins"][0]["state_present"],
+        serde_json::json!(true)
+    );
+    assert_eq!(
+        report["github"]["origins"][0]["base_mismatches"],
+        serde_json::json!([])
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+#[cfg(unix)]
+fn github_section_reports_missing_origin_state_as_a_problem() {
+    let (home, _state_dir) = isolated_home("missing-state");
+    let work = tempfile::tempdir().unwrap();
+    let config = work.path().join("config.yaml");
+    write_team_domain_config(&config, &work.path().join("kb-brand"));
+    // No `origins/brand/state.json` is ever written: the state directory was
+    // lost or the domain never fully connected.
+
+    let mut cmd = bin();
+    apply_home(&mut cmd, &home);
+    let out = cmd
+        .args(["--json", "doctor", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(work.path().join("index.db"))
+        .assert()
+        .code(1)
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(
+        report["github"]["origins"][0]["state_present"],
+        serde_json::json!(false)
+    );
+
+    let human = {
+        let mut cmd = bin();
+        apply_home(&mut cmd, &home);
+        cmd.args(["doctor", "--config"])
+            .arg(&config)
+            .args(["--db"])
+            .arg(work.path().join("index.db"))
+            .output()
+            .unwrap()
+            .stdout
+    };
+    let human = String::from_utf8(human).unwrap();
+    assert!(human.contains("no origin state on disk"), "{human}");
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+#[cfg(unix)]
+fn github_section_reports_a_base_snapshot_mismatch_as_a_problem() {
+    let (home, state_dir) = isolated_home("base-mismatch");
+    let work = tempfile::tempdir().unwrap();
+    let config = work.path().join("config.yaml");
+    write_team_domain_config(&config, &work.path().join("kb-brand"));
+
+    // State records `a.md`, but its base snapshot copy was never written (or
+    // was lost), so `verify_base` finds it missing.
+    let origin_dir = state_dir.join("origins/brand");
+    std::fs::create_dir_all(&origin_dir).unwrap();
+    std::fs::write(
+        origin_dir.join("state.json"),
+        r#"{"version":1,"repo":"acme/brand-knowledge","branch":"main","base_commit":"abc123","ref_etag":null,"last_checked":null,"files":{"a.md":{"sha256":"c3c11220a2499569be3fefd408a950e49125ad33d587a26dadbcb210127098fc","size":15}},"proposals":[],"history":[],"conflicts":[]}"#,
+    )
+    .unwrap();
+
+    let mut cmd = bin();
+    apply_home(&mut cmd, &home);
+    let out = cmd
+        .args(["--json", "doctor", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(work.path().join("index.db"))
+        .assert()
+        .code(1)
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(
+        report["github"]["origins"][0]["state_present"],
+        serde_json::json!(true)
+    );
+    assert_eq!(
+        report["github"]["origins"][0]["base_mismatches"],
+        serde_json::json!(["a.md"])
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}
