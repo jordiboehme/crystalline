@@ -63,6 +63,17 @@ enum Command {
         #[command(subcommand)]
         command: DomainCommand,
     },
+    /// Connect this machine to GitHub, for sharing and updating team domains.
+    Connect {
+        #[command(subcommand)]
+        command: ConnectCommand,
+    },
+    /// Bring a team domain up to date with its origin, or check where it
+    /// stands.
+    Origin {
+        #[command(subcommand)]
+        command: OriginCommand,
+    },
     /// Show, set or reset an agent-adjustable setting (see the settings
     /// registry, currently the `github.*` block).
     Config {
@@ -450,18 +461,33 @@ enum DomainCommand {
     },
     /// Register a domain in the global config, then index it immediately. A file
     /// domain refuses without a MANIFEST.md; `--virtual` registers a
-    /// database-backed domain (no path) and scaffolds its MANIFEST in the index.
+    /// database-backed domain (no path) and scaffolds its MANIFEST in the index;
+    /// `--origin` connects it to a GitHub repository instead of an existing local
+    /// folder, downloading its tracked subtree as the domain's files.
     Add {
         /// The domain name used everywhere it is referenced.
         name: String,
-        /// The domain root directory. Omitted for a virtual domain.
+        /// The domain root directory. Omitted for a virtual domain. With
+        /// `--origin`, this is where the downloaded team domain is written;
+        /// defaults to ~/Documents/Crystalline/<name> when omitted.
         path: Option<PathBuf>,
         /// Register a virtual domain: engrams live in the database, not on disk.
         /// Incompatible with a path argument.
         #[arg(long = "virtual")]
         is_virtual: bool,
+        /// Connect to a GitHub repository instead of an existing local folder:
+        /// owner/repo, or owner/repo/subpath when the team domain is a
+        /// subfolder of the repository. Requires github.enabled and a prior
+        /// `crystalline connect github`.
+        #[arg(long)]
+        origin: Option<String>,
+        /// The branch to track. Only meaningful with --origin; defaults to
+        /// main.
+        #[arg(long)]
+        branch: Option<String>,
         /// Register only; skip indexing (run `crystalline sync` later). Applies
-        /// to file domains only.
+        /// to file domains only; incompatible with --origin, which always
+        /// indexes what it downloads.
         #[arg(long)]
         no_sync: bool,
         /// Load the global config from this file instead of the default path.
@@ -517,6 +543,51 @@ enum DomainCommand {
     Remove {
         /// The domain name to remove.
         name: String,
+        /// Load the global config from this file instead of the default path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ConnectCommand {
+    /// Sign in to GitHub: paste a personal access token, or sign in with a
+    /// short code in the browser. Works whether or not team domains are
+    /// turned on yet (signing in is this machine's identity, not content).
+    Github {
+        /// A GitHub personal access token, skipping the browser sign-in.
+        #[arg(long)]
+        token: Option<String>,
+        /// A GitHub Enterprise Server host, for example
+        /// github.acme.example. Defaults to github.com, or the configured
+        /// github.api_url.
+        #[arg(long)]
+        host: Option<String>,
+        /// Load the global config from this file instead of the default path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum OriginCommand {
+    /// Bring one team domain (or every one connected to an origin) up to
+    /// date with its origin.
+    Update {
+        /// Update only this domain instead of every team domain.
+        #[arg(long)]
+        domain: Option<String>,
+        /// Load the global config from this file instead of the default path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Show where one team domain (or every one connected to an origin)
+    /// stands relative to its origin, and whether this machine is connected
+    /// to GitHub.
+    Status {
+        /// Report only this domain instead of every team domain.
+        #[arg(long)]
+        domain: Option<String>,
         /// Load the global config from this file instead of the default path.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -588,6 +659,8 @@ fn main() -> anyhow::Result<()> {
             } => run_prompt(workspace, read_only, config, cli.db, cli.json),
         },
         Some(Command::Domain { command }) => run_domain(command, cli.db, cli.json),
+        Some(Command::Connect { command }) => on_runtime(run_connect(command, cli.json)),
+        Some(Command::Origin { command }) => on_runtime(run_origin(command, cli.db, cli.json)),
         Some(Command::Config { command }) => on_runtime(config_dispatch(command, cli.json)),
         Some(Command::Sync {
             domain,
@@ -837,6 +910,161 @@ fn print_setting_result(data: &serde_json::Value, json: bool) {
     }
 }
 
+/// `connect github`: sign this machine in to GitHub, always in-process (no
+/// daemon involved - signing in is this machine's identity, not content).
+async fn run_connect(command: ConnectCommand, json: bool) -> anyhow::Result<()> {
+    match command {
+        ConnectCommand::Github {
+            token,
+            host,
+            config,
+        } => cmd::connect_github(token.as_deref(), host.as_deref(), config.as_deref(), json).await,
+    }
+}
+
+/// `origin update`/`origin status`: socket-first with an in-process fallback,
+/// both already handled inside `crystalline_service::origin_update` and
+/// `crystalline_service::origin_status`.
+async fn run_origin(command: OriginCommand, db: Option<PathBuf>, json: bool) -> anyhow::Result<()> {
+    match command {
+        OriginCommand::Update { domain, config } => {
+            let data = crystalline_service::origin_update(
+                domain.as_deref(),
+                db.as_deref(),
+                config.as_deref(),
+            )
+            .await?;
+            print_origin_update(&data, json);
+            Ok(())
+        }
+        OriginCommand::Status { domain, config } => {
+            let data = crystalline_service::origin_status(
+                domain.as_deref(),
+                db.as_deref(),
+                config.as_deref(),
+            )
+            .await?;
+            print_origin_status(&data, json);
+            Ok(())
+        }
+    }
+}
+
+/// Render `origin update`'s aggregate result: one line per team domain (up
+/// to date, or the applied/merged counts with conflicts and proposal
+/// transitions called out), then one line per domain that failed to update.
+/// Conflicts only name the path: resolution tooling arrives in a later task.
+fn print_origin_update(data: &serde_json::Value, json: bool) {
+    if json {
+        print_value(data, true);
+        return;
+    }
+    let empty = Vec::new();
+    let domains = data["domains"].as_array().unwrap_or(&empty);
+    if domains.is_empty() {
+        println!("No team domains to update.");
+    }
+    for d in domains {
+        let name = d["domain"].as_str().unwrap_or("");
+        if d["up_to_date"].as_bool().unwrap_or(false) {
+            println!("{name}: up to date");
+            continue;
+        }
+        let applied = d["applied"].as_array().map(Vec::len).unwrap_or(0);
+        let merged = d["merged"].as_array().map(Vec::len).unwrap_or(0);
+        println!("{name}: {applied} file(s) applied ({merged} merged)");
+        for c in d["conflicts"].as_array().unwrap_or(&empty) {
+            println!(
+                "  conflict: {} (resolution tooling is coming; left as it was)",
+                c["path"].as_str().unwrap_or("")
+            );
+        }
+        for p in d["proposals"].as_array().unwrap_or(&empty) {
+            let number = p.get(0).and_then(|v| v.as_u64()).unwrap_or(0);
+            let status = p.get(1).and_then(|v| v.as_str()).unwrap_or("");
+            println!("  proposal #{number}: {status}");
+        }
+    }
+    for e in data["errors"].as_array().unwrap_or(&empty) {
+        println!(
+            "{}: could not update: {}",
+            e["domain"].as_str().unwrap_or(""),
+            e["error"].as_str().unwrap_or("")
+        );
+    }
+}
+
+/// Render `origin status`'s result: the connection line, then per team
+/// domain its repo, branch, how far ahead (local changes) and behind it is,
+/// open and declined proposals with their urls, unresolved conflicts and
+/// when it was last checked.
+fn print_origin_status(data: &serde_json::Value, json: bool) {
+    if json {
+        print_value(data, true);
+        return;
+    }
+    let connection = &data["connection"];
+    if connection["connected"].as_bool().unwrap_or(false) {
+        println!(
+            "GitHub: connected as {} ({} token store)",
+            connection["user"].as_str().unwrap_or("?"),
+            connection["token_store"].as_str().unwrap_or("?")
+        );
+    } else {
+        println!("GitHub: not connected. Run: crystalline connect github");
+    }
+
+    let empty = Vec::new();
+    let domains = data["domains"].as_array().unwrap_or(&empty);
+    if domains.is_empty() {
+        println!("No team domains connected to an origin.");
+    }
+    for d in domains {
+        let name = d["domain"].as_str().unwrap_or("");
+        let repo = d["repo"].as_str().unwrap_or("");
+        let branch = d["branch"].as_str().unwrap_or("");
+        println!("{name}: {repo}@{branch}");
+        println!(
+            "  ahead: {} local change(s)",
+            d["local_changes"].as_u64().unwrap_or(0)
+        );
+        println!(
+            "  behind: {}",
+            match d["behind"].as_bool() {
+                Some(true) => "yes",
+                Some(false) => "no",
+                None => "unknown (offline)",
+            }
+        );
+        for p in d["open_proposals"].as_array().unwrap_or(&empty) {
+            println!(
+                "  open proposal #{}: {} - {}",
+                p["number"].as_u64().unwrap_or(0),
+                p["title"].as_str().unwrap_or(""),
+                p["url"].as_str().unwrap_or("")
+            );
+        }
+        for p in d["declined_proposals"].as_array().unwrap_or(&empty) {
+            println!(
+                "  declined proposal #{}: {} - {}",
+                p["number"].as_u64().unwrap_or(0),
+                p["title"].as_str().unwrap_or(""),
+                p["url"].as_str().unwrap_or("")
+            );
+        }
+        for c in d["conflicts"].as_array().unwrap_or(&empty) {
+            println!(
+                "  unresolved conflict: {}",
+                c["path"].as_str().unwrap_or("")
+            );
+        }
+        println!(
+            "  last checked: {}",
+            d["last_checked"].as_str().unwrap_or("never")
+        );
+    }
+}
+
 /// `doctor`: diagnose the index, domains and service state. Exits 1 when
 /// unresolved problems remain, 0 otherwise (including with `--fix` once every
 /// fixable problem is fixed).
@@ -1079,10 +1307,12 @@ fn run_domain(command: DomainCommand, db: Option<PathBuf>, json: bool) -> anyhow
             name,
             path,
             is_virtual,
+            origin,
+            branch,
             no_sync,
             config,
         } => on_runtime(domain_add_dispatch(
-            name, path, is_virtual, config, db, no_sync, json,
+            name, path, is_virtual, origin, branch, config, db, no_sync, json,
         )),
         DomainCommand::List { config } => {
             on_runtime(cmd::domain_list(config.as_deref(), db.as_deref(), json))
@@ -1211,15 +1441,36 @@ async fn mcp_dispatch(
 /// running, else synced directly, the same dispatch `sync` itself uses.
 /// `--no-sync` registers only. `--virtual` registers a database-backed domain
 /// and scaffolds its MANIFEST into the index instead of syncing files.
+#[allow(clippy::too_many_arguments)]
 async fn domain_add_dispatch(
     name: String,
     path: Option<PathBuf>,
     is_virtual: bool,
+    origin: Option<String>,
+    branch: Option<String>,
     config: Option<PathBuf>,
     db: Option<PathBuf>,
     no_sync: bool,
     json: bool,
 ) -> anyhow::Result<()> {
+    if let Some(origin_spec) = origin {
+        return domain_add_origin_dispatch(
+            name,
+            path,
+            origin_spec,
+            branch,
+            is_virtual,
+            no_sync,
+            config,
+            db,
+            json,
+        )
+        .await;
+    }
+    if branch.is_some() {
+        anyhow::bail!("`domain add --branch` requires --origin");
+    }
+
     if is_virtual {
         if path.is_some() {
             anyhow::bail!(
@@ -1265,6 +1516,54 @@ async fn domain_add_dispatch(
     };
 
     cmd::print_domain_add(&name, &abs, &report, json);
+    Ok(())
+}
+
+/// `domain add --origin`: connects a team domain to a GitHub repository
+/// instead of an existing local folder. Routes socket-first to the daemon's
+/// `origin_add` ctl command (via `crystalline_service::origin_add`, which
+/// falls back to the in-process engine path other routable verbs use when no
+/// daemon is running); the config write, the download and the indexing all
+/// happen on whichever side answers, never split across the CLI and the
+/// engine the way the local-folder path splits registration from sync.
+#[allow(clippy::too_many_arguments)]
+async fn domain_add_origin_dispatch(
+    name: String,
+    path: Option<PathBuf>,
+    origin_spec: String,
+    branch: Option<String>,
+    is_virtual: bool,
+    no_sync: bool,
+    config: Option<PathBuf>,
+    db: Option<PathBuf>,
+    json: bool,
+) -> anyhow::Result<()> {
+    if is_virtual {
+        anyhow::bail!("`domain add --origin` cannot be combined with --virtual");
+    }
+    if no_sync {
+        anyhow::bail!(
+            "`domain add --origin` cannot be combined with --no-sync; a team domain is indexed as part of connecting it"
+        );
+    }
+    let (repo, subpath) = cmd::parse_origin_spec(&origin_spec)?;
+    let folder = match path {
+        Some(p) => Some(cmd::absolute_path(&p)?),
+        None => None,
+    };
+    let folder_str = folder.as_ref().map(|p| p.display().to_string());
+
+    let data = crystalline_service::origin_add(
+        &repo,
+        Some(&name),
+        subpath.as_deref(),
+        branch.as_deref(),
+        folder_str.as_deref(),
+        db.as_deref(),
+        config.as_deref(),
+    )
+    .await?;
+    cmd::print_origin_add(&repo, &data, json);
     Ok(())
 }
 
