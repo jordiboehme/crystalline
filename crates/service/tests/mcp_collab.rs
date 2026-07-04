@@ -481,9 +481,14 @@ impl ConnectAuth for FakeConnectAuth {
 
 async fn engine_for_connect(auth: Arc<FakeConnectAuth>, dir: &std::path::Path) -> Engine {
     let store = TursoStore::open_in_memory().await.unwrap();
-    Engine::new(Arc::new(Mutex::new(store)), config(false), None, None)
-        .with_connect_auth(auth)
-        .with_token_store_dir(dir.to_path_buf())
+    Engine::new(
+        Arc::new(Mutex::new(store)),
+        config(false),
+        None,
+        Some(dir.join("config.yaml").to_path_buf()),
+    )
+    .with_connect_auth(auth)
+    .with_token_store_dir(dir.to_path_buf())
 }
 
 #[tokio::test]
@@ -516,10 +521,15 @@ async fn token_connect_refuses_on_a_read_only_engine() {
         Ok("octocat".to_string()),
     );
     let store = TursoStore::open_in_memory().await.unwrap();
-    let eng = Engine::new(Arc::new(Mutex::new(store)), config(false), None, None)
-        .with_connect_auth(auth)
-        .with_token_store_dir(tmp.path().to_path_buf())
-        .with_read_only(true);
+    let eng = Engine::new(
+        Arc::new(Mutex::new(store)),
+        config(false),
+        None,
+        Some(tmp.path().join("config.yaml").to_path_buf()),
+    )
+    .with_connect_auth(auth)
+    .with_token_store_dir(tmp.path().to_path_buf())
+    .with_read_only(true);
 
     let err = eng.connect_with_token("pat-123", None).await.unwrap_err();
     assert!(matches!(err, EngineError::ReadOnly));
