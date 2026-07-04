@@ -2092,28 +2092,32 @@ impl Engine {
                 if self.read_only {
                     return Err(EngineError::ReadOnly);
                 }
-                let mut config = {
-                    let guard = self.config.read().unwrap();
-                    guard.clone()
-                };
+                // Acquire write lock first to serialize against concurrent configure calls.
+                // This prevents two tasks from both cloning the old config and clobbering
+                // each other's changes. persist_config is synchronous (no .await), so
+                // holding the write guard across it is safe and legal.
+                let mut guard = self.config.write().unwrap();
+                let mut config = guard.clone();
                 settings::apply(&mut config, key, value)?;
                 self.persist_config(&config)?;
                 let view = self.setting_view_json(&config, key);
-                *self.config.write().unwrap() = config;
+                *guard = config;
                 Ok(view)
             }
             ConfigureAction::Unset { key } => {
                 if self.read_only {
                     return Err(EngineError::ReadOnly);
                 }
-                let mut config = {
-                    let guard = self.config.read().unwrap();
-                    guard.clone()
-                };
+                // Acquire write lock first to serialize against concurrent configure calls.
+                // This prevents two tasks from both cloning the old config and clobbering
+                // each other's changes. persist_config is synchronous (no .await), so
+                // holding the write guard across it is safe and legal.
+                let mut guard = self.config.write().unwrap();
+                let mut config = guard.clone();
                 settings::unset(&mut config, key)?;
                 self.persist_config(&config)?;
                 let view = self.setting_view_json(&config, key);
-                *self.config.write().unwrap() = config;
+                *guard = config;
                 Ok(view)
             }
         }
