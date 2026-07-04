@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/core",
     "crates/index",
+    "crates/remote",
     "crates/service",
     "crates/cli",
 ]
@@ -20,6 +21,7 @@ crystalline-core = { path = "crates/core" }
 # explicitly; `cargo build --workspace --no-default-features` then drops candle
 # from the whole build rather than pulling it back in through a dependency edge.
 crystalline-index = { path = "crates/index", default-features = false }
+crystalline-remote = { path = "crates/remote" }
 crystalline-service = { path = "crates/service" }
 
 clap = { version = "4.6.1", features = ["derive"] }
@@ -71,6 +73,17 @@ schemars = "1.2.1"
 futures = "0.3.32"
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
+
+# GitHub collaboration (crates/remote): plain-text three-way merge, the
+# GitHub-issued token in the OS keychain and repository tarball extraction.
+diffy = "0.5.0"
+# `v1` pulls in exactly the apple-native (Keychain), windows-native and
+# zbus-secret-service (pure-Rust, no libdbus) backends; the 0600 file fallback
+# in crates/remote covers everything else (headless Linux without a session
+# bus, CI).
+keyring = { version = "4.1.3", default-features = false, features = ["v1"] }
+tar = "0.4.46"
+flate2 = "1.1.9"
 
 insta = { version = "1.48.0", features = ["yaml"] }
 assert_cmd = "2.2.2"

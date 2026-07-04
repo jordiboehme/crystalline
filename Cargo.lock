@@ -1007,6 +1007,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "crystalline-remote"
+version = "0.2.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "crystalline-core",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "crystalline-service"
 version = "0.2.0"
 dependencies = [

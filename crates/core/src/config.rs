@@ -57,6 +57,11 @@ pub struct GlobalConfig {
     /// `index.db` path, so every existing config keeps working untouched.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub database: Option<DatabaseConfig>,
+    /// GitHub collaboration settings. Absent means the feature is off: no
+    /// collaboration tools are shown and the origin poller never runs, so
+    /// every existing config keeps working untouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github: Option<GitHubConfig>,
 }
 
 impl GlobalConfig {
@@ -76,6 +81,16 @@ impl GlobalConfig {
     /// before opening a backend.
     pub fn database(&self) -> DatabaseConfig {
         self.database.clone().unwrap_or_default()
+    }
+
+    /// Whether GitHub collaboration is turned on, from `github.enabled`.
+    /// Absent config or an absent key means off (false), so an unconfigured
+    /// install shows no collaboration tools and runs no origin poller.
+    pub fn github_enabled(&self) -> bool {
+        self.github
+            .as_ref()
+            .and_then(|g| g.enabled)
+            .unwrap_or(false)
     }
 }
 
@@ -122,22 +137,28 @@ pub struct DomainEntry {
     /// domain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
+    /// The GitHub repository this domain syncs with, absent for a domain with
+    /// no origin (the common case, and every domain predating this feature).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<OriginConfig>,
 }
 
 impl DomainEntry {
-    /// A file-backed domain entry rooted at `path`.
+    /// A file-backed domain entry rooted at `path`, with no origin.
     pub fn file(path: impl Into<PathBuf>) -> DomainEntry {
         DomainEntry {
             kind: DomainKind::File,
             path: Some(path.into()),
+            origin: None,
         }
     }
 
-    /// A virtual domain entry (database-backed, no path).
+    /// A virtual domain entry (database-backed, no path, no origin).
     pub fn virtual_domain() -> DomainEntry {
         DomainEntry {
             kind: DomainKind::Virtual,
             path: None,
+            origin: None,
         }
     }
 
@@ -152,6 +173,34 @@ impl DomainEntry {
         self.path
             .as_ref()
             .map(|p| expand_tilde(&p.to_string_lossy()))
+    }
+}
+
+/// Which GitHub repository, subfolder and branch a domain syncs with. Present
+/// only on domains added with an origin; a plain local domain has none.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OriginConfig {
+    /// The repository, `owner/name`.
+    pub repo: String,
+    /// The subfolder within the repository that is the domain root. Absent
+    /// means the domain root is the repository root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// The branch this domain tracks. Absent means `main`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// A per-domain override for how often the daemon polls this origin,
+    /// taking priority over `github.poll_secs`. Absent defers to the global
+    /// setting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poll_secs: Option<u64>,
+}
+
+impl OriginConfig {
+    /// The effective branch this domain tracks: the configured `branch`, or
+    /// `main` when absent.
+    pub fn branch(&self) -> &str {
+        self.branch.as_deref().unwrap_or("main")
     }
 }
 
@@ -201,6 +250,29 @@ impl DatabaseConfig {
             Ok(())
         }
     }
+}
+
+/// The `github` block: whether team collaboration through GitHub is turned
+/// on and its provider settings. Reads like a settings-page section - see the
+/// `configure` tool, which exposes exactly these keys.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct GitHubConfig {
+    /// Turns GitHub collaboration on or off. Absent means off: no
+    /// collaboration tools are shown and the origin poller never runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// How often the daemon polls origins in the background, in seconds.
+    /// Absent means 300.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poll_secs: Option<u64>,
+    /// The GitHub API base URL, for a GitHub Enterprise Server instance.
+    /// Absent means `https://api.github.com`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_url: Option<String>,
+    /// A self-hosted OAuth App client id, overriding the embedded default.
+    /// Needed only for a GitHub Enterprise Server deployment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_client_id: Option<String>,
 }
 
 /// Service configuration.
@@ -427,6 +499,17 @@ pub fn service_lock_path() -> Result<PathBuf, ConfigError> {
 /// The service socket path, `<state_dir>/service.sock`.
 pub fn service_sock_path() -> Result<PathBuf, ConfigError> {
     Ok(state_dir()?.join("service.sock"))
+}
+
+/// The directory holding every origin's on-disk state, `<state_dir>/origins`.
+pub fn origins_state_dir() -> Result<PathBuf, ConfigError> {
+    Ok(state_dir()?.join("origins"))
+}
+
+/// One domain's origin state directory, `<state_dir>/origins/<domain>`. Holds
+/// the origin state file, the base snapshot and any recorded conflicts.
+pub fn origin_state_dir(domain: &str) -> Result<PathBuf, ConfigError> {
+    Ok(origins_state_dir()?.join(domain))
 }
 
 /// The instance-id path, `<state_dir>/instance-id`. Holds this machine and
