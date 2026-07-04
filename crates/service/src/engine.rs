@@ -143,6 +143,73 @@ impl From<crystalline_index::IndexError> for EngineError {
 /// The result type used across the engine.
 pub type Result<T> = std::result::Result<T, EngineError>;
 
+// --- connect auth (a testable seam over crystalline_remote::github::auth) ---
+
+/// The GitHub identity calls the `configure` tool's connect actions need:
+/// validating a token and running a device flow to completion. Production
+/// always uses [`RealConnectAuth`], a thin pass-through to
+/// `crystalline_remote::github::auth`; tests inject a fake so the
+/// pending-connect state machine (one flow at a time, a landed outcome
+/// reported once, the slot cleared after) can be driven deterministically,
+/// with no real device flow, network access or OS keychain interaction.
+#[async_trait::async_trait]
+pub trait ConnectAuth: Send + Sync {
+    /// Starts a device-flow sign-in, returning the code to show the user.
+    async fn start_device_flow(
+        &self,
+        auth_base: &str,
+        client_id: &str,
+    ) -> std::result::Result<crystalline_remote::DeviceFlowStart, RemoteError>;
+
+    /// Runs a started device flow to completion, returning the access token.
+    async fn run_device_flow(
+        &self,
+        auth_base: &str,
+        client_id: &str,
+        start: &crystalline_remote::DeviceFlowStart,
+    ) -> std::result::Result<String, RemoteError>;
+
+    /// Validates a token (freshly issued by a device flow, or a pasted
+    /// personal access token), returning the signed-in login.
+    async fn validate_token(
+        &self,
+        api_url: Option<&str>,
+        token: &str,
+    ) -> std::result::Result<String, RemoteError>;
+}
+
+/// The production [`ConnectAuth`]: delegates straight to
+/// `crystalline_remote::github::auth`.
+struct RealConnectAuth;
+
+#[async_trait::async_trait]
+impl ConnectAuth for RealConnectAuth {
+    async fn start_device_flow(
+        &self,
+        auth_base: &str,
+        client_id: &str,
+    ) -> std::result::Result<crystalline_remote::DeviceFlowStart, RemoteError> {
+        crystalline_remote::github::auth::start_device_flow(auth_base, client_id).await
+    }
+
+    async fn run_device_flow(
+        &self,
+        auth_base: &str,
+        client_id: &str,
+        start: &crystalline_remote::DeviceFlowStart,
+    ) -> std::result::Result<String, RemoteError> {
+        crystalline_remote::github::auth::run_device_flow(auth_base, client_id, start).await
+    }
+
+    async fn validate_token(
+        &self,
+        api_url: Option<&str>,
+        token: &str,
+    ) -> std::result::Result<String, RemoteError> {
+        crystalline_remote::github::auth::validate_token(api_url, token).await
+    }
+}
+
 /// A message from the engine to the daemon's file watcher: a domain root to
 /// start or stop watching, raised when a domain registered after the daemon
 /// started is first resolved (see [`Engine::domain_entry`]) or removed (see
@@ -236,6 +303,19 @@ pub struct Engine {
     // real `crystalline_core::config::origin_state_dir`, a real machine path
     // no test may touch.
     origins_dir_override: Option<PathBuf>,
+    // The `configure` tool's connect actions: production always resolves a
+    // fresh `RealConnectAuth`; tests inject a fake so the pending-connect
+    // state machine runs with no real device flow or network access.
+    connect_auth: Arc<dyn ConnectAuth>,
+    // The one in-flight device-flow sign-in this engine is tracking, if any.
+    // See `PendingConnect` and `Engine::start_device_connect`.
+    pending_connect: std::sync::Mutex<Option<PendingConnect>>,
+    // Forces the GitHub token store to a plain file under this directory
+    // instead of probing the real OS keychain, for tests: connect and
+    // configure tests must never read, write or prompt for the developer's
+    // actual credential store. `None` (production) uses the real
+    // `TokenStore::resolve`.
+    token_store_dir_override: Option<PathBuf>,
 }
 
 impl Engine {
@@ -271,6 +351,9 @@ impl Engine {
             origin_locks: std::sync::Mutex::new(HashMap::new()),
             origin_provider_override: None,
             origins_dir_override: None,
+            connect_auth: Arc::new(RealConnectAuth),
+            pending_connect: std::sync::Mutex::new(None),
+            token_store_dir_override: None,
         }
     }
 
@@ -328,6 +411,23 @@ impl Engine {
     /// directory.
     pub fn with_origins_dir(mut self, dir: PathBuf) -> Engine {
         self.origins_dir_override = Some(dir);
+        self
+    }
+
+    /// Inject a fake [`ConnectAuth`] for the `configure` tool's connect
+    /// actions, bypassing the real device flow and token validation.
+    /// Test-only: production code always leaves this at the default
+    /// `RealConnectAuth`.
+    pub fn with_connect_auth(mut self, auth: Arc<dyn ConnectAuth>) -> Engine {
+        self.connect_auth = auth;
+        self
+    }
+
+    /// Force the GitHub token store to a plain file under `dir`, never the
+    /// real OS keychain. Test-only: a connect or configure test must never
+    /// read, write or prompt for the developer's actual credential store.
+    pub fn with_token_store_dir(mut self, dir: PathBuf) -> Engine {
+        self.token_store_dir_override = Some(dir);
         self
     }
 
@@ -2679,8 +2779,7 @@ impl Engine {
             .as_ref()
             .and_then(|g| g.api_url.clone());
         let host = origin::token_host(api_url.as_deref());
-        let state_dir = self.origins_base_dir()?;
-        let store = TokenStore::resolve(host.as_deref(), &state_dir);
+        let store = self.resolve_token_store(host.as_deref())?;
         let token = store.load()?.ok_or(RemoteError::NotConnected)?;
         Ok(Arc::new(GitHubProvider::new(
             api_url,
@@ -2705,8 +2804,7 @@ impl Engine {
             .as_ref()
             .and_then(|g| g.api_url.clone());
         let host = origin::token_host(api_url.as_deref());
-        let state_dir = self.origins_base_dir()?;
-        let store = TokenStore::resolve(host.as_deref(), &state_dir);
+        let store = self.resolve_token_store(host.as_deref())?;
         let token = store.load()?;
         Ok(json!({
             "connected": token.is_some(),
@@ -2714,11 +2812,253 @@ impl Engine {
             "token_store": store.kind(),
         }))
     }
+
+    /// Resolves the `TokenStore` backend for `host`: the test override when
+    /// one is set (see [`Engine::with_token_store_dir`]), a plain file store
+    /// that never touches the real OS keychain, otherwise the real
+    /// `TokenStore::resolve` (the keyring when a cheap probe says it works,
+    /// else a file under the origins state directory).
+    fn resolve_token_store(&self, host: Option<&str>) -> Result<TokenStore> {
+        if let Some(dir) = &self.token_store_dir_override {
+            return Ok(TokenStore::File {
+                path: dir.join("github-token.json"),
+            });
+        }
+        let base = self.origins_base_dir()?;
+        Ok(TokenStore::resolve(host, &base))
+    }
+
+    // --- configure: GitHub connect ------------------------------------------
+
+    /// The api url a connect action uses for this one call: `host`
+    /// (formatted as a GitHub Enterprise Server api base) when supplied,
+    /// otherwise the durable `github.api_url` setting. `host` never persists;
+    /// durable Enterprise Server setup is `set github.api_url`.
+    fn connect_api_url(&self, host: Option<&str>) -> Option<String> {
+        host.map(|h| format!("https://{h}/api/v3")).or_else(|| {
+            self.config
+                .read()
+                .unwrap()
+                .github
+                .as_ref()
+                .and_then(|g| g.api_url.clone())
+        })
+    }
+
+    /// The OAuth App client id a connect action authenticates as: the
+    /// self-hosted override from `github.oauth_client_id` when set, else the
+    /// embedded Crystalline client id.
+    fn oauth_client_id(&self) -> String {
+        self.config
+            .read()
+            .unwrap()
+            .github
+            .as_ref()
+            .and_then(|g| g.oauth_client_id.clone())
+            .unwrap_or_else(|| crystalline_remote::GITHUB_CLIENT_ID.to_string())
+    }
+
+    /// The pending device flow's display view, `{ pending: true, user_code,
+    /// verification_url, expires_in_secs }`, or `None` when no flow is
+    /// running.
+    fn pending_view(&self) -> Option<Value> {
+        self.pending_connect.lock().unwrap().as_ref().map(|p| {
+            json!({
+                "pending": true,
+                "user_code": p.user_code,
+                "verification_url": p.verification_url,
+                "expires_in_secs": p.expires_in_secs,
+            })
+        })
+    }
+
+    /// Takes the pending flow's outcome if it has landed, clearing the slot
+    /// so a later connect starts fresh. Returns `None` both when no flow is
+    /// pending at all and when one is pending but still waiting on the
+    /// user; a caller distinguishes those with [`Engine::pending_view`].
+    fn take_finished_pending(&self) -> Option<std::result::Result<String, RemoteError>> {
+        let mut guard = self.pending_connect.lock().unwrap();
+        let landed = guard
+            .as_ref()
+            .and_then(|p| p.outcome.lock().unwrap().take());
+        if landed.is_some() {
+            *guard = None;
+        }
+        landed
+    }
+
+    /// The `github` block of the `configure` tool's snapshot: `{ connected,
+    /// user, token_store, pending_connect }`. A flow still waiting on the
+    /// user reports `pending_connect`; one that landed since the last call
+    /// is reported here exactly once and the slot is cleared - a successful
+    /// sign-in folds into `connected`/`user`, while an expired or declined
+    /// one surfaces as an error (its message is already actionable) instead
+    /// of being silently swallowed.
+    async fn configure_connection_block(&self) -> Result<Value> {
+        if let Some(outcome) = self.take_finished_pending() {
+            return match outcome {
+                Ok(_user) => {
+                    let mut github = self.origin_connection_json().await?;
+                    github["pending_connect"] = Value::Null;
+                    Ok(github)
+                }
+                Err(e) => Err(e.into()),
+            };
+        }
+        if let Some(view) = self.pending_view() {
+            return Ok(json!({
+                "connected": false,
+                "user": Value::Null,
+                "token_store": Value::Null,
+                "pending_connect": view,
+            }));
+        }
+        let mut github = self.origin_connection_json().await?;
+        github["pending_connect"] = Value::Null;
+        Ok(github)
+    }
+
+    /// Wraps a `github` block with the settings registry snapshot, the full
+    /// shape the `configure` tool always returns.
+    fn configure_snapshot_with(&self, github: Value) -> Result<Value> {
+        let config = self.config.read().unwrap().clone();
+        Ok(json!({ "settings": settings::snapshot(&config), "github": github }))
+    }
+
+    /// The `configure` tool's plain snapshot: every registry setting plus
+    /// the GitHub connection block. Used for a bare call and after applying
+    /// `set`/`unset`.
+    pub async fn configure_snapshot(&self) -> Result<Value> {
+        let github = self.configure_connection_block().await?;
+        self.configure_snapshot_with(github)
+    }
+
+    /// The `configure` tool's personal-access-token path: validates `token`
+    /// against GitHub (or `host`, for this call only), saves it and reports
+    /// the connection. Drops any unrelated pending device flow, since a PAT
+    /// connect settles identity immediately and a later-landing background
+    /// flow must never overwrite that with a stale report.
+    pub async fn connect_with_token(&self, token: &str, host: Option<&str>) -> Result<Value> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        let api_url = self.connect_api_url(host);
+        let user = self
+            .connect_auth
+            .validate_token(api_url.as_deref(), token)
+            .await?;
+        let token_host = origin::token_host(api_url.as_deref());
+        let store = self.resolve_token_store(token_host.as_deref())?;
+        store.save(&crystalline_remote::StoredToken {
+            access_token: token.to_string(),
+            host: token_host.unwrap_or_else(|| "github.com".to_string()),
+            user: user.clone(),
+            created_at: chrono::Utc::now(),
+        })?;
+        *self.pending_connect.lock().unwrap() = None;
+
+        let mut github = self.origin_connection_json().await?;
+        github["pending_connect"] = Value::Null;
+        self.configure_snapshot_with(github)
+    }
+
+    /// The `configure` tool's device-flow path: starts a new sign-in, or
+    /// reports the one already running (or just finished), so a second
+    /// connect call never starts a second flow. A fresh start spawns a
+    /// background task that runs the flow to completion, validates the
+    /// token and saves it, stashing the outcome in the pending slot for a
+    /// later `configure` call to report and clear (see
+    /// [`Engine::configure_connection_block`]). Returns immediately either
+    /// way: the caller sees `pending_connect` in the same call that starts
+    /// the flow, never blocking on the user confirming the code.
+    pub async fn start_device_connect(&self, host: Option<&str>) -> Result<Value> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        if self.pending_connect.lock().unwrap().is_some() {
+            let github = self.configure_connection_block().await?;
+            return self.configure_snapshot_with(github);
+        }
+
+        let api_url = self.connect_api_url(host);
+        let auth_base = crystalline_remote::github::auth::auth_base(api_url.as_deref());
+        let client_id = self.oauth_client_id();
+        let start = self
+            .connect_auth
+            .start_device_flow(&auth_base, &client_id)
+            .await?;
+
+        let outcome_slot: Arc<std::sync::Mutex<Option<std::result::Result<String, RemoteError>>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let pending = PendingConnect {
+            user_code: start.user_code.clone(),
+            verification_url: start.verification_url.clone(),
+            expires_in_secs: start.expires_in_secs,
+            outcome: outcome_slot.clone(),
+        };
+        let view = json!({
+            "pending": true,
+            "user_code": pending.user_code,
+            "verification_url": pending.verification_url,
+            "expires_in_secs": pending.expires_in_secs,
+        });
+        *self.pending_connect.lock().unwrap() = Some(pending);
+
+        let auth = self.connect_auth.clone();
+        let token_host = origin::token_host(api_url.as_deref());
+        let store = self.resolve_token_store(token_host.as_deref())?;
+        tokio::spawn(async move {
+            let result: std::result::Result<String, RemoteError> = async {
+                let access_token = auth.run_device_flow(&auth_base, &client_id, &start).await?;
+                let user = auth
+                    .validate_token(api_url.as_deref(), &access_token)
+                    .await?;
+                store.save(&crystalline_remote::StoredToken {
+                    access_token,
+                    host: token_host
+                        .clone()
+                        .unwrap_or_else(|| "github.com".to_string()),
+                    user: user.clone(),
+                    created_at: chrono::Utc::now(),
+                })?;
+                Ok(user)
+            }
+            .await;
+            *outcome_slot.lock().unwrap() = Some(result);
+        });
+
+        self.configure_snapshot_with(json!({
+            "connected": false,
+            "user": Value::Null,
+            "token_store": Value::Null,
+            "pending_connect": view,
+        }))
+    }
 }
 
-/// The requested settings action for [`Engine::configure`], mirroring the ctl
-/// `configure` command's `action` field and (in a later task) the MCP
-/// `configure` tool's arguments.
+/// One in-flight GitHub device-flow sign-in, held by
+/// [`Engine::pending_connect`] so a second `configure` connect call while
+/// one is running reports the same code instead of starting another. The
+/// background task started by [`Engine::start_device_connect`] writes its
+/// result into `outcome` once, for the next `configure` call (any call, not
+/// just a connect) to observe and clear.
+struct PendingConnect {
+    /// The short code the user types in at `verification_url`.
+    user_code: String,
+    /// Where the user confirms the code.
+    verification_url: String,
+    /// How many seconds from when the flow started it stops being valid.
+    expires_in_secs: u64,
+    /// `None` while still waiting on the user; set once by the background
+    /// task that runs the flow to completion, to either the signed-in login
+    /// or the error that ended the flow (expired, declined, offline).
+    outcome: Arc<std::sync::Mutex<Option<std::result::Result<String, RemoteError>>>>,
+}
+
+/// The requested settings action for [`Engine::configure`], mirroring the
+/// ctl `configure` command's `action` field. The MCP `configure` tool also
+/// drives `Set`/`Unset` through this same method, once per key, for its
+/// richer `set`/`unset` maps.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigureAction {
     /// Show every registry setting's effective value.
