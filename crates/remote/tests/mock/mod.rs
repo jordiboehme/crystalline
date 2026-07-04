@@ -1,16 +1,19 @@
-//! An in-memory forge implementing [`Provider`], the read side of a GitHub
-//! stand-in for the lifecycle tests.
+//! An in-memory forge implementing [`Provider`], a full GitHub stand-in for
+//! the lifecycle tests.
 //!
 //! It models a fake commit graph (commits as maps of repo-relative path to
 //! bytes, with parent links), branches as name to commit id, per-branch ETags
 //! that bump on every branch move, a compare computed by diffing two commit
 //! snapshots, blobs addressed by content hash and tarballs wrapped in the
-//! single top-level directory GitHub's tarball endpoint uses. A settable
+//! single top-level directory GitHub's tarball endpoint uses. The write side
+//! (`create_blob`/`create_tree`/`create_commit`/`create_branch`/
+//! `create_proposal`) works for real against the same in-memory graph, so a
+//! `propose` call under test produces a genuine new commit a later `pull` can
+//! merge in, with every call logged (see [`MockProvider::calls`]). A settable
 //! proposal registry and two fault injectors (a garbage-collected base commit
 //! and a forced compare truncation) let the tests drive the reconciliation
 //! and recovery paths. Nothing here reaches the network and nothing panics on
-//! an injected fault; the write-side trait methods are unused by the pull
-//! path and return a plain error rather than pretending to work.
+//! an injected fault.
 
 #![allow(dead_code)]
 

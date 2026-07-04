@@ -1,15 +1,21 @@
-//! End-to-end lifecycle tests for the pull-side orchestration in
-//! `crystalline_remote::ops`, driven by an in-memory forge ([`mock::MockProvider`])
-//! rather than a live GitHub. Each test is a scenario over throwaway tempdirs:
-//! subscribe a domain, move the mock forge, pull and assert what landed on
-//! disk and in the origin state.
+//! End-to-end lifecycle tests for the pull-side and share-side orchestration
+//! in `crystalline_remote::ops` (`subscribe`, `pull`, `status`, `propose`,
+//! `discard`, `resolve`), driven by an in-memory forge
+//! ([`mock::MockProvider`]) rather than a live GitHub. Each test is a
+//! scenario over throwaway tempdirs: subscribe a domain, move the mock forge
+//! or edit the working tree, run the operation under test and assert what
+//! landed on disk, in the origin state and (for `propose`) in the calls the
+//! mock recorded.
 //!
-//! The mock is a faithful stand-in for the read side of a forge: a fake commit
-//! graph with parent links, per-branch ETags that bump on every branch move,
-//! a compare computed from two commit snapshots, blobs addressed by content
-//! hash, tarballs wrapped in the single top-level directory GitHub uses and a
-//! settable proposal registry. It never reaches the network and never panics
-//! on an injected fault (a garbage-collected base commit, a forced truncation).
+//! The mock is a faithful stand-in for a forge, read and write sides both: a
+//! fake commit graph with parent links, per-branch ETags that bump on every
+//! branch move, a compare computed from two commit snapshots, blobs
+//! addressed by content hash, tarballs wrapped in the single top-level
+//! directory GitHub uses, a settable proposal registry and a working
+//! create-blob/tree/commit/branch/proposal path that produces genuine new
+//! commits a later `pull` can merge in. It never reaches the network and
+//! never panics on an injected fault (a garbage-collected base commit, a
+//! forced truncation).
 
 mod mock;
 

@@ -4,9 +4,11 @@
 //! Lifted from `crystalline_remote`'s own `tests/mock/mod.rs` (a test-only
 //! module of that crate, not reachable from here) and trimmed to what the
 //! origin engine methods exercise: a single branch's commit history, tarball
-//! download for `subscribe`, a diff-based compare for `pull` and a
-//! conditional branch probe for `status`. Production code never depends on
-//! this; it exists only under `tests/`.
+//! download for `subscribe`, a diff-based compare for `pull`, a conditional
+//! branch probe for `status`, and a working write side
+//! (`create_blob`/`create_tree`/`create_commit`/`create_branch`/
+//! `create_proposal`) against the same in-memory graph for `origin_share`.
+//! Production code never depends on this; it exists only under `tests/`.
 
 #![allow(dead_code)]
 
