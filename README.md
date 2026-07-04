@@ -177,7 +177,7 @@ The first agent to connect starts a background daemon that loads the embedding m
 
 ## Deployment scenarios
 
-Crystalline runs the same way in every scenario: a daemon in the middle keeps one search index in sync with knowledge files on disk, and one or more agents connect to it, whether that connection is a local stdio pipe or a network HTTP endpoint. The six scenarios below are variations on that one architecture.
+Crystalline runs the same way in every scenario: a daemon in the middle keeps one search index in sync with knowledge files on disk, and one or more agents connect to it, whether that connection is a local stdio pipe or a network HTTP endpoint. The seven scenarios below are variations on that one architecture.
 
 ### Personal workstation
 
@@ -217,7 +217,7 @@ flowchart LR
 
 ### Published read-only knowledge base
 
-When a team curates knowledge as a reviewed git repository instead of writing into the container directly, `examples/docker/compose.git-sync.yaml` adds a sidecar that pulls the repository into a shared volume every 60 seconds and mounts it read-only into Crystalline. The daemon runs with `--read-only`, so the four content-mutating tools disappear from the MCP tool list and agents can only search and read, while sync, the file watcher and embedding keep following every pull. See Read-only deployments below for the full behavior.
+When a team curates knowledge as a reviewed git repository instead of writing into the container directly, `examples/docker/compose.git-sync.yaml` adds a sidecar that pulls the repository into a shared volume every 60 seconds and mounts it read-only into Crystalline. The daemon runs with `--read-only`, so the four content-mutating tools disappear from the MCP tool list and agents can only search and read, while sync, the file watcher and embedding keep following every pull. A team domain connected to a GitHub origin (see Team knowledge on GitHub below) gets the same effect natively, no sidecar container needed: `update_domain` and `origin_status` stay visible even in read-only mode, so a read-only instance keeps a team domain current on its own background poll schedule. See Read-only deployments below for the full behavior.
 
 ```mermaid
 flowchart LR
@@ -249,6 +249,20 @@ flowchart LR
     D1 --> PG[(PostgreSQL + pgvector)]
     D2 --> PG
     D2 -.->|reads X from DB, hosts virtual domain Y| PG
+```
+
+### Team knowledge on GitHub
+
+For a team that keeps a domain in a GitHub repository instead of a shared filesystem or database, each repository (optionally a subfolder of one) becomes a team domain, with an origin recording which repository, subfolder and branch it tracks. Members connect once with a short code confirmed in a browser they are already signed into: no git, no SSH keys and no token to paste for someone who only knows the GitHub web UI. Crystalline shares new knowledge as a proposal the team reviews and merges on GitHub itself, and brings each team domain up to date automatically in the background once its proposals merge; a genuine disagreement between local and team knowledge surfaces as a conflict, settled locally. See Share knowledge with a team below for the full verb set and the one-time connect flow.
+
+```mermaid
+flowchart LR
+    A1[Agent] --> D[Daemon]
+    A2[CLI] --> D
+    D -->|propose| P[Pull request]
+    P -->|reviewed and merged on GitHub| G[GitHub repository]
+    G -.->|poller, auto-update| D
+    D --> K[Team domain files]
 ```
 
 ## Run in a container
@@ -324,7 +338,7 @@ Any harness with an equivalent session-start hook can run the same command the s
 
 ## Teach and learn
 
-The MCP server exposes 12 tools; capturing knowledge as a byproduct of work is the core loop:
+The MCP server exposes 13 tools, 18 once team domains are turned on (see Share knowledge with a team below); capturing knowledge as a byproduct of work is the core loop:
 
 - **`write_engram`** - capture a new engram. `domain` is always required (there is no default domain for writes, so an agent never writes into the wrong place). `permalink`, `status` and `recorded_at` are filled in for you.
 - **`search_engrams`** - search before writing, and search to recall what is already known. Defaults to hybrid text-plus-semantic ranking across every domain; pass `domains` to narrow it, or filter by `type`, `tags`, `status` or arbitrary `metadata_filters` with no query text at all.
@@ -353,23 +367,73 @@ The action downloads a pinned release binary (checksum-verified), runs `crystall
 Two more commands keep a knowledge base trustworthy:
 
 - **`crystalline import <src> --domain <name>`** brings an existing markdown-plus-frontmatter knowledge base under Crystalline: normalizes legacy `type` values, backfills `status` and temporal metadata, drops sentinel far-future dates in favor of leaving the field open-ended, and adds a missing `timestamp` - all as a pure file transformation, with `--dry-run` to preview first.
-- **`crystalline doctor`** diagnoses the index, registered domains and service state (orphan index rows, encoding issues, stale service locks) and repairs what it safely can with `--fix`.
+- **`crystalline doctor`** diagnoses the index, registered domains and service state (orphan index rows, encoding issues, stale service locks) and repairs what it safely can with `--fix`. Once team domains are turned on it also reports whether this machine is connected to GitHub and whether each team domain's local origin state is intact; that part is always report-only, `--fix` never touches origin state.
+
+## Share knowledge with a team
+
+A team domain is an ordinary domain whose files also live in a GitHub repository: local markdown stays the source of truth on this machine, and an origin records which repository, subfolder and branch it tracks.
+
+Connect this machine to GitHub once:
+
+```sh
+crystalline config set github.enabled true
+crystalline connect github
+```
+
+`connect github` opens a short code to confirm at github.com/login/device, or takes a personal access token via `--token` for someone who would rather skip the browser; either way there is no git and no SSH key involved, since connecting only establishes this machine's GitHub identity. An agent does the same through the `configure` MCP tool, passing `connect: "github"` and relaying the code to the person at the keyboard.
+
+Bring a team repository in as a domain:
+
+```sh
+crystalline domain add design --origin acme/design-knowledge --branch main
+```
+
+`--origin` takes `owner/repo` or `owner/repo/subpath` when the domain is a subfolder of a bigger repository; the local folder defaults to `~/Documents/Crystalline/<name>` and the domain is downloaded and indexed immediately. An agent does the same with the `add_domain` MCP tool.
+
+From there, `crystalline origin` covers the team domain lifecycle:
+
+- **`origin status [--domain <name>]`** - where a team domain stands: ahead, behind, open and declined proposals, unresolved conflicts.
+- **`origin update [--domain <name>]`** - bring a team domain (or every one) up to date with what the team has merged.
+- **`origin share <name> [--title <t>] [--message <m>]`** - share local changes as a proposal the team reviews on GitHub; refuses while a conflict is unresolved so the team always reviews a clean proposal.
+- **`origin resolve <name> <path> --keep mine|theirs`** (or `--content-file <f>` for a hand-merged result) - settle a flagged conflict.
+- **`origin discard <name> --proposal <n>`** - abandon a declined or no-longer-wanted proposal, restoring local files that were not touched since sharing them.
+
+The same actions are MCP tools an agent calls directly: `update_domain`, `origin_status`, `share_changes`, `resolve_conflict` and `add_domain`, plus `configure` for settings and connecting. The five beyond `configure` only appear once `github.enabled` is true, so an install that never uses team domains carries no extra tool beyond `configure` itself. Sharing always ends with the agent relaying the proposal's review URL to the person it is working with, since review and merging happen on GitHub, by a person, never by the agent.
+
+`crystalline config show`, `set <key> <value>` and `unset <key>` read and write the same settings registry the `configure` MCP tool exposes, today the `github.*` block. A domain's origin and the global `github` block look like this in `config.yaml`:
+
+```yaml
+domains:
+  design:
+    path: ~/Documents/Crystalline/design
+    origin:
+      repo: acme/design-knowledge   # the GitHub repository, owner/name
+      path: knowledge               # optional subfolder; absent means the repository root
+      branch: main                  # optional; absent means main
+      poll_secs: 600                # optional per-domain poll interval override
+github:
+  enabled: true                     # turns team domains on; absent means off
+  poll_secs: 300                    # background poll interval in seconds; minimum 60
+  api_url: https://github.example.com/api/v3   # GitHub Enterprise Server only
+  oauth_client_id: abc123                       # a self-hosted OAuth App, GitHub Enterprise Server only
+```
 
 ## Skills
 
-The `skills/` folder ships three harness-agnostic agent skills that teach an agent how to use Crystalline well:
+The `skills/` folder ships four harness-agnostic agent skills that teach an agent how to use Crystalline well:
 
 - **`crystalline-routing`** - which domain(s) to search for a task, when to sweep every domain instead, temporal filtering for "what is true now", and when to fall back to reading a MANIFEST directly.
 - **`crystalline-capture`** - when captured knowledge is worth writing down, searching before writing to avoid duplicates, editing an existing engram instead of forking the topic, and the observation-category and temporal-field conventions that keep engrams useful later.
 - **`crystalline-schema`** - authoring a Picoschema schema engram for a domain that wants structure, inferring one from what is already captured, and validating conformance.
+- **`crystalline-collaboration`** - working in a domain that has a team origin: checking status at session start, updating before deep work, sharing a coherent unit of knowledge as a proposal and relaying its review URL, conflict etiquette and connecting a new teammate end to end.
 
 Each is a plain folder with a `SKILL.md`; install by copying the folder into wherever your harness looks for skills. For Claude Code, that is `.claude/skills/` in a project or `~/.claude/skills/` globally:
 
 ```sh
-cp -r skills/crystalline-routing skills/crystalline-capture skills/crystalline-schema ~/.claude/skills/
+cp -r skills/crystalline-routing skills/crystalline-capture skills/crystalline-schema skills/crystalline-collaboration ~/.claude/skills/
 ```
 
-Other harnesses that support a similar skill or instruction-file convention can point at the same folders directly; the content only assumes the 12 MCP tools above, never a specific harness.
+Other harnesses that support a similar skill or instruction-file convention can point at the same folders directly; the content only assumes the MCP tools documented above, never a specific harness.
 
 ## Architecture
 
@@ -390,7 +454,6 @@ Exactly one process ever holds the database open: the first `crystalline mcp` or
 
 ## Roadmap
 
-- Versioning and collaboration on a knowledge base through git.
 - Authentication for the optional HTTP transport, which is unauthenticated today regardless of bind address. That is fine on the `127.0.0.1` default; the container image binds `0.0.0.0` so agents on the host can reach it, so treat the network boundary around the container (a private network, a reverse proxy, firewall rules) as the access control until this ships.
 
 ## License

@@ -98,3 +98,4 @@ A `/*` suffix on the anchor globs a permalink prefix, useful for pulling in an e
 - Need the shape of a domain, not its content -> `browse_domain` or its `MANIFEST.md`.
 - Need what surrounds a known engram -> `build_context`.
 - Before writing anything, switch to the `crystalline-capture` skill.
+- Domain has a team origin (`origin_status` says so) -> switch to the `crystalline-collaboration` skill for status, sharing and conflicts.
