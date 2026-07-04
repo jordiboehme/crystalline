@@ -37,6 +37,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
 use crate::params::*;
+use crate::settings;
 
 /// How many chunks are embedded per background batch.
 const EMBED_BATCH: usize = 16;
@@ -149,7 +150,11 @@ enum ContentSource {
 /// The shared service engine.
 pub struct Engine {
     store: Arc<Mutex<dyn Store>>,
-    config: GlobalConfig,
+    // The resolved config this engine was constructed with. Behind a lock (not
+    // an immutable snapshot) so `configure` can update a setting and every
+    // later read (including a concurrent one) sees it, mirroring the
+    // `discovered_domains`/`provider` interior-mutability pattern below.
+    config: std::sync::RwLock<GlobalConfig>,
     // The `--config` override this engine was started with, so a domain
     // registered after startup (`domain add` only ever touches the file on
     // disk) can be found by re-reading the same file. See `refresh_domain`.
@@ -208,7 +213,7 @@ impl Engine {
         let chunk_params = ChunkParams::for_model(model_id.clone());
         Engine {
             store,
-            config,
+            config: std::sync::RwLock::new(config),
             config_path,
             discovered_domains: std::sync::RwLock::new(HashMap::new()),
             watch_tx: None,
@@ -276,9 +281,10 @@ impl Engine {
         *self.provider.write().unwrap() = Some(provider);
     }
 
-    /// The registered config.
-    pub fn config(&self) -> &GlobalConfig {
-        &self.config
+    /// A snapshot of the registered config as of now, reflecting any
+    /// `configure` set or unset applied since construction.
+    pub fn config(&self) -> GlobalConfig {
+        self.config.read().unwrap().clone()
     }
 
     /// The active embedding model id.
@@ -446,7 +452,7 @@ impl Engine {
     /// discovered overlay, then a fresh re-read of the config from disk (a
     /// `domain add` only ever edits the file, never this in-memory snapshot).
     fn domain_entry(&self, name: &str) -> Result<DomainEntry> {
-        if let Some(entry) = self.config.domains.get(name) {
+        if let Some(entry) = self.config.read().unwrap().domains.get(name) {
             return Ok(entry.clone());
         }
         if let Some(entry) = self.discovered_domains.read().unwrap().get(name) {
@@ -485,7 +491,14 @@ impl Engine {
     /// Every domain name this engine currently knows about: the startup
     /// snapshot plus anything discovered since.
     fn known_domain_names(&self) -> Vec<String> {
-        let mut names: Vec<String> = self.config.domains.keys().cloned().collect();
+        let mut names: Vec<String> = self
+            .config
+            .read()
+            .unwrap()
+            .domains
+            .keys()
+            .cloned()
+            .collect();
         names.extend(self.discovered_domains.read().unwrap().keys().cloned());
         names
     }
@@ -1358,7 +1371,10 @@ impl Engine {
         drop(store);
 
         let mut out = Vec::new();
-        for (name, entry) in &self.config.domains {
+        // Cloned out from behind the lock before any `.await` below, matching
+        // the `hosted`/`discovered_domains` convention elsewhere in this file.
+        let domains = self.config.read().unwrap().domains.clone();
+        for (name, entry) in &domains {
             let source = self.source_of(entry);
             let s = stats.iter().find(|d| &d.name == name);
             let mut obj = json!({
@@ -1424,7 +1440,8 @@ impl Engine {
     /// inside its latency budget for virtual domains too.
     pub async fn virtual_routing_bullets(&self) -> BTreeMap<String, Vec<String>> {
         let mut out = BTreeMap::new();
-        for (name, entry) in &self.config.domains {
+        let domains = self.config.read().unwrap().domains.clone();
+        for (name, entry) in &domains {
             if entry.is_virtual() {
                 out.insert(name.clone(), self.virtual_routing_bullets_for(name).await);
             }
@@ -1904,7 +1921,8 @@ impl Engine {
             },
             None => {
                 let mut targets: Vec<(String, PathBuf)> = Vec::new();
-                for (name, entry) in &self.config.domains {
+                let config = self.config.read().unwrap();
+                for (name, entry) in &config.domains {
                     if let Some(root) = entry.file_path().filter(|_| !entry.is_virtual()) {
                         targets.push((name.clone(), root));
                     }
@@ -1912,7 +1930,7 @@ impl Engine {
                 // A domain registered after startup and already resolved once
                 // (e.g. by a named `ctl sync`) rides along on a full sync too.
                 for (name, entry) in self.discovered_domains.read().unwrap().iter() {
-                    if self.config.domains.contains_key(name) {
+                    if config.domains.contains_key(name) {
                         continue;
                     }
                     if let Some(root) = entry.file_path().filter(|_| !entry.is_virtual()) {
@@ -1979,13 +1997,15 @@ impl Engine {
         let mut ids: Vec<DomainId> = self.hosted.read().unwrap().values().copied().collect();
         let mut virtuals: Vec<String> = self
             .config
+            .read()
+            .unwrap()
             .domains
             .iter()
             .filter(|(_, e)| e.is_virtual())
             .map(|(n, _)| n.clone())
             .collect();
         for (name, entry) in self.discovered_domains.read().unwrap().iter() {
-            if entry.is_virtual() && !self.config.domains.contains_key(name) {
+            if entry.is_virtual() && !self.config.read().unwrap().domains.contains_key(name) {
                 virtuals.push(name.clone());
             }
         }
@@ -2050,6 +2070,98 @@ impl Engine {
         }
         Ok(embedded)
     }
+
+    // --- configure -------------------------------------------------------------
+
+    /// Show, set or reset an agent-adjustable setting from the
+    /// [`crate::settings`] registry. `show` takes only the config's read lock
+    /// and is always allowed, even on a read-only instance; `set` and `unset`
+    /// refuse with `EngineError::ReadOnly` on a read-only instance (config is
+    /// frozen the same way the four content-mutating methods are), otherwise
+    /// they validate and apply the change, persist the config file this engine
+    /// was started with (or the default path) and update the in-memory config
+    /// so a later read (including a concurrent one, once the write lock
+    /// releases) sees it.
+    pub async fn configure(&self, action: &ConfigureAction) -> Result<Value> {
+        match action {
+            ConfigureAction::Show => {
+                let config = self.config.read().unwrap();
+                Ok(json!({ "settings": settings::snapshot(&config) }))
+            }
+            ConfigureAction::Set { key, value } => {
+                if self.read_only {
+                    return Err(EngineError::ReadOnly);
+                }
+                let mut config = self.config.write().unwrap();
+                settings::apply(&mut config, key, value)?;
+                self.persist_config(&config)?;
+                Ok(self.setting_view_json(&config, key))
+            }
+            ConfigureAction::Unset { key } => {
+                if self.read_only {
+                    return Err(EngineError::ReadOnly);
+                }
+                let mut config = self.config.write().unwrap();
+                settings::unset(&mut config, key)?;
+                self.persist_config(&config)?;
+                Ok(self.setting_view_json(&config, key))
+            }
+        }
+    }
+
+    /// The just-applied setting's snapshot entry, as a JSON value. `key` has
+    /// already been validated against the registry by `apply`/`unset`, so it
+    /// is always found.
+    fn setting_view_json(&self, config: &GlobalConfig, key: &str) -> Value {
+        settings::snapshot(config)
+            .into_iter()
+            .find(|v| v.key == key)
+            .map(|v| serde_json::to_value(v).unwrap_or(Value::Null))
+            .unwrap_or(Value::Null)
+    }
+
+    /// Persist a config to the path this engine was started with (its
+    /// `--config` override), or the default global config path when none was
+    /// given. Never touches unrelated content: the caller always passes the
+    /// current, load-modify-save typed config, so the serde round trip keeps
+    /// every other key byte-for-byte.
+    fn persist_config(&self, config: &GlobalConfig) -> Result<()> {
+        let path = match &self.config_path {
+            Some(p) => p.clone(),
+            None => crystalline_core::config::global_config_path()
+                .map_err(|e| EngineError::Internal(e.to_string()))?,
+        };
+        crystalline_core::config::save_yaml(&path, config).map_err(|e| {
+            EngineError::Internal(format!("failed to save config {}: {e}", path.display()))
+        })
+    }
+}
+
+/// The requested settings action for [`Engine::configure`], mirroring the ctl
+/// `configure` command's `action` field and (in a later task) the MCP
+/// `configure` tool's arguments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigureAction {
+    /// Show every registry setting's effective value.
+    Show,
+    /// Set `key` to the string `value`, validating type and bounds.
+    Set {
+        /// The dotted setting key.
+        key: String,
+        /// The value to parse and apply.
+        value: String,
+    },
+    /// Reset `key` to its default.
+    Unset {
+        /// The dotted setting key.
+        key: String,
+    },
+}
+
+impl From<settings::SettingsError> for EngineError {
+    fn from(e: settings::SettingsError) -> Self {
+        EngineError::Invalid(e.to_string())
+    }
 }
 
 /// Build an engine that opens the store directly for a one-shot standalone CLI
@@ -2083,7 +2195,8 @@ pub async fn open_standalone(
                 .map(|c| c.has_active_embeddings(&engine.model_id))
                 .unwrap_or(false)
         };
-        if has_embeddings && let Some(provider) = build_provider(&engine.config).await {
+        let snapshot = engine.config.read().unwrap().clone();
+        if has_embeddings && let Some(provider) = build_provider(&snapshot).await {
             engine.set_provider(provider);
         }
     }

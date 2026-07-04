@@ -3,8 +3,8 @@
 //! Each request is one JSON line `{ "v": 1, "cmd": ..., ... }`; each response is
 //! one line `{ "v": 1, "ok": true, "data": ... }` or
 //! `{ "v": 1, "ok": false, "error": ... }`. Commands: sync, status, reindex,
-//! sessions, forget_domain, shutdown. This is the operator channel; data
-//! operations go over the MCP handshake instead.
+//! sessions, configure, forget_domain, shutdown. This is the operator channel;
+//! data operations go over the MCP handshake instead.
 
 use std::sync::Arc;
 
@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::daemon::Shared;
+use crate::engine::ConfigureAction;
 
 /// The protocol version carried on every ctl envelope.
 pub const CTL_VERSION: u64 = 1;
@@ -164,6 +165,42 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                 Err(e) => (envelope_err(e.to_string()), false),
             }
         }
+        // Show, set or reset a setting from the settings registry. `set` and
+        // `unset` refuse on a read-only daemon (the engine method itself
+        // checks); `show` is always allowed.
+        "configure" => {
+            let action = req.get("action").and_then(Value::as_str).unwrap_or("show");
+            let outcome = match action {
+                "show" => shared.engine.configure(&ConfigureAction::Show).await,
+                "set" => {
+                    let key = req.get("key").and_then(Value::as_str).unwrap_or("");
+                    let value = req.get("value").and_then(Value::as_str).unwrap_or("");
+                    shared
+                        .engine
+                        .configure(&ConfigureAction::Set {
+                            key: key.to_string(),
+                            value: value.to_string(),
+                        })
+                        .await
+                }
+                "unset" => {
+                    let key = req.get("key").and_then(Value::as_str).unwrap_or("");
+                    shared
+                        .engine
+                        .configure(&ConfigureAction::Unset {
+                            key: key.to_string(),
+                        })
+                        .await
+                }
+                other => Err(crate::engine::EngineError::Invalid(format!(
+                    "unknown configure action '{other}'; expected show, set or unset"
+                ))),
+            };
+            match outcome {
+                Ok(data) => (envelope_ok(data), false),
+                Err(e) => (envelope_err(e.to_string()), false),
+            }
+        }
         "shutdown" => (envelope_ok(json!({ "stopping": true })), true),
         // Best-effort: `domain remove` calls this so a live daemon stops
         // watching the removed path right away instead of on its next
@@ -177,7 +214,8 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
         other => (
             envelope_err(format!(
                 "unknown ctl command '{other}'; expected status, sessions, sync, reindex, \
-                 routing_bullets, scaffold_manifest, domain_import, domain_export, forget_domain or shutdown"
+                 routing_bullets, scaffold_manifest, domain_import, domain_export, configure, \
+                 forget_domain or shutdown"
             )),
             false,
         ),

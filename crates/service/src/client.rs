@@ -200,6 +200,78 @@ pub async fn domain_export(
     Ok(engine.export_domain(domain, dest, force, dry_run).await?)
 }
 
+/// Show, set or reset an agent-adjustable setting from the [`crate::settings`]
+/// registry: over the daemon when one is running, else against the config
+/// file directly (no index store is opened either way, unlike every data
+/// command above). `action` is `show`, `set` or `unset`; `key` and `value`
+/// are required for `set`, `key` alone for `unset`, and both are ignored for
+/// `show`.
+pub async fn configure(
+    action: &str,
+    key: Option<&str>,
+    value: Option<&str>,
+    config_path: Option<&Path>,
+) -> anyhow::Result<Value> {
+    use serde_json::json;
+    if let Some(data) = ctl_if_running(json!({
+        "v": 1, "cmd": "configure", "action": action, "key": key, "value": value,
+    }))
+    .await?
+    {
+        return Ok(data);
+    }
+
+    let mut config = load_config(config_path)?;
+    match action {
+        "show" => Ok(json!({ "settings": crate::settings::snapshot(&config) })),
+        "set" => {
+            if config.read_only() {
+                anyhow::bail!("{}", crate::engine::EngineError::ReadOnly);
+            }
+            let key = key.ok_or_else(|| anyhow::anyhow!("configure set requires a key"))?;
+            let value = value.ok_or_else(|| anyhow::anyhow!("configure set requires a value"))?;
+            crate::settings::apply(&mut config, key, value)?;
+            save_config(config_path, &config)?;
+            Ok(setting_view(&config, key))
+        }
+        "unset" => {
+            if config.read_only() {
+                anyhow::bail!("{}", crate::engine::EngineError::ReadOnly);
+            }
+            let key = key.ok_or_else(|| anyhow::anyhow!("configure unset requires a key"))?;
+            crate::settings::unset(&mut config, key)?;
+            save_config(config_path, &config)?;
+            Ok(setting_view(&config, key))
+        }
+        other => anyhow::bail!("unknown configure action '{other}'; expected show, set or unset"),
+    }
+}
+
+/// The just-applied setting's snapshot entry, as a JSON value. `key` has
+/// already been validated against the registry by `apply`/`unset`, so it is
+/// always found.
+fn setting_view(config: &crystalline_core::config::GlobalConfig, key: &str) -> Value {
+    crate::settings::snapshot(config)
+        .into_iter()
+        .find(|v| v.key == key)
+        .map(|v| serde_json::to_value(v).unwrap_or(Value::Null))
+        .unwrap_or(Value::Null)
+}
+
+/// Save a config back to the path it was loaded from: the `--config`
+/// override, or the default global config path when none was given.
+fn save_config(
+    config_path: Option<&Path>,
+    config: &crystalline_core::config::GlobalConfig,
+) -> anyhow::Result<()> {
+    let path = match config_path {
+        Some(p) => p.to_path_buf(),
+        None => crystalline_core::config::global_config_path()?,
+    };
+    crystalline_core::config::save_yaml(&path, config)
+        .map_err(|e| anyhow::anyhow!("failed to save config {}: {e}", path.display()))
+}
+
 /// Resolve virtual-domain routing bullets for `prompt system`: over the daemon
 /// when one is running (its warm state), else against a directly opened store.
 /// Returns an empty map when the config has no virtual domains, so the common

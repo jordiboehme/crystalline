@@ -63,6 +63,12 @@ enum Command {
         #[command(subcommand)]
         command: DomainCommand,
     },
+    /// Show, set or reset an agent-adjustable setting (see the settings
+    /// registry, currently the `github.*` block).
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
     /// Sync one or all registered domains into the index.
     Sync {
         /// Sync only this domain instead of every registered domain.
@@ -517,6 +523,34 @@ enum DomainCommand {
     },
 }
 
+#[derive(Subcommand, Debug)]
+enum ConfigCommand {
+    /// Show every setting's effective value.
+    Show {
+        /// Load the global config from this file instead of the default path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Set a setting to a value.
+    Set {
+        /// The setting key, for example github.enabled.
+        key: String,
+        /// The value to set.
+        value: String,
+        /// Load the global config from this file instead of the default path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Reset a setting to its default.
+    Unset {
+        /// The setting key, for example github.enabled.
+        key: String,
+        /// Load the global config from this file instead of the default path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 enum OutputFormat {
     Human,
@@ -554,6 +588,7 @@ fn main() -> anyhow::Result<()> {
             } => run_prompt(workspace, read_only, config, cli.db, cli.json),
         },
         Some(Command::Domain { command }) => run_domain(command, cli.db, cli.json),
+        Some(Command::Config { command }) => on_runtime(config_dispatch(command, cli.json)),
         Some(Command::Sync {
             domain,
             embed,
@@ -728,6 +763,78 @@ async fn reindex_dispatch(
         return Ok(());
     }
     cmd::reindex(full, embed, config.as_deref(), db.as_deref(), json).await
+}
+
+/// `config show|set|unset`: route over the daemon's ctl `configure` command
+/// when one is running, else act on the config file directly. Neither path
+/// opens the index; settings live in `config.yaml`, not the database.
+async fn config_dispatch(command: ConfigCommand, json: bool) -> anyhow::Result<()> {
+    match command {
+        ConfigCommand::Show { config } => {
+            let data =
+                crystalline_service::configure("show", None, None, config.as_deref()).await?;
+            if json {
+                print_value(&data, true);
+                return Ok(());
+            }
+            let views: Vec<crystalline_service::settings::SettingView> =
+                serde_json::from_value(data["settings"].clone())?;
+            render_settings_table(&views);
+            Ok(())
+        }
+        ConfigCommand::Set { key, value, config } => {
+            let data =
+                crystalline_service::configure("set", Some(&key), Some(&value), config.as_deref())
+                    .await?;
+            print_setting_result(&data, json);
+            Ok(())
+        }
+        ConfigCommand::Unset { key, config } => {
+            let data = crystalline_service::configure("unset", Some(&key), None, config.as_deref())
+                .await?;
+            print_setting_result(&data, json);
+            Ok(())
+        }
+    }
+}
+
+/// Render `config show`'s snapshot: key, effective value (with a "(default)"
+/// marker when unset) and doc line, columns aligned to the widest entry.
+fn render_settings_table(views: &[crystalline_service::settings::SettingView]) {
+    let key_width = views.iter().map(|v| v.key.len()).max().unwrap_or(0);
+    let displayed: Vec<String> = views.iter().map(setting_display_value).collect();
+    let value_width = displayed.iter().map(|v| v.len()).max().unwrap_or(0);
+    for (view, value) in views.iter().zip(&displayed) {
+        println!(
+            "{:<key_width$}  {:<value_width$}  {}",
+            view.key, value, view.doc
+        );
+    }
+}
+
+/// A setting's effective value with a "(default)" marker when it was never
+/// explicitly set.
+fn setting_display_value(view: &crystalline_service::settings::SettingView) -> String {
+    if view.is_default {
+        format!("{} (default)", view.value)
+    } else {
+        view.value.clone()
+    }
+}
+
+/// Print a `config set`/`config unset` result: the resulting setting.
+fn print_setting_result(data: &serde_json::Value, json: bool) {
+    if json {
+        print_value(data, true);
+        return;
+    }
+    let key = data["key"].as_str().unwrap_or("");
+    let value = data["value"].as_str().unwrap_or("");
+    if data["is_default"].as_bool().unwrap_or(false) {
+        println!("{key} = {value} (default)");
+    } else {
+        println!("{key} = {value}");
+    }
 }
 
 /// `doctor`: diagnose the index, domains and service state. Exits 1 when

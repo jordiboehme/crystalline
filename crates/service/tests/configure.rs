@@ -1,0 +1,152 @@
+//! Engine-level tests for `Engine::configure`: show, set and unset against a
+//! real config file, the read-only refusal and the in-memory config staying
+//! coherent for later reads. There is no ctl-level (socket) test harness in
+//! this crate yet (`control.rs` has no dedicated test file), so this exercises
+//! the engine method directly, one layer below the ctl `configure` command
+//! that just forwards to it.
+
+use std::sync::Arc;
+
+use crystalline_core::config::GlobalConfig;
+use crystalline_index::TursoStore;
+use crystalline_service::Engine;
+use crystalline_service::engine::ConfigureAction;
+use tokio::sync::Mutex;
+
+async fn engine_at(config_path: &std::path::Path, read_only: bool) -> Engine {
+    let store = TursoStore::open_in_memory().await.unwrap();
+    Engine::new(
+        Arc::new(Mutex::new(store)),
+        GlobalConfig::default(),
+        None,
+        Some(config_path.to_path_buf()),
+    )
+    .with_read_only(read_only)
+}
+
+fn settings_of(data: &serde_json::Value) -> Vec<crystalline_service::settings::SettingView> {
+    serde_json::from_value(data["settings"].clone()).unwrap()
+}
+
+#[tokio::test]
+async fn show_lists_every_registry_key_at_its_default() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_path = tmp.path().join("config.yaml");
+    let engine = engine_at(&config_path, false).await;
+
+    let data = engine.configure(&ConfigureAction::Show).await.unwrap();
+    let views = settings_of(&data);
+    assert_eq!(views.len(), 4);
+    assert!(views.iter().all(|v| v.is_default));
+    assert_eq!(views[0].key, "github.enabled");
+    assert_eq!(views[0].value, "false");
+}
+
+#[tokio::test]
+async fn set_persists_to_the_config_file_and_updates_the_in_memory_config() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_path = tmp.path().join("config.yaml");
+    let engine = engine_at(&config_path, false).await;
+
+    let data = engine
+        .configure(&ConfigureAction::Set {
+            key: "github.enabled".to_string(),
+            value: "true".to_string(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(data["key"], "github.enabled");
+    assert_eq!(data["value"], "true");
+    assert_eq!(data["is_default"], false);
+
+    // The file on disk carries the change...
+    let on_disk: GlobalConfig = crystalline_core::config::load_yaml(&config_path).unwrap();
+    assert!(on_disk.github_enabled());
+
+    // ...and so does this engine's in-memory config, without reconstructing it.
+    assert!(engine.config().github_enabled());
+}
+
+#[tokio::test]
+async fn unset_returns_to_default_and_the_file_drops_an_emptied_github_block() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_path = tmp.path().join("config.yaml");
+    let engine = engine_at(&config_path, false).await;
+
+    engine
+        .configure(&ConfigureAction::Set {
+            key: "github.enabled".to_string(),
+            value: "true".to_string(),
+        })
+        .await
+        .unwrap();
+    let data = engine
+        .configure(&ConfigureAction::Unset {
+            key: "github.enabled".to_string(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(data["value"], "false");
+    assert_eq!(data["is_default"], true);
+
+    assert!(!engine.config().github_enabled());
+    let raw = std::fs::read_to_string(&config_path).unwrap();
+    assert!(
+        !raw.contains("github"),
+        "an emptied github block must not round-trip into the saved file: {raw}"
+    );
+}
+
+#[tokio::test]
+async fn set_on_an_unknown_key_lists_every_known_key_and_does_not_write_the_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_path = tmp.path().join("config.yaml");
+    let engine = engine_at(&config_path, false).await;
+
+    let err = engine
+        .configure(&ConfigureAction::Set {
+            key: "github.bogus".to_string(),
+            value: "x".to_string(),
+        })
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("github.enabled"), "{err}");
+    assert!(!config_path.exists(), "an invalid key must not touch disk");
+}
+
+#[tokio::test]
+async fn read_only_refuses_set_and_unset_but_allows_show() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_path = tmp.path().join("config.yaml");
+    let engine = engine_at(&config_path, true).await;
+
+    let show = engine.configure(&ConfigureAction::Show).await;
+    assert!(show.is_ok(), "show is always allowed, even read-only");
+
+    let set_err = engine
+        .configure(&ConfigureAction::Set {
+            key: "github.enabled".to_string(),
+            value: "true".to_string(),
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        set_err,
+        crystalline_service::EngineError::ReadOnly
+    ));
+
+    let unset_err = engine
+        .configure(&ConfigureAction::Unset {
+            key: "github.enabled".to_string(),
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        unset_err,
+        crystalline_service::EngineError::ReadOnly
+    ));
+    assert!(
+        !config_path.exists(),
+        "a refused set/unset must never touch disk"
+    );
+}
