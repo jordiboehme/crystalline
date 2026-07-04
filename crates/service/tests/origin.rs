@@ -16,6 +16,8 @@ use std::sync::Arc;
 use crystalline_core::config::{GitHubConfig, GlobalConfig};
 use crystalline_index::TursoStore;
 use crystalline_remote::RemoteError;
+use crystalline_remote::provider::ProposalState;
+use crystalline_remote::state::{OriginState, Proposal, ProposalStatus};
 use crystalline_service::Engine;
 use crystalline_service::engine::EngineError;
 use crystalline_service::params::{ReadParams, SearchParams};
@@ -391,6 +393,71 @@ async fn origin_update_one_domain_failing_does_not_abort_the_others() {
     assert!(good_root.join("notes/new.md").exists());
 }
 
+#[tokio::test]
+async fn origin_update_reports_a_proposal_transition_with_its_url_and_title() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let c1 = mock.add_commit(commit_files(&[("MANIFEST.md", manifest())]));
+    mock.set_branch("main", &c1);
+
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let root = tmp.path().join("brand-knowledge");
+    let eng = engine_with(&config_path, &origins_dir, mock.clone(), true, false).await;
+    eng.origin_add(
+        "acme/brand-knowledge",
+        Some("brand"),
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+    )
+    .await
+    .unwrap();
+
+    // Record an open share proposal directly in the domain's origin state, as
+    // if it had been opened by a previous share (sharing itself is a later
+    // task); `origin_update`'s pull refreshes it against the provider below.
+    let state_dir = origins_dir.join("brand");
+    let mut state = OriginState::load(&state_dir).unwrap().unwrap();
+    state.proposals.push(Proposal {
+        number: 7,
+        url: "https://github.com/acme/brand-knowledge/pull/7".to_string(),
+        branch: "share/glossary".to_string(),
+        title: "Share glossary edits".to_string(),
+        created_at: chrono::Utc::now(),
+        status: ProposalStatus::Open,
+        files: vec![],
+    });
+    state.save(&state_dir).unwrap();
+    mock.set_proposal_state(7, ProposalState::Merged);
+
+    // Move the branch so `pull` takes the "changed" path (which refreshes
+    // proposals) rather than short-circuiting as up to date.
+    let c2 = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        ("notes/new.md", engram("New", "new", "added upstream")),
+    ]));
+    mock.set_branch("main", &c2);
+
+    let result = eng.origin_update(Some("brand")).await.unwrap();
+    let domains = result["domains"].as_array().unwrap();
+    assert_eq!(domains.len(), 1, "{result}");
+    let proposals = domains[0]["proposals"].as_array().unwrap();
+    assert_eq!(proposals.len(), 1, "{result}");
+    assert_eq!(proposals[0]["number"], 7);
+    assert_eq!(proposals[0]["status"], "Merged");
+    assert_eq!(
+        proposals[0]["url"],
+        "https://github.com/acme/brand-knowledge/pull/7"
+    );
+    assert_eq!(proposals[0]["title"], "Share glossary edits");
+
+    // The merged proposal moved from `proposals` to `history` on disk.
+    let reloaded = OriginState::load(&state_dir).unwrap().unwrap();
+    assert!(reloaded.proposals.iter().all(|p| p.number != 7));
+    assert!(reloaded.history.iter().any(|p| p.number == 7));
+}
+
 // --- origin_status -----------------------------------------------------------
 
 #[tokio::test]
@@ -470,4 +537,172 @@ async fn origin_status_with_no_domain_reports_every_origin_domain() {
     let domains = status["domains"].as_array().unwrap();
     assert_eq!(domains.len(), 1);
     assert_eq!(domains[0]["domain"], "brand");
+}
+
+#[tokio::test]
+async fn origin_status_survives_a_live_offline_probe_for_a_connected_domain() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[("MANIFEST.md", manifest())]));
+    mock.set_branch("main", &commit);
+
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let root = tmp.path().join("brand-knowledge");
+    let eng = engine_with(&config_path, &origins_dir, mock.clone(), true, false).await;
+    eng.origin_add(
+        "acme/brand-knowledge",
+        Some("brand"),
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+    )
+    .await
+    .unwrap();
+
+    // A local edit so `local_changes` reports something real, not just a
+    // default zero.
+    std::fs::create_dir_all(root.join("notes")).unwrap();
+    std::fs::write(
+        root.join("notes/local.md"),
+        engram("Local", "local", "not shared yet"),
+    )
+    .unwrap();
+
+    // The GitHub connection (the mock provider override) is still present -
+    // this is a live network outage, not a missing token - but the probe
+    // itself cannot reach GitHub.
+    mock.fail_branch_head_offline("main");
+
+    let status = eng.origin_status(Some("brand")).await.unwrap();
+    assert_eq!(
+        status["errors"].as_array().unwrap().len(),
+        0,
+        "an offline probe must never hard-fail origin_status: {status}"
+    );
+    let domains = status["domains"].as_array().unwrap();
+    assert_eq!(domains.len(), 1, "{status}");
+    assert_eq!(domains[0]["domain"], "brand");
+    assert!(
+        domains[0]["behind"].is_null(),
+        "behind must degrade to unknown, not error: {status}"
+    );
+    assert_eq!(domains[0]["local_changes"], 1);
+    let probe_error = domains[0]["probe_error"]
+        .as_str()
+        .expect("probe_error must carry the offline message");
+    assert!(probe_error.contains("offline"), "{probe_error}");
+}
+
+#[tokio::test]
+async fn origin_status_offline_probe_on_one_domain_still_reports_both_domains() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let good_commit = mock.add_commit(commit_files(&[("MANIFEST.md", manifest())]));
+    mock.set_branch("good-branch", &good_commit);
+    let bad_commit = mock.add_commit(commit_files(&[("MANIFEST.md", manifest())]));
+    mock.set_branch("bad-branch", &bad_commit);
+
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let good_root = tmp.path().join("good");
+    let bad_root = tmp.path().join("bad");
+    let eng = engine_with(&config_path, &origins_dir, mock.clone(), true, false).await;
+
+    eng.origin_add(
+        "acme/good",
+        Some("good"),
+        None,
+        Some("good-branch"),
+        Some(good_root.to_str().unwrap()),
+    )
+    .await
+    .unwrap();
+    eng.origin_add(
+        "acme/bad",
+        Some("bad"),
+        None,
+        Some("bad-branch"),
+        Some(bad_root.to_str().unwrap()),
+    )
+    .await
+    .unwrap();
+
+    mock.fail_branch_head_offline("bad-branch");
+
+    let status = eng.origin_status(None).await.unwrap();
+    assert_eq!(status["errors"].as_array().unwrap().len(), 0, "{status}");
+    let domains = status["domains"].as_array().unwrap();
+    assert_eq!(
+        domains.len(),
+        2,
+        "both domains must still be reported: {status}"
+    );
+
+    let good = domains
+        .iter()
+        .find(|d| d["domain"] == "good")
+        .expect("good domain present");
+    assert!(good["probe_error"].is_null());
+    assert_eq!(good["behind"], false);
+
+    let bad = domains
+        .iter()
+        .find(|d| d["domain"] == "bad")
+        .expect("bad domain still present despite its offline probe");
+    assert!(bad["probe_error"].as_str().is_some());
+    assert!(bad["behind"].is_null());
+}
+
+#[tokio::test]
+async fn origin_status_one_domain_genuinely_failing_does_not_abort_the_others() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let good_commit = mock.add_commit(commit_files(&[("MANIFEST.md", manifest())]));
+    mock.set_branch("good-branch", &good_commit);
+    let bad_commit = mock.add_commit(commit_files(&[("MANIFEST.md", manifest())]));
+    mock.set_branch("bad-branch", &bad_commit);
+
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let good_root = tmp.path().join("good");
+    let bad_root = tmp.path().join("bad");
+    let eng = engine_with(&config_path, &origins_dir, mock.clone(), true, false).await;
+
+    eng.origin_add(
+        "acme/good",
+        Some("good"),
+        None,
+        Some("good-branch"),
+        Some(good_root.to_str().unwrap()),
+    )
+    .await
+    .unwrap();
+    eng.origin_add(
+        "acme/bad",
+        Some("bad"),
+        None,
+        Some("bad-branch"),
+        Some(bad_root.to_str().unwrap()),
+    )
+    .await
+    .unwrap();
+
+    // Corrupt "bad"'s origin state so its status genuinely fails, without
+    // touching "good".
+    std::fs::remove_file(origins_dir.join("bad").join("state.json")).unwrap();
+
+    let status = eng.origin_status(None).await.unwrap();
+    let domains = status["domains"].as_array().unwrap();
+    let errors = status["errors"].as_array().unwrap();
+    assert_eq!(domains.len(), 1, "{status}");
+    assert_eq!(domains[0]["domain"], "good");
+    assert_eq!(errors.len(), 1, "{status}");
+    assert_eq!(errors[0]["domain"], "bad");
+    assert!(
+        errors[0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("origin state")
+    );
 }

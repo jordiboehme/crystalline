@@ -2360,7 +2360,17 @@ impl Engine {
             tracing::warn!("embedding after updating '{name}' failed: {e}");
         }
 
-        Ok(origin::pull_report_json(name, &report))
+        // `ops::pull` already saved the post-pull state to `state_dir`; reload
+        // it fresh so each transition's url and title can be joined in for
+        // the caller. A reload failure only degrades the proposal entries to
+        // number and status (see `origin::proposal_transitions_json`), it
+        // never fails an update that has already landed on disk.
+        let state = crystalline_remote::state::OriginState::load(&state_dir)
+            .ok()
+            .flatten();
+        let proposals = origin::proposal_transitions_json(&report.proposals, state.as_ref());
+
+        Ok(origin::pull_report_json(name, &report, proposals))
     }
 
     /// Reports where one origin-connected domain (or every one, when
@@ -2368,7 +2378,10 @@ impl Engine {
     /// machine's GitHub connection. Never hard-fails just because the
     /// machine is offline or has no saved connection: each domain's `behind`
     /// is `None` and the connection block reports `connected: false` rather
-    /// than erroring. Allowed on a read-only instance (a pure read).
+    /// than erroring. One domain's genuine failure (corrupt state, a missing
+    /// filesystem root) never aborts the others: it is collected into the
+    /// `errors` array instead, mirroring `origin_update`. Allowed on a
+    /// read-only instance (a pure read).
     pub async fn origin_status(&self, domain: Option<&str>) -> Result<Value> {
         if !self.config.read().unwrap().github_enabled() {
             return Err(RemoteError::NotEnabled.into());
@@ -2377,17 +2390,48 @@ impl Engine {
         let connection = self.origin_connection_json().await?;
 
         let mut domains = Vec::new();
+        let mut errors = Vec::new();
         for (name, entry) in targets {
-            let lock = self.origin_lock(&name);
-            let _guard = lock.lock().await;
-            let (spec, root, state_dir) = self.origin_spec_for(&name, &entry)?;
-            // A probe is best-effort: no connection, or a provider that fails
-            // to build, must never turn a status call into a hard failure.
-            let probe = self.resolve_origin_provider().ok();
-            let report = ops::status(&spec, &root, &state_dir, probe.as_deref()).await?;
-            domains.push(origin::status_report_json(&name, &report));
+            match self.origin_status_one(&name, &entry).await {
+                Ok(v) => domains.push(v),
+                Err(e) => errors.push(json!({ "domain": name, "error": e.to_string() })),
+            }
         }
-        Ok(json!({ "connection": connection, "domains": domains }))
+        Ok(json!({ "connection": connection, "domains": domains, "errors": errors }))
+    }
+
+    /// Reports one domain's status, under its origin lock. The per-domain
+    /// body behind `origin_status`'s aggregate loop.
+    ///
+    /// A live probe is best-effort in two layers: no connection, or a
+    /// provider that fails to build, degrades straight to `probe: None`
+    /// (unchanged from before). When a provider was resolved but the probe
+    /// call itself fails for a transport reason - offline, rate limited, an
+    /// expired connection, see [`origin::is_probe_transport_error`] - the
+    /// same domain is retried once with no probe at all, so the
+    /// offline-capable report still comes back; the probe's own error
+    /// message rides along verbatim as `probe_error` instead of aborting
+    /// the domain. Any other failure (corrupt local state, and so on) is a
+    /// genuine per-domain error, propagated to the caller's `errors` array.
+    async fn origin_status_one(&self, name: &str, entry: &DomainEntry) -> Result<Value> {
+        let lock = self.origin_lock(name);
+        let _guard = lock.lock().await;
+        let (spec, root, state_dir) = self.origin_spec_for(name, entry)?;
+        // A probe is best-effort: no connection, or a provider that fails to
+        // build, must never turn a status call into a hard failure.
+        let probe = self.resolve_origin_provider().ok();
+        match ops::status(&spec, &root, &state_dir, probe.as_deref()).await {
+            Ok(report) => Ok(origin::status_report_json(name, &report, None)),
+            Err(e) if probe.is_some() && origin::is_probe_transport_error(&e) => {
+                let report = ops::status(&spec, &root, &state_dir, None).await?;
+                Ok(origin::status_report_json(
+                    name,
+                    &report,
+                    Some(e.to_string()),
+                ))
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// The domains `origin_update`/`origin_status` operate on: the one named

@@ -10,7 +10,7 @@
 
 #![allow(dead_code)]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
 use std::sync::Mutex;
 
@@ -50,6 +50,15 @@ struct Inner {
     etag_counter: u64,
     commit_counter: u64,
     current_user: String,
+    /// Branches whose `branch_head` probe should fail with
+    /// `RemoteError::Offline`, simulating a live network outage. Set through
+    /// `MockProvider::fail_branch_head_offline`.
+    offline_branches: HashSet<String>,
+    /// The lifecycle state `proposal_state` reports for a given proposal
+    /// number, set through `MockProvider::set_proposal_state`. A number with
+    /// no entry here errors as unknown, matching a genuinely nonexistent
+    /// proposal.
+    proposal_states: HashMap<u64, ProposalState>,
 }
 
 /// An in-memory forge implementing [`Provider`] for the origin engine tests.
@@ -101,6 +110,24 @@ impl MockProvider {
             .insert(branch.to_string(), commit.to_string());
         inner.etags.insert(branch.to_string(), etag);
     }
+
+    /// Marks `branch` as unreachable: every subsequent `branch_head` probe
+    /// against it returns `Err(RemoteError::Offline)`, simulating a live
+    /// network outage while a saved GitHub connection still exists (as
+    /// opposed to no connection at all, which the engine already handles by
+    /// never resolving a provider in the first place).
+    pub fn fail_branch_head_offline(&self, branch: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.offline_branches.insert(branch.to_string());
+    }
+
+    /// Sets the lifecycle state `proposal_state` reports for `number`, so a
+    /// `pull`'s open-proposal refresh can observe a proposal moving to
+    /// merged or declined.
+    pub fn set_proposal_state(&self, number: u64, state: ProposalState) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.proposal_states.insert(number, state);
+    }
 }
 
 #[async_trait::async_trait]
@@ -111,6 +138,9 @@ impl Provider for MockProvider {
         etag: Option<&str>,
     ) -> Result<HeadProbe, RemoteError> {
         let inner = self.inner.lock().unwrap();
+        if inner.offline_branches.contains(&origin.branch) {
+            return Err(RemoteError::Offline);
+        }
         let commit = inner.branches.get(&origin.branch).cloned().ok_or_else(|| {
             RemoteError::RepoNotFound {
                 repo: origin.repo.clone(),
@@ -273,10 +303,15 @@ impl Provider for MockProvider {
         _origin: &OriginSpec,
         number: u64,
     ) -> Result<ProposalState, RemoteError> {
-        Err(RemoteError::Api {
-            status: 404,
-            message: format!("no proposal {number}"),
-        })
+        let inner = self.inner.lock().unwrap();
+        inner
+            .proposal_states
+            .get(&number)
+            .copied()
+            .ok_or_else(|| RemoteError::Api {
+                status: 404,
+                message: format!("no proposal {number}"),
+            })
     }
 
     async fn current_user(&self) -> Result<String, RemoteError> {

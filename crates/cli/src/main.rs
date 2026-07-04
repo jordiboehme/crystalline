@@ -980,9 +980,15 @@ fn print_origin_update(data: &serde_json::Value, json: bool) {
             );
         }
         for p in d["proposals"].as_array().unwrap_or(&empty) {
-            let number = p.get(0).and_then(|v| v.as_u64()).unwrap_or(0);
-            let status = p.get(1).and_then(|v| v.as_str()).unwrap_or("");
-            println!("  proposal #{number}: {status}");
+            let number = p["number"].as_u64().unwrap_or(0);
+            let status = p["status"].as_str().unwrap_or("");
+            match p["url"].as_str() {
+                Some(url) => {
+                    let title = p["title"].as_str().unwrap_or("");
+                    println!("  proposal #{number}: {status} - {title} ({url})");
+                }
+                None => println!("  proposal #{number}: {status}"),
+            }
         }
     }
     for e in data["errors"].as_array().unwrap_or(&empty) {
@@ -996,8 +1002,10 @@ fn print_origin_update(data: &serde_json::Value, json: bool) {
 
 /// Render `origin status`'s result: the connection line, then per team
 /// domain its repo, branch, how far ahead (local changes) and behind it is,
-/// open and declined proposals with their urls, unresolved conflicts and
-/// when it was last checked.
+/// a note when the live probe itself failed (offline, rate limited, an
+/// expired connection) rather than the whole domain, open and declined
+/// proposals with their urls, unresolved conflicts and when it was last
+/// checked, then one line per domain that genuinely failed to report.
 fn print_origin_status(data: &serde_json::Value, json: bool) {
     if json {
         print_value(data, true);
@@ -1036,6 +1044,9 @@ fn print_origin_status(data: &serde_json::Value, json: bool) {
                 None => "unknown (offline)",
             }
         );
+        if let Some(probe_error) = d["probe_error"].as_str() {
+            println!("  probe failed, reporting from local state only: {probe_error}");
+        }
         for p in d["open_proposals"].as_array().unwrap_or(&empty) {
             println!(
                 "  open proposal #{}: {} - {}",
@@ -1061,6 +1072,13 @@ fn print_origin_status(data: &serde_json::Value, json: bool) {
         println!(
             "  last checked: {}",
             d["last_checked"].as_str().unwrap_or("never")
+        );
+    }
+    for e in data["errors"].as_array().unwrap_or(&empty) {
+        println!(
+            "{}: could not report status: {}",
+            e["domain"].as_str().unwrap_or(""),
+            e["error"].as_str().unwrap_or("")
         );
     }
 }
