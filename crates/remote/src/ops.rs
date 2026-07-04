@@ -629,8 +629,13 @@ pub async fn propose(
                     path: to_repo_relative(path, spec.subpath.as_deref()),
                     blob_sha: None,
                 });
-                let base_content = state::read_base_file(state_dir, path)?;
-                entries.deleted.push((path.clone(), base_content));
+                // Only worth reading back the retired file's last known
+                // content (for its engram title in the generated body) when
+                // there is a generated body to put it in at all.
+                if description.is_none() {
+                    let base_content = state::read_base_file(state_dir, path)?;
+                    entries.deleted.push((path.clone(), base_content));
+                }
                 deleted.push(path.clone());
                 files.push(ProposedFile {
                     path: path.clone(),

@@ -1584,3 +1584,35 @@ async fn scenario_23_generated_summary_joins_three_plural_clauses_without_an_oxf
     );
     assert_eq!(req.body.lines().next().unwrap(), report.summary);
 }
+
+#[tokio::test]
+async fn scenario_23_caller_supplied_title_and_description_are_used_verbatim() {
+    let mock = MockProvider::new();
+    let spec = share_spec();
+    let c1 = mock.add_commit(sub_commit_files(&[("MANIFEST.md", b"# Manifest")]), None);
+    let sub = subscribe_named(&mock, &spec, &c1, "brand").await;
+
+    write(&sub.domain_root.join("notes/new.md"), b"content\n");
+
+    let outcome = propose(
+        &mock,
+        &spec,
+        &sub.domain_root,
+        &sub.state_dir,
+        Some("My own title"),
+        Some("My own description, written by hand."),
+    )
+    .await
+    .unwrap();
+    let report = match outcome {
+        ProposeOutcome::Proposed(r) => r,
+        other => panic!("expected Proposed, got {other:?}"),
+    };
+
+    let req = mock.proposal_request(report.number).unwrap();
+    assert_eq!(req.title, "My own title");
+    assert_eq!(req.body, "My own description, written by hand.");
+    // The state also records the caller's title, not a generated one.
+    let recorded = &load_state(&sub.state_dir).proposals[0];
+    assert_eq!(recorded.title, "My own title");
+}
