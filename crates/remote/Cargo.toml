@@ -34,13 +34,13 @@ walkdir = { workspace = true }
 # workaround for keyring 4.1.3's v1 feature never installing a default
 # store itself; see "Known upstream workarounds" in CLAUDE.md.
 [target.'cfg(target_os = "macos")'.dependencies]
-apple-native-keyring-store = { version = "1.0.0", features = ["keychain"] }
+apple-native-keyring-store = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-native-keyring-store = "1.1.0"
+windows-native-keyring-store = { workspace = true }
 
 [target.'cfg(all(unix, not(any(target_os = "macos", target_os = "ios", target_os = "android"))))'.dependencies]
-zbus-secret-service-keyring-store = { version = "1.0.0", features = ["crypto-rust"] }
+zbus-secret-service-keyring-store = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }

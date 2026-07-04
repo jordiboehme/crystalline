@@ -7,7 +7,7 @@
 //! Every test injects `support::MockProvider` via `Engine::with_origin_provider`
 //! and points origin state and the GitHub token store at tempdirs via
 //! `Engine::with_origins_dir` and `Engine::with_token_store_dir`, so nothing
-//! here reaches a network, a real GitHub repository, or the real machine's
+//! here reaches a network, a real GitHub repository or the real machine's
 //! config, state directory or OS keychain.
 //!
 //! `poll_secs`' 60-second floor makes waiting out real intervals

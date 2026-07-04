@@ -373,7 +373,7 @@ impl Engine {
     /// `config::read_or_create_instance_id`). With an id set, syncing a file
     /// domain first claims its host lock: acquired domains sync and embed here, a
     /// domain held by another live instance is skipped on a full sync and refused
-    /// on a named one, and this instance renews its locks on the heartbeat timer.
+    /// on a named one and this instance renews its locks on the heartbeat timer.
     /// An empty id (the default) leaves collaboration off.
     pub fn with_instance_id(mut self, instance_id: String) -> Engine {
         self.label = instance_id.clone();
@@ -1997,7 +1997,7 @@ impl Engine {
     /// collaboration mode (a non-empty instance id) each file domain is claimed
     /// before syncing: an acquired domain syncs, a domain held by another live
     /// instance is skipped on a full sync (`only` is `None`) and refused on a
-    /// named one, and `take_over` forces the claim. Outside collaboration mode
+    /// named one and `take_over` forces the claim. Outside collaboration mode
     /// (standalone, single-instance) nothing is claimed and every target syncs.
     pub async fn sync_take_over(&self, only: Option<&str>, take_over: bool) -> Result<Value> {
         let targets = self.sync_targets(only)?;
@@ -2573,7 +2573,7 @@ impl Engine {
     ///
     /// A tick does nothing when collaboration is off (so enabling it later
     /// starts polling on the very next tick, no restart needed), when the
-    /// shared rate-limit pause has not yet elapsed, or when no GitHub token
+    /// shared rate-limit pause has not yet elapsed or when no GitHub token
     /// is on file (so a `connect` lands and the next tick picks it up
     /// automatically; a debug line notes this at most once an hour). A
     /// domain hitting `RemoteError::RateLimited` pauses every domain until

@@ -23,7 +23,7 @@ const KEYRING_SERVICE: &str = "crystalline";
 const TOKEN_FILE_NAME: &str = "github-token.json";
 
 /// A saved GitHub access token, together with who it belongs to and where.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredToken {
     /// The token itself, as GitHub issued it.
     pub access_token: String,
@@ -34,6 +34,22 @@ pub struct StoredToken {
     pub user: String,
     /// When this token was saved.
     pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Redacts `access_token`: a `StoredToken` reaches `Debug` output in a log
+/// line, a panic message or a test failure far more easily than it reaches
+/// `Display` (which this type has none of), so the derive is deliberately not
+/// used here. Every other field is plain, non-secret metadata and prints as
+/// normal.
+impl std::fmt::Debug for StoredToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoredToken")
+            .field("access_token", &"<redacted>")
+            .field("host", &self.host)
+            .field("user", &self.user)
+            .field("created_at", &self.created_at)
+            .finish()
+    }
 }
 
 /// Where a GitHub access token is persisted between runs.
@@ -390,6 +406,14 @@ mod tests {
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "expected owner-only permissions, got {mode:o}");
+    }
+
+    #[test]
+    fn debug_redacts_the_access_token_but_keeps_the_other_fields() {
+        let debugged = format!("{:?}", sample_token());
+        assert!(!debugged.contains("gho_examplesecret"), "{debugged}");
+        assert!(debugged.contains("<redacted>"), "{debugged}");
+        assert!(debugged.contains("octocat"), "{debugged}");
     }
 
     #[test]

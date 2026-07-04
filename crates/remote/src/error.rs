@@ -78,7 +78,8 @@ pub enum RemoteError {
     /// unresolved. Every proposal must be mergeable at creation, so sharing
     /// refuses until the conflicts are settled.
     #[error(
-        "{count} conflict(s) need to be settled before sharing; use resolve_conflict, then try again."
+        "{} before sharing; use resolve_conflict, then try again.",
+        conflicts_pending_clause(*count)
     )]
     ConflictsPending {
         /// How many conflicts are outstanding.
@@ -155,6 +156,17 @@ fn manifest_location(path: &Option<String>) -> String {
     match path {
         Some(p) => format!("at {p}"),
         None => "at the repository root".to_string(),
+    }
+}
+
+/// The leading clause of the `ConflictsPending` message, singular or plural
+/// depending on `count`: `"1 conflict needs to be settled"` or `"N conflicts
+/// need to be settled"`.
+fn conflicts_pending_clause(count: usize) -> String {
+    if count == 1 {
+        "1 conflict needs to be settled".to_string()
+    } else {
+        format!("{count} conflicts need to be settled")
     }
 }
 
@@ -258,6 +270,22 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains('3'), "{msg}");
         assert!(msg.contains("resolve_conflict"), "{msg}");
+    }
+
+    #[test]
+    fn conflicts_pending_uses_singular_wording_for_one() {
+        assert_eq!(
+            RemoteError::ConflictsPending { count: 1 }.to_string(),
+            "1 conflict needs to be settled before sharing; use resolve_conflict, then try again."
+        );
+    }
+
+    #[test]
+    fn conflicts_pending_uses_plural_wording_for_more_than_one() {
+        assert_eq!(
+            RemoteError::ConflictsPending { count: 2 }.to_string(),
+            "2 conflicts need to be settled before sharing; use resolve_conflict, then try again."
+        );
     }
 
     #[test]

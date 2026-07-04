@@ -150,13 +150,17 @@ pub enum DevicePoll {
 /// `POST {auth_base}/login/oauth/access_token` response. Every outcome
 /// (pending, slow down, expired, declined, success) comes back as this same
 /// shape rather than through the HTTP status, per the OAuth device flow
-/// specification.
+/// specification. `error_description` is optional per the spec: GitHub sends
+/// it for some error codes and not others, so an undocumented code falls back
+/// to repeating the raw code itself rather than leaving the detail blank.
 #[derive(Debug, Default, Deserialize)]
 struct AccessTokenResponse {
     #[serde(default)]
     access_token: Option<String>,
     #[serde(default)]
     error: Option<String>,
+    #[serde(default)]
+    error_description: Option<String>,
 }
 
 /// `POST {auth_base}/login/oauth/access_token` request body.
@@ -202,10 +206,21 @@ pub async fn poll_device_flow_once(
             status: 403,
             message: "the sign-in was declined on GitHub".to_string(),
         }),
-        Some(other) => Err(RemoteError::Api {
-            status: 0,
-            message: format!("GitHub reported an unexpected device flow error: {other}"),
-        }),
+        Some(other) => {
+            // An undocumented device-flow error code: the OAuth device flow
+            // specification names five (`authorization_pending`,
+            // `slow_down`, `expired_token`, `access_denied` and
+            // `unsupported_grant_type`, which GitHub never actually sends
+            // here), so this is a real gap rather than a transport failure.
+            // `status: 0` would surface a meaningless "status 0" to the user;
+            // 200 reflects the successful HTTP response actually received,
+            // with the detail carrying the useful information.
+            let detail = body.error_description.as_deref().unwrap_or(other);
+            Err(RemoteError::Api {
+                status: 200,
+                message: format!("GitHub answered the sign-in with {other}: {detail}"),
+            })
+        }
         None => Err(RemoteError::Api {
             status: 0,
             message: "the device flow response had neither a token nor an error".to_string(),

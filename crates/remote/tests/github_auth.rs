@@ -205,6 +205,58 @@ async fn poll_device_flow_once_maps_access_denied_to_a_403_api_error() {
 }
 
 #[tokio::test]
+async fn poll_device_flow_once_maps_an_undocumented_error_code_to_a_clear_message() {
+    let app = Router::new().route(
+        "/login/oauth/access_token",
+        post(|| async {
+            Json(serde_json::json!({
+                "error": "temporarily_unavailable",
+                "error_description": "the server is overloaded",
+            }))
+        }),
+    );
+    let base = spawn(app).await;
+
+    let err = poll_device_flow_once(&base, "client", "devicecode")
+        .await
+        .unwrap_err();
+    match err {
+        RemoteError::Api { status, message } => {
+            assert_eq!(
+                status, 200,
+                "status 0 must never be user-visible: {message}"
+            );
+            assert!(message.contains("temporarily_unavailable"), "{message}");
+            assert!(message.contains("the server is overloaded"), "{message}");
+        }
+        other => panic!("expected Api, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn poll_device_flow_once_maps_an_undocumented_error_code_with_no_description() {
+    let app = Router::new().route(
+        "/login/oauth/access_token",
+        post(|| async { Json(serde_json::json!({"error": "temporarily_unavailable"})) }),
+    );
+    let base = spawn(app).await;
+
+    let err = poll_device_flow_once(&base, "client", "devicecode")
+        .await
+        .unwrap_err();
+    match err {
+        RemoteError::Api { status, message } => {
+            assert_eq!(
+                status, 200,
+                "status 0 must never be user-visible: {message}"
+            );
+            assert!(message.contains("temporarily_unavailable"), "{message}");
+        }
+        other => panic!("expected Api, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn poll_device_flow_once_maps_connection_refused_to_offline() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
