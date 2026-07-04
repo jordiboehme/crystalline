@@ -1697,3 +1697,165 @@ async fn scenario_23_caller_supplied_title_and_description_are_used_verbatim() {
     let recorded = &load_state(&sub.state_dir).proposals[0];
     assert_eq!(recorded.title, "My own title");
 }
+
+// Scenario 24: a domain whose origin carries hidden upstream paths (a
+// dot-file, a dot-directory, the domain config file) never extracts the
+// hidden ones to the working tree or the base snapshot; the domain config
+// file is the one dot-prefixed exception, since it travels with the domain
+// like any other tracked file. Status then reports zero local changes (the
+// hidden paths are invisible to both the base snapshot and the local-change
+// walk, so nothing looks deleted), and a later share proposal for a trivial
+// visible edit proposes only that edit, never a `Deleted` entry for a hidden
+// path the domain never tracked in the first place.
+
+#[tokio::test]
+async fn scenario_24_hidden_upstream_paths_never_extract_status_or_share_clean() {
+    let mock = MockProvider::new();
+    let c1 = mock.add_commit(
+        commit_files(&[
+            ("MANIFEST.md", b"# Manifest"),
+            ("notes/a.md", b"alpha"),
+            (".gitignore", b"target/\n"),
+            (".github/workflows/ci.yml", b"name: ci\n"),
+            (".crystalline.yaml", b"config: true\n"),
+        ]),
+        None,
+    );
+    let (sub, report) = subscribe_at(&mock, &c1).await;
+
+    // Working tree: the visible file and the domain config file land, the
+    // hidden dot-file and dot-directory never do.
+    assert_eq!(read(&sub.domain_root.join("notes/a.md")), b"alpha");
+    assert_eq!(
+        read(&sub.domain_root.join(".crystalline.yaml")),
+        b"config: true\n"
+    );
+    assert!(!sub.domain_root.join(".gitignore").exists());
+    assert!(!sub.domain_root.join(".github").exists());
+    assert_eq!(
+        report.files_written, 3,
+        "MANIFEST.md, notes/a.md and .crystalline.yaml; the two hidden paths never count"
+    );
+
+    // Origin state: the same three paths, nothing hidden stamped.
+    let st = load_state(&sub.state_dir);
+    let mut stamped: Vec<&str> = st.files.keys().map(String::as_str).collect();
+    stamped.sort();
+    assert_eq!(
+        stamped,
+        vec![".crystalline.yaml", "MANIFEST.md", "notes/a.md"]
+    );
+    assert!(!st.files.contains_key(".gitignore"));
+    assert!(!st.files.contains_key(".github/workflows/ci.yml"));
+
+    // Status: the hidden paths this domain never tracked cannot show up as
+    // local changes, since the base snapshot never claimed them either.
+    let status_report = status(&spec(), &sub.domain_root, &sub.state_dir, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        status_report.local_changes, 0,
+        "{:?}",
+        status_report.local_changes
+    );
+
+    // A trivial visible edit proposes only that edit: no `Deleted` entries
+    // for hidden paths the domain never tracked.
+    write(&sub.domain_root.join("notes/a.md"), b"alpha revised\n");
+    let outcome = propose(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "team-knowledge",
+        &sub.state_dir,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let share_report = match outcome {
+        ProposeOutcome::Proposed(r) => r,
+        other => panic!("expected Proposed, got {other:?}"),
+    };
+    assert_eq!(share_report.updated, vec!["notes/a.md".to_string()]);
+    assert!(share_report.added.is_empty(), "{:?}", share_report.added);
+    assert!(
+        share_report.deleted.is_empty(),
+        "no hidden path may be proposed for deletion: {:?}",
+        share_report.deleted
+    );
+}
+
+// Scenario 25: upstream adds a hidden file (a compare-driven pull, the
+// ordinary path when the change set is small). The pull ignores it entirely:
+// not written to the working tree, not stamped into the base snapshot and not
+// reported in `applied`, even though the base commit still advances to head.
+
+#[tokio::test]
+async fn scenario_25_pull_ignores_a_hidden_upstream_addition_via_compare() {
+    let mock = MockProvider::new();
+    let c1 = mock.add_commit(
+        commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/a.md", b"alpha")]),
+        None,
+    );
+    let (sub, _) = subscribe_at(&mock, &c1).await;
+
+    let c2 = mock.add_commit(
+        commit_files(&[
+            ("MANIFEST.md", b"# Manifest"),
+            ("notes/a.md", b"alpha"),
+            (".github/workflows/ci.yml", b"name: ci\n"),
+        ]),
+        Some(&c1),
+    );
+    mock.set_branch("main", &c2);
+
+    let report = pull(&mock, &spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+
+    assert!(!report.up_to_date);
+    assert!(report.applied.is_empty(), "{:?}", report.applied);
+    assert!(!sub.domain_root.join(".github").exists());
+
+    let st = load_state(&sub.state_dir);
+    assert!(!st.files.contains_key(".github/workflows/ci.yml"));
+    assert_eq!(st.base_commit, c2, "base still advances to head");
+}
+
+// Scenario 26: the same hidden-addition pull, forced through the whole-tree
+// tarball diff fallback (a truncated compare) instead of the compare-based
+// path scenario 25 exercises, so both routes into `extract_tarball` agree.
+
+#[tokio::test]
+async fn scenario_26_pull_ignores_a_hidden_upstream_addition_via_tarball_fallback() {
+    let mock = MockProvider::new();
+    let c1 = mock.add_commit(
+        commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/a.md", b"alpha")]),
+        None,
+    );
+    let (sub, _) = subscribe_at(&mock, &c1).await;
+
+    let c2 = mock.add_commit(
+        commit_files(&[
+            ("MANIFEST.md", b"# Manifest"),
+            ("notes/a.md", b"alpha revised\n"),
+            (".env", b"SECRET=upstream\n"),
+        ]),
+        Some(&c1),
+    );
+    mock.set_branch("main", &c2);
+    mock.set_truncate(true);
+
+    let report = pull(&mock, &spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+
+    assert!(!report.up_to_date);
+    assert_eq!(report.applied, vec!["notes/a.md".to_string()]);
+    assert!(!sub.domain_root.join(".env").exists());
+
+    let st = load_state(&sub.state_dir);
+    assert!(!st.files.contains_key(".env"));
+    assert_eq!(st.base_commit, c2);
+}

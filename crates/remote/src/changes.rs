@@ -210,6 +210,30 @@ fn is_hidden(name: &str) -> bool {
     name.starts_with('.') && name != "." && name != ".." && name != DOMAIN_CONFIG_FILE_NAME
 }
 
+/// The single hidden-path rule every ingestion boundary in this crate must
+/// apply, so [`crate::state::OriginState::files`] only ever contains paths
+/// [`detect_local_changes`] can also see: without this, a hidden file stamped
+/// into the base snapshot by one path but skipped by the working-tree walk
+/// looks like a local deletion in `status`, and worse, like something to
+/// delete upstream in a share proposal.
+///
+/// True when `rel_path` (a forward-slash relative path, domain-rooted) is, or
+/// sits under, a hidden directory or file: any `/`-separated component for
+/// which [`is_hidden`] is true. This mirrors the walk [`detect_local_changes`]
+/// performs component by component, so a component that is itself
+/// [`DOMAIN_CONFIG_FILE_NAME`] never makes the whole path hidden on its own,
+/// but a hidden ancestor directory still does even when the leaf name is
+/// `.crystalline.yaml` (the walk would have pruned that directory before ever
+/// reaching the file, so this function must agree).
+///
+/// Used by [`crate::archive::extract_tarball`] (skipping hidden entries
+/// before they are written or stamped into a base snapshot) and
+/// [`crate::ops`]'s compare-path filter (dropping hidden upstream changes
+/// before a blob is ever fetched for one).
+pub(crate) fn is_hidden_path(rel_path: &str) -> bool {
+    rel_path.split('/').any(is_hidden)
+}
+
 /// The forward-slash relative path of `path` under `root`.
 fn rel_path(root: &Path, path: &Path) -> String {
     path.strip_prefix(root)
@@ -396,6 +420,44 @@ mod tests {
             result.skipped_large,
             vec![("notes/huge.md".to_string(), oversized.len() as u64)]
         );
+    }
+
+    #[test]
+    fn is_hidden_path_is_true_for_a_hidden_file_at_root() {
+        assert!(is_hidden_path(".gitignore"));
+    }
+
+    #[test]
+    fn is_hidden_path_is_true_for_a_file_under_a_hidden_directory() {
+        assert!(is_hidden_path(".github/workflows/ci.yml"));
+    }
+
+    #[test]
+    fn is_hidden_path_is_true_for_a_nested_hidden_directory() {
+        assert!(is_hidden_path("notes/.trash/old.md"));
+    }
+
+    #[test]
+    fn is_hidden_path_is_false_for_an_ordinary_nested_file() {
+        assert!(!is_hidden_path("notes/a/b/deep.md"));
+    }
+
+    #[test]
+    fn is_hidden_path_makes_an_exception_for_the_domain_config_file_at_root() {
+        assert!(!is_hidden_path(".crystalline.yaml"));
+    }
+
+    #[test]
+    fn is_hidden_path_makes_an_exception_for_the_domain_config_file_nested_under_a_visible_dir() {
+        assert!(!is_hidden_path("notes/.crystalline.yaml"));
+    }
+
+    #[test]
+    fn is_hidden_path_still_hides_the_domain_config_file_under_a_hidden_directory() {
+        // The domain config file's own name is exempt, but a hidden ancestor
+        // directory still hides it: the walk would have pruned `.config`
+        // before ever reaching the file inside it.
+        assert!(is_hidden_path(".config/.crystalline.yaml"));
     }
 
     #[test]

@@ -37,6 +37,13 @@ pub type ExtractedFiles = (BTreeMap<String, Vec<u8>>, Vec<(String, u64)>);
 /// is just another path inside (or, if crafted maliciously, outside) the
 /// archive rather than content to trust.
 ///
+/// A hidden entry (a dot-file, or anything under a dot-directory, at any
+/// depth of the extracted tree) is skipped outright too, [`crate::state`]'s
+/// domain config file excepted: see [`crate::changes::is_hidden_path`] for
+/// the exact rule, shared with [`crate::changes::detect_local_changes`] so
+/// this function never extracts a path the local change walk would not also
+/// see.
+///
 /// An entry whose normalized path would escape the archive root (any `..`
 /// path component) or could be mistaken for a Windows drive-prefixed path
 /// (any component containing `:`) is rejected with [`RemoteError::State`]:
@@ -102,6 +109,17 @@ pub fn extract_tarball(bytes: &[u8], subpath: Option<&str>) -> Result<ExtractedF
             None => rest,
         };
         if rel.is_empty() {
+            continue;
+        }
+
+        // A hidden path (a dot-file or anything under a dot-directory, the
+        // domain config file excepted) is never extracted: it must never land
+        // in the working tree or the base snapshot, since
+        // `crate::changes::detect_local_changes` skips the same paths on its
+        // own walk. Extracting one here regardless would stamp a path into
+        // `OriginState::files` that the local change walk can never see
+        // again, later read back as a spurious deletion.
+        if crate::changes::is_hidden_path(rel) {
             continue;
         }
 
