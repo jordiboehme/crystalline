@@ -18,6 +18,7 @@
 
 pub mod error;
 pub mod github;
+pub mod merge;
 pub mod provider;
 pub mod token;
 
