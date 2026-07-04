@@ -542,6 +542,11 @@ pub async fn status(
 
 /// Proposes a domain's local changes as a pull request against its origin.
 ///
+/// `domain_name` is the domain's registered name, the contract's sole
+/// authority over what a share calls the domain: it seeds the branch slug
+/// (see [`share_branch_name`]) and the generated title and body, regardless
+/// of what `domain_root`'s own directory happens to be named.
+///
 /// The algorithm, in order: pull first, so every proposal is opened
 /// mergeable (any upstream movement is integrated onto the working tree
 /// before anything is proposed); refuse with [`RemoteError::ConflictsPending`]
@@ -558,6 +563,7 @@ pub async fn propose(
     provider: &dyn Provider,
     spec: &OriginSpec,
     domain_root: &Path,
+    domain_name: &str,
     state_dir: &Path,
     title: Option<&str>,
     description: Option<&str>,
@@ -582,7 +588,6 @@ pub async fn propose(
         });
     }
 
-    let domain_name = domain_display_name(domain_root);
     let mut added = Vec::new();
     let mut updated = Vec::new();
     let mut deleted = Vec::new();
@@ -646,12 +651,12 @@ pub async fn propose(
         }
     }
 
-    let generated_title = generate_title(added.len(), updated.len(), deleted.len(), &domain_name);
+    let generated_title = generate_title(added.len(), updated.len(), deleted.len(), domain_name);
     let effective_title = title.map(str::to_string).unwrap_or(generated_title);
     let summary = generate_summary_line(added.len(), updated.len(), deleted.len());
     let body = description
         .map(str::to_string)
-        .unwrap_or_else(|| generate_body(&summary, &entries, &domain_name));
+        .unwrap_or_else(|| generate_body(&summary, &entries, domain_name));
 
     let tree_sha = provider
         .create_tree(spec, &state.base_commit, &writes)
@@ -659,7 +664,7 @@ pub async fn propose(
     let commit_sha = provider
         .create_commit(spec, &effective_title, &tree_sha, &state.base_commit)
         .await?;
-    let branch = share_branch_name(&domain_name);
+    let branch = share_branch_name(domain_name);
     provider.create_branch(spec, &branch, &commit_sha).await?;
     let handle = provider
         .create_proposal(
@@ -1222,21 +1227,6 @@ struct ChangeEntries {
     added: Vec<(String, Vec<u8>)>,
     updated: Vec<(String, Vec<u8>)>,
     deleted: Vec<(String, Option<Vec<u8>>)>,
-}
-
-/// The domain's display name for the branch slug and the generated title and
-/// body: the working tree's own directory name, since this module knows a
-/// domain only by its filesystem paths, never the name it happens to be
-/// registered under. Falls back to `"domain"` on the unlikely event
-/// `domain_root` has no file name component at all (for example the
-/// filesystem root).
-fn domain_display_name(domain_root: &Path) -> String {
-    domain_root
-        .file_name()
-        .and_then(|s| s.to_str())
-        .filter(|s| !s.is_empty())
-        .unwrap_or("domain")
-        .to_string()
 }
 
 /// Builds a share branch name: `crystalline/share-<slug>-<timestamp>`.

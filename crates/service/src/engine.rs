@@ -2468,6 +2468,7 @@ impl Engine {
             provider.as_ref(),
             &spec,
             &root,
+            domain,
             &state_dir,
             title,
             description,

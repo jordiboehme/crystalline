@@ -98,9 +98,11 @@ fn load_state(state_dir: &Path) -> OriginState {
 
 /// Subscribes a fresh domain at `commit` against `spec`, with the working
 /// tree rooted at a directory named `domain_name` (rather than the fixed
-/// `"domain"` name [`subscribe_at`] uses), for share-side tests that need
-/// control over the domain's own display name (the branch-slug contract
-/// derives it from this basename) or a subpath spec.
+/// `"domain"` name [`subscribe_at`] uses), for share-side tests that need a
+/// distinctively named working tree or a subpath spec. The domain's display
+/// name for `propose`'s branch slug and generated title and body is a
+/// separate argument passed straight to `propose`, not derived from this
+/// basename.
 async fn subscribe_named(
     mock: &MockProvider,
     spec: &OriginSpec,
@@ -943,9 +945,17 @@ async fn scenario_15_propose_happy_path_creates_pr_and_records_proposal() {
     write(&sub.domain_root.join("notes/added.md"), b"brand new\n");
     std::fs::remove_file(sub.domain_root.join("notes/gone.md")).unwrap();
 
-    let outcome = propose(&mock, &spec, &sub.domain_root, &sub.state_dir, None, None)
-        .await
-        .unwrap();
+    let outcome = propose(
+        &mock,
+        &spec,
+        &sub.domain_root,
+        "Brand Team",
+        &sub.state_dir,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     let report = match outcome {
         ProposeOutcome::Proposed(r) => r,
         other => panic!("expected Proposed, got {other:?}"),
@@ -1075,9 +1085,17 @@ async fn scenario_16_propose_with_conflicts_pending_refuses_without_provider_wri
     // must refuse the share.
     write(&sub.domain_root.join("notes/new.md"), b"brand new\n");
 
-    let err = propose(&mock, &spec, &sub.domain_root, &sub.state_dir, None, None)
-        .await
-        .unwrap_err();
+    let err = propose(
+        &mock,
+        &spec,
+        &sub.domain_root,
+        "brand",
+        &sub.state_dir,
+        None,
+        None,
+    )
+    .await
+    .unwrap_err();
     match err {
         crystalline_remote::RemoteError::ConflictsPending { count } => assert_eq!(count, 1),
         other => panic!("expected ConflictsPending, got {other:?}"),
@@ -1102,9 +1120,17 @@ async fn scenario_18_propose_with_no_local_changes_is_nothing_to_share() {
     );
     let sub = subscribe_named(&mock, &spec, &c1, "brand").await;
 
-    let outcome = propose(&mock, &spec, &sub.domain_root, &sub.state_dir, None, None)
-        .await
-        .unwrap();
+    let outcome = propose(
+        &mock,
+        &spec,
+        &sub.domain_root,
+        "brand",
+        &sub.state_dir,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     match outcome {
         ProposeOutcome::NothingToShare { skipped_large } => assert!(skipped_large.is_empty()),
         other => panic!("expected NothingToShare, got {other:?}"),
@@ -1142,9 +1168,17 @@ async fn scenario_17_propose_freshness_pulls_first_then_proposes_on_new_base() {
     );
     mock.set_branch("main", &c2);
 
-    let outcome = propose(&mock, &spec, &sub.domain_root, &sub.state_dir, None, None)
-        .await
-        .unwrap();
+    let outcome = propose(
+        &mock,
+        &spec,
+        &sub.domain_root,
+        "brand",
+        &sub.state_dir,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     let report = match outcome {
         ProposeOutcome::Proposed(r) => r,
         other => panic!("expected Proposed, got {other:?}"),
@@ -1184,9 +1218,17 @@ async fn scenario_19_propose_full_circle_merged_verbatim_is_consumed_by_pull() {
 
     write(&sub.domain_root.join("notes/new.md"), b"shared content\n");
 
-    let outcome = propose(&mock, &spec, &sub.domain_root, &sub.state_dir, None, None)
-        .await
-        .unwrap();
+    let outcome = propose(
+        &mock,
+        &spec,
+        &sub.domain_root,
+        "brand",
+        &sub.state_dir,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     let report = match outcome {
         ProposeOutcome::Proposed(r) => r,
         other => panic!("expected Proposed, got {other:?}"),
@@ -1231,9 +1273,17 @@ async fn scenario_20_propose_amended_merge_upstream_wins_silently() {
 
     write(&sub.domain_root.join("notes/new.md"), b"proposed content\n");
 
-    let outcome = propose(&mock, &spec, &sub.domain_root, &sub.state_dir, None, None)
-        .await
-        .unwrap();
+    let outcome = propose(
+        &mock,
+        &spec,
+        &sub.domain_root,
+        "brand",
+        &sub.state_dir,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     let report = match outcome {
         ProposeOutcome::Proposed(r) => r,
         other => panic!("expected Proposed, got {other:?}"),
@@ -1513,9 +1563,17 @@ async fn scenario_23_generated_title_pluralizes_additions_only() {
     write(&sub.domain_root.join("notes/one.md"), b"one\n");
     write(&sub.domain_root.join("notes/two.md"), b"two\n");
 
-    let outcome = propose(&mock, &spec, &sub.domain_root, &sub.state_dir, None, None)
-        .await
-        .unwrap();
+    let outcome = propose(
+        &mock,
+        &spec,
+        &sub.domain_root,
+        "brand",
+        &sub.state_dir,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     let report = match outcome {
         ProposeOutcome::Proposed(r) => r,
         other => panic!("expected Proposed, got {other:?}"),
@@ -1537,9 +1595,17 @@ async fn scenario_23_generated_title_singular_modification_only() {
 
     write(&sub.domain_root.join("notes/a.md"), b"v2\n");
 
-    let outcome = propose(&mock, &spec, &sub.domain_root, &sub.state_dir, None, None)
-        .await
-        .unwrap();
+    let outcome = propose(
+        &mock,
+        &spec,
+        &sub.domain_root,
+        "brand",
+        &sub.state_dir,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     let report = match outcome {
         ProposeOutcome::Proposed(r) => r,
         other => panic!("expected Proposed, got {other:?}"),
@@ -1572,9 +1638,17 @@ async fn scenario_23_generated_summary_joins_three_plural_clauses_without_an_oxf
     std::fs::remove_file(sub.domain_root.join("notes/d1.md")).unwrap();
     std::fs::remove_file(sub.domain_root.join("notes/d2.md")).unwrap();
 
-    let outcome = propose(&mock, &spec, &sub.domain_root, &sub.state_dir, None, None)
-        .await
-        .unwrap();
+    let outcome = propose(
+        &mock,
+        &spec,
+        &sub.domain_root,
+        "brand",
+        &sub.state_dir,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     let report = match outcome {
         ProposeOutcome::Proposed(r) => r,
         other => panic!("expected Proposed, got {other:?}"),
@@ -1604,6 +1678,7 @@ async fn scenario_23_caller_supplied_title_and_description_are_used_verbatim() {
         &mock,
         &spec,
         &sub.domain_root,
+        "brand",
         &sub.state_dir,
         Some("My own title"),
         Some("My own description, written by hand."),

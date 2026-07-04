@@ -817,11 +817,24 @@ async fn origin_share_happy_path_opens_a_proposal_and_records_it() {
         "{result}"
     );
 
+    // The branch name is slugged from the registered domain name "brand",
+    // never the working tree's own folder name "brand-knowledge".
+    let branch = result["branch"].as_str().unwrap();
+    assert!(branch.contains("share-brand-"), "{branch}");
+    assert!(!branch.contains("brand-knowledge"), "{branch}");
+
     // Recorded in the domain's origin state, open.
     let state_dir = origins_dir.join("brand");
     let state = OriginState::load(&state_dir).unwrap().unwrap();
     assert_eq!(state.proposals.len(), 1);
     assert_eq!(state.proposals[0].status, ProposalStatus::Open);
+    assert_eq!(state.proposals[0].branch, branch);
+
+    // The generated PR title names the domain "brand", not the folder
+    // "brand-knowledge" it happens to live in.
+    let title = &state.proposals[0].title;
+    assert!(title.contains("brand"), "{title}");
+    assert!(!title.contains("brand-knowledge"), "{title}");
 
     // Nothing local changed: a share never touches the working tree.
     assert!(root.join("notes/new.md").exists());
