@@ -663,7 +663,13 @@ fn http_smoke_initialize_list_and_search() {
         .pointer("/result/tools")
         .and_then(Value::as_array)
         .unwrap();
-    assert_eq!(tools.len(), 12, "12 tools over HTTP");
+    // The 12 core tools plus `configure`: GitHub collaboration is off by
+    // default, so the other five collaboration tools stay hidden (see
+    // crystalline-service's mcp_collab test suite for the full gating matrix).
+    assert_eq!(tools.len(), 13, "13 tools over HTTP");
+    let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+    assert!(names.contains(&"configure"), "{names:?}");
+    assert!(!names.contains(&"add_domain"), "{names:?}");
 
     // one search
     let search = parse_jsonrpc(
