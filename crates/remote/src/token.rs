@@ -144,6 +144,17 @@ fn keyring_entry(account: &str) -> Result<keyring::Entry, RemoteError> {
 /// backend itself is unavailable rather than just empty; this is the one
 /// place that distinction is made, so both `resolve` and anyone reasoning
 /// about it later only need to look here.
+///
+/// As of the `keyring` 4.1.3 release pinned in the workspace, this probe
+/// currently reports "unavailable" on every platform: `keyring::Entry::new`
+/// always returns `NoDefaultStore`, because the crate's own v1
+/// compatibility layer never actually installs a default store (its
+/// `SET_CREDENTIAL_STORE.compare_exchange(false, true, ..) == Ok(true)`
+/// check can never be true, since `compare_exchange` returns `Ok` of the
+/// *previous* value on success, so the branch that would call
+/// `set_credential_store()` is dead code). This falls back to the file
+/// store safely, just without the OS keychain until upstream ships a fix;
+/// nothing here needs to change once it does.
 fn keyring_probe_ok(account: &str) -> bool {
     match keyring::Entry::new(KEYRING_SERVICE, account) {
         Ok(entry) => !matches!(
