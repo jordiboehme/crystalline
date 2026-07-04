@@ -23,6 +23,7 @@ postgres = ["crystalline-index/postgres"]
 crystalline-core = { workspace = true }
 crystalline-index = { workspace = true }
 crystalline-remote = { workspace = true }
+base64 = { workspace = true }
 tokio = { workspace = true }
 rmcp = { workspace = true, features = [
     "server",

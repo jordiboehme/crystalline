@@ -2434,6 +2434,145 @@ impl Engine {
         }
     }
 
+    /// Proposes one domain's local changes as a pull request against its
+    /// origin, under its origin lock.
+    ///
+    /// Refuses with `github.enabled`'s message when collaboration is off,
+    /// and with `EngineError::ReadOnly` on a read-only instance (a share
+    /// publishes content, exactly what read-only mode protects). When
+    /// `ops::propose` refuses because conflicts are still pending, this
+    /// degrades that refusal into a `conflicts_pending` outcome carrying the
+    /// actual conflict paths (reloaded from the domain's now-current state,
+    /// durable on disk since the inline pull inside `propose` already
+    /// persisted them) rather than the bare count `RemoteError` alone
+    /// carries, so a caller never needs to make a second round trip to learn
+    /// what needs resolving. Nothing local changes on a share, so no sync
+    /// runs afterward.
+    pub async fn origin_share(
+        &self,
+        domain: &str,
+        title: Option<&str>,
+        description: Option<&str>,
+    ) -> Result<Value> {
+        if !self.config.read().unwrap().github_enabled() {
+            return Err(RemoteError::NotEnabled.into());
+        }
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        let lock = self.origin_lock(domain);
+        let _guard = lock.lock().await;
+        let (spec, root, state_dir) = self.origin_spec_for_domain(domain)?;
+        let provider = self.resolve_origin_provider()?;
+        match ops::propose(
+            provider.as_ref(),
+            &spec,
+            &root,
+            &state_dir,
+            title,
+            description,
+        )
+        .await
+        {
+            Ok(outcome) => Ok(origin::propose_outcome_json(&outcome)),
+            Err(RemoteError::ConflictsPending { count }) => {
+                let conflicts = crystalline_remote::state::OriginState::load(&state_dir)
+                    .ok()
+                    .flatten()
+                    .map(|s| s.conflicts)
+                    .unwrap_or_default();
+                Ok(json!({
+                    "outcome": "conflicts_pending",
+                    "count": count,
+                    "conflicts": conflicts,
+                }))
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Discards a declined, or still-open ("never mind"), share proposal for
+    /// one domain, under its origin lock, then syncs the domain (and
+    /// embeds) since discarding can restore or delete working-tree files.
+    ///
+    /// Refuses with `github.enabled`'s message when collaboration is off,
+    /// and with `EngineError::ReadOnly` on a read-only instance (a discard
+    /// writes the working tree).
+    pub async fn origin_discard(&self, domain: &str, proposal_number: u64) -> Result<Value> {
+        if !self.config.read().unwrap().github_enabled() {
+            return Err(RemoteError::NotEnabled.into());
+        }
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        let lock = self.origin_lock(domain);
+        let _guard = lock.lock().await;
+        let (_, root, state_dir) = self.origin_spec_for_domain(domain)?;
+        let report = ops::discard(&root, &state_dir, proposal_number)?;
+
+        self.sync(Some(domain)).await?;
+        if let Err(e) = self.embed_pending().await {
+            tracing::warn!(
+                "embedding after discarding proposal #{proposal_number} for '{domain}' failed: {e}"
+            );
+        }
+
+        Ok(json!({
+            "restored": report.restored,
+            "deleted": report.deleted,
+            "skipped_diverged": report.skipped_diverged,
+        }))
+    }
+
+    /// Resolves one recorded conflict for one domain, under its origin lock,
+    /// then syncs the domain (and embeds) since resolving writes the
+    /// working tree.
+    ///
+    /// `keep` is `"mine"` or `"theirs"`; exactly one of `keep` or `content`
+    /// must be supplied (see [`origin::resolution_from`]). Refuses with
+    /// `github.enabled`'s message when collaboration is off, and with
+    /// `EngineError::ReadOnly` on a read-only instance.
+    pub async fn origin_resolve(
+        &self,
+        domain: &str,
+        path: &str,
+        keep: Option<&str>,
+        content: Option<&[u8]>,
+    ) -> Result<Value> {
+        if !self.config.read().unwrap().github_enabled() {
+            return Err(RemoteError::NotEnabled.into());
+        }
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        let resolution = origin::resolution_from(keep, content)?;
+        let lock = self.origin_lock(domain);
+        let _guard = lock.lock().await;
+        let (_, root, state_dir) = self.origin_spec_for_domain(domain)?;
+        let report = ops::resolve(&root, &state_dir, path, resolution)?;
+
+        self.sync(Some(domain)).await?;
+        if let Err(e) = self.embed_pending().await {
+            tracing::warn!("embedding after resolving a conflict for '{domain}' failed: {e}");
+        }
+
+        Ok(json!({
+            "resolved": report.resolved,
+            "remaining": report.remaining,
+        }))
+    }
+
+    /// Resolves a single domain's `OriginSpec`, root and state directory for
+    /// `origin_share`, `origin_discard` and `origin_resolve`: each a
+    /// single-domain operation unlike `origin_update`/`origin_status`'s
+    /// optional "every domain" mode. Errors with `UnknownDomain` when
+    /// unregistered, and with the same "has no origin" message
+    /// `origin_spec_for` raises when registered but not origin-connected.
+    fn origin_spec_for_domain(&self, domain: &str) -> Result<(OriginSpec, PathBuf, PathBuf)> {
+        let entry = self.domain_entry(domain)?;
+        self.origin_spec_for(domain, &entry)
+    }
+
     /// The domains `origin_update`/`origin_status` operate on: the one named
     /// (erroring if it is not registered or has no origin) or every
     /// registered domain with an origin, mirroring `sync_targets`'s

@@ -272,6 +272,86 @@ pub async fn origin_status(
     Ok(engine.origin_status(domain).await?)
 }
 
+/// Propose one team domain's local changes as a pull request against its
+/// origin: over the daemon when one owns the index, else against a directly
+/// opened store. `want_embeddings` is `false` in the standalone fallback: a
+/// share never touches the working tree, so there is nothing new to embed.
+pub async fn origin_share(
+    domain: &str,
+    title: Option<&str>,
+    description: Option<&str>,
+    db: Option<&Path>,
+    config_path: Option<&Path>,
+) -> anyhow::Result<Value> {
+    use serde_json::json;
+    if let Some(data) = ctl_if_running(json!({
+        "v": 1, "cmd": "origin_share", "domain": domain,
+        "title": title, "description": description,
+    }))
+    .await?
+    {
+        return Ok(data);
+    }
+    let config = load_config(config_path)?;
+    let db_path = resolve_db(db)?;
+    let engine = open_standalone(config, &db_path, false).await?;
+    Ok(engine.origin_share(domain, title, description).await?)
+}
+
+/// Discard a declined, or still-open, share proposal for one team domain,
+/// restoring local files that were not changed since sharing them: over the
+/// daemon when one owns the index, else against a directly opened store.
+pub async fn origin_discard(
+    domain: &str,
+    proposal: u64,
+    db: Option<&Path>,
+    config_path: Option<&Path>,
+) -> anyhow::Result<Value> {
+    use serde_json::json;
+    if let Some(data) = ctl_if_running(json!({
+        "v": 1, "cmd": "origin_discard", "domain": domain, "proposal": proposal,
+    }))
+    .await?
+    {
+        return Ok(data);
+    }
+    let config = load_config(config_path)?;
+    let db_path = resolve_db(db)?;
+    let engine = open_standalone(config, &db_path, false).await?;
+    Ok(engine.origin_discard(domain, proposal).await?)
+}
+
+/// Resolve one recorded conflict for a team domain: over the daemon when one
+/// owns the index, else against a directly opened store. `content` (a
+/// caller-supplied merge) travels over the ctl socket base64-encoded, since
+/// the JSON envelope carries text only and a resolved asset may be binary;
+/// the in-process fallback passes the bytes straight through.
+pub async fn origin_resolve(
+    domain: &str,
+    path: &str,
+    keep: Option<&str>,
+    content: Option<&[u8]>,
+    db: Option<&Path>,
+    config_path: Option<&Path>,
+) -> anyhow::Result<Value> {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+    use serde_json::json;
+    let content_b64 = content.map(|c| BASE64.encode(c));
+    if let Some(data) = ctl_if_running(json!({
+        "v": 1, "cmd": "origin_resolve", "domain": domain, "path": path,
+        "keep": keep, "content_b64": content_b64,
+    }))
+    .await?
+    {
+        return Ok(data);
+    }
+    let config = load_config(config_path)?;
+    let db_path = resolve_db(db)?;
+    let engine = open_standalone(config, &db_path, false).await?;
+    Ok(engine.origin_resolve(domain, path, keep, content).await?)
+}
+
 /// Show, set or reset an agent-adjustable setting from the [`crate::settings`]
 /// registry: over the daemon when one is running, else against the config
 /// file directly (no index store is opened either way, unlike every data

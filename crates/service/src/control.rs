@@ -4,11 +4,14 @@
 //! one line `{ "v": 1, "ok": true, "data": ... }` or
 //! `{ "v": 1, "ok": false, "error": ... }`. Commands: sync, status, reindex,
 //! sessions, configure, origin_add, origin_update, origin_status,
-//! forget_domain, shutdown. This is the operator channel; data operations go
-//! over the MCP handshake instead.
+//! origin_share, origin_discard, origin_resolve, forget_domain, shutdown.
+//! This is the operator channel; data operations go over the MCP handshake
+//! instead.
 
 use std::sync::Arc;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use interprocess::local_socket::tokio::Stream as IpcStream;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -236,6 +239,49 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                 Err(e) => (envelope_err(e.to_string()), false),
             }
         }
+        // Propose one domain's local changes as a pull request against its
+        // origin.
+        "origin_share" => {
+            let domain = req.get("domain").and_then(Value::as_str).unwrap_or("");
+            let title = req.get("title").and_then(Value::as_str);
+            let description = req.get("description").and_then(Value::as_str);
+            match shared.engine.origin_share(domain, title, description).await {
+                Ok(data) => (envelope_ok(data), false),
+                Err(e) => (envelope_err(e.to_string()), false),
+            }
+        }
+        // Discard a declined, or still-open, share proposal for one domain.
+        "origin_discard" => {
+            let domain = req.get("domain").and_then(Value::as_str).unwrap_or("");
+            let proposal = req.get("proposal").and_then(Value::as_u64).unwrap_or(0);
+            match shared.engine.origin_discard(domain, proposal).await {
+                Ok(data) => (envelope_ok(data), false),
+                Err(e) => (envelope_err(e.to_string()), false),
+            }
+        }
+        // Resolve one recorded conflict for one domain. `content_b64` (a
+        // caller-supplied merge) travels base64-encoded since the envelope
+        // is JSON text and the resolved content may be binary.
+        "origin_resolve" => {
+            let domain = req.get("domain").and_then(Value::as_str).unwrap_or("");
+            let path = req.get("path").and_then(Value::as_str).unwrap_or("");
+            let keep = req.get("keep").and_then(Value::as_str);
+            let content = match req.get("content_b64").and_then(Value::as_str) {
+                Some(b64) => match BASE64.decode(b64) {
+                    Ok(bytes) => Some(bytes),
+                    Err(e) => return (envelope_err(format!("invalid content_b64: {e}")), false),
+                },
+                None => None,
+            };
+            match shared
+                .engine
+                .origin_resolve(domain, path, keep, content.as_deref())
+                .await
+            {
+                Ok(data) => (envelope_ok(data), false),
+                Err(e) => (envelope_err(e.to_string()), false),
+            }
+        }
         "shutdown" => (envelope_ok(json!({ "stopping": true })), true),
         // Best-effort: `domain remove` calls this so a live daemon stops
         // watching the removed path right away instead of on its next
@@ -250,7 +296,8 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
             envelope_err(format!(
                 "unknown ctl command '{other}'; expected status, sessions, sync, reindex, \
                  routing_bullets, scaffold_manifest, domain_import, domain_export, configure, \
-                 origin_add, origin_update, origin_status, forget_domain or shutdown"
+                 origin_add, origin_update, origin_status, origin_share, origin_discard, \
+                 origin_resolve, forget_domain or shutdown"
             )),
             false,
         ),

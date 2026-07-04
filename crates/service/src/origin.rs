@@ -1,21 +1,25 @@
 //! Pure helpers for GitHub-origin collaboration, factored out of
-//! [`crate::engine::Engine`] so its `origin_add`, `origin_update` and
-//! `origin_status` methods stay orchestration-only: everything here is a free
-//! function over plain data, with no access to `Engine`'s private state,
-//! mirroring how [`crate::settings`] operates on [`crystalline_core::config::GlobalConfig`]
+//! [`crate::engine::Engine`] so its `origin_add`, `origin_update`,
+//! `origin_status`, `origin_share`, `origin_discard` and `origin_resolve`
+//! methods stay orchestration-only: everything here is a free function over
+//! plain data, with no access to `Engine`'s private state, mirroring how
+//! [`crate::settings`] operates on [`crystalline_core::config::GlobalConfig`]
 //! rather than reaching into the engine itself.
 //!
 //! Nothing here talks to GitHub, the filesystem or the token store; that is
 //! `crystalline_remote::ops` and `crystalline_remote::token`'s job. This
 //! module only shapes the inputs (a default domain name, a default folder, a
-//! token-store host key) and the outputs (aggregate JSON) around those calls.
+//! token-store host key, a validated conflict resolution) and the outputs
+//! (aggregate JSON) around those calls.
 
 use std::path::PathBuf;
 
 use crystalline_remote::RemoteError;
-use crystalline_remote::ops::{OriginStatusReport, PullReport};
+use crystalline_remote::ops::{self, OriginStatusReport, ProposeOutcome, PullReport};
 use crystalline_remote::state::{OriginState, ProposalStatus};
 use serde_json::{Value, json};
+
+use crate::engine::EngineError;
 
 /// The domain name `origin_add` uses when the caller does not supply one: the
 /// repository's own name segment (the part after the last `/`), run through
@@ -154,6 +158,60 @@ pub(crate) fn is_probe_transport_error(err: &RemoteError) -> bool {
         err,
         RemoteError::Offline | RemoteError::RateLimited { .. } | RemoteError::AuthExpired
     )
+}
+
+/// Shapes [`ops::propose`]'s outcome into `origin_share`'s JSON: `{ outcome:
+/// "proposed", url, number, branch, added, updated, deleted, skipped_large,
+/// summary }` when a pull request was opened, or `{ outcome:
+/// "nothing_to_share", skipped_large }` when the team already has everything
+/// the domain knows. The third outcome a caller may see, `conflicts_pending`,
+/// is not shaped here: `Engine::origin_share` builds it directly from the
+/// reloaded conflict list when `ops::propose` itself refuses, since
+/// `RemoteError::ConflictsPending` alone carries only a count.
+pub(crate) fn propose_outcome_json(outcome: &ProposeOutcome) -> Value {
+    match outcome {
+        ProposeOutcome::Proposed(report) => json!({
+            "outcome": "proposed",
+            "url": report.url,
+            "number": report.number,
+            "branch": report.branch,
+            "added": report.added,
+            "updated": report.updated,
+            "deleted": report.deleted,
+            "skipped_large": report.skipped_large,
+            "summary": report.summary,
+        }),
+        ProposeOutcome::NothingToShare { skipped_large } => json!({
+            "outcome": "nothing_to_share",
+            "skipped_large": skipped_large,
+        }),
+    }
+}
+
+/// Builds the [`ops::Resolution`] `origin_resolve` acts on from its `keep`
+/// and `content` arguments, which must be exactly one of: `keep` is
+/// `"mine"` or `"theirs"` with `content` absent, or `content` is present
+/// with `keep` absent. Any other combination - both absent, both present or
+/// an unrecognized `keep` value - is `EngineError::Invalid`, naming exactly
+/// what is wrong.
+pub(crate) fn resolution_from<'a>(
+    keep: Option<&str>,
+    content: Option<&'a [u8]>,
+) -> Result<ops::Resolution<'a>, EngineError> {
+    match (keep, content) {
+        (Some("mine"), None) => Ok(ops::Resolution::Mine),
+        (Some("theirs"), None) => Ok(ops::Resolution::Theirs),
+        (None, Some(bytes)) => Ok(ops::Resolution::Merged(bytes)),
+        (Some(other), None) => Err(EngineError::Invalid(format!(
+            "origin_resolve keep must be mine or theirs, got '{other}'"
+        ))),
+        (None, None) => Err(EngineError::Invalid(
+            "origin_resolve requires keep (mine or theirs) or content".to_string(),
+        )),
+        (Some(_), Some(_)) => Err(EngineError::Invalid(
+            "origin_resolve accepts only one of keep or content, not both".to_string(),
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -380,5 +438,76 @@ mod tests {
         assert!(!is_probe_transport_error(&RemoteError::State(
             "corrupt".to_string()
         )));
+    }
+
+    #[test]
+    fn propose_outcome_json_shapes_a_proposed_outcome() {
+        let outcome = ProposeOutcome::Proposed(ops::ProposeReport {
+            url: "https://github.com/acme/brand-knowledge/pull/3".to_string(),
+            number: 3,
+            branch: "crystalline/share-brand-240101120000".to_string(),
+            added: vec!["notes/new.md".to_string()],
+            updated: vec![],
+            deleted: vec![],
+            skipped_large: vec![],
+            summary: "Shares 1 new engram.".to_string(),
+        });
+        let v = propose_outcome_json(&outcome);
+        assert_eq!(v["outcome"], "proposed");
+        assert_eq!(v["number"], 3);
+        assert_eq!(v["added"][0], "notes/new.md");
+        assert_eq!(v["summary"], "Shares 1 new engram.");
+    }
+
+    #[test]
+    fn propose_outcome_json_shapes_a_nothing_to_share_outcome() {
+        let outcome = ProposeOutcome::NothingToShare {
+            skipped_large: vec![("notes/huge.md".to_string(), 999)],
+        };
+        let v = propose_outcome_json(&outcome);
+        assert_eq!(v["outcome"], "nothing_to_share");
+        assert_eq!(v["skipped_large"][0][0], "notes/huge.md");
+    }
+
+    #[test]
+    fn resolution_from_maps_mine_and_theirs() {
+        assert!(matches!(
+            resolution_from(Some("mine"), None).unwrap(),
+            ops::Resolution::Mine
+        ));
+        assert!(matches!(
+            resolution_from(Some("theirs"), None).unwrap(),
+            ops::Resolution::Theirs
+        ));
+    }
+
+    #[test]
+    fn resolution_from_maps_content_to_merged() {
+        let content = b"merged bytes";
+        match resolution_from(None, Some(content)).unwrap() {
+            ops::Resolution::Merged(bytes) => assert_eq!(bytes, content),
+            other => panic!("expected Merged, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolution_from_rejects_neither_keep_nor_content() {
+        let err = resolution_from(None, None).unwrap_err();
+        assert!(matches!(err, EngineError::Invalid(_)), "{err}");
+    }
+
+    #[test]
+    fn resolution_from_rejects_both_keep_and_content() {
+        let err = resolution_from(Some("mine"), Some(b"x")).unwrap_err();
+        assert!(matches!(err, EngineError::Invalid(_)), "{err}");
+    }
+
+    #[test]
+    fn resolution_from_rejects_an_unrecognized_keep_value() {
+        let err = resolution_from(Some("nope"), None).unwrap_err();
+        match err {
+            EngineError::Invalid(msg) => assert!(msg.contains("nope"), "{msg}"),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
     }
 }

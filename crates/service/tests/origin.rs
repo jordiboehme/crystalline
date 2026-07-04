@@ -1,6 +1,7 @@
 //! Engine-level tests for GitHub origin collaboration: `origin_add`,
-//! `origin_update` and `origin_status`, plus the gating matrix (the
-//! `github.enabled` refusal and the read-only mode's asymmetric refusal).
+//! `origin_update`, `origin_status`, `origin_share`, `origin_discard` and
+//! `origin_resolve`, plus the gating matrix (the `github.enabled` refusal
+//! and the read-only mode's asymmetric refusal).
 //!
 //! Every test injects `support::MockProvider` via `Engine::with_origin_provider`
 //! and points origin state at a tempdir via `Engine::with_origins_dir`, so
@@ -17,11 +18,13 @@ use crystalline_core::config::{GitHubConfig, GlobalConfig};
 use crystalline_index::TursoStore;
 use crystalline_remote::RemoteError;
 use crystalline_remote::provider::ProposalState;
-use crystalline_remote::state::{OriginState, Proposal, ProposalStatus};
+use crystalline_remote::state::{
+    OriginState, Proposal, ProposalStatus, ProposedChange, ProposedFile,
+};
 use crystalline_service::Engine;
 use crystalline_service::engine::EngineError;
 use crystalline_service::params::{ReadParams, SearchParams};
-use support::MockProvider;
+use support::{MockProvider, sha256_hex};
 use tokio::sync::Mutex;
 
 fn config(github_enabled: bool) -> GlobalConfig {
@@ -151,6 +154,75 @@ async fn read_only_refuses_add_but_allows_update_and_status() {
 
     let status = eng.origin_status(None).await.unwrap();
     assert_eq!(status["domains"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn github_disabled_refuses_share_discard_and_resolve() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let eng = engine_with(
+        &tmp.path().join("config.yaml"),
+        &tmp.path().join("origins"),
+        mock,
+        false,
+        false,
+    )
+    .await;
+
+    let share_err = eng.origin_share("brand", None, None).await.unwrap_err();
+    assert!(
+        matches!(share_err, EngineError::Remote(RemoteError::NotEnabled)),
+        "{share_err}"
+    );
+
+    let discard_err = eng.origin_discard("brand", 1).await.unwrap_err();
+    assert!(
+        matches!(discard_err, EngineError::Remote(RemoteError::NotEnabled)),
+        "{discard_err}"
+    );
+
+    let resolve_err = eng
+        .origin_resolve("brand", "notes/a.md", Some("mine"), None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(resolve_err, EngineError::Remote(RemoteError::NotEnabled)),
+        "{resolve_err}"
+    );
+}
+
+#[tokio::test]
+async fn read_only_refuses_share_discard_and_resolve() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let eng = engine_with(
+        &tmp.path().join("config.yaml"),
+        &tmp.path().join("origins"),
+        mock,
+        true,
+        true,
+    )
+    .await;
+
+    // None of these need a registered domain: read-only refuses before the
+    // domain is even resolved, exactly like `origin_add` above.
+    let share_err = eng.origin_share("brand", None, None).await.unwrap_err();
+    assert!(matches!(share_err, EngineError::ReadOnly), "{share_err}");
+
+    let discard_err = eng.origin_discard("brand", 1).await.unwrap_err();
+    assert!(
+        matches!(discard_err, EngineError::ReadOnly),
+        "{discard_err}"
+    );
+
+    let resolve_err = eng
+        .origin_resolve("brand", "notes/a.md", Some("mine"), None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(resolve_err, EngineError::ReadOnly),
+        "{resolve_err}"
+    );
 }
 
 // --- origin_add ----------------------------------------------------------------
@@ -704,5 +776,271 @@ async fn origin_status_one_domain_genuinely_failing_does_not_abort_the_others() 
             .as_str()
             .unwrap()
             .contains("origin state")
+    );
+}
+
+// --- origin_share --------------------------------------------------------------
+
+#[tokio::test]
+async fn origin_share_happy_path_opens_a_proposal_and_records_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[("MANIFEST.md", manifest())]));
+    mock.set_branch("main", &commit);
+
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let root = tmp.path().join("brand-knowledge");
+    let eng = engine_with(&config_path, &origins_dir, mock.clone(), true, false).await;
+    eng.origin_add(
+        "acme/brand-knowledge",
+        Some("brand"),
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+    )
+    .await
+    .unwrap();
+
+    std::fs::create_dir_all(root.join("notes")).unwrap();
+    std::fs::write(
+        root.join("notes/new.md"),
+        engram("New", "new", "brand new content"),
+    )
+    .unwrap();
+
+    let result = eng.origin_share("brand", None, None).await.unwrap();
+    assert_eq!(result["outcome"], "proposed");
+    assert_eq!(result["added"][0], "notes/new.md");
+    assert!(
+        result["url"].as_str().unwrap().starts_with("https://"),
+        "{result}"
+    );
+
+    // Recorded in the domain's origin state, open.
+    let state_dir = origins_dir.join("brand");
+    let state = OriginState::load(&state_dir).unwrap().unwrap();
+    assert_eq!(state.proposals.len(), 1);
+    assert_eq!(state.proposals[0].status, ProposalStatus::Open);
+
+    // Nothing local changed: a share never touches the working tree.
+    assert!(root.join("notes/new.md").exists());
+}
+
+#[tokio::test]
+async fn origin_share_with_pending_conflicts_reports_them_without_erroring() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let c1 = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        ("notes/a.md", engram("A", "a", "line one")),
+    ]));
+    mock.set_branch("main", &c1);
+
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let root = tmp.path().join("brand-knowledge");
+    let eng = engine_with(&config_path, &origins_dir, mock.clone(), true, false).await;
+    eng.origin_add(
+        "acme/brand-knowledge",
+        Some("brand"),
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+    )
+    .await
+    .unwrap();
+
+    // A genuine same-line conflict, from a real pull.
+    std::fs::write(root.join("notes/a.md"), engram("A", "a", "line one LOCAL")).unwrap();
+    let c2 = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        ("notes/a.md", engram("A", "a", "line one UPSTREAM")),
+    ]));
+    mock.set_branch("main", &c2);
+    eng.origin_update(Some("brand")).await.unwrap();
+
+    let result = eng.origin_share("brand", None, None).await.unwrap();
+    assert_eq!(result["outcome"], "conflicts_pending");
+    assert_eq!(result["count"], 1);
+    let conflicts = result["conflicts"].as_array().unwrap();
+    assert_eq!(conflicts.len(), 1);
+    assert_eq!(conflicts[0]["path"], "notes/a.md");
+}
+
+// --- origin_discard --------------------------------------------------------------
+
+#[tokio::test]
+async fn origin_discard_restores_files_and_syncs_the_index() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        ("notes/keep.md", engram("Keep", "keep", "base content")),
+    ]));
+    mock.set_branch("main", &commit);
+
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let root = tmp.path().join("brand-knowledge");
+    let eng = engine_with(&config_path, &origins_dir, mock.clone(), true, false).await;
+    eng.origin_add(
+        "acme/brand-knowledge",
+        Some("brand"),
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+    )
+    .await
+    .unwrap();
+
+    // A previously opened, now declined proposal touching keep.md, without
+    // going through a real `origin_share` call.
+    let proposed = engram("Keep", "keep", "shared v2 content");
+    std::fs::write(root.join("notes/keep.md"), &proposed).unwrap();
+    let state_dir = origins_dir.join("brand");
+    let mut state = OriginState::load(&state_dir).unwrap().unwrap();
+    state.proposals.push(Proposal {
+        number: 5,
+        url: "https://github.test/pulls/5".to_string(),
+        branch: "crystalline/share-brand-000101000000".to_string(),
+        title: "Refine 1 engram in brand".to_string(),
+        created_at: chrono::Utc::now(),
+        status: ProposalStatus::Declined,
+        files: vec![ProposedFile {
+            path: "notes/keep.md".to_string(),
+            change: ProposedChange::Modified,
+            sha256: Some(sha256_hex(&proposed)),
+        }],
+    });
+    state.save(&state_dir).unwrap();
+
+    let result = eng.origin_discard("brand", 5).await.unwrap();
+    assert_eq!(result["restored"][0], "notes/keep.md");
+
+    // The working tree is back to the base content.
+    let content = std::fs::read_to_string(root.join("notes/keep.md")).unwrap();
+    assert!(content.contains("base content"), "{content}");
+
+    // The record moved to history, declined status preserved.
+    let reloaded = OriginState::load(&state_dir).unwrap().unwrap();
+    assert!(reloaded.proposals.is_empty());
+    assert_eq!(reloaded.history[0].status, ProposalStatus::Declined);
+
+    // The index reflects the restored content: sync ran after discard.
+    let hits = eng
+        .search_engrams(&SearchParams {
+            query: Some("base content".to_string()),
+            ..SearchParams::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(hits["total"], 1, "{hits}");
+}
+
+// --- origin_resolve --------------------------------------------------------------
+
+#[tokio::test]
+async fn origin_resolve_writes_the_resolution_and_syncs_the_index() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let c1 = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        ("notes/a.md", engram("A", "a", "line one")),
+    ]));
+    mock.set_branch("main", &c1);
+
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let root = tmp.path().join("brand-knowledge");
+    let eng = engine_with(&config_path, &origins_dir, mock.clone(), true, false).await;
+    eng.origin_add(
+        "acme/brand-knowledge",
+        Some("brand"),
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+    )
+    .await
+    .unwrap();
+
+    // A local edit, then an upstream edit to the same line: a genuine
+    // EditEdit conflict once pulled.
+    std::fs::write(root.join("notes/a.md"), engram("A", "a", "line one LOCAL")).unwrap();
+    let c2 = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        ("notes/a.md", engram("A", "a", "line one UPSTREAM")),
+    ]));
+    mock.set_branch("main", &c2);
+    eng.origin_update(Some("brand")).await.unwrap();
+
+    let state_dir = origins_dir.join("brand");
+    assert_eq!(
+        OriginState::load(&state_dir)
+            .unwrap()
+            .unwrap()
+            .conflicts
+            .len(),
+        1
+    );
+
+    let result = eng
+        .origin_resolve("brand", "notes/a.md", Some("theirs"), None)
+        .await
+        .unwrap();
+    assert_eq!(result["remaining"], 0);
+
+    let content = std::fs::read_to_string(root.join("notes/a.md")).unwrap();
+    assert!(content.contains("line one UPSTREAM"), "{content}");
+    assert!(
+        OriginState::load(&state_dir)
+            .unwrap()
+            .unwrap()
+            .conflicts
+            .is_empty()
+    );
+
+    // The index reflects the resolved content: sync ran after resolve.
+    let hits = eng
+        .search_engrams(&SearchParams {
+            query: Some("UPSTREAM".to_string()),
+            ..SearchParams::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(hits["total"], 1, "{hits}");
+}
+
+#[tokio::test]
+async fn origin_resolve_unknown_path_errors_without_writing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[("MANIFEST.md", manifest())]));
+    mock.set_branch("main", &commit);
+
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let root = tmp.path().join("brand-knowledge");
+    let eng = engine_with(&config_path, &origins_dir, mock.clone(), true, false).await;
+    eng.origin_add(
+        "acme/brand-knowledge",
+        Some("brand"),
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+    )
+    .await
+    .unwrap();
+
+    let err = eng
+        .origin_resolve("brand", "notes/missing.md", Some("mine"), None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            EngineError::Remote(RemoteError::ConflictNotFound { .. })
+        ),
+        "{err}"
     );
 }
