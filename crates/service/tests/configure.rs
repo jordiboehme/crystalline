@@ -150,3 +150,113 @@ async fn read_only_refuses_set_and_unset_but_allows_show() {
         "a refused set/unset must never touch disk"
     );
 }
+
+#[tokio::test]
+async fn set_fails_to_persist_leaves_in_memory_config_unchanged() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_path = tmp.path().join("config.yaml");
+    let engine = engine_at(&config_path, false).await;
+
+    let before = engine.configure(&ConfigureAction::Show).await.unwrap();
+    let before_views = settings_of(&before);
+    assert!(
+        !before_views
+            .iter()
+            .any(|v| v.key == "github.enabled" && v.value == "true")
+    );
+
+    let unwritable_path = tmp.path().join("subdir");
+    std::fs::create_dir(&unwritable_path).unwrap();
+    let engine_with_dir_path = {
+        let store = TursoStore::open_in_memory().await.unwrap();
+        Engine::new(
+            Arc::new(Mutex::new(store)),
+            GlobalConfig::default(),
+            None,
+            Some(unwritable_path), // point to a directory, not a file
+        )
+    };
+
+    let err = engine_with_dir_path
+        .configure(&ConfigureAction::Set {
+            key: "github.enabled".to_string(),
+            value: "true".to_string(),
+        })
+        .await;
+    assert!(
+        err.is_err(),
+        "persist must fail when config_path is a directory"
+    );
+
+    let after = engine_with_dir_path
+        .configure(&ConfigureAction::Show)
+        .await
+        .unwrap();
+    let after_views = settings_of(&after);
+    assert_eq!(
+        after_views
+            .iter()
+            .find(|v| v.key == "github.enabled")
+            .map(|v| v.value.as_str()),
+        Some("false"),
+        "in-memory config must stay at default after failed persist"
+    );
+}
+
+#[tokio::test]
+async fn unset_fails_to_persist_leaves_in_memory_config_unchanged() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_path = tmp.path().join("config.yaml");
+    let engine = engine_at(&config_path, false).await;
+
+    engine
+        .configure(&ConfigureAction::Set {
+            key: "github.enabled".to_string(),
+            value: "true".to_string(),
+        })
+        .await
+        .unwrap();
+
+    assert!(engine.config().github_enabled());
+
+    let unwritable_path = tmp.path().join("unset_subdir");
+    std::fs::create_dir(&unwritable_path).unwrap();
+    let engine_with_dir_path = {
+        let store = TursoStore::open_in_memory().await.unwrap();
+        let mut config = GlobalConfig::default();
+        config.github = Some(crystalline_core::config::GitHubConfig {
+            enabled: Some(true),
+            ..Default::default()
+        });
+        Engine::new(
+            Arc::new(Mutex::new(store)),
+            config,
+            None,
+            Some(unwritable_path),
+        )
+    };
+
+    let err = engine_with_dir_path
+        .configure(&ConfigureAction::Unset {
+            key: "github.enabled".to_string(),
+        })
+        .await;
+    assert!(
+        err.is_err(),
+        "persist must fail when config_path is a directory"
+    );
+
+    let after = engine_with_dir_path
+        .configure(&ConfigureAction::Show)
+        .await
+        .unwrap();
+    let after_views = settings_of(&after);
+    assert_eq!(
+        after_views
+            .iter()
+            .find(|v| v.key == "github.enabled")
+            .map(|v| v.value.as_str()),
+        Some("true"),
+        "in-memory config must stay at applied value after failed unset persist"
+    );
+}

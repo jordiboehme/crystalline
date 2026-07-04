@@ -2092,19 +2092,29 @@ impl Engine {
                 if self.read_only {
                     return Err(EngineError::ReadOnly);
                 }
-                let mut config = self.config.write().unwrap();
+                let mut config = {
+                    let guard = self.config.read().unwrap();
+                    guard.clone()
+                };
                 settings::apply(&mut config, key, value)?;
                 self.persist_config(&config)?;
-                Ok(self.setting_view_json(&config, key))
+                let view = self.setting_view_json(&config, key);
+                *self.config.write().unwrap() = config;
+                Ok(view)
             }
             ConfigureAction::Unset { key } => {
                 if self.read_only {
                     return Err(EngineError::ReadOnly);
                 }
-                let mut config = self.config.write().unwrap();
+                let mut config = {
+                    let guard = self.config.read().unwrap();
+                    guard.clone()
+                };
                 settings::unset(&mut config, key)?;
                 self.persist_config(&config)?;
-                Ok(self.setting_view_json(&config, key))
+                let view = self.setting_view_json(&config, key);
+                *self.config.write().unwrap() = config;
+                Ok(view)
             }
         }
     }
