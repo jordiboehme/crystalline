@@ -21,7 +21,7 @@
 
 /// How a conflict came about, recorded with the conflict for status
 /// displays.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ConflictKind {
     /// Both sides edited the file, differently, since the common base, and
     /// the text merge could not reconcile the two versions cleanly.

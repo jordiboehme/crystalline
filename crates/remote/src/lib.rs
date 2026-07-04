@@ -16,10 +16,13 @@
 //! `crystalline-service` orchestrates the files this crate produces into the
 //! existing sync engine.
 
+pub mod archive;
+pub mod changes;
 pub mod error;
 pub mod github;
 pub mod merge;
 pub mod provider;
+pub mod state;
 pub mod token;
 
 pub use error::RemoteError;
