@@ -85,6 +85,29 @@ pub enum RemoteError {
         count: usize,
     },
 
+    /// A discard named a proposal number that is not among this domain's
+    /// open or declined proposals: never registered, already discarded, or
+    /// merged (and so already moved to history, not discardable).
+    #[error("no open or declined proposal #{number} found for this domain")]
+    ProposalNotFound {
+        /// The proposal number that was not found.
+        number: u64,
+    },
+
+    /// A resolve named a path with no recorded conflict for this domain.
+    /// Names every currently open conflict path so the caller can retry with
+    /// one that actually exists.
+    #[error(
+        "no conflict recorded for {path}; open conflicts: {}",
+        if open.is_empty() { "none".to_string() } else { open.join(", ") }
+    )]
+    ConflictNotFound {
+        /// The path that was requested.
+        path: String,
+        /// Every path with a currently open conflict.
+        open: Vec<String>,
+    },
+
     /// The recorded base commit is no longer reachable upstream, for example
     /// because the repository history was rewritten. Recovers automatically:
     /// the next pull re-baselines by fetching head and treating locally
@@ -238,6 +261,35 @@ mod tests {
     }
 
     #[test]
+    fn proposal_not_found_names_the_number() {
+        let err = RemoteError::ProposalNotFound { number: 7 };
+        let msg = err.to_string();
+        assert!(msg.contains('7'), "{msg}");
+        assert!(msg.contains("proposal"), "{msg}");
+    }
+
+    #[test]
+    fn conflict_not_found_names_the_path_and_lists_open_conflicts() {
+        let err = RemoteError::ConflictNotFound {
+            path: "notes/missing.md".to_string(),
+            open: vec!["notes/a.md".to_string(), "notes/b.md".to_string()],
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("notes/missing.md"), "{msg}");
+        assert!(msg.contains("notes/a.md"), "{msg}");
+        assert!(msg.contains("notes/b.md"), "{msg}");
+    }
+
+    #[test]
+    fn conflict_not_found_reports_none_when_no_conflicts_are_open() {
+        let err = RemoteError::ConflictNotFound {
+            path: "notes/missing.md".to_string(),
+            open: vec![],
+        };
+        assert!(err.to_string().contains("none"));
+    }
+
+    #[test]
     fn base_unavailable_mentions_re_baselining() {
         assert!(
             RemoteError::BaseUnavailable
@@ -304,6 +356,12 @@ mod tests {
             }
             .to_string(),
             RemoteError::ConflictsPending { count: 1 }.to_string(),
+            RemoteError::ProposalNotFound { number: 1 }.to_string(),
+            RemoteError::ConflictNotFound {
+                path: "notes/a.md".to_string(),
+                open: vec!["notes/b.md".to_string()],
+            }
+            .to_string(),
             RemoteError::BaseUnavailable.to_string(),
             RemoteError::Api {
                 status: 500,

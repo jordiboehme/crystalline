@@ -42,15 +42,19 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
+use crystalline_core::parse_engram;
 
 use crate::archive::extract_tarball;
-use crate::changes::{MAX_SHARED_FILE_BYTES, detect_local_changes};
+use crate::changes::{LocalChange, MAX_SHARED_FILE_BYTES, detect_local_changes};
 use crate::error::RemoteError;
 use crate::merge::{FileMerge, merge_file};
 use crate::provider::{
-    ChangeKind, CompareResult, HeadProbe, OriginSpec, ProposalState, Provider, UpstreamChange,
+    ChangeKind, CompareResult, HeadProbe, OriginSpec, ProposalRequest, ProposalState, Provider,
+    TreeWrite, UpstreamChange,
 };
-use crate::state::{self, BaseStamp, Conflict, OriginState, Proposal, ProposalStatus};
+use crate::state::{
+    self, BaseStamp, Conflict, OriginState, Proposal, ProposalStatus, ProposedChange, ProposedFile,
+};
 
 /// Above this many changed files (after subpath filtering) a compare is
 /// abandoned for a whole-tree tarball diff, matching the provider's own
@@ -121,6 +125,83 @@ pub struct OriginStatusReport {
     pub conflicts: Vec<Conflict>,
     /// When the branch was last checked for new upstream commits.
     pub last_checked: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// What [`propose`] did with a domain's local changes.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProposeOutcome {
+    /// A pull request was opened.
+    Proposed(ProposeReport),
+    /// Success-shaped, not an error: the team already has everything this
+    /// domain knows, so there was nothing to open a pull request for.
+    NothingToShare {
+        /// Working-tree files skipped for exceeding
+        /// [`MAX_SHARED_FILE_BYTES`], each with its size in bytes.
+        skipped_large: Vec<(String, u64)>,
+    },
+}
+
+/// What [`propose`] did when it opened a pull request from local changes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProposeReport {
+    /// The web URL a human reviews the proposal at.
+    pub url: String,
+    /// The proposal number.
+    pub number: u64,
+    /// The branch carrying the proposed commits.
+    pub branch: String,
+    /// Domain-relative paths of files added by the proposal.
+    pub added: Vec<String>,
+    /// Domain-relative paths of files modified by the proposal.
+    pub updated: Vec<String>,
+    /// Domain-relative paths of files deleted by the proposal.
+    pub deleted: Vec<String>,
+    /// Working-tree files skipped for exceeding [`MAX_SHARED_FILE_BYTES`],
+    /// each with its size in bytes.
+    pub skipped_large: Vec<(String, u64)>,
+    /// A one-line, human-readable summary of the change mix (also the first
+    /// line of the generated proposal body, when the caller supplies no
+    /// description of their own).
+    pub summary: String,
+}
+
+/// What [`discard`] did with a declined or still-open proposal's files.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DiscardReport {
+    /// Domain-relative paths restored to their base-tree content (a
+    /// proposed `Modified` or `Deleted` file whose local copy still matched
+    /// what was proposed).
+    pub restored: Vec<String>,
+    /// Domain-relative paths deleted (a proposed `Added` file whose local
+    /// copy still matched what was proposed).
+    pub deleted: Vec<String>,
+    /// Domain-relative paths left untouched because the local file no
+    /// longer matches what was proposed: newer work is never destroyed.
+    pub skipped_diverged: Vec<String>,
+}
+
+/// How to settle one recorded conflict, passed to [`resolve`].
+#[derive(Debug, Clone, Copy)]
+pub enum Resolution<'a> {
+    /// Keep the local copy: the working tree is left untouched, an ordinary
+    /// local change against the advanced base, shareable on the next
+    /// `propose`.
+    Mine,
+    /// Take upstream's copy: writes the recorded upstream content, or
+    /// deletes the local file when upstream had none (an `EditDelete`
+    /// conflict).
+    Theirs,
+    /// Write this caller-supplied content as the resolved merge.
+    Merged(&'a [u8]),
+}
+
+/// What [`resolve`] did with one conflict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolveReport {
+    /// The domain-relative path that was resolved.
+    pub resolved: String,
+    /// How many conflicts remain open after this one.
+    pub remaining: usize,
 }
 
 /// One upstream change to integrate, already normalized to a domain-relative
@@ -459,6 +540,299 @@ pub async fn status(
     })
 }
 
+/// Proposes a domain's local changes as a pull request against its origin.
+///
+/// The algorithm, in order: pull first, so every proposal is opened
+/// mergeable (any upstream movement is integrated onto the working tree
+/// before anything is proposed); refuse with [`RemoteError::ConflictsPending`]
+/// when any conflict is open afterward, new or pre-existing, before a single
+/// provider write call is made; detect local changes against the
+/// now-current base, reporting [`ProposeOutcome::NothingToShare`] when there
+/// are none; upload each added or modified file's content as a blob, build a
+/// tree from the base commit with every domain-relative path re-prefixed to
+/// its repo-relative form (see [`to_repo_relative`]), commit it, open a
+/// share branch named per [`share_branch_name`] and open the pull request;
+/// finally record the proposal in state (status `Open`) and save. Local
+/// files are never touched: a share only ever reads them.
+pub async fn propose(
+    provider: &dyn Provider,
+    spec: &OriginSpec,
+    domain_root: &Path,
+    state_dir: &Path,
+    title: Option<&str>,
+    description: Option<&str>,
+) -> Result<ProposeOutcome, RemoteError> {
+    // Freshness first: every proposal must be mergeable at creation.
+    pull(provider, spec, domain_root, state_dir).await?;
+    let mut state = OriginState::load(state_dir)?.ok_or_else(|| {
+        RemoteError::State(
+            "this domain has no origin state; add the domain from its origin first".to_string(),
+        )
+    })?;
+    if !state.conflicts.is_empty() {
+        return Err(RemoteError::ConflictsPending {
+            count: state.conflicts.len(),
+        });
+    }
+
+    let local = detect_local_changes(domain_root, &state.files)?;
+    if local.changes.is_empty() {
+        return Ok(ProposeOutcome::NothingToShare {
+            skipped_large: local.skipped_large,
+        });
+    }
+
+    let domain_name = domain_display_name(domain_root);
+    let mut added = Vec::new();
+    let mut updated = Vec::new();
+    let mut deleted = Vec::new();
+    let mut writes = Vec::new();
+    let mut files = Vec::new();
+    let mut entries = ChangeEntries::default();
+
+    for change in &local.changes {
+        match change {
+            LocalChange::Added { path, sha256 } => {
+                let wt_path = checked_working_path(state_dir, domain_root, path)?;
+                let bytes = std::fs::read(&wt_path)?;
+                let blob_sha = provider.create_blob(spec, &bytes).await?;
+                writes.push(TreeWrite {
+                    path: to_repo_relative(path, spec.subpath.as_deref()),
+                    blob_sha: Some(blob_sha),
+                });
+                entries.added.push((path.clone(), bytes));
+                added.push(path.clone());
+                files.push(ProposedFile {
+                    path: path.clone(),
+                    change: ProposedChange::Added,
+                    sha256: Some(sha256.clone()),
+                });
+            }
+            LocalChange::Modified { path, sha256 } => {
+                let wt_path = checked_working_path(state_dir, domain_root, path)?;
+                let bytes = std::fs::read(&wt_path)?;
+                let blob_sha = provider.create_blob(spec, &bytes).await?;
+                writes.push(TreeWrite {
+                    path: to_repo_relative(path, spec.subpath.as_deref()),
+                    blob_sha: Some(blob_sha),
+                });
+                entries.updated.push((path.clone(), bytes));
+                updated.push(path.clone());
+                files.push(ProposedFile {
+                    path: path.clone(),
+                    change: ProposedChange::Modified,
+                    sha256: Some(sha256.clone()),
+                });
+            }
+            LocalChange::Deleted { path } => {
+                writes.push(TreeWrite {
+                    path: to_repo_relative(path, spec.subpath.as_deref()),
+                    blob_sha: None,
+                });
+                let base_content = state::read_base_file(state_dir, path)?;
+                entries.deleted.push((path.clone(), base_content));
+                deleted.push(path.clone());
+                files.push(ProposedFile {
+                    path: path.clone(),
+                    change: ProposedChange::Deleted,
+                    sha256: None,
+                });
+            }
+        }
+    }
+
+    let generated_title = generate_title(added.len(), updated.len(), deleted.len(), &domain_name);
+    let effective_title = title.map(str::to_string).unwrap_or(generated_title);
+    let summary = generate_summary_line(added.len(), updated.len(), deleted.len());
+    let body = description
+        .map(str::to_string)
+        .unwrap_or_else(|| generate_body(&summary, &entries, &domain_name));
+
+    let tree_sha = provider
+        .create_tree(spec, &state.base_commit, &writes)
+        .await?;
+    let commit_sha = provider
+        .create_commit(spec, &effective_title, &tree_sha, &state.base_commit)
+        .await?;
+    let branch = share_branch_name(&domain_name);
+    provider.create_branch(spec, &branch, &commit_sha).await?;
+    let handle = provider
+        .create_proposal(
+            spec,
+            &ProposalRequest {
+                title: effective_title.clone(),
+                body,
+                branch: branch.clone(),
+                base_branch: spec.branch.clone(),
+            },
+        )
+        .await?;
+
+    state.proposals.push(Proposal {
+        number: handle.number,
+        url: handle.url.clone(),
+        branch: branch.clone(),
+        title: effective_title,
+        created_at: Utc::now(),
+        status: ProposalStatus::Open,
+        files,
+    });
+    state.save(state_dir)?;
+
+    Ok(ProposeOutcome::Proposed(ProposeReport {
+        url: handle.url,
+        number: handle.number,
+        branch,
+        added,
+        updated,
+        deleted,
+        skipped_large: local.skipped_large,
+        summary,
+    }))
+}
+
+/// Discards a declined, or still-open ("never mind"), share proposal:
+/// restores each proposed file that still matches what was proposed to its
+/// pre-proposal content (the base tree, or plain deletion for a proposed
+/// addition), leaves any file whose local content has since diverged
+/// untouched, then moves the proposal record to history with whatever
+/// status it currently holds (discarding never rewrites `status` itself).
+///
+/// Offline: this never talks to a provider. Discarding an `Open` proposal
+/// does not close its pull request on the origin; that happens on GitHub
+/// itself, and the next pull's proposal refresh marks it `Declined` once it
+/// is closed there.
+pub fn discard(
+    domain_root: &Path,
+    state_dir: &Path,
+    proposal_number: u64,
+) -> Result<DiscardReport, RemoteError> {
+    let mut state = OriginState::load(state_dir)?.ok_or_else(|| {
+        RemoteError::State(
+            "this domain has no origin state; add the domain from its origin first".to_string(),
+        )
+    })?;
+
+    let proposal = state
+        .proposals
+        .iter()
+        .find(|p| p.number == proposal_number)
+        .cloned()
+        .ok_or(RemoteError::ProposalNotFound {
+            number: proposal_number,
+        })?;
+    if proposal.status == ProposalStatus::Merged {
+        // Not reachable through the normal pull/propose lifecycle (a merged
+        // proposal is consumed straight to history), but guarded explicitly
+        // since a discard must never apply to one.
+        return Err(RemoteError::State(format!(
+            "proposal #{proposal_number} has already merged and cannot be discarded"
+        )));
+    }
+
+    let mut restored = Vec::new();
+    let mut deleted = Vec::new();
+    let mut skipped_diverged = Vec::new();
+
+    for pf in &proposal.files {
+        let wt_path = checked_working_path(state_dir, domain_root, &pf.path)?;
+        let current = read_optional_file(&wt_path)?;
+        let current_sha = current.as_deref().map(state::sha256_hex);
+
+        let diverged = match pf.change {
+            ProposedChange::Added | ProposedChange::Modified => {
+                current_sha.as_deref() != pf.sha256.as_deref()
+            }
+            ProposedChange::Deleted => current.is_some(),
+        };
+        if diverged {
+            skipped_diverged.push(pf.path.clone());
+            continue;
+        }
+
+        match pf.change {
+            ProposedChange::Added => {
+                remove_working_file(&wt_path)?;
+                deleted.push(pf.path.clone());
+            }
+            ProposedChange::Modified | ProposedChange::Deleted => {
+                match state::read_base_file(state_dir, &pf.path)? {
+                    Some(bytes) => {
+                        write_working_file(&wt_path, &bytes)?;
+                        restored.push(pf.path.clone());
+                    }
+                    // No base copy to restore from (should not happen: a
+                    // Modified or Deleted change always had a base entry);
+                    // never destroy the local file over it, so this is left
+                    // alone like a genuine divergence.
+                    None => skipped_diverged.push(pf.path.clone()),
+                }
+            }
+        }
+    }
+
+    state.proposals.retain(|p| p.number != proposal_number);
+    state.push_history(proposal);
+    state.save(state_dir)?;
+
+    Ok(DiscardReport {
+        restored,
+        deleted,
+        skipped_diverged,
+    })
+}
+
+/// Resolves one recorded conflict at `path`: settles it per `resolution`,
+/// clears its recorded conflict copies and drops it from state.
+///
+/// Errors with [`RemoteError::ConflictNotFound`], naming `path` and listing
+/// every currently open conflict path, when there is no open conflict there.
+/// Offline: this never talks to a provider.
+pub fn resolve(
+    domain_root: &Path,
+    state_dir: &Path,
+    path: &str,
+    resolution: Resolution<'_>,
+) -> Result<ResolveReport, RemoteError> {
+    let mut state = OriginState::load(state_dir)?.ok_or_else(|| {
+        RemoteError::State(
+            "this domain has no origin state; add the domain from its origin first".to_string(),
+        )
+    })?;
+
+    let conflict = state
+        .conflicts
+        .iter()
+        .find(|c| c.path == path)
+        .cloned()
+        .ok_or_else(|| RemoteError::ConflictNotFound {
+            path: path.to_string(),
+            open: state.conflicts.iter().map(|c| c.path.clone()).collect(),
+        })?;
+
+    let wt_path = checked_working_path(state_dir, domain_root, path)?;
+    match resolution {
+        Resolution::Mine => {}
+        Resolution::Theirs => {
+            let (_, upstream) = state::read_conflict_files(state_dir, &conflict.id)?;
+            match upstream {
+                Some(bytes) => write_working_file(&wt_path, &bytes)?,
+                None => remove_working_file(&wt_path)?,
+            }
+        }
+        Resolution::Merged(content) => write_working_file(&wt_path, content)?,
+    }
+
+    state::clear_conflict(state_dir, &conflict.id)?;
+    state.conflicts.retain(|c| c.id != conflict.id);
+    state.save(state_dir)?;
+
+    Ok(ResolveReport {
+        resolved: path.to_string(),
+        remaining: state.conflicts.len(),
+    })
+}
+
 /// Handles the "nothing new upstream" outcome of a pull: refresh open
 /// proposals (a proposal can still be declined without the branch moving),
 /// persist any resulting change, and report up to date.
@@ -768,6 +1142,17 @@ fn to_domain_relative(repo_rel: &str, subpath: Option<&str>) -> Option<String> {
     }
 }
 
+/// Maps a domain-relative path to its repo-relative form under `subpath`,
+/// prefixing `subpath` back on. The inverse of [`to_domain_relative`], built
+/// from the exact same prefix so the two stay in agreement; a change to
+/// either's stripping or prefixing rule must be made to both.
+fn to_repo_relative(domain_rel: &str, subpath: Option<&str>) -> String {
+    match subpath {
+        None => domain_rel.to_string(),
+        Some(sub) => format!("{}/{domain_rel}", sub.trim_matches('/')),
+    }
+}
+
 /// Reads a working-tree file, returning `None` when it does not exist.
 fn read_optional_file(path: &Path) -> Result<Option<Vec<u8>>, RemoteError> {
     match std::fs::read(path) {
@@ -819,4 +1204,212 @@ fn checked_working_path(
         }
     }
     Ok(path)
+}
+
+/// Per-kind change entries carrying enough content for [`generate_body`] to
+/// derive an engram's frontmatter title: `(domain-relative path, content)`
+/// for added and modified files (the same bytes already read from disk to
+/// build their blob) and `(path, base-tree content)` for deleted files
+/// (their last known content, read back from the base snapshot since the
+/// working copy is already gone by the time a deletion is proposed).
+#[derive(Default)]
+struct ChangeEntries {
+    added: Vec<(String, Vec<u8>)>,
+    updated: Vec<(String, Vec<u8>)>,
+    deleted: Vec<(String, Option<Vec<u8>>)>,
+}
+
+/// The domain's display name for the branch slug and the generated title and
+/// body: the working tree's own directory name, since this module knows a
+/// domain only by its filesystem paths, never the name it happens to be
+/// registered under. Falls back to `"domain"` on the unlikely event
+/// `domain_root` has no file name component at all (for example the
+/// filesystem root).
+fn domain_display_name(domain_root: &Path) -> String {
+    domain_root
+        .file_name()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("domain")
+        .to_string()
+}
+
+/// Builds a share branch name: `crystalline/share-<slug>-<timestamp>`.
+///
+/// `slug` is `domain_name` lowercased with every character outside
+/// `[a-z0-9-]` replaced, one for one, by `-`: a direct character map, not
+/// [`crystalline_core::slugify`]'s segment-aware collapsing (consecutive
+/// replaced characters are not merged into one hyphen). `timestamp` is the
+/// current UTC time as `yymmddHHMMSS`, keeping repeated shares of the same
+/// domain from colliding on the same branch name.
+///
+/// GitHub's client does not percent-encode URL path segments, so a branch
+/// name carrying any character outside `[a-z0-9-]` would break a proposal's
+/// browser URL; the fixed `crystalline/share-` prefix's own `/` is safe
+/// because it sits outside the sanitized segment, not inside it.
+fn share_branch_name(domain_name: &str) -> String {
+    let slug: String = domain_name
+        .to_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let timestamp = Utc::now().format("%y%m%d%H%M%S");
+    format!("crystalline/share-{slug}-{timestamp}")
+}
+
+/// `singular` when `count == 1`, else `plural`. Every noun this module
+/// pluralizes ("engram"/"engrams") is regular, so nothing richer than this
+/// is needed.
+fn pluralize<'a>(count: usize, singular: &'a str, plural: &'a str) -> &'a str {
+    if count == 1 { singular } else { plural }
+}
+
+/// Generates a proposal title from the change mix, by three simple,
+/// deterministic rules:
+///
+/// - only additions -> `"Share N new engram(s) from <domain>"`
+/// - only modifications -> `"Refine N engram(s) in <domain>"`
+/// - anything else (deletions alone, or any mix of two or three kinds) ->
+///   `"Share updates from <domain>"`
+///
+/// Used as the proposal title, and (unless the caller supplies their own
+/// title) the commit message too.
+fn generate_title(added: usize, updated: usize, deleted: usize, domain_name: &str) -> String {
+    match (added > 0, updated > 0, deleted > 0) {
+        (true, false, false) => format!(
+            "Share {added} new {} from {domain_name}",
+            pluralize(added, "engram", "engrams")
+        ),
+        (false, true, false) => format!(
+            "Refine {updated} {} in {domain_name}",
+            pluralize(updated, "engram", "engrams")
+        ),
+        _ => format!("Share updates from {domain_name}"),
+    }
+}
+
+/// The proposal body's first line (and [`ProposeReport::summary`]):
+/// `"Shares X new engram(s), refines Y engram(s) and retires Z engram(s)."`
+/// with a zero-count clause omitted entirely, singular or plural chosen per
+/// count, and no Oxford comma before the final "and" (see
+/// [`join_clauses`]).
+fn generate_summary_line(added: usize, updated: usize, deleted: usize) -> String {
+    let mut clauses = Vec::new();
+    if added > 0 {
+        clauses.push(format!(
+            "shares {added} new {}",
+            pluralize(added, "engram", "engrams")
+        ));
+    }
+    if updated > 0 {
+        clauses.push(format!(
+            "refines {updated} {}",
+            pluralize(updated, "engram", "engrams")
+        ));
+    }
+    if deleted > 0 {
+        clauses.push(format!(
+            "retires {deleted} {}",
+            pluralize(deleted, "engram", "engrams")
+        ));
+    }
+    format!("{}.", capitalize_first(&join_clauses(&clauses)))
+}
+
+/// Joins clauses with no Oxford comma: `["a"]` -> `"a"`, `["a", "b"]` ->
+/// `"a and b"`, `["a", "b", "c"]` -> `"a, b and c"`.
+fn join_clauses(clauses: &[String]) -> String {
+    match clauses.split_last() {
+        None => String::new(),
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+/// Uppercases the first character of `s`, leaving the rest as is.
+fn capitalize_first(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) => c.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
+/// Generates a proposal body when the caller supplies no description of
+/// their own: `summary`, then a bulleted list per change kind naming each
+/// file by its engram title where one can be found (see [`engram_title`]),
+/// ending with a plain footer line naming the domain. No AI attribution
+/// anywhere: nothing here, or anywhere else in this crate, credits a tool
+/// for the content.
+fn generate_body(summary: &str, entries: &ChangeEntries, domain_name: &str) -> String {
+    let mut body = String::new();
+    body.push_str(summary);
+    body.push('\n');
+    append_section(
+        &mut body,
+        "Added",
+        entries
+            .added
+            .iter()
+            .map(|(path, content)| engram_title(path, Some(content))),
+    );
+    append_section(
+        &mut body,
+        "Modified",
+        entries
+            .updated
+            .iter()
+            .map(|(path, content)| engram_title(path, Some(content))),
+    );
+    append_section(
+        &mut body,
+        "Deleted",
+        entries
+            .deleted
+            .iter()
+            .map(|(path, content)| engram_title(path, content.as_deref())),
+    );
+    body.push_str(&format!("\nDomain: {domain_name}\n"));
+    body
+}
+
+/// Appends a `<header>:` section listing `entries` as markdown bullets, or
+/// nothing at all when `entries` is empty (a change kind with no files gets
+/// no section header, rather than an empty one).
+fn append_section(body: &mut String, header: &str, entries: impl Iterator<Item = String>) {
+    let mut entries = entries.peekable();
+    if entries.peek().is_none() {
+        return;
+    }
+    body.push_str(&format!("\n{header}:\n"));
+    for entry in entries {
+        body.push_str(&format!("- {entry}\n"));
+    }
+}
+
+/// The display entry for one changed file in a generated proposal body:
+/// `"<title> (<path>)"` when `content` is markdown with a non-empty
+/// frontmatter title, else the bare path. One fallback covers three cases at
+/// once: a non-`.md` asset, content that fails to parse as an engram, and
+/// content absent entirely (a deleted file whose base copy could not be
+/// read back).
+fn engram_title(path: &str, content: Option<&[u8]>) -> String {
+    if !path.ends_with(".md") {
+        return path.to_string();
+    }
+    let title = content
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .and_then(|text| parse_engram(text).ok())
+        .map(|engram| engram.frontmatter.title)
+        .filter(|title| !title.is_empty());
+    match title {
+        Some(title) => format!("{title} ({path})"),
+        None => path.to_string(),
+    }
 }

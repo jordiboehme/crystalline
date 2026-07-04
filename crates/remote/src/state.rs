@@ -130,7 +130,10 @@ pub enum ProposalStatus {
 /// One file changed by a [`Proposal`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProposedFile {
-    /// The file's repo-relative path.
+    /// The file's domain-relative path (not repo-relative: the same space
+    /// every other local layer in this crate uses, so it compares directly
+    /// against [`OriginState::files`] and the pull-side override in
+    /// `crystalline_remote::ops` without a subpath translation).
     pub path: String,
     /// How the file changed.
     pub change: ProposedChange,

@@ -16,7 +16,10 @@ mod mock;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use crystalline_remote::ops::{PullReport, SubscribeReport, pull, status, subscribe};
+use crystalline_remote::ops::{
+    ProposeOutcome, PullReport, Resolution, SubscribeReport, discard, propose, pull, resolve,
+    status, subscribe,
+};
 use crystalline_remote::provider::{OriginSpec, ProposalState};
 use crystalline_remote::state::{
     BaseStamp, OriginState, Proposal, ProposalStatus, ProposedChange, ProposedFile,
@@ -85,6 +88,33 @@ async fn subscribe_at(mock: &MockProvider, commit: &str) -> (Subscribed, Subscri
 
 fn load_state(state_dir: &Path) -> OriginState {
     OriginState::load(state_dir).unwrap().unwrap()
+}
+
+/// Subscribes a fresh domain at `commit` against `spec`, with the working
+/// tree rooted at a directory named `domain_name` (rather than the fixed
+/// `"domain"` name [`subscribe_at`] uses), for share-side tests that need
+/// control over the domain's own display name (the branch-slug contract
+/// derives it from this basename) or a subpath spec.
+async fn subscribe_named(
+    mock: &MockProvider,
+    spec: &OriginSpec,
+    commit: &str,
+    domain_name: &str,
+) -> Subscribed {
+    mock.set_branch(&spec.branch, commit);
+    let work = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let domain_root = work.path().join(domain_name);
+    let state_dir = state.path().join("origin");
+    subscribe(mock, spec, &domain_root, &state_dir)
+        .await
+        .expect("subscribe should succeed");
+    Subscribed {
+        _work: work,
+        _state: state,
+        domain_root,
+        state_dir,
+    }
 }
 
 /// Overwrites the saved base commit, the corruption scenario 11 needs to force
@@ -858,4 +888,607 @@ async fn scenario_14_truncated_compare_falls_back_to_tarball_diff() {
         st.files.get("notes/a.md").unwrap().sha256,
         sha256_hex(b"a2\n")
     );
+}
+
+// --- share-side: propose, discard, resolve ------------------------------------
+
+/// The origin every share-side scenario tracks, rooted at a `knowledge/`
+/// subpath so tree writes exercise contract 3's repo-relative prefixing.
+fn share_spec() -> OriginSpec {
+    OriginSpec {
+        repo: "team/knowledge".to_string(),
+        subpath: Some("knowledge".to_string()),
+        branch: "main".to_string(),
+    }
+}
+
+fn sub_commit_files(pairs: &[(&str, &[u8])]) -> BTreeMap<String, Vec<u8>> {
+    pairs
+        .iter()
+        .map(|(p, c)| (format!("knowledge/{p}"), c.to_vec()))
+        .collect()
+}
+
+// Scenario 15 (a): propose happy path. Edit, add and delete locally, then
+// propose: two blobs uploaded, a tree with three writes at repo-relative
+// paths (the "knowledge/" subpath prefixed back on), the deletion carried as
+// a `blob_sha: None` write, the commit parented on the base commit, the
+// branch name matching the slug contract for a domain name needing
+// sanitization, the PR opened against the tracked branch, the Proposal
+// recorded with domain-relative paths and hashes, and the local files left
+// exactly as they are.
+
+#[tokio::test]
+async fn scenario_15_propose_happy_path_creates_pr_and_records_proposal() {
+    let mock = MockProvider::new();
+    let spec = share_spec();
+    let c1 = mock.add_commit(
+        sub_commit_files(&[
+            ("MANIFEST.md", b"# Manifest"),
+            ("notes/keep.md", b"keep\n"),
+            ("notes/edit.md", b"before\n"),
+            ("notes/gone.md", b"bye\n"),
+        ]),
+        None,
+    );
+    let sub = subscribe_named(&mock, &spec, &c1, "Brand Team").await;
+
+    write(&sub.domain_root.join("notes/edit.md"), b"after\n");
+    write(&sub.domain_root.join("notes/added.md"), b"brand new\n");
+    std::fs::remove_file(sub.domain_root.join("notes/gone.md")).unwrap();
+
+    let outcome = propose(&mock, &spec, &sub.domain_root, &sub.state_dir, None, None)
+        .await
+        .unwrap();
+    let report = match outcome {
+        ProposeOutcome::Proposed(r) => r,
+        other => panic!("expected Proposed, got {other:?}"),
+    };
+
+    // Branch slug: "Brand Team" lowercased, the space replaced with '-'.
+    assert!(
+        report.branch.starts_with("crystalline/share-brand-team-"),
+        "{}",
+        report.branch
+    );
+    assert_eq!(report.number, 1);
+    assert_eq!(report.url, "https://github.test/pulls/1");
+    assert_eq!(report.added, vec!["notes/added.md".to_string()]);
+    assert_eq!(report.updated, vec!["notes/edit.md".to_string()]);
+    assert_eq!(report.deleted, vec!["notes/gone.md".to_string()]);
+    assert!(report.skipped_large.is_empty());
+
+    // Two blobs uploaded, for the edited and the added file's content.
+    let calls = mock.calls();
+    assert!(
+        calls.contains(&format!("create_blob:{}", sha256_hex(b"after\n"))),
+        "{calls:?}"
+    );
+    assert!(
+        calls.contains(&format!("create_blob:{}", sha256_hex(b"brand new\n"))),
+        "{calls:?}"
+    );
+
+    // The PR request targets the tracked branch and carries the created
+    // branch name.
+    let req = mock.proposal_request(1).unwrap();
+    assert_eq!(req.branch, report.branch);
+    assert_eq!(req.base_branch, "main");
+
+    // The tree carries repo-relative paths: the "knowledge/" subpath is
+    // prefixed back onto every write, the deletion is gone and an untouched
+    // file carried over unchanged from the parent tree (proving the tree was
+    // built on top of the base commit, not from scratch).
+    let branch_commit = mock.branch_commit(&report.branch).unwrap();
+    let tree = mock.commit_tree(&branch_commit).unwrap();
+    assert_eq!(
+        tree.get("knowledge/notes/edit.md"),
+        Some(&b"after\n".to_vec())
+    );
+    assert_eq!(
+        tree.get("knowledge/notes/added.md"),
+        Some(&b"brand new\n".to_vec())
+    );
+    assert!(!tree.contains_key("knowledge/notes/gone.md"));
+    assert_eq!(
+        tree.get("knowledge/notes/keep.md"),
+        Some(&b"keep\n".to_vec()),
+        "an untouched file must carry over from the base commit's tree"
+    );
+
+    // State records the Proposal with domain-relative paths and hashes.
+    let st = load_state(&sub.state_dir);
+    assert_eq!(st.proposals.len(), 1);
+    let recorded = &st.proposals[0];
+    assert_eq!(recorded.number, 1);
+    assert_eq!(recorded.status, ProposalStatus::Open);
+    let mut files = recorded.files.clone();
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    assert_eq!(
+        files,
+        vec![
+            ProposedFile {
+                path: "notes/added.md".to_string(),
+                change: ProposedChange::Added,
+                sha256: Some(sha256_hex(b"brand new\n")),
+            },
+            ProposedFile {
+                path: "notes/edit.md".to_string(),
+                change: ProposedChange::Modified,
+                sha256: Some(sha256_hex(b"after\n")),
+            },
+            ProposedFile {
+                path: "notes/gone.md".to_string(),
+                change: ProposedChange::Deleted,
+                sha256: None,
+            },
+        ]
+    );
+
+    // Local files are left exactly as they are.
+    assert_eq!(read(&sub.domain_root.join("notes/edit.md")), b"after\n");
+    assert_eq!(
+        read(&sub.domain_root.join("notes/added.md")),
+        b"brand new\n"
+    );
+    assert!(!sub.domain_root.join("notes/gone.md").exists());
+}
+
+// Scenario 16 (b): conflicts pending refuses the share outright, before any
+// provider write call.
+
+#[tokio::test]
+async fn scenario_16_propose_with_conflicts_pending_refuses_without_provider_writes() {
+    let mock = MockProvider::new();
+    let spec = share_spec();
+    let c1 = mock.add_commit(
+        sub_commit_files(&[
+            ("MANIFEST.md", b"# Manifest"),
+            ("notes/a.md", b"line one\n"),
+        ]),
+        None,
+    );
+    let sub = subscribe_named(&mock, &spec, &c1, "brand").await;
+
+    // A same-line conflict from a previous pull.
+    write(&sub.domain_root.join("notes/a.md"), b"line one LOCAL\n");
+    let c2 = mock.add_commit(
+        sub_commit_files(&[
+            ("MANIFEST.md", b"# Manifest"),
+            ("notes/a.md", b"line one UPSTREAM\n"),
+        ]),
+        Some(&c1),
+    );
+    mock.set_branch("main", &c2);
+    pull(&mock, &spec, &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+    assert_eq!(load_state(&sub.state_dir).conflicts.len(), 1);
+
+    // Share another, unrelated local change; the outstanding conflict alone
+    // must refuse the share.
+    write(&sub.domain_root.join("notes/new.md"), b"brand new\n");
+
+    let err = propose(&mock, &spec, &sub.domain_root, &sub.state_dir, None, None)
+        .await
+        .unwrap_err();
+    match err {
+        crystalline_remote::RemoteError::ConflictsPending { count } => assert_eq!(count, 1),
+        other => panic!("expected ConflictsPending, got {other:?}"),
+    }
+
+    // No write call was ever logged: the refusal happens before any blob,
+    // tree, commit, branch or proposal is created.
+    let calls = mock.calls();
+    assert!(!calls.iter().any(|c| c.starts_with("create_")), "{calls:?}");
+}
+
+// Scenario 18 (d): nothing to share when the working tree already matches
+// the base exactly.
+
+#[tokio::test]
+async fn scenario_18_propose_with_no_local_changes_is_nothing_to_share() {
+    let mock = MockProvider::new();
+    let spec = share_spec();
+    let c1 = mock.add_commit(
+        sub_commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/a.md", b"alpha\n")]),
+        None,
+    );
+    let sub = subscribe_named(&mock, &spec, &c1, "brand").await;
+
+    let outcome = propose(&mock, &spec, &sub.domain_root, &sub.state_dir, None, None)
+        .await
+        .unwrap();
+    match outcome {
+        ProposeOutcome::NothingToShare { skipped_large } => assert!(skipped_large.is_empty()),
+        other => panic!("expected NothingToShare, got {other:?}"),
+    }
+
+    let calls = mock.calls();
+    assert!(!calls.iter().any(|c| c.starts_with("create_")), "{calls:?}");
+    assert!(load_state(&sub.state_dir).proposals.is_empty());
+}
+
+// Scenario 17 (c): freshness. Upstream moved with a mergeable edit; propose
+// pulls it in first, then builds its commit on the new base.
+
+#[tokio::test]
+async fn scenario_17_propose_freshness_pulls_first_then_proposes_on_new_base() {
+    let mock = MockProvider::new();
+    let spec = share_spec();
+    let c1 = mock.add_commit(
+        sub_commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/a.md", b"a v1\n")]),
+        None,
+    );
+    let sub = subscribe_named(&mock, &spec, &c1, "brand").await;
+
+    // A local addition to share.
+    write(&sub.domain_root.join("notes/local.md"), b"brand new\n");
+
+    // Upstream moves with a plain, mergeable edit to a file the working tree
+    // never touched.
+    let c2 = mock.add_commit(
+        sub_commit_files(&[
+            ("MANIFEST.md", b"# Manifest"),
+            ("notes/a.md", b"a v2 upstream\n"),
+        ]),
+        Some(&c1),
+    );
+    mock.set_branch("main", &c2);
+
+    let outcome = propose(&mock, &spec, &sub.domain_root, &sub.state_dir, None, None)
+        .await
+        .unwrap();
+    let report = match outcome {
+        ProposeOutcome::Proposed(r) => r,
+        other => panic!("expected Proposed, got {other:?}"),
+    };
+
+    // The inline pull applied the upstream edit before proposing.
+    assert_eq!(
+        read(&sub.domain_root.join("notes/a.md")),
+        b"a v2 upstream\n"
+    );
+    assert_eq!(load_state(&sub.state_dir).base_commit, c2);
+
+    // The commit is parented on the new base c2, not the stale c1: its tree
+    // carries both the upstream edit to a.md and the newly proposed file.
+    let branch_commit = mock.branch_commit(&report.branch).unwrap();
+    let tree = mock.commit_tree(&branch_commit).unwrap();
+    assert_eq!(
+        tree.get("knowledge/notes/a.md"),
+        Some(&b"a v2 upstream\n".to_vec())
+    );
+    assert_eq!(
+        tree.get("knowledge/notes/local.md"),
+        Some(&b"brand new\n".to_vec())
+    );
+}
+
+// Scenario 19 (e): full circle. The mock merges the proposed branch into
+// main verbatim; a later pull consumes the proposal to history as Merged
+// with no conflicts, through real propose output rather than seeded state.
+
+#[tokio::test]
+async fn scenario_19_propose_full_circle_merged_verbatim_is_consumed_by_pull() {
+    let mock = MockProvider::new();
+    let spec = share_spec();
+    let c1 = mock.add_commit(sub_commit_files(&[("MANIFEST.md", b"# Manifest")]), None);
+    let sub = subscribe_named(&mock, &spec, &c1, "brand").await;
+
+    write(&sub.domain_root.join("notes/new.md"), b"shared content\n");
+
+    let outcome = propose(&mock, &spec, &sub.domain_root, &sub.state_dir, None, None)
+        .await
+        .unwrap();
+    let report = match outcome {
+        ProposeOutcome::Proposed(r) => r,
+        other => panic!("expected Proposed, got {other:?}"),
+    };
+
+    // The mock "merges" the proposed branch into main verbatim: a
+    // fast-forward onto exactly the commit propose created.
+    let branch_commit = mock.branch_commit(&report.branch).unwrap();
+    mock.set_branch("main", &branch_commit);
+    mock.set_proposal_state(report.number, ProposalState::Merged);
+
+    let pull_report = pull(&mock, &spec, &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+    assert!(pull_report.conflicts.is_empty());
+    assert_eq!(
+        pull_report.proposals,
+        vec![(report.number, ProposalStatus::Merged)]
+    );
+
+    let st = load_state(&sub.state_dir);
+    assert!(st.proposals.is_empty());
+    assert_eq!(st.history.len(), 1);
+    assert_eq!(st.history[0].number, report.number);
+    assert_eq!(st.history[0].status, ProposalStatus::Merged);
+    assert_eq!(
+        read(&sub.domain_root.join("notes/new.md")),
+        b"shared content\n"
+    );
+}
+
+// Scenario 20 (f): amended circle. The mock merges an amended version of the
+// proposal; the pull's override path applies since the local hash still
+// matches what was proposed, so the amendment wins silently.
+
+#[tokio::test]
+async fn scenario_20_propose_amended_merge_upstream_wins_silently() {
+    let mock = MockProvider::new();
+    let spec = share_spec();
+    let c1 = mock.add_commit(sub_commit_files(&[("MANIFEST.md", b"# Manifest")]), None);
+    let sub = subscribe_named(&mock, &spec, &c1, "brand").await;
+
+    write(&sub.domain_root.join("notes/new.md"), b"proposed content\n");
+
+    let outcome = propose(&mock, &spec, &sub.domain_root, &sub.state_dir, None, None)
+        .await
+        .unwrap();
+    let report = match outcome {
+        ProposeOutcome::Proposed(r) => r,
+        other => panic!("expected Proposed, got {other:?}"),
+    };
+
+    // A reviewer amends the content before merging: a new commit parented on
+    // c1 (not the proposed branch commit) landing different bytes at the
+    // same path.
+    let amended = b"amended by the reviewer\n";
+    let c2 = mock.add_commit(
+        sub_commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/new.md", amended)]),
+        Some(&c1),
+    );
+    mock.set_branch("main", &c2);
+    mock.set_proposal_state(report.number, ProposalState::Merged);
+
+    let pull_report = pull(&mock, &spec, &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+    assert!(pull_report.conflicts.is_empty(), "amendment wins silently");
+    assert_eq!(read(&sub.domain_root.join("notes/new.md")), amended);
+
+    let st = load_state(&sub.state_dir);
+    assert!(st.proposals.is_empty());
+    assert_eq!(st.history[0].status, ProposalStatus::Merged);
+}
+
+// Scenario 21 (g): discard. A declined proposal touching three files: one
+// verbatim (restored to its base content), one diverged since sharing
+// (skipped, untouched) and one proposed addition (deleted). The record
+// lands in history with its declined status preserved.
+
+#[tokio::test]
+async fn scenario_21_discard_restores_verbatim_deletes_added_skips_diverged() {
+    let mock = MockProvider::new();
+    let spec = share_spec();
+    let c1 = mock.add_commit(
+        sub_commit_files(&[
+            ("MANIFEST.md", b"# Manifest"),
+            ("notes/keep.md", b"base keep\n"),
+            ("notes/diverge.md", b"base diverge\n"),
+        ]),
+        None,
+    );
+    let sub = subscribe_named(&mock, &spec, &c1, "brand").await;
+
+    // What a previous share proposed, without going through a real propose
+    // call: two modifications and one addition.
+    write(&sub.domain_root.join("notes/keep.md"), b"shared keep v2\n");
+    write(
+        &sub.domain_root.join("notes/diverge.md"),
+        b"shared diverge v2\n",
+    );
+    write(&sub.domain_root.join("notes/added.md"), b"newly added\n");
+
+    let mut state = load_state(&sub.state_dir);
+    state.proposals.push(Proposal {
+        number: 9,
+        url: "https://github.test/pulls/9".to_string(),
+        branch: "crystalline/share-brand-000101000000".to_string(),
+        title: "Share updates from brand".to_string(),
+        created_at: chrono::Utc::now(),
+        status: ProposalStatus::Declined,
+        files: vec![
+            ProposedFile {
+                path: "notes/keep.md".to_string(),
+                change: ProposedChange::Modified,
+                sha256: Some(sha256_hex(b"shared keep v2\n")),
+            },
+            ProposedFile {
+                path: "notes/diverge.md".to_string(),
+                change: ProposedChange::Modified,
+                sha256: Some(sha256_hex(b"shared diverge v2\n")),
+            },
+            ProposedFile {
+                path: "notes/added.md".to_string(),
+                change: ProposedChange::Added,
+                sha256: Some(sha256_hex(b"newly added\n")),
+            },
+        ],
+    });
+    state.save(&sub.state_dir).unwrap();
+
+    // The user edits notes/diverge.md again after sharing it.
+    write(
+        &sub.domain_root.join("notes/diverge.md"),
+        b"further edited after sharing\n",
+    );
+
+    let report = discard(&sub.domain_root, &sub.state_dir, 9).unwrap();
+    assert_eq!(report.restored, vec!["notes/keep.md".to_string()]);
+    assert_eq!(report.deleted, vec!["notes/added.md".to_string()]);
+    assert_eq!(
+        report.skipped_diverged,
+        vec!["notes/diverge.md".to_string()]
+    );
+
+    assert_eq!(read(&sub.domain_root.join("notes/keep.md")), b"base keep\n");
+    assert!(!sub.domain_root.join("notes/added.md").exists());
+    assert_eq!(
+        read(&sub.domain_root.join("notes/diverge.md")),
+        b"further edited after sharing\n",
+        "a diverged file must be left untouched"
+    );
+
+    let st = load_state(&sub.state_dir);
+    assert!(st.proposals.is_empty());
+    assert_eq!(st.history.len(), 1);
+    assert_eq!(st.history[0].number, 9);
+    assert_eq!(st.history[0].status, ProposalStatus::Declined);
+}
+
+// Scenario 22 (h): resolve. Mine, theirs (both EditEdit and the
+// EditDelete-theirs-means-delete case) and a caller-supplied merge, plus the
+// remaining count and the unknown-path error listing open conflicts.
+
+/// Subscribes a fresh domain, then drives a real `EditEdit` conflict at
+/// `notes/a.md` through an actual pull: base "line one", local "line one
+/// LOCAL", upstream "line one UPSTREAM".
+async fn seeded_edit_edit_conflict(mock: &MockProvider, spec: &OriginSpec) -> Subscribed {
+    let c1 = mock.add_commit(
+        sub_commit_files(&[
+            ("MANIFEST.md", b"# Manifest"),
+            ("notes/a.md", b"line one\n"),
+        ]),
+        None,
+    );
+    let sub = subscribe_named(mock, spec, &c1, "brand").await;
+    write(&sub.domain_root.join("notes/a.md"), b"line one LOCAL\n");
+    let c2 = mock.add_commit(
+        sub_commit_files(&[
+            ("MANIFEST.md", b"# Manifest"),
+            ("notes/a.md", b"line one UPSTREAM\n"),
+        ]),
+        Some(&c1),
+    );
+    mock.set_branch("main", &c2);
+    pull(mock, spec, &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+    assert_eq!(load_state(&sub.state_dir).conflicts.len(), 1);
+    sub
+}
+
+#[tokio::test]
+async fn scenario_22_resolve_mine_keeps_local_content_untouched() {
+    let mock = MockProvider::new();
+    let spec = share_spec();
+    let sub = seeded_edit_edit_conflict(&mock, &spec).await;
+
+    let report = resolve(
+        &sub.domain_root,
+        &sub.state_dir,
+        "notes/a.md",
+        Resolution::Mine,
+    )
+    .unwrap();
+    assert_eq!(report.resolved, "notes/a.md");
+    assert_eq!(report.remaining, 0);
+    assert_eq!(
+        read(&sub.domain_root.join("notes/a.md")),
+        b"line one LOCAL\n"
+    );
+    assert!(load_state(&sub.state_dir).conflicts.is_empty());
+}
+
+#[tokio::test]
+async fn scenario_22_resolve_theirs_edit_edit_takes_upstream_content() {
+    let mock = MockProvider::new();
+    let spec = share_spec();
+    let sub = seeded_edit_edit_conflict(&mock, &spec).await;
+
+    let report = resolve(
+        &sub.domain_root,
+        &sub.state_dir,
+        "notes/a.md",
+        Resolution::Theirs,
+    )
+    .unwrap();
+    assert_eq!(report.remaining, 0);
+    assert_eq!(
+        read(&sub.domain_root.join("notes/a.md")),
+        b"line one UPSTREAM\n"
+    );
+    assert!(load_state(&sub.state_dir).conflicts.is_empty());
+}
+
+#[tokio::test]
+async fn scenario_22_resolve_theirs_edit_delete_deletes_the_local_file() {
+    let mock = MockProvider::new();
+    let spec = share_spec();
+    let c1 = mock.add_commit(
+        sub_commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/a.md", b"content\n")]),
+        None,
+    );
+    let sub = subscribe_named(&mock, &spec, &c1, "brand").await;
+    write(&sub.domain_root.join("notes/a.md"), b"locally edited\n");
+    let c2 = mock.add_commit(
+        sub_commit_files(&[("MANIFEST.md", b"# Manifest")]),
+        Some(&c1),
+    );
+    mock.set_branch("main", &c2);
+    pull(&mock, &spec, &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+    assert_eq!(load_state(&sub.state_dir).conflicts.len(), 1);
+
+    let report = resolve(
+        &sub.domain_root,
+        &sub.state_dir,
+        "notes/a.md",
+        Resolution::Theirs,
+    )
+    .unwrap();
+    assert_eq!(report.remaining, 0);
+    assert!(!sub.domain_root.join("notes/a.md").exists());
+    assert!(load_state(&sub.state_dir).conflicts.is_empty());
+}
+
+#[tokio::test]
+async fn scenario_22_resolve_merged_writes_the_supplied_content() {
+    let mock = MockProvider::new();
+    let spec = share_spec();
+    let sub = seeded_edit_edit_conflict(&mock, &spec).await;
+
+    let merged: &[u8] = b"merged by hand\n";
+    let report = resolve(
+        &sub.domain_root,
+        &sub.state_dir,
+        "notes/a.md",
+        Resolution::Merged(merged),
+    )
+    .unwrap();
+    assert_eq!(report.remaining, 0);
+    assert_eq!(read(&sub.domain_root.join("notes/a.md")), merged);
+}
+
+#[tokio::test]
+async fn scenario_22_resolve_unknown_path_errors_and_lists_open_conflicts() {
+    let mock = MockProvider::new();
+    let spec = share_spec();
+    let sub = seeded_edit_edit_conflict(&mock, &spec).await;
+
+    let err = resolve(
+        &sub.domain_root,
+        &sub.state_dir,
+        "notes/missing.md",
+        Resolution::Mine,
+    )
+    .unwrap_err();
+    match err {
+        crystalline_remote::RemoteError::ConflictNotFound { path, open } => {
+            assert_eq!(path, "notes/missing.md");
+            assert_eq!(open, vec!["notes/a.md".to_string()]);
+        }
+        other => panic!("expected ConflictNotFound, got {other:?}"),
+    }
+    // Untouched: the error refused before any write.
+    assert_eq!(
+        read(&sub.domain_root.join("notes/a.md")),
+        b"line one LOCAL\n"
+    );
+    assert_eq!(load_state(&sub.state_dir).conflicts.len(), 1);
 }

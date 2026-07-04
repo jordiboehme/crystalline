@@ -54,10 +54,20 @@ struct Inner {
     etags: HashMap<String, String>,
     blobs: HashMap<String, Vec<u8>>,
     proposals: HashMap<u64, ProposalState>,
+    /// The request each created proposal was opened with, for tests that
+    /// assert on the generated title or body without threading them through
+    /// `calls`.
+    proposal_requests: HashMap<u64, ProposalRequest>,
+    /// Trees built by `create_tree`, keyed by a generated tree id: the
+    /// parent commit's files with every write applied, ready for
+    /// `create_commit` to snapshot into a new [`Commit`].
+    trees: HashMap<String, BTreeMap<String, Vec<u8>>>,
     gc: HashSet<String>,
     truncate: bool,
     etag_counter: u64,
     commit_counter: u64,
+    tree_counter: u64,
+    proposal_counter: u64,
     calls: Vec<String>,
 }
 
@@ -117,6 +127,39 @@ impl MockProvider {
     /// report for proposal `number`.
     pub fn set_proposal_state(&self, number: u64, state: ProposalState) {
         self.inner.lock().unwrap().proposals.insert(number, state);
+    }
+
+    /// The commit `branch` currently points at, or `None` if it was never
+    /// set. Lets a test fast-forward `main` onto exactly the commit a
+    /// `propose` call created (simulating GitHub merging its pull request
+    /// verbatim) without `ProposeReport` itself needing to expose a commit
+    /// sha.
+    pub fn branch_commit(&self, branch: &str) -> Option<String> {
+        self.inner.lock().unwrap().branches.get(branch).cloned()
+    }
+
+    /// The request every proposal was opened with, keyed by its number, for
+    /// tests asserting on the generated title or body.
+    pub fn proposal_request(&self, number: u64) -> Option<ProposalRequest> {
+        self.inner
+            .lock()
+            .unwrap()
+            .proposal_requests
+            .get(&number)
+            .cloned()
+    }
+
+    /// The full repo-relative file tree of `commit`, for tests asserting
+    /// exactly which paths a `create_tree`/`create_commit` call produced
+    /// (repo-relative, subpath prefix included) and that untouched files
+    /// carried over from the parent tree.
+    pub fn commit_tree(&self, commit: &str) -> Option<BTreeMap<String, Vec<u8>>> {
+        self.inner
+            .lock()
+            .unwrap()
+            .commits
+            .get(commit)
+            .map(|c| c.files.clone())
     }
 
     /// Marks `commit` as garbage-collected: a [`Provider::compare`] using it
@@ -261,37 +304,97 @@ impl Provider for MockProvider {
     async fn create_blob(
         &self,
         _origin: &OriginSpec,
-        _content: &[u8],
+        content: &[u8],
     ) -> Result<String, RemoteError> {
-        unsupported_write("create_blob")
+        let sha = sha256_hex(content);
+        let mut inner = self.inner.lock().unwrap();
+        inner.blobs.insert(sha.clone(), content.to_vec());
+        inner.calls.push(format!("create_blob:{sha}"));
+        Ok(sha)
     }
 
     async fn create_tree(
         &self,
-        _origin: &OriginSpec,
-        _parent_commit: &str,
-        _writes: &[TreeWrite],
+        origin: &OriginSpec,
+        parent_commit: &str,
+        writes: &[TreeWrite],
     ) -> Result<String, RemoteError> {
-        unsupported_write("create_tree")
+        let mut inner = self.inner.lock().unwrap();
+        let mut files = inner
+            .commits
+            .get(parent_commit)
+            .ok_or_else(|| RemoteError::RepoNotFound {
+                repo: origin.repo.clone(),
+            })?
+            .files
+            .clone();
+        for write in writes {
+            match &write.blob_sha {
+                Some(sha) => {
+                    let content =
+                        inner
+                            .blobs
+                            .get(sha)
+                            .cloned()
+                            .ok_or_else(|| RemoteError::Api {
+                                status: 404,
+                                message: format!("no blob {sha}"),
+                            })?;
+                    files.insert(write.path.clone(), content);
+                }
+                None => {
+                    files.remove(&write.path);
+                }
+            }
+        }
+        inner.tree_counter += 1;
+        let id = format!("tree{}", inner.tree_counter);
+        inner.trees.insert(id.clone(), files);
+        inner.calls.push(format!("create_tree:{id}"));
+        Ok(id)
     }
 
     async fn create_commit(
         &self,
-        _origin: &OriginSpec,
+        origin: &OriginSpec,
         _message: &str,
-        _tree: &str,
-        _parent: &str,
+        tree: &str,
+        parent: &str,
     ) -> Result<String, RemoteError> {
-        unsupported_write("create_commit")
+        let mut inner = self.inner.lock().unwrap();
+        let files = inner
+            .trees
+            .get(tree)
+            .cloned()
+            .ok_or_else(|| RemoteError::RepoNotFound {
+                repo: origin.repo.clone(),
+            })?;
+        inner.commit_counter += 1;
+        let id = format!("commit{}", inner.commit_counter);
+        inner.commits.insert(
+            id.clone(),
+            Commit {
+                files,
+                parent: Some(parent.to_string()),
+            },
+        );
+        inner.calls.push(format!("create_commit:{id}"));
+        Ok(id)
     }
 
     async fn create_branch(
         &self,
         _origin: &OriginSpec,
-        _name: &str,
-        _commit: &str,
+        name: &str,
+        commit: &str,
     ) -> Result<(), RemoteError> {
-        unsupported_write("create_branch").map(|_: String| ())
+        let mut inner = self.inner.lock().unwrap();
+        inner.etag_counter += 1;
+        let etag = format!("etag{}", inner.etag_counter);
+        inner.branches.insert(name.to_string(), commit.to_string());
+        inner.etags.insert(name.to_string(), etag);
+        inner.calls.push(format!("create_branch:{name}:{commit}"));
+        Ok(())
     }
 
     async fn delete_branch(&self, _origin: &OriginSpec, name: &str) -> Result<(), RemoteError> {
@@ -306,11 +409,17 @@ impl Provider for MockProvider {
     async fn create_proposal(
         &self,
         _origin: &OriginSpec,
-        _req: &ProposalRequest,
+        req: &ProposalRequest,
     ) -> Result<ProposalHandle, RemoteError> {
-        Err(RemoteError::Api {
-            status: 0,
-            message: "create_proposal is not supported by the mock".to_string(),
+        let mut inner = self.inner.lock().unwrap();
+        inner.proposal_counter += 1;
+        let number = inner.proposal_counter;
+        inner.proposals.insert(number, ProposalState::Open);
+        inner.proposal_requests.insert(number, req.clone());
+        inner.calls.push(format!("create_proposal:{}", req.branch));
+        Ok(ProposalHandle {
+            number,
+            url: format!("https://github.test/pulls/{number}"),
         })
     }
 
@@ -334,11 +443,4 @@ impl Provider for MockProvider {
     async fn current_user(&self) -> Result<String, RemoteError> {
         Ok("mock-user".to_string())
     }
-}
-
-fn unsupported_write(op: &str) -> Result<String, RemoteError> {
-    Err(RemoteError::Api {
-        status: 0,
-        message: format!("{op} is not supported by the mock"),
-    })
 }
