@@ -1492,3 +1492,95 @@ async fn scenario_22_resolve_unknown_path_errors_and_lists_open_conflicts() {
     );
     assert_eq!(load_state(&sub.state_dir).conflicts.len(), 1);
 }
+
+// Scenario 23: the generated title and summary rules, across singular and
+// plural counts and every change mix, checked against the actual PR request
+// the mock recorded (title and body are otherwise internal to `propose`).
+
+#[tokio::test]
+async fn scenario_23_generated_title_pluralizes_additions_only() {
+    let mock = MockProvider::new();
+    let spec = share_spec();
+    let c1 = mock.add_commit(sub_commit_files(&[("MANIFEST.md", b"# Manifest")]), None);
+    let sub = subscribe_named(&mock, &spec, &c1, "brand").await;
+
+    write(&sub.domain_root.join("notes/one.md"), b"one\n");
+    write(&sub.domain_root.join("notes/two.md"), b"two\n");
+
+    let outcome = propose(&mock, &spec, &sub.domain_root, &sub.state_dir, None, None)
+        .await
+        .unwrap();
+    let report = match outcome {
+        ProposeOutcome::Proposed(r) => r,
+        other => panic!("expected Proposed, got {other:?}"),
+    };
+    let req = mock.proposal_request(report.number).unwrap();
+    assert_eq!(req.title, "Share 2 new engrams from brand");
+    assert_eq!(req.body.lines().next().unwrap(), "Shares 2 new engrams.");
+}
+
+#[tokio::test]
+async fn scenario_23_generated_title_singular_modification_only() {
+    let mock = MockProvider::new();
+    let spec = share_spec();
+    let c1 = mock.add_commit(
+        sub_commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/a.md", b"v1\n")]),
+        None,
+    );
+    let sub = subscribe_named(&mock, &spec, &c1, "brand").await;
+
+    write(&sub.domain_root.join("notes/a.md"), b"v2\n");
+
+    let outcome = propose(&mock, &spec, &sub.domain_root, &sub.state_dir, None, None)
+        .await
+        .unwrap();
+    let report = match outcome {
+        ProposeOutcome::Proposed(r) => r,
+        other => panic!("expected Proposed, got {other:?}"),
+    };
+    let req = mock.proposal_request(report.number).unwrap();
+    assert_eq!(req.title, "Refine 1 engram in brand");
+    assert_eq!(req.body.lines().next().unwrap(), "Refines 1 engram.");
+}
+
+#[tokio::test]
+async fn scenario_23_generated_summary_joins_three_plural_clauses_without_an_oxford_comma() {
+    let mock = MockProvider::new();
+    let spec = share_spec();
+    let c1 = mock.add_commit(
+        sub_commit_files(&[
+            ("MANIFEST.md", b"# Manifest"),
+            ("notes/m1.md", b"v1\n"),
+            ("notes/m2.md", b"v1\n"),
+            ("notes/d1.md", b"v1\n"),
+            ("notes/d2.md", b"v1\n"),
+        ]),
+        None,
+    );
+    let sub = subscribe_named(&mock, &spec, &c1, "brand").await;
+
+    write(&sub.domain_root.join("notes/a1.md"), b"new\n");
+    write(&sub.domain_root.join("notes/a2.md"), b"new\n");
+    write(&sub.domain_root.join("notes/m1.md"), b"v2\n");
+    write(&sub.domain_root.join("notes/m2.md"), b"v2\n");
+    std::fs::remove_file(sub.domain_root.join("notes/d1.md")).unwrap();
+    std::fs::remove_file(sub.domain_root.join("notes/d2.md")).unwrap();
+
+    let outcome = propose(&mock, &spec, &sub.domain_root, &sub.state_dir, None, None)
+        .await
+        .unwrap();
+    let report = match outcome {
+        ProposeOutcome::Proposed(r) => r,
+        other => panic!("expected Proposed, got {other:?}"),
+    };
+
+    // A mixed change set always titles as a generic update, regardless of
+    // how many files each kind touches.
+    let req = mock.proposal_request(report.number).unwrap();
+    assert_eq!(req.title, "Share updates from brand");
+    assert_eq!(
+        report.summary,
+        "Shares 2 new engrams, refines 2 engrams and retires 2 engrams."
+    );
+    assert_eq!(req.body.lines().next().unwrap(), report.summary);
+}

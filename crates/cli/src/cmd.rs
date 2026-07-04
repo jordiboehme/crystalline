@@ -369,6 +369,110 @@ pub(crate) fn print_origin_add(repo: &str, data: &serde_json::Value, json: bool)
     println!("Run: crystalline origin status --domain {name}");
 }
 
+// --- origin share, discard and resolve ----------------------------------------
+
+/// Print `origin share`'s result: the proposal URL and change summary when
+/// one was opened, the friendly "nothing to share" line when the team
+/// already has everything the domain knows, or (when conflicts are still
+/// pending) every conflicting path plus a pointer at `origin resolve`.
+pub(crate) fn print_origin_share(domain: &str, data: &serde_json::Value, json: bool) {
+    if json {
+        println!("{data}");
+        return;
+    }
+    let empty = Vec::new();
+    match data["outcome"].as_str().unwrap_or("") {
+        "proposed" => {
+            println!("Shared: {}", data["url"].as_str().unwrap_or(""));
+            if let Some(summary) = data["summary"].as_str() {
+                println!("  {summary}");
+            }
+            let added = data["added"].as_array().map(Vec::len).unwrap_or(0);
+            let updated = data["updated"].as_array().map(Vec::len).unwrap_or(0);
+            let deleted = data["deleted"].as_array().map(Vec::len).unwrap_or(0);
+            println!("  {added} added, {updated} updated, {deleted} deleted");
+            print_skipped_large(&data["skipped_large"]);
+        }
+        "nothing_to_share" => {
+            println!("Nothing to share: '{domain}' already matches its origin.");
+            print_skipped_large(&data["skipped_large"]);
+        }
+        "conflicts_pending" => {
+            println!(
+                "Cannot share '{domain}': {} conflict(s) need to be resolved first.",
+                data["count"].as_u64().unwrap_or(0)
+            );
+            for c in data["conflicts"].as_array().unwrap_or(&empty) {
+                println!("  conflict: {}", c["path"].as_str().unwrap_or(""));
+            }
+            println!("Run: crystalline origin resolve {domain} <path> --keep mine|theirs");
+        }
+        other => println!("origin share '{domain}': unexpected outcome '{other}'"),
+    }
+}
+
+fn print_skipped_large(skipped_large: &serde_json::Value) {
+    let empty = Vec::new();
+    for s in skipped_large.as_array().unwrap_or(&empty) {
+        println!(
+            "  skipped (too large): {} ({} bytes)",
+            s[0].as_str().unwrap_or(""),
+            s[1].as_u64().unwrap_or(0)
+        );
+    }
+}
+
+/// Print `origin discard`'s result: the restored, deleted and skipped
+/// (diverged since sharing) paths, or a friendly line when there was
+/// nothing to discard.
+pub(crate) fn print_origin_discard(data: &serde_json::Value, json: bool) {
+    if json {
+        println!("{data}");
+        return;
+    }
+    let empty = Vec::new();
+    let restored = data["restored"].as_array().unwrap_or(&empty);
+    let deleted = data["deleted"].as_array().unwrap_or(&empty);
+    let skipped = data["skipped_diverged"].as_array().unwrap_or(&empty);
+    if restored.is_empty() && deleted.is_empty() && skipped.is_empty() {
+        println!("Nothing to discard.");
+        return;
+    }
+    for p in restored {
+        println!("restored: {}", p.as_str().unwrap_or(""));
+    }
+    for p in deleted {
+        println!("deleted: {}", p.as_str().unwrap_or(""));
+    }
+    for p in skipped {
+        println!(
+            "left alone (diverged since sharing): {}",
+            p.as_str().unwrap_or("")
+        );
+    }
+}
+
+/// Print `origin resolve`'s result: the resolved path and how many
+/// conflicts remain open.
+pub(crate) fn print_origin_resolve(data: &serde_json::Value, json: bool) {
+    if json {
+        println!("{data}");
+        return;
+    }
+    println!("Resolved: {}", data["resolved"].as_str().unwrap_or(""));
+    println!(
+        "Remaining conflicts: {}",
+        data["remaining"].as_u64().unwrap_or(0)
+    );
+}
+
+/// Reads `--content-file`'s bytes for `origin resolve --content-file`, as raw
+/// bytes rather than a UTF-8 string: a resolved file may be a binary asset,
+/// and the merge must round-trip byte for byte.
+pub(crate) fn read_resolve_content(path: &Path) -> Result<Vec<u8>> {
+    std::fs::read(path).with_context(|| format!("reading {}", path.display()))
+}
+
 // --- mcp domain auto-registration ---------------------------------------------
 
 /// Ensure a Claude Desktop MCPB bundle's picked folder is registered as a

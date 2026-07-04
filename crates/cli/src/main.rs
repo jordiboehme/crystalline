@@ -592,6 +592,60 @@ enum OriginCommand {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// Propose a team domain's local changes as a pull request against its
+    /// origin.
+    Share {
+        /// The team domain to share local changes from.
+        domain: String,
+        /// The proposal's title. Defaults to a generated one-liner from the
+        /// change mix.
+        #[arg(long)]
+        title: Option<String>,
+        /// The proposal's description. Defaults to a generated summary.
+        #[arg(long)]
+        message: Option<String>,
+        /// Load the global config from this file instead of the default path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Discard a declined, or still-open ("never mind"), share proposal,
+    /// restoring local files that were not changed since sharing them.
+    Discard {
+        /// The team domain the proposal belongs to.
+        domain: String,
+        /// The proposal number to discard.
+        #[arg(long)]
+        proposal: u64,
+        /// Load the global config from this file instead of the default path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Resolve one recorded conflict for a team domain.
+    Resolve {
+        /// The team domain the conflict belongs to.
+        domain: String,
+        /// The conflicting file's path, relative to the domain root.
+        path: String,
+        /// Keep the local copy (mine) or take upstream's (theirs).
+        /// Exactly one of --keep or --content-file is required.
+        #[arg(long)]
+        keep: Option<KeepSide>,
+        /// Write this file's bytes as the resolved merge instead of keeping
+        /// either side verbatim. Exactly one of --keep or --content-file is
+        /// required.
+        #[arg(long)]
+        content_file: Option<PathBuf>,
+        /// Load the global config from this file instead of the default path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+}
+
+/// Which side of a conflict `origin resolve --keep` keeps.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum KeepSide {
+    Mine,
+    Theirs,
 }
 
 #[derive(Subcommand, Debug)]
@@ -922,9 +976,9 @@ async fn run_connect(command: ConnectCommand, json: bool) -> anyhow::Result<()> 
     }
 }
 
-/// `origin update`/`origin status`: socket-first with an in-process fallback,
-/// both already handled inside `crystalline_service::origin_update` and
-/// `crystalline_service::origin_status`.
+/// `origin update`/`origin status`/`origin share`/`origin discard`/
+/// `origin resolve`: socket-first with an in-process fallback, all already
+/// handled inside their respective `crystalline_service` entry points.
 async fn run_origin(command: OriginCommand, db: Option<PathBuf>, json: bool) -> anyhow::Result<()> {
     match command {
         OriginCommand::Update { domain, config } => {
@@ -945,6 +999,68 @@ async fn run_origin(command: OriginCommand, db: Option<PathBuf>, json: bool) -> 
             )
             .await?;
             print_origin_status(&data, json);
+            Ok(())
+        }
+        OriginCommand::Share {
+            domain,
+            title,
+            message,
+            config,
+        } => {
+            let data = crystalline_service::origin_share(
+                &domain,
+                title.as_deref(),
+                message.as_deref(),
+                db.as_deref(),
+                config.as_deref(),
+            )
+            .await?;
+            cmd::print_origin_share(&domain, &data, json);
+            Ok(())
+        }
+        OriginCommand::Discard {
+            domain,
+            proposal,
+            config,
+        } => {
+            let data = crystalline_service::origin_discard(
+                &domain,
+                proposal,
+                db.as_deref(),
+                config.as_deref(),
+            )
+            .await?;
+            cmd::print_origin_discard(&data, json);
+            Ok(())
+        }
+        OriginCommand::Resolve {
+            domain,
+            path,
+            keep,
+            content_file,
+            config,
+        } => {
+            if keep.is_some() == content_file.is_some() {
+                anyhow::bail!("`origin resolve` requires exactly one of --keep or --content-file");
+            }
+            let content = match &content_file {
+                Some(f) => Some(cmd::read_resolve_content(f)?),
+                None => None,
+            };
+            let keep_str = keep.map(|k| match k {
+                KeepSide::Mine => "mine",
+                KeepSide::Theirs => "theirs",
+            });
+            let data = crystalline_service::origin_resolve(
+                &domain,
+                &path,
+                keep_str,
+                content.as_deref(),
+                db.as_deref(),
+                config.as_deref(),
+            )
+            .await?;
+            cmd::print_origin_resolve(&data, json);
             Ok(())
         }
     }
