@@ -105,9 +105,21 @@ pub enum EngineError {
     /// A GitHub collaboration error from the remote origin engine, surfaced
     /// with its message verbatim: every `RemoteError` variant is already
     /// actionable product copy (see `crystalline_remote::error`), so this
-    /// never re-wraps or restates it.
+    /// never re-wraps or restates it. Deliberately not `#[from]`: thiserror
+    /// would then also derive `source()` pointing back at the same
+    /// `RemoteError`, and since its text is identical to this variant's own
+    /// `Display`, a top-level `anyhow` printer would show the message twice
+    /// (once as the error, once as its "caused by"). The manual `From` impl
+    /// below converts without that, mirroring `IndexError`'s and
+    /// `SettingsError`'s conversions in this file.
     #[error("{0}")]
-    Remote(#[from] crystalline_remote::RemoteError),
+    Remote(crystalline_remote::RemoteError),
+}
+
+impl From<crystalline_remote::RemoteError> for EngineError {
+    fn from(e: crystalline_remote::RemoteError) -> Self {
+        EngineError::Remote(e)
+    }
 }
 
 impl From<crystalline_index::IndexError> for EngineError {
