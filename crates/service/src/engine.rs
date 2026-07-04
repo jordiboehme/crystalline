@@ -2628,16 +2628,38 @@ impl Engine {
                 Ok(v) => {
                     let up_to_date = v["up_to_date"].as_bool().unwrap_or(false);
                     let applied = v["applied"].as_array().map(Vec::len).unwrap_or(0);
-                    let empty = Vec::new();
-                    let new_conflicts = v["conflicts"].as_array().unwrap_or(&empty);
-                    if !new_conflicts.is_empty() {
-                        let paths: Vec<&str> = new_conflicts
-                            .iter()
-                            .filter_map(|c| c["path"].as_str())
-                            .collect();
+                    let conflict_paths: Vec<&str> = v["conflicts"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|c| c["path"].as_str())
+                        .collect();
+                    // A share proposal can transition (merged, declined) with
+                    // no file in this domain changing at all, so it needs its
+                    // own info line even when the pull otherwise reports
+                    // `up_to_date`: `PullReport::proposals` (see
+                    // `crystalline_remote::ops::settle_up_to_date`) is
+                    // refreshed on every pull regardless of whether the
+                    // branch itself moved.
+                    let proposal_lines: Vec<String> = v["proposals"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .map(|p| {
+                            let number = p["number"].as_u64().unwrap_or(0);
+                            let status = p["status"].as_str().unwrap_or("?");
+                            format!("#{number} {status}")
+                        })
+                        .collect();
+                    if !conflict_paths.is_empty() {
                         tracing::info!(
                             "origin poll: '{name}' has new conflict(s): {}",
-                            paths.join(", ")
+                            conflict_paths.join(", ")
+                        );
+                    } else if !proposal_lines.is_empty() {
+                        tracing::info!(
+                            "origin poll: '{name}' proposal update: {}",
+                            proposal_lines.join(", ")
                         );
                     } else if !up_to_date {
                         tracing::info!("origin poll: '{name}' applied {applied} file(s)");
@@ -2649,7 +2671,7 @@ impl Engine {
                     } else {
                         poller::DomainPollOutcome::Applied {
                             applied,
-                            conflicts: new_conflicts.len(),
+                            conflicts: conflict_paths.len(),
                         }
                     };
                     self.origin_poller.record_result(&name, outcome);
