@@ -8,6 +8,8 @@
 //! optional fields are `Option` and defaulted in the engine so the defaults are
 //! documented in one place.
 
+use std::collections::BTreeMap;
+
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -235,4 +237,102 @@ pub struct InferParams {
     /// Frequency at or above which a field is suggested. Defaults to 0.25.
     #[serde(default)]
     pub threshold: Option<f64>,
+}
+
+/// Parameters for `configure`. Omit everything to see the current settings
+/// and GitHub connection. `token` or `connect` handle a GitHub connect
+/// action on their own and ignore `set`/`unset` in the same call; give them
+/// on a separate call from a settings change.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+pub struct ConfigureParams {
+    /// Settings to change, key to value, for example { "github.enabled":
+    /// "true" }. Applied in ascending key order; the first invalid key or
+    /// value stops the rest and reports what was already applied.
+    #[serde(default)]
+    pub set: Option<BTreeMap<String, String>>,
+    /// Setting keys to reset to their default, applied after `set`.
+    #[serde(default)]
+    pub unset: Option<Vec<String>>,
+    /// Pass "github" to link a GitHub account: starts a short code to
+    /// confirm at github.com/login/device, or reports an already-pending
+    /// one. Omit when `token` is supplied.
+    #[serde(default)]
+    pub connect: Option<String>,
+    /// A GitHub personal access token, connecting immediately instead of the
+    /// short-code flow.
+    #[serde(default)]
+    pub token: Option<String>,
+    /// A GitHub Enterprise Server host for this connect only, for example
+    /// github.example.com. Durable GitHub Enterprise Server setup is `set
+    /// github.api_url`.
+    #[serde(default)]
+    pub host: Option<String>,
+}
+
+/// Parameters for `add_domain`.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct AddDomainParams {
+    /// The GitHub repository, `owner/name`.
+    pub repo: String,
+    /// The domain name to register the repository under. Defaults to the
+    /// repository's own name.
+    #[serde(default)]
+    pub domain: Option<String>,
+    /// A subfolder within the repository that is the domain root, for a
+    /// domain living inside a bigger repository. Defaults to the repository
+    /// root.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// The branch to track. Defaults to `main`.
+    #[serde(default)]
+    pub branch: Option<String>,
+    /// Where to download the domain's engrams on this machine. Defaults to
+    /// `~/Documents/Crystalline/<domain>`.
+    #[serde(default)]
+    pub folder: Option<String>,
+}
+
+/// Parameters for `share_changes`.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ShareChangesParams {
+    /// The domain whose new knowledge to share.
+    pub domain: String,
+    /// A title for the shared proposal. Defaults to a generated summary.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// A longer description of what changed and why.
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+/// Parameters for `update_domain`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+pub struct UpdateDomainParams {
+    /// The domain to bring up to date. Omit to update every shared domain.
+    #[serde(default)]
+    pub domain: Option<String>,
+}
+
+/// Parameters for `origin_status`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+pub struct OriginStatusParams {
+    /// Restrict the review to this domain. Omit to review every shared
+    /// domain.
+    #[serde(default)]
+    pub domain: Option<String>,
+}
+
+/// Parameters for `resolve_conflict`.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ResolveConflictParams {
+    /// The domain the conflict belongs to.
+    pub domain: String,
+    /// The domain-relative path of the flagged engram.
+    pub path: String,
+    /// One of mine (keep your version), theirs (take the team's version) or
+    /// merged (use `content`).
+    pub resolution: String,
+    /// The merged markdown content. Required when `resolution` is merged.
+    #[serde(default)]
+    pub content: Option<String>,
 }
