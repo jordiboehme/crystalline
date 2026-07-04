@@ -17,9 +17,11 @@
 //! existing sync engine.
 
 pub mod error;
+pub mod github;
 pub mod provider;
 
 pub use error::RemoteError;
+pub use github::GitHubProvider;
 pub use provider::{
     ChangeKind, CompareResult, HeadProbe, OriginSpec, ProposalHandle, ProposalRequest,
     ProposalState, Provider, TreeWrite, UpstreamChange,
