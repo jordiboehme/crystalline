@@ -422,6 +422,17 @@ async fn origin_status_reports_behind_and_connection() {
     assert_eq!(domains[0]["domain"], "brand");
     assert_eq!(domains[0]["repo"], "acme/brand-knowledge");
     assert_eq!(domains[0]["behind"], false);
+    assert_eq!(domains[0]["local_changes"], 0);
+
+    // A local edit shows up as "ahead" (a local change against the base).
+    std::fs::create_dir_all(root.join("notes")).unwrap();
+    std::fs::write(
+        root.join("notes/local.md"),
+        engram("Local", "local", "not shared yet"),
+    )
+    .unwrap();
+    let status_local = eng.origin_status(Some("brand")).await.unwrap();
+    assert_eq!(status_local["domains"][0]["local_changes"], 1);
 
     let c2 = mock.add_commit(commit_files(&[
         ("MANIFEST.md", manifest()),
