@@ -391,8 +391,22 @@ pub fn verify_base(
 }
 
 /// The directory holding `id`'s recorded conflict copies under `dir`.
-fn conflict_dir(dir: &Path, id: &str) -> PathBuf {
-    dir.join(CONFLICTS_DIR_NAME).join(id)
+///
+/// `id` must be exactly 8 lowercase ASCII hexadecimal characters, the format
+/// produced by [`new_conflict_id`]. A malformed id from a tampered state file
+/// is rejected with [`RemoteError::State`] naming the offending id, without
+/// touching the filesystem.
+fn conflict_dir(dir: &Path, id: &str) -> Result<PathBuf, RemoteError> {
+    if id.len() != 8
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    {
+        return Err(RemoteError::State(format!(
+            "rejected conflict id (must be 8 lowercase hex chars): {id}"
+        )));
+    }
+    Ok(dir.join(CONFLICTS_DIR_NAME).join(id))
 }
 
 /// Records the pre-advance base and upstream copies of a conflicting file
@@ -400,13 +414,17 @@ fn conflict_dir(dir: &Path, id: &str) -> PathBuf {
 /// sides without needing them to still be reachable upstream or in the
 /// working tree. `None` on either side (the file did not exist there) writes
 /// no file for that side, and removes one if a previous call had written it.
+///
+/// `id` must be exactly 8 lowercase hexadecimal characters. A malformed id
+/// from a tampered state file is rejected with [`RemoteError::State`] naming
+/// the offending id.
 pub fn record_conflict_files(
     dir: &Path,
     id: &str,
     base: Option<&[u8]>,
     upstream: Option<&[u8]>,
 ) -> Result<(), RemoteError> {
-    let conflict_dir = conflict_dir(dir, id);
+    let conflict_dir = conflict_dir(dir, id)?;
     std::fs::create_dir_all(&conflict_dir)?;
     write_or_clear(&conflict_dir.join(CONFLICT_BASE_FILE_NAME), base)?;
     write_or_clear(&conflict_dir.join(CONFLICT_UPSTREAM_FILE_NAME), upstream)?;
@@ -430,8 +448,12 @@ fn write_or_clear(path: &Path, content: Option<&[u8]>) -> Result<(), RemoteError
 pub type ConflictFiles = (Option<Vec<u8>>, Option<Vec<u8>>);
 
 /// Reads back `id`'s recorded conflict copies.
+///
+/// `id` must be exactly 8 lowercase hexadecimal characters. A malformed id
+/// from a tampered state file is rejected with [`RemoteError::State`] naming
+/// the offending id.
 pub fn read_conflict_files(dir: &Path, id: &str) -> Result<ConflictFiles, RemoteError> {
-    let conflict_dir = conflict_dir(dir, id);
+    let conflict_dir = conflict_dir(dir, id)?;
     let base = read_optional(&conflict_dir.join(CONFLICT_BASE_FILE_NAME))?;
     let upstream = read_optional(&conflict_dir.join(CONFLICT_UPSTREAM_FILE_NAME))?;
     Ok((base, upstream))
@@ -447,8 +469,13 @@ fn read_optional(path: &Path) -> Result<Option<Vec<u8>>, RemoteError> {
 
 /// Removes `id`'s recorded conflict copies entirely. Clearing a conflict
 /// that was never recorded (or already cleared) is not an error.
+///
+/// `id` must be exactly 8 lowercase hexadecimal characters. A malformed id
+/// from a tampered state file is rejected with [`RemoteError::State`] naming
+/// the offending id without touching the filesystem.
 pub fn clear_conflict(dir: &Path, id: &str) -> Result<(), RemoteError> {
-    match std::fs::remove_dir_all(conflict_dir(dir, id)) {
+    let conflict_dir = conflict_dir(dir, id)?;
+    match std::fs::remove_dir_all(conflict_dir) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e.into()),
@@ -891,5 +918,85 @@ mod tests {
         };
         assert!(added.sha256.is_some());
         assert!(deleted.sha256.is_none());
+    }
+
+    #[test]
+    fn clear_conflict_rejects_parent_traversal_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("conflicts")).unwrap();
+        std::fs::create_dir_all(dir.path().join("sibling")).unwrap();
+
+        let err = clear_conflict(dir.path(), "../../etc").unwrap_err();
+        assert!(matches!(err, RemoteError::State(_)));
+
+        assert!(dir.path().join("conflicts").exists());
+        assert!(dir.path().join("sibling").exists());
+    }
+
+    #[test]
+    fn clear_conflict_rejects_uppercase_hex() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("conflicts")).unwrap();
+        std::fs::create_dir_all(dir.path().join("sibling")).unwrap();
+
+        let err = clear_conflict(dir.path(), "ABCDEF12").unwrap_err();
+        assert!(matches!(err, RemoteError::State(_)));
+
+        assert!(dir.path().join("conflicts").exists());
+        assert!(dir.path().join("sibling").exists());
+    }
+
+    #[test]
+    fn clear_conflict_rejects_short_id() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("conflicts")).unwrap();
+        std::fs::create_dir_all(dir.path().join("sibling")).unwrap();
+
+        let err = clear_conflict(dir.path(), "abc").unwrap_err();
+        assert!(matches!(err, RemoteError::State(_)));
+
+        assert!(dir.path().join("conflicts").exists());
+        assert!(dir.path().join("sibling").exists());
+    }
+
+    #[test]
+    fn clear_conflict_rejects_long_id() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("conflicts")).unwrap();
+        std::fs::create_dir_all(dir.path().join("sibling")).unwrap();
+
+        let err = clear_conflict(dir.path(), "aaaaaaaaa").unwrap_err();
+        assert!(matches!(err, RemoteError::State(_)));
+
+        assert!(dir.path().join("conflicts").exists());
+        assert!(dir.path().join("sibling").exists());
+    }
+
+    #[test]
+    fn clear_conflict_rejects_empty_id() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("conflicts")).unwrap();
+        std::fs::create_dir_all(dir.path().join("sibling")).unwrap();
+
+        let err = clear_conflict(dir.path(), "").unwrap_err();
+        assert!(matches!(err, RemoteError::State(_)));
+
+        assert!(dir.path().join("conflicts").exists());
+        assert!(dir.path().join("sibling").exists());
+    }
+
+    #[test]
+    fn record_conflict_files_rejects_malformed_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let err =
+            record_conflict_files(dir.path(), "../../etc", Some(b"content"), None).unwrap_err();
+        assert!(matches!(err, RemoteError::State(_)));
+    }
+
+    #[test]
+    fn read_conflict_files_rejects_malformed_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = read_conflict_files(dir.path(), "ABCDEF12").unwrap_err();
+        assert!(matches!(err, RemoteError::State(_)));
     }
 }
