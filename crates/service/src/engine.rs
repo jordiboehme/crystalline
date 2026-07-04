@@ -18,7 +18,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::{DateTime, Duration, FixedOffset};
-use crystalline_core::config::{DomainEntry, GlobalConfig};
+use crystalline_core::config::{
+    DomainEntry, DomainKind as CoreDomainKind, GlobalConfig, OriginConfig,
+};
 use crystalline_core::emit::{
     append_body, insert_after_section, insert_before_section, prepend_body, replace_section,
     touch_timestamp,
@@ -32,10 +34,13 @@ use crystalline_index::{
     EngramRecord, FileStamp, HostClaim, RecentFilter, SearchMode, SearchQuery, Store, chunk_engram,
     configured_model_id, parse_metadata_filters, provider_from_config, sync_domain_with,
 };
+use crystalline_remote::ops;
+use crystalline_remote::{GitHubProvider, OriginSpec, Provider, RemoteError, TokenStore};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
+use crate::origin;
 use crate::params::*;
 use crate::settings;
 
@@ -97,6 +102,12 @@ pub enum EngineError {
     /// An error from the storage or parse layer.
     #[error("{0}")]
     Internal(String),
+    /// A GitHub collaboration error from the remote origin engine, surfaced
+    /// with its message verbatim: every `RemoteError` variant is already
+    /// actionable product copy (see `crystalline_remote::error`), so this
+    /// never re-wraps or restates it.
+    #[error("{0}")]
+    Remote(#[from] crystalline_remote::RemoteError),
 }
 
 impl From<crystalline_index::IndexError> for EngineError {
@@ -194,6 +205,25 @@ pub struct Engine {
     // short threshold makes multi-instance stale-takeover verification fast).
     heartbeat_secs: i64,
     stale_secs: i64,
+    // Per-domain lock serializing `origin_add`, `origin_update` and
+    // `origin_status` against each other for one domain, so a connect and a
+    // pull racing on the same domain never interleave. Created lazily, one
+    // `tokio::sync::Mutex` per domain name ever operated on; held across the
+    // whole call rather than reasoning about which sub-step actually needs
+    // it, simplest and cheap since these calls are already rare and short.
+    origin_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    // A fixed provider used by every origin operation instead of the
+    // production per-operation `GitHubProvider` build, for tests: an engine
+    // built this way never reads config or the token store to decide who to
+    // talk to, and `origin_status`'s connection block reflects the injected
+    // provider's own identity rather than a real, untestable OS credential
+    // store. Production code never sets this.
+    origin_provider_override: Option<Arc<dyn Provider>>,
+    // Overrides where per-domain origin state (the base snapshot, conflict
+    // records, `state.json`) is read and written, for tests: `None` means the
+    // real `crystalline_core::config::origin_state_dir`, a real machine path
+    // no test may touch.
+    origins_dir_override: Option<PathBuf>,
 }
 
 impl Engine {
@@ -226,6 +256,9 @@ impl Engine {
             hosted: std::sync::RwLock::new(HashMap::new()),
             heartbeat_secs: env_secs("CRYSTALLINE_HEARTBEAT_SECS", DEFAULT_HEARTBEAT_SECS),
             stale_secs: env_secs("CRYSTALLINE_STALE_SECS", DEFAULT_STALE_SECS),
+            origin_locks: std::sync::Mutex::new(HashMap::new()),
+            origin_provider_override: None,
+            origins_dir_override: None,
         }
     }
 
@@ -263,6 +296,27 @@ impl Engine {
     /// Whether this engine serves the content API read-only.
     pub fn read_only(&self) -> bool {
         self.read_only
+    }
+
+    /// Inject a fixed provider for every origin operation (`origin_add`,
+    /// `origin_update`, `origin_status`), bypassing the production
+    /// per-operation `GitHubProvider` build from config and the token store.
+    /// Test-only: production code always leaves this unset so a fresh token
+    /// is read on every operation and a new `connect` is picked up without a
+    /// restart.
+    pub fn with_origin_provider(mut self, provider: Arc<dyn Provider>) -> Engine {
+        self.origin_provider_override = Some(provider);
+        self
+    }
+
+    /// Override the base directory per-domain origin state is read and
+    /// written under, in place of the real
+    /// `crystalline_core::config::origin_state_dir`. Test-only: lets origin
+    /// tests use a tempdir instead of touching the real machine's state
+    /// directory.
+    pub fn with_origins_dir(mut self, dir: PathBuf) -> Engine {
+        self.origins_dir_override = Some(dir);
+        self
     }
 
     /// The shared store handle, for the daemon's watcher and embed loop.
@@ -2148,6 +2202,321 @@ impl Engine {
         crystalline_core::config::save_yaml(&path, config).map_err(|e| {
             EngineError::Internal(format!("failed to save config {}: {e}", path.display()))
         })
+    }
+
+    // --- origin (GitHub collaboration) ----------------------------------------
+
+    /// Connects a new domain to a GitHub repository: downloads its tracked
+    /// subtree, registers it in the global config and brings it into the
+    /// index, mirroring what `domain add` does for a local folder.
+    ///
+    /// `domain` defaults to the repository's own name segment; `folder`
+    /// defaults to `~/Documents/Crystalline/<domain>`. `path` is the
+    /// subfolder within the repository that is the domain root (absent means
+    /// the repository root); `branch` defaults to `main`.
+    ///
+    /// Refuses with `github.enabled`'s message when collaboration is off,
+    /// and with `EngineError::ReadOnly` on a read-only instance (this both
+    /// writes content and mutates config, exactly the two things read-only
+    /// mode protects). Returns `{ domain, root, engrams, base_commit }` on
+    /// success.
+    pub async fn origin_add(
+        &self,
+        repo: &str,
+        domain: Option<&str>,
+        path: Option<&str>,
+        branch: Option<&str>,
+        folder: Option<&str>,
+    ) -> Result<Value> {
+        if !self.config.read().unwrap().github_enabled() {
+            return Err(RemoteError::NotEnabled.into());
+        }
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+
+        let domain_name = match domain {
+            Some(d) => d.to_string(),
+            None => origin::default_domain_name(repo),
+        };
+        if self.domain_entry(&domain_name).is_ok() {
+            return Err(EngineError::Conflict(format!(
+                "domain '{domain_name}' is already registered; pass a domain name to connect this origin under a different one"
+            )));
+        }
+
+        let lock = self.origin_lock(&domain_name);
+        let _guard = lock.lock().await;
+
+        let root = match folder {
+            Some(f) => crystalline_core::config::expand_tilde(f),
+            None => origin::default_domain_folder(&domain_name),
+        };
+        let branch_name = branch.unwrap_or("main").to_string();
+        let spec = OriginSpec {
+            repo: repo.to_string(),
+            subpath: path.map(str::to_string),
+            branch: branch_name,
+        };
+        let state_dir = self.origin_state_dir(&domain_name)?;
+
+        let provider = self.resolve_origin_provider()?;
+        let report = ops::subscribe(provider.as_ref(), &spec, &root, &state_dir).await?;
+
+        // Register the domain and persist, mirroring `configure`'s
+        // write-lock-first pattern so a concurrent read never observes a
+        // half-applied config.
+        {
+            let mut guard = self.config.write().unwrap();
+            let mut config = guard.clone();
+            config.domains.insert(
+                domain_name.clone(),
+                DomainEntry {
+                    kind: CoreDomainKind::File,
+                    path: Some(root.clone()),
+                    origin: Some(OriginConfig {
+                        repo: repo.to_string(),
+                        path: path.map(str::to_string),
+                        branch: branch.map(str::to_string),
+                        poll_secs: None,
+                    }),
+                },
+            );
+            self.persist_config(&config)?;
+            *guard = config;
+        }
+
+        // Tell a running daemon's watcher to start watching the new root; it
+        // also runs its own catch-up sync and embed once the watch is armed.
+        // This engine's own sync just below runs regardless, so the domain is
+        // searchable immediately even outside a daemon (a standalone CLI
+        // command, or a race with the watcher's async catch-up); sync is
+        // checksum idempotent, so the watcher repeating it moments later is a
+        // harmless no-op.
+        if let Some(tx) = &self.watch_tx {
+            let _ = tx.send(WatchEvent::Add(domain_name.clone(), root.clone()));
+        }
+
+        self.sync(Some(&domain_name)).await?;
+        if let Err(e) = self.embed_pending().await {
+            tracing::warn!("embedding after connecting '{domain_name}' failed: {e}");
+        }
+
+        Ok(json!({
+            "domain": domain_name,
+            "root": root.display().to_string(),
+            "engrams": report.engrams,
+            "base_commit": report.base_commit,
+        }))
+    }
+
+    /// Brings one origin-connected domain (or every one, when `domain` is
+    /// `None`) up to date with its origin. Errors when a named domain is not
+    /// registered or has no origin; one domain failing (offline, revoked)
+    /// never aborts the others, each per-domain failure is collected into the
+    /// `errors` array instead. Allowed on a read-only instance: a pull is a
+    /// derived-truth update like sync, not a user-authored content write.
+    pub async fn origin_update(&self, domain: Option<&str>) -> Result<Value> {
+        if !self.config.read().unwrap().github_enabled() {
+            return Err(RemoteError::NotEnabled.into());
+        }
+        let targets = self.origin_targets(domain)?;
+
+        let mut domains = Vec::new();
+        let mut errors = Vec::new();
+        for (name, entry) in targets {
+            match self.origin_update_one(&name, &entry).await {
+                Ok(v) => domains.push(v),
+                Err(e) => errors.push(json!({ "domain": name, "error": e.to_string() })),
+            }
+        }
+        Ok(json!({ "domains": domains, "errors": errors }))
+    }
+
+    /// Pulls and syncs one domain, under its origin lock. The per-domain body
+    /// behind `origin_update`'s aggregate loop.
+    async fn origin_update_one(&self, name: &str, entry: &DomainEntry) -> Result<Value> {
+        let lock = self.origin_lock(name);
+        let _guard = lock.lock().await;
+
+        let (spec, root, state_dir) = self.origin_spec_for(name, entry)?;
+        let provider = self.resolve_origin_provider()?;
+        let report = ops::pull(provider.as_ref(), &spec, &root, &state_dir).await?;
+
+        self.sync(Some(name)).await?;
+        if let Err(e) = self.embed_pending().await {
+            tracing::warn!("embedding after updating '{name}' failed: {e}");
+        }
+
+        Ok(origin::pull_report_json(name, &report))
+    }
+
+    /// Reports where one origin-connected domain (or every one, when
+    /// `domain` is `None`) stands relative to its origin, plus this
+    /// machine's GitHub connection. Never hard-fails just because the
+    /// machine is offline or has no saved connection: each domain's `behind`
+    /// is `None` and the connection block reports `connected: false` rather
+    /// than erroring. Allowed on a read-only instance (a pure read).
+    pub async fn origin_status(&self, domain: Option<&str>) -> Result<Value> {
+        if !self.config.read().unwrap().github_enabled() {
+            return Err(RemoteError::NotEnabled.into());
+        }
+        let targets = self.origin_targets(domain)?;
+        let connection = self.origin_connection_json().await?;
+
+        let mut domains = Vec::new();
+        for (name, entry) in targets {
+            let lock = self.origin_lock(&name);
+            let _guard = lock.lock().await;
+            let (spec, root, state_dir) = self.origin_spec_for(&name, &entry)?;
+            // A probe is best-effort: no connection, or a provider that fails
+            // to build, must never turn a status call into a hard failure.
+            let probe = self.resolve_origin_provider().ok();
+            let report = ops::status(&spec, &root, &state_dir, probe.as_deref()).await?;
+            domains.push(origin::status_report_json(&name, &report));
+        }
+        Ok(json!({ "connection": connection, "domains": domains }))
+    }
+
+    /// The domains `origin_update`/`origin_status` operate on: the one named
+    /// (erroring if it is not registered or has no origin) or every
+    /// registered domain with an origin, mirroring `sync_targets`'s
+    /// config-then-discovered layering.
+    fn origin_targets(&self, domain: Option<&str>) -> Result<Vec<(String, DomainEntry)>> {
+        match domain {
+            Some(name) => {
+                let entry = self.domain_entry(name)?;
+                if entry.origin.is_none() {
+                    return Err(EngineError::Invalid(format!(
+                        "domain '{name}' has no origin; connect it with `crystalline domain add --origin`"
+                    )));
+                }
+                Ok(vec![(name.to_string(), entry)])
+            }
+            None => {
+                let mut out: Vec<(String, DomainEntry)> = Vec::new();
+                let config = self.config.read().unwrap();
+                for (name, entry) in &config.domains {
+                    if entry.origin.is_some() {
+                        out.push((name.clone(), entry.clone()));
+                    }
+                }
+                for (name, entry) in self.discovered_domains.read().unwrap().iter() {
+                    if config.domains.contains_key(name) {
+                        continue;
+                    }
+                    if entry.origin.is_some() {
+                        out.push((name.clone(), entry.clone()));
+                    }
+                }
+                Ok(out)
+            }
+        }
+    }
+
+    /// The `OriginSpec`, domain root and origin state directory for a
+    /// registered domain's origin.
+    fn origin_spec_for(
+        &self,
+        name: &str,
+        entry: &DomainEntry,
+    ) -> Result<(OriginSpec, PathBuf, PathBuf)> {
+        let origin_cfg = entry
+            .origin
+            .as_ref()
+            .ok_or_else(|| EngineError::Invalid(format!("domain '{name}' has no origin")))?;
+        let root = entry.file_path().ok_or_else(|| {
+            EngineError::Invalid(format!(
+                "domain '{name}' has no filesystem root to sync an origin into"
+            ))
+        })?;
+        let state_dir = self.origin_state_dir(name)?;
+        let spec = OriginSpec {
+            repo: origin_cfg.repo.clone(),
+            subpath: origin_cfg.path.clone(),
+            branch: origin_cfg.branch().to_string(),
+        };
+        Ok((spec, root, state_dir))
+    }
+
+    /// The per-domain lock serializing origin operations for one domain
+    /// name, created lazily on first use.
+    fn origin_lock(&self, domain: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.origin_locks.lock().unwrap();
+        locks
+            .entry(domain.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    /// The base directory per-domain origin state lives under: the test
+    /// override, or the real state directory.
+    fn origins_base_dir(&self) -> Result<PathBuf> {
+        match &self.origins_dir_override {
+            Some(p) => Ok(p.clone()),
+            None => crystalline_core::config::origins_state_dir()
+                .map_err(|e| EngineError::Internal(e.to_string())),
+        }
+    }
+
+    /// One domain's origin state directory (base snapshot, conflict records,
+    /// `state.json`).
+    fn origin_state_dir(&self, domain: &str) -> Result<PathBuf> {
+        Ok(self.origins_base_dir()?.join(domain))
+    }
+
+    /// Resolves the provider an origin operation runs its GitHub calls
+    /// through: the injected test provider when one is set, or a fresh
+    /// `GitHubProvider` built from the current config and a token read from
+    /// the token store right now, so a `connect` earlier this same process
+    /// is picked up without a restart. Errors with `RemoteError::NotConnected`
+    /// when no token has been saved and no test provider is injected.
+    fn resolve_origin_provider(&self) -> Result<Arc<dyn Provider>> {
+        if let Some(p) = &self.origin_provider_override {
+            return Ok(p.clone());
+        }
+        let api_url = self
+            .config
+            .read()
+            .unwrap()
+            .github
+            .as_ref()
+            .and_then(|g| g.api_url.clone());
+        let host = origin::token_host(api_url.as_deref());
+        let state_dir = self.origins_base_dir()?;
+        let store = TokenStore::resolve(host.as_deref(), &state_dir);
+        let token = store.load()?.ok_or(RemoteError::NotConnected)?;
+        Ok(Arc::new(GitHubProvider::new(
+            api_url,
+            Some(token.access_token),
+        )))
+    }
+
+    /// This machine's GitHub connection, for `origin_status`: `{ connected,
+    /// user, token_store }`. With an injected test provider, reflects the
+    /// mock's own identity instead of the real token store, so origin tests
+    /// never touch the OS keychain or a real credential file.
+    async fn origin_connection_json(&self) -> Result<Value> {
+        if let Some(provider) = &self.origin_provider_override {
+            let user = provider.current_user().await.ok();
+            return Ok(json!({ "connected": true, "user": user, "token_store": "file" }));
+        }
+        let api_url = self
+            .config
+            .read()
+            .unwrap()
+            .github
+            .as_ref()
+            .and_then(|g| g.api_url.clone());
+        let host = origin::token_host(api_url.as_deref());
+        let state_dir = self.origins_base_dir()?;
+        let store = TokenStore::resolve(host.as_deref(), &state_dir);
+        let token = store.load()?;
+        Ok(json!({
+            "connected": token.is_some(),
+            "user": token.as_ref().map(|t| t.user.clone()),
+            "token_store": store.kind(),
+        }))
     }
 }
 

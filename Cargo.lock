@@ -1201,10 +1201,13 @@ name = "crystalline-service"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "chrono",
  "crystalline-core",
  "crystalline-index",
+ "crystalline-remote",
+ "flate2",
  "fs4 1.1.0",
  "futures",
  "globset",
@@ -1217,6 +1220,7 @@ dependencies = [
  "serde_json",
  "serde_yaml_ng",
  "sha2 0.11.0",
+ "tar",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

@@ -22,6 +22,7 @@ postgres = ["crystalline-index/postgres"]
 [dependencies]
 crystalline-core = { workspace = true }
 crystalline-index = { workspace = true }
+crystalline-remote = { workspace = true }
 tokio = { workspace = true }
 rmcp = { workspace = true, features = [
     "server",
@@ -55,3 +56,6 @@ libc = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 serde_yaml_ng = { workspace = true }
+async-trait = { workspace = true }
+flate2 = { workspace = true }
+tar = { workspace = true }

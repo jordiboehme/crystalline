@@ -299,7 +299,8 @@ fn to_error(e: EngineError) -> ErrorData {
         | EngineError::Ambiguous(_)
         | EngineError::Conflict(_)
         | EngineError::Invalid(_)
-        | EngineError::ReadOnly => ErrorData::invalid_params(e.to_string(), None),
+        | EngineError::ReadOnly
+        | EngineError::Remote(_) => ErrorData::invalid_params(e.to_string(), None),
         EngineError::Io { .. } | EngineError::Internal(_) => {
             ErrorData::internal_error(e.to_string(), None)
         }

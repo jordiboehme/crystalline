@@ -14,6 +14,7 @@ pub mod daemon;
 pub mod engine;
 pub mod instance;
 pub mod mcp;
+mod origin;
 pub mod params;
 pub mod settings;
 
