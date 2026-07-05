@@ -62,23 +62,14 @@ async fn embed_pass(store: &dyn Store, cfg: &GlobalConfig) -> Result<()> {
     Ok(())
 }
 
-/// Resolve the global config path from an optional override.
-pub(crate) fn config_path(override_path: Option<&Path>) -> Result<PathBuf> {
-    match override_path {
-        Some(p) => Ok(p.to_path_buf()),
-        None => config::global_config_path()
-            .map_err(|e| anyhow!("could not resolve the default config path: {e}")),
-    }
-}
-
-/// Load the global config, treating a missing file as an empty config.
-pub(crate) fn load_config(path: &Path) -> Result<GlobalConfig> {
-    if path.is_file() {
-        config::load_yaml(path)
-            .map_err(|e| anyhow!("failed to load config {}: {e}", path.display()))
-    } else {
-        Ok(GlobalConfig::default())
-    }
+/// Load the effective config through the service's single load chokepoint: the
+/// config file resolved from the `--config` override, then `CRYSTALLINE_CONFIG`,
+/// then the default global path, with the environment overlay parsed and
+/// applied. Readers use `loaded.effective`; the file mutators (`domain add`,
+/// `domain remove`) mutate `loaded.file` and save it back to `loaded.path`, so
+/// no environment value ever bakes into `config.yaml`.
+pub(crate) fn load(config_override: Option<&Path>) -> Result<crystalline_service::LoadedConfig> {
+    crystalline_service::overlay::load(config_override)
 }
 
 /// Resolve the index database path from an optional override.
@@ -197,6 +188,17 @@ pub(crate) fn domain_add_register(
     path: &Path,
     config_override: Option<&Path>,
 ) -> Result<PathBuf> {
+    // Mutate the file truth and save it back to the resolved path; the
+    // environment overlay is never written. An env-defined domain of the same
+    // name is refused: it is managed by its variable, not the config file.
+    let loaded = load(config_override)?;
+    if let Some(env) = loaded.overlay.env_domain(name) {
+        bail!(
+            "domain '{name}' is defined by the environment variable {}; unset it to manage this domain in the config file",
+            env.var
+        );
+    }
+
     let manifest = path.join("MANIFEST.md");
     if !manifest.exists() {
         bail!(
@@ -207,12 +209,11 @@ pub(crate) fn domain_add_register(
     }
     let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
 
-    let cfg_path = config_path(config_override)?;
-    let mut cfg = load_config(&cfg_path)?;
+    let mut cfg = loaded.file;
     cfg.domains
         .insert(name.to_string(), DomainEntry::file(abs.clone()));
-    config::save_yaml(&cfg_path, &cfg)
-        .map_err(|e| anyhow!("failed to save config {}: {e}", cfg_path.display()))?;
+    config::save_yaml(&loaded.path, &cfg)
+        .map_err(|e| anyhow!("failed to save config {}: {e}", loaded.path.display()))?;
     Ok(abs)
 }
 
@@ -222,12 +223,18 @@ pub(crate) fn domain_add_register_virtual(
     name: &str,
     config_override: Option<&Path>,
 ) -> Result<String> {
-    let cfg_path = config_path(config_override)?;
-    let mut cfg = load_config(&cfg_path)?;
+    let loaded = load(config_override)?;
+    if let Some(env) = loaded.overlay.env_domain(name) {
+        bail!(
+            "domain '{name}' is defined by the environment variable {}; unset it to manage this domain in the config file",
+            env.var
+        );
+    }
+    let mut cfg = loaded.file;
     cfg.domains
         .insert(name.to_string(), DomainEntry::virtual_domain());
-    config::save_yaml(&cfg_path, &cfg)
-        .map_err(|e| anyhow!("failed to save config {}: {e}", cfg_path.display()))?;
+    config::save_yaml(&loaded.path, &cfg)
+        .map_err(|e| anyhow!("failed to save config {}: {e}", loaded.path.display()))?;
     let today = chrono::Utc::now()
         .date_naive()
         .format("%Y-%m-%d")
@@ -271,7 +278,7 @@ pub(crate) async fn sync_domain_direct(
     config_override: Option<&Path>,
     db_override: Option<&Path>,
 ) -> Result<crystalline_index::SyncReport> {
-    let cfg = load_config(&config_path(config_override)?)?;
+    let cfg = load(config_override)?.effective;
     let store = open_backend(&cfg, db_override, false).await?;
     let store = store.lock().await;
     let params = chunk_params(&cfg);
@@ -323,19 +330,12 @@ pub(crate) fn print_domain_add_no_sync(name: &str, path: &Path, json: bool) {
 // --- domain add --origin ------------------------------------------------------
 
 /// Parses a `domain add --origin owner/repo[/subpath...]` value into
-/// `(owner/repo, subpath)`: the first segment is the owner, the second the
-/// repository name and everything after the second `/` (if any) is the
-/// subpath within the repository the team domain roots at.
+/// `(owner/repo, subpath)`. A thin `anyhow` wrapper over the shared
+/// [`crystalline_service::parse_origin_spec`] the environment overlay also
+/// parses origins through, so the CLI flag and `CRYSTALLINE_DOMAIN_*_ORIGIN`
+/// agree on the grammar; the `--origin` framing is re-attached here.
 pub(crate) fn parse_origin_spec(spec: &str) -> Result<(String, Option<String>)> {
-    let mut parts = spec.splitn(3, '/');
-    let owner = parts.next().filter(|s| !s.is_empty());
-    let repo = parts.next().filter(|s| !s.is_empty());
-    let (owner, repo) = match (owner, repo) {
-        (Some(o), Some(r)) => (o, r),
-        _ => bail!("--origin must look like owner/repo or owner/repo/subpath, got '{spec}'"),
-    };
-    let subpath = parts.next().filter(|s| !s.is_empty()).map(str::to_string);
-    Ok((format!("{owner}/{repo}"), subpath))
+    crystalline_service::parse_origin_spec(spec).map_err(|e| anyhow!("--origin {e}"))
 }
 
 /// Resolves `path` to an absolute path against the current directory,
@@ -501,7 +501,7 @@ pub(crate) fn ensure_domain_registered(
     let canonical =
         std::fs::canonicalize(path).with_context(|| format!("resolving {}", path.display()))?;
 
-    let cfg = load_config(&config_path(config_override)?)?;
+    let cfg = load(config_override)?.effective;
     let already_registered = cfg
         .domains
         .values()
@@ -580,13 +580,21 @@ fn name_taken_by_other(name: &str, canonical: &Path, cfg: &GlobalConfig) -> bool
 /// Remove a domain from the global config. Leaves its files and index rows
 /// untouched; the rows are only dropped by a later full reindex.
 pub fn domain_remove(name: &str, config_override: Option<&Path>, json: bool) -> Result<()> {
-    let cfg_path = config_path(config_override)?;
-    let mut cfg = load_config(&cfg_path)?;
+    let loaded = load(config_override)?;
+    let mut cfg = loaded.file;
     if cfg.domains.shift_remove(name).is_none() {
+        // A miss in the file config may be an env-defined domain: those are
+        // immune to `domain remove` (the variable is their source of truth).
+        if let Some(env) = loaded.overlay.env_domain(name) {
+            bail!(
+                "domain '{name}' is defined by the environment variable {}; unset it to manage this domain in the config file",
+                env.var
+            );
+        }
         bail!("no domain named '{name}' is registered");
     }
-    config::save_yaml(&cfg_path, &cfg)
-        .map_err(|e| anyhow!("failed to save config {}: {e}", cfg_path.display()))?;
+    config::save_yaml(&loaded.path, &cfg)
+        .map_err(|e| anyhow!("failed to save config {}: {e}", loaded.path.display()))?;
     if json {
         println!(
             "{}",
@@ -610,7 +618,10 @@ pub async fn domain_list(
     db_override: Option<&Path>,
     json: bool,
 ) -> Result<()> {
-    let cfg = load_config(&config_path(config_override)?)?;
+    // Keep the whole `LoadedConfig`: reads use the effective config, and the
+    // overlay marks which rows an environment variable defines.
+    let loaded = load(config_override)?;
+    let cfg = loaded.effective;
     let should_open = !backend_is_turso(&cfg) || db_path(db_override)?.exists();
     let stats = if should_open {
         match open_backend(&cfg, db_override, false).await {
@@ -641,11 +652,19 @@ pub async fn domain_list(
             .domains
             .iter()
             .map(|(name, entry)| {
+                // Env-defined domains carry `"source": "env"`; file entries
+                // carry `"config"`, so a caller can tell which is which.
+                let source = if loaded.overlay.env_domain(name).is_some() {
+                    "env"
+                } else {
+                    "config"
+                };
                 serde_json::json!({
                     "name": name,
                     "kind": if entry.is_virtual() { "virtual" } else { "file" },
                     "path": entry.file_path().map(|p| p.display().to_string()),
                     "engrams": count_for(name),
+                    "source": source,
                     "host": host_for(name).map(|(id, hb)| serde_json::json!({
                         "instance_id": id,
                         "heartbeat_at": hb,
@@ -663,10 +682,15 @@ pub async fn domain_list(
     }
     for (name, entry) in &cfg.domains {
         // A virtual domain reports "(virtual)" where a file domain shows its root.
-        let location = entry
+        let mut location = entry
             .file_path()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "(virtual)".to_string());
+        // An env-defined domain is marked so it reads as managed by its
+        // variable, not the config file.
+        if loaded.overlay.env_domain(name).is_some() {
+            location.push_str(" (env)");
+        }
         // In a shared database a file domain names the instance that hosts it.
         let host = host_for(name)
             .map(|(id, _)| format!("\thosted by {id}"))
@@ -689,7 +713,7 @@ pub async fn sync(
     db_override: Option<&Path>,
     json: bool,
 ) -> Result<()> {
-    let cfg = load_config(&config_path(config_override)?)?;
+    let cfg = load(config_override)?.effective;
     let targets = select_domains(&cfg, only)?;
     let store = open_backend(&cfg, db_override, false).await?;
     let store = store.lock().await;
@@ -732,7 +756,7 @@ pub async fn reindex(
     db_override: Option<&Path>,
     json: bool,
 ) -> Result<()> {
-    let cfg = load_config(&config_path(config_override)?)?;
+    let cfg = load(config_override)?.effective;
     let targets = select_domains(&cfg, None)?;
     let params = chunk_params(&cfg);
 
@@ -797,7 +821,7 @@ pub async fn status(
     db_override: Option<&Path>,
     json: bool,
 ) -> Result<()> {
-    let cfg = load_config(&config_path(config_override)?)?;
+    let cfg = load(config_override)?.effective;
     // Only the Turso backend has a local file whose absence means "no index
     // yet"; Postgres is always opened.
     if backend_is_turso(&cfg) {
@@ -900,7 +924,7 @@ pub async fn status(
 /// non-zero (via the returned error) when the fetch fails or the build has no
 /// local embedding support.
 pub async fn model_download(config_override: Option<&Path>, json: bool) -> Result<()> {
-    let cfg = load_config(&config_path(config_override)?)?;
+    let cfg = load(config_override)?.effective;
     let ecfg = embeddings_config(&cfg);
     let download = download_local_model(&ecfg)
         .await
@@ -938,7 +962,7 @@ pub fn import(
     config_override: Option<&Path>,
     json: bool,
 ) -> Result<()> {
-    let cfg = load_config(&config_path(config_override)?)?;
+    let cfg = load(config_override)?.effective;
     let entry = cfg.domains.get(domain).ok_or_else(|| {
         anyhow!(
             "no domain named '{domain}' is registered. Register it first: crystalline domain add {domain} <path>"
@@ -1023,14 +1047,22 @@ fn print_import_report(r: &crystalline_core::import::ImportReport, dry_run: bool
 /// device flow, printing the short code and verification url unmissably
 /// before waiting on it to be confirmed. Works whether or not team domains
 /// are turned on yet; prints a one-line hint to turn them on when they are
-/// currently off.
+/// currently off. Refuses up front when `CRYSTALLINE_GITHUB_TOKEN` is set:
+/// this machine's identity is already fixed by the environment, so there is
+/// nothing for an interactive sign-in to change.
 pub async fn connect_github(
     token: Option<&str>,
     host: Option<&str>,
     config_override: Option<&Path>,
     json: bool,
 ) -> Result<()> {
-    let cfg = load_config(&config_path(config_override)?)?;
+    let loaded = load(config_override)?;
+    if loaded.overlay.github_token().is_some() {
+        bail!(
+            "this machine's GitHub identity comes from CRYSTALLINE_GITHUB_TOKEN; unset it to sign in interactively"
+        );
+    }
+    let cfg = loaded.effective;
     let api_url = host
         .map(|h| format!("https://{h}/api/v3"))
         .or_else(|| cfg.github.as_ref().and_then(|g| g.api_url.clone()));

@@ -1213,6 +1213,7 @@ dependencies = [
  "fs4 1.1.0",
  "futures",
  "globset",
+ "indexmap",
  "interprocess",
  "libc",
  "notify",

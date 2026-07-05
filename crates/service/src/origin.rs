@@ -45,6 +45,29 @@ pub(crate) fn default_domain_folder(domain: &str) -> PathBuf {
     crystalline_core::config::expand_tilde(&format!("~/Documents/Crystalline/{domain}"))
 }
 
+/// Parses an origin spec of the form `owner/repo[/subpath...]` into
+/// `(owner/repo, subpath)`: the first segment is the owner, the second the
+/// repository name and everything after the second `/` (if any) is the
+/// subpath within the repository the team domain roots at. The error text is
+/// deliberately subject-free ("must look like ...") so a caller can prefix its
+/// own framing: `--origin` for the CLI flag, the offending variable name for
+/// the environment overlay.
+pub fn parse_origin_spec(spec: &str) -> Result<(String, Option<String>), String> {
+    let mut parts = spec.splitn(3, '/');
+    let owner = parts.next().filter(|s| !s.is_empty());
+    let repo = parts.next().filter(|s| !s.is_empty());
+    let (owner, repo) = match (owner, repo) {
+        (Some(o), Some(r)) => (o, r),
+        _ => {
+            return Err(format!(
+                "must look like owner/repo or owner/repo/subpath, got '{spec}'"
+            ));
+        }
+    };
+    let subpath = parts.next().filter(|s| !s.is_empty()).map(str::to_string);
+    Ok((format!("{owner}/{repo}"), subpath))
+}
+
 /// Derives the token-store host key from `github.api_url`: `None` (the
 /// GitHub.com account) when the api url is absent or is the default
 /// `https://api.github.com`, or the bare Enterprise Server host otherwise.
@@ -268,6 +291,34 @@ pub(crate) fn resolution_from<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_origin_spec_reads_owner_and_repo() {
+        let (repo, subpath) = parse_origin_spec("acme/brand-knowledge").unwrap();
+        assert_eq!(repo, "acme/brand-knowledge");
+        assert_eq!(subpath, None);
+    }
+
+    #[test]
+    fn parse_origin_spec_reads_a_subpath() {
+        let (repo, subpath) = parse_origin_spec("acme/monorepo/teams/brand").unwrap();
+        assert_eq!(repo, "acme/monorepo");
+        assert_eq!(subpath.as_deref(), Some("teams/brand"));
+    }
+
+    #[test]
+    fn parse_origin_spec_rejects_a_bare_owner() {
+        let err = parse_origin_spec("acme").unwrap_err();
+        assert!(err.contains("must look like"), "{err}");
+        assert!(err.contains("acme"), "{err}");
+    }
+
+    #[test]
+    fn parse_origin_spec_rejects_an_empty_repo_segment() {
+        assert!(parse_origin_spec("acme/").is_err());
+        assert!(parse_origin_spec("/repo").is_err());
+        assert!(parse_origin_spec("").is_err());
+    }
 
     #[test]
     fn default_domain_name_slugifies_the_repo_s_last_segment() {

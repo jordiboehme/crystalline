@@ -925,8 +925,9 @@ async fn config_dispatch(command: ConfigCommand, json: bool) -> anyhow::Result<(
     }
 }
 
-/// Render `config show`'s snapshot: key, effective value (with a "(default)"
-/// marker when unset) and doc line, columns aligned to the widest entry.
+/// Render `config show`'s snapshot: key, effective value (with a source
+/// marker for defaulted or env-overridden entries) and doc line, columns
+/// aligned to the widest entry.
 fn render_settings_table(views: &[crystalline_service::settings::SettingView]) {
     let key_width = views.iter().map(|v| v.key.len()).max().unwrap_or(0);
     let displayed: Vec<String> = views.iter().map(setting_display_value).collect();
@@ -939,17 +940,20 @@ fn render_settings_table(views: &[crystalline_service::settings::SettingView]) {
     }
 }
 
-/// A setting's effective value with a "(default)" marker when it was never
-/// explicitly set.
+/// A setting's effective value with a "(default)" or "(env)" marker when it
+/// is not read straight from the config file.
 fn setting_display_value(view: &crystalline_service::settings::SettingView) -> String {
-    if view.is_default {
-        format!("{} (default)", view.value)
-    } else {
-        view.value.clone()
+    use crystalline_service::settings::SettingSource;
+    match view.source {
+        SettingSource::Default => format!("{} (default)", view.value),
+        SettingSource::Config => view.value.clone(),
+        SettingSource::Env => format!("{} (env)", view.value),
     }
 }
 
-/// Print a `config set`/`config unset` result: the resulting setting.
+/// Print a `config set`/`config unset` result: the resulting setting, and
+/// any note attached to it (for example, that a startup-effective key needs
+/// a daemon restart to take effect).
 fn print_setting_result(data: &serde_json::Value, json: bool) {
     if json {
         print_value(data, true);
@@ -957,10 +961,13 @@ fn print_setting_result(data: &serde_json::Value, json: bool) {
     }
     let key = data["key"].as_str().unwrap_or("");
     let value = data["value"].as_str().unwrap_or("");
-    if data["is_default"].as_bool().unwrap_or(false) {
-        println!("{key} = {value} (default)");
-    } else {
-        println!("{key} = {value}");
+    match data["source"].as_str().unwrap_or("config") {
+        "default" => println!("{key} = {value} (default)"),
+        "env" => println!("{key} = {value} (env)"),
+        _ => println!("{key} = {value}"),
+    }
+    if let Some(note) = data["note"].as_str() {
+        println!("  {note}");
     }
 }
 
@@ -1082,6 +1089,14 @@ fn print_origin_update(data: &serde_json::Value, json: bool) {
     }
     for d in domains {
         let name = d["domain"].as_str().unwrap_or("");
+        if d["provisioned"].as_bool().unwrap_or(false) {
+            println!(
+                "{name}: provisioned {} engram(s) at {}",
+                d["engrams"].as_u64().unwrap_or(0),
+                d["base_commit"].as_str().unwrap_or("")
+            );
+            continue;
+        }
         if d["up_to_date"].as_bool().unwrap_or(false) {
             println!("{name}: up to date");
             continue;
@@ -1129,11 +1144,15 @@ fn print_origin_status(data: &serde_json::Value, json: bool) {
     }
     let connection = &data["connection"];
     if connection["connected"].as_bool().unwrap_or(false) {
-        println!(
-            "GitHub: connected as {} ({} token store)",
-            connection["user"].as_str().unwrap_or("?"),
-            connection["token_store"].as_str().unwrap_or("?")
-        );
+        if connection["token_store"].as_str() == Some("environment") {
+            println!("GitHub: connected via CRYSTALLINE_GITHUB_TOKEN (environment token store)");
+        } else {
+            println!(
+                "GitHub: connected as {} ({} token store)",
+                connection["user"].as_str().unwrap_or("?"),
+                connection["token_store"].as_str().unwrap_or("?")
+            );
+        }
     } else {
         println!("GitHub: not connected. Run: crystalline connect github");
     }
@@ -1770,18 +1789,10 @@ fn run_prompt(
     json_flag: bool,
 ) -> anyhow::Result<()> {
     let workspace = workspace.unwrap_or_else(|| PathBuf::from("."));
-    let cfg_path = match config_path {
-        Some(p) => p,
-        None => config::global_config_path()
-            .map_err(|e| anyhow::anyhow!("could not resolve the default config path: {e}"))?,
-    };
-
-    let global = if cfg_path.is_file() {
-        config::load_yaml(&cfg_path)
-            .map_err(|e| anyhow::anyhow!("failed to load config {}: {e}", cfg_path.display()))?
-    } else {
-        config::GlobalConfig::default()
-    };
+    // The single load chokepoint resolves the config path (flag, then
+    // CRYSTALLINE_CONFIG, then the default) and applies the environment overlay,
+    // so the routing prompt reflects env-configured settings.
+    let global = crystalline_service::overlay::load(config_path.as_deref())?.effective;
 
     // Virtual domains have no MANIFEST on disk; their routing bullets come from
     // the daemon (warm) or a direct store read. The all-file common case never

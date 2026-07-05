@@ -1,6 +1,6 @@
 //! Where a GitHub access token lives once a machine has one: the OS
 //! keychain when it works, a permissions-locked file on disk when it does
-//! not.
+//! not, or a read-only view over a value the environment already supplied.
 //!
 //! [`TokenStore::resolve`] decides which backend to use, once, the first
 //! time a machine needs to save a token; every later save, load or delete
@@ -8,6 +8,12 @@
 //! `TokenStore` value rather than re-probing on every call means a single
 //! sign-in session always reads back what it just wrote, even on a machine
 //! whose keychain the probe judged unusable.
+//!
+//! [`TokenStore::env`] builds the third backend directly rather than through
+//! `resolve`: this crate never reads the process environment itself
+//! (`CRYSTALLINE_GITHUB_TOKEN` is read exactly once, in
+//! `crystalline_service::overlay::EnvOverlay::from_process_env`), so a caller
+//! that already has the value in hand constructs the store explicitly.
 
 use std::path::{Path, PathBuf};
 use std::sync::Once;
@@ -34,6 +40,22 @@ pub struct StoredToken {
     pub user: String,
     /// When this token was saved.
     pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl StoredToken {
+    /// The signed-in login for display, or `None` when it is unknown. Only
+    /// [`TokenStore::Env`] ever produces an empty `user` (an
+    /// environment-supplied token with no login lookup behind it); every
+    /// other store fills it in at connect time, so this is the one place
+    /// that distinction needs making, rather than every caller checking
+    /// `user.is_empty()` itself.
+    pub fn user_display(&self) -> Option<&str> {
+        if self.user.is_empty() {
+            None
+        } else {
+            Some(self.user.as_str())
+        }
+    }
 }
 
 /// Redacts `access_token`: a `StoredToken` reaches `Debug` output in a log
@@ -68,6 +90,38 @@ pub enum TokenStore {
         /// The token file's path.
         path: PathBuf,
     },
+    /// A token supplied directly by the `CRYSTALLINE_GITHUB_TOKEN`
+    /// environment variable: read-only, since the environment is the source
+    /// of truth and there is nothing here for `save` or `delete` to change.
+    /// Never produced by [`TokenStore::resolve`]; built directly with
+    /// [`TokenStore::env`] by a caller that already holds the value (see the
+    /// module docs).
+    Env {
+        /// The token value, exactly as `CRYSTALLINE_GITHUB_TOKEN` carries it.
+        token: String,
+        /// The GitHub host this token authenticates against: `github.com`,
+        /// or a GitHub Enterprise Server hostname.
+        host: String,
+    },
+}
+
+/// Redacts the `token` field of [`TokenStore::Env`] the same way
+/// [`StoredToken`]'s manual `Debug` redacts `access_token`: the other two
+/// variants carry no secret, so their fields print as a derive would.
+impl std::fmt::Debug for TokenStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TokenStore::Keyring { account } => {
+                f.debug_struct("Keyring").field("account", account).finish()
+            }
+            TokenStore::File { path } => f.debug_struct("File").field("path", path).finish(),
+            TokenStore::Env { host, .. } => f
+                .debug_struct("Env")
+                .field("token", &"<redacted>")
+                .field("host", host)
+                .finish(),
+        }
+    }
 }
 
 impl TokenStore {
@@ -86,6 +140,20 @@ impl TokenStore {
         }
     }
 
+    /// Builds the read-only [`TokenStore::Env`] backend for a token the
+    /// caller already holds (from `CRYSTALLINE_GITHUB_TOKEN`, read once by
+    /// `crystalline_service::overlay::EnvOverlay`). `host` defaults to
+    /// `"github.com"` when `None`, matching every other host-defaulting site
+    /// in this module (see [`account_for`]).
+    pub fn env(token: impl Into<String>, host: Option<&str>) -> TokenStore {
+        TokenStore::Env {
+            token: token.into(),
+            host: host
+                .map(str::to_string)
+                .unwrap_or_else(|| "github.com".to_string()),
+        }
+    }
+
     /// Saves `token`, replacing whatever was saved before.
     pub fn save(&self, token: &StoredToken) -> Result<(), RemoteError> {
         match self {
@@ -96,10 +164,17 @@ impl TokenStore {
                     .map_err(|e| credential_error("save", e))
             }
             TokenStore::File { path } => save_file(path, token),
+            TokenStore::Env { .. } => Err(env_read_only_error()),
         }
     }
 
-    /// Loads the saved token, or `None` if nothing has been saved yet.
+    /// Loads the saved token, or `None` if nothing has been saved yet. The
+    /// `Env` variant never has "nothing saved": it always synthesizes a
+    /// token from the value it was built with, an empty `user` (unknown
+    /// offline - nothing in this crate ever calls GitHub just to look up who
+    /// an environment-supplied token belongs to) and a fresh `created_at`
+    /// (never displayed anywhere; only `user`, `kind` and the fact that a
+    /// token exists at all ever surface).
     pub fn load(&self) -> Result<Option<StoredToken>, RemoteError> {
         match self {
             TokenStore::Keyring { account } => match keyring_entry(account)?.get_password() {
@@ -108,6 +183,12 @@ impl TokenStore {
                 Err(e) => Err(credential_error("load", e)),
             },
             TokenStore::File { path } => load_file(path),
+            TokenStore::Env { token, host } => Ok(Some(StoredToken {
+                access_token: token.clone(),
+                host: host.clone(),
+                user: String::new(),
+                created_at: chrono::Utc::now(),
+            })),
         }
     }
 
@@ -120,15 +201,17 @@ impl TokenStore {
                 Err(e) => Err(credential_error("delete", e)),
             },
             TokenStore::File { path } => delete_file(path),
+            TokenStore::Env { .. } => Err(env_read_only_error()),
         }
     }
 
-    /// `"keyring"` or `"file"`, for doctor and status to report which
-    /// backend is in play.
+    /// `"keyring"`, `"file"` or `"environment"`, for doctor and status to
+    /// report which backend is in play.
     pub fn kind(&self) -> &'static str {
         match self {
             TokenStore::Keyring { .. } => "keyring",
             TokenStore::File { .. } => "file",
+            TokenStore::Env { .. } => "environment",
         }
     }
 }
@@ -231,6 +314,15 @@ fn install_native_store() -> keyring_core::Result<()> {
 fn credential_error(operation: &str, source: impl std::fmt::Display) -> RemoteError {
     RemoteError::Credential {
         detail: format!("could not {operation} the GitHub token: {source}"),
+    }
+}
+
+/// The refusal [`TokenStore::save`] and [`TokenStore::delete`] return for the
+/// `Env` variant: the environment is the source of truth for this token, so
+/// there is nothing here to save or delete until the variable is unset.
+fn env_read_only_error() -> RemoteError {
+    RemoteError::Credential {
+        detail: "the GitHub token comes from the CRYSTALLINE_GITHUB_TOKEN environment variable and is read-only; unset it to manage a saved token".to_string(),
     }
 }
 
@@ -422,5 +514,66 @@ mod tests {
             account: "github".to_string(),
         };
         assert_eq!(store.kind(), "keyring");
+    }
+
+    // --- the Env variant ------------------------------------------------------
+
+    #[test]
+    fn env_store_round_trips_the_token_and_host_with_an_empty_user() {
+        let store = TokenStore::env("gho_SECRETSECRET", Some("ghe.example.com"));
+        assert_eq!(store.kind(), "environment");
+
+        let token = store
+            .load()
+            .unwrap()
+            .expect("the env store always has a token");
+        assert_eq!(token.access_token, "gho_SECRETSECRET");
+        assert_eq!(token.host, "ghe.example.com");
+        assert_eq!(token.user, "", "the login is unknown offline");
+        assert_eq!(token.user_display(), None);
+    }
+
+    #[test]
+    fn env_store_defaults_the_host_to_github_com() {
+        let store = TokenStore::env("gho_SECRETSECRET", None);
+        let token = store.load().unwrap().unwrap();
+        assert_eq!(token.host, "github.com");
+    }
+
+    #[test]
+    fn env_store_save_returns_the_guidance_error() {
+        let store = TokenStore::env("gho_SECRETSECRET", None);
+        let err = store.save(&sample_token()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("CRYSTALLINE_GITHUB_TOKEN"), "{msg}");
+        assert!(msg.contains("read-only"), "{msg}");
+        assert!(matches!(err, RemoteError::Credential { .. }));
+    }
+
+    #[test]
+    fn env_store_delete_returns_the_guidance_error() {
+        let store = TokenStore::env("gho_SECRETSECRET", None);
+        let err = store.delete().unwrap_err();
+        assert!(
+            err.to_string().contains("CRYSTALLINE_GITHUB_TOKEN"),
+            "{err}"
+        );
+        assert!(matches!(err, RemoteError::Credential { .. }));
+    }
+
+    #[test]
+    fn env_store_debug_never_shows_the_token_or_a_prefix_of_it() {
+        let store = TokenStore::env("gho_SECRETSECRET", Some("ghe.example.com"));
+        let debugged = format!("{store:?}");
+        assert!(!debugged.contains("SECRET"), "{debugged}");
+        assert!(debugged.contains("<redacted>"), "{debugged}");
+        assert!(debugged.contains("ghe.example.com"), "{debugged}");
+
+        // The synthesized `StoredToken` redacts the same way, through the
+        // existing manual `Debug` impl.
+        let token = store.load().unwrap().unwrap();
+        let token_debugged = format!("{token:?}");
+        assert!(!token_debugged.contains("SECRET"), "{token_debugged}");
+        assert!(token_debugged.contains("<redacted>"), "{token_debugged}");
     }
 }

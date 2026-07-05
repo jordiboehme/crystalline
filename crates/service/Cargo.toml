@@ -25,6 +25,7 @@ crystalline-index = { workspace = true }
 crystalline-remote = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
+indexmap = { workspace = true }
 tokio = { workspace = true }
 rmcp = { workspace = true, features = [
     "server",

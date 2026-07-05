@@ -21,9 +21,9 @@ use crystalline_remote::provider::ProposalState;
 use crystalline_remote::state::{
     OriginState, Proposal, ProposalStatus, ProposedChange, ProposedFile,
 };
-use crystalline_service::Engine;
 use crystalline_service::engine::EngineError;
 use crystalline_service::params::{ReadParams, SearchParams};
+use crystalline_service::{Engine, EnvOverlay};
 use support::{MockProvider, sha256_hex};
 use tokio::sync::Mutex;
 
@@ -55,6 +55,34 @@ async fn engine_with(
     .with_read_only(read_only)
     .with_origin_provider(provider)
     .with_origins_dir(origins_dir.to_path_buf())
+}
+
+/// An engine whose only domains come from an environment overlay, wired to the
+/// mock provider and a tempdir origins directory. GitHub is enabled so the
+/// origin operations are not gated off.
+async fn engine_with_env(
+    config_path: &Path,
+    origins_dir: &Path,
+    provider: Arc<MockProvider>,
+    env_vars: &[(&str, &str)],
+) -> Engine {
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let overlay = EnvOverlay::from_vars(
+        env_vars
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    Engine::new(
+        Arc::new(Mutex::new(store)),
+        config(true),
+        None,
+        Some(config_path.to_path_buf()),
+    )
+    .with_origin_provider(provider)
+    .with_origins_dir(origins_dir.to_path_buf())
+    .with_env_overlay(overlay)
 }
 
 fn manifest() -> Vec<u8> {
@@ -401,6 +429,115 @@ async fn origin_update_named_domain_with_no_origin_errors() {
     let err = eng.origin_update(Some("nope")).await.unwrap_err();
     // Unregistered entirely, since none was ever added.
     assert!(matches!(err, EngineError::UnknownDomain { .. }), "{err}");
+}
+
+// --- env-defined domains -----------------------------------------------------
+
+#[tokio::test]
+async fn origin_update_provisions_an_env_domain_then_plain_pulls() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let c1 = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        (
+            "notes/alpha.md",
+            engram("Alpha", "alpha", "shared knowledge about turbines"),
+        ),
+    ]));
+    mock.set_branch("main", &c1);
+
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let root = tmp.path().join("team");
+    let eng = engine_with_env(
+        &config_path,
+        &origins_dir,
+        mock.clone(),
+        &[
+            ("CRYSTALLINE_DOMAIN_TEAM", root.to_str().unwrap()),
+            ("CRYSTALLINE_DOMAIN_TEAM_ORIGIN", "acme/brand-knowledge"),
+        ],
+    )
+    .await;
+
+    // First update provisions: the missing-state env domain subscribes.
+    let result = eng.origin_update(Some("team")).await.unwrap();
+    let domains = result["domains"].as_array().unwrap();
+    assert_eq!(domains.len(), 1);
+    assert_eq!(domains[0]["domain"], "team");
+    assert_eq!(domains[0]["provisioned"], true);
+    assert_eq!(domains[0]["engrams"], 2);
+    assert_eq!(domains[0]["base_commit"], c1);
+    assert_eq!(result["errors"].as_array().unwrap().len(), 0);
+
+    // Files landed on disk and origin state now exists.
+    assert!(root.join("MANIFEST.md").exists());
+    assert!(root.join("notes/alpha.md").exists());
+    assert!(
+        OriginState::load(&origins_dir.join("team"))
+            .unwrap()
+            .is_some(),
+        "origin state written on provisioning"
+    );
+
+    // Indexed and searchable through the engine's own read path.
+    let hits = eng
+        .search_engrams(&SearchParams {
+            query: Some("turbines".to_string()),
+            ..SearchParams::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(hits["total"], 1);
+
+    // Second update is a plain pull now that state is present: nothing new
+    // upstream, so it is up to date and no longer marked provisioned.
+    let result = eng.origin_update(Some("team")).await.unwrap();
+    let domains = result["domains"].as_array().unwrap();
+    assert_eq!(domains.len(), 1);
+    assert!(
+        domains[0]["provisioned"].is_null(),
+        "the second pull does not provision"
+    );
+    assert_eq!(domains[0]["up_to_date"], true);
+}
+
+#[tokio::test]
+async fn origin_add_on_an_env_defined_name_names_the_variable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[("MANIFEST.md", manifest())]));
+    mock.set_branch("main", &commit);
+
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let team_root = tmp.path().join("team");
+    let eng = engine_with_env(
+        &config_path,
+        &origins_dir,
+        mock,
+        &[("CRYSTALLINE_DOMAIN_TEAM", team_root.to_str().unwrap())],
+    )
+    .await;
+
+    let other_root = tmp.path().join("other");
+    let err = eng
+        .origin_add(
+            "acme/brand-knowledge",
+            Some("team"),
+            None,
+            None,
+            Some(other_root.to_str().unwrap()),
+        )
+        .await
+        .unwrap_err();
+    match err {
+        EngineError::Conflict(msg) => {
+            assert!(msg.contains("CRYSTALLINE_DOMAIN_TEAM"), "{msg}")
+        }
+        other => panic!("expected Conflict naming the variable, got {other}"),
+    }
+    assert!(!other_root.exists(), "a refused add must not touch disk");
 }
 
 #[tokio::test]

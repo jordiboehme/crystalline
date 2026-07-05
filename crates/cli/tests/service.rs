@@ -150,6 +150,33 @@ impl Mcp {
         Mcp::spawn_inner(env, true, &[])
     }
 
+    /// Spawn an `mcp` client with `CRYSTALLINE_SERVICE_READ_ONLY=true` in the
+    /// environment and no `--read-only` flag, so the daemon it starts derives
+    /// read-only mode from the environment overlay. The spawned daemon inherits
+    /// the parent's environment, so the variable reaches `serve` without being
+    /// passed as a flag.
+    fn spawn_env_read_only(env: &Env) -> Mcp {
+        let mut cmd = Command::new(bin());
+        env.apply(&mut cmd);
+        cmd.env("CRYSTALLINE_SERVICE_READ_ONLY", "true");
+        cmd.arg("mcp");
+        cmd.arg("--config").arg(env.config_path());
+        let mut child = cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let out = BufReader::new(child.stdout.take().unwrap());
+        Mcp {
+            child,
+            stdin,
+            out,
+            id: 0,
+        }
+    }
+
     /// Spawn an `mcp` client with `--domain` folders: the Claude Desktop MCPB
     /// bundle entry point. Each folder is registered as a domain (created and
     /// scaffolded with a MANIFEST.md when it does not exist yet) before the
@@ -372,6 +399,45 @@ fn read_only_daemon_reports_hides_and_refuses() {
     }
 
     // Calling a hidden tool by name returns the read-only error, not a panic.
+    c1.send_call(
+        "write_engram",
+        json!({ "domain": "eng", "title": "Nope", "content": "no" }),
+    );
+    let resp = c1.read();
+    let msg = resp
+        .pointer("/error/message")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        msg.contains("read-only"),
+        "read-only error expected: {resp}"
+    );
+
+    drop(c1);
+    let _ = env.run(&["ctl", "shutdown"]);
+}
+
+/// End to end: a daemon whose read-only mode comes from
+/// `CRYSTALLINE_SERVICE_READ_ONLY` (not the `--read-only` flag) reports it over
+/// ctl status and refuses a write over the socket, so a container can serve
+/// read-only through the environment alone.
+#[test]
+fn env_read_only_daemon_reports_and_refuses_a_write() {
+    let env = Env::new("env-ro");
+    env.setup_domain("eng");
+
+    // The domain was registered read-write above; the daemon starts read-only
+    // purely from the environment variable.
+    let mut c1 = Mcp::spawn_env_read_only(&env);
+    c1.initialize();
+    env.wait_ready();
+
+    let (ok, out) = env.run(&["ctl", "status", "--json"]);
+    assert!(ok, "ctl status");
+    let status: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(status["read_only"], json!(true), "status: {status}");
+
+    // A write over the socket returns the read-only error, not a success.
     c1.send_call(
         "write_engram",
         json!({ "domain": "eng", "title": "Nope", "content": "no" }),

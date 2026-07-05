@@ -11,10 +11,11 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-use crate::daemon::{load_config, open_store, resolve_db};
+use crate::daemon::{open_store, resolve_db};
 use crate::engine::{Engine, open_standalone};
 use crate::instance::{Connection, acquire_ownership, ensure_daemon, try_attach};
 use crate::mcp::McpServer;
+use crate::overlay;
 use crate::params::*;
 
 /// The `crystalline mcp` stdio entry: attach to (or spawn) a daemon and pump
@@ -72,29 +73,27 @@ async fn run_embedded_stdio(
     init_tracing();
     let ownership = acquire_ownership()
         .map_err(|e| anyhow::anyhow!("cannot run an embedded MCP server: {e}"))?;
-    let config = load_config(config_path)?;
-    let read_only = read_only || config.read_only();
+    let loaded = overlay::load(config_path)?;
+    let read_only = read_only || loaded.effective.read_only();
     let db_path = resolve_db(db)?;
-    let store = open_store(&config, Some(&db_path)).await?;
+    let store = open_store(&loaded.effective, Some(&db_path)).await?;
     // The provider is built in the background so the stdio session is ready and
     // text search works before any model download completes. There is no
-    // watcher task in this mode, so `config_path` only helps a domain added
-    // mid-session resolve for data operations, not for picking up external
-    // file changes.
+    // watcher task in this mode, so the resolved config path only helps a domain
+    // added mid-session resolve for data operations, not for picking up external
+    // file changes. The engine holds the file config and the overlay apart, so
+    // its effective config drives reads while persistence stays env-free.
     let engine = Arc::new(
-        Engine::new(
-            store,
-            config.clone(),
-            None,
-            config_path.map(Path::to_path_buf),
-        )
-        .with_read_only(read_only),
+        Engine::new(store, loaded.file.clone(), None, Some(loaded.path.clone()))
+            .with_read_only(read_only)
+            .with_env_overlay(loaded.overlay.clone()),
     );
 
     let bg = engine.clone();
+    let bg_config = loaded.effective.clone();
     tokio::spawn(async move {
         let _ = bg.sync(None).await;
-        if let Some(provider) = crate::engine::build_provider(&config).await {
+        if let Some(provider) = crate::engine::build_provider(&bg_config).await {
             bg.set_provider(provider);
             let _ = bg.embed_pending().await;
         }
@@ -119,10 +118,10 @@ pub async fn run_tool(
         let stream = conn.into_mcp().await?;
         return call_tool_over_stream(stream, tool, args).await;
     }
-    let config = load_config(config_path)?;
+    let loaded = overlay::load(config_path)?;
     let db_path = resolve_db(db)?;
     let want_embeddings = matches!(tool, "search_engrams");
-    let engine = open_standalone(config, &db_path, want_embeddings).await?;
+    let engine = open_standalone(loaded, &db_path, want_embeddings).await?;
     dispatch_engine(&engine, tool, args).await
 }
 
@@ -142,9 +141,9 @@ pub async fn scaffold_virtual_manifest(
     {
         return Ok(data);
     }
-    let config = load_config(config_path)?;
+    let loaded = overlay::load(config_path)?;
     let db_path = resolve_db(db)?;
-    let engine = open_standalone(config, &db_path, false).await?;
+    let engine = open_standalone(loaded, &db_path, false).await?;
     Ok(engine.scaffold_virtual_manifest(domain, markdown).await?)
 }
 
@@ -167,9 +166,9 @@ pub async fn domain_import(
     {
         return Ok(data);
     }
-    let config = load_config(config_path)?;
+    let loaded = overlay::load(config_path)?;
     let db_path = resolve_db(db)?;
-    let engine = open_standalone(config, &db_path, false).await?;
+    let engine = open_standalone(loaded, &db_path, false).await?;
     Ok(engine
         .import_domain(domain, src, overwrite, dry_run)
         .await?)
@@ -194,9 +193,9 @@ pub async fn domain_export(
     {
         return Ok(data);
     }
-    let config = load_config(config_path)?;
+    let loaded = overlay::load(config_path)?;
     let db_path = resolve_db(db)?;
-    let engine = open_standalone(config, &db_path, false).await?;
+    let engine = open_standalone(loaded, &db_path, false).await?;
     Ok(engine.export_domain(domain, dest, force, dry_run).await?)
 }
 
@@ -225,9 +224,9 @@ pub async fn origin_add(
     {
         return Ok(data);
     }
-    let config = load_config(config_path)?;
+    let loaded = overlay::load(config_path)?;
     let db_path = resolve_db(db)?;
-    let engine = open_standalone(config, &db_path, false).await?;
+    let engine = open_standalone(loaded, &db_path, false).await?;
     Ok(engine
         .origin_add(repo, domain, path, branch, folder)
         .await?)
@@ -246,9 +245,9 @@ pub async fn origin_update(
     {
         return Ok(data);
     }
-    let config = load_config(config_path)?;
+    let loaded = overlay::load(config_path)?;
     let db_path = resolve_db(db)?;
-    let engine = open_standalone(config, &db_path, false).await?;
+    let engine = open_standalone(loaded, &db_path, false).await?;
     Ok(engine.origin_update(domain).await?)
 }
 
@@ -266,9 +265,9 @@ pub async fn origin_status(
     {
         return Ok(data);
     }
-    let config = load_config(config_path)?;
+    let loaded = overlay::load(config_path)?;
     let db_path = resolve_db(db)?;
-    let engine = open_standalone(config, &db_path, false).await?;
+    let engine = open_standalone(loaded, &db_path, false).await?;
     Ok(engine.origin_status(domain).await?)
 }
 
@@ -292,9 +291,9 @@ pub async fn origin_share(
     {
         return Ok(data);
     }
-    let config = load_config(config_path)?;
+    let loaded = overlay::load(config_path)?;
     let db_path = resolve_db(db)?;
-    let engine = open_standalone(config, &db_path, false).await?;
+    let engine = open_standalone(loaded, &db_path, false).await?;
     Ok(engine.origin_share(domain, title, description).await?)
 }
 
@@ -315,9 +314,9 @@ pub async fn origin_discard(
     {
         return Ok(data);
     }
-    let config = load_config(config_path)?;
+    let loaded = overlay::load(config_path)?;
     let db_path = resolve_db(db)?;
-    let engine = open_standalone(config, &db_path, false).await?;
+    let engine = open_standalone(loaded, &db_path, false).await?;
     Ok(engine.origin_discard(domain, proposal).await?)
 }
 
@@ -346,9 +345,9 @@ pub async fn origin_resolve(
     {
         return Ok(data);
     }
-    let config = load_config(config_path)?;
+    let loaded = overlay::load(config_path)?;
     let db_path = resolve_db(db)?;
-    let engine = open_standalone(config, &db_path, false).await?;
+    let engine = open_standalone(loaded, &db_path, false).await?;
     Ok(engine.origin_resolve(domain, path, keep, content).await?)
 }
 
@@ -373,54 +372,70 @@ pub async fn configure(
         return Ok(data);
     }
 
-    let mut config = load_config(config_path)?;
+    // The single load chokepoint resolves the config path and parses the
+    // environment overlay: `show` reads the file config plus the overlay, and a
+    // write mutates a clone of the file config and saves it to the resolved
+    // path, so no environment value ever bakes into the saved file.
+    let loaded = overlay::load(config_path)?;
     match action {
-        "show" => Ok(json!({ "settings": crate::settings::snapshot(&config) })),
+        "show" => Ok(json!({
+            "settings": crate::settings::snapshot(&loaded.file, &loaded.overlay)
+        })),
         "set" => {
-            if config.read_only() {
+            if loaded.effective.read_only() {
                 anyhow::bail!("{}", crate::engine::EngineError::ReadOnly);
             }
             let key = key.ok_or_else(|| anyhow::anyhow!("configure set requires a key"))?;
             let value = value.ok_or_else(|| anyhow::anyhow!("configure set requires a value"))?;
-            crate::settings::apply(&mut config, key, value)?;
-            save_config(config_path, &config)?;
-            Ok(setting_view(&config, key))
+            let mut file = loaded.file.clone();
+            crate::settings::apply(&mut file, key, value)?;
+            save_file(&loaded.path, &file)?;
+            Ok(setting_view(&file, key, &loaded.overlay))
         }
         "unset" => {
-            if config.read_only() {
+            if loaded.effective.read_only() {
                 anyhow::bail!("{}", crate::engine::EngineError::ReadOnly);
             }
             let key = key.ok_or_else(|| anyhow::anyhow!("configure unset requires a key"))?;
-            crate::settings::unset(&mut config, key)?;
-            save_config(config_path, &config)?;
-            Ok(setting_view(&config, key))
+            let mut file = loaded.file.clone();
+            crate::settings::unset(&mut file, key)?;
+            save_file(&loaded.path, &file)?;
+            Ok(setting_view(&file, key, &loaded.overlay))
         }
         other => anyhow::bail!("unknown configure action '{other}'; expected show, set or unset"),
     }
 }
 
-/// The just-applied setting's snapshot entry, as a JSON value. `key` has
+/// The just-applied setting's snapshot entry, as a JSON value, with a `note`
+/// field attached when [`crate::settings::change_note`] has one (a
+/// startup-effective reminder, an active env override, or both). `file` is the
+/// freshly saved file config; the snapshot layers `overlay` on top, so an
+/// env-overridden key reports its env value with `source: env`. `key` has
 /// already been validated against the registry by `apply`/`unset`, so it is
 /// always found.
-fn setting_view(config: &crystalline_core::config::GlobalConfig, key: &str) -> Value {
-    crate::settings::snapshot(config)
+fn setting_view(
+    file: &crystalline_core::config::GlobalConfig,
+    key: &str,
+    overlay: &overlay::EnvOverlay,
+) -> Value {
+    crate::settings::snapshot(file, overlay)
         .into_iter()
         .find(|v| v.key == key)
-        .map(|v| serde_json::to_value(v).unwrap_or(Value::Null))
+        .map(|v| {
+            let mut value = serde_json::to_value(v).unwrap_or(Value::Null);
+            if let Some(note) = crate::settings::change_note(key, overlay)
+                && let Value::Object(map) = &mut value
+            {
+                map.insert("note".to_string(), Value::String(note));
+            }
+            value
+        })
         .unwrap_or(Value::Null)
 }
 
-/// Save a config back to the path it was loaded from: the `--config`
-/// override, or the default global config path when none was given.
-fn save_config(
-    config_path: Option<&Path>,
-    config: &crystalline_core::config::GlobalConfig,
-) -> anyhow::Result<()> {
-    let path = match config_path {
-        Some(p) => p.to_path_buf(),
-        None => crystalline_core::config::global_config_path()?,
-    };
-    crystalline_core::config::save_yaml(&path, config)
+/// Save a config to the path the load chokepoint already resolved.
+fn save_file(path: &Path, config: &crystalline_core::config::GlobalConfig) -> anyhow::Result<()> {
+    crystalline_core::config::save_yaml(path, config)
         .map_err(|e| anyhow::anyhow!("failed to save config {}: {e}", path.display()))
 }
 
@@ -445,7 +460,18 @@ pub async fn virtual_routing_bullets(
         Ok(p) => p,
         Err(_) => return std::collections::BTreeMap::new(),
     };
-    match open_standalone(config.clone(), &db_path, false).await {
+    // The caller already resolved the effective config (the overlay is applied
+    // upstream in `run_prompt`), and this read-only path never persists, so a
+    // no-op overlay over the given config is all `open_standalone` needs. The
+    // path is only consulted on a post-startup domain re-read, which this
+    // one-shot never performs.
+    let loaded = overlay::LoadedConfig {
+        path: crystalline_core::config::global_config_path().unwrap_or_default(),
+        file: config.clone(),
+        effective: config.clone(),
+        overlay: overlay::EnvOverlay::default(),
+    };
+    match open_standalone(loaded, &db_path, false).await {
         Ok(engine) => engine.virtual_routing_bullets().await,
         Err(_) => std::collections::BTreeMap::new(),
     }

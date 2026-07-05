@@ -42,6 +42,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
 use crate::origin;
+use crate::overlay::{self, EnvOverlay, LoadedConfig};
 use crate::params::*;
 use crate::poller;
 use crate::settings;
@@ -93,6 +94,14 @@ pub enum EngineError {
     /// A content mutation was attempted against a read-only instance.
     #[error("this instance is read-only; content mutations are disabled")]
     ReadOnly,
+    /// An interactive connect action (`connect_with_token`,
+    /// `start_device_connect`) was attempted while `CRYSTALLINE_GITHUB_TOKEN`
+    /// is set. This machine's identity is fixed by the environment, so there
+    /// is nothing for a sign-in to change until the variable is unset.
+    #[error(
+        "this machine's GitHub identity comes from CRYSTALLINE_GITHUB_TOKEN; unset it to sign in interactively"
+    )]
+    EnvTokenConnect,
     /// A filesystem error.
     #[error("io error at {path}: {source}")]
     Io {
@@ -242,11 +251,24 @@ enum ContentSource {
 /// The shared service engine.
 pub struct Engine {
     store: Arc<Mutex<dyn Store>>,
-    // The resolved config this engine was constructed with. Behind a lock (not
-    // an immutable snapshot) so `configure` can update a setting and every
-    // later read (including a concurrent one) sees it, mirroring the
+    // The effective config: the file config with the environment overlay
+    // applied. Every runtime read goes through this, so the ~30 read sites stay
+    // untouched by the file/effective split. Behind a lock (not an immutable
+    // snapshot) so `configure` can update a setting and every later read
+    // (including a concurrent one) sees it, mirroring the
     // `discovered_domains`/`provider` interior-mutability pattern below.
     config: std::sync::RwLock<GlobalConfig>,
+    // The persisted file config, the truth `persist_config` writes back. Kept
+    // apart from `config` so an environment value never bakes itself into
+    // `config.yaml`: `configure show` and `set`/`unset` read and mutate this,
+    // and the effective `config` above is recomputed from it plus the overlay.
+    // The lock order is always `file_config` then `config`.
+    file_config: std::sync::RwLock<GlobalConfig>,
+    // The parsed environment overlay layered on top of `file_config` to produce
+    // `config`. Empty by default (the standalone construction path and every
+    // existing test); the daemon and the standalone loader install the real one
+    // via `with_env_overlay`.
+    overlay: EnvOverlay,
     // The `--config` override this engine was started with, so a domain
     // registered after startup (`domain add` only ever touches the file on
     // disk) can be found by re-reading the same file. See `refresh_domain`.
@@ -343,9 +365,14 @@ impl Engine {
     ) -> Engine {
         let model_id = configured_model_id(config.embeddings.as_ref());
         let chunk_params = ChunkParams::for_model(model_id.clone());
+        // No overlay yet: file and effective start identical, so an engine
+        // built without `with_env_overlay` behaves exactly as before the split.
+        let file_config = config.clone();
         Engine {
             store,
             config: std::sync::RwLock::new(config),
+            file_config: std::sync::RwLock::new(file_config),
+            overlay: EnvOverlay::default(),
             config_path,
             discovered_domains: std::sync::RwLock::new(HashMap::new()),
             watch_tx: None,
@@ -402,6 +429,18 @@ impl Engine {
     /// Whether this engine serves the content API read-only.
     pub fn read_only(&self) -> bool {
         self.read_only
+    }
+
+    /// Install the environment overlay and recompute the effective config from
+    /// the file config plus this overlay. The daemon and the standalone loader
+    /// call this with the overlay parsed at startup; every existing call site
+    /// leaves the default empty overlay in place, so file and effective stay
+    /// identical there.
+    pub fn with_env_overlay(mut self, overlay: EnvOverlay) -> Engine {
+        let effective = overlay.apply(&self.file_config.read().unwrap());
+        *self.config.write().unwrap() = effective;
+        self.overlay = overlay;
+        self
     }
 
     /// Inject a fixed provider for every origin operation (`origin_add`,
@@ -650,7 +689,16 @@ impl Engine {
     /// starts watching its root without a restart. A virtual domain has no root,
     /// so it is cached but never watched.
     fn refresh_domain(&self, name: &str) -> Option<DomainEntry> {
-        let fresh = crate::daemon::load_config(self.config_path.as_deref()).ok()?;
+        // Re-read the same file this engine persists to (its `--config`
+        // override, else the default global path) and layer the overlay back
+        // on, so a post-startup re-read sees the same effective config a fresh
+        // load would, environment overrides included.
+        let path = match &self.config_path {
+            Some(p) => p.clone(),
+            None => crystalline_core::config::global_config_path().ok()?,
+        };
+        let file = overlay::load_file(&path).ok()?;
+        let fresh = self.overlay.apply(&file);
         let entry = fresh.domains.get(name)?.clone();
         self.discovered_domains
             .write()
@@ -2270,52 +2318,71 @@ impl Engine {
     pub async fn configure(&self, action: &ConfigureAction) -> Result<Value> {
         match action {
             ConfigureAction::Show => {
-                let config = self.config.read().unwrap();
-                Ok(json!({ "settings": settings::snapshot(&config) }))
+                let file = self.file_config.read().unwrap();
+                Ok(json!({ "settings": settings::snapshot(&file, &self.overlay) }))
             }
             ConfigureAction::Set { key, value } => {
                 if self.read_only {
                     return Err(EngineError::ReadOnly);
                 }
-                // Acquire write lock first to serialize against concurrent configure calls.
-                // This prevents two tasks from both cloning the old config and clobbering
-                // each other's changes. persist_config is synchronous (no .await), so
-                // holding the write guard across it is safe and legal.
-                let mut guard = self.config.write().unwrap();
-                let mut config = guard.clone();
-                settings::apply(&mut config, key, value)?;
-                self.persist_config(&config)?;
-                let view = self.setting_view_json(&config, key);
-                *guard = config;
+                // Take the file-config write lock first to serialize against a
+                // concurrent configure call, so two tasks cannot both clone the
+                // old file and clobber each other's change. `persist_config` is
+                // synchronous (no .await), so holding the guard across it is
+                // safe. Lock order is always file_config then config.
+                let mut file_guard = self.file_config.write().unwrap();
+                let mut file = file_guard.clone();
+                settings::apply(&mut file, key, value)?;
+                self.persist_config(&file)?;
+                // Recompute the effective config from the freshly saved file
+                // plus the overlay, so an env-overridden key keeps reading its
+                // env value even after the file value changes underneath it.
+                let effective = self.overlay.apply(&file);
+                let view = self.setting_view_json(&file, key);
+                *file_guard = file;
+                *self.config.write().unwrap() = effective;
                 Ok(view)
             }
             ConfigureAction::Unset { key } => {
                 if self.read_only {
                     return Err(EngineError::ReadOnly);
                 }
-                // Acquire write lock first to serialize against concurrent configure calls.
-                // This prevents two tasks from both cloning the old config and clobbering
-                // each other's changes. persist_config is synchronous (no .await), so
-                // holding the write guard across it is safe and legal.
-                let mut guard = self.config.write().unwrap();
-                let mut config = guard.clone();
-                settings::unset(&mut config, key)?;
-                self.persist_config(&config)?;
-                let view = self.setting_view_json(&config, key);
-                *guard = config;
+                // Same write-lock-first discipline and lock order as Set above.
+                let mut file_guard = self.file_config.write().unwrap();
+                let mut file = file_guard.clone();
+                settings::unset(&mut file, key)?;
+                self.persist_config(&file)?;
+                let effective = self.overlay.apply(&file);
+                let view = self.setting_view_json(&file, key);
+                *file_guard = file;
+                *self.config.write().unwrap() = effective;
                 Ok(view)
             }
         }
     }
 
-    /// The just-applied setting's snapshot entry, as a JSON value. `key` has
-    /// already been validated against the registry by `apply`/`unset`, so it
-    /// is always found.
-    fn setting_view_json(&self, config: &GlobalConfig, key: &str) -> Value {
-        settings::snapshot(config)
+    /// The just-applied setting's snapshot entry, as a JSON value, with a
+    /// `note` field attached when [`settings::change_note`] has one (for
+    /// example, a startup-effective key reminding the caller that a running
+    /// daemon keeps its old value, or an env-overridden key reminding it that
+    /// the saved value waits on the variable being removed). `file` is the
+    /// freshly saved file config; the snapshot layers the overlay on top, so an
+    /// env-overridden key reports its env value with `source: env`. `key` has
+    /// already been validated against the registry by `apply`/`unset`, so it is
+    /// always found.
+    fn setting_view_json(&self, file: &GlobalConfig, key: &str) -> Value {
+        settings::snapshot(file, &self.overlay)
             .into_iter()
             .find(|v| v.key == key)
-            .map(|v| serde_json::to_value(v).unwrap_or(Value::Null))
+            .map(|v| {
+                let mut value = serde_json::to_value(v).unwrap_or(Value::Null);
+                if let Some(note) = settings::change_note(key, &self.overlay)
+                    && let Value::Object(map) = &mut value
+                {
+                    map.insert("note".to_string(), Value::String(note));
+                }
+                value
+            })
             .unwrap_or(Value::Null)
     }
 
@@ -2371,9 +2438,18 @@ impl Engine {
             None => origin::default_domain_name(repo),
         };
         if self.domain_entry(&domain_name).is_ok() {
-            return Err(EngineError::Conflict(format!(
-                "domain '{domain_name}' is already registered; pass a domain name to connect this origin under a different one"
-            )));
+            // An env-defined domain names the variable that owns it, so the
+            // operator knows to unset it rather than pick another name.
+            let msg = match self.overlay.env_domain(&domain_name) {
+                Some(env) => format!(
+                    "domain '{domain_name}' is defined by the environment variable {}; unset it to manage this domain in the config file",
+                    env.var
+                ),
+                None => format!(
+                    "domain '{domain_name}' is already registered; pass a domain name to connect this origin under a different one"
+                ),
+            };
+            return Err(EngineError::Conflict(msg));
         }
 
         let lock = self.origin_lock(&domain_name);
@@ -2394,13 +2470,13 @@ impl Engine {
         let provider = self.resolve_origin_provider()?;
         let report = ops::subscribe(provider.as_ref(), &spec, &root, &state_dir).await?;
 
-        // Register the domain and persist, mirroring `configure`'s
-        // write-lock-first pattern so a concurrent read never observes a
-        // half-applied config.
+        // Register the domain and persist, mirroring `configure`'s file-then-
+        // effective write-lock-first pattern so a concurrent read never observes
+        // a half-applied config and no env value bakes into the saved file.
         {
-            let mut guard = self.config.write().unwrap();
-            let mut config = guard.clone();
-            config.domains.insert(
+            let mut file_guard = self.file_config.write().unwrap();
+            let mut file = file_guard.clone();
+            file.domains.insert(
                 domain_name.clone(),
                 DomainEntry {
                     kind: CoreDomainKind::File,
@@ -2413,8 +2489,10 @@ impl Engine {
                     }),
                 },
             );
-            self.persist_config(&config)?;
-            *guard = config;
+            self.persist_config(&file)?;
+            let effective = self.overlay.apply(&file);
+            *file_guard = file;
+            *self.config.write().unwrap() = effective;
         }
 
         // Tell a running daemon's watcher to start watching the new root; it
@@ -2471,6 +2549,26 @@ impl Engine {
         let _guard = lock.lock().await;
 
         let (spec, root, state_dir) = self.origin_spec_for(name, entry)?;
+
+        // An env-defined team domain with no origin state yet provisions itself
+        // on first contact: the zero-config read-only node's first pull is a
+        // subscribe, not an update. This is gated on the domain being
+        // env-defined so a non-env domain with missing state still fails exactly
+        // as before (it was never fully connected). Provisioning is a
+        // derived-truth pull, so it is allowed on a read-only instance. The
+        // env check comes first so ordinary domains skip the state read on
+        // every poll tick.
+        if self.overlay.env_domain(name).is_some()
+            && crystalline_remote::state::OriginState::load(&state_dir)
+                .ok()
+                .flatten()
+                .is_none()
+        {
+            return self
+                .provision_env_origin(name, &spec, &root, &state_dir)
+                .await;
+        }
+
         let provider = self.resolve_origin_provider()?;
         let report = ops::pull(provider.as_ref(), &spec, &root, &state_dir).await?;
 
@@ -2490,6 +2588,119 @@ impl Engine {
         let proposals = origin::proposal_transitions_json(&report.proposals, state.as_ref());
 
         Ok(origin::pull_report_json(name, &report, proposals))
+    }
+
+    /// Provisions an env-defined team domain on its first contact with GitHub:
+    /// creates the root, runs the same [`ops::subscribe`] `origin_add` uses
+    /// (minus the config write, since an env domain is never persisted), then
+    /// syncs and best-effort embeds. Called under the domain's origin lock by
+    /// [`Engine::origin_update_one`]. The report is shaped like a normal update
+    /// (`up_to_date`, `applied`, `merged`, `conflicts`, `proposals`) so
+    /// `print_origin_update` and the poller's outcome handling keep working
+    /// unchanged, plus `provisioned: true` and the subscribe facts (`engrams`,
+    /// `base_commit`) a provisioned line reads from.
+    async fn provision_env_origin(
+        &self,
+        name: &str,
+        spec: &OriginSpec,
+        root: &Path,
+        state_dir: &Path,
+    ) -> Result<Value> {
+        let provider = self.resolve_origin_provider()?;
+        // notify refuses to watch a missing directory; the daemon pre-creates
+        // env-domain roots at startup, but a subscribe run outside that path
+        // (an on-demand `origin update`, a poll tick) creates it here too.
+        std::fs::create_dir_all(root).map_err(|e| {
+            EngineError::Internal(format!(
+                "could not create the domain root {}: {e}",
+                root.display()
+            ))
+        })?;
+        let report = ops::subscribe(provider.as_ref(), spec, root, state_dir).await?;
+
+        // Tell a running daemon's watcher to start watching the freshly
+        // provisioned root, the same signal `origin_add` sends.
+        if let Some(tx) = &self.watch_tx {
+            let _ = tx.send(WatchEvent::Add(name.to_string(), root.to_path_buf()));
+        }
+
+        self.sync(Some(name)).await?;
+        if let Err(e) = self.embed_pending().await {
+            tracing::warn!("embedding after provisioning '{name}' failed: {e}");
+        }
+
+        Ok(json!({
+            "domain": name,
+            "provisioned": true,
+            "up_to_date": false,
+            "applied": [],
+            "merged": [],
+            "conflicts": [],
+            "proposals": [],
+            "skipped_large": report.skipped_large,
+            "re_baselined": false,
+            "engrams": report.engrams,
+            "base_commit": report.base_commit,
+        }))
+    }
+
+    /// Self-provisions every env-defined team domain that carries an origin but
+    /// has no local origin state yet, bringing each up through
+    /// [`Engine::origin_update_one`] so provisioning and a plain background
+    /// pull stay exactly one code path. Called once from the daemon's startup
+    /// task. A missing GitHub connection is not a failure - the background
+    /// poller retries the moment a connection lands - so `NotConnected` only
+    /// logs an info line; any other per-domain error is logged and never
+    /// aborts startup. When env-origin domains exist while collaboration is
+    /// off, one warning tells the operator to turn it on.
+    pub async fn provision_env_origins(&self) {
+        let targets: Vec<(String, DomainEntry)> = self
+            .overlay
+            .env_domains()
+            .filter(|(_, env)| env.entry.origin.is_some())
+            .map(|(name, env)| (name.clone(), env.entry.clone()))
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+        if !self.config.read().unwrap().github_enabled() {
+            tracing::warn!(
+                "env-defined team domains are configured but GitHub collaboration is off; set CRYSTALLINE_GITHUB_ENABLED=true to let them provision"
+            );
+            return;
+        }
+
+        for (name, entry) in targets {
+            let Ok(state_dir) = self.origin_state_dir(&name) else {
+                continue;
+            };
+            // Already provisioned in an earlier run: nothing to do here, the
+            // poller keeps it up to date from now on.
+            let has_state = crystalline_remote::state::OriginState::load(&state_dir)
+                .ok()
+                .flatten()
+                .is_some();
+            if has_state {
+                continue;
+            }
+            match self.origin_update_one(&name, &entry).await {
+                Ok(v) => {
+                    tracing::info!(
+                        "provisioned env-defined team domain '{name}' ({} engram(s) at {})",
+                        v["engrams"].as_u64().unwrap_or(0),
+                        v["base_commit"].as_str().unwrap_or("")
+                    );
+                }
+                Err(EngineError::Remote(RemoteError::NotConnected)) => {
+                    tracing::info!(
+                        "env-defined team domain '{name}' is waiting for a GitHub connection; the poller retries automatically"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!("could not provision env-defined team domain '{name}': {e}");
+                }
+            }
+        }
     }
 
     /// Reports where one origin-connected domain (or every one, when
@@ -2651,7 +2862,12 @@ impl Engine {
                             format!("#{number} {status}")
                         })
                         .collect();
-                    if !conflict_paths.is_empty() {
+                    if v["provisioned"].as_bool().unwrap_or(false) {
+                        tracing::info!(
+                            "origin poll: provisioned '{name}' ({} engram(s))",
+                            v["engrams"].as_u64().unwrap_or(0)
+                        );
+                    } else if !conflict_paths.is_empty() {
                         tracing::info!(
                             "origin poll: '{name}' has new conflict(s): {}",
                             conflict_paths.join(", ")
@@ -3017,7 +3233,10 @@ impl Engine {
     /// This machine's GitHub connection, for `origin_status`: `{ connected,
     /// user, token_store }`. With an injected test provider, reflects the
     /// mock's own identity instead of the real token store, so origin tests
-    /// never touch the OS keychain or a real credential file.
+    /// never touch the OS keychain or a real credential file. `user` renders
+    /// as JSON `null` rather than an empty string for the environment token
+    /// store, whose synthesized identity has no login attached (see
+    /// `StoredToken::user_display`).
     async fn origin_connection_json(&self) -> Result<Value> {
         if let Some(provider) = &self.origin_provider_override {
             let user = provider.current_user().await.ok();
@@ -3035,17 +3254,24 @@ impl Engine {
         let token = store.load()?;
         Ok(json!({
             "connected": token.is_some(),
-            "user": token.as_ref().map(|t| t.user.clone()),
+            "user": token.as_ref().and_then(|t| t.user_display()),
             "token_store": store.kind(),
         }))
     }
 
-    /// Resolves the `TokenStore` backend for `host`: the test override when
-    /// one is set (see [`Engine::with_token_store_dir`]), a plain file store
+    /// Resolves the `TokenStore` backend for `host`: the environment token
+    /// first (`CRYSTALLINE_GITHUB_TOKEN`, via `self.overlay`), then the test
+    /// override (see [`Engine::with_token_store_dir`]), a plain file store
     /// that never touches the real OS keychain, otherwise the real
     /// `TokenStore::resolve` (the keyring when a cheap probe says it works,
-    /// else a file under the origins state directory).
+    /// else a file under the origins state directory). The environment wins
+    /// over the test override too, so a poller or connect test can prove the
+    /// env token is actually what gets used even when a token directory is
+    /// also wired up.
     fn resolve_token_store(&self, host: Option<&str>) -> Result<TokenStore> {
+        if let Some(token) = self.overlay.github_token() {
+            return Ok(TokenStore::env(token, host));
+        }
         if let Some(dir) = &self.token_store_dir_override {
             return Ok(TokenStore::File {
                 path: dir.join("github-token.json"),
@@ -3148,8 +3374,8 @@ impl Engine {
     /// Wraps a `github` block with the settings registry snapshot, the full
     /// shape the `configure` tool always returns.
     fn configure_snapshot_with(&self, github: Value) -> Result<Value> {
-        let config = self.config.read().unwrap().clone();
-        Ok(json!({ "settings": settings::snapshot(&config), "github": github }))
+        let file = self.file_config.read().unwrap();
+        Ok(json!({ "settings": settings::snapshot(&file, &self.overlay), "github": github }))
     }
 
     /// The `configure` tool's plain snapshot: every registry setting plus
@@ -3164,8 +3390,14 @@ impl Engine {
     /// against GitHub (or `host`, for this call only), saves it and reports
     /// the connection. Drops any unrelated pending device flow, since a PAT
     /// connect settles identity immediately and a later-landing background
-    /// flow must never overwrite that with a stale report.
+    /// flow must never overwrite that with a stale report. Refuses up front,
+    /// before validating anything against GitHub, when
+    /// `CRYSTALLINE_GITHUB_TOKEN` is set: this machine's identity is already
+    /// fixed by the environment.
     pub async fn connect_with_token(&self, token: &str, host: Option<&str>) -> Result<Value> {
+        if self.overlay.github_token().is_some() {
+            return Err(EngineError::EnvTokenConnect);
+        }
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
@@ -3197,8 +3429,13 @@ impl Engine {
     /// later `configure` call to report and clear (see
     /// [`Engine::configure_connection_block`]). Returns immediately either
     /// way: the caller sees `pending_connect` in the same call that starts
-    /// the flow, never blocking on the user confirming the code.
+    /// the flow, never blocking on the user confirming the code. Refuses up
+    /// front, before starting anything, when `CRYSTALLINE_GITHUB_TOKEN` is
+    /// set: this machine's identity is already fixed by the environment.
     pub async fn start_device_connect(&self, host: Option<&str>) -> Result<Value> {
+        if self.overlay.github_token().is_some() {
+            return Err(EngineError::EnvTokenConnect);
+        }
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
@@ -3312,22 +3549,33 @@ impl From<settings::SettingsError> for EngineError {
 
 /// Build an engine that opens the store directly for a one-shot standalone CLI
 /// command. Builds the embedding provider only when the command may need it.
+/// Takes a [`LoadedConfig`] so the environment overlay reaches a standalone
+/// command exactly as it reaches the daemon.
 pub async fn open_standalone(
-    config: GlobalConfig,
+    loaded: LoadedConfig,
     db: &Path,
     want_embeddings: bool,
 ) -> anyhow::Result<Engine> {
-    // The factory resolves the backend from `database`, creates the parent
-    // directory for a Turso file and unsizes the concrete store into a
-    // `dyn Store`. `db` is the resolved `--db` override for the Turso arm.
-    let store = crystalline_index::open_store(&config.database(), Some(db), false).await?;
-    // No `config_path`: a standalone command is one-shot, so the config it
-    // already loaded is as fresh as any re-read would be. A standalone data
-    // command has no `--read-only` flag of its own, so the mode comes purely
-    // from `service.read_only`; a read-only config refuses CLI writes here the
-    // same way the daemon refuses them over the socket.
-    let read_only = config.read_only();
-    let engine = Engine::new(store, config, None, None).with_read_only(read_only);
+    let LoadedConfig {
+        path,
+        file,
+        effective,
+        overlay,
+    } = loaded;
+    // The factory resolves the backend from the effective `database`, creates
+    // the parent directory for a Turso file and unsizes the concrete store into
+    // a `dyn Store`. `db` is the resolved `--db` override for the Turso arm.
+    let store = crystalline_index::open_store(&effective.database(), Some(db), false).await?;
+    // A standalone data command has no `--read-only` flag of its own, so the
+    // mode comes purely from the effective `service.read_only` (config or
+    // environment); a read-only config refuses CLI writes here the same way the
+    // daemon refuses them over the socket. The resolved `path` is threaded
+    // through so a domain registered mid-command persists to, and re-reads from,
+    // the same file even when it came from `CRYSTALLINE_CONFIG`.
+    let read_only = effective.read_only();
+    let engine = Engine::new(store, file, None, Some(path))
+        .with_read_only(read_only)
+        .with_env_overlay(overlay);
     // Build the provider (which may download the model) only when the index
     // already holds embeddings for the active model, so a text or filter search
     // never triggers a surprise download. With no embeddings, search falls back

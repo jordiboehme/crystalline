@@ -1,14 +1,15 @@
 # Crystalline on a shared PostgreSQL database - the federation pattern where
 # several instances share one index instead of each keeping its own.
 #
-# The `db` service runs Postgres with pgvector; Crystalline points at it via the
-# mounted config.postgres.yaml (backend: postgres). Every instance searches and
-# reads everything in the shared database. Writes follow the single-writer rule:
-# each file domain has exactly one hosting instance that syncs and watches it
-# (arbitrated by a host lock with a heartbeat), while a virtual domain keeps its
-# engrams in the database itself, so any instance may write to it under a
-# per-engram compare-and-swap guard. A second instance is included commented out
-# below to show the collaboration shape.
+# The `db` service runs Postgres with pgvector; Crystalline points at it purely
+# through CRYSTALLINE_DATABASE_BACKEND and CRYSTALLINE_DATABASE_URL, no mounted
+# config file needed. Every instance searches and reads everything in the
+# shared database. Writes follow the single-writer rule: each file domain has
+# exactly one hosting instance that syncs and watches it (arbitrated by a host
+# lock with a heartbeat), while a virtual domain keeps its engrams in the
+# database itself, so any instance may write to it under a per-engram
+# compare-and-swap guard. A second instance is included commented out below to
+# show the collaboration shape.
 #
 # The vector extension is created by Crystalline on first open, so the stock
 # pgvector image needs no init SQL. Losing the Postgres volume loses virtual
@@ -20,14 +21,21 @@
 #   docker compose -f examples/docker/compose.postgres.yaml up -d
 #
 # Bootstrap a file domain (hosted by this instance) and a shared virtual domain
-# (its engrams live in Postgres, every instance sees them). domain add rewrites
-# the mounted config, so pass the same --config every time:
+# (its engrams live in Postgres, every instance sees them). domain add persists
+# into the default config under the /data volume (XDG_CONFIG_HOME=/data/config,
+# see Dockerfile), so no --config flag is needed:
 #   docker compose -f examples/docker/compose.postgres.yaml run --rm crystalline \
 #     domain init /knowledge/team --name team
 #   docker compose -f examples/docker/compose.postgres.yaml run --rm crystalline \
-#     domain add team /knowledge/team --config /config/config.yaml
+#     domain add team /knowledge/team
 #   docker compose -f examples/docker/compose.postgres.yaml run --rm crystalline \
-#     domain add shared --virtual --config /config/config.yaml
+#     domain add shared --virtual
+#
+# Fully immutable alternative: skip domain add and the bootstrap commands
+# above entirely, and declare the team domain itself as an environment
+# variable, so nothing is ever written to a config file at all - add this to
+# the crystalline service's environment: block below:
+#   CRYSTALLINE_DOMAIN_TEAM: /knowledge/team
 
 services:
   db:
@@ -49,14 +57,16 @@ services:
     image: ghcr.io/jordiboehme/crystalline:latest
     # Alternative with the embedding model baked in (no first-start download):
     # image: ghcr.io/jordiboehme/crystalline:with-model
-    command: ["serve", "--http", "0.0.0.0:7411", "--config", "/config/config.yaml"]
+    command: ["serve", "--http", "0.0.0.0:7411"]
+    environment:
+      CRYSTALLINE_DATABASE_BACKEND: postgres
+      CRYSTALLINE_DATABASE_URL: postgres://crystalline:crystalline@db:5432/crystalline
     depends_on:
       db:
         condition: service_healthy
     ports:
       - "7411:7411"
     volumes:
-      - ./config.postgres.yaml:/config/config.yaml
       - ./knowledge:/knowledge
       - crystalline-data:/data
     restart: unless-stopped
@@ -64,20 +74,22 @@ services:
   # A second instance sharing the same Postgres, the collaboration case. It
   # searches and reads everything the first instance indexed and can host its own
   # file domains and write the shared virtual domains, while the host lock keeps
-  # exactly one instance syncing each file domain. Give it its own config and, if
-  # it hosts file domains, its own knowledge mount. `serve --take-over` migrates
-  # hosting of a domain to this instance on purpose.
+  # exactly one instance syncing each file domain. Give it its own knowledge
+  # mount if it hosts file domains. `serve --take-over` migrates hosting of a
+  # domain to this instance on purpose.
   #
   # crystalline-b:
   #   image: ghcr.io/jordiboehme/crystalline:latest
-  #   command: ["serve", "--http", "0.0.0.0:7411", "--config", "/config/config.yaml"]
+  #   command: ["serve", "--http", "0.0.0.0:7411"]
+  #   environment:
+  #     CRYSTALLINE_DATABASE_BACKEND: postgres
+  #     CRYSTALLINE_DATABASE_URL: postgres://crystalline:crystalline@db:5432/crystalline
   #   depends_on:
   #     db:
   #       condition: service_healthy
   #   ports:
   #     - "7412:7411"
   #   volumes:
-  #     - ./config.postgres.b.yaml:/config/config.yaml
   #     - ./knowledge-b:/knowledge
   #     - crystalline-data-b:/data
   #   restart: unless-stopped

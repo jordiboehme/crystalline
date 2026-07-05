@@ -9,8 +9,9 @@ use std::sync::Arc;
 
 use crystalline_core::config::GlobalConfig;
 use crystalline_index::TursoStore;
-use crystalline_service::Engine;
 use crystalline_service::engine::ConfigureAction;
+use crystalline_service::settings::SettingSource;
+use crystalline_service::{Engine, EnvOverlay};
 use tokio::sync::Mutex;
 
 async fn engine_at(config_path: &std::path::Path, read_only: bool) -> Engine {
@@ -22,6 +23,25 @@ async fn engine_at(config_path: &std::path::Path, read_only: bool) -> Engine {
         Some(config_path.to_path_buf()),
     )
     .with_read_only(read_only)
+}
+
+/// An engine at `config_path` with an environment overlay parsed from `vars`,
+/// injected the seam-safe way: no test ever touches the process environment.
+async fn engine_with_overlay(config_path: &std::path::Path, vars: &[(&str, &str)]) -> Engine {
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let overlay = EnvOverlay::from_vars(
+        vars.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    Engine::new(
+        Arc::new(Mutex::new(store)),
+        GlobalConfig::default(),
+        None,
+        Some(config_path.to_path_buf()),
+    )
+    .with_env_overlay(overlay)
 }
 
 fn settings_of(data: &serde_json::Value) -> Vec<crystalline_service::settings::SettingView> {
@@ -36,8 +56,12 @@ async fn show_lists_every_registry_key_at_its_default() {
 
     let data = engine.configure(&ConfigureAction::Show).await.unwrap();
     let views = settings_of(&data);
-    assert_eq!(views.len(), 4);
-    assert!(views.iter().all(|v| v.is_default));
+    assert_eq!(views.len(), 8);
+    assert!(
+        views
+            .iter()
+            .all(|v| v.source == crystalline_service::settings::SettingSource::Default)
+    );
     assert_eq!(views[0].key, "github.enabled");
     assert_eq!(views[0].value, "false");
 }
@@ -57,7 +81,7 @@ async fn set_persists_to_the_config_file_and_updates_the_in_memory_config() {
         .unwrap();
     assert_eq!(data["key"], "github.enabled");
     assert_eq!(data["value"], "true");
-    assert_eq!(data["is_default"], false);
+    assert_eq!(data["source"], "config");
 
     // The file on disk carries the change...
     let on_disk: GlobalConfig = crystalline_core::config::load_yaml(&config_path).unwrap();
@@ -87,7 +111,7 @@ async fn unset_returns_to_default_and_the_file_drops_an_emptied_github_block() {
         .await
         .unwrap();
     assert_eq!(data["value"], "false");
-    assert_eq!(data["is_default"], true);
+    assert_eq!(data["source"], "default");
 
     assert!(!engine.config().github_enabled());
     let raw = std::fs::read_to_string(&config_path).unwrap();
@@ -259,4 +283,114 @@ async fn unset_fails_to_persist_leaves_in_memory_config_unchanged() {
         Some("true"),
         "in-memory config must stay at applied value after failed unset persist"
     );
+}
+
+#[tokio::test]
+async fn set_service_read_only_persists_and_carries_the_startup_effective_note() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_path = tmp.path().join("config.yaml");
+    let engine = engine_at(&config_path, false).await;
+
+    let data = engine
+        .configure(&ConfigureAction::Set {
+            key: "service.read_only".to_string(),
+            value: "true".to_string(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(data["key"], "service.read_only");
+    assert_eq!(data["value"], "true");
+    assert_eq!(data["source"], "config");
+    assert_eq!(
+        data["note"],
+        "this setting applies the next time the daemon starts; a running daemon keeps its current value"
+    );
+
+    let on_disk: GlobalConfig = crystalline_core::config::load_yaml(&config_path).unwrap();
+    assert!(on_disk.read_only());
+
+    let data = engine
+        .configure(&ConfigureAction::Unset {
+            key: "service.read_only".to_string(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(data["value"], "false");
+    assert_eq!(data["source"], "default");
+
+    let raw = std::fs::read_to_string(&config_path).unwrap();
+    assert!(
+        !raw.contains("service"),
+        "an emptied service block must not round-trip into the saved file: {raw}"
+    );
+}
+
+#[tokio::test]
+async fn show_reports_an_env_overridden_setting_as_source_env() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_path = tmp.path().join("config.yaml");
+    let engine = engine_with_overlay(&config_path, &[("CRYSTALLINE_GITHUB_ENABLED", "true")]).await;
+
+    let data = engine.configure(&ConfigureAction::Show).await.unwrap();
+    let views = settings_of(&data);
+    let enabled = views.iter().find(|v| v.key == "github.enabled").unwrap();
+    assert_eq!(enabled.value, "true", "the effective env value is shown");
+    assert_eq!(enabled.source, SettingSource::Env);
+
+    // The engine's effective config drives MCP gating, so github.enabled set
+    // only through the environment turns collaboration on.
+    assert!(
+        engine.config().github_enabled(),
+        "effective config reflects the env override"
+    );
+}
+
+#[tokio::test]
+async fn set_on_an_env_overridden_key_persists_the_file_value_while_the_view_stays_env() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_path = tmp.path().join("config.yaml");
+    // The environment forces github.poll_secs to 600; a `config set` writes a
+    // different value to the file, but the view keeps reporting the effective
+    // env value and the on-disk file never gains the env value.
+    let engine =
+        engine_with_overlay(&config_path, &[("CRYSTALLINE_GITHUB_POLL_SECS", "600")]).await;
+
+    let data = engine
+        .configure(&ConfigureAction::Set {
+            key: "github.poll_secs".to_string(),
+            value: "120".to_string(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        data["value"], "600",
+        "the view shows the effective env value"
+    );
+    assert_eq!(data["source"], "env");
+    let note = data["note"].as_str().unwrap_or_default();
+    assert!(
+        note.contains("CRYSTALLINE_GITHUB_POLL_SECS"),
+        "the override note names the variable: {note}"
+    );
+    assert!(
+        note.contains("takes effect once that variable is removed"),
+        "{note}"
+    );
+
+    // The file on disk carries the saved value, never the env value.
+    let raw = std::fs::read_to_string(&config_path).unwrap();
+    assert!(raw.contains("120"), "the file keeps the saved value: {raw}");
+    assert!(
+        !raw.contains("600"),
+        "the env value must never bake into the file: {raw}"
+    );
+    let on_disk: GlobalConfig = crystalline_core::config::load_yaml(&config_path).unwrap();
+    assert_eq!(on_disk.github.as_ref().unwrap().poll_secs, Some(120));
+
+    // A later show still reports the env value with source env.
+    let show = engine.configure(&ConfigureAction::Show).await.unwrap();
+    let views = settings_of(&show);
+    let poll = views.iter().find(|v| v.key == "github.poll_secs").unwrap();
+    assert_eq!(poll.value, "600");
+    assert_eq!(poll.source, SettingSource::Env);
 }
