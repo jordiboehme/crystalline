@@ -510,3 +510,58 @@ fn github_section_reports_a_base_snapshot_mismatch_as_a_problem() {
 
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+#[cfg(unix)]
+fn github_section_reports_the_environment_token_store_when_the_variable_is_set() {
+    let (home, _state_dir) = isolated_home("env-token");
+    let work = tempfile::tempdir().unwrap();
+    let config = work.path().join("config.yaml");
+    // No domains and no on-disk `github.enabled`: turning collaboration on
+    // and supplying the token both come from the environment alone, proving
+    // the overlay drives `check_github` end to end.
+
+    let mut cmd = bin();
+    apply_home(&mut cmd, &home);
+    let out = cmd
+        .env("CRYSTALLINE_GITHUB_ENABLED", "true")
+        .env("CRYSTALLINE_GITHUB_TOKEN", "gho_SECRETSECRET")
+        .args(["--json", "doctor", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(work.path().join("index.db"))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(report["github"]["connected"], serde_json::json!(true));
+    assert_eq!(report["github"]["user"], serde_json::Value::Null);
+    assert_eq!(
+        report["github"]["token_store"],
+        serde_json::json!("environment")
+    );
+
+    let human = {
+        let mut cmd = bin();
+        apply_home(&mut cmd, &home);
+        cmd.env("CRYSTALLINE_GITHUB_ENABLED", "true")
+            .env("CRYSTALLINE_GITHUB_TOKEN", "gho_SECRETSECRET")
+            .args(["doctor", "--config"])
+            .arg(&config)
+            .args(["--db"])
+            .arg(work.path().join("index.db"))
+            .output()
+            .unwrap()
+            .stdout
+    };
+    let human = String::from_utf8(human).unwrap();
+    assert!(
+        human.contains("connected via CRYSTALLINE_GITHUB_TOKEN (environment token store)"),
+        "{human}"
+    );
+    assert!(!human.contains("SECRET"), "{human}");
+
+    let _ = std::fs::remove_dir_all(&home);
+}

@@ -242,6 +242,48 @@ async fn a_poll_tick_provisions_a_due_env_origin_domain() {
 }
 
 #[tokio::test]
+async fn a_poll_tick_proceeds_with_an_env_token_and_no_saved_token_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let c1 = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        ("notes/alpha.md", engram("Alpha", "alpha", "version one")),
+    ]));
+    mock.set_branch("main", &c1);
+
+    let token_dir = tmp.path().join("token");
+    let origins_dir = tmp.path().join("origins");
+    let root = tmp.path().join("team");
+    let eng = engine_with_env(
+        &tmp.path().join("config.yaml"),
+        &origins_dir,
+        &token_dir,
+        mock.clone(),
+        &[
+            ("CRYSTALLINE_DOMAIN_TEAM", root.to_str().unwrap()),
+            ("CRYSTALLINE_DOMAIN_TEAM_ORIGIN", "acme/brand-knowledge"),
+            ("CRYSTALLINE_GITHUB_TOKEN", "gho_SECRETSECRET"),
+        ],
+    )
+    .await;
+    // Deliberately no `write_fake_token`: the connectivity gate this tick
+    // must pass through `origin_connection_offline` is satisfied by the
+    // environment token alone, not by anything on disk in `token_dir`.
+
+    eng.origin_poll_tick(Instant::now(), Utc::now()).await;
+
+    assert!(
+        root.join("notes/alpha.md").exists(),
+        "the tick provisioned the domain, proving it did not skip for lack of a connection"
+    );
+
+    let status = eng.status_report().await.unwrap();
+    assert_eq!(status["origins"]["token_store"], "environment");
+    let domains = status["origins"]["domains"].as_array().unwrap();
+    assert_eq!(domains[0]["last_result"]["outcome"], "applied");
+}
+
+#[tokio::test]
 async fn poller_does_not_repoll_a_domain_before_its_next_due_instant() {
     let tmp = tempfile::tempdir().unwrap();
     let mock = Arc::new(MockProvider::new());

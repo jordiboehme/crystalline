@@ -21,6 +21,7 @@ use crystalline_core::config::{GitHubConfig, GlobalConfig};
 use crystalline_index::TursoStore;
 use crystalline_remote::{DeviceFlowStart, RemoteError};
 use crystalline_service::Engine;
+use crystalline_service::EnvOverlay;
 use crystalline_service::engine::{ConnectAuth, EngineError};
 use crystalline_service::mcp::McpServer;
 use rmcp::model::CallToolRequestParams;
@@ -491,6 +492,25 @@ async fn engine_for_connect(auth: Arc<FakeConnectAuth>, dir: &std::path::Path) -
     .with_token_store_dir(dir.to_path_buf())
 }
 
+/// The same wiring as [`engine_for_connect`], plus `CRYSTALLINE_GITHUB_TOKEN`
+/// in the environment overlay: the token store directory stays wired up too,
+/// so a test built this way can prove the environment wins over it rather
+/// than merely being the only option available.
+async fn engine_for_connect_with_env_token(
+    auth: Arc<FakeConnectAuth>,
+    dir: &std::path::Path,
+    token: &str,
+) -> Engine {
+    let overlay = EnvOverlay::from_vars(vec![(
+        "CRYSTALLINE_GITHUB_TOKEN".to_string(),
+        token.to_string(),
+    )])
+    .unwrap();
+    engine_for_connect(auth, dir)
+        .await
+        .with_env_overlay(overlay)
+}
+
 #[tokio::test]
 async fn token_connect_validates_saves_and_reports_connected() {
     let tmp = tempfile::tempdir().unwrap();
@@ -533,6 +553,67 @@ async fn token_connect_refuses_on_a_read_only_engine() {
 
     let err = eng.connect_with_token("pat-123", None).await.unwrap_err();
     assert!(matches!(err, EngineError::ReadOnly));
+}
+
+#[tokio::test]
+async fn token_connect_refuses_when_the_environment_owns_the_token() {
+    let tmp = tempfile::tempdir().unwrap();
+    let auth = fake_auth(
+        Err(RemoteError::NotConnected),
+        Err(RemoteError::NotConnected),
+        Ok("octocat".to_string()),
+    );
+    let eng = engine_for_connect_with_env_token(auth, tmp.path(), "gho_SECRETSECRET").await;
+
+    let err = eng.connect_with_token("pat-123", None).await.unwrap_err();
+    assert!(matches!(err, EngineError::EnvTokenConnect));
+    assert!(
+        err.to_string().contains("CRYSTALLINE_GITHUB_TOKEN"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn device_flow_refuses_when_the_environment_owns_the_token() {
+    let tmp = tempfile::tempdir().unwrap();
+    let auth = fake_auth(
+        Ok(device_flow_start()),
+        Ok("device-token".to_string()),
+        Ok("octocat".to_string()),
+    );
+    let eng = engine_for_connect_with_env_token(auth, tmp.path(), "gho_SECRETSECRET").await;
+
+    let err = eng.start_device_connect(None).await.unwrap_err();
+    assert!(matches!(err, EngineError::EnvTokenConnect));
+    assert!(
+        err.to_string().contains("CRYSTALLINE_GITHUB_TOKEN"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn env_token_wins_over_the_test_token_dir_override() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Every FakeConnectAuth outcome is set to fail: if the engine somehow
+    // fell through to the test token directory (which has no saved token
+    // either), reading the snapshot would still not need any of these, so a
+    // wrong resolution would only be caught by the token_store assertion
+    // below, not by a spurious success or failure here.
+    let auth = fake_auth(
+        Err(RemoteError::NotConnected),
+        Err(RemoteError::NotConnected),
+        Err(RemoteError::NotConnected),
+    );
+    let eng = engine_for_connect_with_env_token(auth, tmp.path(), "gho_SECRETSECRET").await;
+
+    let snap = eng.configure_snapshot().await.unwrap();
+    assert_eq!(snap["github"]["connected"], json!(true));
+    assert_eq!(
+        snap["github"]["user"],
+        Value::Null,
+        "the env store's unknown login renders as null, not an empty string"
+    );
+    assert_eq!(snap["github"]["token_store"], json!("environment"));
 }
 
 #[tokio::test]

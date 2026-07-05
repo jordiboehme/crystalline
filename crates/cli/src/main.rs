@@ -1144,11 +1144,15 @@ fn print_origin_status(data: &serde_json::Value, json: bool) {
     }
     let connection = &data["connection"];
     if connection["connected"].as_bool().unwrap_or(false) {
-        println!(
-            "GitHub: connected as {} ({} token store)",
-            connection["user"].as_str().unwrap_or("?"),
-            connection["token_store"].as_str().unwrap_or("?")
-        );
+        if connection["token_store"].as_str() == Some("environment") {
+            println!("GitHub: connected via CRYSTALLINE_GITHUB_TOKEN (environment token store)");
+        } else {
+            println!(
+                "GitHub: connected as {} ({} token store)",
+                connection["user"].as_str().unwrap_or("?"),
+                connection["token_store"].as_str().unwrap_or("?")
+            );
+        }
     } else {
         println!("GitHub: not connected. Run: crystalline connect github");
     }

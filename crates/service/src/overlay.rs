@@ -31,6 +31,12 @@
 //! be env-defined (that spelling is always read as an origin attachment), and
 //! a file domain whose name contains an underscore cannot be env-shadowed
 //! (env names map `_` to `-`, so they never collide with an underscore name).
+//!
+//! `CRYSTALLINE_GITHUB_TOKEN` carries a GitHub token for a headless node: see
+//! [`GITHUB_TOKEN_ENV`] and [`EnvOverlay::github_token`]. It is never applied
+//! to a `GlobalConfig` (there is no config field for it), never appears in
+//! [`EnvOverlay::active_overrides`] beyond a `(set)` placeholder and never
+//! prints through this type's `Debug` impl, which redacts it by hand.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -57,15 +63,21 @@ pub const DOMAIN_ENV_PREFIX: &str = "CRYSTALLINE_DOMAIN_";
 /// domain: `CRYSTALLINE_DOMAIN_<NAME>_ORIGIN`.
 const DOMAIN_ORIGIN_SUFFIX: &str = "_ORIGIN";
 
-/// The variable carrying a GitHub token for a headless node. Reserved here:
-/// skipped silently until the milestone that reads it lands, so it never trips
-/// the unknown-variable warning in the meantime.
+/// The variable carrying a GitHub token for a headless node:
+/// `CRYSTALLINE_GITHUB_TOKEN`. Checked before the keyring and the file store
+/// (see `Engine::resolve_token_store`), so a container with this variable set
+/// never needs an interactive sign-in. Read-only: a saved token is never
+/// consulted while this is set, `connect github` refuses and `crates/remote`
+/// never reads it itself (see [`crate::engine::Engine::resolve_token_store`]
+/// and the `crystalline_remote::token` module docs).
 pub const GITHUB_TOKEN_ENV: &str = "CRYSTALLINE_GITHUB_TOKEN";
 
-/// Variables that live outside the settings registry and are read elsewhere
-/// (or reserved for a later milestone). They are skipped silently rather than
-/// warned about, so a legitimate deployment does not get a spurious warning
-/// for a variable Crystalline itself documents.
+/// Variables that live outside the settings registry and are read elsewhere.
+/// They are skipped silently rather than warned about, so a legitimate
+/// deployment does not get a spurious warning for a variable Crystalline
+/// itself documents. [`GITHUB_TOKEN_ENV`] is handled separately in
+/// [`EnvOverlay::from_vars`], not through this list, since it becomes real
+/// overlay state rather than being ignored.
 const RESERVED_VARS: &[&str] = &[
     "CRYSTALLINE_MODELS_DIR",
     "CRYSTALLINE_HEARTBEAT_SECS",
@@ -95,7 +107,11 @@ pub struct EnvDomain {
 /// The validated environment overlay: the `CRYSTALLINE_*` variables that layer
 /// on top of the config file. Parsed once, then applied to a file config to
 /// produce the effective config every runtime read uses.
-#[derive(Debug, Clone, Default)]
+///
+/// Deliberately does not derive `Debug`: [`EnvOverlay::github_token`] carries
+/// a secret, so the impl below is written by hand to redact it, the same way
+/// `crystalline_remote::StoredToken` redacts `access_token`.
+#[derive(Clone, Default)]
 pub struct EnvOverlay {
     /// Registry key to raw value, one entry per setting variable that was
     /// present and non-empty. Each value was validated at parse time by
@@ -105,9 +121,31 @@ pub struct EnvOverlay {
     /// hyphenated form). Merged into the effective domain map last, so an env
     /// domain wins over a file entry of the same name.
     domains: IndexMap<String, EnvDomain>,
+    /// The GitHub token from [`GITHUB_TOKEN_ENV`], when set and non-empty.
+    /// Never written back to the config file and never the `Default`/`Clone`
+    /// derive's business to print: see the manual `Debug` impl below.
+    github_token: Option<String>,
     /// The config file path from [`CONFIG_PATH_ENV`], tilde-expanded. `None`
     /// when the variable is absent or empty.
     config_path: Option<PathBuf>,
+}
+
+/// Redacts `github_token`: an `EnvOverlay` is long-lived on `Engine` and far
+/// more likely to reach a log line or a test failure message via `Debug` than
+/// via any deliberate print, so the secret is masked unconditionally rather
+/// than trusting every future caller to remember not to print it.
+impl std::fmt::Debug for EnvOverlay {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EnvOverlay")
+            .field("settings", &self.settings)
+            .field("domains", &self.domains)
+            .field(
+                "github_token",
+                &self.github_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("config_path", &self.config_path)
+            .finish()
+    }
 }
 
 impl EnvOverlay {
@@ -135,12 +173,17 @@ impl EnvOverlay {
     /// `CRYSTALLINE_DOMAIN_<NAME>` is not itself defined is fatal. All
     /// `CRYSTALLINE_DOMAIN_*` variables are collected first, so an origin may
     /// appear before its base domain in the iterator without failing.
+    ///
+    /// [`GITHUB_TOKEN_ENV`], when present and non-empty, is captured as
+    /// [`EnvOverlay::github_token`]; an empty value reads as unset, the same
+    /// as every setting variable.
     pub fn from_vars<I>(vars: I) -> Result<EnvOverlay, OverlayError>
     where
         I: IntoIterator<Item = (String, String)>,
     {
         let mut settings = Vec::new();
         let mut config_path = None;
+        let mut github_token = None;
         // A scratch config the setting values are applied to as they parse, so
         // the combined database check below sees every applied value at once.
         let mut scratch = GlobalConfig::default();
@@ -158,6 +201,12 @@ impl EnvOverlay {
             if name == CONFIG_PATH_ENV {
                 if !value.is_empty() {
                     config_path = Some(config::expand_tilde(&value));
+                }
+                continue;
+            }
+            if name == GITHUB_TOKEN_ENV {
+                if !value.is_empty() {
+                    github_token = Some(value);
                 }
                 continue;
             }
@@ -207,6 +256,7 @@ impl EnvOverlay {
         Ok(EnvOverlay {
             settings,
             domains,
+            github_token,
             config_path,
         })
     }
@@ -217,10 +267,14 @@ impl EnvOverlay {
         EnvOverlay::from_vars(std::env::vars())
     }
 
-    /// Whether the overlay carries nothing: no setting override, no env domain
-    /// and no config path. A no-op overlay leaves the file config untouched.
+    /// Whether the overlay carries nothing: no setting override, no env
+    /// domain, no GitHub token and no config path. A no-op overlay leaves the
+    /// file config untouched.
     pub fn is_empty(&self) -> bool {
-        self.settings.is_empty() && self.domains.is_empty() && self.config_path.is_none()
+        self.settings.is_empty()
+            && self.domains.is_empty()
+            && self.github_token.is_none()
+            && self.config_path.is_none()
     }
 
     /// Apply the overlay to a file config, returning the effective config.
@@ -280,12 +334,21 @@ impl EnvOverlay {
         self.config_path.as_deref()
     }
 
+    /// The GitHub token from [`GITHUB_TOKEN_ENV`], if the environment set
+    /// one. `Engine::resolve_token_store` checks this before the keyring and
+    /// the file store; nothing else in the process reads
+    /// `CRYSTALLINE_GITHUB_TOKEN` directly.
+    pub fn github_token(&self) -> Option<&str> {
+        self.github_token.as_deref()
+    }
+
     /// Every active override as `(variable, key, display value)`, for surfacing
     /// in `doctor` and the like: first the setting overrides, then the
     /// env-defined domains (keyed `domain.<name>`, their path as the display
-    /// value). The `database.url` value is rendered as `(set)` rather than
-    /// shown, since it may embed credentials; a domain path carries no secret
-    /// and is shown as-is.
+    /// value), then the GitHub token, if set (keyed `github.token`). The
+    /// `database.url` value and the GitHub token are both rendered as `(set)`
+    /// rather than shown, since either may be a credential; a domain path
+    /// carries no secret and is shown as-is.
     pub fn active_overrides(&self) -> Vec<(String, String, String)> {
         let mut out: Vec<(String, String, String)> = self
             .settings
@@ -306,6 +369,13 @@ impl EnvOverlay {
                 .map(|p| p.display().to_string())
                 .unwrap_or_default();
             out.push((env_domain.var.clone(), format!("domain.{name}"), path));
+        }
+        if self.github_token.is_some() {
+            out.push((
+                GITHUB_TOKEN_ENV.to_string(),
+                "github.token".to_string(),
+                "(set)".to_string(),
+            ));
         }
         out
     }
@@ -409,11 +479,11 @@ fn parse_env_origin(value: &str) -> Result<OriginConfig, String> {
 }
 
 /// Whether `name` is a reserved `CRYSTALLINE_*` variable that is skipped
-/// silently rather than warned about: one read outside the registry or the
-/// GitHub token, neither handled here. Env-domain variables are not reserved:
-/// they are parsed into [`EnvOverlay::domains`] before this check runs.
+/// silently rather than warned about: read outside the registry, not handled
+/// here. Env-domain variables and [`GITHUB_TOKEN_ENV`] are not reserved: both
+/// are parsed into real `EnvOverlay` state before this check ever runs.
 fn is_reserved(name: &str) -> bool {
-    RESERVED_VARS.contains(&name) || name == GITHUB_TOKEN_ENV
+    RESERVED_VARS.contains(&name)
 }
 
 /// The environment variable a registry key maps to. Every stored setting key
@@ -577,7 +647,6 @@ mod tests {
             ("CRYSTALLINE_HEARTBEAT_SECS", "5"),
             ("CRYSTALLINE_STALE_SECS", "15"),
             ("CRYSTALLINE_TEST_POSTGRES_URL", "postgres://db/test"),
-            ("CRYSTALLINE_GITHUB_TOKEN", "ghp_secret"),
         ])
         .unwrap();
         assert!(
@@ -910,5 +979,67 @@ mod tests {
             overrides.iter().any(|(_, key, _)| key == "github.enabled"),
             "setting overrides are still listed alongside domains"
         );
+    }
+
+    // --- the GitHub token -----------------------------------------------------
+
+    #[test]
+    fn the_github_token_is_picked_up() {
+        let ov = overlay(&[("CRYSTALLINE_GITHUB_TOKEN", "gho_SECRETSECRET")]).unwrap();
+        assert_eq!(ov.github_token(), Some("gho_SECRETSECRET"));
+        assert!(!ov.is_empty());
+    }
+
+    #[test]
+    fn an_empty_github_token_is_ignored() {
+        let ov = overlay(&[("CRYSTALLINE_GITHUB_TOKEN", "")]).unwrap();
+        assert_eq!(ov.github_token(), None);
+        assert!(ov.is_empty());
+    }
+
+    #[test]
+    fn no_github_token_variable_leaves_the_accessor_none() {
+        let ov = overlay(&[]).unwrap();
+        assert_eq!(ov.github_token(), None);
+    }
+
+    #[test]
+    fn active_overrides_masks_the_github_token() {
+        let ov = overlay(&[("CRYSTALLINE_GITHUB_TOKEN", "gho_SECRETSECRET")]).unwrap();
+        let overrides = ov.active_overrides();
+        let token = overrides
+            .iter()
+            .find(|(_, key, _)| key == "github.token")
+            .expect("the token is listed among the active overrides");
+        assert_eq!(token.0, "CRYSTALLINE_GITHUB_TOKEN");
+        assert_eq!(token.2, "(set)", "the token value must never be shown");
+        for (_, _, value) in &overrides {
+            assert!(!value.contains("SECRET"), "{value}");
+        }
+    }
+
+    #[test]
+    fn active_overrides_omits_the_github_token_entry_when_unset() {
+        let ov = overlay(&[("CRYSTALLINE_GITHUB_ENABLED", "true")]).unwrap();
+        assert!(
+            !ov.active_overrides()
+                .iter()
+                .any(|(_, key, _)| key == "github.token")
+        );
+    }
+
+    #[test]
+    fn debug_output_of_the_overlay_never_shows_the_github_token_or_a_prefix_of_it() {
+        let ov = overlay(&[
+            ("CRYSTALLINE_GITHUB_ENABLED", "true"),
+            ("CRYSTALLINE_GITHUB_TOKEN", "gho_SECRETSECRET"),
+        ])
+        .unwrap();
+        let debugged = format!("{ov:?}");
+        assert!(!debugged.contains("SECRET"), "{debugged}");
+        assert!(debugged.contains("<redacted>"), "{debugged}");
+        // Everything else still prints, so the redaction is targeted rather
+        // than blanking the whole struct.
+        assert!(debugged.contains("github.enabled"), "{debugged}");
     }
 }

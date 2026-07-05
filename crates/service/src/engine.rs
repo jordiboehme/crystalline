@@ -94,6 +94,14 @@ pub enum EngineError {
     /// A content mutation was attempted against a read-only instance.
     #[error("this instance is read-only; content mutations are disabled")]
     ReadOnly,
+    /// An interactive connect action (`connect_with_token`,
+    /// `start_device_connect`) was attempted while `CRYSTALLINE_GITHUB_TOKEN`
+    /// is set. This machine's identity is fixed by the environment, so there
+    /// is nothing for a sign-in to change until the variable is unset.
+    #[error(
+        "this machine's GitHub identity comes from CRYSTALLINE_GITHUB_TOKEN; unset it to sign in interactively"
+    )]
+    EnvTokenConnect,
     /// A filesystem error.
     #[error("io error at {path}: {source}")]
     Io {
@@ -3225,7 +3233,10 @@ impl Engine {
     /// This machine's GitHub connection, for `origin_status`: `{ connected,
     /// user, token_store }`. With an injected test provider, reflects the
     /// mock's own identity instead of the real token store, so origin tests
-    /// never touch the OS keychain or a real credential file.
+    /// never touch the OS keychain or a real credential file. `user` renders
+    /// as JSON `null` rather than an empty string for the environment token
+    /// store, whose synthesized identity has no login attached (see
+    /// `StoredToken::user_display`).
     async fn origin_connection_json(&self) -> Result<Value> {
         if let Some(provider) = &self.origin_provider_override {
             let user = provider.current_user().await.ok();
@@ -3243,17 +3254,24 @@ impl Engine {
         let token = store.load()?;
         Ok(json!({
             "connected": token.is_some(),
-            "user": token.as_ref().map(|t| t.user.clone()),
+            "user": token.as_ref().and_then(|t| t.user_display()),
             "token_store": store.kind(),
         }))
     }
 
-    /// Resolves the `TokenStore` backend for `host`: the test override when
-    /// one is set (see [`Engine::with_token_store_dir`]), a plain file store
+    /// Resolves the `TokenStore` backend for `host`: the environment token
+    /// first (`CRYSTALLINE_GITHUB_TOKEN`, via `self.overlay`), then the test
+    /// override (see [`Engine::with_token_store_dir`]), a plain file store
     /// that never touches the real OS keychain, otherwise the real
     /// `TokenStore::resolve` (the keyring when a cheap probe says it works,
-    /// else a file under the origins state directory).
+    /// else a file under the origins state directory). The environment wins
+    /// over the test override too, so a poller or connect test can prove the
+    /// env token is actually what gets used even when a token directory is
+    /// also wired up.
     fn resolve_token_store(&self, host: Option<&str>) -> Result<TokenStore> {
+        if let Some(token) = self.overlay.github_token() {
+            return Ok(TokenStore::env(token, host));
+        }
         if let Some(dir) = &self.token_store_dir_override {
             return Ok(TokenStore::File {
                 path: dir.join("github-token.json"),
@@ -3372,8 +3390,14 @@ impl Engine {
     /// against GitHub (or `host`, for this call only), saves it and reports
     /// the connection. Drops any unrelated pending device flow, since a PAT
     /// connect settles identity immediately and a later-landing background
-    /// flow must never overwrite that with a stale report.
+    /// flow must never overwrite that with a stale report. Refuses up front,
+    /// before validating anything against GitHub, when
+    /// `CRYSTALLINE_GITHUB_TOKEN` is set: this machine's identity is already
+    /// fixed by the environment.
     pub async fn connect_with_token(&self, token: &str, host: Option<&str>) -> Result<Value> {
+        if self.overlay.github_token().is_some() {
+            return Err(EngineError::EnvTokenConnect);
+        }
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
@@ -3405,8 +3429,13 @@ impl Engine {
     /// later `configure` call to report and clear (see
     /// [`Engine::configure_connection_block`]). Returns immediately either
     /// way: the caller sees `pending_connect` in the same call that starts
-    /// the flow, never blocking on the user confirming the code.
+    /// the flow, never blocking on the user confirming the code. Refuses up
+    /// front, before starting anything, when `CRYSTALLINE_GITHUB_TOKEN` is
+    /// set: this machine's identity is already fixed by the environment.
     pub async fn start_device_connect(&self, host: Option<&str>) -> Result<Value> {
+        if self.overlay.github_token().is_some() {
+            return Err(EngineError::EnvTokenConnect);
+        }
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }

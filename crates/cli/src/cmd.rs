@@ -1047,14 +1047,22 @@ fn print_import_report(r: &crystalline_core::import::ImportReport, dry_run: bool
 /// device flow, printing the short code and verification url unmissably
 /// before waiting on it to be confirmed. Works whether or not team domains
 /// are turned on yet; prints a one-line hint to turn them on when they are
-/// currently off.
+/// currently off. Refuses up front when `CRYSTALLINE_GITHUB_TOKEN` is set:
+/// this machine's identity is already fixed by the environment, so there is
+/// nothing for an interactive sign-in to change.
 pub async fn connect_github(
     token: Option<&str>,
     host: Option<&str>,
     config_override: Option<&Path>,
     json: bool,
 ) -> Result<()> {
-    let cfg = load(config_override)?.effective;
+    let loaded = load(config_override)?;
+    if loaded.overlay.github_token().is_some() {
+        bail!(
+            "this machine's GitHub identity comes from CRYSTALLINE_GITHUB_TOKEN; unset it to sign in interactively"
+        );
+    }
+    let cfg = loaded.effective;
     let api_url = host
         .map(|h| format!("https://{h}/api/v3"))
         .or_else(|| cfg.github.as_ref().and_then(|g| g.api_url.clone()));

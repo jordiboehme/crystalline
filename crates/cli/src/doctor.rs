@@ -127,13 +127,16 @@ pub struct OriginDoctor {
 /// otherwise, matching how `embeddings` is `None` with no index yet).
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct GithubDoctor {
-    /// Whether a GitHub token is on file for this machine.
+    /// Whether a GitHub token is on file for this machine (or supplied by
+    /// `CRYSTALLINE_GITHUB_TOKEN`).
     pub connected: bool,
-    /// The connected user's login, `None` when not connected.
+    /// The connected user's login. `None` when not connected, and also for
+    /// the environment token store, whose synthesized identity has no login
+    /// attached (see `StoredToken::user_display`).
     pub user: Option<String>,
-    /// Which backend holds (or would hold) the token: `"keyring"` or
-    /// `"file"`, from `TokenStore::kind`. Reported regardless of whether a
-    /// token is actually saved yet, mirroring `origin_status`.
+    /// Which backend holds (or would hold) the token: `"keyring"`, `"file"`
+    /// or `"environment"`, from `TokenStore::kind`. Reported regardless of
+    /// whether a token is actually saved yet, mirroring `origin_status`.
     pub token_store: String,
     /// Diagnostics for every domain connected to an origin (filtered by
     /// `--domain` like every other section).
@@ -458,7 +461,10 @@ fn check_service(fix: bool) -> Result<ServiceDoctor> {
 /// domain in `targets`, whether its local origin state is present and its
 /// base snapshot still matches what was recorded. Read-only: resolving the
 /// token store and calling `verify_base` never write anything, so this runs
-/// the same whether or not `--fix` is set.
+/// the same whether or not `--fix` is set. When the overlay carries
+/// `CRYSTALLINE_GITHUB_TOKEN`, that store is used directly instead of probing
+/// the keychain or the token file, so a headless node's diagnostics never
+/// touch a credential store that variable makes irrelevant.
 fn check_github(
     cfg: &GlobalConfig,
     overlay: &EnvOverlay,
@@ -466,9 +472,14 @@ fn check_github(
 ) -> Result<GithubDoctor> {
     let api_url = cfg.github.as_ref().and_then(|g| g.api_url.clone());
     let host = cmd::bare_host(&auth_base(api_url.as_deref()));
-    let state_base = config::origins_state_dir()
-        .map_err(|e| anyhow!("could not resolve the origins state directory: {e}"))?;
-    let store = TokenStore::resolve(host.as_deref(), &state_base);
+    let store = match overlay.github_token() {
+        Some(token) => TokenStore::env(token, host.as_deref()),
+        None => {
+            let state_base = config::origins_state_dir()
+                .map_err(|e| anyhow!("could not resolve the origins state directory: {e}"))?;
+            TokenStore::resolve(host.as_deref(), &state_base)
+        }
+    };
     let token = store
         .load()
         .map_err(|e| anyhow!("could not read the saved GitHub token: {e}"))?;
@@ -501,7 +512,10 @@ fn check_github(
 
     Ok(GithubDoctor {
         connected: token.is_some(),
-        user: token.as_ref().map(|t| t.user.clone()),
+        user: token
+            .as_ref()
+            .and_then(|t| t.user_display())
+            .map(str::to_string),
         token_store: store.kind().to_string(),
         origins,
     })
@@ -635,7 +649,12 @@ pub fn render_human(report: &DoctorReport) -> String {
 
     if let Some(g) = &report.github {
         let _ = writeln!(out, "github:");
-        if g.connected {
+        if g.connected && g.token_store == "environment" {
+            let _ = writeln!(
+                out,
+                "  connected via CRYSTALLINE_GITHUB_TOKEN (environment token store)"
+            );
+        } else if g.connected {
             let _ = writeln!(
                 out,
                 "  connected as {} ({} token store)",
