@@ -284,7 +284,7 @@ async fn configure_with_no_args_reports_the_settings_snapshot_and_github_block()
 
     let out = call(peer, "configure", json!({})).await.unwrap();
     let settings = out["settings"].as_array().unwrap();
-    assert_eq!(settings.len(), 4, "{settings:?}");
+    assert_eq!(settings.len(), 8, "{settings:?}");
     assert!(settings.iter().any(|s| s["key"] == "github.enabled"));
     assert_eq!(out["github"]["connected"], json!(false));
     assert!(out["github"]["pending_connect"].is_null());
@@ -324,7 +324,7 @@ async fn configure_set_multiple_keys_applies_in_order_and_returns_the_fresh_snap
         .iter()
         .find(|s| s["key"] == "github.poll_secs")
         .unwrap();
-    assert_eq!(poll["is_default"], json!(true));
+    assert_eq!(poll["source"], json!("default"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

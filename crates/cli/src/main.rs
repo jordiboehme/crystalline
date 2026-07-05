@@ -925,8 +925,9 @@ async fn config_dispatch(command: ConfigCommand, json: bool) -> anyhow::Result<(
     }
 }
 
-/// Render `config show`'s snapshot: key, effective value (with a "(default)"
-/// marker when unset) and doc line, columns aligned to the widest entry.
+/// Render `config show`'s snapshot: key, effective value (with a source
+/// marker for defaulted or env-overridden entries) and doc line, columns
+/// aligned to the widest entry.
 fn render_settings_table(views: &[crystalline_service::settings::SettingView]) {
     let key_width = views.iter().map(|v| v.key.len()).max().unwrap_or(0);
     let displayed: Vec<String> = views.iter().map(setting_display_value).collect();
@@ -939,17 +940,20 @@ fn render_settings_table(views: &[crystalline_service::settings::SettingView]) {
     }
 }
 
-/// A setting's effective value with a "(default)" marker when it was never
-/// explicitly set.
+/// A setting's effective value with a "(default)" or "(env)" marker when it
+/// is not read straight from the config file.
 fn setting_display_value(view: &crystalline_service::settings::SettingView) -> String {
-    if view.is_default {
-        format!("{} (default)", view.value)
-    } else {
-        view.value.clone()
+    use crystalline_service::settings::SettingSource;
+    match view.source {
+        SettingSource::Default => format!("{} (default)", view.value),
+        SettingSource::Config => view.value.clone(),
+        SettingSource::Env => format!("{} (env)", view.value),
     }
 }
 
-/// Print a `config set`/`config unset` result: the resulting setting.
+/// Print a `config set`/`config unset` result: the resulting setting, and
+/// any note attached to it (for example, that a startup-effective key needs
+/// a daemon restart to take effect).
 fn print_setting_result(data: &serde_json::Value, json: bool) {
     if json {
         print_value(data, true);
@@ -957,10 +961,13 @@ fn print_setting_result(data: &serde_json::Value, json: bool) {
     }
     let key = data["key"].as_str().unwrap_or("");
     let value = data["value"].as_str().unwrap_or("");
-    if data["is_default"].as_bool().unwrap_or(false) {
-        println!("{key} = {value} (default)");
-    } else {
-        println!("{key} = {value}");
+    match data["source"].as_str().unwrap_or("config") {
+        "default" => println!("{key} = {value} (default)"),
+        "env" => println!("{key} = {value} (env)"),
+        _ => println!("{key} = {value}"),
+    }
+    if let Some(note) = data["note"].as_str() {
+        println!("  {note}");
     }
 }
 

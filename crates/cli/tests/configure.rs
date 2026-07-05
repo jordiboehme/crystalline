@@ -24,8 +24,8 @@ fn config_show_set_unset_round_trip_against_a_temp_config() {
     assert!(out.status.success());
     let shown: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     let settings = shown["settings"].as_array().unwrap();
-    assert_eq!(settings.len(), 4);
-    assert!(settings.iter().all(|s| s["is_default"] == true));
+    assert_eq!(settings.len(), 8);
+    assert!(settings.iter().all(|s| s["source"] == "default"));
 
     // Set writes the config file and returns the new effective value.
     let out = bin()
@@ -44,7 +44,7 @@ fn config_show_set_unset_round_trip_against_a_temp_config() {
     let set: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(set["key"], "github.enabled");
     assert_eq!(set["value"], "true");
-    assert_eq!(set["is_default"], false);
+    assert_eq!(set["source"], "config");
     assert!(config.exists(), "config written");
 
     // The human-readable render is aligned and marks the default entries.
@@ -76,7 +76,7 @@ fn config_show_set_unset_round_trip_against_a_temp_config() {
     assert!(out.status.success());
     let unset: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(unset["value"], "false");
-    assert_eq!(unset["is_default"], true);
+    assert_eq!(unset["source"], "default");
     let raw = std::fs::read_to_string(&config).unwrap();
     assert!(!raw.contains("github"), "emptied block dropped: {raw}");
 }
@@ -91,4 +91,23 @@ fn config_set_unknown_key_lists_known_keys() {
         .assert()
         .failure()
         .stderr(predicates::str::contains("github.enabled"));
+}
+
+#[test]
+fn config_set_a_startup_effective_key_prints_the_restart_note() {
+    let work = tempfile::tempdir().unwrap();
+    let config = work.path().join("config.yaml");
+
+    let out = bin()
+        .args(["config", "set", "database.backend", "postgres", "--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let human = String::from_utf8(out.stdout).unwrap();
+    assert!(human.contains("database.backend = postgres"), "{human}");
+    assert!(
+        human.contains("applies the next time the daemon starts"),
+        "{human}"
+    );
 }

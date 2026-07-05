@@ -36,8 +36,12 @@ async fn show_lists_every_registry_key_at_its_default() {
 
     let data = engine.configure(&ConfigureAction::Show).await.unwrap();
     let views = settings_of(&data);
-    assert_eq!(views.len(), 4);
-    assert!(views.iter().all(|v| v.is_default));
+    assert_eq!(views.len(), 8);
+    assert!(
+        views
+            .iter()
+            .all(|v| v.source == crystalline_service::settings::SettingSource::Default)
+    );
     assert_eq!(views[0].key, "github.enabled");
     assert_eq!(views[0].value, "false");
 }
@@ -57,7 +61,7 @@ async fn set_persists_to_the_config_file_and_updates_the_in_memory_config() {
         .unwrap();
     assert_eq!(data["key"], "github.enabled");
     assert_eq!(data["value"], "true");
-    assert_eq!(data["is_default"], false);
+    assert_eq!(data["source"], "config");
 
     // The file on disk carries the change...
     let on_disk: GlobalConfig = crystalline_core::config::load_yaml(&config_path).unwrap();
@@ -87,7 +91,7 @@ async fn unset_returns_to_default_and_the_file_drops_an_emptied_github_block() {
         .await
         .unwrap();
     assert_eq!(data["value"], "false");
-    assert_eq!(data["is_default"], true);
+    assert_eq!(data["source"], "default");
 
     assert!(!engine.config().github_enabled());
     let raw = std::fs::read_to_string(&config_path).unwrap();
@@ -258,5 +262,45 @@ async fn unset_fails_to_persist_leaves_in_memory_config_unchanged() {
             .map(|v| v.value.as_str()),
         Some("true"),
         "in-memory config must stay at applied value after failed unset persist"
+    );
+}
+
+#[tokio::test]
+async fn set_service_read_only_persists_and_carries_the_startup_effective_note() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_path = tmp.path().join("config.yaml");
+    let engine = engine_at(&config_path, false).await;
+
+    let data = engine
+        .configure(&ConfigureAction::Set {
+            key: "service.read_only".to_string(),
+            value: "true".to_string(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(data["key"], "service.read_only");
+    assert_eq!(data["value"], "true");
+    assert_eq!(data["source"], "config");
+    assert_eq!(
+        data["note"],
+        "this setting applies the next time the daemon starts; a running daemon keeps its current value"
+    );
+
+    let on_disk: GlobalConfig = crystalline_core::config::load_yaml(&config_path).unwrap();
+    assert!(on_disk.read_only());
+
+    let data = engine
+        .configure(&ConfigureAction::Unset {
+            key: "service.read_only".to_string(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(data["value"], "false");
+    assert_eq!(data["source"], "default");
+
+    let raw = std::fs::read_to_string(&config_path).unwrap();
+    assert!(
+        !raw.contains("service"),
+        "an emptied service block must not round-trip into the saved file: {raw}"
     );
 }

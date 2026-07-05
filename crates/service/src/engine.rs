@@ -2308,14 +2308,24 @@ impl Engine {
         }
     }
 
-    /// The just-applied setting's snapshot entry, as a JSON value. `key` has
-    /// already been validated against the registry by `apply`/`unset`, so it
-    /// is always found.
+    /// The just-applied setting's snapshot entry, as a JSON value, with a
+    /// `note` field attached when [`settings::change_note`] has one (for
+    /// example, a startup-effective key reminding the caller that a running
+    /// daemon keeps its old value). `key` has already been validated against
+    /// the registry by `apply`/`unset`, so it is always found.
     fn setting_view_json(&self, config: &GlobalConfig, key: &str) -> Value {
         settings::snapshot(config)
             .into_iter()
             .find(|v| v.key == key)
-            .map(|v| serde_json::to_value(v).unwrap_or(Value::Null))
+            .map(|v| {
+                let mut value = serde_json::to_value(v).unwrap_or(Value::Null);
+                if let Some(note) = settings::change_note(key)
+                    && let Value::Object(map) = &mut value
+                {
+                    map.insert("note".to_string(), Value::String(note));
+                }
+                value
+            })
             .unwrap_or(Value::Null)
     }
 
