@@ -44,13 +44,17 @@ Once knowledge grows into the thousands or tens of thousands of units, reading a
 
 ## Install
 
-macOS, via [Homebrew](https://brew.sh):
+### macOS
+
+Via [Homebrew](https://brew.sh):
 
 ```sh
 brew install jordiboehme/tap/crystalline
 ```
 
-Linux, via `.deb` (Debian, Ubuntu and derivatives, amd64 or arm64):
+### Linux
+
+Via `.deb` package (Debian, Ubuntu and derivatives, amd64 or arm64):
 
 ```sh
 version=$(curl -fsSL https://api.github.com/repos/jordiboehme/crystalline/releases/latest | grep -m1 '"tag_name"' | cut -d '"' -f4)
@@ -61,31 +65,13 @@ sudo dpkg -i "crystalline_${version#v}_${arch}.deb"
 crystalline --version
 ```
 
-Claude Desktop, via MCP Bundle - one click, no terminal needed:
+### Claude Desktop
 
-Download the `.mcpb` file for your platform from the [latest release](https://github.com/jordiboehme/crystalline/releases/latest), then in Claude Desktop open Settings > Extensions > Advanced settings > Install Extension... and pick the file. Choose your knowledge folders in the extension settings; Crystalline prepares each folder as a domain automatically. See the Claude Desktop extension scenario under Deployment scenarios below.
+Via MCP Bundle - one click, no terminal needed. Download the `.mcpb` file for your platform from the [latest release](https://github.com/jordiboehme/crystalline/releases/latest), then in Claude Desktop open Settings > Extensions > Advanced settings > Install Extension... and pick the file. Choose your knowledge folders in the extension settings; Crystalline prepares each folder as a domain automatically. See the Claude Desktop extension scenario under Deployment scenarios below.
 
-Anywhere else, download a prebuilt binary from the [latest release](https://github.com/jordiboehme/crystalline/releases/latest). Four platforms are published:
+### Plain binaries
 
-| Platform | Archive |
-|---|---|
-| macOS (Apple Silicon) | `macos-arm64` |
-| Linux x86_64 (statically linked) | `linux-amd64` |
-| Linux arm64 (statically linked) | `linux-arm64` |
-| Windows x86_64 | `windows-amd64` |
-
-Each archive is named `crystalline-<version>-<platform>.tar.gz` (`.zip` on Windows) and contains the `crystalline` binary alongside `LICENSE` and `README.md`. A `SHA256SUMS` file is attached to every release for verification.
-
-Shell one-liner (macOS/Linux, adjust `platform` to match your platform):
-
-```sh
-version=$(curl -fsSL https://api.github.com/repos/jordiboehme/crystalline/releases/latest | grep -m1 '"tag_name"' | cut -d '"' -f4)
-platform=macos-arm64
-curl -fsSL "https://github.com/jordiboehme/crystalline/releases/download/${version}/crystalline-${version}-${platform}.tar.gz" \
-  | tar xz -C /tmp
-sudo mv "/tmp/crystalline-${version}-${platform}/crystalline" /usr/local/bin/crystalline
-crystalline --version
-```
+Every [release](https://github.com/jordiboehme/crystalline/releases/latest) also ships the standalone `crystalline` binary for macOS (Apple Silicon), Linux (x86_64 and arm64, statically linked) and Windows, with a `SHA256SUMS` file for verification.
 
 ### Build from source
 
