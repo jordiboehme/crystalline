@@ -306,7 +306,12 @@ fn oauth_client_id_effective(config: &GlobalConfig) -> (String, bool) {
         .as_ref()
         .and_then(|g| g.oauth_client_id.clone());
     let is_default = stored.is_none();
-    (stored.unwrap_or_else(|| "(none)".to_string()), is_default)
+    // The effective default is the client id baked into the binary, not
+    // "nothing": sign-ins work out of the box and the snapshot says so.
+    (
+        stored.unwrap_or_else(|| crystalline_remote::GITHUB_CLIENT_ID.to_string()),
+        is_default,
+    )
 }
 
 #[cfg(test)]
@@ -510,7 +515,7 @@ mod tests {
         assert!(api_url.is_default);
 
         let oauth = &views[3];
-        assert_eq!(oauth.value, "(none)");
+        assert_eq!(oauth.value, crystalline_remote::GITHUB_CLIENT_ID);
         assert!(oauth.is_default);
     }
 }
