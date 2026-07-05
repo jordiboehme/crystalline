@@ -191,8 +191,12 @@ pub async fn run(
     config_override: Option<&Path>,
     db_override: Option<&Path>,
 ) -> Result<DoctorReport> {
-    let cfg = cmd::load_config(&cmd::config_path(config_override)?)?;
-    let targets = select_domains(&cfg, domain_filter)?;
+    // The single load chokepoint: the effective config drives every target and
+    // the db factory. The whole `LoadedConfig` stays in scope so a later
+    // milestone can surface the environment overlay in the report.
+    let loaded = cmd::load(config_override)?;
+    let cfg = &loaded.effective;
+    let targets = select_domains(cfg, domain_filter)?;
     let db = cmd::db_path(db_override)?;
 
     let store = if db.is_file() {
@@ -220,13 +224,13 @@ pub async fn run(
     let service = check_service(fix)?;
 
     let github = if cfg.github_enabled() {
-        Some(check_github(&cfg, &targets)?)
+        Some(check_github(cfg, &targets)?)
     } else {
         None
     };
 
     let embeddings = match store_ref {
-        Some(store) => Some(embedding_summary(store, &cfg).await?),
+        Some(store) => Some(embedding_summary(store, cfg).await?),
         None => None,
     };
 

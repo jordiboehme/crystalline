@@ -11,6 +11,8 @@ use crystalline_core::config::{
     DatabaseBackend, DatabaseConfig, GitHubConfig, GlobalConfig, HttpSetting, ServiceConfig,
 };
 
+use crate::overlay::EnvOverlay;
+
 /// An error applying, resetting or looking up a setting. The message is
 /// actionable and safe to show an agent or a terminal as-is.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -190,22 +192,28 @@ pub fn unset(config: &mut GlobalConfig, key: &str) -> Result<(), SettingsError> 
 }
 
 /// An ordered snapshot for display: every registry key with its effective
-/// value, its source and its doc line. For this milestone every setting is
-/// either `Default` or `Config`; `Env` starts appearing once the environment
-/// overlay lands.
-pub fn snapshot(config: &GlobalConfig) -> Vec<SettingView> {
+/// value, its source and its doc line. `file` is the persisted config, `overlay`
+/// the parsed environment overlay. The value shown is the effective one (file
+/// plus overlay); the source is `Env` when a variable overrides the key,
+/// otherwise `Config` or `Default` read from the file alone, so `config show`
+/// tells an operator where each value actually comes from.
+pub fn snapshot(file: &GlobalConfig, overlay: &EnvOverlay) -> Vec<SettingView> {
+    let effective = overlay.apply(file);
     registry()
         .iter()
         .map(|spec| {
-            let (value, is_default) = (spec.effective)(config);
+            let (value, _) = (spec.effective)(&effective);
+            let source = if overlay.overrides_key(spec.key) {
+                SettingSource::Env
+            } else if (spec.effective)(file).1 {
+                SettingSource::Default
+            } else {
+                SettingSource::Config
+            };
             SettingView {
                 key: spec.key.to_string(),
                 value,
-                source: if is_default {
-                    SettingSource::Default
-                } else {
-                    SettingSource::Config
-                },
+                source,
                 doc: spec.doc.to_string(),
             }
         })
@@ -232,19 +240,31 @@ pub struct SettingView {
 /// surfacing beyond its bare value. `key` is assumed already validated
 /// against the registry; an unknown key just yields `None`.
 ///
-/// Today this only flags a startup-effective setting, so a `config set`
-/// against a running daemon does not read as silently ignored. The
-/// environment overlay adds a second kind of note (an active override)
-/// alongside this one.
-pub fn change_note(key: &str) -> Option<String> {
+/// Two kinds of note can apply, and both are joined into one clean string when
+/// they do: a startup-effective setting warns that a running daemon keeps its
+/// current value until the next start, and an env-overridden setting warns that
+/// a saved value only takes effect once the variable is removed. So a
+/// `config set` against a running daemon, or against an env-overridden key,
+/// never reads as silently ignored.
+pub fn change_note(key: &str, overlay: &EnvOverlay) -> Option<String> {
     let spec = find(key).ok()?;
+    let mut notes: Vec<String> = Vec::new();
     if spec.startup_effective {
-        Some(
+        notes.push(
             "this setting applies the next time the daemon starts; a running daemon keeps its current value"
                 .to_string(),
-        )
-    } else {
+        );
+    }
+    if overlay.overrides_key(key) {
+        notes.push(format!(
+            "the environment variable {} currently overrides this key; the saved value takes effect once that variable is removed",
+            spec.env_var()
+        ));
+    }
+    if notes.is_empty() {
         None
+    } else {
+        Some(notes.join("; "))
     }
 }
 
@@ -616,15 +636,47 @@ mod tests {
 
     #[test]
     fn change_note_is_present_only_for_startup_effective_keys() {
-        assert!(change_note("github.enabled").is_none());
-        assert!(change_note("github.poll_secs").is_none());
-        assert!(change_note("github.api_url").is_none());
-        assert!(change_note("github.oauth_client_id").is_none());
-        assert!(change_note("service.read_only").is_some());
-        assert!(change_note("service.http").is_some());
-        assert!(change_note("database.backend").is_some());
-        assert!(change_note("database.url").is_some());
-        assert!(change_note("github.bogus").is_none());
+        let no_env = EnvOverlay::default();
+        assert!(change_note("github.enabled", &no_env).is_none());
+        assert!(change_note("github.poll_secs", &no_env).is_none());
+        assert!(change_note("github.api_url", &no_env).is_none());
+        assert!(change_note("github.oauth_client_id", &no_env).is_none());
+        assert!(change_note("service.read_only", &no_env).is_some());
+        assert!(change_note("service.http", &no_env).is_some());
+        assert!(change_note("database.backend", &no_env).is_some());
+        assert!(change_note("database.url", &no_env).is_some());
+        assert!(change_note("github.bogus", &no_env).is_none());
+    }
+
+    #[test]
+    fn change_note_flags_an_active_env_override() {
+        let overlay =
+            EnvOverlay::from_vars([("CRYSTALLINE_GITHUB_ENABLED".to_string(), "true".to_string())])
+                .unwrap();
+        // A non-startup-effective key gets only the override note.
+        let note = change_note("github.enabled", &overlay).unwrap();
+        assert!(note.contains("CRYSTALLINE_GITHUB_ENABLED"), "{note}");
+        assert!(
+            note.contains("takes effect once that variable is removed"),
+            "{note}"
+        );
+        assert!(
+            !note.contains("the next time the daemon starts"),
+            "github.enabled is not startup-effective: {note}"
+        );
+    }
+
+    #[test]
+    fn change_note_joins_the_startup_and_override_notes() {
+        let overlay = EnvOverlay::from_vars([(
+            "CRYSTALLINE_SERVICE_READ_ONLY".to_string(),
+            "true".to_string(),
+        )])
+        .unwrap();
+        // A startup-effective key that is also env-overridden carries both.
+        let note = change_note("service.read_only", &overlay).unwrap();
+        assert!(note.contains("the next time the daemon starts"), "{note}");
+        assert!(note.contains("CRYSTALLINE_SERVICE_READ_ONLY"), "{note}");
     }
 
     #[test]
@@ -781,7 +833,7 @@ mod tests {
         let mut cfg = GlobalConfig::default();
         apply(&mut cfg, "github.enabled", "true").unwrap();
 
-        let views = snapshot(&cfg);
+        let views = snapshot(&cfg, &EnvOverlay::default());
         assert_eq!(views.len(), 8);
         assert_eq!(
             views.iter().map(|v| v.key.as_str()).collect::<Vec<_>>(),
@@ -829,6 +881,29 @@ mod tests {
         let url = &views[7];
         assert_eq!(url.value, "");
         assert_eq!(url.source, SettingSource::Default);
+    }
+
+    #[test]
+    fn snapshot_marks_an_env_overridden_key_and_shows_the_env_value() {
+        // The file turns github.enabled off; the environment turns it on. The
+        // snapshot must show the effective (env) value and mark its source Env,
+        // while a key the environment does not touch keeps its file source.
+        let mut file = GlobalConfig::default();
+        apply(&mut file, "github.enabled", "false").unwrap();
+        apply(&mut file, "github.poll_secs", "120").unwrap();
+
+        let overlay =
+            EnvOverlay::from_vars([("CRYSTALLINE_GITHUB_ENABLED".to_string(), "true".to_string())])
+                .unwrap();
+        let views = snapshot(&file, &overlay);
+
+        let enabled = views.iter().find(|v| v.key == "github.enabled").unwrap();
+        assert_eq!(enabled.value, "true", "the effective env value is shown");
+        assert_eq!(enabled.source, SettingSource::Env);
+
+        let poll = views.iter().find(|v| v.key == "github.poll_secs").unwrap();
+        assert_eq!(poll.value, "120");
+        assert_eq!(poll.source, SettingSource::Config, "the file value stands");
     }
 
     // --- service.read_only ---------------------------------------------------------

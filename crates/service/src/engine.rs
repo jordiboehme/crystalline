@@ -42,6 +42,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
 use crate::origin;
+use crate::overlay::{self, EnvOverlay, LoadedConfig};
 use crate::params::*;
 use crate::poller;
 use crate::settings;
@@ -242,11 +243,24 @@ enum ContentSource {
 /// The shared service engine.
 pub struct Engine {
     store: Arc<Mutex<dyn Store>>,
-    // The resolved config this engine was constructed with. Behind a lock (not
-    // an immutable snapshot) so `configure` can update a setting and every
-    // later read (including a concurrent one) sees it, mirroring the
+    // The effective config: the file config with the environment overlay
+    // applied. Every runtime read goes through this, so the ~30 read sites stay
+    // untouched by the file/effective split. Behind a lock (not an immutable
+    // snapshot) so `configure` can update a setting and every later read
+    // (including a concurrent one) sees it, mirroring the
     // `discovered_domains`/`provider` interior-mutability pattern below.
     config: std::sync::RwLock<GlobalConfig>,
+    // The persisted file config, the truth `persist_config` writes back. Kept
+    // apart from `config` so an environment value never bakes itself into
+    // `config.yaml`: `configure show` and `set`/`unset` read and mutate this,
+    // and the effective `config` above is recomputed from it plus the overlay.
+    // The lock order is always `file_config` then `config`.
+    file_config: std::sync::RwLock<GlobalConfig>,
+    // The parsed environment overlay layered on top of `file_config` to produce
+    // `config`. Empty by default (the standalone construction path and every
+    // existing test); the daemon and the standalone loader install the real one
+    // via `with_env_overlay`.
+    overlay: EnvOverlay,
     // The `--config` override this engine was started with, so a domain
     // registered after startup (`domain add` only ever touches the file on
     // disk) can be found by re-reading the same file. See `refresh_domain`.
@@ -343,9 +357,14 @@ impl Engine {
     ) -> Engine {
         let model_id = configured_model_id(config.embeddings.as_ref());
         let chunk_params = ChunkParams::for_model(model_id.clone());
+        // No overlay yet: file and effective start identical, so an engine
+        // built without `with_env_overlay` behaves exactly as before the split.
+        let file_config = config.clone();
         Engine {
             store,
             config: std::sync::RwLock::new(config),
+            file_config: std::sync::RwLock::new(file_config),
+            overlay: EnvOverlay::default(),
             config_path,
             discovered_domains: std::sync::RwLock::new(HashMap::new()),
             watch_tx: None,
@@ -402,6 +421,18 @@ impl Engine {
     /// Whether this engine serves the content API read-only.
     pub fn read_only(&self) -> bool {
         self.read_only
+    }
+
+    /// Install the environment overlay and recompute the effective config from
+    /// the file config plus this overlay. The daemon and the standalone loader
+    /// call this with the overlay parsed at startup; every existing call site
+    /// leaves the default empty overlay in place, so file and effective stay
+    /// identical there.
+    pub fn with_env_overlay(mut self, overlay: EnvOverlay) -> Engine {
+        let effective = overlay.apply(&self.file_config.read().unwrap());
+        *self.config.write().unwrap() = effective;
+        self.overlay = overlay;
+        self
     }
 
     /// Inject a fixed provider for every origin operation (`origin_add`,
@@ -650,7 +681,16 @@ impl Engine {
     /// starts watching its root without a restart. A virtual domain has no root,
     /// so it is cached but never watched.
     fn refresh_domain(&self, name: &str) -> Option<DomainEntry> {
-        let fresh = crate::daemon::load_config(self.config_path.as_deref()).ok()?;
+        // Re-read the same file this engine persists to (its `--config`
+        // override, else the default global path) and layer the overlay back
+        // on, so a post-startup re-read sees the same effective config a fresh
+        // load would, environment overrides included.
+        let path = match &self.config_path {
+            Some(p) => p.clone(),
+            None => crystalline_core::config::global_config_path().ok()?,
+        };
+        let file = overlay::load_file(&path).ok()?;
+        let fresh = self.overlay.apply(&file);
         let entry = fresh.domains.get(name)?.clone();
         self.discovered_domains
             .write()
@@ -2270,39 +2310,44 @@ impl Engine {
     pub async fn configure(&self, action: &ConfigureAction) -> Result<Value> {
         match action {
             ConfigureAction::Show => {
-                let config = self.config.read().unwrap();
-                Ok(json!({ "settings": settings::snapshot(&config) }))
+                let file = self.file_config.read().unwrap();
+                Ok(json!({ "settings": settings::snapshot(&file, &self.overlay) }))
             }
             ConfigureAction::Set { key, value } => {
                 if self.read_only {
                     return Err(EngineError::ReadOnly);
                 }
-                // Acquire write lock first to serialize against concurrent configure calls.
-                // This prevents two tasks from both cloning the old config and clobbering
-                // each other's changes. persist_config is synchronous (no .await), so
-                // holding the write guard across it is safe and legal.
-                let mut guard = self.config.write().unwrap();
-                let mut config = guard.clone();
-                settings::apply(&mut config, key, value)?;
-                self.persist_config(&config)?;
-                let view = self.setting_view_json(&config, key);
-                *guard = config;
+                // Take the file-config write lock first to serialize against a
+                // concurrent configure call, so two tasks cannot both clone the
+                // old file and clobber each other's change. `persist_config` is
+                // synchronous (no .await), so holding the guard across it is
+                // safe. Lock order is always file_config then config.
+                let mut file_guard = self.file_config.write().unwrap();
+                let mut file = file_guard.clone();
+                settings::apply(&mut file, key, value)?;
+                self.persist_config(&file)?;
+                // Recompute the effective config from the freshly saved file
+                // plus the overlay, so an env-overridden key keeps reading its
+                // env value even after the file value changes underneath it.
+                let effective = self.overlay.apply(&file);
+                let view = self.setting_view_json(&file, key);
+                *file_guard = file;
+                *self.config.write().unwrap() = effective;
                 Ok(view)
             }
             ConfigureAction::Unset { key } => {
                 if self.read_only {
                     return Err(EngineError::ReadOnly);
                 }
-                // Acquire write lock first to serialize against concurrent configure calls.
-                // This prevents two tasks from both cloning the old config and clobbering
-                // each other's changes. persist_config is synchronous (no .await), so
-                // holding the write guard across it is safe and legal.
-                let mut guard = self.config.write().unwrap();
-                let mut config = guard.clone();
-                settings::unset(&mut config, key)?;
-                self.persist_config(&config)?;
-                let view = self.setting_view_json(&config, key);
-                *guard = config;
+                // Same write-lock-first discipline and lock order as Set above.
+                let mut file_guard = self.file_config.write().unwrap();
+                let mut file = file_guard.clone();
+                settings::unset(&mut file, key)?;
+                self.persist_config(&file)?;
+                let effective = self.overlay.apply(&file);
+                let view = self.setting_view_json(&file, key);
+                *file_guard = file;
+                *self.config.write().unwrap() = effective;
                 Ok(view)
             }
         }
@@ -2311,15 +2356,19 @@ impl Engine {
     /// The just-applied setting's snapshot entry, as a JSON value, with a
     /// `note` field attached when [`settings::change_note`] has one (for
     /// example, a startup-effective key reminding the caller that a running
-    /// daemon keeps its old value). `key` has already been validated against
-    /// the registry by `apply`/`unset`, so it is always found.
-    fn setting_view_json(&self, config: &GlobalConfig, key: &str) -> Value {
-        settings::snapshot(config)
+    /// daemon keeps its old value, or an env-overridden key reminding it that
+    /// the saved value waits on the variable being removed). `file` is the
+    /// freshly saved file config; the snapshot layers the overlay on top, so an
+    /// env-overridden key reports its env value with `source: env`. `key` has
+    /// already been validated against the registry by `apply`/`unset`, so it is
+    /// always found.
+    fn setting_view_json(&self, file: &GlobalConfig, key: &str) -> Value {
+        settings::snapshot(file, &self.overlay)
             .into_iter()
             .find(|v| v.key == key)
             .map(|v| {
                 let mut value = serde_json::to_value(v).unwrap_or(Value::Null);
-                if let Some(note) = settings::change_note(key)
+                if let Some(note) = settings::change_note(key, &self.overlay)
                     && let Value::Object(map) = &mut value
                 {
                     map.insert("note".to_string(), Value::String(note));
@@ -2404,13 +2453,13 @@ impl Engine {
         let provider = self.resolve_origin_provider()?;
         let report = ops::subscribe(provider.as_ref(), &spec, &root, &state_dir).await?;
 
-        // Register the domain and persist, mirroring `configure`'s
-        // write-lock-first pattern so a concurrent read never observes a
-        // half-applied config.
+        // Register the domain and persist, mirroring `configure`'s file-then-
+        // effective write-lock-first pattern so a concurrent read never observes
+        // a half-applied config and no env value bakes into the saved file.
         {
-            let mut guard = self.config.write().unwrap();
-            let mut config = guard.clone();
-            config.domains.insert(
+            let mut file_guard = self.file_config.write().unwrap();
+            let mut file = file_guard.clone();
+            file.domains.insert(
                 domain_name.clone(),
                 DomainEntry {
                     kind: CoreDomainKind::File,
@@ -2423,8 +2472,10 @@ impl Engine {
                     }),
                 },
             );
-            self.persist_config(&config)?;
-            *guard = config;
+            self.persist_config(&file)?;
+            let effective = self.overlay.apply(&file);
+            *file_guard = file;
+            *self.config.write().unwrap() = effective;
         }
 
         // Tell a running daemon's watcher to start watching the new root; it
@@ -3158,8 +3209,8 @@ impl Engine {
     /// Wraps a `github` block with the settings registry snapshot, the full
     /// shape the `configure` tool always returns.
     fn configure_snapshot_with(&self, github: Value) -> Result<Value> {
-        let config = self.config.read().unwrap().clone();
-        Ok(json!({ "settings": settings::snapshot(&config), "github": github }))
+        let file = self.file_config.read().unwrap();
+        Ok(json!({ "settings": settings::snapshot(&file, &self.overlay), "github": github }))
     }
 
     /// The `configure` tool's plain snapshot: every registry setting plus
@@ -3322,22 +3373,33 @@ impl From<settings::SettingsError> for EngineError {
 
 /// Build an engine that opens the store directly for a one-shot standalone CLI
 /// command. Builds the embedding provider only when the command may need it.
+/// Takes a [`LoadedConfig`] so the environment overlay reaches a standalone
+/// command exactly as it reaches the daemon.
 pub async fn open_standalone(
-    config: GlobalConfig,
+    loaded: LoadedConfig,
     db: &Path,
     want_embeddings: bool,
 ) -> anyhow::Result<Engine> {
-    // The factory resolves the backend from `database`, creates the parent
-    // directory for a Turso file and unsizes the concrete store into a
-    // `dyn Store`. `db` is the resolved `--db` override for the Turso arm.
-    let store = crystalline_index::open_store(&config.database(), Some(db), false).await?;
-    // No `config_path`: a standalone command is one-shot, so the config it
-    // already loaded is as fresh as any re-read would be. A standalone data
-    // command has no `--read-only` flag of its own, so the mode comes purely
-    // from `service.read_only`; a read-only config refuses CLI writes here the
-    // same way the daemon refuses them over the socket.
-    let read_only = config.read_only();
-    let engine = Engine::new(store, config, None, None).with_read_only(read_only);
+    let LoadedConfig {
+        path,
+        file,
+        effective,
+        overlay,
+    } = loaded;
+    // The factory resolves the backend from the effective `database`, creates
+    // the parent directory for a Turso file and unsizes the concrete store into
+    // a `dyn Store`. `db` is the resolved `--db` override for the Turso arm.
+    let store = crystalline_index::open_store(&effective.database(), Some(db), false).await?;
+    // A standalone data command has no `--read-only` flag of its own, so the
+    // mode comes purely from the effective `service.read_only` (config or
+    // environment); a read-only config refuses CLI writes here the same way the
+    // daemon refuses them over the socket. The resolved `path` is threaded
+    // through so a domain registered mid-command persists to, and re-reads from,
+    // the same file even when it came from `CRYSTALLINE_CONFIG`.
+    let read_only = effective.read_only();
+    let engine = Engine::new(store, file, None, Some(path))
+        .with_read_only(read_only)
+        .with_env_overlay(overlay);
     // Build the provider (which may download the model) only when the index
     // already holds embeddings for the active model, so a text or filter search
     // never triggers a surprise download. With no embeddings, search falls back

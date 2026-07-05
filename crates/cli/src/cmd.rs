@@ -62,23 +62,14 @@ async fn embed_pass(store: &dyn Store, cfg: &GlobalConfig) -> Result<()> {
     Ok(())
 }
 
-/// Resolve the global config path from an optional override.
-pub(crate) fn config_path(override_path: Option<&Path>) -> Result<PathBuf> {
-    match override_path {
-        Some(p) => Ok(p.to_path_buf()),
-        None => config::global_config_path()
-            .map_err(|e| anyhow!("could not resolve the default config path: {e}")),
-    }
-}
-
-/// Load the global config, treating a missing file as an empty config.
-pub(crate) fn load_config(path: &Path) -> Result<GlobalConfig> {
-    if path.is_file() {
-        config::load_yaml(path)
-            .map_err(|e| anyhow!("failed to load config {}: {e}", path.display()))
-    } else {
-        Ok(GlobalConfig::default())
-    }
+/// Load the effective config through the service's single load chokepoint: the
+/// config file resolved from the `--config` override, then `CRYSTALLINE_CONFIG`,
+/// then the default global path, with the environment overlay parsed and
+/// applied. Readers use `loaded.effective`; the file mutators (`domain add`,
+/// `domain remove`) mutate `loaded.file` and save it back to `loaded.path`, so
+/// no environment value ever bakes into `config.yaml`.
+pub(crate) fn load(config_override: Option<&Path>) -> Result<crystalline_service::LoadedConfig> {
+    crystalline_service::overlay::load(config_override)
 }
 
 /// Resolve the index database path from an optional override.
@@ -207,12 +198,14 @@ pub(crate) fn domain_add_register(
     }
     let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
 
-    let cfg_path = config_path(config_override)?;
-    let mut cfg = load_config(&cfg_path)?;
+    // Mutate the file truth and save it back to the resolved path; the
+    // environment overlay is never written.
+    let loaded = load(config_override)?;
+    let mut cfg = loaded.file;
     cfg.domains
         .insert(name.to_string(), DomainEntry::file(abs.clone()));
-    config::save_yaml(&cfg_path, &cfg)
-        .map_err(|e| anyhow!("failed to save config {}: {e}", cfg_path.display()))?;
+    config::save_yaml(&loaded.path, &cfg)
+        .map_err(|e| anyhow!("failed to save config {}: {e}", loaded.path.display()))?;
     Ok(abs)
 }
 
@@ -222,12 +215,12 @@ pub(crate) fn domain_add_register_virtual(
     name: &str,
     config_override: Option<&Path>,
 ) -> Result<String> {
-    let cfg_path = config_path(config_override)?;
-    let mut cfg = load_config(&cfg_path)?;
+    let loaded = load(config_override)?;
+    let mut cfg = loaded.file;
     cfg.domains
         .insert(name.to_string(), DomainEntry::virtual_domain());
-    config::save_yaml(&cfg_path, &cfg)
-        .map_err(|e| anyhow!("failed to save config {}: {e}", cfg_path.display()))?;
+    config::save_yaml(&loaded.path, &cfg)
+        .map_err(|e| anyhow!("failed to save config {}: {e}", loaded.path.display()))?;
     let today = chrono::Utc::now()
         .date_naive()
         .format("%Y-%m-%d")
@@ -271,7 +264,7 @@ pub(crate) async fn sync_domain_direct(
     config_override: Option<&Path>,
     db_override: Option<&Path>,
 ) -> Result<crystalline_index::SyncReport> {
-    let cfg = load_config(&config_path(config_override)?)?;
+    let cfg = load(config_override)?.effective;
     let store = open_backend(&cfg, db_override, false).await?;
     let store = store.lock().await;
     let params = chunk_params(&cfg);
@@ -501,7 +494,7 @@ pub(crate) fn ensure_domain_registered(
     let canonical =
         std::fs::canonicalize(path).with_context(|| format!("resolving {}", path.display()))?;
 
-    let cfg = load_config(&config_path(config_override)?)?;
+    let cfg = load(config_override)?.effective;
     let already_registered = cfg
         .domains
         .values()
@@ -580,13 +573,13 @@ fn name_taken_by_other(name: &str, canonical: &Path, cfg: &GlobalConfig) -> bool
 /// Remove a domain from the global config. Leaves its files and index rows
 /// untouched; the rows are only dropped by a later full reindex.
 pub fn domain_remove(name: &str, config_override: Option<&Path>, json: bool) -> Result<()> {
-    let cfg_path = config_path(config_override)?;
-    let mut cfg = load_config(&cfg_path)?;
+    let loaded = load(config_override)?;
+    let mut cfg = loaded.file;
     if cfg.domains.shift_remove(name).is_none() {
         bail!("no domain named '{name}' is registered");
     }
-    config::save_yaml(&cfg_path, &cfg)
-        .map_err(|e| anyhow!("failed to save config {}: {e}", cfg_path.display()))?;
+    config::save_yaml(&loaded.path, &cfg)
+        .map_err(|e| anyhow!("failed to save config {}: {e}", loaded.path.display()))?;
     if json {
         println!(
             "{}",
@@ -610,7 +603,7 @@ pub async fn domain_list(
     db_override: Option<&Path>,
     json: bool,
 ) -> Result<()> {
-    let cfg = load_config(&config_path(config_override)?)?;
+    let cfg = load(config_override)?.effective;
     let should_open = !backend_is_turso(&cfg) || db_path(db_override)?.exists();
     let stats = if should_open {
         match open_backend(&cfg, db_override, false).await {
@@ -689,7 +682,7 @@ pub async fn sync(
     db_override: Option<&Path>,
     json: bool,
 ) -> Result<()> {
-    let cfg = load_config(&config_path(config_override)?)?;
+    let cfg = load(config_override)?.effective;
     let targets = select_domains(&cfg, only)?;
     let store = open_backend(&cfg, db_override, false).await?;
     let store = store.lock().await;
@@ -732,7 +725,7 @@ pub async fn reindex(
     db_override: Option<&Path>,
     json: bool,
 ) -> Result<()> {
-    let cfg = load_config(&config_path(config_override)?)?;
+    let cfg = load(config_override)?.effective;
     let targets = select_domains(&cfg, None)?;
     let params = chunk_params(&cfg);
 
@@ -797,7 +790,7 @@ pub async fn status(
     db_override: Option<&Path>,
     json: bool,
 ) -> Result<()> {
-    let cfg = load_config(&config_path(config_override)?)?;
+    let cfg = load(config_override)?.effective;
     // Only the Turso backend has a local file whose absence means "no index
     // yet"; Postgres is always opened.
     if backend_is_turso(&cfg) {
@@ -900,7 +893,7 @@ pub async fn status(
 /// non-zero (via the returned error) when the fetch fails or the build has no
 /// local embedding support.
 pub async fn model_download(config_override: Option<&Path>, json: bool) -> Result<()> {
-    let cfg = load_config(&config_path(config_override)?)?;
+    let cfg = load(config_override)?.effective;
     let ecfg = embeddings_config(&cfg);
     let download = download_local_model(&ecfg)
         .await
@@ -938,7 +931,7 @@ pub fn import(
     config_override: Option<&Path>,
     json: bool,
 ) -> Result<()> {
-    let cfg = load_config(&config_path(config_override)?)?;
+    let cfg = load(config_override)?.effective;
     let entry = cfg.domains.get(domain).ok_or_else(|| {
         anyhow!(
             "no domain named '{domain}' is registered. Register it first: crystalline domain add {domain} <path>"
@@ -1030,7 +1023,7 @@ pub async fn connect_github(
     config_override: Option<&Path>,
     json: bool,
 ) -> Result<()> {
-    let cfg = load_config(&config_path(config_override)?)?;
+    let cfg = load(config_override)?.effective;
     let api_url = host
         .map(|h| format!("https://{h}/api/v3"))
         .or_else(|| cfg.github.as_ref().and_then(|g| g.api_url.clone()));

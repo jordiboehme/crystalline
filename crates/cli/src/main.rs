@@ -1777,18 +1777,10 @@ fn run_prompt(
     json_flag: bool,
 ) -> anyhow::Result<()> {
     let workspace = workspace.unwrap_or_else(|| PathBuf::from("."));
-    let cfg_path = match config_path {
-        Some(p) => p,
-        None => config::global_config_path()
-            .map_err(|e| anyhow::anyhow!("could not resolve the default config path: {e}"))?,
-    };
-
-    let global = if cfg_path.is_file() {
-        config::load_yaml(&cfg_path)
-            .map_err(|e| anyhow::anyhow!("failed to load config {}: {e}", cfg_path.display()))?
-    } else {
-        config::GlobalConfig::default()
-    };
+    // The single load chokepoint resolves the config path (flag, then
+    // CRYSTALLINE_CONFIG, then the default) and applies the environment overlay,
+    // so the routing prompt reflects env-configured settings.
+    let global = crystalline_service::overlay::load(config_path.as_deref())?.effective;
 
     // Virtual domains have no MANIFEST on disk; their routing bullets come from
     // the daemon (warm) or a direct store read. The all-file common case never

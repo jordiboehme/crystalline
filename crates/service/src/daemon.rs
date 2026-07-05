@@ -20,6 +20,7 @@ use crate::control::serve_ctl;
 use crate::engine::{Engine, WatchEvent};
 use crate::instance::{acquire_ownership, read_mode_line};
 use crate::mcp::McpServer;
+use crate::overlay;
 
 /// The default HTTP bind address when HTTP is enabled without an explicit one.
 const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:7411";
@@ -147,10 +148,14 @@ pub async fn run_serve(
         .with_max_level(tracing::Level::INFO)
         .try_init();
 
-    let config = load_config(config_path.as_deref())?;
-    let read_only = read_only || config.read_only();
+    // The single load chokepoint: parse the environment overlay, resolve the
+    // config path (flag, then CRYSTALLINE_CONFIG, then the default) and layer
+    // the overlay over the file. A bad known variable aborts startup here with
+    // a message naming it.
+    let loaded = overlay::load(config_path.as_deref())?;
+    let read_only = read_only || loaded.effective.read_only();
     let db_path = resolve_db(db.as_deref())?;
-    let http_addr = resolve_http(http_flag.as_deref(), &config);
+    let http_addr = resolve_http(http_flag.as_deref(), &loaded.effective);
     // This machine and state-directory's stable identity, generated on first use.
     // It turns on shared-database collaboration: the daemon claims a host lock per
     // file domain, renews it on a timer and releases it on shutdown.
@@ -159,18 +164,21 @@ pub async fn run_serve(
     // Take ownership first so a second daemon fails fast with the live pid.
     let ownership = acquire_ownership()?;
 
-    let store = open_store(&config, Some(&db_path)).await?;
+    let store = open_store(&loaded.effective, Some(&db_path)).await?;
     // A channel the engine uses to tell the watcher (spawned below) about a
     // domain registered after this daemon started, so it starts watching that
     // root without a restart. See `Engine::domain_root`'s fresh-config fallback.
     let (watch_tx, watch_rx) = tokio::sync::mpsc::unbounded_channel::<WatchEvent>();
     // The provider is built in the background (see below); text search and the
-    // socket never wait on the model download.
+    // socket never wait on the model download. The engine holds the file config
+    // and the overlay separately (persist and refresh hit the resolved file even
+    // when it came from CRYSTALLINE_CONFIG); its effective config drives reads.
     let engine = Arc::new(
-        Engine::new(store, config.clone(), None, config_path.clone())
+        Engine::new(store, loaded.file.clone(), None, Some(loaded.path.clone()))
             .with_watch_channel(watch_tx)
             .with_read_only(read_only)
-            .with_instance_id(instance_id),
+            .with_instance_id(instance_id)
+            .with_env_overlay(loaded.overlay.clone()),
     );
 
     // Bind the socket and publish the lock record: this is the readiness point,
@@ -223,7 +231,7 @@ pub async fn run_serve(
     // is immediate. Sync needs no provider; the embed pass waits for it.
     {
         let e = engine.clone();
-        let cfg = config.clone();
+        let cfg = loaded.effective.clone();
         tokio::spawn(async move {
             // Hold the first scan until the watcher has armed the startup
             // watches; a dropped sender (watcher failed to start) lets it run.
@@ -248,7 +256,7 @@ pub async fn run_serve(
     // The file watcher.
     {
         let e = engine.clone();
-        let watch_domains = domain_roots(&config);
+        let watch_domains = domain_roots(&loaded.effective);
         let rx = shared.watch();
         tokio::spawn(async move {
             if let Err(err) =
@@ -670,18 +678,6 @@ fn resolve_http(flag: Option<&str>, config: &GlobalConfig) -> Option<String> {
         Some(HttpSetting::Enabled(true)) => Some(DEFAULT_HTTP_ADDR.to_string()),
         Some(HttpSetting::Address(a)) => Some(a.clone()),
         _ => None,
-    }
-}
-
-pub(crate) fn load_config(path: Option<&Path>) -> anyhow::Result<GlobalConfig> {
-    let path = match path {
-        Some(p) => p.to_path_buf(),
-        None => config::global_config_path()?,
-    };
-    if path.is_file() {
-        Ok(config::load_yaml(&path)?)
-    } else {
-        Ok(GlobalConfig::default())
     }
 }
 

@@ -15,6 +15,7 @@ pub mod engine;
 pub mod instance;
 pub mod mcp;
 mod origin;
+pub mod overlay;
 pub mod params;
 mod poller;
 pub mod settings;
@@ -27,3 +28,4 @@ pub use client::{
 pub use daemon::run_serve;
 pub use engine::{Engine, EngineError};
 pub use mcp::McpServer;
+pub use overlay::{EnvOverlay, LoadedConfig};
