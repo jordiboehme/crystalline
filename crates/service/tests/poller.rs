@@ -27,9 +27,10 @@ use std::time::Instant;
 use chrono::Utc;
 use crystalline_core::config::{GitHubConfig, GlobalConfig};
 use crystalline_index::TursoStore;
+use crystalline_remote::state::OriginState;
 use crystalline_remote::{StoredToken, TokenStore};
-use crystalline_service::Engine;
 use crystalline_service::engine::ConfigureAction;
+use crystalline_service::{Engine, EnvOverlay};
 use support::MockProvider;
 use tokio::sync::Mutex;
 
@@ -65,6 +66,36 @@ async fn engine_with(
     .with_origin_provider(provider)
     .with_origins_dir(origins_dir.to_path_buf())
     .with_token_store_dir(token_dir.to_path_buf())
+}
+
+/// The same wiring as [`engine_with`], but the domains come from an
+/// environment overlay rather than a prior `origin_add`, so a poll tick can be
+/// proven to provision a never-connected env-origin domain end to end.
+async fn engine_with_env(
+    config_path: &Path,
+    origins_dir: &Path,
+    token_dir: &Path,
+    provider: Arc<MockProvider>,
+    env_vars: &[(&str, &str)],
+) -> Engine {
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let overlay = EnvOverlay::from_vars(
+        env_vars
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    Engine::new(
+        Arc::new(Mutex::new(store)),
+        config(None),
+        None,
+        Some(config_path.to_path_buf()),
+    )
+    .with_origin_provider(provider)
+    .with_origins_dir(origins_dir.to_path_buf())
+    .with_token_store_dir(token_dir.to_path_buf())
+    .with_env_overlay(overlay)
 }
 
 /// Writes a fake GitHub token straight into `dir` as `TokenStore::File`
@@ -160,6 +191,54 @@ async fn poller_applies_an_upstream_edit_without_a_user_call() {
     assert_eq!(domains[0]["last_result"]["outcome"], "applied");
     assert_eq!(domains[0]["last_result"]["applied"], 1);
     assert!(!domains[0]["next_due"].is_null());
+}
+
+#[tokio::test]
+async fn a_poll_tick_provisions_a_due_env_origin_domain() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let c1 = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        ("notes/alpha.md", engram("Alpha", "alpha", "version one")),
+    ]));
+    mock.set_branch("main", &c1);
+
+    let token_dir = tmp.path().join("token");
+    let origins_dir = tmp.path().join("origins");
+    let root = tmp.path().join("team");
+    let eng = engine_with_env(
+        &tmp.path().join("config.yaml"),
+        &origins_dir,
+        &token_dir,
+        mock.clone(),
+        &[
+            ("CRYSTALLINE_DOMAIN_TEAM", root.to_str().unwrap()),
+            ("CRYSTALLINE_DOMAIN_TEAM_ORIGIN", "acme/brand-knowledge"),
+        ],
+    )
+    .await;
+    // A connection must be on file for the poller to spend a tick on the domain.
+    write_fake_token(&token_dir);
+
+    // The env-origin domain has never been scheduled, so it is due on the very
+    // first tick; no `origin_add` and no `origin_update` were ever called.
+    eng.origin_poll_tick(Instant::now(), Utc::now()).await;
+
+    // Provisioned end to end: files on disk and origin state written.
+    assert!(root.join("notes/alpha.md").exists());
+    assert!(
+        OriginState::load(&origins_dir.join("team"))
+            .unwrap()
+            .is_some(),
+        "the poll tick provisioned the env domain"
+    );
+
+    // The poller recorded the provisioning as an applied outcome.
+    let status = eng.status_report().await.unwrap();
+    let domains = status["origins"]["domains"].as_array().unwrap();
+    assert_eq!(domains.len(), 1);
+    assert_eq!(domains[0]["domain"], "team");
+    assert_eq!(domains[0]["last_result"]["outcome"], "applied");
 }
 
 #[tokio::test]

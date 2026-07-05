@@ -2430,9 +2430,18 @@ impl Engine {
             None => origin::default_domain_name(repo),
         };
         if self.domain_entry(&domain_name).is_ok() {
-            return Err(EngineError::Conflict(format!(
-                "domain '{domain_name}' is already registered; pass a domain name to connect this origin under a different one"
-            )));
+            // An env-defined domain names the variable that owns it, so the
+            // operator knows to unset it rather than pick another name.
+            let msg = match self.overlay.env_domain(&domain_name) {
+                Some(env) => format!(
+                    "domain '{domain_name}' is defined by the environment variable {}; unset it to manage this domain in the config file",
+                    env.var
+                ),
+                None => format!(
+                    "domain '{domain_name}' is already registered; pass a domain name to connect this origin under a different one"
+                ),
+            };
+            return Err(EngineError::Conflict(msg));
         }
 
         let lock = self.origin_lock(&domain_name);
@@ -2532,6 +2541,26 @@ impl Engine {
         let _guard = lock.lock().await;
 
         let (spec, root, state_dir) = self.origin_spec_for(name, entry)?;
+
+        // An env-defined team domain with no origin state yet provisions itself
+        // on first contact: the zero-config read-only node's first pull is a
+        // subscribe, not an update. This is gated on the domain being
+        // env-defined so a non-env domain with missing state still fails exactly
+        // as before (it was never fully connected). Provisioning is a
+        // derived-truth pull, so it is allowed on a read-only instance. The
+        // env check comes first so ordinary domains skip the state read on
+        // every poll tick.
+        if self.overlay.env_domain(name).is_some()
+            && crystalline_remote::state::OriginState::load(&state_dir)
+                .ok()
+                .flatten()
+                .is_none()
+        {
+            return self
+                .provision_env_origin(name, &spec, &root, &state_dir)
+                .await;
+        }
+
         let provider = self.resolve_origin_provider()?;
         let report = ops::pull(provider.as_ref(), &spec, &root, &state_dir).await?;
 
@@ -2551,6 +2580,119 @@ impl Engine {
         let proposals = origin::proposal_transitions_json(&report.proposals, state.as_ref());
 
         Ok(origin::pull_report_json(name, &report, proposals))
+    }
+
+    /// Provisions an env-defined team domain on its first contact with GitHub:
+    /// creates the root, runs the same [`ops::subscribe`] `origin_add` uses
+    /// (minus the config write, since an env domain is never persisted), then
+    /// syncs and best-effort embeds. Called under the domain's origin lock by
+    /// [`Engine::origin_update_one`]. The report is shaped like a normal update
+    /// (`up_to_date`, `applied`, `merged`, `conflicts`, `proposals`) so
+    /// `print_origin_update` and the poller's outcome handling keep working
+    /// unchanged, plus `provisioned: true` and the subscribe facts (`engrams`,
+    /// `base_commit`) a provisioned line reads from.
+    async fn provision_env_origin(
+        &self,
+        name: &str,
+        spec: &OriginSpec,
+        root: &Path,
+        state_dir: &Path,
+    ) -> Result<Value> {
+        let provider = self.resolve_origin_provider()?;
+        // notify refuses to watch a missing directory; the daemon pre-creates
+        // env-domain roots at startup, but a subscribe run outside that path
+        // (an on-demand `origin update`, a poll tick) creates it here too.
+        std::fs::create_dir_all(root).map_err(|e| {
+            EngineError::Internal(format!(
+                "could not create the domain root {}: {e}",
+                root.display()
+            ))
+        })?;
+        let report = ops::subscribe(provider.as_ref(), spec, root, state_dir).await?;
+
+        // Tell a running daemon's watcher to start watching the freshly
+        // provisioned root, the same signal `origin_add` sends.
+        if let Some(tx) = &self.watch_tx {
+            let _ = tx.send(WatchEvent::Add(name.to_string(), root.to_path_buf()));
+        }
+
+        self.sync(Some(name)).await?;
+        if let Err(e) = self.embed_pending().await {
+            tracing::warn!("embedding after provisioning '{name}' failed: {e}");
+        }
+
+        Ok(json!({
+            "domain": name,
+            "provisioned": true,
+            "up_to_date": false,
+            "applied": [],
+            "merged": [],
+            "conflicts": [],
+            "proposals": [],
+            "skipped_large": report.skipped_large,
+            "re_baselined": false,
+            "engrams": report.engrams,
+            "base_commit": report.base_commit,
+        }))
+    }
+
+    /// Self-provisions every env-defined team domain that carries an origin but
+    /// has no local origin state yet, bringing each up through
+    /// [`Engine::origin_update_one`] so provisioning and a plain background
+    /// pull stay exactly one code path. Called once from the daemon's startup
+    /// task. A missing GitHub connection is not a failure - the background
+    /// poller retries the moment a connection lands - so `NotConnected` only
+    /// logs an info line; any other per-domain error is logged and never
+    /// aborts startup. When env-origin domains exist while collaboration is
+    /// off, one warning tells the operator to turn it on.
+    pub async fn provision_env_origins(&self) {
+        let targets: Vec<(String, DomainEntry)> = self
+            .overlay
+            .env_domains()
+            .filter(|(_, env)| env.entry.origin.is_some())
+            .map(|(name, env)| (name.clone(), env.entry.clone()))
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+        if !self.config.read().unwrap().github_enabled() {
+            tracing::warn!(
+                "env-defined team domains are configured but GitHub collaboration is off; set CRYSTALLINE_GITHUB_ENABLED=true to let them provision"
+            );
+            return;
+        }
+
+        for (name, entry) in targets {
+            let Ok(state_dir) = self.origin_state_dir(&name) else {
+                continue;
+            };
+            // Already provisioned in an earlier run: nothing to do here, the
+            // poller keeps it up to date from now on.
+            let has_state = crystalline_remote::state::OriginState::load(&state_dir)
+                .ok()
+                .flatten()
+                .is_some();
+            if has_state {
+                continue;
+            }
+            match self.origin_update_one(&name, &entry).await {
+                Ok(v) => {
+                    tracing::info!(
+                        "provisioned env-defined team domain '{name}' ({} engram(s) at {})",
+                        v["engrams"].as_u64().unwrap_or(0),
+                        v["base_commit"].as_str().unwrap_or("")
+                    );
+                }
+                Err(EngineError::Remote(RemoteError::NotConnected)) => {
+                    tracing::info!(
+                        "env-defined team domain '{name}' is waiting for a GitHub connection; the poller retries automatically"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!("could not provision env-defined team domain '{name}': {e}");
+                }
+            }
+        }
     }
 
     /// Reports where one origin-connected domain (or every one, when
@@ -2712,7 +2854,12 @@ impl Engine {
                             format!("#{number} {status}")
                         })
                         .collect();
-                    if !conflict_paths.is_empty() {
+                    if v["provisioned"].as_bool().unwrap_or(false) {
+                        tracing::info!(
+                            "origin poll: provisioned '{name}' ({} engram(s))",
+                            v["engrams"].as_u64().unwrap_or(0)
+                        );
+                    } else if !conflict_paths.is_empty() {
                         tracing::info!(
                             "origin poll: '{name}' has new conflict(s): {}",
                             conflict_paths.join(", ")

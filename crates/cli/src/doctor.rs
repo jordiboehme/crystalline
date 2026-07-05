@@ -25,6 +25,7 @@ use crystalline_index::{Store, configured_model_id};
 use crystalline_remote::TokenStore;
 use crystalline_remote::github::auth::auth_base;
 use crystalline_remote::state::{OriginState, verify_base};
+use crystalline_service::EnvOverlay;
 use crystalline_service::instance;
 use serde::Serialize;
 
@@ -114,6 +115,11 @@ pub struct OriginDoctor {
     /// recorded checksum, from `verify_base`. Empty when the base tree is
     /// fully intact, or when `state_present` is false (nothing to check).
     pub base_mismatches: Vec<String>,
+    /// Whether this team domain is defined by an environment variable. An
+    /// env-defined domain with no origin state yet is not a problem: it
+    /// provisions itself when the daemon connects, so `remaining_problems`
+    /// skips it where a config-file domain would count.
+    pub env_defined: bool,
 }
 
 /// GitHub collaboration diagnostics, present only when `github.enabled` is
@@ -174,7 +180,10 @@ impl DoctorReport {
         // corrupt origin state for an already-connected team domain is.
         if let Some(g) = &self.github {
             for o in &g.origins {
-                if !o.state_present {
+                // An env-defined team domain with no origin state provisions
+                // itself when the daemon connects, so it is not a problem; a
+                // config-file domain with no state genuinely is.
+                if !o.state_present && !o.env_defined {
                     n += 1;
                 }
                 n += o.base_mismatches.len();
@@ -224,7 +233,7 @@ pub async fn run(
     let service = check_service(fix)?;
 
     let github = if cfg.github_enabled() {
-        Some(check_github(cfg, &targets)?)
+        Some(check_github(cfg, &loaded.overlay, &targets)?)
     } else {
         None
     };
@@ -450,7 +459,11 @@ fn check_service(fix: bool) -> Result<ServiceDoctor> {
 /// base snapshot still matches what was recorded. Read-only: resolving the
 /// token store and calling `verify_base` never write anything, so this runs
 /// the same whether or not `--fix` is set.
-fn check_github(cfg: &GlobalConfig, targets: &[(String, DomainEntry)]) -> Result<GithubDoctor> {
+fn check_github(
+    cfg: &GlobalConfig,
+    overlay: &EnvOverlay,
+    targets: &[(String, DomainEntry)],
+) -> Result<GithubDoctor> {
     let api_url = cfg.github.as_ref().and_then(|g| g.api_url.clone());
     let host = cmd::bare_host(&auth_base(api_url.as_deref()));
     let state_base = config::origins_state_dir()
@@ -482,6 +495,7 @@ fn check_github(cfg: &GlobalConfig, targets: &[(String, DomainEntry)]) -> Result
             repo: origin.repo.clone(),
             state_present,
             base_mismatches,
+            env_defined: overlay.env_domain(name).is_some(),
         });
     }
 
@@ -639,7 +653,13 @@ pub fn render_human(report: &DoctorReport) -> String {
             let _ = writeln!(out, "  no team domains connected to an origin");
         }
         for o in &g.origins {
-            if !o.state_present {
+            if !o.state_present && o.env_defined {
+                let _ = writeln!(
+                    out,
+                    "  {} ({}): env-defined team domain, provisions itself when the daemon connects",
+                    o.name, o.repo
+                );
+            } else if !o.state_present {
                 let _ = writeln!(
                     out,
                     "  [problem] {} ({}): no origin state on disk; add the domain from its origin first",

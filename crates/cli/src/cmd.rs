@@ -188,6 +188,17 @@ pub(crate) fn domain_add_register(
     path: &Path,
     config_override: Option<&Path>,
 ) -> Result<PathBuf> {
+    // Mutate the file truth and save it back to the resolved path; the
+    // environment overlay is never written. An env-defined domain of the same
+    // name is refused: it is managed by its variable, not the config file.
+    let loaded = load(config_override)?;
+    if let Some(env) = loaded.overlay.env_domain(name) {
+        bail!(
+            "domain '{name}' is defined by the environment variable {}; unset it to manage this domain in the config file",
+            env.var
+        );
+    }
+
     let manifest = path.join("MANIFEST.md");
     if !manifest.exists() {
         bail!(
@@ -198,9 +209,6 @@ pub(crate) fn domain_add_register(
     }
     let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
 
-    // Mutate the file truth and save it back to the resolved path; the
-    // environment overlay is never written.
-    let loaded = load(config_override)?;
     let mut cfg = loaded.file;
     cfg.domains
         .insert(name.to_string(), DomainEntry::file(abs.clone()));
@@ -216,6 +224,12 @@ pub(crate) fn domain_add_register_virtual(
     config_override: Option<&Path>,
 ) -> Result<String> {
     let loaded = load(config_override)?;
+    if let Some(env) = loaded.overlay.env_domain(name) {
+        bail!(
+            "domain '{name}' is defined by the environment variable {}; unset it to manage this domain in the config file",
+            env.var
+        );
+    }
     let mut cfg = loaded.file;
     cfg.domains
         .insert(name.to_string(), DomainEntry::virtual_domain());
@@ -316,19 +330,12 @@ pub(crate) fn print_domain_add_no_sync(name: &str, path: &Path, json: bool) {
 // --- domain add --origin ------------------------------------------------------
 
 /// Parses a `domain add --origin owner/repo[/subpath...]` value into
-/// `(owner/repo, subpath)`: the first segment is the owner, the second the
-/// repository name and everything after the second `/` (if any) is the
-/// subpath within the repository the team domain roots at.
+/// `(owner/repo, subpath)`. A thin `anyhow` wrapper over the shared
+/// [`crystalline_service::parse_origin_spec`] the environment overlay also
+/// parses origins through, so the CLI flag and `CRYSTALLINE_DOMAIN_*_ORIGIN`
+/// agree on the grammar; the `--origin` framing is re-attached here.
 pub(crate) fn parse_origin_spec(spec: &str) -> Result<(String, Option<String>)> {
-    let mut parts = spec.splitn(3, '/');
-    let owner = parts.next().filter(|s| !s.is_empty());
-    let repo = parts.next().filter(|s| !s.is_empty());
-    let (owner, repo) = match (owner, repo) {
-        (Some(o), Some(r)) => (o, r),
-        _ => bail!("--origin must look like owner/repo or owner/repo/subpath, got '{spec}'"),
-    };
-    let subpath = parts.next().filter(|s| !s.is_empty()).map(str::to_string);
-    Ok((format!("{owner}/{repo}"), subpath))
+    crystalline_service::parse_origin_spec(spec).map_err(|e| anyhow!("--origin {e}"))
 }
 
 /// Resolves `path` to an absolute path against the current directory,
@@ -576,6 +583,14 @@ pub fn domain_remove(name: &str, config_override: Option<&Path>, json: bool) -> 
     let loaded = load(config_override)?;
     let mut cfg = loaded.file;
     if cfg.domains.shift_remove(name).is_none() {
+        // A miss in the file config may be an env-defined domain: those are
+        // immune to `domain remove` (the variable is their source of truth).
+        if let Some(env) = loaded.overlay.env_domain(name) {
+            bail!(
+                "domain '{name}' is defined by the environment variable {}; unset it to manage this domain in the config file",
+                env.var
+            );
+        }
         bail!("no domain named '{name}' is registered");
     }
     config::save_yaml(&loaded.path, &cfg)
@@ -603,7 +618,10 @@ pub async fn domain_list(
     db_override: Option<&Path>,
     json: bool,
 ) -> Result<()> {
-    let cfg = load(config_override)?.effective;
+    // Keep the whole `LoadedConfig`: reads use the effective config, and the
+    // overlay marks which rows an environment variable defines.
+    let loaded = load(config_override)?;
+    let cfg = loaded.effective;
     let should_open = !backend_is_turso(&cfg) || db_path(db_override)?.exists();
     let stats = if should_open {
         match open_backend(&cfg, db_override, false).await {
@@ -634,11 +652,19 @@ pub async fn domain_list(
             .domains
             .iter()
             .map(|(name, entry)| {
+                // Env-defined domains carry `"source": "env"`; file entries
+                // carry `"config"`, so a caller can tell which is which.
+                let source = if loaded.overlay.env_domain(name).is_some() {
+                    "env"
+                } else {
+                    "config"
+                };
                 serde_json::json!({
                     "name": name,
                     "kind": if entry.is_virtual() { "virtual" } else { "file" },
                     "path": entry.file_path().map(|p| p.display().to_string()),
                     "engrams": count_for(name),
+                    "source": source,
                     "host": host_for(name).map(|(id, hb)| serde_json::json!({
                         "instance_id": id,
                         "heartbeat_at": hb,
@@ -656,10 +682,15 @@ pub async fn domain_list(
     }
     for (name, entry) in &cfg.domains {
         // A virtual domain reports "(virtual)" where a file domain shows its root.
-        let location = entry
+        let mut location = entry
             .file_path()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "(virtual)".to_string());
+        // An env-defined domain is marked so it reads as managed by its
+        // variable, not the config file.
+        if loaded.overlay.env_domain(name).is_some() {
+            location.push_str(" (env)");
+        }
         // In a shared database a file domain names the instance that hosts it.
         let host = host_for(name)
             .map(|(id, _)| format!("\thosted by {id}"))

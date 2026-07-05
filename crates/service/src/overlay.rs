@@ -19,11 +19,27 @@
 //!
 //! Precedence, highest to lowest: command-line flags, then this overlay, then
 //! the config file, then the built-in defaults.
+//!
+//! The overlay also carries env-defined domains: `CRYSTALLINE_DOMAIN_<NAME>`
+//! registers a file domain rooted at a path, and an optional
+//! `CRYSTALLINE_DOMAIN_<NAME>_ORIGIN=owner/repo[/subpath][@branch]` attaches a
+//! GitHub origin to it so a headless node provisions the team domain itself on
+//! first contact. These domains are merged into the effective config last (env
+//! wins over a file entry of the same name) and are never written back to the
+//! file. Two grammar consequences follow from the `_ORIGIN` suffix rule and
+//! are load-bearing: a domain whose env fragment would end in `_ORIGIN` cannot
+//! be env-defined (that spelling is always read as an origin attachment), and
+//! a file domain whose name contains an underscore cannot be env-shadowed
+//! (env names map `_` to `-`, so they never collide with an underscore name).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crystalline_core::config::{self, GlobalConfig};
+use indexmap::IndexMap;
 
+use crystalline_core::config::{self, DomainEntry, GlobalConfig, OriginConfig};
+
+use crate::origin;
 use crate::settings;
 
 /// The variable naming an alternate config file path. Lower priority than a
@@ -31,11 +47,15 @@ use crate::settings;
 /// expanded like every other path Crystalline reads.
 pub const CONFIG_PATH_ENV: &str = "CRYSTALLINE_CONFIG";
 
-/// The prefix for an env-defined domain, `CRYSTALLINE_DOMAIN_<NAME>`. Reserved
-/// here: a variable with this prefix is skipped silently, neither parsed nor
-/// warned about, so it never trips the unknown-variable warning before the
-/// milestone that wires env domains up lands.
+/// The prefix for an env-defined domain, `CRYSTALLINE_DOMAIN_<NAME>`. A
+/// variable with this prefix defines a file domain (or, with the `_ORIGIN`
+/// suffix, attaches an origin to one); see [`EnvOverlay::from_vars`] for the
+/// full grammar.
 pub const DOMAIN_ENV_PREFIX: &str = "CRYSTALLINE_DOMAIN_";
+
+/// The suffix on the variable that attaches an origin to an env-defined
+/// domain: `CRYSTALLINE_DOMAIN_<NAME>_ORIGIN`.
+const DOMAIN_ORIGIN_SUFFIX: &str = "_ORIGIN";
 
 /// The variable carrying a GitHub token for a headless node. Reserved here:
 /// skipped silently until the milestone that reads it lands, so it never trips
@@ -59,6 +79,19 @@ const RESERVED_VARS: &[&str] = &[
 #[error("{0}")]
 pub struct OverlayError(String);
 
+/// One env-defined domain: the variable that defined it and the resulting
+/// [`DomainEntry`]. The `var` is kept so a guard message (a refused
+/// `domain remove`, an `origin_add` name clash) can name the exact variable an
+/// operator has to unset to manage the domain in the config file instead.
+#[derive(Debug, Clone)]
+pub struct EnvDomain {
+    /// The variable that defined the domain, `CRYSTALLINE_DOMAIN_<NAME>`.
+    pub var: String,
+    /// The file-kind domain entry, carrying its root path and, when a matching
+    /// `_ORIGIN` variable was present, its GitHub origin.
+    pub entry: DomainEntry,
+}
+
 /// The validated environment overlay: the `CRYSTALLINE_*` variables that layer
 /// on top of the config file. Parsed once, then applied to a file config to
 /// produce the effective config every runtime read uses.
@@ -68,6 +101,10 @@ pub struct EnvOverlay {
     /// present and non-empty. Each value was validated at parse time by
     /// running its registry spec's `apply`, so replaying it later cannot fail.
     settings: Vec<(String, String)>,
+    /// Env-defined domains keyed by domain name (the mapped, lowercased,
+    /// hyphenated form). Merged into the effective domain map last, so an env
+    /// domain wins over a file entry of the same name.
+    domains: IndexMap<String, EnvDomain>,
     /// The config file path from [`CONFIG_PATH_ENV`], tilde-expanded. `None`
     /// when the variable is absent or empty.
     config_path: Option<PathBuf>,
@@ -86,6 +123,18 @@ impl EnvOverlay {
     /// version of the store-factory check `config set` defers. An empty value
     /// is treated as unset (mirroring the `CRYSTALLINE_MODELS_DIR` precedent in
     /// core). An unrecognized `CRYSTALLINE_*` name only warns.
+    ///
+    /// Env-defined domains are parsed too. `CRYSTALLINE_DOMAIN_<NAME>=<path>`
+    /// registers a file domain: `<NAME>` must be non-empty and match
+    /// `[A-Za-z0-9_]+`, and the domain name is `<NAME>` lowercased with `_`
+    /// mapped to `-` (so `TEAM_KNOWLEDGE` becomes `team-knowledge`); an empty
+    /// or whitespace-only path is fatal, and the path is tilde-expanded.
+    /// `CRYSTALLINE_DOMAIN_<NAME>_ORIGIN=owner/repo[/subpath][@branch]`
+    /// attaches a GitHub origin to the `<NAME>` domain: every variable ending
+    /// in `_ORIGIN` is read as an origin attachment, and one whose base
+    /// `CRYSTALLINE_DOMAIN_<NAME>` is not itself defined is fatal. All
+    /// `CRYSTALLINE_DOMAIN_*` variables are collected first, so an origin may
+    /// appear before its base domain in the iterator without failing.
     pub fn from_vars<I>(vars: I) -> Result<EnvOverlay, OverlayError>
     where
         I: IntoIterator<Item = (String, String)>,
@@ -95,6 +144,11 @@ impl EnvOverlay {
         // A scratch config the setting values are applied to as they parse, so
         // the combined database check below sees every applied value at once.
         let mut scratch = GlobalConfig::default();
+        // Env-domain variables are collected across the whole iterator and
+        // resolved afterwards, so an `_ORIGIN` attachment finds its base domain
+        // regardless of the order the two variables arrive in.
+        let mut domain_vars: Vec<(String, String)> = Vec::new();
+        let mut origin_vars: Vec<(String, String)> = Vec::new();
 
         for (name, value) in vars {
             // A plain, non-Crystalline variable is not ours to reason about.
@@ -119,6 +173,16 @@ impl EnvOverlay {
                 settings.push((spec.key.to_string(), value));
                 continue;
             }
+            if let Some(fragment) = name.strip_prefix(DOMAIN_ENV_PREFIX) {
+                // Every `_ORIGIN`-suffixed name is an origin attachment; every
+                // other is a domain definition. Both are resolved below.
+                if fragment.ends_with(DOMAIN_ORIGIN_SUFFIX) {
+                    origin_vars.push((name, value));
+                } else {
+                    domain_vars.push((name, value));
+                }
+                continue;
+            }
             // Reserved or read elsewhere: skip without a word.
             if is_reserved(&name) {
                 continue;
@@ -138,8 +202,11 @@ impl EnvOverlay {
             ))
         })?;
 
+        let domains = resolve_env_domains(domain_vars, origin_vars)?;
+
         Ok(EnvOverlay {
             settings,
+            domains,
             config_path,
         })
     }
@@ -150,15 +217,19 @@ impl EnvOverlay {
         EnvOverlay::from_vars(std::env::vars())
     }
 
-    /// Whether the overlay carries nothing: no setting override and no config
-    /// path. A no-op overlay leaves the file config untouched.
+    /// Whether the overlay carries nothing: no setting override, no env domain
+    /// and no config path. A no-op overlay leaves the file config untouched.
     pub fn is_empty(&self) -> bool {
-        self.settings.is_empty() && self.config_path.is_none()
+        self.settings.is_empty() && self.domains.is_empty() && self.config_path.is_none()
     }
 
     /// Apply the overlay to a file config, returning the effective config.
     /// Every value was validated at parse time, so replaying it here cannot
     /// fail; a failure would be a bug, not bad input, hence the panic.
+    ///
+    /// Domains merge last, after the settings: an env domain overwrites a file
+    /// entry of the same name (keeping the file entry's position in the map),
+    /// so `CRYSTALLINE_DOMAIN_X` wins over a `config.yaml` domain `x`.
     pub fn apply(&self, file: &GlobalConfig) -> GlobalConfig {
         let mut effective = file.clone();
         for (key, value) in &self.settings {
@@ -168,6 +239,11 @@ impl EnvOverlay {
                 );
             }
         }
+        for (name, env_domain) in &self.domains {
+            effective
+                .domains
+                .insert(name.clone(), env_domain.entry.clone());
+        }
         effective
     }
 
@@ -176,16 +252,43 @@ impl EnvOverlay {
         self.settings.iter().any(|(k, _)| k == key)
     }
 
+    /// The env-defined domain named `name`, if the environment defines one.
+    pub fn env_domain(&self, name: &str) -> Option<&EnvDomain> {
+        self.domains.get(name)
+    }
+
+    /// Every env-defined domain as `(name, definition)`, in the order the
+    /// variables were seen.
+    pub fn env_domains(&self) -> impl Iterator<Item = (&String, &EnvDomain)> {
+        self.domains.iter()
+    }
+
+    /// The names of env-defined domains that shadow a file entry of the same
+    /// name, so a caller can warn once at daemon startup (rather than on every
+    /// `apply`, which runs repeatedly). Empty when no env domain collides with
+    /// the file config.
+    pub fn shadowed_domains(&self, file: &GlobalConfig) -> Vec<&str> {
+        self.domains
+            .keys()
+            .filter(|name| file.domains.contains_key(name.as_str()))
+            .map(String::as_str)
+            .collect()
+    }
+
     /// The config file path from [`CONFIG_PATH_ENV`], if set.
     pub fn config_path(&self) -> Option<&Path> {
         self.config_path.as_deref()
     }
 
-    /// Every active setting override as `(variable, key, display value)`, for
-    /// surfacing in `doctor` and the like. The `database.url` value is rendered
-    /// as `(set)` rather than shown, since it may embed credentials.
+    /// Every active override as `(variable, key, display value)`, for surfacing
+    /// in `doctor` and the like: first the setting overrides, then the
+    /// env-defined domains (keyed `domain.<name>`, their path as the display
+    /// value). The `database.url` value is rendered as `(set)` rather than
+    /// shown, since it may embed credentials; a domain path carries no secret
+    /// and is shown as-is.
     pub fn active_overrides(&self) -> Vec<(String, String, String)> {
-        self.settings
+        let mut out: Vec<(String, String, String)> = self
+            .settings
             .iter()
             .map(|(key, value)| {
                 let display = if key == "database.url" {
@@ -195,15 +298,122 @@ impl EnvOverlay {
                 };
                 (env_var_for(key), key.clone(), display)
             })
-            .collect()
+            .collect();
+        for (name, env_domain) in &self.domains {
+            let path = env_domain
+                .entry
+                .file_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            out.push((env_domain.var.clone(), format!("domain.{name}"), path));
+        }
+        out
     }
 }
 
+/// Resolves the collected `CRYSTALLINE_DOMAIN_*` variables into the overlay's
+/// domain map: every domain-definition variable becomes a file [`DomainEntry`],
+/// then every `_ORIGIN` variable attaches a parsed [`OriginConfig`] to its base
+/// domain. An origin with no matching base domain, an invalid name, an empty
+/// path or a malformed origin value is fatal, each error naming the offending
+/// variable.
+fn resolve_env_domains(
+    domain_vars: Vec<(String, String)>,
+    origin_vars: Vec<(String, String)>,
+) -> Result<IndexMap<String, EnvDomain>, OverlayError> {
+    let mut domains: IndexMap<String, EnvDomain> = IndexMap::new();
+    // The `<NAME>` fragment (for example `TEAM_KNOWLEDGE`) to the mapped domain
+    // name, so an `_ORIGIN` attachment finds the domain its base defines.
+    let mut fragment_to_name: HashMap<String, String> = HashMap::new();
+
+    for (var, value) in domain_vars {
+        // The fragment after `CRYSTALLINE_DOMAIN_` names the domain.
+        let fragment = var
+            .strip_prefix(DOMAIN_ENV_PREFIX)
+            .expect("collected with the domain prefix");
+        if fragment.is_empty()
+            || !fragment
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            return Err(OverlayError(format!(
+                "invalid environment variable {var}: the domain name must be non-empty and use only letters, digits and underscores"
+            )));
+        }
+        if value.trim().is_empty() {
+            return Err(OverlayError(format!(
+                "invalid environment variable {var}: the domain path must not be empty"
+            )));
+        }
+        // The mapped domain name: lowercased with underscores turned to
+        // hyphens, so it never collides with a slug Crystalline itself
+        // generates (slugs never carry underscores).
+        let name = fragment.to_ascii_lowercase().replace('_', "-");
+        let entry = DomainEntry::file(config::expand_tilde(&value));
+        fragment_to_name.insert(fragment.to_string(), name.clone());
+        domains.insert(
+            name,
+            EnvDomain {
+                var: var.clone(),
+                entry,
+            },
+        );
+    }
+
+    for (var, value) in origin_vars {
+        let fragment = var
+            .strip_prefix(DOMAIN_ENV_PREFIX)
+            .expect("collected with the domain prefix");
+        // The base fragment is the name with the `_ORIGIN` suffix removed.
+        let base = fragment
+            .strip_suffix(DOMAIN_ORIGIN_SUFFIX)
+            .expect("collected by its origin suffix");
+        let Some(name) = fragment_to_name.get(base) else {
+            return Err(OverlayError(format!(
+                "environment variable {var} has no matching {DOMAIN_ENV_PREFIX}{base}"
+            )));
+        };
+        let origin = parse_env_origin(&value)
+            .map_err(|e| OverlayError(format!("invalid environment variable {var}: {e}")))?;
+        domains
+            .get_mut(name)
+            .expect("name recorded when the base domain was resolved")
+            .entry
+            .origin = Some(origin);
+    }
+
+    Ok(domains)
+}
+
+/// Parses a `CRYSTALLINE_DOMAIN_<NAME>_ORIGIN` value,
+/// `owner/repo[/subpath][@branch]`, into an [`OriginConfig`]. An optional
+/// `@branch` is split off the last `@` (an empty branch is an error), then the
+/// `owner/repo[/subpath]` remainder is parsed the same way the CLI `--origin`
+/// flag is. `poll_secs` is left unset: an env-origin domain defers to the
+/// global `github.poll_secs`.
+fn parse_env_origin(value: &str) -> Result<OriginConfig, String> {
+    let (repo_spec, branch) = match value.rsplit_once('@') {
+        Some((_, "")) => {
+            return Err("the branch after '@' must not be empty".to_string());
+        }
+        Some((repo_spec, branch)) => (repo_spec, Some(branch.to_string())),
+        None => (value, None),
+    };
+    let (repo, subpath) = origin::parse_origin_spec(repo_spec)?;
+    Ok(OriginConfig {
+        repo,
+        path: subpath,
+        branch,
+        poll_secs: None,
+    })
+}
+
 /// Whether `name` is a reserved `CRYSTALLINE_*` variable that is skipped
-/// silently rather than warned about: one read outside the registry, an
-/// env-domain definition or the GitHub token, none of them handled here.
+/// silently rather than warned about: one read outside the registry or the
+/// GitHub token, neither handled here. Env-domain variables are not reserved:
+/// they are parsed into [`EnvOverlay::domains`] before this check runs.
 fn is_reserved(name: &str) -> bool {
-    RESERVED_VARS.contains(&name) || name.starts_with(DOMAIN_ENV_PREFIX) || name == GITHUB_TOKEN_ENV
+    RESERVED_VARS.contains(&name) || name == GITHUB_TOKEN_ENV
 }
 
 /// The environment variable a registry key maps to. Every stored setting key
@@ -367,8 +577,6 @@ mod tests {
             ("CRYSTALLINE_HEARTBEAT_SECS", "5"),
             ("CRYSTALLINE_STALE_SECS", "15"),
             ("CRYSTALLINE_TEST_POSTGRES_URL", "postgres://db/test"),
-            ("CRYSTALLINE_DOMAIN_TEAM", "/knowledge/team"),
-            ("CRYSTALLINE_DOMAIN_TEAM_ORIGIN", "owner/repo"),
             ("CRYSTALLINE_GITHUB_TOKEN", "ghp_secret"),
         ])
         .unwrap();
@@ -465,6 +673,242 @@ mod tests {
             resolve_config_path(Some(flag), None).unwrap(),
             PathBuf::from("/flag/config.yaml"),
             "the flag alone resolves to itself"
+        );
+    }
+
+    // --- env-defined domains -------------------------------------------------
+
+    #[test]
+    fn a_domain_name_is_lowercased_with_underscores_mapped_to_hyphens() {
+        let ov = overlay(&[
+            ("CRYSTALLINE_DOMAIN_TEAM_KNOWLEDGE", "/k/team"),
+            ("CRYSTALLINE_DOMAIN_BRAND", "/k/brand"),
+            ("CRYSTALLINE_DOMAIN_TEAM_A", "/k/a"),
+            ("CRYSTALLINE_DOMAIN_TEAM123", "/k/123"),
+        ])
+        .unwrap();
+
+        assert!(ov.env_domain("team-knowledge").is_some());
+        assert!(ov.env_domain("brand").is_some());
+        assert!(ov.env_domain("team-a").is_some());
+        assert!(ov.env_domain("team123").is_some());
+
+        let team = ov.env_domain("team-knowledge").unwrap();
+        assert_eq!(team.var, "CRYSTALLINE_DOMAIN_TEAM_KNOWLEDGE");
+        assert_eq!(
+            team.entry.file_path().as_deref(),
+            Some(Path::new("/k/team"))
+        );
+        assert!(team.entry.origin.is_none());
+        assert!(!ov.is_empty());
+    }
+
+    #[test]
+    fn a_domain_name_with_an_illegal_character_is_rejected_naming_the_variable() {
+        let err = overlay(&[("CRYSTALLINE_DOMAIN_TEAM-X", "/k/team")]).unwrap_err();
+        assert!(
+            err.to_string().contains("CRYSTALLINE_DOMAIN_TEAM-X"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_empty_domain_path_is_rejected_naming_the_variable() {
+        let err = overlay(&[("CRYSTALLINE_DOMAIN_TEAM", "   ")]).unwrap_err();
+        assert!(err.to_string().contains("CRYSTALLINE_DOMAIN_TEAM"), "{err}");
+        assert!(err.to_string().contains("path"), "{err}");
+    }
+
+    #[test]
+    fn an_origin_attaches_a_repo_with_no_subpath_or_branch() {
+        let ov = overlay(&[
+            ("CRYSTALLINE_DOMAIN_TEAM", "/k/team"),
+            ("CRYSTALLINE_DOMAIN_TEAM_ORIGIN", "acme/brand-knowledge"),
+        ])
+        .unwrap();
+        let origin = ov
+            .env_domain("team")
+            .unwrap()
+            .entry
+            .origin
+            .as_ref()
+            .unwrap();
+        assert_eq!(origin.repo, "acme/brand-knowledge");
+        assert_eq!(origin.path, None);
+        assert_eq!(origin.branch, None);
+        assert_eq!(origin.branch(), "main");
+        assert_eq!(origin.poll_secs, None);
+    }
+
+    #[test]
+    fn an_origin_reads_a_subpath() {
+        let ov = overlay(&[
+            ("CRYSTALLINE_DOMAIN_TEAM", "/k/team"),
+            (
+                "CRYSTALLINE_DOMAIN_TEAM_ORIGIN",
+                "acme/monorepo/teams/brand",
+            ),
+        ])
+        .unwrap();
+        let origin = ov
+            .env_domain("team")
+            .unwrap()
+            .entry
+            .origin
+            .as_ref()
+            .unwrap();
+        assert_eq!(origin.repo, "acme/monorepo");
+        assert_eq!(origin.path.as_deref(), Some("teams/brand"));
+        assert_eq!(origin.branch, None);
+    }
+
+    #[test]
+    fn an_origin_reads_a_branch_off_the_last_at() {
+        let ov = overlay(&[
+            ("CRYSTALLINE_DOMAIN_TEAM", "/k/team"),
+            ("CRYSTALLINE_DOMAIN_TEAM_ORIGIN", "acme/brand@release"),
+        ])
+        .unwrap();
+        let origin = ov
+            .env_domain("team")
+            .unwrap()
+            .entry
+            .origin
+            .as_ref()
+            .unwrap();
+        assert_eq!(origin.repo, "acme/brand");
+        assert_eq!(origin.path, None);
+        assert_eq!(origin.branch.as_deref(), Some("release"));
+    }
+
+    #[test]
+    fn an_origin_reads_a_subpath_and_a_branch_together() {
+        let ov = overlay(&[
+            ("CRYSTALLINE_DOMAIN_TEAM", "/k/team"),
+            (
+                "CRYSTALLINE_DOMAIN_TEAM_ORIGIN",
+                "acme/monorepo/teams/brand@release",
+            ),
+        ])
+        .unwrap();
+        let origin = ov
+            .env_domain("team")
+            .unwrap()
+            .entry
+            .origin
+            .as_ref()
+            .unwrap();
+        assert_eq!(origin.repo, "acme/monorepo");
+        assert_eq!(origin.path.as_deref(), Some("teams/brand"));
+        assert_eq!(origin.branch.as_deref(), Some("release"));
+    }
+
+    #[test]
+    fn an_origin_with_an_empty_branch_is_rejected_naming_the_variable() {
+        let err = overlay(&[
+            ("CRYSTALLINE_DOMAIN_TEAM", "/k/team"),
+            ("CRYSTALLINE_DOMAIN_TEAM_ORIGIN", "acme/brand@"),
+        ])
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("CRYSTALLINE_DOMAIN_TEAM_ORIGIN"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("branch"), "{err}");
+    }
+
+    #[test]
+    fn an_orphan_origin_with_no_base_domain_is_rejected() {
+        let err = overlay(&[("CRYSTALLINE_DOMAIN_TEAM_ORIGIN", "acme/brand")]).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("CRYSTALLINE_DOMAIN_TEAM_ORIGIN"), "{msg}");
+        assert!(msg.contains("CRYSTALLINE_DOMAIN_TEAM"), "{msg}");
+    }
+
+    #[test]
+    fn an_origin_may_precede_its_base_domain_in_the_iterator() {
+        // The two variables are collected before either is resolved, so order
+        // in the environment does not matter.
+        let ov = overlay(&[
+            ("CRYSTALLINE_DOMAIN_TEAM_ORIGIN", "acme/brand"),
+            ("CRYSTALLINE_DOMAIN_TEAM", "/k/team"),
+        ])
+        .unwrap();
+        assert_eq!(
+            ov.env_domain("team")
+                .unwrap()
+                .entry
+                .origin
+                .as_ref()
+                .unwrap()
+                .repo,
+            "acme/brand"
+        );
+    }
+
+    #[test]
+    fn an_env_domain_beats_a_file_domain_of_the_same_name() {
+        let mut file = GlobalConfig::default();
+        file.domains
+            .insert("team".to_string(), DomainEntry::file("/file/team"));
+
+        let ov = overlay(&[("CRYSTALLINE_DOMAIN_TEAM", "/env/team")]).unwrap();
+        let effective = ov.apply(&file);
+
+        assert_eq!(
+            effective
+                .domains
+                .get("team")
+                .unwrap()
+                .file_path()
+                .as_deref(),
+            Some(Path::new("/env/team")),
+            "the env domain wins over the file entry"
+        );
+        assert_eq!(ov.shadowed_domains(&file), vec!["team"]);
+    }
+
+    #[test]
+    fn shadowed_domains_is_empty_when_no_env_domain_collides() {
+        let mut file = GlobalConfig::default();
+        file.domains
+            .insert("brand".to_string(), DomainEntry::file("/file/brand"));
+        let ov = overlay(&[("CRYSTALLINE_DOMAIN_TEAM", "/env/team")]).unwrap();
+        assert!(ov.shadowed_domains(&file).is_empty());
+    }
+
+    #[test]
+    fn env_domains_lists_every_env_domain() {
+        let ov = overlay(&[
+            ("CRYSTALLINE_DOMAIN_TEAM", "/k/team"),
+            ("CRYSTALLINE_DOMAIN_BRAND", "/k/brand"),
+        ])
+        .unwrap();
+        let names: Vec<&String> = ov.env_domains().map(|(name, _)| name).collect();
+        assert!(names.iter().any(|n| n.as_str() == "team"));
+        assert!(names.iter().any(|n| n.as_str() == "brand"));
+        assert_eq!(names.len(), 2);
+    }
+
+    #[test]
+    fn active_overrides_includes_env_domains() {
+        let ov = overlay(&[
+            ("CRYSTALLINE_GITHUB_ENABLED", "true"),
+            ("CRYSTALLINE_DOMAIN_TEAM", "/k/team"),
+        ])
+        .unwrap();
+        let overrides = ov.active_overrides();
+
+        let domain = overrides
+            .iter()
+            .find(|(_, key, _)| key == "domain.team")
+            .expect("the env domain is listed among the active overrides");
+        assert_eq!(domain.0, "CRYSTALLINE_DOMAIN_TEAM");
+        assert_eq!(domain.2, "/k/team");
+
+        assert!(
+            overrides.iter().any(|(_, key, _)| key == "github.enabled"),
+            "setting overrides are still listed alongside domains"
         );
     }
 }
