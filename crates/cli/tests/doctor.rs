@@ -565,3 +565,134 @@ fn github_section_reports_the_environment_token_store_when_the_variable_is_set()
 
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// A minimal config plus an env-defined domain (with a real `MANIFEST.md` so
+/// the per-domain checks report clean and the assertions below stay focused
+/// on the environment section), used by the three tests below.
+fn setup_env_domain(work: &Path) -> (PathBuf, PathBuf) {
+    let config = work.join("config.yaml");
+    std::fs::write(&config, "domains: {}\n").unwrap();
+    let domain_dir = work.join("kb-team");
+    std::fs::create_dir_all(&domain_dir).unwrap();
+    std::fs::write(domain_dir.join("MANIFEST.md"), "# Manifest\n").unwrap();
+    (config, domain_dir)
+}
+
+#[test]
+fn environment_section_reports_masked_and_filtered_overrides_domains_and_token() {
+    let work = tempfile::tempdir().unwrap();
+    let (config, domain_dir) = setup_env_domain(work.path());
+    let env_config_path = work.path().join("elsewhere-config.yaml");
+
+    let out = bin()
+        .env("CRYSTALLINE_SERVICE_READ_ONLY", "true")
+        .env("CRYSTALLINE_DOMAIN_TEAM", &domain_dir)
+        .env("CRYSTALLINE_GITHUB_TOKEN", "gho_SECRETSECRET")
+        .env("CRYSTALLINE_CONFIG", &env_config_path)
+        .args(["--json", "doctor", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(work.path().join("index.db"))
+        .output()
+        .unwrap()
+        .stdout;
+    let report: Value = serde_json::from_slice(&out).unwrap();
+    let env = &report["environment"];
+
+    // The `--config` flag wins for what actually loads, but the overlay still
+    // records the variable itself, independent of which path won.
+    assert_eq!(
+        env["config_path_var"],
+        serde_json::json!(env_config_path.display().to_string())
+    );
+
+    let overrides = env["overrides"].as_array().unwrap();
+    assert!(
+        overrides
+            .iter()
+            .any(|o| o["var"] == "CRYSTALLINE_SERVICE_READ_ONLY"
+                && o["key"] == "service.read_only"
+                && o["value"] == "true"),
+        "{overrides:?}"
+    );
+    assert!(
+        !overrides
+            .iter()
+            .any(|o| o["key"].as_str().unwrap_or_default().starts_with("domain.")),
+        "domain rows belong in the dedicated `domains` list, not the flat overrides: {overrides:?}"
+    );
+    assert!(
+        !overrides.iter().any(|o| o["key"] == "github.token"),
+        "the token belongs in the dedicated `github_token` flag, not the flat overrides: {overrides:?}"
+    );
+
+    let domains = env["domains"].as_array().unwrap();
+    assert_eq!(domains.len(), 1);
+    assert_eq!(
+        domains[0]["var"],
+        serde_json::json!("CRYSTALLINE_DOMAIN_TEAM")
+    );
+    assert_eq!(domains[0]["name"], serde_json::json!("team"));
+    assert_eq!(
+        domains[0]["path"],
+        serde_json::json!(domain_dir.display().to_string())
+    );
+    assert_eq!(domains[0]["origin"], serde_json::Value::Null);
+
+    assert_eq!(env["github_token"], serde_json::json!(true));
+}
+
+#[test]
+fn environment_section_renders_for_a_human_without_leaking_the_token() {
+    let work = tempfile::tempdir().unwrap();
+    let (config, domain_dir) = setup_env_domain(work.path());
+
+    let human = bin()
+        .env("CRYSTALLINE_SERVICE_READ_ONLY", "true")
+        .env("CRYSTALLINE_DOMAIN_TEAM", &domain_dir)
+        .env("CRYSTALLINE_GITHUB_TOKEN", "gho_SECRETSECRET")
+        .args(["doctor", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(work.path().join("index.db"))
+        .output()
+        .unwrap()
+        .stdout;
+    let human = String::from_utf8(human).unwrap();
+
+    assert!(human.contains("environment:"), "{human}");
+    assert!(
+        human.contains("CRYSTALLINE_SERVICE_READ_ONLY overrides service.read_only = true"),
+        "{human}"
+    );
+    assert!(
+        human.contains(&format!(
+            "CRYSTALLINE_DOMAIN_TEAM defines domain 'team' at {}",
+            domain_dir.display()
+        )),
+        "{human}"
+    );
+    assert!(
+        human.contains("CRYSTALLINE_GITHUB_TOKEN provides the GitHub token (read-only)"),
+        "{human}"
+    );
+    assert!(!human.contains("SECRET"), "{human}");
+}
+
+#[test]
+fn environment_section_is_absent_with_no_env_vars_active() {
+    let work = tempfile::tempdir().unwrap();
+    let config = work.path().join("config.yaml");
+    std::fs::write(&config, "domains: {}\n").unwrap();
+
+    let out = bin()
+        .args(["--json", "doctor", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(work.path().join("index.db"))
+        .output()
+        .unwrap()
+        .stdout;
+    let report: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(report["environment"], serde_json::Value::Null);
+}

@@ -11,15 +11,17 @@
 //! against the configured one; (g) when `github.enabled`, whether this
 //! machine is connected to GitHub and, per team domain, whether its local
 //! origin state is present and its base snapshot still matches what was
-//! recorded (`verify_base`). `--fix` removes orphan rows and stale service
-//! artifacts; the rest, including the whole GitHub section, are report-only,
-//! each pointing at the right next command.
+//! recorded (`verify_base`); (h) which `CRYSTALLINE_*` environment variables
+//! are active, purely informational. `--fix` removes orphan rows and stale
+//! service artifacts; the rest, including the whole GitHub and environment
+//! sections, are report-only, and every finding that has a fix points at the
+//! right next command.
 
 use std::collections::HashSet;
 use std::path::Path;
 
 use anyhow::{Result, anyhow};
-use crystalline_core::config::{self, DomainEntry, GlobalConfig};
+use crystalline_core::config::{self, DomainEntry, GlobalConfig, OriginConfig};
 use crystalline_core::verify::{self, VerifyOptions};
 use crystalline_index::{Store, configured_model_id};
 use crystalline_remote::TokenStore;
@@ -143,6 +145,58 @@ pub struct GithubDoctor {
     pub origins: Vec<OriginDoctor>,
 }
 
+/// One flat setting override from the environment, `(variable, key, value)`
+/// reshaped into a record. Sourced from [`EnvOverlay::active_overrides`],
+/// filtered to drop `domain.*` and `github.token` rows: those get the richer
+/// dedicated [`EnvironmentDoctor::domains`] and
+/// [`EnvironmentDoctor::github_token`] fields instead, so the flat list never
+/// duplicates them. `database.url` already arrives masked as `"(set)"`.
+#[derive(Debug, Clone, Serialize)]
+pub struct EnvOverride {
+    /// The environment variable, for example `CRYSTALLINE_DATABASE_BACKEND`.
+    pub var: String,
+    /// The settings registry key it overrides, for example
+    /// `database.backend`.
+    pub key: String,
+    /// The overridden value, masked to `"(set)"` for `database.url`.
+    pub value: String,
+}
+
+/// One env-defined domain, from [`EnvOverlay::env_domains`].
+#[derive(Debug, Clone, Serialize)]
+pub struct EnvDomainReport {
+    /// The variable that defined the domain, `CRYSTALLINE_DOMAIN_<NAME>`.
+    pub var: String,
+    /// The mapped domain name.
+    pub name: String,
+    /// The domain's root path.
+    pub path: String,
+    /// The attached GitHub origin, rendered `owner/repo[/subpath]@branch`,
+    /// when a matching `_ORIGIN` variable was present.
+    pub origin: Option<String>,
+}
+
+/// Which `CRYSTALLINE_*` environment variables are active, surfaced purely
+/// for visibility: never counted as a problem, and never present at all
+/// (`None`) when the environment overlay carries nothing (mirroring how
+/// [`DoctorReport::github`] is absent when collaboration is off). No value
+/// here is a secret: `database.url` and the GitHub token are masked exactly
+/// as [`EnvOverlay::active_overrides`] masks them, and the token itself is
+/// reduced to a boolean.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct EnvironmentDoctor {
+    /// The `CRYSTALLINE_CONFIG` value, when set. A path, never a secret.
+    pub config_path_var: Option<String>,
+    /// Every active setting override, `domain.*` and `github.token` rows
+    /// excluded (see [`EnvDomainReport`] and `github_token` below).
+    pub overrides: Vec<EnvOverride>,
+    /// Every env-defined domain.
+    pub domains: Vec<EnvDomainReport>,
+    /// Whether `CRYSTALLINE_GITHUB_TOKEN` is set. The value itself never
+    /// appears anywhere in this report.
+    pub github_token: bool,
+}
+
 /// The full `doctor` report.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct DoctorReport {
@@ -150,6 +204,9 @@ pub struct DoctorReport {
     pub domains: Vec<DomainDoctor>,
     /// Service lock and socket diagnostics.
     pub service: ServiceDoctor,
+    /// Which `CRYSTALLINE_*` environment variables are active, `None` when
+    /// none are.
+    pub environment: Option<EnvironmentDoctor>,
     /// GitHub collaboration diagnostics, `None` when `github.enabled` is
     /// false.
     pub github: Option<GithubDoctor>,
@@ -235,6 +292,8 @@ pub async fn run(
 
     let service = check_service(fix)?;
 
+    let environment = check_environment(&loaded.overlay);
+
     let github = if cfg.github_enabled() {
         Some(check_github(cfg, &loaded.overlay, &targets)?)
     } else {
@@ -249,6 +308,7 @@ pub async fn run(
     Ok(DoctorReport {
         domains,
         service,
+        environment,
         github,
         embeddings,
         fix,
@@ -457,6 +517,58 @@ fn check_service(fix: bool) -> Result<ServiceDoctor> {
     Ok(s)
 }
 
+/// Which `CRYSTALLINE_*` environment variables are active, straight off the
+/// parsed overlay. `None` when the overlay is empty, the same "omit the
+/// section rather than show it empty" rule [`check_github`] follows. Purely
+/// informational: nothing here ever feeds `remaining_problems`.
+fn check_environment(overlay: &EnvOverlay) -> Option<EnvironmentDoctor> {
+    if overlay.is_empty() {
+        return None;
+    }
+
+    let overrides = overlay
+        .active_overrides()
+        .into_iter()
+        .filter(|(_, key, _)| !key.starts_with("domain.") && key != "github.token")
+        .map(|(var, key, value)| EnvOverride { var, key, value })
+        .collect();
+
+    let domains = overlay
+        .env_domains()
+        .map(|(name, env_domain)| EnvDomainReport {
+            var: env_domain.var.clone(),
+            name: name.clone(),
+            path: env_domain
+                .entry
+                .file_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            origin: env_domain.entry.origin.as_ref().map(render_origin),
+        })
+        .collect();
+
+    Some(EnvironmentDoctor {
+        config_path_var: overlay.config_path().map(|p| p.display().to_string()),
+        overrides,
+        domains,
+        github_token: overlay.github_token().is_some(),
+    })
+}
+
+/// Renders an [`OriginConfig`] as `owner/repo[/subpath]@branch`, the same
+/// grammar `CRYSTALLINE_DOMAIN_<NAME>_ORIGIN` parses, so the report reads as
+/// something an operator could paste back into that variable.
+fn render_origin(origin: &OriginConfig) -> String {
+    let mut s = origin.repo.clone();
+    if let Some(path) = &origin.path {
+        s.push('/');
+        s.push_str(path);
+    }
+    s.push('@');
+    s.push_str(origin.branch());
+    s
+}
+
 /// GitHub collaboration diagnostics: this machine's connection and, per team
 /// domain in `targets`, whether its local origin state is present and its
 /// base snapshot still matches what was recorded. Read-only: resolving the
@@ -645,6 +757,36 @@ pub fn render_human(report: &DoctorReport) -> String {
     }
     if !s.lock_stale && !s.socket_orphaned {
         let _ = writeln!(out, "  ok");
+    }
+
+    if let Some(e) = &report.environment {
+        let _ = writeln!(out, "environment:");
+        if let Some(path) = &e.config_path_var {
+            let _ = writeln!(out, "  CRYSTALLINE_CONFIG points at {path}");
+        }
+        for o in &e.overrides {
+            let _ = writeln!(out, "  {} overrides {} = {}", o.var, o.key, o.value);
+        }
+        for d in &e.domains {
+            match &d.origin {
+                Some(origin) => {
+                    let _ = writeln!(
+                        out,
+                        "  {} defines domain '{}' at {} (origin {origin})",
+                        d.var, d.name, d.path
+                    );
+                }
+                None => {
+                    let _ = writeln!(out, "  {} defines domain '{}' at {}", d.var, d.name, d.path);
+                }
+            }
+        }
+        if e.github_token {
+            let _ = writeln!(
+                out,
+                "  CRYSTALLINE_GITHUB_TOKEN provides the GitHub token (read-only)"
+            );
+        }
     }
 
     if let Some(g) = &report.github {
