@@ -67,13 +67,7 @@ crystalline --version
 
 ### Windows
 
-Via winget (after the first release clears winget-pkgs moderation):
-
-```powershell
-winget install JordiBoehme.Crystalline
-```
-
-Or via MSI - download `crystalline-<version>-windows-amd64.msi` from the [latest release](https://github.com/jordiboehme/crystalline/releases/latest) and double-click it, or install silently:
+Via MSI - download `crystalline-<version>-windows-amd64.msi` from the [latest release](https://github.com/jordiboehme/crystalline/releases/latest) and double-click it, or install silently:
 
 ```powershell
 msiexec /i crystalline-v0.3.0-windows-amd64.msi /qn
