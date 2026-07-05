@@ -65,6 +65,16 @@ sudo dpkg -i "crystalline_${version#v}_${arch}.deb"
 crystalline --version
 ```
 
+### Windows
+
+Via MSI - download `crystalline-<version>-windows-amd64.msi` from the [latest release](https://github.com/jordiboehme/crystalline/releases/latest) and double-click it, or install silently:
+
+```powershell
+msiexec /i crystalline-v0.3.0-windows-amd64.msi /qn
+```
+
+The installer puts Crystalline under `C:\Program Files\Crystalline`, adds it to the system PATH and upgrades in place when you install a newer MSI. Releases are not code signed yet, so SmartScreen may ask you to confirm a downloaded MSI (More info > Run anyway) - verify it against `SHA256SUMS` first.
+
 ### Claude Desktop
 
 Via MCP Bundle - one click, no terminal needed. Download the `.mcpb` file for your platform from the [latest release](https://github.com/jordiboehme/crystalline/releases/latest), then in Claude Desktop open Settings > Extensions > Advanced settings > Install Extension... and pick the file. Choose your knowledge folders in the extension settings; Crystalline prepares each folder as a domain automatically. See the Claude Desktop extension scenario under Deployment scenarios below.

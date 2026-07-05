@@ -1,0 +1,109 @@
+<?xml version='1.0' encoding='utf-8'?>
+<!--
+  WiX v3 source consumed by `cargo wix` in .github/workflows/release.yml.
+  For a local build (Windows only, WiX v3 on PATH or %WIX% set), run the
+  exact cargo-wix invocation from that workflow's "Build .msi package" step
+  after a release build of the crystalline package.
+
+  Never change the UpgradeCode: in-place upgrades via `msiexec /i` depend on
+  it staying identical across every released version.
+-->
+<?if $(sys.BUILDARCH) = x64 or $(sys.BUILDARCH) = arm64 ?>
+    <?define PlatformProgramFilesFolder = "ProgramFiles64Folder" ?>
+<?else ?>
+    <?define PlatformProgramFilesFolder = "ProgramFilesFolder" ?>
+<?endif ?>
+<Wix xmlns='http://schemas.microsoft.com/wix/2006/wi'>
+  <Product Id='*'
+      Name='Crystalline'
+      UpgradeCode='A04060D9-E5E1-4E8E-8751-2DCA3D8896CC'
+      Manufacturer='Jordi Böhme'
+      Language='1033'
+      Codepage='1252'
+      Version='$(var.Version)'>
+
+    <Package Keywords='Installer'
+        Description='Local-first knowledge management for humans and AI agents.'
+        Manufacturer='Jordi Böhme'
+        InstallerVersion='450'
+        Languages='1033'
+        Compressed='yes'
+        InstallScope='perMachine'
+        SummaryCodepage='1252'/>
+
+    <MajorUpgrade Schedule='afterInstallInitialize'
+        DowngradeErrorMessage='A newer version of [ProductName] is already installed. Setup will now exit.'/>
+
+    <Media Id='1' Cabinet='media1.cab' EmbedCab='yes'/>
+
+    <Directory Id='TARGETDIR' Name='SourceDir'>
+      <Directory Id='$(var.PlatformProgramFilesFolder)' Name='PFiles'>
+        <Directory Id='APPLICATIONFOLDER' Name='Crystalline'>
+          <!-- CargoTargetDir is the workspace target/ directory, so ..\LICENSE
+               resolves to the repository root license regardless of the
+               invocation working directory. -->
+          <Component Id='License' Guid='*'>
+            <File Id='LicenseFile'
+                Name='LICENSE'
+                DiskId='1'
+                Source='$(var.CargoTargetDir)\..\LICENSE'
+                KeyPath='yes'/>
+          </Component>
+          <Directory Id='Bin' Name='bin'>
+            <!-- Appends the bin directory to the machine PATH on install and
+                 removes it again on uninstall (Permanent='no'). Lives in its
+                 own default-on feature so an administrator can deselect it. -->
+            <Component Id='Path' Guid='49D159B7-47A6-4F1C-8021-CE0C2BF02C9A' KeyPath='yes'>
+              <Environment Id='PATH'
+                  Name='PATH'
+                  Value='[Bin]'
+                  Permanent='no'
+                  Part='last'
+                  Action='set'
+                  System='yes'/>
+            </Component>
+            <Component Id='CrystallineBinary' Guid='*'>
+              <File Id='CrystallineExe'
+                  Name='crystalline.exe'
+                  DiskId='1'
+                  Source='$(var.CargoTargetBinDir)\crystalline.exe'
+                  KeyPath='yes'/>
+            </Component>
+          </Directory>
+        </Directory>
+      </Directory>
+    </Directory>
+
+    <Feature Id='Binaries'
+        Title='Application'
+        Description='Installs the crystalline command line tool.'
+        Level='1'
+        ConfigurableDirectory='APPLICATIONFOLDER'
+        AllowAdvertise='no'
+        Display='expand'
+        Absent='disallow'>
+      <ComponentRef Id='License'/>
+      <ComponentRef Id='CrystallineBinary'/>
+      <Feature Id='Environment'
+          Title='PATH Environment Variable'
+          Description='Adds the install location to the system PATH so crystalline is available from any terminal.'
+          Level='1'
+          Absent='allow'>
+        <ComponentRef Id='Path'/>
+      </Feature>
+    </Feature>
+
+    <SetProperty Id='ARPINSTALLLOCATION' Value='[APPLICATIONFOLDER]' After='CostFinalize'/>
+    <Property Id='ARPHELPLINK' Value='https://github.com/jordiboehme/crystalline'/>
+    <Property Id='ARPURLINFOABOUT' Value='https://github.com/jordiboehme/crystalline'/>
+
+    <UI>
+      <UIRef Id='WixUI_FeatureTree'/>
+      <!-- No EULA dialog: cargo-wix ships no AGPL-3.0 RTF template, so the
+           LICENSE file installs beside the binary instead and the dialog
+           order skips straight from the welcome page to feature selection. -->
+      <Publish Dialog='WelcomeDlg' Control='Next' Event='NewDialog' Value='CustomizeDlg' Order='99'>1</Publish>
+      <Publish Dialog='CustomizeDlg' Control='Back' Event='NewDialog' Value='WelcomeDlg' Order='99'>1</Publish>
+    </UI>
+  </Product>
+</Wix>

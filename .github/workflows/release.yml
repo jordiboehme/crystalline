@@ -46,6 +46,7 @@ jobs:
             os: windows-latest
             archive_ext: zip
             rustflags: '-C target-feature=+crt-static'
+            msi: true
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
@@ -165,6 +166,62 @@ jobs:
           path: dist/crystalline_*.deb
           if-no-files-found: error
 
+      # .msi package: only the Windows leg produces one, built with the WiX v3
+      # toolset preinstalled on the windows-latest image and driven by
+      # cargo-wix from crates/cli/wix/main.wxs. The MSI installs per machine
+      # into Program Files, puts the binary on the system PATH and upgrades in
+      # place thanks to the frozen UpgradeCode in the wxs.
+      - name: Install cargo-wix
+        if: matrix.msi
+        run: cargo install cargo-wix --version 0.3.9 --locked
+
+      - name: Build .msi package
+        if: matrix.msi
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          # MSI ProductVersion is numeric major.minor.patch: strip the v
+          # prefix and any prerelease suffix (a dry run's v0.0.0-dev becomes
+          # the placeholder 0.0.0 and is never published).
+          msi_version="${version#v}"
+          msi_version="${msi_version%%-*}"
+          cargo wix -p crystalline \
+            --no-build --nocapture \
+            --target ${{ matrix.target }} \
+            --install-version "$msi_version" \
+            --output "dist/crystalline-${version}-windows-amd64.msi"
+
+      # A real elevated install rather than an administrative extract: only an
+      # actual install exercises the PATH Environment component, the upgrade
+      # table and clean removal.
+      - name: Smoke test the .msi
+        if: matrix.msi
+        shell: pwsh
+        run: |
+          $msi = (Get-Item dist/*.msi).FullName
+          $log = Join-Path $env:RUNNER_TEMP 'msi-install.log'
+          $p = Start-Process msiexec -ArgumentList "/i `"$msi`" /qn /norestart /L*v `"$log`"" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { Get-Content $log -Tail 50; throw "install failed: $($p.ExitCode)" }
+          $exe = 'C:\Program Files\Crystalline\bin\crystalline.exe'
+          if (-not (Test-Path $exe)) { throw 'crystalline.exe missing after install' }
+          & $exe --version
+          $sysPath = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment').Path
+          if ($sysPath -notlike '*Crystalline\bin*') { throw 'install dir not on the system PATH' }
+          $p = Start-Process msiexec -ArgumentList "/x `"$msi`" /qn /norestart" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "uninstall failed: $($p.ExitCode)" }
+          if (Test-Path $exe) { throw 'crystalline.exe still present after uninstall' }
+          $sysPath = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment').Path
+          if ($sysPath -like '*Crystalline\bin*') { throw 'PATH entry not removed on uninstall' }
+
+      - name: Upload .msi artifact
+        if: matrix.msi
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: crystalline-msi-amd64
+          path: dist/*.msi
+          if-no-files-found: error
+
   mcpb:
     name: package MCP bundles
     needs: build
@@ -270,7 +327,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p release
-          find downloads -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.deb' -o -name '*.mcpb' \) -exec cp {} release/ \;
+          find downloads -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.deb' -o -name '*.mcpb' -o -name '*.msi' \) -exec cp {} release/ \;
           cd release
           sha256sum * > SHA256SUMS
           ls -la
