@@ -332,7 +332,9 @@ fn detects_and_fixes_a_stale_lock_and_orphaned_socket() {
 
 /// Origin state (like the service lock/socket above) lives under the state
 /// directory, reachable only through `HOME`/`XDG_*`, never a CLI flag, so the
-/// three tests below isolate a short-path temp `HOME` the same way.
+/// tests below isolate a short-path temp `HOME` the same way. Unix-only like
+/// every test that calls it: the isolation runs through `/tmp` and `HOME`.
+#[cfg(unix)]
 fn isolated_home(tag: &str) -> (PathBuf, PathBuf) {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -347,6 +349,7 @@ fn isolated_home(tag: &str) -> (PathBuf, PathBuf) {
     (home, state_dir)
 }
 
+#[cfg(unix)]
 fn apply_home(cmd: &mut Command, home: &Path) {
     cmd.env("HOME", home)
         .env("XDG_CONFIG_HOME", home.join("config"))
@@ -357,6 +360,7 @@ fn apply_home(cmd: &mut Command, home: &Path) {
 /// A team domain's config entry, with a real MANIFEST.md at `domain_dir` so
 /// the ordinary per-domain checks report clean and the assertions below stay
 /// focused on the github section.
+#[cfg(unix)]
 fn write_team_domain_config(config: &Path, domain_dir: &Path) {
     std::fs::create_dir_all(domain_dir).unwrap();
     std::fs::write(domain_dir.join("MANIFEST.md"), "# Manifest\n").unwrap();

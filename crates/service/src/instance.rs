@@ -159,9 +159,12 @@ pub async fn try_attach() -> Option<Connection> {
 }
 
 /// Attach to a daemon, spawning one detached and polling for readiness (up to
-/// ~2s) when none is running and `spawn` is set. `read_only` is passed through
-/// only to a daemon this call spawns; attaching to an already-running daemon
-/// uses that daemon's own mode, never this flag.
+/// ~15s) when none is running and `spawn` is set. The window is generous on
+/// purpose: a cold start on modest hardware or a loaded machine can take well
+/// over the couple of seconds a warm start needs, and giving up early strands
+/// the MCP client with a dead server. `read_only` is passed through only to a
+/// daemon this call spawns; attaching to an already-running daemon uses that
+/// daemon's own mode, never this flag.
 pub async fn ensure_daemon(
     spawn: bool,
     db: Option<&Path>,
@@ -176,13 +179,13 @@ pub async fn ensure_daemon(
     }
     spawn_daemon(db, config_path, read_only)?;
     // Poll readiness: lock record present and socket connectable.
-    for _ in 0..40 {
+    for _ in 0..300 {
         if let Some(conn) = try_attach().await {
             return Ok(conn);
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    anyhow::bail!("spawned a daemon but it did not become ready within 2s")
+    anyhow::bail!("spawned a daemon but it did not become ready within 15s")
 }
 
 /// Spawn `current_exe serve --daemon` fully detached, forwarding `--read-only`
