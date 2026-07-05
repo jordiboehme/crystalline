@@ -42,26 +42,6 @@ Once knowledge grows into the thousands or tens of thousands of units, reading a
   *Unless you ask for exactly that: a virtual domain keeps its engrams in the database instead of on disk, for deployments where a filesystem is baggage rather than a feature. The principle does not bend - it just lets you pick which side of it your domain lives on, and `crystalline domain export` hands the files back whenever you change your mind.
 - **The index is disposable.** Crystalline maintains a database for fast text, tag, temporal and semantic search. For a file domain it is fully derived from the markdown files and rebuilt on demand with `crystalline reindex --full`; for a virtual domain the same tables hold the source of truth, so `reindex --full` rebuilds the file domains around it and never touches it. Corruption or a schema change is never a data-loss event.
 
-### Virtual domains
-
-Most domains are folders of files. A virtual domain is the other option: its engrams live in the database, with no filesystem root. Reach for one where a filesystem is baggage rather than a feature - a container with no writable volume, a PostgreSQL backend shared across machines, or a domain you would rather not mirror to disk at all.
-
-```sh
-# Register a database-backed domain and scaffold its MANIFEST into the index.
-crystalline domain add notes --virtual
-
-# It works with the same tools as any domain.
-crystalline write notes "First note" --content "captured straight into the database"
-crystalline search "captured"
-```
-
-Two commands move engrams between the two kinds of truth:
-
-- `crystalline domain import <path> --domain <name>` loads already-well-formed engram files into a virtual domain, verbatim. It is distinct from `crystalline import`, which converts a legacy tree into a *file* domain's directory.
-- `crystalline domain export <path> --domain <name>` writes any domain's engrams back out as a normal markdown folder. This is how you take a virtual domain's data out to run `crystalline verify` on it, or convert it back to files whenever you change your mind.
-
-Concurrent edits to the same virtual engram are guarded: `read_engram` returns a checksum, and passing it back as `expected_checksum` on `edit_engram` refuses the edit if the engram changed since you read it, so a stale write conflicts instead of clobbering. Omit it for last-write-wins.
-
 ## Install
 
 macOS, via [Homebrew](https://brew.sh):
@@ -370,24 +350,6 @@ Temporal fields are plain and easy to get wrong by overthinking them: an absent 
 
 The CLI mirrors the mutating and read tools directly for scripting and quick edits outside an agent session: `crystalline write`, `read`, `edit`, `move`, `delete`, `search`, `context` and `recent` take the same parameters as their MCP counterparts.
 
-## Keep knowledge honest
-
-`crystalline verify` statically checks one or more domains against the full rule catalog - malformed frontmatter, broken links, missing MANIFEST sections, schema drift - with no database, service or network connection involved. Run it in CI with the bundled GitHub Action:
-
-```yaml
-- uses: jordiboehme/crystalline@v1
-  with:
-    paths: knowledge/
-    strict: 'false'
-```
-
-The action downloads a pinned release binary (checksum-verified), runs `crystalline verify`, annotates the run and, on a pull request, posts a single summary comment kept up to date in place.
-
-Two more commands keep a knowledge base trustworthy:
-
-- **`crystalline import <src> --domain <name>`** brings an existing markdown-plus-frontmatter knowledge base under Crystalline: normalizes legacy `type` values, backfills `status` and temporal metadata, drops sentinel far-future dates in favor of leaving the field open-ended, and adds a missing `timestamp` - all as a pure file transformation, with `--dry-run` to preview first.
-- **`crystalline doctor`** diagnoses the index, registered domains and service state (orphan index rows, encoding issues, stale service locks) and repairs what it safely can with `--fix`. Once team domains are turned on it also reports whether this machine is connected to GitHub and whether each team domain's local origin state is intact; that part is always report-only, `--fix` never touches origin state.
-
 ## Share knowledge with a team
 
 A team domain is an ordinary domain whose files also live in a GitHub repository: local markdown stays the source of truth on this machine, and an origin records which repository, subfolder and branch it tracks.
@@ -437,6 +399,24 @@ github:
   oauth_client_id: abc123                       # a self-hosted OAuth App, GitHub Enterprise Server only
 ```
 
+## Keep knowledge honest
+
+`crystalline verify` statically checks one or more domains against the full rule catalog - malformed frontmatter, broken links, missing MANIFEST sections, schema drift - with no database, service or network connection involved. Its usual home is CI/CD on the GitHub repositories that hold a team's knowledge: every proposal is verified before the team merges it, so nothing malformed ever lands on the branch everyone pulls from. The bundled GitHub Action wires that up:
+
+```yaml
+- uses: jordiboehme/crystalline@v1
+  with:
+    paths: knowledge/
+    strict: 'false'
+```
+
+The action downloads a pinned release binary (checksum-verified), runs `crystalline verify`, annotates the run and, on a pull request, posts a single summary comment kept up to date in place.
+
+Two more commands keep a knowledge base trustworthy:
+
+- **`crystalline import <src> --domain <name>`** brings an existing markdown-plus-frontmatter knowledge base under Crystalline: normalizes legacy `type` values, backfills `status` and temporal metadata, drops sentinel far-future dates in favor of leaving the field open-ended, and adds a missing `timestamp` - all as a pure file transformation, with `--dry-run` to preview first.
+- **`crystalline doctor`** diagnoses the index, registered domains and service state (orphan index rows, encoding issues, stale service locks) and repairs what it safely can with `--fix`. Once team domains are turned on it also reports whether this machine is connected to GitHub and whether each team domain's local origin state is intact; that part is always report-only, `--fix` never touches origin state.
+
 ## Skills
 
 The `skills/` folder ships four harness-agnostic agent skills that teach an agent how to use Crystalline well:
@@ -453,6 +433,26 @@ cp -r skills/crystalline-routing skills/crystalline-capture skills/crystalline-s
 ```
 
 Other harnesses that support a similar skill or instruction-file convention can point at the same folders directly; the content only assumes the MCP tools documented above, never a specific harness.
+
+## Virtual domains
+
+Most domains are folders of files. A virtual domain is the other option: its engrams live in the database, with no filesystem root. Reach for one where a filesystem is baggage rather than a feature - a container with no writable volume, a PostgreSQL backend shared across machines, or a domain you would rather not mirror to disk at all.
+
+```sh
+# Register a database-backed domain and scaffold its MANIFEST into the index.
+crystalline domain add notes --virtual
+
+# It works with the same tools as any domain.
+crystalline write notes "First note" --content "captured straight into the database"
+crystalline search "captured"
+```
+
+Two commands move engrams between the two kinds of truth:
+
+- `crystalline domain import <path> --domain <name>` loads already-well-formed engram files into a virtual domain, verbatim. It is distinct from `crystalline import`, which converts a legacy tree into a *file* domain's directory.
+- `crystalline domain export <path> --domain <name>` writes any domain's engrams back out as a normal markdown folder. This is how you take a virtual domain's data out to run `crystalline verify` on it, or convert it back to files whenever you change your mind.
+
+Concurrent edits to the same virtual engram are guarded: `read_engram` returns a checksum, and passing it back as `expected_checksum` on `edit_engram` refuses the edit if the engram changed since you read it, so a stale write conflicts instead of clobbering. Omit it for last-write-wins.
 
 ## Architecture
 
