@@ -224,9 +224,15 @@ impl EnvOverlay {
             }
             if let Some(fragment) = name.strip_prefix(DOMAIN_ENV_PREFIX) {
                 // Every `_ORIGIN`-suffixed name is an origin attachment; every
-                // other is a domain definition. Both are resolved below.
+                // other is a domain definition. Both are resolved below. An
+                // empty `_ORIGIN` value reads as "no attachment", matching the
+                // empty-is-unset convention of every other variable (an empty
+                // domain PATH stays an error: the base variable declares a
+                // domain, so it has to say where the domain lives).
                 if fragment.ends_with(DOMAIN_ORIGIN_SUFFIX) {
-                    origin_vars.push((name, value));
+                    if !value.is_empty() {
+                        origin_vars.push((name, value));
+                    }
                 } else {
                     domain_vars.push((name, value));
                 }
@@ -807,6 +813,21 @@ mod tests {
         assert_eq!(origin.branch, None);
         assert_eq!(origin.branch(), "main");
         assert_eq!(origin.poll_secs, None);
+    }
+
+    #[test]
+    fn an_empty_origin_value_reads_as_no_attachment() {
+        // `VAR=` means unset for every other variable; a blanked `_ORIGIN`
+        // therefore leaves a plain local domain instead of failing startup,
+        // even when no base variable exists for it at all.
+        let ov = overlay(&[
+            ("CRYSTALLINE_DOMAIN_TEAM", "/k/team"),
+            ("CRYSTALLINE_DOMAIN_TEAM_ORIGIN", ""),
+            ("CRYSTALLINE_DOMAIN_LONER_ORIGIN", ""),
+        ])
+        .unwrap();
+        assert!(ov.env_domain("team").unwrap().entry.origin.is_none());
+        assert!(ov.env_domain("loner").is_none());
     }
 
     #[test]
