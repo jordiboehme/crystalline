@@ -732,7 +732,8 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Status { config }) => on_runtime(status_dispatch(config, cli.db, cli.json)),
         Some(Command::Model { command }) => match command {
             ModelCommand::Download { config } => {
-                on_runtime(cmd::model_download(config.as_deref(), cli.json))
+                let json = cli.json;
+                on_runtime(async move { cmd::model_download(config.as_deref(), json).await })
             }
         },
         Some(Command::Import {
@@ -1435,22 +1436,46 @@ async fn run_data(command: Command, db: Option<PathBuf>, json: bool) -> anyhow::
 
 /// Run an async command body on a fresh multi-threaded Tokio runtime. Kept off
 /// the static `verify` and `prompt` paths so they never start a runtime.
-fn on_runtime<F: std::future::Future<Output = anyhow::Result<()>>>(fut: F) -> anyhow::Result<()> {
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?
-        .block_on(fut)
+fn on_runtime<F>(fut: F) -> anyhow::Result<()>
+where
+    F: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
+{
+    on_runtime_value(fut)?
 }
 
 /// Like [`on_runtime`] but for a future that yields a plain value. Used by
 /// `prompt system` to resolve virtual-domain routing bullets only when the
 /// config actually has a virtual domain, so the common all-file path never
 /// starts a runtime.
-fn on_runtime_value<T, F: std::future::Future<Output = T>>(fut: F) -> anyhow::Result<T> {
-    Ok(tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?
-        .block_on(fut))
+///
+/// The future runs on a dedicated thread with an explicit 8 MiB stack rather
+/// than being polled on the process main thread: Windows gives the main
+/// thread 1 MiB where Linux and macOS give 8, and the larger command futures
+/// overflow that in unoptimized builds. One deep thread makes the stack
+/// budget identical on every platform.
+fn on_runtime_value<T, F>(fut: F) -> anyhow::Result<T>
+where
+    T: Send + 'static,
+    F: std::future::Future<Output = T> + Send + 'static,
+{
+    let worker = std::thread::Builder::new()
+        .name("crystalline-cmd".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || {
+            anyhow::Ok(
+                tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()?
+                    .block_on(fut),
+            )
+        })?;
+    match worker.join() {
+        Ok(result) => result,
+        // The default hook already printed the panic message on the worker;
+        // re-raising on the main thread preserves the process-level behavior
+        // block_on-on-main had.
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
 }
 
 fn run_domain(command: DomainCommand, db: Option<PathBuf>, json: bool) -> anyhow::Result<()> {
@@ -1468,7 +1493,9 @@ fn run_domain(command: DomainCommand, db: Option<PathBuf>, json: bool) -> anyhow
             name, path, is_virtual, origin, branch, config, db, no_sync, json,
         )),
         DomainCommand::List { config } => {
-            on_runtime(cmd::domain_list(config.as_deref(), db.as_deref(), json))
+            on_runtime(
+                async move { cmd::domain_list(config.as_deref(), db.as_deref(), json).await },
+            )
         }
         DomainCommand::Import {
             path,
@@ -1798,10 +1825,13 @@ fn run_prompt(
     // the daemon (warm) or a direct store read. The all-file common case never
     // opens a runtime, so it stays as fast and deterministic as before.
     let virtual_bullets = if global.domains.values().any(|e| e.is_virtual()) {
-        on_runtime_value(crystalline_service::virtual_routing_bullets(
-            &global,
-            db.as_deref(),
-        ))?
+        // Owned copies: the future moves onto the runtime worker thread.
+        let global_bullets = global.clone();
+        let db_bullets = db.clone();
+        on_runtime_value(async move {
+            crystalline_service::virtual_routing_bullets(&global_bullets, db_bullets.as_deref())
+                .await
+        })?
     } else {
         std::collections::BTreeMap::new()
     };
