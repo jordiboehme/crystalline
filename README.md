@@ -308,7 +308,7 @@ Agents connect to the containerized daemon over its HTTP MCP endpoint, `http://l
 
 ## Session onboarding
 
-Every MCP client gets a baseline automatically: the crystalline server's instructions, returned when a client connects, carry a routing block - one line per registered domain plus the behavior rules - rebuilt from the registered MANIFESTs for each new connection. Claude Desktop and any harness that shows the model its MCP server instructions need no further setup. Over MCP there is no workspace, so `prompt.rules` filters and repo-local `preferred_domains` do not apply there; the hook recipe below is the workspace-scoped path.
+Every MCP client gets a baseline automatically: the crystalline server's instructions, returned when a client connects, carry a routing block - one line per registered domain plus the behavior rules. The domain list and file-domain MANIFESTs are read fresh for every new connection; virtual-domain routing lines follow the daemon's latest snapshot, refreshed on every stdio connection and on every local virtual write. Claude Desktop and any harness that shows the model its MCP server instructions need no further setup. Over MCP there is no workspace, so `prompt.rules` filters and repo-local `preferred_domains` do not apply there; the hook recipe below is the workspace-scoped path.
 
 Run `crystalline prompt system` at the start of a session and feed its output to the agent as context. It reads every registered domain's `MANIFEST.md` and renders a compact routing block: one line per domain summarizing when to use it, plus the behavior rules (narrow question -> search that domain; broad question -> sweep all of them; writes always name a domain explicitly). The output names the exact crystalline MCP tools each rule refers to (`search_engrams`, `write_engram` and the rest), so an agent with several MCP servers connected knows exactly which tool on which server to call. `prompt` takes a subcommand naming the kind of prompt to generate; `system` is the only kind today.
 
@@ -435,7 +435,7 @@ cp -r skills/crystalline-routing skills/crystalline-capture skills/crystalline-s
 
 Installing from a release instead of a clone: download `crystalline-skills-v<version>.zip` from the [latest release](https://github.com/jordiboehme/crystalline/releases/latest) and unpack it into `~/.claude/skills/`.
 
-Claude Desktop: download `crystalline-skill-v<version>.zip` from the latest release, then open Settings > Capabilities > Skills and upload the zip as-is (it contains the `crystalline-memory` folder; do not unpack it). Routing itself needs no skill - the server's instructions deliver it automatically; the skill adds capture and collaboration best practices.
+Claude Desktop: download `crystalline-skill-v<version>.zip` from the latest release, then open Settings > Capabilities > Skills (enable the Skills capability there if it is off) and upload the zip as-is (it contains the `crystalline-memory` folder; do not unpack it). Routing itself needs no skill - the server's instructions deliver it automatically; the skill adds capture and collaboration best practices.
 
 Other harnesses that support a similar skill or instruction-file convention can point at the same folders directly; the content only assumes the MCP tools documented above, never a specific harness.
 

@@ -319,8 +319,13 @@ jobs:
           (cd skills && zip -qr "../skill-out/crystalline-skill-v${version}.zip" crystalline-memory)
           (cd skills && zip -qr "../skill-out/crystalline-skills-v${version}.zip" \
             crystalline-routing crystalline-capture crystalline-schema crystalline-collaboration)
-          unzip -l "skill-out/crystalline-skill-v${version}.zip" | grep -q 'crystalline-memory/SKILL.md'
-          unzip -l "skill-out/crystalline-skills-v${version}.zip" | grep -q 'crystalline-routing/SKILL.md'
+          # Exact-path assertions: each skill folder must sit at the zip ROOT
+          # (an unanchored grep would also match a wrong skills/<name> layout)
+          # and every topical skill must be present in the bundle zip.
+          unzip -Z1 "skill-out/crystalline-skill-v${version}.zip" | grep -qx 'crystalline-memory/SKILL.md'
+          for s in crystalline-routing crystalline-capture crystalline-schema crystalline-collaboration; do
+            unzip -Z1 "skill-out/crystalline-skills-v${version}.zip" | grep -qx "$s/SKILL.md"
+          done
 
       - name: Upload skill zips artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
