@@ -1148,3 +1148,34 @@ parity!(
     embedding_column_width_follows_provider_dims,
     embedding_width_follows_provider
 );
+
+/// Models routinely double-encode nested tool arguments, sending the
+/// `metadata_filters` object as a JSON string. The wire parser accepts
+/// that form by parsing the string first; everything else non-object
+/// still fails with the plain must-be-an-object error.
+#[test]
+fn metadata_filters_accept_a_json_encoded_object() {
+    let object_form = serde_json::json!({
+        "valid_from": { "$lte": "2025-03-15" },
+        "valid_to": { "$gt": "2025-03-15" }
+    });
+    let expected = crystalline_index::parse_metadata_filters(&object_form).unwrap();
+
+    let string_form = serde_json::json!(
+        "{\"valid_from\": {\"$lte\": \"2025-03-15\"}, \"valid_to\": {\"$gt\": \"2025-03-15\"}}"
+    );
+    let parsed = crystalline_index::parse_metadata_filters(&string_form).unwrap();
+    assert_eq!(parsed, expected);
+
+    for wrong in [
+        serde_json::json!("not json at all"),
+        serde_json::json!("[\"an\", \"array\"]"),
+        serde_json::json!(42),
+    ] {
+        let err = crystalline_index::parse_metadata_filters(&wrong).unwrap_err();
+        assert!(
+            err.to_string().contains("must be an object"),
+            "unexpected error for {wrong}: {err}"
+        );
+    }
+}

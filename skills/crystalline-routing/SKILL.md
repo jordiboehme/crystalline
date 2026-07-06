@@ -85,7 +85,7 @@ Classify the question shape before dropping the `current` filter:
 - **Binary adoption questions** - "are we running on X", "did we adopt Y", "is Z live". The yes/no itself is in doubt, so search without a status filter and read each hit's own `status`; a `current`-only filter would hide the draft or superseded engram that answers "no". Name the status in the answer ("proposed but never marked current").
 - **Attribute questions** - "how long does X live", "how much does Y cost", "how many stages". The thing exists; only its present value is unknown. Keep `status: "current"` even when the subject sounds operational.
 
-Two practical notes on window filters: `metadata_filters` must be a JSON object, not a JSON-encoded string - a stringified object is rejected with an invalid-input error. And when a window filter is not getting traction, the `supersedes`/`superseded_by` relations plus each hit's `status` tell the same temporal story: search by keyword (topic or year) and read which engram covers the period asked about.
+When a window filter is not getting traction, the `supersedes`/`superseded_by` relations plus each hit's `status` tell the same temporal story: search by keyword (topic or year) and read which engram covers the period asked about.
 
 ## Read a MANIFEST only when needed
 

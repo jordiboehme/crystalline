@@ -269,8 +269,20 @@ pub struct MetadataFilter {
 /// a bare scalar (shorthand for `$eq`) or an operator object with exactly one of
 /// `$eq`, `$in`, `$gt`, `$gte`, `$lt`, `$lte` or `$between`. `$in` takes an array
 /// and `$between` takes a two-element `[lo, hi]` array. This is the boundary the
-/// M5 MCP and CLI layers parse tool arguments through.
+/// M5 MCP and CLI layers parse tool arguments through. Models routinely
+/// double-encode nested tool arguments, so the whole object arriving as a JSON
+/// string is also accepted and parsed first.
 pub fn parse_metadata_filters(value: &serde_json::Value) -> Result<Vec<MetadataFilter>> {
+    let decoded;
+    let value = match value {
+        serde_json::Value::String(raw) => {
+            decoded = serde_json::from_str::<serde_json::Value>(raw).map_err(|_| {
+                crate::IndexError::Invalid("metadata_filters must be an object".into())
+            })?;
+            &decoded
+        }
+        other => other,
+    };
     let obj = value
         .as_object()
         .ok_or_else(|| crate::IndexError::Invalid("metadata_filters must be an object".into()))?;
