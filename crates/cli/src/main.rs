@@ -1,9 +1,9 @@
 //! `crystalline`: the command-line entry point. Wires the crate stack
 //! (core, index, service) into subcommands.
 //!
-//! `verify` and `prompt` are static: they call straight into
-//! `crystalline-core` and touch no database, socket or network connection.
-//! Every other subcommand lands in a later milestone.
+//! `verify`, `prompt` and `hook` are static: none of them opens a database,
+//! a socket or a network connection, and none starts a Tokio runtime. Every
+//! other subcommand lands in a later milestone.
 
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -15,6 +15,8 @@ use crystalline_core::verify::{self, VerifyOptions};
 
 mod cmd;
 mod doctor;
+mod hook;
+mod install;
 
 /// Local-first knowledge management for humans and AI agents.
 #[derive(Parser, Debug)]
@@ -67,6 +69,49 @@ enum Command {
     Connect {
         #[command(subcommand)]
         command: ConnectCommand,
+    },
+    /// Wire a coding harness up to Crystalline in one idempotent step:
+    /// register the MCP server, install the SessionStart routing hook and the
+    /// Stop capture-nudge hook and copy the four topical skills into place.
+    /// Safe to re-run; a second run that finds everything already in place
+    /// writes nothing and reports it as already present. Static like `verify`
+    /// and `prompt`: no database, service or network connection. A missing or
+    /// failing harness CLI is never fatal - the MCP command to run by hand is
+    /// printed and the hooks and skills still install.
+    Install {
+        /// Which harness to wire up.
+        #[arg(value_enum)]
+        harness: install::HarnessKind,
+        /// Write into the current repository's harness config (.claude,
+        /// .codex or .agents under the working directory) instead of this
+        /// user's global one. Codex still registers its MCP server per user.
+        #[arg(long)]
+        project: bool,
+        /// Skip registering the MCP server.
+        #[arg(long)]
+        skip_mcp: bool,
+        /// Skip installing the SessionStart and Stop hooks.
+        #[arg(long)]
+        skip_hooks: bool,
+        /// Skip copying the topical skills.
+        #[arg(long)]
+        skip_skills: bool,
+    },
+    /// Reverse `crystalline install` for a harness: deregister the MCP server,
+    /// remove the managed hooks and drop the copied skills, leaving every
+    /// hook, key and skill that is not Crystalline's own untouched. A skill a
+    /// person edited by hand is kept unless `--force` is given.
+    Uninstall {
+        /// Which harness to unwire.
+        #[arg(value_enum)]
+        harness: install::HarnessKind,
+        /// Act on the current repository's harness config instead of this
+        /// user's global one.
+        #[arg(long)]
+        project: bool,
+        /// Remove a copied skill even when its SKILL.md was edited locally.
+        #[arg(long)]
+        force: bool,
     },
     /// Bring a team domain up to date with its origin, or check where it
     /// stands.
@@ -381,6 +426,32 @@ enum Command {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// Respond to a harness lifecycle hook event over stdin/stdout. Plumbing
+    /// for `crystalline install`'s generated hook wiring, not something a
+    /// person runs by hand - documented here so anyone who finds it in a
+    /// harness's settings file can identify what it is. Static like `verify`
+    /// and `prompt`: no database, service or network connection, and a call
+    /// completes in tens of milliseconds. Silent (exit 0, empty stdout) on
+    /// every call that is not the one earning a nudge, since a hook must
+    /// never be the reason a harness's turn breaks.
+    Hook {
+        #[command(subcommand)]
+        event: HookEvent,
+    },
+}
+
+/// Which harness lifecycle event a `hook` invocation answers. `Stop` is the
+/// only kind today; future events attach here without reshaping `hook`
+/// again.
+#[derive(Subcommand, Debug)]
+enum HookEvent {
+    /// Once per substantive session, on the first Stop call that earns it:
+    /// print a reminder to review the conversation for durable learnings and
+    /// propose capturing them. Every other call - a stale or malformed
+    /// payload, a hook-caused continuation, an unconfigured or read-only
+    /// install, a session already nudged or a session too short to be worth
+    /// interrupting - is silent.
+    Stop,
 }
 
 /// The kind of prompt to generate. `system` is the only kind today; future
@@ -714,6 +785,27 @@ fn main() -> anyhow::Result<()> {
         },
         Some(Command::Domain { command }) => run_domain(command, cli.db, cli.json),
         Some(Command::Connect { command }) => on_runtime(run_connect(command, cli.json)),
+        Some(Command::Install {
+            harness,
+            project,
+            skip_mcp,
+            skip_hooks,
+            skip_skills,
+        }) => install::run_install(
+            install::InstallOptions {
+                harness,
+                project,
+                skip_mcp,
+                skip_hooks,
+                skip_skills,
+            },
+            cli.json,
+        ),
+        Some(Command::Uninstall {
+            harness,
+            project,
+            force,
+        }) => install::run_uninstall(harness, project, force, cli.json),
         Some(Command::Origin { command }) => on_runtime(run_origin(command, cli.db, cli.json)),
         Some(Command::Config { command }) => on_runtime(config_dispatch(command, cli.json)),
         Some(Command::Sync {
@@ -783,6 +875,12 @@ fn main() -> anyhow::Result<()> {
             | Command::Context { .. }
             | Command::Recent { .. }),
         ) => on_runtime(run_data(cmd, cli.db, cli.json)),
+        Some(Command::Hook { event }) => match event {
+            HookEvent::Stop => {
+                hook::run_stop();
+                Ok(())
+            }
+        },
     }
 }
 
@@ -825,16 +923,19 @@ fn opt_vec(v: Vec<String>) -> Option<Vec<String>> {
     if v.is_empty() { None } else { Some(v) }
 }
 
-/// `status`: report from the daemon over ctl when one is running, else open the
-/// index directly.
+/// `status`: report from the daemon over ctl when one is running and no explicit
+/// `--config`/`--db` override was given, else open the index directly. An
+/// override names an exact config and index the running daemon may not serve, so
+/// it always takes the direct path (see [`crystalline_service::use_daemon`]).
 async fn status_dispatch(
     config: Option<PathBuf>,
     db: Option<PathBuf>,
     json: bool,
 ) -> anyhow::Result<()> {
     use serde_json::json;
-    if let Some(data) =
-        crystalline_service::ctl_if_running(json!({ "v": 1, "cmd": "status" })).await?
+    if crystalline_service::use_daemon(db.as_deref(), config.as_deref())
+        && let Some(data) =
+            crystalline_service::ctl_if_running(json!({ "v": 1, "cmd": "status" })).await?
     {
         print_value(&data, json);
         return Ok(());
@@ -842,7 +943,10 @@ async fn status_dispatch(
     cmd::status(config.as_deref(), db.as_deref(), json).await
 }
 
-/// `sync`: route to the daemon when one owns the index, else sync directly.
+/// `sync`: route to the daemon when one owns the index and no explicit
+/// `--config`/`--db` override was given, else sync directly. An override names
+/// an exact config and index the running daemon may not serve, so it always
+/// takes the direct path (see [`crystalline_service::use_daemon`]).
 /// `take_over` forces the daemon's host-lock claim for a shared-database host
 /// migration; it is meaningless without a daemon (standalone sync holds no host
 /// lock), so the direct path ignores it.
@@ -855,10 +959,11 @@ async fn sync_dispatch(
     json: bool,
 ) -> anyhow::Result<()> {
     use serde_json::json;
-    if let Some(data) = crystalline_service::ctl_if_running(
-        json!({ "v": 1, "cmd": "sync", "domain": domain, "embed": embed, "take_over": take_over }),
-    )
-    .await?
+    if crystalline_service::use_daemon(db.as_deref(), config.as_deref())
+        && let Some(data) = crystalline_service::ctl_if_running(
+            json!({ "v": 1, "cmd": "sync", "domain": domain, "embed": embed, "take_over": take_over }),
+        )
+        .await?
     {
         print_value(&data, json);
         return Ok(());
@@ -873,7 +978,10 @@ async fn sync_dispatch(
     .await
 }
 
-/// `reindex`: route to the daemon when one owns the index, else reindex directly.
+/// `reindex`: route to the daemon when one owns the index and no explicit
+/// `--config`/`--db` override was given, else reindex directly. An override
+/// names an exact config and index the running daemon may not serve, so it
+/// always takes the direct path (see [`crystalline_service::use_daemon`]).
 async fn reindex_dispatch(
     full: bool,
     embed: bool,
@@ -882,10 +990,11 @@ async fn reindex_dispatch(
     json: bool,
 ) -> anyhow::Result<()> {
     use serde_json::json;
-    if let Some(data) = crystalline_service::ctl_if_running(
-        json!({ "v": 1, "cmd": "reindex", "full": full, "embed": embed }),
-    )
-    .await?
+    if crystalline_service::use_daemon(db.as_deref(), config.as_deref())
+        && let Some(data) = crystalline_service::ctl_if_running(
+            json!({ "v": 1, "cmd": "reindex", "full": full, "embed": embed }),
+        )
+        .await?
     {
         print_value(&data, json);
         return Ok(());
@@ -1593,10 +1702,19 @@ async fn mcp_dispatch(
                     "crystalline mcp: registered domain '{name}' at {}",
                     path.display()
                 );
-                if let Err(e) = crystalline_service::ctl_if_running(
-                    json!({ "v": 1, "cmd": "sync", "domain": name, "embed": false }),
-                )
-                .await
+                // Nudge a running daemon to sync (and start watching) the new
+                // root only when the registration landed in the daemon's own
+                // config; an explicit --config wrote a different file the daemon
+                // does not serve, so it has nothing to sync. The --db override
+                // is deliberately not gated on here: `run_mcp` below attaches to
+                // a running daemon regardless of --db, so the notify must still
+                // fire whenever the domain reached the daemon's config, keeping
+                // this session and the daemon in step.
+                if config.is_none()
+                    && let Err(e) = crystalline_service::ctl_if_running(
+                        json!({ "v": 1, "cmd": "sync", "domain": name, "embed": false }),
+                    )
+                    .await
                 {
                     eprintln!(
                         "crystalline mcp: warning: could not sync newly registered domain '{name}' with the running daemon: {e}"
@@ -1677,23 +1795,28 @@ async fn domain_add_dispatch(
         return Ok(());
     }
 
+    // Index over the daemon only when no explicit --config/--db override was
+    // given: an override names an exact config and index, so the sync must land
+    // there via the direct path rather than in whatever the running daemon
+    // serves (see [`crystalline_service::use_daemon`]).
     use serde_json::json as j;
-    let report: crystalline_index::SyncReport = if let Some(data) =
-        crystalline_service::ctl_if_running(
-            j!({ "v": 1, "cmd": "sync", "domain": name, "embed": false }),
-        )
-        .await?
-    {
-        let first = data
-            .get("reports")
-            .and_then(|r| r.get(0))
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
-        serde_json::from_value(first)
-            .map_err(|e| anyhow::anyhow!("could not parse the daemon's sync report: {e}"))?
-    } else {
-        cmd::sync_domain_direct(&name, &abs, config.as_deref(), db.as_deref()).await?
-    };
+    let report: crystalline_index::SyncReport =
+        if crystalline_service::use_daemon(db.as_deref(), config.as_deref())
+            && let Some(data) = crystalline_service::ctl_if_running(
+                j!({ "v": 1, "cmd": "sync", "domain": name, "embed": false }),
+            )
+            .await?
+        {
+            let first = data
+                .get("reports")
+                .and_then(|r| r.get(0))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            serde_json::from_value(first)
+                .map_err(|e| anyhow::anyhow!("could not parse the daemon's sync report: {e}"))?
+        } else {
+            cmd::sync_domain_direct(&name, &abs, config.as_deref(), db.as_deref()).await?
+        };
 
     cmd::print_domain_add(&name, &abs, &report, json);
     Ok(())
@@ -1749,7 +1872,10 @@ async fn domain_add_origin_dispatch(
 
 /// `domain remove`: drop it from the config, then best-effort tell a running
 /// daemon to stop watching its path. Never fails on the ctl round trip; the
-/// config edit already succeeded by the time it runs.
+/// config edit already succeeded by the time it runs. The notify fires only
+/// when the removal happened in the daemon's own config: an explicit --config
+/// edited a different file the daemon does not serve, so its watch set is
+/// unaffected and there is nothing to forget.
 async fn domain_remove_dispatch(
     name: String,
     config: Option<PathBuf>,
@@ -1757,9 +1883,12 @@ async fn domain_remove_dispatch(
 ) -> anyhow::Result<()> {
     cmd::domain_remove(&name, config.as_deref(), json)?;
     use serde_json::json as j;
-    let _ =
-        crystalline_service::ctl_if_running(j!({ "v": 1, "cmd": "forget_domain", "domain": name }))
-            .await;
+    if config.is_none() {
+        let _ = crystalline_service::ctl_if_running(
+            j!({ "v": 1, "cmd": "forget_domain", "domain": name }),
+        )
+        .await;
+    }
     Ok(())
 }
 
@@ -1825,12 +1954,19 @@ fn run_prompt(
     // the daemon (warm) or a direct store read. The all-file common case never
     // opens a runtime, so it stays as fast and deterministic as before.
     let virtual_bullets = if global.domains.values().any(|e| e.is_virtual()) {
-        // Owned copies: the future moves onto the runtime worker thread.
+        // Owned copies: the future moves onto the runtime worker thread. The
+        // raw --config override rides along so it bypasses the daemon just like
+        // every other verb, even though `global` was already resolved from it.
         let global_bullets = global.clone();
         let db_bullets = db.clone();
+        let config_bullets = config_path.clone();
         on_runtime_value(async move {
-            crystalline_service::virtual_routing_bullets(&global_bullets, db_bullets.as_deref())
-                .await
+            crystalline_service::virtual_routing_bullets(
+                &global_bullets,
+                db_bullets.as_deref(),
+                config_bullets.as_deref(),
+            )
+            .await
         })?
     } else {
         std::collections::BTreeMap::new()

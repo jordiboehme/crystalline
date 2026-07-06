@@ -12,10 +12,16 @@
 //! machine is connected to GitHub and, per team domain, whether its local
 //! origin state is present and its base snapshot still matches what was
 //! recorded (`verify_base`); (h) which `CRYSTALLINE_*` environment variables
-//! are active, purely informational. `--fix` removes orphan rows and stale
-//! service artifacts; the rest, including the whole GitHub and environment
-//! sections, are report-only, and every finding that has a fix points at the
-//! right next command.
+//! are active, purely informational; (i) for Claude Code and Codex, whether
+//! either coding-harness integration `crystalline install` wires up leaves
+//! any trace on disk and, when it does, whether its settings/hooks file
+//! parses and carries the `SessionStart` and `Stop` hooks and how many of
+//! the four managed skills are installed or locally modified - filesystem
+//! only, with no shell-out to the harness's own CLI, so this check stays
+//! fast and works offline. `--fix` removes orphan rows and stale service
+//! artifacts; the rest, including the whole GitHub, environment and
+//! harnesses sections, are report-only, and every finding that has a fix
+//! points at the right next command.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -32,6 +38,7 @@ use crystalline_service::instance;
 use serde::Serialize;
 
 use crate::cmd;
+use crate::install::{self, HarnessKind};
 
 /// One domain's diagnostics.
 #[derive(Debug, Clone, Default, Serialize)]
@@ -197,6 +204,45 @@ pub struct EnvironmentDoctor {
     pub github_token: bool,
 }
 
+/// One coding harness's onboarding trace: whether its settings/hooks file
+/// exists, parses, carries our two managed hooks and how many of the four
+/// managed skills are installed at its skills folder. Checked purely from
+/// the filesystem, reusing `install`'s own presence predicate and skill
+/// list, with no shell-out to the harness's own CLI (`claude` or `codex`),
+/// so this stays fast and works offline; user scope only, since doctor
+/// reports on the ambient environment rather than any one repository's
+/// `--project` setup.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct HarnessDoctor {
+    /// The harness's stable identifier, `"claude-code"` or `"codex"` - the
+    /// same spelling `crystalline install <name>` takes.
+    pub name: String,
+    /// The settings/hooks file this harness reads (`settings.json` for
+    /// Claude Code, `hooks.json` for Codex).
+    pub settings_path: String,
+    /// Whether the settings file exists on disk.
+    pub settings_present: bool,
+    /// The parse error, when the file is present but is not valid JSON or
+    /// not a JSON object. `None` when the file is absent or parses cleanly -
+    /// the only field on this struct that
+    /// [`DoctorReport::remaining_problems`] counts, since a harness that was
+    /// simply never installed is not itself a problem.
+    pub settings_parse_error: Option<String>,
+    /// Whether the `SessionStart` routing hook is present, matcher-insensitive
+    /// (a hand-written recipe counts, not only one `crystalline install`
+    /// wrote).
+    pub session_start_hook: bool,
+    /// Whether the `Stop` capture-nudge hook is present.
+    pub stop_hook: bool,
+    /// How many of the four managed skills have a `SKILL.md` at this
+    /// harness's skills folder, whether or not its content still matches the
+    /// embedded copy.
+    pub skills_installed: usize,
+    /// How many of the skills counted in `skills_installed` were locally
+    /// modified: present, but no longer byte-identical to the embedded copy.
+    pub skills_modified: usize,
+}
+
 /// The full `doctor` report.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct DoctorReport {
@@ -212,6 +258,11 @@ pub struct DoctorReport {
     pub github: Option<GithubDoctor>,
     /// Embedding staleness summary, `None` when there is no index yet.
     pub embeddings: Option<serde_json::Value>,
+    /// Onboarding trace for the Claude Code and Codex integrations
+    /// `crystalline install` wires up. `None` when neither harness leaves
+    /// any trace on disk at all: no settings/hooks file and no managed
+    /// skill installed.
+    pub harnesses: Option<Vec<HarnessDoctor>>,
     /// Whether this report was produced with `--fix`.
     pub fix: bool,
 }
@@ -248,6 +299,14 @@ impl DoctorReport {
                 }
                 n += o.base_mismatches.len();
             }
+        }
+        // A harness that was never installed is not a problem; an
+        // unparseable settings/hooks file for one that was is.
+        if let Some(harnesses) = &self.harnesses {
+            n += harnesses
+                .iter()
+                .filter(|h| h.settings_parse_error.is_some())
+                .count();
         }
         n
     }
@@ -305,12 +364,15 @@ pub async fn run(
         None => None,
     };
 
+    let harnesses = check_harnesses();
+
     Ok(DoctorReport {
         domains,
         service,
         environment,
         github,
         embeddings,
+        harnesses,
         fix,
     })
 }
@@ -567,6 +629,68 @@ fn render_origin(origin: &OriginConfig) -> String {
     s.push('@');
     s.push_str(origin.branch());
     s
+}
+
+/// Filesystem-only diagnostics for both coding harnesses `crystalline
+/// install` wires up: whether a settings/hooks file exists, whether it
+/// parses, whether it carries our two managed hooks and how many of the
+/// four managed skills are present. No shell-out to `claude` or `codex`, so
+/// this stays fast and works offline; user scope only, reusing `install`'s
+/// own presence predicate and skill list rather than duplicating either.
+/// `None` when neither harness leaves any trace at all, the same
+/// "omit the section rather than show it empty" rule [`check_environment`]
+/// and [`check_github`] follow.
+fn check_harnesses() -> Option<Vec<HarnessDoctor>> {
+    let harnesses: Vec<HarnessDoctor> = [HarnessKind::ClaudeCode, HarnessKind::Codex]
+        .into_iter()
+        .map(check_one_harness)
+        .collect();
+    let any_trace = harnesses
+        .iter()
+        .any(|h| h.settings_present || h.skills_installed > 0);
+    any_trace.then_some(harnesses)
+}
+
+/// One harness's diagnostics: read its settings/hooks file read-only, check
+/// both managed hooks via [`install::hook_present`] and count how many of
+/// [`install::MANAGED_SKILLS`] are present (and, of those, how many were
+/// locally modified) at its skills folder.
+fn check_one_harness(harness: HarnessKind) -> HarnessDoctor {
+    let paths = install::harness_paths(harness, false);
+    let settings_present = paths.settings.is_file();
+
+    let (session_start_hook, stop_hook, settings_parse_error) =
+        match install::read_settings(&paths.settings) {
+            Ok(root) => (
+                install::hook_present(&root, "SessionStart", install::SESSION_START_COMMAND),
+                install::hook_present(&root, "Stop", install::STOP_COMMAND),
+                None,
+            ),
+            Err(e) => (false, false, Some(e.to_string())),
+        };
+
+    let mut skills_installed = 0;
+    let mut skills_modified = 0;
+    for &(name, content) in install::MANAGED_SKILLS {
+        let path = paths.skills_dir.join(name).join("SKILL.md");
+        if let Ok(existing) = std::fs::read(&path) {
+            skills_installed += 1;
+            if existing != content.as_bytes() {
+                skills_modified += 1;
+            }
+        }
+    }
+
+    HarnessDoctor {
+        name: harness.id().to_string(),
+        settings_path: paths.settings.display().to_string(),
+        settings_present,
+        settings_parse_error,
+        session_start_hook,
+        stop_hook,
+        skills_installed,
+        skills_modified,
+    }
 }
 
 /// GitHub collaboration diagnostics: this machine's connection and, per team
@@ -852,6 +976,55 @@ pub fn render_human(report: &DoctorReport) -> String {
         );
     } else {
         let _ = writeln!(out, "embeddings: no index yet");
+    }
+
+    if let Some(harnesses) = &report.harnesses {
+        let _ = writeln!(out, "harnesses:");
+        for h in harnesses {
+            let _ = writeln!(out, "  {} ({})", h.name, h.settings_path);
+            if let Some(err) = &h.settings_parse_error {
+                let _ = writeln!(out, "    [problem] settings file is not valid JSON: {err}");
+            } else if !h.settings_present {
+                let _ = writeln!(out, "    not installed (no settings/hooks file yet)");
+            } else {
+                let _ = writeln!(
+                    out,
+                    "    SessionStart hook: {}",
+                    if h.session_start_hook {
+                        "present"
+                    } else {
+                        "absent"
+                    }
+                );
+                let _ = writeln!(
+                    out,
+                    "    Stop hook: {}",
+                    if h.stop_hook { "present" } else { "absent" }
+                );
+                if h.session_start_hook != h.stop_hook {
+                    let _ = writeln!(
+                        out,
+                        "    partial setup - run: crystalline install {}",
+                        h.name
+                    );
+                }
+            }
+            if h.skills_installed > 0 {
+                let modified = if h.skills_modified > 0 {
+                    format!(", {} locally modified", h.skills_modified)
+                } else {
+                    String::new()
+                };
+                let _ = writeln!(
+                    out,
+                    "    skills: {}/{} installed{modified}",
+                    h.skills_installed,
+                    install::MANAGED_SKILLS.len()
+                );
+            } else {
+                let _ = writeln!(out, "    skills: none installed");
+            }
+        }
     }
 
     let remaining = report.remaining_problems();

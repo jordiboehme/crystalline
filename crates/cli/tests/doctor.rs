@@ -33,6 +33,21 @@ fn engram(title: &str, permalink: &str) -> String {
 /// now indexes on registration, so it needs the same `--db` the test's own
 /// later sync/doctor calls use (`work/index.db`), rather than the machine's
 /// default state directory.
+/// Point a doctor invocation's `HOME`/`XDG_*` at a scratch directory so its
+/// exit-code assertions never couple to the developer's real machine-wide
+/// state (harness configs under `~/.claude` and `~/.codex`, service lock and
+/// socket). A no-op on Windows, where the base-directory strategy does not
+/// honor these variables; Windows CI runs on a fresh profile, so the ambient
+/// state is empty there anyway.
+#[allow(unused_variables)]
+fn shield_ambient_home(cmd: &mut Command, tag: &str) {
+    #[cfg(unix)]
+    {
+        let (home, _state) = isolated_home(tag);
+        apply_home(cmd, &home);
+    }
+}
+
 fn setup_domain(work: &Path, name: &str, config: &Path) -> PathBuf {
     let domain_dir = work.join(format!("kb-{name}"));
     bin()
@@ -69,7 +84,9 @@ fn reports_clean_when_nothing_is_wrong() {
         .assert()
         .success();
 
-    let out = bin()
+    let mut cmd = bin();
+    shield_ambient_home(&mut cmd, "clean-run");
+    let out = cmd
         .args(["--json", "doctor", "--config"])
         .arg(&config)
         .args(["--db"])
@@ -123,7 +140,9 @@ fn detects_orphan_and_fix_removes_it() {
     assert_eq!(report["domains"][0]["orphans"], serde_json::json!(["b.md"]));
 
     // --fix removes the orphan row and the report shows zero problems.
-    let fixed_out = bin()
+    let mut fixed_cmd = bin();
+    shield_ambient_home(&mut fixed_cmd, "orphan-fix");
+    let fixed_out = fixed_cmd
         .args(["--json", "doctor", "--fix", "--config"])
         .arg(&config)
         .args(["--db"])
@@ -137,7 +156,9 @@ fn detects_orphan_and_fix_removes_it() {
     assert_eq!(fixed["domains"][0]["orphans_removed"], serde_json::json!(1));
 
     // A clean re-run confirms the row is really gone.
-    let clean = bin()
+    let mut clean_cmd = bin();
+    shield_ambient_home(&mut clean_cmd, "orphan-clean");
+    let clean = clean_cmd
         .args(["--json", "doctor", "--config"])
         .arg(&config)
         .args(["--db"])
@@ -246,7 +267,9 @@ fn domain_filter_restricts_checks_to_one_domain() {
     setup_domain(work.path(), "eng", &config);
     setup_domain(work.path(), "product", &config);
 
-    let out = bin()
+    let mut cmd = bin();
+    shield_ambient_home(&mut cmd, "domain-filter");
+    let out = cmd
         .args(["--json", "doctor", "--domain", "eng", "--config"])
         .arg(&config)
         .args(["--db"])
@@ -699,4 +722,175 @@ fn environment_section_is_absent_with_no_env_vars_active() {
         .stdout;
     let report: Value = serde_json::from_slice(&out).unwrap();
     assert_eq!(report["environment"], serde_json::Value::Null);
+}
+
+/// The `harnesses` section reads `~/.claude` and `~/.codex`/`~/.agents`,
+/// reachable only through `HOME`, never a CLI flag, so every scenario below
+/// isolates a fresh `HOME` the same way the lock/socket and github tests
+/// above do. A domain-less config plus a fresh `--db` path keeps every
+/// assertion focused on the harnesses section alone.
+#[cfg(unix)]
+fn empty_config(work: &Path) -> (PathBuf, PathBuf) {
+    let config = work.join("config.yaml");
+    std::fs::write(&config, "domains: {}\n").unwrap();
+    (config, work.join("index.db"))
+}
+
+/// Find one harness's entry in a `--json doctor` report's `harnesses` array
+/// by its `name` (`"claude-code"` or `"codex"`).
+#[cfg(unix)]
+fn harness_entry<'a>(report: &'a Value, name: &str) -> &'a Value {
+    report["harnesses"]
+        .as_array()
+        .unwrap_or_else(|| panic!("harnesses section is absent: {report}"))
+        .iter()
+        .find(|h| h["name"] == name)
+        .unwrap_or_else(|| panic!("no {name} entry in harnesses: {report}"))
+}
+
+#[test]
+#[cfg(unix)]
+fn harnesses_section_reports_both_hooks_present_after_install() {
+    let (home, _state_dir) = isolated_home("harness-installed");
+    let work = tempfile::tempdir().unwrap();
+    let (config, db) = empty_config(work.path());
+
+    // Seed a real Claude Code settings file the same way a user would: run
+    // the installer itself, skipping MCP (no shim on PATH) and skills
+    // (irrelevant to this scenario) so only the two hooks land.
+    let mut install_cmd = bin();
+    apply_home(&mut install_cmd, &home);
+    install_cmd
+        .args(["install", "claude-code", "--skip-mcp", "--skip-skills"])
+        .assert()
+        .success();
+
+    let mut cmd = bin();
+    apply_home(&mut cmd, &home);
+    let out = cmd
+        .args(["--json", "doctor", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&out).unwrap();
+    let claude = harness_entry(&report, "claude-code");
+    assert_eq!(claude["settings_present"], serde_json::json!(true));
+    assert_eq!(claude["settings_parse_error"], serde_json::Value::Null);
+    assert_eq!(claude["session_start_hook"], serde_json::json!(true));
+    assert_eq!(claude["stop_hook"], serde_json::json!(true));
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+#[cfg(unix)]
+fn harnesses_section_counts_a_corrupt_settings_file_as_a_problem() {
+    let (home, _state_dir) = isolated_home("harness-corrupt");
+    let work = tempfile::tempdir().unwrap();
+    let (config, db) = empty_config(work.path());
+
+    let claude_dir = home.join(".claude");
+    std::fs::create_dir_all(&claude_dir).unwrap();
+    std::fs::write(claude_dir.join("settings.json"), "{ not valid json").unwrap();
+
+    let mut cmd = bin();
+    apply_home(&mut cmd, &home);
+    let out = cmd
+        .args(["--json", "doctor", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .code(1)
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&out).unwrap();
+    let claude = harness_entry(&report, "claude-code");
+    assert!(
+        claude["settings_parse_error"].is_string(),
+        "a corrupt settings file must report a parse error: {report}"
+    );
+
+    let human = {
+        let mut cmd = bin();
+        apply_home(&mut cmd, &home);
+        cmd.args(["doctor", "--config"])
+            .arg(&config)
+            .args(["--db"])
+            .arg(&db)
+            .output()
+            .unwrap()
+            .stdout
+    };
+    let human = String::from_utf8(human).unwrap();
+    assert!(human.contains("not valid JSON"), "{human}");
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+#[cfg(unix)]
+fn harnesses_section_hints_partial_setup_when_only_one_hook_is_present() {
+    let (home, _state_dir) = isolated_home("harness-partial");
+    let work = tempfile::tempdir().unwrap();
+    let (config, db) = empty_config(work.path());
+
+    // Only the hand-written SessionStart recipe from the README, no Stop
+    // hook: exactly the "half installed" shape the hint exists for.
+    let claude_dir = home.join(".claude");
+    std::fs::create_dir_all(&claude_dir).unwrap();
+    std::fs::write(
+        claude_dir.join("settings.json"),
+        r#"{ "hooks": { "SessionStart": [ { "matcher": "startup", "hooks": [ { "type": "command", "command": "crystalline prompt system" } ] } ] } }"#,
+    )
+    .unwrap();
+
+    let mut cmd = bin();
+    apply_home(&mut cmd, &home);
+    let human = cmd
+        .args(["doctor", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .output()
+        .unwrap()
+        .stdout;
+    let human = String::from_utf8(human).unwrap();
+    assert!(
+        human.contains("partial setup - run: crystalline install claude-code"),
+        "{human}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+#[cfg(unix)]
+fn harnesses_section_is_absent_with_no_trace_on_either_harness() {
+    let (home, _state_dir) = isolated_home("harness-none");
+    let work = tempfile::tempdir().unwrap();
+    let (config, db) = empty_config(work.path());
+
+    let mut cmd = bin();
+    apply_home(&mut cmd, &home);
+    let out = cmd
+        .args(["--json", "doctor", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(report["harnesses"], serde_json::Value::Null);
+
+    let _ = std::fs::remove_dir_all(&home);
 }

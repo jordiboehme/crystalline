@@ -133,6 +133,17 @@ Edit `~/knowledge/engineering/MANIFEST.md`'s `## Scope` and `## When to Use` sec
 
 Crystalline runs as an MCP server over stdio. Any MCP-capable harness works - the server command is always `crystalline mcp`.
 
+For Claude Code or Codex CLI, one command wires up the whole integration: MCP registration, the `SessionStart` session onboarding hook, the `Stop` capture nudge hook (see The learning loop below) and the four topical skills.
+
+```sh
+crystalline install claude-code
+# or: crystalline install codex
+```
+
+It is idempotent - rerun it any time and whatever is already correct is left untouched - and each part is skippable on its own with `--skip-mcp`, `--skip-hooks` or `--skip-skills`. Pass `--project` to write into the current repository's harness config instead of your global one (Codex keeps MCP registration user-level either way; the installer says so when it applies). `crystalline uninstall claude-code` (or `codex`) reverses everything `install` did, leaving any hook, key or locally edited skill that is not Crystalline's own in place.
+
+Everything the installer does can also be done by hand:
+
 Claude Code (registered for all your projects):
 
 ```sh
@@ -316,14 +327,14 @@ Run `crystalline prompt system` at the start of a session and feed its output to
 crystalline prompt system --workspace .
 ```
 
-Wire it into a harness with a generic recipe: run `crystalline prompt system` at session start and inject its stdout as context before the agent does anything else. In Claude Code, that is a `SessionStart` hook in `settings.json`:
+Wire it into a harness with a generic recipe: run `crystalline prompt system` at session start and inject its stdout as context before the agent does anything else. In Claude Code, that is a `SessionStart` hook in `settings.json`, matched on `startup|clear|compact` so the routing block is re-injected after `/clear` and after a compaction as well as on a fresh start (a resumed session is deliberately excluded, since its transcript already carries the earlier routing block); `crystalline install claude-code` (or `codex`) writes this hook for you:
 
 ```json
 {
   "hooks": {
     "SessionStart": [
       {
-        "matcher": "startup",
+        "matcher": "startup|clear|compact",
         "hooks": [
           { "type": "command", "command": "crystalline prompt system" }
         ]
@@ -334,6 +345,10 @@ Wire it into a harness with a generic recipe: run `crystalline prompt system` at
 ```
 
 Any harness with an equivalent session-start hook can run the same command the same way.
+
+### The learning loop
+
+`crystalline install` also wires a `Stop` hook running `crystalline hook stop`, the other half of the loop: a once-per-session, late nudge that closes the gap between an agent learning something mid-session and actually capturing it. It fires on the first `Stop` event a session reaches after real substance - a transcript past a size and line threshold, or the third `Stop` call in a row when a harness sends no transcript at all - and stays silent on every other call: below that threshold, once it has already fired for the session, when the effective mode is read-only or when no domain is registered at all. When it fires, it asks the agent to review the conversation for durable learnings and propose capturing each one into the fitting domain, the same propose-first, wait-for-a-yes shape the capture skill already follows; the reminder costs about 100 tokens, at most once per session. Remove it with `crystalline uninstall <harness>`, or leave it out from the start with `--skip-hooks`.
 
 ## Teach and learn
 
@@ -427,7 +442,7 @@ The `skills/` folder ships four harness-agnostic agent skills plus one consolida
 - **`crystalline-collaboration`** - working in a domain that has a team origin: checking status at session start, updating before deep work, sharing a coherent unit of knowledge as a proposal and relaying its review URL, conflict etiquette and connecting a new teammate end to end.
 - **`crystalline-memory`** - a single consolidated skill for Claude Desktop and other harnesses that install one skill at a time: recall, capture, read-only stand-down and team sharing essentials in one file.
 
-Each is a plain folder with a `SKILL.md`; install by copying the folder into wherever your harness looks for skills. For Claude Code, that is `.claude/skills/` in a project or `~/.claude/skills/` globally:
+`crystalline install claude-code` (or `codex`) copies these same four skills into place automatically - `~/.claude/skills` for Claude Code, `~/.agents/skills` for Codex - and leaves `crystalline-memory` alone, since it is Claude Desktop's own consolidated skill. Each is a plain folder with a `SKILL.md`; to do it by hand instead, copy the folder into wherever your harness looks for skills. For Claude Code, that is `.claude/skills/` in a project or `~/.claude/skills/` globally:
 
 ```sh
 cp -r skills/crystalline-routing skills/crystalline-capture skills/crystalline-schema skills/crystalline-collaboration ~/.claude/skills/
