@@ -29,6 +29,7 @@ productive peer over time."""
 assets = [
     ["target/release/crystalline", "usr/bin/", "755"],
     ["../../README.md", "usr/share/doc/crystalline/README.md", "644"],
+    ["../../docs/deployment.md", "usr/share/doc/crystalline/docs/deployment.md", "644"],
     ["../../LICENSE", "usr/share/doc/crystalline/LICENSE", "644"],
 ]
 
