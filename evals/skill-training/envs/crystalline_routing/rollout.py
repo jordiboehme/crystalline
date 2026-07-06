@@ -35,6 +35,31 @@ DISALLOWED_TOOLS = [
     "WebSearch", "WebFetch", "Task", "NotebookEdit", "TodoWrite",
 ]
 
+TRANSIENT_API_STATUS = {401, 403, 429, 500, 502, 503, 529}
+
+
+class TransientRolloutError(RuntimeError):
+    """The session failed for infrastructure reasons (rate limit, auth,
+    API outage), not agent behavior. Such a task must never be scored or
+    cached: raising aborts the batch loudly and a later re-run of the
+    same command resumes past the tasks that did complete."""
+
+
+def _detect_transient(events: list[dict]) -> str:
+    for event in events:
+        if event.get("type") == "rate_limit_event":
+            info = event.get("rate_limit_info", {}) or {}
+            if info.get("status") == "rejected":
+                return f"rate limited ({info.get('rateLimitType', 'unknown')})"
+        if event.get("type") == "result":
+            status = event.get("api_error_status")
+            if status in TRANSIENT_API_STATUS:
+                return f"API error {status}: {str(event.get('result'))[:200]}"
+            text = str(event.get("result") or "")
+            if "hit your session limit" in text or "usage limit" in text.lower():
+                return f"usage limit: {text[:200]}"
+    return ""
+
 
 def _run(cmd: list[str], env: dict, timeout: int) -> subprocess.CompletedProcess:
     return subprocess.run(
@@ -99,11 +124,12 @@ def _setup_sandbox(
     return mcp_config
 
 
-def _parse_transcript(raw: str) -> tuple[list[dict], str, dict]:
-    """Extract (tool_calls, final_answer, stats) from stream-json output."""
+def _parse_transcript(raw: str) -> tuple[list[dict], str, dict, list[dict]]:
+    """Extract (tool_calls, final_answer, stats, events) from stream-json output."""
     tool_calls: list[dict] = []
     answer = ""
     stats: dict = {}
+    events: list[dict] = []
     for line in raw.splitlines():
         line = line.strip()
         if not line:
@@ -112,6 +138,7 @@ def _parse_transcript(raw: str) -> tuple[list[dict], str, dict]:
             event = json.loads(line)
         except json.JSONDecodeError:
             continue
+        events.append(event)
         if event.get("type") == "assistant":
             for block in event.get("message", {}).get("content", []) or []:
                 if block.get("type") == "tool_use":
@@ -127,7 +154,7 @@ def _parse_transcript(raw: str) -> tuple[list[dict], str, dict]:
                 "duration_ms": event.get("duration_ms"),
                 "total_cost_usd": event.get("total_cost_usd"),
             }
-    return tool_calls, answer, stats
+    return tool_calls, answer, stats, events
 
 
 def rollout_one(
@@ -193,7 +220,19 @@ def rollout_one(
             fail_reason = f"claude timed out after {exec_timeout}s"
 
         (task_dir / "transcript.jsonl").write_text(raw, encoding="utf-8")
-        tool_calls, answer, stats = _parse_transcript(raw)
+        tool_calls, answer, stats, events = _parse_transcript(raw)
+
+        transient = _detect_transient(events)
+        if not transient and fail_reason and not any(
+            e.get("type") == "result" for e in events
+        ):
+            # A nonzero exit without any result event is an infra
+            # failure too (crashed CLI, killed process), not behavior.
+            transient = fail_reason
+        if transient:
+            raise TransientRolloutError(
+                f"task {item['id']}: {transient}"
+            )
     finally:
         shutil.rmtree(sandbox, ignore_errors=True)
 
