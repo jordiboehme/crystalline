@@ -124,12 +124,32 @@ def _setup_sandbox(
     return mcp_config
 
 
-def _parse_transcript(raw: str) -> tuple[list[dict], str, dict, list[dict]]:
-    """Extract (tool_calls, final_answer, stats, events) from stream-json output."""
+def _tool_result_text(block: dict) -> str:
+    content = block.get("content")
+    if isinstance(content, str):
+        return content
+    parts = []
+    for part in content or []:
+        if isinstance(part, dict) and part.get("type") == "text":
+            parts.append(str(part.get("text", "")))
+    return "\n".join(parts)
+
+
+def _parse_transcript(
+    raw: str,
+) -> tuple[list[dict], str, dict, list[dict], list[dict]]:
+    """Extract (tool_calls, final_answer, stats, events, conversation).
+
+    The conversation is the analyst-facing trajectory: assistant text as
+    role/content entries and each tool call as a tool_call record whose
+    observation is filled in from the matching tool_result block.
+    """
     tool_calls: list[dict] = []
     answer = ""
     stats: dict = {}
     events: list[dict] = []
+    conversation: list[dict] = []
+    obs_by_id: dict[str, dict] = {}
     for line in raw.splitlines():
         line = line.strip()
         if not line:
@@ -142,10 +162,30 @@ def _parse_transcript(raw: str) -> tuple[list[dict], str, dict, list[dict]]:
         if event.get("type") == "assistant":
             for block in event.get("message", {}).get("content", []) or []:
                 if block.get("type") == "tool_use":
+                    call_input = block.get("input", {}) or {}
                     tool_calls.append({
                         "name": block.get("name", ""),
-                        "input": block.get("input", {}) or {},
+                        "input": call_input,
                     })
+                    record = {
+                        "type": "tool_call",
+                        "cmd": f"{block.get('name', '')} {json.dumps(call_input, ensure_ascii=False)}",
+                        "obs": "",
+                    }
+                    conversation.append(record)
+                    if block.get("id"):
+                        obs_by_id[block["id"]] = record
+                elif block.get("type") == "text" and str(block.get("text", "")).strip():
+                    conversation.append({
+                        "role": "agent",
+                        "content": str(block["text"]),
+                    })
+        elif event.get("type") == "user":
+            for block in event.get("message", {}).get("content", []) or []:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    record = obs_by_id.get(str(block.get("tool_use_id", "")))
+                    if record is not None:
+                        record["obs"] = _tool_result_text(block)
         elif event.get("type") == "result":
             answer = str(event.get("result") or "")
             stats = {
@@ -154,13 +194,34 @@ def _parse_transcript(raw: str) -> tuple[list[dict], str, dict, list[dict]]:
                 "duration_ms": event.get("duration_ms"),
                 "total_cost_usd": event.get("total_cost_usd"),
             }
-    return tool_calls, answer, stats, events
+    return tool_calls, answer, stats, events, conversation
+
+
+def _write_predictions(
+    predictions_dir: Path,
+    item: dict,
+    conversation: list[dict],
+    skill_content: str,
+) -> None:
+    """Write the per-task files the reflect stage reads: reflection skips
+    any task without predictions/<id>/conversation.json."""
+    task_pred = predictions_dir / str(item["id"])
+    task_pred.mkdir(parents=True, exist_ok=True)
+    with open(task_pred / "conversation.json", "w", encoding="utf-8") as f:
+        json.dump(conversation, f, ensure_ascii=False, indent=2)
+    (task_pred / "target_system_prompt.txt").write_text(
+        skill_content or "(empty skill)", encoding="utf-8"
+    )
+    (task_pred / "target_user_prompt.txt").write_text(
+        str(item.get("question", "")), encoding="utf-8"
+    )
 
 
 def rollout_one(
     item: dict,
     skill_content: str,
     task_dir: Path,
+    predictions_dir: Path,
     *,
     claude_bin: str,
     claude_model: str,
@@ -172,7 +233,20 @@ def rollout_one(
     result_path = task_dir / "result.json"
     if result_path.exists():
         with open(result_path, encoding="utf-8") as f:
-            return json.load(f)
+            cached = json.load(f)
+        if not (predictions_dir / str(item["id"]) / "conversation.json").exists():
+            # Older cached results predate the prediction files the
+            # reflect stage needs; regenerate them from the transcript.
+            raw = (task_dir / "transcript.jsonl").read_text(encoding="utf-8")
+            _, _, _, _, conversation = _parse_transcript(raw)
+            _write_predictions(predictions_dir, item, conversation, skill_content)
+        if "reference_text" not in cached:
+            cached["task_description"] = item.get("question", "")
+            cached["n_turns"] = (cached.get("stats") or {}).get("num_turns")
+            cached["reference_text"] = item.get("reference_text", "")
+            with open(result_path, "w", encoding="utf-8") as f:
+                json.dump(cached, f, ensure_ascii=False, indent=2)
+        return cached
 
     task_dir.mkdir(parents=True, exist_ok=True)
     fixture_dir = fixture_root / str(item["workspace"])
@@ -220,7 +294,7 @@ def rollout_one(
             fail_reason = f"claude timed out after {exec_timeout}s"
 
         (task_dir / "transcript.jsonl").write_text(raw, encoding="utf-8")
-        tool_calls, answer, stats, events = _parse_transcript(raw)
+        tool_calls, answer, stats, events, conversation = _parse_transcript(raw)
 
         transient = _detect_transient(events)
         if not transient and fail_reason and not any(
@@ -250,11 +324,15 @@ def rollout_one(
         "task_type": item.get("task_type", "routing"),
         "workspace": item.get("workspace", ""),
         "question": item.get("question", ""),
+        "task_description": item.get("question", ""),
+        "n_turns": stats.get("num_turns"),
+        "reference_text": item.get("reference_text", ""),
         "predicted_answer": answer,
         "tool_calls": tool_calls,
         "fail_reason": "; ".join(failed_checks) if failed_checks else "",
         "stats": stats,
     }
+    _write_predictions(predictions_dir, item, conversation, skill_content)
     with open(result_path, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
     return result
@@ -276,10 +354,11 @@ def run_batch(
     out = Path(out_root)
     out.mkdir(parents=True, exist_ok=True)
     tasks_dir = out / "tasks"
+    predictions_dir = out / "predictions"
 
     def _one(item: dict) -> dict:
         return rollout_one(
-            item, skill_content, tasks_dir / str(item["id"]),
+            item, skill_content, tasks_dir / str(item["id"]), predictions_dir,
             claude_bin=claude_bin,
             claude_model=claude_model,
             crystalline_bin=crystalline_bin,
