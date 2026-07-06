@@ -116,6 +116,8 @@ jobs:
           cp "${{ steps.bin.outputs.path }}" "$stage/"
           cp LICENSE "$stage/"
           cp README.md "$stage/"
+          mkdir -p "$stage/docs"
+          cp docs/deployment.md "$stage/docs/"
           echo "name=$name" >> "$GITHUB_OUTPUT"
 
       - name: Package archive (tar.gz)

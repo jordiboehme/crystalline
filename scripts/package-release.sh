@@ -52,6 +52,8 @@ mkdir -p "$stage"
 cp "$bin" "$stage/"
 cp LICENSE "$stage/"
 cp README.md "$stage/"
+mkdir -p "$stage/docs"
+cp docs/deployment.md "$stage/docs/"
 
 archive="dist/$name.$ext"
 rm -f "$archive"
