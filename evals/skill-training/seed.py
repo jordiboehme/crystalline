@@ -33,5 +33,24 @@ def make_seed() -> Path:
     return SEED_PATH
 
 
+def ensure_prompts() -> None:
+    """Copy the vendored optimizer prompts into the installed package.
+
+    The skillopt 0.2.0 wheel ships without its prompt markdown files
+    (see vendor/README.md); load_prompt only reads from the package
+    directory, so the vendored copies are installed there on startup.
+    """
+    import shutil
+
+    import skillopt.prompts as prompts_pkg
+
+    target = Path(prompts_pkg.__file__).parent
+    vendor = HARNESS_ROOT / "vendor" / "skillopt-prompts"
+    for src in sorted(vendor.glob("*.md")):
+        dst = target / src.name
+        if not dst.exists():
+            shutil.copyfile(src, dst)
+
+
 if __name__ == "__main__":
     print(make_seed())
