@@ -16,6 +16,7 @@ use crystalline_core::verify::{self, VerifyOptions};
 mod cmd;
 mod doctor;
 mod hook;
+mod install;
 
 /// Local-first knowledge management for humans and AI agents.
 #[derive(Parser, Debug)]
@@ -68,6 +69,49 @@ enum Command {
     Connect {
         #[command(subcommand)]
         command: ConnectCommand,
+    },
+    /// Wire a coding harness up to Crystalline in one idempotent step:
+    /// register the MCP server, install the SessionStart routing hook and the
+    /// Stop capture-nudge hook and copy the four topical skills into place.
+    /// Safe to re-run; a second run that finds everything already in place
+    /// writes nothing and reports it as already present. Static like `verify`
+    /// and `prompt`: no database, service or network connection. A missing or
+    /// failing harness CLI is never fatal - the MCP command to run by hand is
+    /// printed and the hooks and skills still install.
+    Install {
+        /// Which harness to wire up.
+        #[arg(value_enum)]
+        harness: install::HarnessKind,
+        /// Write into the current repository's harness config (.claude,
+        /// .codex or .agents under the working directory) instead of this
+        /// user's global one. Codex still registers its MCP server per user.
+        #[arg(long)]
+        project: bool,
+        /// Skip registering the MCP server.
+        #[arg(long)]
+        skip_mcp: bool,
+        /// Skip installing the SessionStart and Stop hooks.
+        #[arg(long)]
+        skip_hooks: bool,
+        /// Skip copying the topical skills.
+        #[arg(long)]
+        skip_skills: bool,
+    },
+    /// Reverse `crystalline install` for a harness: deregister the MCP server,
+    /// remove the managed hooks and drop the copied skills, leaving every
+    /// hook, key and skill that is not Crystalline's own untouched. A skill a
+    /// person edited by hand is kept unless `--force` is given.
+    Uninstall {
+        /// Which harness to unwire.
+        #[arg(value_enum)]
+        harness: install::HarnessKind,
+        /// Act on the current repository's harness config instead of this
+        /// user's global one.
+        #[arg(long)]
+        project: bool,
+        /// Remove a copied skill even when its SKILL.md was edited locally.
+        #[arg(long)]
+        force: bool,
     },
     /// Bring a team domain up to date with its origin, or check where it
     /// stands.
@@ -741,6 +785,27 @@ fn main() -> anyhow::Result<()> {
         },
         Some(Command::Domain { command }) => run_domain(command, cli.db, cli.json),
         Some(Command::Connect { command }) => on_runtime(run_connect(command, cli.json)),
+        Some(Command::Install {
+            harness,
+            project,
+            skip_mcp,
+            skip_hooks,
+            skip_skills,
+        }) => install::run_install(
+            install::InstallOptions {
+                harness,
+                project,
+                skip_mcp,
+                skip_hooks,
+                skip_skills,
+            },
+            cli.json,
+        ),
+        Some(Command::Uninstall {
+            harness,
+            project,
+            force,
+        }) => install::run_uninstall(harness, project, force, cli.json),
         Some(Command::Origin { command }) => on_runtime(run_origin(command, cli.db, cli.json)),
         Some(Command::Config { command }) => on_runtime(config_dispatch(command, cli.json)),
         Some(Command::Sync {
