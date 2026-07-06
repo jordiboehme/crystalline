@@ -1,0 +1,363 @@
+[
+  {
+    "id": "acme-narrow-13",
+    "workspace": "acme",
+    "task_type": "narrow",
+    "question": "Is replaying a payment job safe, and why?",
+    "expect": {
+      "search": {
+        "domains": [
+          "payments"
+        ]
+      },
+      "answer_any": [
+        "idempoten"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "acme-narrow-14",
+    "workspace": "acme",
+    "task_type": "narrow",
+    "question": "Within how many days must chargeback dispute evidence be submitted?",
+    "expect": {
+      "search": {
+        "domains": [
+          "payments"
+        ]
+      },
+      "answer_any": [
+        "10 day",
+        "ten day"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "acme-narrow-15",
+    "workspace": "acme",
+    "task_type": "narrow",
+    "question": "Who owns connection pool sizing?",
+    "expect": {
+      "search": {
+        "domains": [
+          "infra"
+        ]
+      },
+      "answer_any": [
+        "platform team"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "acme-narrow-16",
+    "workspace": "acme",
+    "task_type": "narrow",
+    "question": "How long are audit logs kept?",
+    "expect": {
+      "search": {
+        "domains": [
+          "infra"
+        ]
+      },
+      "answer_any": [
+        "7"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "acme-narrow-17",
+    "workspace": "acme",
+    "task_type": "narrow",
+    "question": "Do we give take-home exercises in interviews?",
+    "expect": {
+      "search": {
+        "domains": [
+          "people-ops"
+        ]
+      },
+      "answer_any": [
+        "take-home",
+        "take home"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "acme-sweep-04",
+    "workspace": "acme",
+    "task_type": "sweep",
+    "question": "Does the on-call stipend still apply if no pages fire?",
+    "expect": {
+      "search": {
+        "reaches_domain": "people-ops"
+      },
+      "answer_any": [
+        "regardless",
+        "yes"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "acme-sweep-05",
+    "workspace": "acme",
+    "task_type": "sweep",
+    "question": "Where is the refund escalation rotation managed?",
+    "expect": {
+      "search": {
+        "reaches_domain": "people-ops"
+      },
+      "answer_any": [
+        "paging"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "acme-context-03",
+    "workspace": "acme",
+    "task_type": "context_nav",
+    "question": "Starting from crystalline://payments/retry-queue-gotcha, what does the gotcha depend on and what does that system look like?",
+    "expect": {
+      "build_context_anchor": "crystalline://payments/retry-queue-gotcha",
+      "answer_any": [
+        "redis"
+      ],
+      "forbid_write": true
+    }
+  },
+  {
+    "id": "acme-structure-03",
+    "workspace": "acme",
+    "task_type": "structure",
+    "question": "Which domain should questions about invoices route to, and what else does it cover?",
+    "expect": {
+      "require_manifest_read": true,
+      "manifest_read_ok": true,
+      "answer_all": [
+        "payments",
+        "chargeback"
+      ],
+      "forbid_write": true
+    }
+  },
+  {
+    "id": "chronos-now-07",
+    "workspace": "chronos",
+    "task_type": "temporal_now",
+    "question": "Name the deployment mechanism in use today.",
+    "expect": {
+      "search": {
+        "domains": [
+          "platform"
+        ],
+        "status": "current"
+      },
+      "forbid_metadata_filters": true,
+      "answer_any": [
+        "argocd"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "chronos-now-08",
+    "workspace": "chronos",
+    "task_type": "temporal_now",
+    "question": "What is today's service-to-service auth and its token lifetime?",
+    "expect": {
+      "search": {
+        "domains": [
+          "platform"
+        ],
+        "status": "current"
+      },
+      "forbid_metadata_filters": true,
+      "answer_all": [
+        "oidc",
+        "15"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "chronos-history-06",
+    "workspace": "chronos",
+    "task_type": "history",
+    "question": "Compare how we orchestrated pipelines before and now.",
+    "expect": {
+      "search": {
+        "domains": [
+          "platform"
+        ],
+        "forbid_status": true
+      },
+      "answer_all": [
+        "airflow",
+        "dagster"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "chronos-history-07",
+    "workspace": "chronos",
+    "task_type": "history",
+    "question": "What deployment approaches has the platform gone through?",
+    "expect": {
+      "search": {
+        "domains": [
+          "platform"
+        ],
+        "forbid_status": true
+      },
+      "answer_all": [
+        "jenkins",
+        "argocd"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "chronos-proposal-03",
+    "workspace": "chronos",
+    "task_type": "proposal",
+    "question": "Has the move to NATS JetStream happened?",
+    "expect": {
+      "search": {
+        "domains": [
+          "platform"
+        ],
+        "forbid_status": true
+      },
+      "answer_any": [
+        "propos"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "horizon-window-06",
+    "workspace": "horizon",
+    "task_type": "temporal_window",
+    "question": "What price did the standard plan carry in the third quarter of 2025?",
+    "expect": {
+      "search": {
+        "domains": [
+          "policies"
+        ],
+        "metadata_filters_keys": [
+          "valid_from",
+          "valid_to"
+        ]
+      },
+      "answer_any": [
+        "39"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "horizon-now-04",
+    "workspace": "horizon",
+    "task_type": "temporal_now",
+    "question": "How much is the standard plan per month at present?",
+    "expect": {
+      "search": {
+        "domains": [
+          "policies"
+        ],
+        "status": "current"
+      },
+      "forbid_metadata_filters": true,
+      "answer_any": [
+        "49"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "horizon-narrow-06",
+    "workspace": "horizon",
+    "task_type": "narrow",
+    "question": "Where do EU customer backups replicate?",
+    "expect": {
+      "search": {
+        "domains": [
+          "policies"
+        ]
+      },
+      "answer_any": [
+        "eu-central",
+        "within the eu"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "nimbus-narrow-08",
+    "workspace": "nimbus",
+    "task_type": "narrow",
+    "question": "What data structure family underpins Atlas sync?",
+    "expect": {
+      "search": {
+        "domains": [
+          "product-atlas"
+        ]
+      },
+      "answer_any": [
+        "crdt"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "nimbus-context-04",
+    "workspace": "nimbus",
+    "task_type": "context_nav",
+    "question": "Walk the graph from crystalline://product-atlas/sync-engine-overview and list the connected topics.",
+    "expect": {
+      "build_context_anchor": "crystalline://product-atlas/sync-engine-overview",
+      "answer_all": [
+        "conflict",
+        "offline"
+      ],
+      "forbid_write": true
+    }
+  },
+  {
+    "id": "nimbus-structure-04",
+    "workspace": "nimbus",
+    "task_type": "structure",
+    "question": "Describe the product-atlas domain's scope.",
+    "expect": {
+      "require_manifest_read": true,
+      "manifest_read_ok": true,
+      "answer_all": [
+        "sync",
+        "shar"
+      ],
+      "forbid_write": true
+    }
+  }
+]

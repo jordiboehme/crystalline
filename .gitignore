@@ -2,6 +2,11 @@
 /target/
 /dist/
 
+# Skill training harness runtime state (evals/skill-training)
+evals/skill-training/outputs/
+evals/skill-training/.venv/
+__pycache__/
+
 # Local research notes and plans (not part of the published repo)
 /research/
 /plans/

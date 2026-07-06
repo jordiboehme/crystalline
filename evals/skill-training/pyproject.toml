@@ -1,0 +1,7 @@
+[project]
+name = "crystalline-skill-training"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "skillopt[claude]>=0.2.0",
+]

@@ -1,0 +1,365 @@
+[
+  {
+    "id": "acme-narrow-10",
+    "workspace": "acme",
+    "task_type": "narrow",
+    "question": "When do refunds show up on a customer's statement?",
+    "expect": {
+      "search": {
+        "domains": [
+          "payments"
+        ]
+      },
+      "answer_any": [
+        "5 business",
+        "five business"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "acme-narrow-11",
+    "workspace": "acme",
+    "task_type": "narrow",
+    "question": "How long do we keep raw logs?",
+    "expect": {
+      "search": {
+        "domains": [
+          "infra"
+        ]
+      },
+      "answer_any": [
+        "30"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "acme-narrow-12",
+    "workspace": "acme",
+    "task_type": "narrow",
+    "question": "How long does the onboarding buddy period last?",
+    "expect": {
+      "search": {
+        "domains": [
+          "people-ops"
+        ]
+      },
+      "answer_any": [
+        "6 week",
+        "six week"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "acme-sweep-03",
+    "workspace": "acme",
+    "task_type": "sweep",
+    "question": "Which rotation handles weekend refund escalations?",
+    "expect": {
+      "search": {
+        "reaches_domain": "people-ops"
+      },
+      "answer_any": [
+        "support duty",
+        "same rotation"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "acme-structure-02",
+    "workspace": "acme",
+    "task_type": "structure",
+    "question": "Summarize what the infra domain is responsible for.",
+    "expect": {
+      "require_manifest_read": true,
+      "manifest_read_ok": true,
+      "answer_any": [
+        "rollback",
+        "kubernetes",
+        "logging"
+      ],
+      "forbid_write": true
+    }
+  },
+  {
+    "id": "acme-context-02",
+    "workspace": "acme",
+    "task_type": "context_nav",
+    "question": "Starting from crystalline://infra/deploy-pipeline, what surrounds the deploy pipeline?",
+    "expect": {
+      "build_context_anchor": "crystalline://infra/deploy-pipeline",
+      "answer_any": [
+        "rollback"
+      ],
+      "forbid_write": true
+    }
+  },
+  {
+    "id": "chronos-now-05",
+    "workspace": "chronos",
+    "task_type": "temporal_now",
+    "question": "Which tool reconciles a merge to main into production?",
+    "expect": {
+      "search": {
+        "domains": [
+          "platform"
+        ],
+        "status": "current"
+      },
+      "forbid_metadata_filters": true,
+      "answer_any": [
+        "argocd"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "chronos-history-04",
+    "workspace": "chronos",
+    "task_type": "history",
+    "question": "Which CI system did deploys use before the current setup?",
+    "expect": {
+      "search": {
+        "domains": [
+          "platform"
+        ],
+        "forbid_status": true
+      },
+      "answer_any": [
+        "jenkins"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "chronos-now-06",
+    "workspace": "chronos",
+    "task_type": "temporal_now",
+    "question": "What is the current data pipeline stack?",
+    "expect": {
+      "search": {
+        "domains": [
+          "platform"
+        ],
+        "status": "current"
+      },
+      "forbid_metadata_filters": true,
+      "answer_any": [
+        "dagster"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "chronos-proposal-02",
+    "workspace": "chronos",
+    "task_type": "proposal",
+    "question": "What is the status of the event bus rework?",
+    "expect": {
+      "search": {
+        "domains": [
+          "platform"
+        ],
+        "forbid_status": true
+      },
+      "answer_any": [
+        "propos"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "chronos-history-05",
+    "workspace": "chronos",
+    "task_type": "history",
+    "question": "Why were shared secrets abandoned for service auth?",
+    "expect": {
+      "search": {
+        "domains": [
+          "platform"
+        ],
+        "forbid_status": true
+      },
+      "answer_any": [
+        "audit"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "horizon-window-04",
+    "workspace": "horizon",
+    "task_type": "temporal_window",
+    "question": "What did a standard plan subscriber pay in November 2025?",
+    "expect": {
+      "search": {
+        "domains": [
+          "policies"
+        ],
+        "metadata_filters_keys": [
+          "valid_from",
+          "valid_to"
+        ]
+      },
+      "answer_any": [
+        "39"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "horizon-now-03",
+    "workspace": "horizon",
+    "task_type": "temporal_now",
+    "question": "What is the standard plan price right now?",
+    "expect": {
+      "search": {
+        "domains": [
+          "policies"
+        ],
+        "status": "current"
+      },
+      "forbid_metadata_filters": true,
+      "answer_any": [
+        "49"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "horizon-narrow-04",
+    "workspace": "horizon",
+    "task_type": "narrow",
+    "question": "What happens to free tier projects after 30 days of inactivity?",
+    "expect": {
+      "search": {
+        "domains": [
+          "policies"
+        ]
+      },
+      "answer_any": [
+        "pause"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "horizon-narrow-05",
+    "workspace": "horizon",
+    "task_type": "narrow",
+    "question": "How often is the manual cert rotation due?",
+    "expect": {
+      "search": {
+        "domains": [
+          "policies"
+        ]
+      },
+      "answer_any": [
+        "monday",
+        "month"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "horizon-window-05",
+    "workspace": "horizon",
+    "task_type": "temporal_window",
+    "question": "On 2025-05-01, what was the standard plan price?",
+    "expect": {
+      "search": {
+        "domains": [
+          "policies"
+        ],
+        "metadata_filters_keys": [
+          "valid_from",
+          "valid_to"
+        ]
+      },
+      "answer_any": [
+        "39"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "nimbus-narrow-06",
+    "workspace": "nimbus",
+    "task_type": "narrow",
+    "question": "Who can revoke an Atlas share link?",
+    "expect": {
+      "search": {
+        "domains": [
+          "product-atlas"
+        ]
+      },
+      "answer_any": [
+        "owner"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "nimbus-context-03",
+    "workspace": "nimbus",
+    "task_type": "context_nav",
+    "question": "Explore around crystalline://product-atlas/search-quirks and explain how search relates to sync.",
+    "expect": {
+      "build_context_anchor": "crystalline://product-atlas/search-quirks",
+      "answer_any": [
+        "60"
+      ],
+      "forbid_write": true
+    }
+  },
+  {
+    "id": "nimbus-narrow-07",
+    "workspace": "nimbus",
+    "task_type": "narrow",
+    "question": "What wins when a delete and an edit collide on the same field in Atlas?",
+    "expect": {
+      "search": {
+        "domains": [
+          "product-atlas"
+        ]
+      },
+      "answer_any": [
+        "delete"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "nimbus-structure-03",
+    "workspace": "nimbus",
+    "task_type": "structure",
+    "question": "When should anything be put in the scratch domain?",
+    "expect": {
+      "require_manifest_read": true,
+      "manifest_read_ok": true,
+      "answer_any": [
+        "experiment"
+      ],
+      "forbid_write": true
+    }
+  }
+]

@@ -1,0 +1,725 @@
+[
+  {
+    "id": "acme-narrow-01",
+    "workspace": "acme",
+    "task_type": "narrow",
+    "question": "How old can a job get before the retry queue drops it?",
+    "expect": {
+      "search": {
+        "domains": [
+          "payments"
+        ]
+      },
+      "answer_any": [
+        "24"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "acme-narrow-02",
+    "workspace": "acme",
+    "task_type": "narrow",
+    "question": "What is the approved way to dispute a chargeback?",
+    "expect": {
+      "search": {
+        "domains": [
+          "payments"
+        ]
+      },
+      "answer_any": [
+        "dashboard"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "acme-narrow-03",
+    "workspace": "acme",
+    "task_type": "narrow",
+    "question": "What format do our invoice numbers follow?",
+    "expect": {
+      "search": {
+        "domains": [
+          "payments"
+        ]
+      },
+      "answer_any": [
+        "acme-"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "acme-narrow-04",
+    "workspace": "acme",
+    "task_type": "narrow",
+    "question": "How many days of dual-write did the card vault migration need?",
+    "expect": {
+      "search": {
+        "domains": [
+          "payments"
+        ]
+      },
+      "answer_any": [
+        "30"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "acme-narrow-05",
+    "workspace": "acme",
+    "task_type": "narrow",
+    "question": "How long does a production deploy take end to end?",
+    "expect": {
+      "search": {
+        "domains": [
+          "infra"
+        ]
+      },
+      "answer_any": [
+        "18"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "acme-narrow-06",
+    "workspace": "acme",
+    "task_type": "narrow",
+    "question": "How fast is a rollback once we decide to do one?",
+    "expect": {
+      "search": {
+        "domains": [
+          "infra"
+        ]
+      },
+      "answer_any": [
+        "90"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "acme-narrow-07",
+    "workspace": "acme",
+    "task_type": "narrow",
+    "question": "What is the pgbouncer client connection cap?",
+    "expect": {
+      "search": {
+        "domains": [
+          "infra"
+        ]
+      },
+      "answer_any": [
+        "400"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "acme-narrow-08",
+    "workspace": "acme",
+    "task_type": "narrow",
+    "question": "Below what amount do expenses need no receipt?",
+    "expect": {
+      "search": {
+        "domains": [
+          "people-ops"
+        ]
+      },
+      "answer_any": [
+        "75"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "acme-narrow-09",
+    "workspace": "acme",
+    "task_type": "narrow",
+    "question": "How many stages does the interview loop have?",
+    "expect": {
+      "search": {
+        "domains": [
+          "people-ops"
+        ]
+      },
+      "answer_any": [
+        "four",
+        "4"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "acme-sweep-01",
+    "workspace": "acme",
+    "task_type": "sweep",
+    "question": "Who gets paged when a refund needs escalation?",
+    "expect": {
+      "search": {
+        "reaches_domain": "people-ops"
+      },
+      "answer_any": [
+        "support duty manager"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "acme-sweep-02",
+    "workspace": "acme",
+    "task_type": "sweep",
+    "question": "What do we pay for a week of on-call?",
+    "expect": {
+      "search": {
+        "reaches_domain": "people-ops"
+      },
+      "answer_any": [
+        "500"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "acme-structure-01",
+    "workspace": "acme",
+    "task_type": "structure",
+    "question": "What kinds of knowledge does the payments domain cover?",
+    "expect": {
+      "require_manifest_read": true,
+      "manifest_read_ok": true,
+      "answer_all": [
+        "refund",
+        "chargeback"
+      ],
+      "forbid_write": true
+    }
+  },
+  {
+    "id": "acme-context-01",
+    "workspace": "acme",
+    "task_type": "context_nav",
+    "question": "Starting from crystalline://payments/retry-queue-architecture, what is connected to the retry queue and what should I watch out for?",
+    "expect": {
+      "build_context_anchor": "crystalline://payments/retry-queue-architecture",
+      "answer_any": [
+        "24"
+      ],
+      "forbid_write": true
+    }
+  },
+  {
+    "id": "chronos-now-01",
+    "workspace": "chronos",
+    "task_type": "temporal_now",
+    "question": "What do we deploy with right now?",
+    "expect": {
+      "search": {
+        "domains": [
+          "platform"
+        ],
+        "status": "current"
+      },
+      "forbid_metadata_filters": true,
+      "answer_any": [
+        "argocd"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "chronos-now-02",
+    "workspace": "chronos",
+    "task_type": "temporal_now",
+    "question": "How do services authenticate today?",
+    "expect": {
+      "search": {
+        "domains": [
+          "platform"
+        ],
+        "status": "current"
+      },
+      "forbid_metadata_filters": true,
+      "answer_any": [
+        "oidc"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "chronos-now-03",
+    "workspace": "chronos",
+    "task_type": "temporal_now",
+    "question": "Which orchestrator runs our data pipelines currently?",
+    "expect": {
+      "search": {
+        "domains": [
+          "platform"
+        ],
+        "status": "current"
+      },
+      "forbid_metadata_filters": true,
+      "answer_any": [
+        "dagster"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "chronos-history-01",
+    "workspace": "chronos",
+    "task_type": "history",
+    "question": "How has our deployment tooling changed over time?",
+    "expect": {
+      "search": {
+        "domains": [
+          "platform"
+        ],
+        "forbid_status": true
+      },
+      "answer_all": [
+        "jenkins",
+        "argocd"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "chronos-history-02",
+    "workspace": "chronos",
+    "task_type": "history",
+    "question": "What did services use for auth before today's mechanism?",
+    "expect": {
+      "search": {
+        "domains": [
+          "platform"
+        ],
+        "forbid_status": true
+      },
+      "answer_any": [
+        "shared secret"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "chronos-history-03",
+    "workspace": "chronos",
+    "task_type": "history",
+    "question": "Tell the story of our data pipeline orchestration so far.",
+    "expect": {
+      "search": {
+        "domains": [
+          "platform"
+        ],
+        "forbid_status": true
+      },
+      "answer_all": [
+        "airflow",
+        "dagster"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "chronos-now-04",
+    "workspace": "chronos",
+    "task_type": "temporal_now",
+    "question": "How long do service auth tokens live?",
+    "expect": {
+      "search": {
+        "domains": [
+          "platform"
+        ],
+        "status": "current"
+      },
+      "forbid_metadata_filters": true,
+      "answer_any": [
+        "15"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "chronos-proposal-01",
+    "workspace": "chronos",
+    "task_type": "proposal",
+    "question": "Are we running on NATS JetStream?",
+    "expect": {
+      "search": {
+        "domains": [
+          "platform"
+        ],
+        "forbid_status": true
+      },
+      "answer_any": [
+        "propos"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "chronos-structure-01",
+    "workspace": "chronos",
+    "task_type": "structure",
+    "question": "What does the platform domain hold?",
+    "expect": {
+      "require_manifest_read": true,
+      "manifest_read_ok": true,
+      "answer_all": [
+        "deploy",
+        "auth"
+      ],
+      "forbid_write": true
+    }
+  },
+  {
+    "id": "horizon-window-01",
+    "workspace": "horizon",
+    "task_type": "temporal_window",
+    "question": "What did the standard plan cost in June 2025?",
+    "expect": {
+      "search": {
+        "domains": [
+          "policies"
+        ],
+        "metadata_filters_keys": [
+          "valid_from",
+          "valid_to"
+        ]
+      },
+      "answer_any": [
+        "39"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "horizon-window-02",
+    "workspace": "horizon",
+    "task_type": "temporal_window",
+    "question": "What was our standard plan price on 2025-03-15?",
+    "expect": {
+      "search": {
+        "domains": [
+          "policies"
+        ],
+        "metadata_filters_keys": [
+          "valid_from",
+          "valid_to"
+        ]
+      },
+      "answer_any": [
+        "39"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "horizon-now-01",
+    "workspace": "horizon",
+    "task_type": "temporal_now",
+    "question": "What does the standard plan cost today?",
+    "expect": {
+      "search": {
+        "domains": [
+          "policies"
+        ],
+        "status": "current"
+      },
+      "forbid_metadata_filters": true,
+      "answer_any": [
+        "49"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "horizon-narrow-01",
+    "workspace": "horizon",
+    "task_type": "narrow",
+    "question": "How many projects does the free tier allow?",
+    "expect": {
+      "search": {
+        "domains": [
+          "policies"
+        ]
+      },
+      "answer_any": [
+        "3"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "horizon-narrow-02",
+    "workspace": "horizon",
+    "task_type": "narrow",
+    "question": "Until when does the manual cert rotation workaround run?",
+    "expect": {
+      "search": {
+        "domains": [
+          "policies"
+        ]
+      },
+      "answer_any": [
+        "2026-09-30",
+        "september"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "horizon-narrow-03",
+    "workspace": "horizon",
+    "task_type": "narrow",
+    "question": "Where must EU customer data stay?",
+    "expect": {
+      "search": {
+        "domains": [
+          "policies"
+        ]
+      },
+      "answer_any": [
+        "eu-central-1"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "horizon-window-03",
+    "workspace": "horizon",
+    "task_type": "temporal_window",
+    "question": "Which standard plan pricing applied on 2025-08-01?",
+    "expect": {
+      "search": {
+        "domains": [
+          "policies"
+        ],
+        "metadata_filters_keys": [
+          "valid_from",
+          "valid_to"
+        ]
+      },
+      "answer_any": [
+        "39"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "horizon-now-02",
+    "workspace": "horizon",
+    "task_type": "temporal_now",
+    "question": "What is the current monthly price of the standard plan?",
+    "expect": {
+      "search": {
+        "domains": [
+          "policies"
+        ],
+        "status": "current"
+      },
+      "forbid_metadata_filters": true,
+      "answer_any": [
+        "49"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "horizon-structure-01",
+    "workspace": "horizon",
+    "task_type": "structure",
+    "question": "What is the policies domain for?",
+    "expect": {
+      "require_manifest_read": true,
+      "manifest_read_ok": true,
+      "answer_any": [
+        "pricing"
+      ],
+      "forbid_write": true
+    }
+  },
+  {
+    "id": "nimbus-narrow-01",
+    "workspace": "nimbus",
+    "task_type": "narrow",
+    "question": "How long can Atlas run offline before it needs re-authentication?",
+    "expect": {
+      "search": {
+        "domains": [
+          "product-atlas"
+        ]
+      },
+      "answer_any": [
+        "30"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "nimbus-narrow-02",
+    "workspace": "nimbus",
+    "task_type": "narrow",
+    "question": "How does Atlas resolve concurrent edits?",
+    "expect": {
+      "search": {
+        "domains": [
+          "product-atlas"
+        ]
+      },
+      "answer_any": [
+        "vector clock",
+        "last-writer",
+        "last writer"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "nimbus-narrow-03",
+    "workspace": "nimbus",
+    "task_type": "narrow",
+    "question": "What sharing roles exist in Atlas?",
+    "expect": {
+      "search": {
+        "domains": [
+          "product-atlas"
+        ]
+      },
+      "answer_all": [
+        "viewer",
+        "owner"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "nimbus-narrow-04",
+    "workspace": "nimbus",
+    "task_type": "narrow",
+    "question": "How stale can Atlas search results be right after a sync?",
+    "expect": {
+      "search": {
+        "domains": [
+          "product-atlas"
+        ]
+      },
+      "answer_any": [
+        "60"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  },
+  {
+    "id": "nimbus-context-01",
+    "workspace": "nimbus",
+    "task_type": "context_nav",
+    "question": "Starting from crystalline://product-atlas/sync-engine-overview, summarize everything connected to the sync engine.",
+    "expect": {
+      "build_context_anchor": "crystalline://product-atlas/sync-engine-overview",
+      "answer_all": [
+        "conflict",
+        "offline"
+      ],
+      "forbid_write": true
+    }
+  },
+  {
+    "id": "nimbus-context-02",
+    "workspace": "nimbus",
+    "task_type": "context_nav",
+    "question": "Use the knowledge around crystalline://product-atlas/offline-mode to explain offline behavior and what it depends on.",
+    "expect": {
+      "build_context_anchor": "crystalline://product-atlas/offline-mode",
+      "answer_all": [
+        "30",
+        "sync"
+      ],
+      "forbid_write": true
+    }
+  },
+  {
+    "id": "nimbus-structure-01",
+    "workspace": "nimbus",
+    "task_type": "structure",
+    "question": "What does the product-atlas domain cover?",
+    "expect": {
+      "require_manifest_read": true,
+      "manifest_read_ok": true,
+      "answer_all": [
+        "sync",
+        "shar"
+      ],
+      "forbid_write": true
+    }
+  },
+  {
+    "id": "nimbus-structure-02",
+    "workspace": "nimbus",
+    "task_type": "structure",
+    "question": "What is the scratch domain for and when should it be used?",
+    "expect": {
+      "require_manifest_read": true,
+      "manifest_read_ok": true,
+      "answer_any": [
+        "experiment"
+      ],
+      "forbid_write": true
+    }
+  },
+  {
+    "id": "nimbus-narrow-05",
+    "workspace": "nimbus",
+    "task_type": "narrow",
+    "question": "What merge strategy does Atlas sync use?",
+    "expect": {
+      "search": {
+        "domains": [
+          "product-atlas"
+        ]
+      },
+      "answer_any": [
+        "crdt",
+        "per-field",
+        "per field"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    }
+  }
+]

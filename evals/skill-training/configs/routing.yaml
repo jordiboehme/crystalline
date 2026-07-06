@@ -1,0 +1,61 @@
+# Crystalline routing skill, pilot training config. Self-contained (no
+# _base_): the wheel ships no base YAML, so every knob is explicit here.
+# The optimizer runs over the local Claude CLI login (claude_chat drives
+# `claude -p`); the target is driven directly by the env's rollout code,
+# which launches headless Claude Code sessions against a sandboxed
+# crystalline MCP server (env.claude_model picks the target model).
+
+model:
+  backend: claude
+  optimizer: claude-sonnet-5
+  target: claude-haiku-4-5-20251001
+  optimizer_backend: claude_chat
+  target_backend: claude_chat
+  reasoning_effort: ""
+
+train:
+  num_epochs: 3
+  train_size: 0
+  batch_size: 8
+  accumulation: 1
+  seed: 42
+
+gradient:
+  minibatch_size: 4
+  merge_batch_size: 8
+  analyst_workers: 4
+  max_analyst_rounds: 3
+  failure_only: false
+
+optimizer:
+  learning_rate: 4
+  min_learning_rate: 2
+  lr_scheduler: cosine
+  lr_control_mode: fixed
+  skill_update_mode: patch
+  use_slow_update: true
+  slow_update_samples: 8
+  slow_update_gate_with_selection: false
+  longitudinal_pair_policy: mixed
+  use_meta_skill: true
+
+evaluation:
+  use_gate: true
+  gate_metric: hard
+  sel_env_num: 0
+  test_env_num: 0
+  eval_test: true
+
+env:
+  name: crystalline_routing
+  skill_init: outputs/seed_routing.md
+  split_mode: split_dir
+  split_dir: data/routing_split
+  fixture_root: fixtures/workspaces
+  crystalline_bin: ../../target/release/crystalline
+  claude_bin: claude
+  claude_model: claude-haiku-4-5-20251001
+  workers: 4
+  max_turns: 12
+  exec_timeout: 240
+  limit: 0
