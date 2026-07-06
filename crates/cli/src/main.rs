@@ -784,7 +784,7 @@ fn main() -> anyhow::Result<()> {
             } => run_prompt(workspace, read_only, config, cli.db, cli.json),
         },
         Some(Command::Domain { command }) => run_domain(command, cli.db, cli.json),
-        Some(Command::Connect { command }) => on_runtime(run_connect(command, cli.json)),
+        Some(Command::Connect { command }) => on_runtime(move || run_connect(command, cli.json)),
         Some(Command::Install {
             harness,
             project,
@@ -806,26 +806,30 @@ fn main() -> anyhow::Result<()> {
             project,
             force,
         }) => install::run_uninstall(harness, project, force, cli.json),
-        Some(Command::Origin { command }) => on_runtime(run_origin(command, cli.db, cli.json)),
-        Some(Command::Config { command }) => on_runtime(config_dispatch(command, cli.json)),
+        Some(Command::Origin { command }) => {
+            on_runtime(move || run_origin(command, cli.db, cli.json))
+        }
+        Some(Command::Config { command }) => on_runtime(move || config_dispatch(command, cli.json)),
         Some(Command::Sync {
             domain,
             embed,
             take_over,
             config,
-        }) => on_runtime(sync_dispatch(
-            domain, embed, take_over, config, cli.db, cli.json,
-        )),
+        }) => on_runtime(move || sync_dispatch(domain, embed, take_over, config, cli.db, cli.json)),
         Some(Command::Reindex {
             full,
             embed,
             config,
-        }) => on_runtime(reindex_dispatch(full, embed, config, cli.db, cli.json)),
-        Some(Command::Status { config }) => on_runtime(status_dispatch(config, cli.db, cli.json)),
+        }) => on_runtime(move || reindex_dispatch(full, embed, config, cli.db, cli.json)),
+        Some(Command::Status { config }) => {
+            on_runtime(move || status_dispatch(config, cli.db, cli.json))
+        }
         Some(Command::Model { command }) => match command {
             ModelCommand::Download { config } => {
                 let json = cli.json;
-                on_runtime(async move { cmd::model_download(config.as_deref(), json).await })
+                on_runtime(
+                    move || async move { cmd::model_download(config.as_deref(), json).await },
+                )
             }
         },
         Some(Command::Import {
@@ -848,23 +852,23 @@ fn main() -> anyhow::Result<()> {
             domain,
             fix,
             config,
-        }) => on_runtime(run_doctor(domain, fix, config, cli.db, cli.json)),
+        }) => on_runtime(move || run_doctor(domain, fix, config, cli.db, cli.json)),
         Some(Command::Serve {
             http,
             daemon,
             read_only,
             take_over,
             config,
-        }) => on_runtime(crystalline_service::run_serve(
-            daemon, http, cli.db, config, read_only, take_over,
-        )),
+        }) => on_runtime(move || {
+            crystalline_service::run_serve(daemon, http, cli.db, config, read_only, take_over)
+        }),
         Some(Command::Mcp {
             embedded,
             read_only,
             domain,
             config,
-        }) => on_runtime(mcp_dispatch(domain, embedded, read_only, config, cli.db)),
-        Some(Command::Ctl { command }) => on_runtime(run_ctl(command, cli.json)),
+        }) => on_runtime(move || mcp_dispatch(domain, embedded, read_only, config, cli.db)),
+        Some(Command::Ctl { command }) => on_runtime(move || run_ctl(command, cli.json)),
         Some(
             cmd @ (Command::Write { .. }
             | Command::Read { .. }
@@ -874,7 +878,7 @@ fn main() -> anyhow::Result<()> {
             | Command::Search { .. }
             | Command::Context { .. }
             | Command::Recent { .. }),
-        ) => on_runtime(run_data(cmd, cli.db, cli.json)),
+        ) => on_runtime(move || run_data(cmd, cli.db, cli.json)),
         Some(Command::Hook { event }) => match event {
             HookEvent::Stop => {
                 hook::run_stop();
@@ -1545,11 +1549,12 @@ async fn run_data(command: Command, db: Option<PathBuf>, json: bool) -> anyhow::
 
 /// Run an async command body on a fresh multi-threaded Tokio runtime. Kept off
 /// the static `verify` and `prompt` paths so they never start a runtime.
-fn on_runtime<F>(fut: F) -> anyhow::Result<()>
+fn on_runtime<F, Fut>(make: F) -> anyhow::Result<()>
 where
-    F: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
 {
-    on_runtime_value(fut)?
+    on_runtime_value(make)?
 }
 
 /// Like [`on_runtime`] but for a future that yields a plain value. Used by
@@ -1557,15 +1562,19 @@ where
 /// config actually has a virtual domain, so the common all-file path never
 /// starts a runtime.
 ///
-/// The future runs on a dedicated thread with an explicit 8 MiB stack rather
-/// than being polled on the process main thread: Windows gives the main
-/// thread 1 MiB where Linux and macOS give 8, and the larger command futures
-/// overflow that in unoptimized builds. One deep thread makes the stack
-/// budget identical on every platform.
-fn on_runtime_value<T, F>(fut: F) -> anyhow::Result<T>
+/// Takes a closure that builds the future, not the future itself, and calls
+/// it on a dedicated thread with an explicit 8 MiB stack. An async fn's
+/// future is materialized on the stack of whoever calls it, so passing a
+/// built future would land its whole state machine on the process main
+/// thread first - and Windows gives that thread 1 MiB where Linux and macOS
+/// give 8, which the larger command futures overflow in unoptimized builds.
+/// Building inside the deep thread keeps the main thread's stack usage
+/// independent of how big any command's future grows.
+fn on_runtime_value<T, F, Fut>(make: F) -> anyhow::Result<T>
 where
     T: Send + 'static,
-    F: std::future::Future<Output = T> + Send + 'static,
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = T>,
 {
     let worker = std::thread::Builder::new()
         .name("crystalline-cmd".into())
@@ -1575,7 +1584,7 @@ where
                 tokio::runtime::Builder::new_multi_thread()
                     .enable_all()
                     .build()?
-                    .block_on(fut),
+                    .block_on(make()),
             )
         })?;
     match worker.join() {
@@ -1598,34 +1607,34 @@ fn run_domain(command: DomainCommand, db: Option<PathBuf>, json: bool) -> anyhow
             branch,
             no_sync,
             config,
-        } => on_runtime(domain_add_dispatch(
-            name, path, is_virtual, origin, branch, config, db, no_sync, json,
-        )),
-        DomainCommand::List { config } => {
-            on_runtime(
-                async move { cmd::domain_list(config.as_deref(), db.as_deref(), json).await },
+        } => on_runtime(move || {
+            domain_add_dispatch(
+                name, path, is_virtual, origin, branch, config, db, no_sync, json,
             )
-        }
+        }),
+        DomainCommand::List { config } => on_runtime(move || async move {
+            cmd::domain_list(config.as_deref(), db.as_deref(), json).await
+        }),
         DomainCommand::Import {
             path,
             domain,
             overwrite,
             dry_run,
             config,
-        } => on_runtime(domain_import_dispatch(
-            domain, path, overwrite, dry_run, config, db, json,
-        )),
+        } => on_runtime(move || {
+            domain_import_dispatch(domain, path, overwrite, dry_run, config, db, json)
+        }),
         DomainCommand::Export {
             path,
             domain,
             force,
             dry_run,
             config,
-        } => on_runtime(domain_export_dispatch(
-            domain, path, force, dry_run, config, db, json,
-        )),
+        } => on_runtime(move || {
+            domain_export_dispatch(domain, path, force, dry_run, config, db, json)
+        }),
         DomainCommand::Remove { name, config } => {
-            on_runtime(domain_remove_dispatch(name, config, json))
+            on_runtime(move || domain_remove_dispatch(name, config, json))
         }
     }
 }
@@ -1960,7 +1969,7 @@ fn run_prompt(
         let global_bullets = global.clone();
         let db_bullets = db.clone();
         let config_bullets = config_path.clone();
-        on_runtime_value(async move {
+        on_runtime_value(move || async move {
             crystalline_service::virtual_routing_bullets(
                 &global_bullets,
                 db_bullets.as_deref(),
