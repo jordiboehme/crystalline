@@ -4,9 +4,10 @@
 //! Each tool is a thin wrapper over [`crate::engine::Engine`], which does the
 //! real work and is shared with the CLI data commands. Tool descriptions are
 //! agent-facing product copy framed around onboarding, teaching, learning and
-//! experience. The recommended `type` and `status` value sets are stated in the
-//! `write_engram` and `edit_engram` descriptions as guidance; they are never
-//! enforced. Every mutating tool requires an explicit domain.
+//! experience. The recommended `type` and `status` value sets are stated once,
+//! in the `write_engram` description, as guidance that is never enforced;
+//! `edit_engram` points back to it rather than repeating the list. Every
+//! mutating tool requires an explicit domain.
 //!
 //! The server handshake (`get_info`) hands each connecting agent the live
 //! routing block as its `instructions`, rendered from the engine by
@@ -134,7 +135,7 @@ impl McpServer {
 impl McpServer {
     #[tool(
         name = "write_engram",
-        description = "Capture a new engram - a unit of knowledge or experience - into a domain so it becomes part of what the agent knows in later sessions. Writes the markdown file (the source of truth) and indexes it. The body is markdown: top-level bullets like '- [decision] we chose X #tag' become observations and '- rel_type [[Target]]' become relations. domain is required so an engram never lands in the wrong place. permalink, status (current), recorded_at (today) and timestamp are filled in for you; valid_from and valid_to are never set, since their absence means always valid. Recommended type values: engram, guide, decision, architecture, runbook, reference. Recommended status values: current, implemented, draft, proposed, idea, poc, deprecated, superseded, archived, legacy - guidance that lets you tell an idea or draft apart from current fact, not a fixed list. Errors if the permalink already exists unless overwrite is true."
+        description = "Capture a new engram - a unit of knowledge - into a domain. Writes the markdown file and indexes it. Body bullets: '- [decision] we chose X #tag' become observations, '- rel_type [[Target]]' become relations. domain is required so an engram never lands in the wrong place. permalink, status, recorded_at and timestamp are filled in; valid_from/valid_to are never set, since absence means always valid. Recommended type values: engram, guide, decision, architecture, runbook, reference. Recommended status values (guidance, not enforced): current, implemented, draft, proposed, idea, poc, deprecated, superseded, archived, legacy. Errors if the permalink exists unless overwrite is true."
     )]
     async fn write_engram(
         &self,
@@ -164,7 +165,7 @@ impl McpServer {
 
     #[tool(
         name = "edit_engram",
-        description = "Refine an existing engram in place as understanding evolves, rather than rewriting it. Sections are addressed by heading path such as '## API > ### Auth'; replace_section keeps deeper subsections unless include_subsections is set. operation is one of append, prepend, find_replace, replace_section, insert_before_section, insert_after_section. find_replace takes find_text and an optional expected_replacements guard that fails on a count mismatch. Pass expected_checksum (the checksum returned by read_engram) to guard a virtual-domain edit against a change since you last read it: the edit is refused as a conflict if it changed, so re-read and retry; omit it for last-write-wins. The timestamp is refreshed. Recommended status values to reflect a changed lifecycle: current, implemented, draft, proposed, idea, poc, deprecated, superseded, archived, legacy."
+        description = "Refine an existing engram in place as understanding evolves. Sections are addressed by heading path such as '## API > ### Auth'; replace_section keeps deeper subsections unless include_subsections is set. operation is one of append, prepend, find_replace, replace_section, insert_before_section, insert_after_section. find_replace takes find_text and an optional expected_replacements guard that fails on a count mismatch. Pass expected_checksum (from read_engram) to guard a virtual-domain edit against a change since your read: a conflict is refused if it changed, so re-read and retry; omit it for last-write-wins. The timestamp is refreshed. Status values to reflect a changed lifecycle (recommended values: see write_engram)."
     )]
     async fn edit_engram(
         &self,
@@ -254,7 +255,7 @@ impl McpServer {
 
     #[tool(
         name = "list_domains",
-        description = "List the registered domains with their engram counts to see what the agent has been taught. Set include_routing to also get each domain's When to Use routing bullets from its MANIFEST."
+        description = "List the registered domains with their engram counts to see what the agent has been taught. Set include_routing to also get each domain's When to Use routing bullets from its MANIFEST - the routing source the server instructions summarize, with every bullet included."
     )]
     async fn list_domains(
         &self,

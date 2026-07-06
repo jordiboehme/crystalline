@@ -7,11 +7,11 @@ description: Use when deciding which Crystalline domain(s) to search or read for
 
 Crystalline organizes what you have been taught into Domains, each with a `MANIFEST.md` describing its scope. Before you act on a task, know which domain(s) it lives in and search rather than guessing from memory or pre-trained knowledge.
 
-## Start from the routing prompt
+## Start from the routing block
 
-At session start you are typically handed the output of `crystalline prompt system`: one routing line per registered domain summarizing when to use it, built from that domain's `MANIFEST.md` `## When to Use` bullets, plus the crystalline MCP tool names (`search_engrams`, `write_engram` and the rest) those domains route through. Treat each routing line as a targeting aid, not a complete catalog - it cannot capture everything inside a domain, and a domain that looks unrelated at a glance may still hold the answer.
+At session start you are handed a routing block - injected as a session prompt in some harnesses, served as the MCP server's own instructions in others - with one routing line per registered domain summarizing when to use it, built from its `MANIFEST.md` `## When to Use` bullets, plus the crystalline MCP tool names (`search_engrams`, `write_engram` and the rest) those domains route through. Treat each routing line as a targeting aid, not a complete catalog - a domain that looks unrelated at a glance may still hold the answer.
 
-If you were not handed a routing prompt, call `list_domains` with `include_routing: true` to get the same information mid-session.
+Either way, `list_domains` with `include_routing: true` re-fetches the same index mid-session.
 
 ## Decide scope first
 
@@ -40,7 +40,7 @@ Omit `domains` entirely - `search_engrams` defaults to every registered domain, 
 }
 ```
 
-Do not pre-filter to the domains you recognize from the routing prompt; a domain returning no hits for one phrasing does not mean the knowledge is not captured there under different words. If hits span several domains and the guidance conflicts, say so explicitly and name which domain each answer came from rather than picking one silently.
+Do not pre-filter to the domains you recognize from the routing block; a domain returning no hits for one phrasing does not mean the knowledge is not captured there under different words. If hits span several domains and the guidance conflicts, say so explicitly and name which domain each answer came from rather than picking one silently.
 
 ## Temporal filtering: "what is true now"
 
@@ -53,7 +53,7 @@ Do not pre-filter to the domains you recognize from the routing prompt; a domain
 }
 ```
 
-`valid_from` and `valid_to` are optional fields set only when a fact is genuinely time-bounded (absence means the engram has always been valid / is valid forever - never a sentinel far-future date). Because absence is the common case, do not build a `metadata_filters` range check on `valid_from`/`valid_to` and expect it to include engrams that never set those fields: a plain comparison like `{"valid_to": {"$gt": "2026-07-02"}}` is a strict SQL predicate and excludes rows where the column is null, which is the opposite of what "absence means unbounded" implies. Use such a filter only when you deliberately want engrams with an explicit, bounded validity window - for example, to find what was true on a past date:
+Absence of `valid_from`/`valid_to` means unbounded validity (the write-side rule lives in `crystalline-capture`), so a `metadata_filters` range check on those fields excludes engrams that never set them: a comparison like `{"valid_to": {"$gt": "2026-07-02"}}` is a strict SQL predicate that skips null rows, the opposite of what "absence means unbounded" implies. Use such a filter only for an explicit, bounded validity window - for example, to find what was true on a past date:
 
 ```json
 {
@@ -75,7 +75,7 @@ Read a domain's `MANIFEST.md` (via `read_engram` or `browse_domain`) only when:
 - the task is about the domain's own structure or conventions, or
 - you are about to write or reorganize engrams inside it.
 
-Otherwise, search first. Reading every MANIFEST up front burns context for no benefit once the routing prompt already exists.
+Otherwise, search first. Reading every MANIFEST up front burns context for no benefit once the routing block already exists.
 
 ## Explore the neighbourhood with build_context
 

@@ -87,7 +87,7 @@ cat >"$manifest_path" <<JSON
   "display_name": "Crystalline",
   "version": "$version",
   "description": "Durable memory for AI agents: teach knowledge in Domains, capture learnings as Engrams.",
-  "long_description": "Crystalline gives an AI agent durable memory across sessions instead of starting from zero each time. It is onboarded through a generated routing prompt, taught information through curated Domains and captures what it learns and experiences as Engrams: markdown files with structured frontmatter that stay readable and editable outside of any agent.\n\nOver time an engram collection becomes a working memory the agent can search, browse and build context from before starting new work, turning it into a more useful peer with each session it runs. Each folder picked in the Knowledge folders setting below becomes a Domain that Crystalline prepares automatically; removing a folder from the setting does not delete its knowledge.",
+  "long_description": "Crystalline gives an AI agent durable memory across sessions instead of starting from zero each time. The moment it connects, the server's own instructions carry a live routing index, so onboarding is automatic; from there the agent is taught information through curated Domains and captures what it learns and experiences as Engrams: markdown files with structured frontmatter that stay readable and editable outside of any agent.\n\nOver time an engram collection becomes a working memory the agent can search, browse and build context from before starting new work, turning it into a more useful peer with each session it runs. Each folder picked in the Knowledge folders setting below becomes a Domain that Crystalline prepares automatically; removing a folder from the setting does not delete its knowledge.",
   "author": {
     "name": "$author_name",
     "email": "$author_email"
@@ -171,6 +171,10 @@ cat >"$manifest_path" <<JSON
     {
       "name": "infer_schema",
       "description": "Suggest a Picoschema for a type by generalizing over engrams already captured in a domain."
+    },
+    {
+      "name": "configure",
+      "description": "View and adjust Crystalline's settings, like connecting a GitHub account for team collaboration."
     }
   ],
   "tools_generated": false
