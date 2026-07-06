@@ -92,8 +92,10 @@ pub enum HarnessKind {
 }
 
 impl HarnessKind {
-    /// The stable identifier used in machine-readable output.
-    fn id(self) -> &'static str {
+    /// The stable identifier used in machine-readable output, and reused by
+    /// `doctor` to label its harnesses section with the same spelling
+    /// `crystalline install <name>` takes.
+    pub(crate) fn id(self) -> &'static str {
         match self {
             HarnessKind::ClaudeCode => "claude-code",
             HarnessKind::Codex => "codex",
@@ -133,20 +135,22 @@ pub struct InstallOptions {
     pub skip_skills: bool,
 }
 
-/// The settings file and skills folder for a harness at a given scope.
-struct HarnessPaths {
+/// The settings file and skills folder for a harness at a given scope. Reused
+/// by `doctor`, which reads these same two paths to report each harness's
+/// onboarding trace without ever writing to them.
+pub(crate) struct HarnessPaths {
     /// The JSON file the hooks live in (`settings.json` for Claude Code, a
     /// dedicated `hooks.json` for Codex).
-    settings: PathBuf,
+    pub(crate) settings: PathBuf,
     /// The folder each skill's `<name>/SKILL.md` is copied under.
-    skills_dir: PathBuf,
+    pub(crate) skills_dir: PathBuf,
 }
 
 /// Resolve the settings file and skills folder for a harness and scope. User
 /// scope expands `~` through [`config::expand_tilde`]; `--project` scope is
 /// relative to the current working directory, so it lands in the repository
 /// the command is run from.
-fn harness_paths(harness: HarnessKind, project: bool) -> HarnessPaths {
+pub(crate) fn harness_paths(harness: HarnessKind, project: bool) -> HarnessPaths {
     match (harness, project) {
         (HarnessKind::ClaudeCode, false) => HarnessPaths {
             settings: config::expand_tilde("~/.claude/settings.json"),
@@ -332,8 +336,11 @@ pub(crate) fn remove_managed_hooks(root: &mut Map<String, Value>) -> bool {
 /// Read a settings file into its top-level object. A missing file is the empty
 /// object (the merge builds it from scratch); a present file that is not valid
 /// JSON, or is valid JSON but not an object, is a hard error naming the path,
-/// so a file this process does not understand is never overwritten.
-fn read_settings(path: &Path) -> anyhow::Result<Map<String, Value>> {
+/// so a file this process does not understand is never overwritten. Reused by
+/// `doctor`, which reads the same file read-only to check for a parse error
+/// and to test hook presence via [`hook_present`], never duplicating this
+/// parsing logic.
+pub(crate) fn read_settings(path: &Path) -> anyhow::Result<Map<String, Value>> {
     match std::fs::read(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Map::new()),
         Err(e) => Err(anyhow::anyhow!("could not read {}: {e}", path.display())),

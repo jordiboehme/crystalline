@@ -5,7 +5,7 @@ description: Use when durable knowledge is learned while working, when the user 
 
 # Crystalline Capture
 
-Capturing what you learn while you work, as engrams, is the core of Crystalline. Treat it as a normal byproduct of the task, not a separate chore to remember at the end.
+Capturing what you learn while you work, as engrams, is the core of Crystalline. Treat it as a normal byproduct of the task, not a separate chore to remember at the end. A session-end reminder may ask you to review the conversation for uncaptured learnings - handle it with this skill and finish quietly when nothing qualifies.
 
 Some deployments are read-only: if the server instructions or an injected prompt say this deployment's knowledge is read-only and curated externally, stand down on capture. The write tools are not exposed there and this whole skill does not apply; search and read instead.
 
