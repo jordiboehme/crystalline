@@ -1,4 +1,3 @@
-#![allow(dead_code)] // TODO(task 3): remove once install.rs consumes the receipt
 //! The install receipt: `crystalline install`'s memory of what it wired up,
 //! read back by later runs and by the session-start auto-reconcile to decide
 //! which skills to update or retire and which install options to replay.

@@ -21,6 +21,14 @@
 //! with a trailing newline, so foreign keys are preserved semantically even
 //! though their original byte formatting is not.
 //!
+//! Every install run records what it did in the install receipt
+//! (`receipt.rs`, `<state_dir>/installs.json`): binary version, chosen
+//! parts and each skill's content hash as written. The receipt is what a
+//! later binary reconciles against - updating old untouched skills in
+//! place, preserving edited ones as `SKILL.md.bak` and retiring skills the
+//! newer version no longer ships - and what the session-start auto-update
+//! in `prompt system` replays install options from.
+//!
 //! Presence is decided by command string, ignoring the hook group's matcher,
 //! so the README's hand-written `startup` recipe counts as already installed
 //! (no duplicate is added) and is removed on uninstall like any managed
@@ -711,33 +719,84 @@ fn retire(
     }
 }
 
-/// Remove each managed skill: dropped when its content matches the embedded
-/// copy (`removed`), kept when a person edited it (`kept-modified`) unless
-/// `force` is set (`removed-forced`), reported `absent` when it was never
-/// there. Never touches a folder that is not one of the four managed skills.
-fn uninstall_skills(dir: &Path, force: bool) -> anyhow::Result<SkillsReport> {
-    let mut skills = Vec::with_capacity(MANAGED_SKILLS.len());
-    for &(name, content) in MANAGED_SKILLS {
+/// Remove each managed skill plus any receipt-recorded or list-retired
+/// leftover. A file matching this binary's embedded copy or its own receipt
+/// hash is untouched by the user and is dropped; a genuinely edited file is
+/// kept (`kept-modified`) unless `force` is set. The receipt hash is what
+/// keeps an old-but-clean skill from being mistaken for an edited one.
+fn uninstall_skills(
+    dir: &Path,
+    prior: &[receipt::RecordedSkill],
+    force: bool,
+) -> anyhow::Result<SkillsReport> {
+    let prior_hash: std::collections::HashMap<&str, &str> = prior
+        .iter()
+        .map(|r| (r.name.as_str(), r.sha256.as_str()))
+        .collect();
+    let mut skills = Vec::new();
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+
+    let drop_one = |name: &str, embedded: Option<&str>| -> anyhow::Result<Option<&'static str>> {
         let skill_dir = dir.join(name);
         let path = skill_dir.join("SKILL.md");
-        let status = match std::fs::read(&path) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => "absent",
-            Err(e) => return Err(anyhow::anyhow!("could not read {}: {e}", path.display())),
-            Ok(existing) if existing == content.as_bytes() => {
-                remove_skill(&path, &skill_dir)?;
-                "removed"
+        match std::fs::read(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(if embedded.is_some() {
+                Some("absent")
+            } else {
+                None
+            }),
+            Err(e) => Err(anyhow::anyhow!("could not read {}: {e}", path.display())),
+            Ok(existing) => {
+                let file_hash = receipt::sha256_hex(&existing);
+                let clean = embedded.is_some_and(|c| existing == c.as_bytes())
+                    || prior_hash.get(name).copied() == Some(file_hash.as_str());
+                if clean {
+                    remove_skill(&path, &skill_dir)?;
+                    Ok(Some("removed"))
+                } else if force {
+                    remove_skill(&path, &skill_dir)?;
+                    Ok(Some("removed-forced"))
+                } else {
+                    Ok(Some("kept-modified"))
+                }
             }
-            Ok(_) if force => {
-                remove_skill(&path, &skill_dir)?;
-                "removed-forced"
-            }
-            Ok(_) => "kept-modified",
-        };
-        skills.push(SkillReport {
-            name: name.to_string(),
-            status,
-        });
+        }
+    };
+
+    for &(name, content) in MANAGED_SKILLS {
+        seen.insert(name);
+        if let Some(status) = drop_one(name, Some(content))? {
+            skills.push(SkillReport {
+                name: name.to_string(),
+                status,
+            });
+        }
     }
+    // Leftovers behind the current set: receipt names first (they carry a
+    // hash), then the static retired list. Reported only when present.
+    for r in prior {
+        if !seen.insert(r.name.as_str()) {
+            continue;
+        }
+        if let Some(status) = drop_one(&r.name, None)? {
+            skills.push(SkillReport {
+                name: r.name.clone(),
+                status,
+            });
+        }
+    }
+    for &name in RETIRED_SKILLS {
+        if !seen.insert(name) {
+            continue;
+        }
+        if let Some(status) = drop_one(name, None)? {
+            skills.push(SkillReport {
+                name: name.to_string(),
+                status,
+            });
+        }
+    }
+
     Ok(SkillsReport {
         dir: dir.display().to_string(),
         skills,
@@ -802,6 +861,13 @@ struct SkillReport {
     status: &'static str,
 }
 
+/// The receipt outcome: where it lives and whether this run rewrote it.
+#[derive(Serialize)]
+struct ReceiptReport {
+    path: String,
+    written: bool,
+}
+
 /// The full result of an `install`. A skipped part is `None`, omitted from the
 /// JSON entirely; `notices` carries harness-specific follow-up (Codex's trust
 /// step, for one).
@@ -815,6 +881,8 @@ struct InstallReport {
     hooks: Option<HooksReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     skills: Option<SkillsReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    receipt: Option<ReceiptReport>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     notices: Vec<String>,
 }
@@ -828,6 +896,8 @@ struct UninstallReport {
     mcp: McpReport,
     hooks: HooksReport,
     skills: SkillsReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    receipt: Option<ReceiptReport>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     notices: Vec<String>,
 }
@@ -880,6 +950,7 @@ fn render_human(
     mcp: Option<&McpReport>,
     hooks: Option<&HooksReport>,
     skills: Option<&SkillsReport>,
+    receipt: Option<&ReceiptReport>,
     notices: &[String],
 ) -> String {
     let mut out = header;
@@ -908,6 +979,10 @@ fn render_human(
             }
         }
     }
+    if let Some(r) = receipt {
+        let state = if r.written { "" } else { " (not written)" };
+        out.push_str(&format!("  Install receipt: {}{state}\n", r.path));
+    }
     for note in notices {
         out.push('\n');
         out.push_str(note);
@@ -927,6 +1002,25 @@ pub fn run_install(opts: InstallOptions, json: bool) -> anyhow::Result<()> {
     let paths = harness_paths(opts.harness, opts.project);
     let scope = if opts.project { "project" } else { "user" };
 
+    // Receipt context first: the prior record's hashes feed the skills
+    // reconcile, so it must be in hand before any part runs. A corrupt
+    // receipt is disposable state and is regenerated from empty.
+    let receipt_path = receipt::receipt_path().ok();
+    let mut book = receipt_path
+        .as_deref()
+        .map(|p| receipt::load(p).unwrap_or_default())
+        .unwrap_or_default();
+    let project_path = if opts.project {
+        let cwd = std::env::current_dir()
+            .map_err(|e| anyhow::anyhow!("could not resolve the working directory: {e}"))?;
+        Some(cwd.canonicalize().unwrap_or(cwd).display().to_string())
+    } else {
+        None
+    };
+    let prior = book
+        .find(opts.harness.id(), scope, project_path.as_deref())
+        .cloned();
+
     let mcp = if opts.skip_mcp {
         None
     } else {
@@ -937,10 +1031,15 @@ pub fn run_install(opts: InstallOptions, json: bool) -> anyhow::Result<()> {
     } else {
         Some(install_hooks(&paths.settings)?)
     };
+    let mut new_records = None;
     let skills = if opts.skip_skills {
         None
     } else {
-        Some(reconcile_skills(&paths.skills_dir, &[], ReconcileMode::Install)?.0)
+        let prior_skills = prior.as_ref().map(|p| p.skills.as_slice()).unwrap_or(&[]);
+        let (report, records) =
+            reconcile_skills(&paths.skills_dir, prior_skills, ReconcileMode::Install)?;
+        new_records = Some(records);
+        Some(report)
     };
 
     let mut notices = Vec::new();
@@ -970,12 +1069,61 @@ pub fn run_install(opts: InstallOptions, json: bool) -> anyhow::Result<()> {
         }
     }
 
+    // The receipt records the union of everything ever installed here: a
+    // part skipped on this run keeps its earlier record, since skipping
+    // means "do not touch", not "undo".
+    let prior_parts = prior.as_ref().map(|p| p.parts).unwrap_or(receipt::Parts {
+        mcp: false,
+        hooks: false,
+        skills: false,
+    });
+    book.upsert(receipt::InstallRecord {
+        harness: opts.harness.id().to_string(),
+        scope: scope.to_string(),
+        project_path,
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        parts: receipt::Parts {
+            mcp: prior_parts.mcp || !opts.skip_mcp,
+            hooks: prior_parts.hooks || !opts.skip_hooks,
+            skills: prior_parts.skills || !opts.skip_skills,
+        },
+        skills: match new_records {
+            Some(records) => records,
+            None => prior.map(|p| p.skills).unwrap_or_default(),
+        },
+    });
+    let receipt_report = match &receipt_path {
+        Some(path) => match receipt::save(path, &book) {
+            Ok(()) => Some(ReceiptReport {
+                path: path.display().to_string(),
+                written: true,
+            }),
+            Err(e) => {
+                notices.push(format!(
+                    "Could not write the install receipt ({e}). Session-start auto-updates will not cover this install until a later `crystalline install` succeeds."
+                ));
+                Some(ReceiptReport {
+                    path: path.display().to_string(),
+                    written: false,
+                })
+            }
+        },
+        None => {
+            notices.push(
+                "Could not resolve the state directory for the install receipt; session-start auto-updates will not cover this install."
+                    .to_string(),
+            );
+            None
+        }
+    };
+
     let report = InstallReport {
         harness: opts.harness.id(),
         scope,
         mcp,
         hooks,
         skills,
+        receipt: receipt_report,
         notices,
     };
 
@@ -993,6 +1141,7 @@ pub fn run_install(opts: InstallOptions, json: bool) -> anyhow::Result<()> {
                 report.mcp.as_ref(),
                 report.hooks.as_ref(),
                 report.skills.as_ref(),
+                report.receipt.as_ref(),
                 &report.notices,
             )
         );
@@ -1013,9 +1162,29 @@ pub fn run_uninstall(
     let paths = harness_paths(harness, project);
     let scope = if project { "project" } else { "user" };
 
+    // Receipt context first, mirroring run_install: the prior record's skill
+    // hashes are what let uninstall recognize an old-but-clean skill that
+    // predates this binary's embedded copy.
+    let receipt_path = receipt::receipt_path().ok();
+    let mut book = receipt_path
+        .as_deref()
+        .map(|p| receipt::load(p).unwrap_or_default())
+        .unwrap_or_default();
+    let project_path = if project {
+        let cwd = std::env::current_dir()
+            .map_err(|e| anyhow::anyhow!("could not resolve the working directory: {e}"))?;
+        Some(cwd.canonicalize().unwrap_or(cwd).display().to_string())
+    } else {
+        None
+    };
+    let prior = book
+        .find(harness.id(), scope, project_path.as_deref())
+        .cloned();
+
     let mcp = uninstall_mcp(harness);
     let hooks = uninstall_hooks(&paths.settings)?;
-    let skills = uninstall_skills(&paths.skills_dir, force)?;
+    let prior_skills = prior.as_ref().map(|p| p.skills.as_slice()).unwrap_or(&[]);
+    let skills = uninstall_skills(&paths.skills_dir, prior_skills, force)?;
 
     let mut notices = Vec::new();
     if harness == HarnessKind::Codex {
@@ -1025,12 +1194,46 @@ pub fn run_uninstall(
         );
     }
 
+    // Prune this target's entry from the receipt, saving only when something
+    // was actually there to remove: an uninstall of a target the receipt
+    // never knew about must never touch the file.
+    let removed = book.remove(harness.id(), scope, project_path.as_deref());
+    let receipt_report = if removed {
+        match &receipt_path {
+            Some(path) => match receipt::save(path, &book) {
+                Ok(()) => Some(ReceiptReport {
+                    path: path.display().to_string(),
+                    written: true,
+                }),
+                Err(e) => {
+                    notices.push(format!(
+                        "Could not update the install receipt ({e}). It may still list this install as present."
+                    ));
+                    Some(ReceiptReport {
+                        path: path.display().to_string(),
+                        written: false,
+                    })
+                }
+            },
+            None => {
+                notices.push(
+                    "Could not resolve the state directory for the install receipt; it may still list this install as present."
+                        .to_string(),
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let report = UninstallReport {
         harness: harness.id(),
         scope,
         mcp,
         hooks,
         skills,
+        receipt: receipt_report,
         notices,
     };
 
@@ -1048,6 +1251,7 @@ pub fn run_uninstall(
                 Some(&report.mcp),
                 Some(&report.hooks),
                 Some(&report.skills),
+                report.receipt.as_ref(),
                 &report.notices,
             )
         );

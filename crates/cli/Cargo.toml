@@ -66,3 +66,4 @@ tempfile = { workspace = true }
 serde_json = { workspace = true }
 insta = { workspace = true }
 reqwest = { workspace = true, features = ["blocking"] }
+sha2 = { workspace = true }

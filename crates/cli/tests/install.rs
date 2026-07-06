@@ -513,3 +513,155 @@ fn a_matching_crystalline_on_the_path_earns_no_version_notice() {
         "a matching PATH binary must stay quiet: {stdout}"
     );
 }
+
+/// The receipt path under an isolated home: state_dir honors
+/// XDG_STATE_HOME, which install_cmd points at <home>/state.
+fn receipt_file(home: &Path) -> PathBuf {
+    home.join("state").join("crystalline").join("installs.json")
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    let mut s = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+#[test]
+fn install_writes_a_receipt_and_uninstall_removes_its_entry() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let bin_dir = work.path().join("bin");
+    let log = work.path().join("claude.log");
+    write_shim(&bin_dir, "claude", &log);
+
+    install_cmd(&home, &bin_dir)
+        .args(["install", "claude-code"])
+        .assert()
+        .success();
+
+    let receipt = read_json(&receipt_file(&home));
+    assert_eq!(receipt["format"], 1);
+    let entry = &receipt["installs"][0];
+    assert_eq!(entry["harness"], "claude-code");
+    assert_eq!(entry["scope"], "user");
+    assert!(
+        entry.get("project_path").is_none(),
+        "user scope records no path"
+    );
+    assert_eq!(entry["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(
+        entry["parts"],
+        json!({ "mcp": true, "hooks": true, "skills": true })
+    );
+    let skills = entry["skills"].as_array().unwrap();
+    assert_eq!(skills.len(), 4, "all four managed skills recorded");
+    for s in skills {
+        let hash = s["sha256"].as_str().unwrap();
+        assert_eq!(hash.len(), 64, "a full sha256 hex digest per skill");
+    }
+
+    install_cmd(&home, &bin_dir)
+        .args(["uninstall", "claude-code"])
+        .assert()
+        .success();
+    let receipt = read_json(&receipt_file(&home));
+    assert!(
+        receipt["installs"].as_array().unwrap().is_empty(),
+        "uninstall prunes the entry"
+    );
+}
+
+#[test]
+fn a_skip_run_after_a_full_install_keeps_the_recorded_knowledge() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let bin_dir = work.path().join("bin");
+    let log = work.path().join("claude.log");
+    write_shim(&bin_dir, "claude", &log);
+
+    install_cmd(&home, &bin_dir)
+        .args(["install", "claude-code"])
+        .assert()
+        .success();
+    install_cmd(&home, &bin_dir)
+        .args(["install", "claude-code", "--skip-skills", "--skip-mcp"])
+        .assert()
+        .success();
+
+    let receipt = read_json(&receipt_file(&home));
+    let entry = &receipt["installs"][0];
+    // Skip means "do not touch", not "undo": parts stay true and the skill
+    // records survive for the next reconcile.
+    assert_eq!(
+        entry["parts"],
+        json!({ "mcp": true, "hooks": true, "skills": true })
+    );
+    assert_eq!(entry["skills"].as_array().unwrap().len(), 4);
+}
+
+#[test]
+fn uninstall_removes_an_old_but_clean_skill_via_its_receipt_hash() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let bin_dir = work.path().join("bin");
+    let log = work.path().join("claude.log");
+    write_shim(&bin_dir, "claude", &log);
+
+    install_cmd(&home, &bin_dir)
+        .args(["install", "claude-code"])
+        .assert()
+        .success();
+
+    // Simulate a skill written by an older binary: the file and its receipt
+    // hash agree with each other but not with this binary's embedded copy.
+    let old_body = "routing skill as an older version shipped it";
+    std::fs::write(claude_skill(&home, "crystalline-routing"), old_body).unwrap();
+    let receipt_path = receipt_file(&home);
+    let mut receipt = read_json(&receipt_path);
+    for s in receipt["installs"][0]["skills"].as_array_mut().unwrap() {
+        if s["name"] == "crystalline-routing" {
+            s["sha256"] = json!(sha256_hex(old_body.as_bytes()));
+        }
+    }
+    std::fs::write(
+        &receipt_path,
+        serde_json::to_string_pretty(&receipt).unwrap(),
+    )
+    .unwrap();
+
+    install_cmd(&home, &bin_dir)
+        .args(["uninstall", "claude-code"])
+        .assert()
+        .success();
+    assert!(
+        !claude_skill(&home, "crystalline-routing").exists(),
+        "an old but untouched skill is recognized by its receipt hash and removed"
+    );
+}
+
+#[test]
+fn a_corrupt_receipt_never_blocks_install() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let bin_dir = work.path().join("bin");
+    let log = work.path().join("claude.log");
+    write_shim(&bin_dir, "claude", &log);
+
+    let receipt_path = receipt_file(&home);
+    std::fs::create_dir_all(receipt_path.parent().unwrap()).unwrap();
+    std::fs::write(&receipt_path, "{ not a receipt").unwrap();
+
+    install_cmd(&home, &bin_dir)
+        .args(["install", "claude-code"])
+        .assert()
+        .success();
+    // Regenerated fresh: valid again and carrying this install.
+    let receipt = read_json(&receipt_path);
+    assert_eq!(receipt["installs"][0]["harness"], "claude-code");
+}
