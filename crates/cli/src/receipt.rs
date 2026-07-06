@@ -81,7 +81,7 @@ pub(crate) struct Parts {
 }
 
 /// One installed skill's name and content fingerprint.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct RecordedSkill {
     pub(crate) name: String,
     pub(crate) sha256: String,
