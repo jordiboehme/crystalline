@@ -693,14 +693,27 @@ fn reconcile_skill_set(
 /// argument as a full replacement of the first, so a recorded name of
 /// `/etc/passwd` (or, on Windows, a drive-rooted path) would target that
 /// path outright, and a name of `../../elsewhere` climbs out of the skills
-/// folder through plain relative segments. A name is only usable once it is
-/// a single, plain path component: non-empty, neither `.` nor `..`, and
-/// free of both `/` and `\` (checked on every platform, since a receipt
-/// written by one platform's binary can end up read back on another).
+/// folder through plain relative segments. Windows adds one more escape the
+/// separator checks alone miss: a drive-relative name like `C:evil` carries
+/// a prefix but no root and no separator at all, yet `Path::join` documents
+/// that a path with a prefix replaces the base entirely, so `dir.join`
+/// resolves it against drive C's current directory instead of `dir`.
+/// A name is only usable once it is a single, plain path component:
+/// non-empty, neither `.` nor `..`, and free of `/`, `\` and `:` (checked
+/// on every platform, since a receipt written by one platform's binary can
+/// end up read back on another). Rejecting `:` closes every Windows prefix
+/// form - a drive prefix needs the colon, the UNC and verbatim forms all
+/// need `\` - and costs nothing legitimate, since a colon is invalid in
+/// Windows filenames anyway and no managed skill name carries one.
 /// Anything else must be skipped outright wherever it would otherwise reach
 /// the filesystem, never sanitized or truncated into something safe-looking.
 pub(crate) fn is_plain_skill_name(name: &str) -> bool {
-    !name.is_empty() && name != "." && name != ".." && !name.contains('/') && !name.contains('\\')
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains(':')
 }
 
 /// A fresh receipt record for a skill at its embedded content.
@@ -2026,7 +2039,11 @@ mod tests {
 
     #[test]
     fn is_plain_skill_name_rejects_every_hostile_shape() {
-        for hostile in ["/tmp/evil", "../escape", "a/b", "..", ""] {
+        // "C:evil" and "C:.." are the Windows drive-relative forms: no
+        // separator at all, but the drive prefix makes `Path::join` replace
+        // the base there. The classification is a pure string check, so it
+        // asserts the same on every platform.
+        for hostile in ["/tmp/evil", "../escape", "a/b", "..", "", "C:evil", "C:.."] {
             assert!(
                 !is_plain_skill_name(hostile),
                 "{hostile:?} must not be usable as a path component"
