@@ -1,9 +1,9 @@
 //! `crystalline`: the command-line entry point. Wires the crate stack
 //! (core, index, service) into subcommands.
 //!
-//! `verify` and `prompt` are static: they call straight into
-//! `crystalline-core` and touch no database, socket or network connection.
-//! Every other subcommand lands in a later milestone.
+//! `verify`, `prompt` and `hook` are static: none of them opens a database,
+//! a socket or a network connection, and none starts a Tokio runtime. Every
+//! other subcommand lands in a later milestone.
 
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -15,6 +15,7 @@ use crystalline_core::verify::{self, VerifyOptions};
 
 mod cmd;
 mod doctor;
+mod hook;
 
 /// Local-first knowledge management for humans and AI agents.
 #[derive(Parser, Debug)]
@@ -381,6 +382,32 @@ enum Command {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// Respond to a harness lifecycle hook event over stdin/stdout. Plumbing
+    /// for `crystalline install`'s generated hook wiring, not something a
+    /// person runs by hand - documented here so anyone who finds it in a
+    /// harness's settings file can identify what it is. Static like `verify`
+    /// and `prompt`: no database, service or network connection, and a call
+    /// completes in tens of milliseconds. Silent (exit 0, empty stdout) on
+    /// every call that is not the one earning a nudge, since a hook must
+    /// never be the reason a harness's turn breaks.
+    Hook {
+        #[command(subcommand)]
+        event: HookEvent,
+    },
+}
+
+/// Which harness lifecycle event a `hook` invocation answers. `Stop` is the
+/// only kind today; future events attach here without reshaping `hook`
+/// again.
+#[derive(Subcommand, Debug)]
+enum HookEvent {
+    /// Once per substantive session, on the first Stop call that earns it:
+    /// print a reminder to review the conversation for durable learnings and
+    /// propose capturing them. Every other call - a stale or malformed
+    /// payload, a hook-caused continuation, an unconfigured or read-only
+    /// install, a session already nudged or a session too short to be worth
+    /// interrupting - is silent.
+    Stop,
 }
 
 /// The kind of prompt to generate. `system` is the only kind today; future
@@ -783,6 +810,12 @@ fn main() -> anyhow::Result<()> {
             | Command::Context { .. }
             | Command::Recent { .. }),
         ) => on_runtime(run_data(cmd, cli.db, cli.json)),
+        Some(Command::Hook { event }) => match event {
+            HookEvent::Stop => {
+                hook::run_stop();
+                Ok(())
+            }
+        },
     }
 }
 

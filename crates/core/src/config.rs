@@ -415,6 +415,15 @@ pub fn load_yaml<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, ConfigE
 /// temporary file then renames it into place.
 pub fn save_yaml<T: Serialize>(path: &Path, value: &T) -> Result<(), ConfigError> {
     let yaml = serde_yaml_ng::to_string(value).map_err(|e| ConfigError::Yaml(e.to_string()))?;
+    save_bytes(path, yaml.as_bytes())
+}
+
+/// Atomically write raw bytes to a file: create the parent directory if it is
+/// missing, write a sibling temporary file, then rename it into place. This is
+/// the IO half of [`save_yaml`], extracted so a caller with an already-encoded
+/// payload (JSON, for example) gets the same atomicity and directory-creation
+/// guarantees without round-tripping through YAML.
+pub fn save_bytes(path: &Path, bytes: &[u8]) -> Result<(), ConfigError> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -424,7 +433,7 @@ pub fn save_yaml<T: Serialize>(path: &Path, value: &T) -> Result<(), ConfigError
         })?;
     }
     let tmp = temp_sibling(path);
-    std::fs::write(&tmp, yaml.as_bytes()).map_err(|source| ConfigError::Io {
+    std::fs::write(&tmp, bytes).map_err(|source| ConfigError::Io {
         path: tmp.display().to_string(),
         source,
     })?;
@@ -687,6 +696,18 @@ mod tests {
         let entry = back.domains.get("notes").unwrap();
         assert!(entry.is_virtual());
         assert_eq!(entry.file_path(), None);
+    }
+
+    #[test]
+    fn save_bytes_creates_parent_dirs_and_writes_the_exact_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("state.json");
+        save_bytes(&path, b"{\"v\":1}").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"{\"v\":1}");
+        // A second write overwrites in place rather than failing because the
+        // destination already exists.
+        save_bytes(&path, b"{\"v\":2}").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"{\"v\":2}");
     }
 
     #[test]
