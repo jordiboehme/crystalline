@@ -12,19 +12,21 @@
 //! run - it gets a placeholder routing line and a warning the caller can
 //! print to stderr.
 //!
-//! Determinism contract: `generate_prompt` and both renderers are pure
-//! functions of their inputs (the config file and the MANIFESTs on disk).
-//! No timestamps, process IDs, environment variables or other
+//! Determinism contract: `generate_prompt`, `generate_prompt_unscoped` and
+//! the three renderers (`render_text`, `render_json`, `render_instructions`)
+//! are pure functions of their inputs (the config file and the MANIFESTs on
+//! disk). No timestamps, process IDs, environment variables or other
 //! environment-dependent values ever enter the output, and no unordered
 //! iteration (a hash map, a hash set) drives ordering. Domain order comes
-//! from the config's own registered order, filtered through a sorted
-//! inclusion set and reordered preferred-first; `render_json` relies on
-//! `serde_json`'s stable field order. Identical config plus identical
-//! on-disk MANIFESTs must render byte-identical output every time, whether
-//! rendered twice in one process or by two separate invocations of the
-//! binary, so a harness can cache the rendered prompt across sessions.
-//! This contract binds every prompt kind added after `system`, not only
-//! the one implemented today.
+//! from the config's own registered order: `generate_prompt` filters it
+//! through a sorted inclusion set and reorders preferred-first, while
+//! `generate_prompt_unscoped` emits that registered order verbatim.
+//! `render_json` relies on `serde_json`'s stable field order. Identical
+//! config plus identical on-disk MANIFESTs must render byte-identical output
+//! every time, whether rendered twice in one process or by two separate
+//! invocations of the binary, so a harness can cache the rendered prompt
+//! across sessions. This contract binds every prompt kind added after
+//! `system`, not only the one implemented today.
 //!
 //! Latency contract: prompt commands run in session-start hooks for AI
 //! agents and must stay fast - the target is under 50ms wall-clock for 30
@@ -140,6 +142,52 @@ pub fn generate_prompt(
 
     PromptOutput {
         workspace: workspace.to_path_buf(),
+        domains,
+        warnings,
+        read_only: global.read_only(),
+    }
+}
+
+/// Build the routing prompt with no workspace context: every registered
+/// domain in config order, unfiltered. This is the shape the MCP
+/// `instructions` channel wants, where a server serves one index to every
+/// connecting agent and there is no workspace path to scope by. So
+/// `prompt.rules` path-glob filters never apply (there is nothing to match a
+/// glob against) and no domain is ever marked `preferred` (a repo-local
+/// `preferred_domains` reorder needs a workspace too); `workspace` is left
+/// empty and `read_only` is seeded from `service.read_only`.
+///
+/// Bullet sourcing is identical to [`generate_prompt`]: a file domain reads
+/// its `MANIFEST.md` from disk, a virtual domain takes the caller-supplied
+/// `virtual_bullets` keyed by domain name, and a missing or empty set gets the
+/// same placeholder line and warning. The determinism contract holds.
+pub fn generate_prompt_unscoped(
+    global: &GlobalConfig,
+    virtual_bullets: &BTreeMap<String, Vec<String>>,
+) -> PromptOutput {
+    let mut domains = Vec::with_capacity(global.domains.len());
+    let mut warnings = Vec::new();
+    for (name, entry) in &global.domains {
+        let (bullets, warning) = if entry.is_virtual() {
+            virtual_routing_bullets(name, virtual_bullets.get(name))
+        } else {
+            match &entry.path {
+                Some(path) => load_routing_bullets(name, path),
+                None => virtual_routing_bullets(name, virtual_bullets.get(name)),
+            }
+        };
+        if let Some(w) = warning {
+            warnings.push(w);
+        }
+        domains.push(PromptDomain {
+            name: name.clone(),
+            bullets,
+            preferred: false,
+        });
+    }
+
+    PromptOutput {
+        workspace: PathBuf::new(),
         domains,
         warnings,
         read_only: global.read_only(),
@@ -265,9 +313,37 @@ pub fn render_text(output: &PromptOutput) -> String {
     out.push_str(
         "You are being onboarded to the knowledge accumulated in this workspace. It is served by the crystalline MCP server; these instructions govern its tools (your harness may prefix tool names, for example mcp__crystalline__search_engrams). The domains below are registered and ready to use; route searches and reads through them instead of starting from zero.\n\n",
     );
+    render_routing_body(
+        output,
+        usize::MAX,
+        "(no domains are registered for this workspace)",
+        &mut out,
+    );
+    out
+}
 
+/// Render the shared body of an onboarding block: one routing line per domain
+/// (bullets joined with `; `, capped at `bullet_cap`), then the fixed Behavior
+/// rules naming the exact tools an agent reaches for. `empty_line` is the
+/// message emitted in place of the domain lines when no domain is registered,
+/// the one place the workspace-scoped `render_text` and the workspace-free
+/// `render_instructions` word things differently.
+///
+/// The Behavior block is identical across both renderers: it drops the
+/// write-tools line in read-only mode and always points at
+/// `list_domains include_routing=true` as the mid-session re-fetch, so neither
+/// caller has to restate either rule. A `bullet_cap` of [`usize::MAX`] shows
+/// every bullet (the CLI `prompt system` path), a small cap trims the routing
+/// lines for the token-lean MCP `instructions` channel.
+fn render_routing_body(
+    output: &PromptOutput,
+    bullet_cap: usize,
+    empty_line: &str,
+    out: &mut String,
+) {
     if output.domains.is_empty() {
-        out.push_str("(no domains are registered for this workspace)\n\n");
+        out.push_str(empty_line);
+        out.push_str("\n\n");
     } else {
         for d in &output.domains {
             let label = if d.preferred {
@@ -275,7 +351,14 @@ pub fn render_text(output: &PromptOutput) -> String {
             } else {
                 d.name.clone()
             };
-            let _ = writeln!(out, "- {label}: {}", d.bullets.join("; "));
+            let bullets = d
+                .bullets
+                .iter()
+                .take(bullet_cap)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("; ");
+            let _ = writeln!(out, "- {label}: {bullets}");
         }
         out.push('\n');
     }
@@ -304,6 +387,34 @@ pub fn render_text(output: &PromptOutput) -> String {
     out.push_str(
         "- Read a domain's MANIFEST via read_engram only when its routing line above is not enough; list_domains with include_routing=true re-fetches this index mid-session.\n",
     );
+}
+
+/// Render the onboarding block for the MCP `instructions` channel: the same
+/// "CRYSTALLINE KNOWLEDGE ROUTING" header and shared Behavior body as
+/// [`render_text`], but with a workspace-free intro and each domain's routing
+/// line capped at three bullets to stay token-lean on every connect.
+///
+/// This is the block a server hands the model at initialize, so the intro
+/// frames the tools as this server's own (the harness may prefix their names)
+/// rather than assuming a workspace context: there is no workspace over MCP, so
+/// `prompt.rules` and `preferred_domains` never shaped this output. The
+/// read-write intro tells the agent to read, write and refine engrams and to
+/// search before writing; the read-only intro states the knowledge is curated
+/// and drops the write sentence. The shared body then handles read-only tool
+/// dropping and the `list_domains include_routing=true` re-fetch.
+pub fn render_instructions(output: &PromptOutput) -> String {
+    let mut out = String::new();
+    out.push_str("CRYSTALLINE KNOWLEDGE ROUTING\n\n");
+    if output.read_only {
+        out.push_str(
+            "Crystalline gives you durable memory across sessions: the domains below hold curated knowledge as engrams you search and read while you work. These instructions govern this server's tools (your harness may prefix their names, for example mcp__crystalline__search_engrams). Route searches and reads through these domains instead of starting from zero.\n\n",
+        );
+    } else {
+        out.push_str(
+            "Crystalline gives you durable memory across sessions: the domains below hold knowledge as engrams you read, write and refine while you work. These instructions govern this server's tools (your harness may prefix their names, for example mcp__crystalline__search_engrams). Route searches and reads through these domains instead of starting from zero and search before you write.\n\n",
+        );
+    }
+    render_routing_body(output, 3, "(no domains are registered yet)", &mut out);
     out
 }
 
@@ -507,5 +618,101 @@ mod tests {
         let first_json = render_json(&read_only_output(&tmp, &global));
         let second_json = render_json(&read_only_output(&tmp, &global));
         assert_eq!(first_json.as_bytes(), second_json.as_bytes());
+    }
+
+    // --- unscoped prompt + instructions renderer -----------------------------
+
+    /// A config whose `prompt.rules` would exclude `beta` for any workspace,
+    /// proving the unscoped generator ignores those filters entirely.
+    fn fixture_with_prompt_rules() -> (tempfile::TempDir, GlobalConfig) {
+        let (tmp, mut global) = fixture();
+        let mut rules = indexmap::IndexMap::new();
+        rules.insert(
+            "**".to_string(),
+            crate::config::PromptRule {
+                include: Some(vec!["alpha".to_string()]),
+                exclude: None,
+            },
+        );
+        global.prompt = Some(crate::config::PromptConfig { rules });
+        (tmp, global)
+    }
+
+    #[test]
+    fn unscoped_ignores_prompt_rules_and_marks_nothing_preferred() {
+        let (_tmp, global) = fixture_with_prompt_rules();
+        let output = generate_prompt_unscoped(&global, &BTreeMap::new());
+        // Every registered domain is present in config order, `beta` included
+        // despite the include-only rule that would drop it in the scoped path.
+        let names: Vec<&str> = output.domains.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "beta"]);
+        // No workspace means no preferred reorder: nothing is ever preferred.
+        assert!(output.domains.iter().all(|d| !d.preferred));
+    }
+
+    #[test]
+    fn render_instructions_caps_bullets_at_three() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("many");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("MANIFEST.md"),
+            manifest_source(&["one", "two", "three", "four", "five"]),
+        )
+        .unwrap();
+        let mut domains = indexmap::IndexMap::new();
+        domains.insert("many".to_string(), DomainEntry::file(root));
+        let global = GlobalConfig {
+            domains,
+            ..GlobalConfig::default()
+        };
+
+        let output = generate_prompt_unscoped(&global, &BTreeMap::new());
+        // The domain really has five bullets; the CLI text shows them all.
+        assert_eq!(output.domains[0].bullets.len(), 5);
+        let text = render_instructions(&output);
+        let line = text
+            .lines()
+            .find(|l| l.starts_with("- many:"))
+            .expect("a routing line for the many domain");
+        assert!(line.contains("one; two; three"), "first three kept: {line}");
+        assert!(
+            !line.contains("four") && !line.contains("five"),
+            "bullets past three dropped: {line}"
+        );
+    }
+
+    #[test]
+    fn render_instructions_read_only_names_no_mutating_tool() {
+        let (_tmp, global) = fixture();
+        let mut output = generate_prompt_unscoped(&global, &BTreeMap::new());
+        output.read_only = true;
+        let text = render_instructions(&output);
+        assert!(
+            text.contains("read-only and curated externally"),
+            "read-only behavior line expected:\n{text}"
+        );
+        for tool in [
+            "write_engram",
+            "edit_engram",
+            "move_engram",
+            "delete_engram",
+        ] {
+            assert!(
+                !text.contains(tool),
+                "{tool} must not appear read-only:\n{text}"
+            );
+        }
+        // The read tools an agent still needs are named.
+        assert!(text.contains("search_engrams"));
+        assert!(text.contains("build_context"));
+    }
+
+    #[test]
+    fn render_instructions_is_byte_identical_across_repeated_runs() {
+        let (_tmp, global) = fixture();
+        let first = render_instructions(&generate_prompt_unscoped(&global, &BTreeMap::new()));
+        let second = render_instructions(&generate_prompt_unscoped(&global, &BTreeMap::new()));
+        assert_eq!(first.as_bytes(), second.as_bytes());
     }
 }

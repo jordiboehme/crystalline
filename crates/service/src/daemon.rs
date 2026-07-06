@@ -210,6 +210,11 @@ pub async fn run_serve(
             .with_env_overlay(loaded.overlay.clone()),
     );
 
+    // Prime the routing cache once as the HTTP baseline: every HTTP session
+    // shares this engine and reads its cache at initialize, and each socket
+    // connection refreshes it again in `handle_conn` before serving.
+    engine.refresh_routing_cache().await;
+
     // Bind the socket and publish the lock record: this is the readiness point,
     // reached before the provider build and the initial sync so clients attach
     // fast.
@@ -394,6 +399,10 @@ async fn handle_conn(mut stream: IpcStream, shared: Arc<Shared>) {
     match mode.as_str() {
         "mcp" => {
             let id = shared.begin_session("mcp");
+            // Refresh the routing cache before this connection initializes so its
+            // instructions reflect the latest virtual MANIFESTs, including edits
+            // made by other instances sharing the database.
+            shared.engine.refresh_routing_cache().await;
             let server = McpServer::new(shared.engine.clone());
             match rmcp::serve_server(server, stream).await {
                 Ok(running) => {

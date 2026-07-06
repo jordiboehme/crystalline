@@ -348,6 +348,14 @@ pub struct Engine {
     // standalone engine alike; it simply stays at its empty default when no
     // poller ever ticks.
     origin_poller: poller::OriginPollerState,
+    // The routing bullets of every virtual domain, keyed by domain name, cached
+    // for the SYNC `routing_text` path. A virtual domain's bullets live in the
+    // database (its MANIFEST engram), so they cannot be read from `routing_text`
+    // without an await; this cache is recomputed off the async path by
+    // `refresh_routing_cache` at each MCP connection's initialize and after every
+    // virtual-source write, and read here under the lock. Empty at construction
+    // and for an engine that never serves MCP.
+    routing_virtual: std::sync::RwLock<BTreeMap<String, Vec<String>>>,
 }
 
 impl Engine {
@@ -392,6 +400,7 @@ impl Engine {
             pending_connect: std::sync::Mutex::new(None),
             token_store_dir_override: None,
             origin_poller: poller::OriginPollerState::default(),
+            routing_virtual: std::sync::RwLock::new(BTreeMap::new()),
         }
     }
 
@@ -1025,6 +1034,13 @@ impl Engine {
             }
         }
 
+        // A virtual write may have landed or replaced this domain's MANIFEST
+        // engram, the source of its routing bullets, so refresh the cache the
+        // sync `routing_text` reads. The store locks above are all released.
+        if matches!(source, ContentSource::Virtual) {
+            self.refresh_routing_cache().await;
+        }
+
         Ok(json!({
             "domain": p.domain,
             "permalink": permalink,
@@ -1127,6 +1143,12 @@ impl Engine {
                 )
                 .await?;
             }
+        }
+
+        // A virtual edit may have rewritten this domain's MANIFEST engram, so
+        // refresh the routing cache. The store locks above are all released.
+        if matches!(source, ContentSource::Virtual) {
+            self.refresh_routing_cache().await;
         }
 
         Ok(json!({
@@ -1340,6 +1362,15 @@ impl Engine {
             }
         }
 
+        // When either end of the move is a virtual domain, a MANIFEST engram
+        // may have moved into or out of it, so refresh the routing cache. Every
+        // store lock taken above is released by here.
+        if matches!(src_source, ContentSource::Virtual)
+            || matches!(dest_source, ContentSource::Virtual)
+        {
+            self.refresh_routing_cache().await;
+        }
+
         Ok(json!({
             "from": { "domain": p.domain, "permalink": src.permalink, "path": src.path },
             "to": { "domain": dest_domain, "path": dest_rel },
@@ -1392,6 +1423,14 @@ impl Engine {
         }
         let store = self.store.lock().await;
         store.delete_engram(desc.domain_id, &desc.path).await?;
+        drop(store);
+
+        // Deleting a virtual domain's MANIFEST engram empties its routing
+        // bullets, so refresh the cache once the store lock is released.
+        if matches!(source, ContentSource::Virtual) {
+            self.refresh_routing_cache().await;
+        }
+
         Ok(json!({
             "domain": desc.domain,
             "permalink": desc.permalink,
@@ -1660,9 +1699,10 @@ impl Engine {
     }
 
     /// Routing bullets for every virtual domain, keyed by domain name. Supplied
-    /// to `crystalline_core::generate_prompt` (which never touches a database)
-    /// and served over the `routing_bullets` ctl request so `prompt system` stays
-    /// inside its latency budget for virtual domains too.
+    /// to `crystalline_core::generate_prompt` (which never touches a database),
+    /// served over the `routing_bullets` ctl request so `prompt system` stays
+    /// inside its latency budget for virtual domains too and snapshotted by
+    /// [`Engine::refresh_routing_cache`] for the MCP server instructions.
     pub async fn virtual_routing_bullets(&self) -> BTreeMap<String, Vec<String>> {
         let mut out = BTreeMap::new();
         let domains = self.config.read().unwrap().domains.clone();
@@ -1672,6 +1712,75 @@ impl Engine {
             }
         }
         out
+    }
+
+    // --- routing instructions ------------------------------------------------
+
+    /// Recompute the cached virtual-domain routing bullets from the database.
+    /// The async companion to [`Engine::routing_text`]: a virtual domain's
+    /// bullets live in its MANIFEST engram in the store, so they need an await
+    /// to read, but `routing_text` is sync and must not block. The daemon and
+    /// the embedded stdio stack call this off the async path (at each MCP
+    /// connection's initialize, and after every write that touches a virtual
+    /// source) so the sync render only ever reads the cache under the lock.
+    pub async fn refresh_routing_cache(&self) {
+        let bullets = self.virtual_routing_bullets().await;
+        *self.routing_virtual.write().unwrap() = bullets;
+    }
+
+    /// The routing instructions a fresh MCP connection is handed at initialize:
+    /// the "CRYSTALLINE KNOWLEDGE ROUTING" block over every registered domain.
+    /// Synchronous, because rmcp's `get_info` is sync and runs once per
+    /// connection; it never blocks on async work, so the virtual bullets come
+    /// from the [`Engine::routing_virtual`] cache alone (refreshed off the async
+    /// path by [`Engine::refresh_routing_cache`]) and the file bullets are read
+    /// straight from each domain's `MANIFEST.md` on disk.
+    ///
+    /// There is no workspace over MCP: a server serves one index to every
+    /// connecting agent, so `prompt.rules` path-glob filters and repo-local
+    /// `preferred_domains` never apply here (both need a workspace path). The
+    /// effective config is composed live: with a `--config` override this
+    /// re-reads that file and re-applies the environment overlay (mirroring
+    /// [`Engine::refresh_domain`]) so a domain registered after startup shows up
+    /// on the next connection; without one (tests and standalone) it takes the
+    /// in-memory config plus any domain discovered since, and never touches the
+    /// default global config path. Staleness is bounded to one connection: the
+    /// block is an initialize-time snapshot, and the virtual bullets are only as
+    /// fresh as the last cache refresh.
+    pub fn routing_text(&self) -> String {
+        // (1) The effective config, composed the same way a fresh load would
+        // see it. With a config path this is a fresh file read plus the overlay;
+        // a read error falls back to the in-memory effective config.
+        let global = match &self.config_path {
+            Some(path) => match overlay::load_file(path) {
+                Ok(file) => self.overlay.apply(&file),
+                Err(_) => self.config(),
+            },
+            None => {
+                // No config path to re-read (tests, standalone): start from the
+                // in-memory config and append any domain discovered since
+                // startup that it does not already carry, sorted for
+                // determinism. Never touch the default global config path.
+                let mut global = self.config();
+                let discovered = self.discovered_domains.read().unwrap().clone();
+                let mut extra: Vec<(String, DomainEntry)> = discovered
+                    .into_iter()
+                    .filter(|(name, _)| !global.domains.contains_key(name))
+                    .collect();
+                extra.sort_by(|a, b| a.0.cmp(&b.0));
+                for (name, entry) in extra {
+                    global.domains.insert(name, entry);
+                }
+                global
+            }
+        };
+
+        // (2) Generate over every registered domain from the cached virtual map,
+        // (3) force the engine's effective read-only mode, then (4) render.
+        let virtual_bullets = self.routing_virtual.read().unwrap().clone();
+        let mut output = crystalline_core::generate_prompt_unscoped(&global, &virtual_bullets);
+        output.read_only = self.read_only();
+        crystalline_core::render_instructions(&output)
     }
 
     // --- browse --------------------------------------------------------------
@@ -1874,6 +1983,13 @@ impl Engine {
             true,
         )
         .await?;
+        drop(store);
+
+        // The MANIFEST engram just landed; its Scope and When to Use bullets are
+        // exactly what the routing block reads for this virtual domain, so
+        // refresh the cache the sync `routing_text` serves.
+        self.refresh_routing_cache().await;
+
         Ok(json!({ "domain": domain, "manifest": "MANIFEST.md", "created": true }))
     }
 

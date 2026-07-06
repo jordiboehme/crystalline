@@ -8,6 +8,14 @@
 //! `write_engram` and `edit_engram` descriptions as guidance; they are never
 //! enforced. Every mutating tool requires an explicit domain.
 //!
+//! The server handshake (`get_info`) hands each connecting agent the live
+//! routing block as its `instructions`, rendered from the engine by
+//! [`crate::engine::Engine::routing_text`]: the same CRYSTALLINE KNOWLEDGE
+//! ROUTING onboarding the CLI `prompt system` emits, minus any workspace
+//! scoping, so an agent is routed the moment it connects with no skill or hook
+//! required. It re-fetches mid-session through `list_domains` with
+//! `include_routing=true`, the same index the instructions carry.
+//!
 //! In read-only mode (the engine's `read_only` flag) the four content-mutating
 //! tools are filtered out of `list_tools` and `get_tool`, so the surface is the
 //! eight read tools; the routes stay registered so a client that calls a hidden
@@ -511,15 +519,17 @@ fn applied_failure(applied: &[String], failed_key: &str, e: EngineError) -> Erro
 
 #[tool_handler]
 impl ServerHandler for McpServer {
+    /// The server handshake: hand the connecting agent the live routing block
+    /// as its `instructions`. rmcp calls `get_info` once per connection at
+    /// initialize, so [`Engine::routing_text`] renders the currently registered
+    /// domains (a domain added since startup shows up on the next connection)
+    /// and follows the engine's read-only mode, read-write and read-only intros
+    /// alike. The daemon and the embedded stdio stack refresh the
+    /// virtual-domain routing cache just before this runs, so the sync render
+    /// reads a current cache and never blocks on the store.
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::default();
-        info.instructions = Some(if self.engine.read_only() {
-            // Read-only surface: no capture language. Knowledge is curated
-            // externally; the agent searches and reads.
-            "Crystalline gives you a durable memory across sessions. Domains hold curated knowledge; engrams are the units you read to recall what is known. This deployment is read-only: its knowledge is curated externally, so search and read to learn and do not attempt to write.".to_string()
-        } else {
-            "Crystalline gives you a durable memory across sessions. Domains hold curated knowledge; engrams are the units you read, write and refine as you work. Search before you write, capture decisions and learnings as engrams, and always name the domain when writing.".to_string()
-        });
+        info.instructions = Some(self.engine.routing_text());
         info.capabilities = ServerCapabilities::builder()
             .enable_tools()
             .enable_tool_list_changed()
