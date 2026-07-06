@@ -923,16 +923,19 @@ fn opt_vec(v: Vec<String>) -> Option<Vec<String>> {
     if v.is_empty() { None } else { Some(v) }
 }
 
-/// `status`: report from the daemon over ctl when one is running, else open the
-/// index directly.
+/// `status`: report from the daemon over ctl when one is running and no explicit
+/// `--config`/`--db` override was given, else open the index directly. An
+/// override names an exact config and index the running daemon may not serve, so
+/// it always takes the direct path (see [`crystalline_service::use_daemon`]).
 async fn status_dispatch(
     config: Option<PathBuf>,
     db: Option<PathBuf>,
     json: bool,
 ) -> anyhow::Result<()> {
     use serde_json::json;
-    if let Some(data) =
-        crystalline_service::ctl_if_running(json!({ "v": 1, "cmd": "status" })).await?
+    if crystalline_service::use_daemon(db.as_deref(), config.as_deref())
+        && let Some(data) =
+            crystalline_service::ctl_if_running(json!({ "v": 1, "cmd": "status" })).await?
     {
         print_value(&data, json);
         return Ok(());
@@ -940,7 +943,10 @@ async fn status_dispatch(
     cmd::status(config.as_deref(), db.as_deref(), json).await
 }
 
-/// `sync`: route to the daemon when one owns the index, else sync directly.
+/// `sync`: route to the daemon when one owns the index and no explicit
+/// `--config`/`--db` override was given, else sync directly. An override names
+/// an exact config and index the running daemon may not serve, so it always
+/// takes the direct path (see [`crystalline_service::use_daemon`]).
 /// `take_over` forces the daemon's host-lock claim for a shared-database host
 /// migration; it is meaningless without a daemon (standalone sync holds no host
 /// lock), so the direct path ignores it.
@@ -953,10 +959,11 @@ async fn sync_dispatch(
     json: bool,
 ) -> anyhow::Result<()> {
     use serde_json::json;
-    if let Some(data) = crystalline_service::ctl_if_running(
-        json!({ "v": 1, "cmd": "sync", "domain": domain, "embed": embed, "take_over": take_over }),
-    )
-    .await?
+    if crystalline_service::use_daemon(db.as_deref(), config.as_deref())
+        && let Some(data) = crystalline_service::ctl_if_running(
+            json!({ "v": 1, "cmd": "sync", "domain": domain, "embed": embed, "take_over": take_over }),
+        )
+        .await?
     {
         print_value(&data, json);
         return Ok(());
@@ -971,7 +978,10 @@ async fn sync_dispatch(
     .await
 }
 
-/// `reindex`: route to the daemon when one owns the index, else reindex directly.
+/// `reindex`: route to the daemon when one owns the index and no explicit
+/// `--config`/`--db` override was given, else reindex directly. An override
+/// names an exact config and index the running daemon may not serve, so it
+/// always takes the direct path (see [`crystalline_service::use_daemon`]).
 async fn reindex_dispatch(
     full: bool,
     embed: bool,
@@ -980,10 +990,11 @@ async fn reindex_dispatch(
     json: bool,
 ) -> anyhow::Result<()> {
     use serde_json::json;
-    if let Some(data) = crystalline_service::ctl_if_running(
-        json!({ "v": 1, "cmd": "reindex", "full": full, "embed": embed }),
-    )
-    .await?
+    if crystalline_service::use_daemon(db.as_deref(), config.as_deref())
+        && let Some(data) = crystalline_service::ctl_if_running(
+            json!({ "v": 1, "cmd": "reindex", "full": full, "embed": embed }),
+        )
+        .await?
     {
         print_value(&data, json);
         return Ok(());
@@ -1691,10 +1702,19 @@ async fn mcp_dispatch(
                     "crystalline mcp: registered domain '{name}' at {}",
                     path.display()
                 );
-                if let Err(e) = crystalline_service::ctl_if_running(
-                    json!({ "v": 1, "cmd": "sync", "domain": name, "embed": false }),
-                )
-                .await
+                // Nudge a running daemon to sync (and start watching) the new
+                // root only when the registration landed in the daemon's own
+                // config; an explicit --config wrote a different file the daemon
+                // does not serve, so it has nothing to sync. The --db override
+                // is deliberately not gated on here: `run_mcp` below attaches to
+                // a running daemon regardless of --db, so the notify must still
+                // fire whenever the domain reached the daemon's config, keeping
+                // this session and the daemon in step.
+                if config.is_none()
+                    && let Err(e) = crystalline_service::ctl_if_running(
+                        json!({ "v": 1, "cmd": "sync", "domain": name, "embed": false }),
+                    )
+                    .await
                 {
                     eprintln!(
                         "crystalline mcp: warning: could not sync newly registered domain '{name}' with the running daemon: {e}"
@@ -1775,23 +1795,28 @@ async fn domain_add_dispatch(
         return Ok(());
     }
 
+    // Index over the daemon only when no explicit --config/--db override was
+    // given: an override names an exact config and index, so the sync must land
+    // there via the direct path rather than in whatever the running daemon
+    // serves (see [`crystalline_service::use_daemon`]).
     use serde_json::json as j;
-    let report: crystalline_index::SyncReport = if let Some(data) =
-        crystalline_service::ctl_if_running(
-            j!({ "v": 1, "cmd": "sync", "domain": name, "embed": false }),
-        )
-        .await?
-    {
-        let first = data
-            .get("reports")
-            .and_then(|r| r.get(0))
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
-        serde_json::from_value(first)
-            .map_err(|e| anyhow::anyhow!("could not parse the daemon's sync report: {e}"))?
-    } else {
-        cmd::sync_domain_direct(&name, &abs, config.as_deref(), db.as_deref()).await?
-    };
+    let report: crystalline_index::SyncReport =
+        if crystalline_service::use_daemon(db.as_deref(), config.as_deref())
+            && let Some(data) = crystalline_service::ctl_if_running(
+                j!({ "v": 1, "cmd": "sync", "domain": name, "embed": false }),
+            )
+            .await?
+        {
+            let first = data
+                .get("reports")
+                .and_then(|r| r.get(0))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            serde_json::from_value(first)
+                .map_err(|e| anyhow::anyhow!("could not parse the daemon's sync report: {e}"))?
+        } else {
+            cmd::sync_domain_direct(&name, &abs, config.as_deref(), db.as_deref()).await?
+        };
 
     cmd::print_domain_add(&name, &abs, &report, json);
     Ok(())
@@ -1847,7 +1872,10 @@ async fn domain_add_origin_dispatch(
 
 /// `domain remove`: drop it from the config, then best-effort tell a running
 /// daemon to stop watching its path. Never fails on the ctl round trip; the
-/// config edit already succeeded by the time it runs.
+/// config edit already succeeded by the time it runs. The notify fires only
+/// when the removal happened in the daemon's own config: an explicit --config
+/// edited a different file the daemon does not serve, so its watch set is
+/// unaffected and there is nothing to forget.
 async fn domain_remove_dispatch(
     name: String,
     config: Option<PathBuf>,
@@ -1855,9 +1883,12 @@ async fn domain_remove_dispatch(
 ) -> anyhow::Result<()> {
     cmd::domain_remove(&name, config.as_deref(), json)?;
     use serde_json::json as j;
-    let _ =
-        crystalline_service::ctl_if_running(j!({ "v": 1, "cmd": "forget_domain", "domain": name }))
-            .await;
+    if config.is_none() {
+        let _ = crystalline_service::ctl_if_running(
+            j!({ "v": 1, "cmd": "forget_domain", "domain": name }),
+        )
+        .await;
+    }
     Ok(())
 }
 
@@ -1923,12 +1954,19 @@ fn run_prompt(
     // the daemon (warm) or a direct store read. The all-file common case never
     // opens a runtime, so it stays as fast and deterministic as before.
     let virtual_bullets = if global.domains.values().any(|e| e.is_virtual()) {
-        // Owned copies: the future moves onto the runtime worker thread.
+        // Owned copies: the future moves onto the runtime worker thread. The
+        // raw --config override rides along so it bypasses the daemon just like
+        // every other verb, even though `global` was already resolved from it.
         let global_bullets = global.clone();
         let db_bullets = db.clone();
+        let config_bullets = config_path.clone();
         on_runtime_value(async move {
-            crystalline_service::virtual_routing_bullets(&global_bullets, db_bullets.as_deref())
-                .await
+            crystalline_service::virtual_routing_bullets(
+                &global_bullets,
+                db_bullets.as_deref(),
+                config_bullets.as_deref(),
+            )
+            .await
         })?
     } else {
         std::collections::BTreeMap::new()

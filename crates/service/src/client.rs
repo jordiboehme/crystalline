@@ -18,6 +18,20 @@ use crate::mcp::McpServer;
 use crate::overlay;
 use crate::params::*;
 
+/// Whether a CLI verb may route to a running daemon instead of opening the
+/// index (or config) directly. An explicit `db` or `config_path` override means
+/// "operate on exactly this file/index"; a running daemon serves ITS OWN default
+/// config and index, which may be entirely different ones, so with either
+/// override the answer, or worse the write, would land in the wrong place. Any
+/// override therefore bypasses the daemon and takes the direct in-process path;
+/// only when BOTH are absent may the socket-first path run, which is the plain
+/// `crystalline <verb>` invocation the daemon-first design is meant for. A verb
+/// that takes only one of the two passes `None` for the other and so gates on
+/// the override it actually has.
+pub fn use_daemon(db: Option<&Path>, config_path: Option<&Path>) -> bool {
+    db.is_none() && config_path.is_none()
+}
+
 /// The `crystalline mcp` stdio entry: attach to (or spawn) a daemon and pump
 /// bytes, or run the full stack in-process when embedded or when no daemon can
 /// be started.
@@ -118,7 +132,9 @@ pub async fn run_tool(
     db: Option<&Path>,
     config_path: Option<&Path>,
 ) -> anyhow::Result<Value> {
-    if let Some(conn) = try_attach().await {
+    if use_daemon(db, config_path)
+        && let Some(conn) = try_attach().await
+    {
         let stream = conn.into_mcp().await?;
         return call_tool_over_stream(stream, tool, args).await;
     }
@@ -138,10 +154,11 @@ pub async fn scaffold_virtual_manifest(
     config_path: Option<&Path>,
 ) -> anyhow::Result<Value> {
     use serde_json::json;
-    if let Some(data) = ctl_if_running(json!({
-        "v": 1, "cmd": "scaffold_manifest", "domain": domain, "markdown": markdown,
-    }))
-    .await?
+    if use_daemon(db, config_path)
+        && let Some(data) = ctl_if_running(json!({
+            "v": 1, "cmd": "scaffold_manifest", "domain": domain, "markdown": markdown,
+        }))
+        .await?
     {
         return Ok(data);
     }
@@ -162,11 +179,12 @@ pub async fn domain_import(
     config_path: Option<&Path>,
 ) -> anyhow::Result<Value> {
     use serde_json::json;
-    if let Some(data) = ctl_if_running(json!({
-        "v": 1, "cmd": "domain_import", "domain": domain,
-        "path": src.display().to_string(), "overwrite": overwrite, "dry_run": dry_run,
-    }))
-    .await?
+    if use_daemon(db, config_path)
+        && let Some(data) = ctl_if_running(json!({
+            "v": 1, "cmd": "domain_import", "domain": domain,
+            "path": src.display().to_string(), "overwrite": overwrite, "dry_run": dry_run,
+        }))
+        .await?
     {
         return Ok(data);
     }
@@ -189,11 +207,12 @@ pub async fn domain_export(
     config_path: Option<&Path>,
 ) -> anyhow::Result<Value> {
     use serde_json::json;
-    if let Some(data) = ctl_if_running(json!({
-        "v": 1, "cmd": "domain_export", "domain": domain,
-        "path": dest.display().to_string(), "force": force, "dry_run": dry_run,
-    }))
-    .await?
+    if use_daemon(db, config_path)
+        && let Some(data) = ctl_if_running(json!({
+            "v": 1, "cmd": "domain_export", "domain": domain,
+            "path": dest.display().to_string(), "force": force, "dry_run": dry_run,
+        }))
+        .await?
     {
         return Ok(data);
     }
@@ -220,11 +239,12 @@ pub async fn origin_add(
     config_path: Option<&Path>,
 ) -> anyhow::Result<Value> {
     use serde_json::json;
-    if let Some(data) = ctl_if_running(json!({
-        "v": 1, "cmd": "origin_add", "repo": repo, "domain": domain,
-        "path": path, "branch": branch, "folder": folder,
-    }))
-    .await?
+    if use_daemon(db, config_path)
+        && let Some(data) = ctl_if_running(json!({
+            "v": 1, "cmd": "origin_add", "repo": repo, "domain": domain,
+            "path": path, "branch": branch, "folder": folder,
+        }))
+        .await?
     {
         return Ok(data);
     }
@@ -244,8 +264,9 @@ pub async fn origin_update(
     config_path: Option<&Path>,
 ) -> anyhow::Result<Value> {
     use serde_json::json;
-    if let Some(data) =
-        ctl_if_running(json!({ "v": 1, "cmd": "origin_update", "domain": domain })).await?
+    if use_daemon(db, config_path)
+        && let Some(data) =
+            ctl_if_running(json!({ "v": 1, "cmd": "origin_update", "domain": domain })).await?
     {
         return Ok(data);
     }
@@ -264,8 +285,9 @@ pub async fn origin_status(
     config_path: Option<&Path>,
 ) -> anyhow::Result<Value> {
     use serde_json::json;
-    if let Some(data) =
-        ctl_if_running(json!({ "v": 1, "cmd": "origin_status", "domain": domain })).await?
+    if use_daemon(db, config_path)
+        && let Some(data) =
+            ctl_if_running(json!({ "v": 1, "cmd": "origin_status", "domain": domain })).await?
     {
         return Ok(data);
     }
@@ -287,11 +309,12 @@ pub async fn origin_share(
     config_path: Option<&Path>,
 ) -> anyhow::Result<Value> {
     use serde_json::json;
-    if let Some(data) = ctl_if_running(json!({
-        "v": 1, "cmd": "origin_share", "domain": domain,
-        "title": title, "description": description,
-    }))
-    .await?
+    if use_daemon(db, config_path)
+        && let Some(data) = ctl_if_running(json!({
+            "v": 1, "cmd": "origin_share", "domain": domain,
+            "title": title, "description": description,
+        }))
+        .await?
     {
         return Ok(data);
     }
@@ -311,10 +334,11 @@ pub async fn origin_discard(
     config_path: Option<&Path>,
 ) -> anyhow::Result<Value> {
     use serde_json::json;
-    if let Some(data) = ctl_if_running(json!({
-        "v": 1, "cmd": "origin_discard", "domain": domain, "proposal": proposal,
-    }))
-    .await?
+    if use_daemon(db, config_path)
+        && let Some(data) = ctl_if_running(json!({
+            "v": 1, "cmd": "origin_discard", "domain": domain, "proposal": proposal,
+        }))
+        .await?
     {
         return Ok(data);
     }
@@ -341,11 +365,12 @@ pub async fn origin_resolve(
     use base64::engine::general_purpose::STANDARD as BASE64;
     use serde_json::json;
     let content_b64 = content.map(|c| BASE64.encode(c));
-    if let Some(data) = ctl_if_running(json!({
-        "v": 1, "cmd": "origin_resolve", "domain": domain, "path": path,
-        "keep": keep, "content_b64": content_b64,
-    }))
-    .await?
+    if use_daemon(db, config_path)
+        && let Some(data) = ctl_if_running(json!({
+            "v": 1, "cmd": "origin_resolve", "domain": domain, "path": path,
+            "keep": keep, "content_b64": content_b64,
+        }))
+        .await?
     {
         return Ok(data);
     }
@@ -356,11 +381,11 @@ pub async fn origin_resolve(
 }
 
 /// Show, set or reset an agent-adjustable setting from the [`crate::settings`]
-/// registry: over the daemon when one is running, else against the config
-/// file directly (no index store is opened either way, unlike every data
-/// command above). `action` is `show`, `set` or `unset`; `key` and `value`
-/// are required for `set`, `key` alone for `unset`, and both are ignored for
-/// `show`.
+/// registry: over the daemon when one is running and no explicit config file
+/// was named, else against the config file directly (no index store is opened
+/// either way, unlike every data command above). `action` is `show`, `set` or
+/// `unset`; `key` and `value` are required for `set`, `key` alone for
+/// `unset`, and both are ignored for `show`.
 pub async fn configure(
     action: &str,
     key: Option<&str>,
@@ -368,10 +393,15 @@ pub async fn configure(
     config_path: Option<&Path>,
 ) -> anyhow::Result<Value> {
     use serde_json::json;
-    if let Some(data) = ctl_if_running(json!({
-        "v": 1, "cmd": "configure", "action": action, "key": key, "value": value,
-    }))
-    .await?
+    // An explicit --config override names the exact file to operate on. A
+    // running daemon answers for ITS config file, which may be a different
+    // one entirely, so the override always takes the direct path and the
+    // daemon is only consulted about the default config it actually serves.
+    if config_path.is_none()
+        && let Some(data) = ctl_if_running(json!({
+            "v": 1, "cmd": "configure", "action": action, "key": key, "value": value,
+        }))
+        .await?
     {
         return Ok(data);
     }
@@ -444,18 +474,24 @@ fn save_file(path: &Path, config: &crystalline_core::config::GlobalConfig) -> an
 }
 
 /// Resolve virtual-domain routing bullets for `prompt system`: over the daemon
-/// when one is running (its warm state), else against a directly opened store.
-/// Returns an empty map when the config has no virtual domains, so the common
-/// all-file case never opens a store or a socket.
+/// when one is running (its warm state) and no explicit `--config`/`--db`
+/// override was given, else against a directly opened store. Returns an empty
+/// map when the config has no virtual domains, so the common all-file case never
+/// opens a store or a socket. `config_path` is the raw `--config` override the
+/// caller resolved `config` from, threaded through only so an override bypasses
+/// the daemon (which serves its own default config) exactly like every other
+/// verb.
 pub async fn virtual_routing_bullets(
     config: &crystalline_core::config::GlobalConfig,
     db: Option<&Path>,
+    config_path: Option<&Path>,
 ) -> std::collections::BTreeMap<String, Vec<String>> {
     use serde_json::json;
     if !config.domains.values().any(|e| e.is_virtual()) {
         return std::collections::BTreeMap::new();
     }
-    if let Ok(Some(data)) = ctl_if_running(json!({ "v": 1, "cmd": "routing_bullets" })).await
+    if use_daemon(db, config_path)
+        && let Ok(Some(data)) = ctl_if_running(json!({ "v": 1, "cmd": "routing_bullets" })).await
         && let Ok(map) = serde_json::from_value(data)
     {
         return map;

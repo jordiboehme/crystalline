@@ -60,7 +60,13 @@ impl Env {
     }
 
     /// Create a domain directory with a MANIFEST and a seed engram, then register
-    /// it in the config.
+    /// it in the config. Config selection rides on the isolated `XDG_CONFIG_HOME`
+    /// (`apply` below), never an explicit `--config`: the default config path
+    /// already resolves to `config_path()`, and an explicit override would mean
+    /// "bypass the daemon" (see `crystalline_service::use_daemon`), which would
+    /// wrongly force the direct index path and collide with a running daemon's
+    /// lock. Leaving it off lets `domain add` route its sync through a live
+    /// daemon exactly as a plain invocation does.
     fn setup_domain(&self, name: &str) {
         let dir = self.dir.join(format!("kb-{name}"));
         std::fs::create_dir_all(&dir).unwrap();
@@ -81,8 +87,6 @@ impl Env {
         let ok = cmd
             .args(["domain", "add", name])
             .arg(&dir)
-            .arg("--config")
-            .arg(self.config_path())
             .status()
             .unwrap()
             .success();
@@ -648,6 +652,154 @@ fn domain_names(value: &Value) -> Vec<String> {
         .iter()
         .filter_map(|d| d["name"].as_str().map(str::to_string))
         .collect()
+}
+
+/// The routing bug this covers: CLI verbs are socket-first, so with a live
+/// daemon they used to route `config set`, `domain add`, `status` and every
+/// other verb over the socket even when the caller passed an explicit
+/// `--config`/`--db`. The daemon serves ITS OWN default config and index, so an
+/// override's read (or, worse, its write) landed in the daemon's world instead
+/// of the named file. Here a real daemon owns the default config and index; the
+/// overridden commands must operate purely on a separate location and leave the
+/// daemon's config and index untouched.
+#[test]
+fn explicit_overrides_bypass_a_running_daemon() {
+    let env = Env::new("bypass");
+    env.setup_domain("eng");
+
+    // A real daemon owns this isolated HOME's default config and index.
+    let mut c1 = Mcp::spawn(&env);
+    c1.initialize();
+    env.wait_ready();
+
+    // Snapshot the daemon's own config before any overridden command runs.
+    let daemon_config_before = std::fs::read_to_string(env.config_path()).unwrap();
+
+    // A second, entirely separate config + index the overrides target.
+    let side = env.dir.join("side");
+    std::fs::create_dir_all(&side).unwrap();
+    let side_config = side.join("config.yaml");
+    let side_db = side.join("index.db");
+
+    // `config set --config <side>` writes the side file and never routes the
+    // write over the socket, so the daemon's config stays byte for byte identical.
+    let (ok, _) = env.run(&[
+        "--json",
+        "config",
+        "set",
+        "github.enabled",
+        "true",
+        "--config",
+        side_config.to_str().unwrap(),
+    ]);
+    assert!(ok, "config set --config <side>");
+    let side_raw = std::fs::read_to_string(&side_config).unwrap();
+    assert!(
+        side_raw.contains("enabled: true"),
+        "the side config got the change: {side_raw}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(env.config_path()).unwrap(),
+        daemon_config_before,
+        "an overridden config set left the running daemon's config file untouched"
+    );
+
+    // A data verb: `domain add --config <side> --db <side>` registers into the
+    // side config and indexes into the side db, never the daemon's. Without the
+    // fix the sync half of `domain add` routed to the daemon, which cannot even
+    // resolve a domain the side config alone registered, so this failed.
+    let side_domain = env.dir.join("kb-side");
+    std::fs::create_dir_all(&side_domain).unwrap();
+    std::fs::write(
+        side_domain.join("MANIFEST.md"),
+        "---\ntype: manifest\ntitle: side\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# side\n\n## Scope\n\n- side\n\n## When to Use\n\n- Route here for side\n",
+    )
+    .unwrap();
+    std::fs::write(
+        side_domain.join("seed.md"),
+        "---\ntype: engram\ntitle: Side\npermalink: side\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nsidebandtoken body\n",
+    )
+    .unwrap();
+    let (ok, _) = env.run(&[
+        "--json",
+        "domain",
+        "add",
+        "side",
+        side_domain.to_str().unwrap(),
+        "--config",
+        side_config.to_str().unwrap(),
+        "--db",
+        side_db.to_str().unwrap(),
+    ]);
+    assert!(ok, "domain add --config/--db <side>");
+    assert!(
+        side_db.exists(),
+        "the overridden domain add created the side index"
+    );
+
+    // The side config registers 'side'; the daemon's config still knows only 'eng'.
+    let side_cfg: GlobalConfig = config::load_yaml(&side_config).unwrap();
+    assert!(
+        side_cfg.domains.contains_key("side"),
+        "the side config registered 'side': {side_cfg:?}"
+    );
+    let daemon_cfg: GlobalConfig = config::load_yaml(&env.config_path()).unwrap();
+    assert!(
+        daemon_cfg.domains.contains_key("eng"),
+        "the daemon still knows 'eng': {daemon_cfg:?}"
+    );
+    assert!(
+        !daemon_cfg.domains.contains_key("side"),
+        "the overridden domain add never reached the daemon's config: {daemon_cfg:?}"
+    );
+
+    // `status --config/--db <side>` opens the side index directly and reports
+    // its 'side' domain, proving status bypassed the daemon too.
+    let (ok, out) = env.run(&[
+        "--json",
+        "status",
+        "--config",
+        side_config.to_str().unwrap(),
+        "--db",
+        side_db.to_str().unwrap(),
+    ]);
+    assert!(ok, "status --config/--db <side>");
+    let side_status: Value = serde_json::from_str(&out).unwrap();
+    let side_domains: Vec<String> = side_status["domains"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|d| d["name"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        side_domains.contains(&"side".to_string()),
+        "the side index reports 'side' via an overridden status: {side_status}"
+    );
+
+    // The daemon's own index never saw the side domain: its MCP session lists
+    // only 'eng' and finds nothing for the side engram's unique token.
+    c1.send_call("list_domains", json!({}));
+    let listed = c1.read_tool_value();
+    let names = domain_names(&listed);
+    assert!(
+        names.contains(&"eng".to_string()),
+        "daemon lists 'eng': {listed}"
+    );
+    assert!(
+        !names.contains(&"side".to_string()),
+        "the daemon's index never learned about 'side': {listed}"
+    );
+    c1.send_call("search_engrams", json!({ "query": "sidebandtoken" }));
+    let hits = c1.read_tool_value();
+    assert_eq!(
+        hits["total"].as_u64().unwrap_or(0),
+        0,
+        "the daemon's index holds none of the side domain's content: {hits}"
+    );
+
+    drop(c1);
+    let _ = env.run(&["ctl", "shutdown"]);
 }
 
 #[test]
