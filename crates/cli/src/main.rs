@@ -17,6 +17,7 @@ mod cmd;
 mod doctor;
 mod hook;
 mod install;
+mod receipt;
 
 /// Local-first knowledge management for humans and AI agents.
 #[derive(Parser, Debug)]
