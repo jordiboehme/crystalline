@@ -894,3 +894,126 @@ fn harnesses_section_is_absent_with_no_trace_on_either_harness() {
 
     let _ = std::fs::remove_dir_all(&home);
 }
+
+// --- receipt-aware harness diagnostics ---------------------------------------
+//
+// The scenario below needs a real install receipt to tamper with, which only
+// `crystalline install` writes. `receipt_file`, `tamper_receipt` and
+// `write_shim` mirror the same-named helpers in `tests/install.rs` - test
+// binaries do not share code across files, so they are duplicated here rather
+// than factored out.
+
+/// Create an executable shim named `name` in `bin_dir` that appends its
+/// arguments to `log` and exits 1 for `mcp get`, 0 otherwise, so the install
+/// this scenario seeds proceeds exactly like a real (not-yet-registered)
+/// harness CLI would.
+#[cfg(unix)]
+fn write_shim(bin_dir: &Path, name: &str, log: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(bin_dir).unwrap();
+    let script = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$1\" = mcp ] && [ \"$2\" = get ]; then\n  exit 1\nfi\nexit 0\n",
+        log.display()
+    );
+    let path = bin_dir.join(name);
+    std::fs::write(&path, script).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// The receipt path under an isolated home: state_dir honors
+/// `XDG_STATE_HOME`, which `apply_home` points at `<home>/state`.
+#[cfg(unix)]
+fn receipt_file(home: &Path) -> PathBuf {
+    home.join("state").join("crystalline").join("installs.json")
+}
+
+/// Rewrite the receipt with a mutation applied, for simulating an install
+/// last reconciled by a different binary version, or one that still
+/// remembers a skill this version no longer ships.
+#[cfg(unix)]
+fn tamper_receipt(home: &Path, mutate: impl FnOnce(&mut Value)) {
+    let path = receipt_file(home);
+    let bytes = std::fs::read(&path).unwrap();
+    let mut receipt: Value = serde_json::from_slice(&bytes).unwrap();
+    mutate(&mut receipt);
+    std::fs::write(&path, serde_json::to_string_pretty(&receipt).unwrap()).unwrap();
+}
+
+/// A version-skewed install whose receipt still remembers a retired skill:
+/// `doctor` must surface both the skew and the leftover, in `--json` and in
+/// the human rendering, without failing the exit code - both self-heal, the
+/// skew at the next session start and the leftover at the next `crystalline
+/// install`.
+#[test]
+#[cfg(unix)]
+fn doctor_reports_a_version_skewed_install_and_retired_leftovers() {
+    let (home, _state_dir) = isolated_home("skew-leftover");
+    let work = tempfile::tempdir().unwrap();
+    let bin_dir = work.path().join("bin");
+    let log = work.path().join("claude.log");
+    write_shim(&bin_dir, "claude", &log);
+    let (config, db) = empty_config(work.path());
+
+    let mut install_cmd = bin();
+    apply_home(&mut install_cmd, &home);
+    install_cmd
+        .env("PATH", &bin_dir)
+        .args(["install", "claude-code"])
+        .assert()
+        .success();
+
+    // Tamper the receipt: an older version reconciled this install, and it
+    // still remembers a skill folder this binary no longer ships.
+    tamper_receipt(&home, |receipt| {
+        let entry = &mut receipt["installs"][0];
+        entry["version"] = serde_json::json!("0.0.1");
+        let skills = entry["skills"].as_array_mut().unwrap();
+        skills.push(serde_json::json!({
+            "name": "crystalline-legacy",
+            "sha256": "0".repeat(64),
+        }));
+    });
+    let legacy_dir = home
+        .join(".claude")
+        .join("skills")
+        .join("crystalline-legacy");
+    std::fs::create_dir_all(&legacy_dir).unwrap();
+    std::fs::write(legacy_dir.join("SKILL.md"), "legacy body").unwrap();
+
+    let mut cmd = bin();
+    apply_home(&mut cmd, &home);
+    let out = cmd
+        .args(["--json", "doctor", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&out).unwrap();
+    let claude = harness_entry(&report, "claude-code");
+    assert_eq!(claude["receipt_version"], serde_json::json!("0.0.1"));
+    assert_eq!(
+        claude["retired_leftovers"],
+        serde_json::json!(["crystalline-legacy"])
+    );
+
+    let human = {
+        let mut cmd = bin();
+        apply_home(&mut cmd, &home);
+        cmd.args(["doctor", "--config"])
+            .arg(&config)
+            .args(["--db"])
+            .arg(&db)
+            .output()
+            .unwrap()
+            .stdout
+    };
+    let human = String::from_utf8(human).unwrap();
+    assert!(human.contains("installed by 0.0.1"), "{human}");
+    assert!(human.contains("crystalline-legacy"), "{human}");
+
+    let _ = std::fs::remove_dir_all(&home);
+}

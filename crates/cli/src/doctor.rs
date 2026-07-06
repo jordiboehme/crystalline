@@ -16,7 +16,9 @@
 //! either coding-harness integration `crystalline install` wires up leaves
 //! any trace on disk and, when it does, whether its settings/hooks file
 //! parses and carries the `SessionStart` and `Stop` hooks and how many of
-//! the four managed skills are installed or locally modified - filesystem
+//! the four managed skills are installed or locally modified (against the
+//! install receipt when one exists) and whether a receipt version skew or
+//! retired leftovers await the next session-start refresh - filesystem
 //! only, with no shell-out to the harness's own CLI, so this check stays
 //! fast and works offline. `--fix` removes orphan rows and stale service
 //! artifacts; the rest, including the whole GitHub, environment and
@@ -39,6 +41,7 @@ use serde::Serialize;
 
 use crate::cmd;
 use crate::install::{self, HarnessKind};
+use crate::receipt;
 
 /// One domain's diagnostics.
 #[derive(Debug, Clone, Default, Serialize)]
@@ -239,8 +242,17 @@ pub struct HarnessDoctor {
     /// embedded copy.
     pub skills_installed: usize,
     /// How many of the skills counted in `skills_installed` were locally
-    /// modified: present, but no longer byte-identical to the embedded copy.
+    /// modified: present, but matching neither the embedded copy nor the
+    /// install receipt's recorded hash for that name.
     pub skills_modified: usize,
+    /// The binary version that last reconciled this harness's user-scope
+    /// install, from the install receipt. `None` when no receipt entry
+    /// exists (never installed, or installed before receipts existed).
+    pub receipt_version: Option<String>,
+    /// Leftover folders of skills this binary no longer ships: names the
+    /// receipt or the retired list knows that still have a `SKILL.md` on
+    /// disk. A re-run of `crystalline install` retires them.
+    pub retired_leftovers: Vec<String>,
 }
 
 /// The full `doctor` report.
@@ -301,7 +313,11 @@ impl DoctorReport {
             }
         }
         // A harness that was never installed is not a problem; an
-        // unparseable settings/hooks file for one that was is.
+        // unparseable settings/hooks file for one that was is. A receipt
+        // version skew and a retired leftover skill are never counted here:
+        // both self-heal, the skew at the next session start and the
+        // leftover at the next `crystalline install`, so neither should fail
+        // doctor's exit code on a machine that fixes itself.
         if let Some(harnesses) = &self.harnesses {
             n += harnesses
                 .iter()
@@ -640,10 +656,20 @@ fn render_origin(origin: &OriginConfig) -> String {
 /// `None` when neither harness leaves any trace at all, the same
 /// "omit the section rather than show it empty" rule [`check_environment`]
 /// and [`check_github`] follow.
+///
+/// The install receipt is loaded once here rather than inside
+/// [`check_one_harness`], since both harnesses' user-scope entries live in
+/// the same file: a missing or corrupt receipt reads as the empty one
+/// (nothing recorded), exactly like `install` itself treats it as disposable
+/// derived state.
 fn check_harnesses() -> Option<Vec<HarnessDoctor>> {
+    let book = receipt::receipt_path()
+        .ok()
+        .and_then(|p| receipt::load(&p).ok())
+        .unwrap_or_default();
     let harnesses: Vec<HarnessDoctor> = [HarnessKind::ClaudeCode, HarnessKind::Codex]
         .into_iter()
-        .map(check_one_harness)
+        .map(|kind| check_one_harness(kind, book.find(kind.id(), "user", None)))
         .collect();
     let any_trace = harnesses
         .iter()
@@ -654,8 +680,13 @@ fn check_harnesses() -> Option<Vec<HarnessDoctor>> {
 /// One harness's diagnostics: read its settings/hooks file read-only, check
 /// both managed hooks via [`install::hook_present`] and count how many of
 /// [`install::MANAGED_SKILLS`] are present (and, of those, how many were
-/// locally modified) at its skills folder.
-fn check_one_harness(harness: HarnessKind) -> HarnessDoctor {
+/// locally modified against either the embedded copy or `entry`'s recorded
+/// hash) at its skills folder. `entry` is this harness's user-scope install
+/// receipt record, `None` when it was never installed or predates receipts.
+fn check_one_harness(
+    harness: HarnessKind,
+    entry: Option<&receipt::InstallRecord>,
+) -> HarnessDoctor {
     let paths = install::harness_paths(harness, false);
     let settings_present = paths.settings.is_file();
 
@@ -669,15 +700,49 @@ fn check_one_harness(harness: HarnessKind) -> HarnessDoctor {
             Err(e) => (false, false, Some(e.to_string())),
         };
 
+    let recorded_hash: std::collections::HashMap<&str, &str> = entry
+        .map(|e| {
+            e.skills
+                .iter()
+                .map(|s| (s.name.as_str(), s.sha256.as_str()))
+                .collect()
+        })
+        .unwrap_or_default();
+
     let mut skills_installed = 0;
     let mut skills_modified = 0;
     for &(name, content) in install::MANAGED_SKILLS {
         let path = paths.skills_dir.join(name).join("SKILL.md");
         if let Ok(existing) = std::fs::read(&path) {
             skills_installed += 1;
-            if existing != content.as_bytes() {
+            let matches_embedded = existing == content.as_bytes();
+            let matches_receipt = matches_embedded
+                || recorded_hash
+                    .get(name)
+                    .is_some_and(|&h| h == receipt::sha256_hex(&existing));
+            if !matches_receipt {
                 skills_modified += 1;
             }
+        }
+    }
+
+    // Leftovers: every name the receipt or the static retired list still
+    // remembers, deduplicated, that is not a currently managed skill and
+    // whose `SKILL.md` still sits on disk. Mirrors the retirement logic in
+    // `install::reconcile_skill_set` without shelling out to it.
+    let managed: HashSet<&str> = install::MANAGED_SKILLS.iter().map(|&(n, _)| n).collect();
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut retired_leftovers = Vec::new();
+    let candidate_names = entry
+        .into_iter()
+        .flat_map(|e| e.skills.iter().map(|s| s.name.as_str()))
+        .chain(install::RETIRED_SKILLS.iter().copied());
+    for name in candidate_names {
+        if managed.contains(name) || !seen.insert(name) {
+            continue;
+        }
+        if paths.skills_dir.join(name).join("SKILL.md").is_file() {
+            retired_leftovers.push(name.to_string());
         }
     }
 
@@ -690,6 +755,8 @@ fn check_one_harness(harness: HarnessKind) -> HarnessDoctor {
         stop_hook,
         skills_installed,
         skills_modified,
+        receipt_version: entry.map(|e| e.version.clone()),
+        retired_leftovers,
     }
 }
 
@@ -1023,6 +1090,21 @@ pub fn render_human(report: &DoctorReport) -> String {
                 );
             } else {
                 let _ = writeln!(out, "    skills: none installed");
+            }
+            if let Some(v) = &h.receipt_version
+                && v != env!("CARGO_PKG_VERSION")
+            {
+                let _ = writeln!(
+                    out,
+                    "    installed by {v}, this binary is {} (refreshes at next session start)",
+                    env!("CARGO_PKG_VERSION")
+                );
+            }
+            for name in &h.retired_leftovers {
+                let _ = writeln!(
+                    out,
+                    "    leftover retired skill: {name} (crystalline install removes it)"
+                );
             }
         }
     }
