@@ -461,3 +461,55 @@ fn a_missing_harness_cli_prints_a_manual_command_and_still_succeeds() {
         "skills still copied"
     );
 }
+
+/// A `crystalline` shim answering `--version` with the given version string,
+/// for the PATH version-skew notice.
+fn write_version_shim(bin_dir: &Path, version: &str) {
+    std::fs::create_dir_all(bin_dir).unwrap();
+    let script = format!("#!/bin/sh\necho 'crystalline {version}'\nexit 0\n");
+    let path = bin_dir.join("crystalline");
+    std::fs::write(&path, script).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[test]
+fn an_older_crystalline_on_the_path_earns_a_version_notice() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let bin_dir = work.path().join("bin");
+    let log = work.path().join("claude.log");
+    write_shim(&bin_dir, "claude", &log);
+    write_version_shim(&bin_dir, "0.0.1");
+
+    let out = install_cmd(&home, &bin_dir)
+        .args(["install", "claude-code"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains("version 0.0.1, not this binary's"),
+        "an older PATH binary must earn the skew notice: {stdout}"
+    );
+}
+
+#[test]
+fn a_matching_crystalline_on_the_path_earns_no_version_notice() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let bin_dir = work.path().join("bin");
+    let log = work.path().join("claude.log");
+    write_shim(&bin_dir, "claude", &log);
+    write_version_shim(&bin_dir, env!("CARGO_PKG_VERSION"));
+
+    let out = install_cmd(&home, &bin_dir)
+        .args(["install", "claude-code"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        !stdout.contains("from your PATH"),
+        "a matching PATH binary must stay quiet: {stdout}"
+    );
+}

@@ -426,6 +426,42 @@ fn mcp_add_args(harness: HarnessKind, project: bool) -> Vec<String> {
     args.into_iter().map(String::from).collect()
 }
 
+/// The version-skew guard for the hooks: they run whatever `crystalline` the
+/// PATH resolves at hook time, which is not necessarily the binary running
+/// this install. An older PATH binary without the `hook` verb exits 2 on
+/// every Stop event, which a harness reads as "block the stop" - a real
+/// footgun, so a mismatch earns a notice. `None` when the PATH binary
+/// matches this one; a notice string otherwise (missing, unresponsive or a
+/// different version).
+fn path_binary_notice() -> Option<String> {
+    let mine = env!("CARGO_PKG_VERSION");
+    match std::process::Command::new("crystalline")
+        .arg("--version")
+        .output()
+    {
+        Err(_) => Some(
+            "The hooks run `crystalline` from your PATH, but none was found there. Put this binary on the PATH or the hooks will fail."
+                .to_string(),
+        ),
+        Ok(out) => {
+            let version = String::from_utf8_lossy(&out.stdout);
+            let version = version.trim().strip_prefix("crystalline ").unwrap_or("");
+            if !out.status.success() || version.is_empty() {
+                Some(
+                    "The hooks run `crystalline` from your PATH, but it did not answer --version. Check which binary the PATH resolves."
+                        .to_string(),
+                )
+            } else if version != mine {
+                Some(format!(
+                    "The hooks run `crystalline` from your PATH, which is version {version}, not this binary's {mine}. Upgrade the installed crystalline (or adjust the PATH) so the hooks find the verbs they need."
+                ))
+            } else {
+                None
+            }
+        }
+    }
+}
+
 /// Register the MCP server: check presence with `mcp get` first, then `mcp
 /// add`. A missing CLI or a failing add never aborts the install; it records
 /// the command to run by hand instead.
@@ -759,6 +795,11 @@ pub fn run_install(opts: InstallOptions, json: bool) -> anyhow::Result<()> {
     };
 
     let mut notices = Vec::new();
+    if !opts.skip_hooks
+        && let Some(notice) = path_binary_notice()
+    {
+        notices.push(notice);
+    }
     if opts.harness == HarnessKind::Codex {
         if !opts.skip_mcp && opts.project {
             notices.push(
