@@ -647,6 +647,12 @@ fn reconcile_skill_set(
         if current_names.contains(r.name.as_str()) || !seen.insert(r.name.as_str()) {
             continue;
         }
+        // The receipt is attacker-writable local state; a hostile name is
+        // skipped outright, silently, before it ever reaches `retire`'s
+        // `dir.join(name)`. See `is_plain_skill_name`.
+        if !is_plain_skill_name(&r.name) {
+            continue;
+        }
         if let Some(status) = retire(dir, &r.name, Some(&r.sha256))? {
             skills.push(SkillReport {
                 name: r.name.clone(),
@@ -673,6 +679,28 @@ fn reconcile_skill_set(
         },
         records,
     ))
+}
+
+/// Whether `name` is safe to use as a single path component under a skills
+/// folder, i.e. whether `dir.join(name)` can only ever land inside `dir`.
+///
+/// [`MANAGED_SKILLS`] and [`RETIRED_SKILLS`] are compiled into this binary,
+/// so their names are trusted outright. A name read back from the install
+/// receipt is not: the receipt is attacker-writable local state (plain JSON
+/// under `<state_dir>/installs.json`, editable by anything that can write
+/// there), yet the leftover-retirement loops join a receipt name straight
+/// onto the skills directory. `Path::join` treats an absolute second
+/// argument as a full replacement of the first, so a recorded name of
+/// `/etc/passwd` (or, on Windows, a drive-rooted path) would target that
+/// path outright, and a name of `../../elsewhere` climbs out of the skills
+/// folder through plain relative segments. A name is only usable once it is
+/// a single, plain path component: non-empty, neither `.` nor `..`, and
+/// free of both `/` and `\` (checked on every platform, since a receipt
+/// written by one platform's binary can end up read back on another).
+/// Anything else must be skipped outright wherever it would otherwise reach
+/// the filesystem, never sanitized or truncated into something safe-looking.
+pub(crate) fn is_plain_skill_name(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains('/') && !name.contains('\\')
 }
 
 /// A fresh receipt record for a skill at its embedded content.
@@ -773,6 +801,12 @@ fn uninstall_skills(
     // hash), then the static retired list. Reported only when present.
     for r in prior {
         if !seen.insert(r.name.as_str()) {
+            continue;
+        }
+        // The receipt is attacker-writable local state; a hostile name is
+        // skipped outright, silently, before it ever reaches `drop_one`'s
+        // `dir.join(name)`. See `is_plain_skill_name`.
+        if !is_plain_skill_name(&r.name) {
             continue;
         }
         if let Some(status) = drop_one(&r.name, None)? {
@@ -1074,16 +1108,41 @@ pub fn run_install(opts: InstallOptions, json: bool) -> anyhow::Result<()> {
         hooks: false,
         skills: false,
     });
+    let merged_parts = receipt::Parts {
+        mcp: prior_parts.mcp || !opts.skip_mcp,
+        hooks: prior_parts.hooks || !opts.skip_hooks,
+        skills: prior_parts.skills || !opts.skip_skills,
+    };
+
+    // The version stamped here is what the session-start auto-reconcile
+    // compares against: a match means "nothing to do". Stamping the current
+    // binary's version unconditionally would disarm that check for a part
+    // this run skipped but `merged_parts` still carries as true - hooks or
+    // skills installed by an earlier run and left untouched here, not
+    // reinstalled fresh. mcp is excluded from this decision on purpose: it
+    // is version-independent and the auto-reconcile never replays it, so a
+    // skipped MCP registration has nothing that could go stale. Only when
+    // this run actually skipped a hooks or skills part that is recorded true
+    // do we carry the prior entry's version forward instead, so a later
+    // session start still sees the mismatch and reconciles the part this run
+    // left alone.
+    let skipped_a_recorded_part =
+        (opts.skip_hooks && merged_parts.hooks) || (opts.skip_skills && merged_parts.skills);
+    let version = if skipped_a_recorded_part {
+        prior
+            .as_ref()
+            .map(|p| p.version.clone())
+            .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string())
+    } else {
+        env!("CARGO_PKG_VERSION").to_string()
+    };
+
     book.upsert(receipt::InstallRecord {
         harness: opts.harness.id().to_string(),
         scope: scope.to_string(),
         project_path,
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        parts: receipt::Parts {
-            mcp: prior_parts.mcp || !opts.skip_mcp,
-            hooks: prior_parts.hooks || !opts.skip_hooks,
-            skills: prior_parts.skills || !opts.skip_skills,
-        },
+        version,
+        parts: merged_parts,
         skills: match new_records {
             Some(records) => records,
             None => prior.map(|p| p.skills).unwrap_or_default(),
@@ -1956,5 +2015,120 @@ mod tests {
             reconcile_skill_set(dir.path(), CUR, &[], &[], ReconcileMode::Auto).unwrap();
         assert_eq!(status_of(&report, "alpha"), "already-current");
         assert_eq!(records, vec![rec("alpha", "alpha v2 body")]);
+    }
+
+    // --- hostile receipt names: the path-escape guard -----------------------
+    //
+    // The receipt is attacker-writable local state. `is_plain_skill_name` is
+    // what stands between a hostile recorded name and `dir.join(name)`; these
+    // lock its classification in directly, then prove it end to end against
+    // the two loops that consume receipt names.
+
+    #[test]
+    fn is_plain_skill_name_rejects_every_hostile_shape() {
+        for hostile in ["/tmp/evil", "../escape", "a/b", "..", ""] {
+            assert!(
+                !is_plain_skill_name(hostile),
+                "{hostile:?} must not be usable as a path component"
+            );
+        }
+        assert!(is_plain_skill_name("crystalline-routing"));
+    }
+
+    #[test]
+    fn reconcile_skips_hostile_receipt_names_leaving_them_untouched() {
+        let work = tempfile::tempdir().unwrap();
+        let dir = work.path().join("skills");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Canaries at the exact locations a missing guard would have
+        // followed: an absolute path elsewhere in the sandbox, and the
+        // sibling directory "../escape" resolves to, one level above `dir`.
+        // Both carry a body whose hash matches the hostile record, so an
+        // unguarded `retire` would recognize them as "ours" and delete them.
+        let absolute_target = work.path().join("elsewhere");
+        std::fs::create_dir_all(&absolute_target).unwrap();
+        std::fs::write(absolute_target.join("SKILL.md"), "absolute canary").unwrap();
+        let escape_target = work.path().join("escape");
+        std::fs::create_dir_all(&escape_target).unwrap();
+        std::fs::write(escape_target.join("SKILL.md"), "escape canary").unwrap();
+        let nested_target = dir.join("a").join("b");
+
+        seed(&dir, "alpha", "alpha v1 body");
+        let absolute_name = absolute_target.to_str().unwrap().to_string();
+        let prior = vec![
+            rec(&absolute_name, "absolute canary"),
+            rec("../escape", "escape canary"),
+            rec("a/b", "hostile"),
+            rec("..", "hostile"),
+            rec("", "hostile"),
+            rec("alpha", "alpha v1 body"),
+        ];
+        let (report, _records) =
+            reconcile_skill_set(&dir, CUR, &[], &prior, ReconcileMode::Auto).unwrap();
+
+        // The plain sibling name still reconciles normally.
+        assert_eq!(status_of(&report, "alpha"), "updated");
+        // None of the hostile names produced a report entry.
+        for hostile in [absolute_name.as_str(), "../escape", "a/b", "..", ""] {
+            assert!(
+                report.skills.iter().all(|s| s.name != hostile),
+                "{hostile:?} must not appear in the report"
+            );
+        }
+        // No filesystem effect outside the tempdir's own skill folder.
+        assert_eq!(
+            std::fs::read_to_string(absolute_target.join("SKILL.md")).unwrap(),
+            "absolute canary",
+            "the absolute name was never followed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(escape_target.join("SKILL.md")).unwrap(),
+            "escape canary",
+            "the relative escape was never followed"
+        );
+        assert!(!nested_target.exists(), "the nested name was never created");
+    }
+
+    #[test]
+    fn uninstall_skips_hostile_receipt_names_leaving_them_untouched() {
+        let work = tempfile::tempdir().unwrap();
+        let dir = work.path().join("skills");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A plain leftover the receipt legitimately remembers, to prove the
+        // guard does not disturb an ordinary name.
+        seed(&dir, "beta", "beta body");
+        // A canary at the location a missing guard would have deleted.
+        let escape_target = work.path().join("escape");
+        std::fs::create_dir_all(&escape_target).unwrap();
+        std::fs::write(escape_target.join("SKILL.md"), "escape canary").unwrap();
+
+        let prior = vec![
+            rec("beta", "beta body"),
+            rec("/tmp/evil", "hostile"),
+            rec("../escape", "escape canary"),
+            rec("a/b", "hostile"),
+            rec("..", "hostile"),
+            rec("", "hostile"),
+        ];
+        let report = uninstall_skills(&dir, &prior, false).unwrap();
+
+        // The plain sibling name still reconciles normally.
+        assert_eq!(status_of(&report, "beta"), "removed");
+        assert!(!dir.join("beta").exists());
+        // None of the hostile names produced a report entry.
+        for hostile in ["/tmp/evil", "../escape", "a/b", "..", ""] {
+            assert!(
+                report.skills.iter().all(|s| s.name != hostile),
+                "{hostile:?} must not appear in the report"
+            );
+        }
+        // No filesystem effect outside the tempdir's own skill folder.
+        assert_eq!(
+            std::fs::read_to_string(escape_target.join("SKILL.md")).unwrap(),
+            "escape canary",
+            "the relative escape was never followed"
+        );
     }
 }

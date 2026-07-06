@@ -606,6 +606,54 @@ fn a_skip_run_after_a_full_install_keeps_the_recorded_knowledge() {
 }
 
 #[test]
+fn a_skip_run_after_a_version_bump_keeps_the_prior_version_stamped() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let bin_dir = work.path().join("bin");
+    let log = work.path().join("claude.log");
+    write_shim(&bin_dir, "claude", &log);
+
+    install_cmd(&home, &bin_dir)
+        .args(["install", "claude-code"])
+        .assert()
+        .success();
+
+    // Simulate the binary having since been upgraded: the receipt still
+    // says an older version last reconciled this install.
+    tamper_receipt(&home, |receipt| {
+        receipt["installs"][0]["version"] = json!("0.0.1");
+    });
+
+    // A run that skips skills must not stamp the current version: the
+    // skills on disk are still whatever the 0.0.1 install left there, so
+    // stamping the current version here would tell the session-start
+    // auto-reconcile there is nothing left to refresh.
+    install_cmd(&home, &bin_dir)
+        .args(["install", "claude-code", "--skip-skills", "--skip-mcp"])
+        .assert()
+        .success();
+    let receipt = read_json(&receipt_file(&home));
+    assert_eq!(
+        receipt["installs"][0]["version"],
+        json!("0.0.1"),
+        "a run that skips a recorded part must not advance the stamped version"
+    );
+
+    // A full install with nothing skipped reconciles skills for real, so
+    // the version is free to advance again.
+    install_cmd(&home, &bin_dir)
+        .args(["install", "claude-code"])
+        .assert()
+        .success();
+    let receipt = read_json(&receipt_file(&home));
+    assert_eq!(
+        receipt["installs"][0]["version"],
+        json!(env!("CARGO_PKG_VERSION")),
+        "a run that skips nothing stamps the current version"
+    );
+}
+
+#[test]
 fn uninstall_removes_an_old_but_clean_skill_via_its_receipt_hash() {
     let work = tempfile::tempdir().unwrap();
     let home = work.path().join("home");

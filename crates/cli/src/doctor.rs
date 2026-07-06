@@ -741,6 +741,13 @@ fn check_one_harness(
         if managed.contains(name) || !seen.insert(name) {
             continue;
         }
+        // Receipt names are attacker-writable local state; this check is
+        // read-only here, but the same guard keeps a hostile name out of the
+        // report rather than have doctor point a person at retiring it by
+        // hand. See `install::is_plain_skill_name`.
+        if !install::is_plain_skill_name(name) {
+            continue;
+        }
         if paths.skills_dir.join(name).join("SKILL.md").is_file() {
             retired_leftovers.push(name.to_string());
         }
