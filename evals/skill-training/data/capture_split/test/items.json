@@ -1,0 +1,221 @@
+[
+  {
+    "id": "cap-fresh-12",
+    "workspace": "acme",
+    "task_type": "fresh_capture",
+    "question": "Capture this for the team: chargeback fees are 15 EUR per case regardless of outcome.",
+    "expect": {
+      "capture": {
+        "domain": "payments",
+        "content_any": [
+          "15"
+        ]
+      }
+    }
+  },
+  {
+    "id": "cap-fresh-13",
+    "workspace": "chronos",
+    "task_type": "fresh_capture",
+    "question": "Store in the knowledge base: platform incidents get a blameless postmortem within 48 hours.",
+    "expect": {
+      "capture": {
+        "domain": "platform",
+        "content_any": [
+          "48"
+        ]
+      }
+    }
+  },
+  {
+    "id": "cap-fresh-14",
+    "workspace": "acme",
+    "task_type": "fresh_capture",
+    "question": "Capture: new hires get their laptop ordered one week before their start date.",
+    "expect": {
+      "capture": {
+        "domain": "people-ops",
+        "content_any": [
+          "one week",
+          "1 week",
+          "week before"
+        ]
+      }
+    }
+  },
+  {
+    "id": "cap-fresh-11",
+    "workspace": "horizon",
+    "task_type": "fresh_capture",
+    "question": "Please store: enterprise contracts require a 90 day termination notice.",
+    "expect": {
+      "capture": {
+        "domain": "policies",
+        "content_any": [
+          "90"
+        ]
+      }
+    }
+  },
+  {
+    "id": "cap-dedupe-09",
+    "workspace": "acme",
+    "task_type": "dedupe_edit",
+    "question": "Capture this follow-up lesson: the vault migration also needs the token cache flushed after cutover.",
+    "expect": {
+      "edit": {
+        "identifier": "card-vault-migration-lesson",
+        "domain": "payments"
+      },
+      "forbid_new_engram": true
+    }
+  },
+  {
+    "id": "cap-dedupe-10",
+    "workspace": "acme",
+    "task_type": "dedupe_edit",
+    "question": "Add to the knowledge base: buddies also review the new hire's first pull request.",
+    "expect": {
+      "edit": {
+        "identifier": "onboarding-buddy-pattern",
+        "domain": "people-ops"
+      },
+      "forbid_new_engram": true
+    }
+  },
+  {
+    "id": "cap-dedupe-08",
+    "workspace": "acme",
+    "task_type": "dedupe_edit",
+    "question": "Add to our knowledge: the pgbouncer cap counts prepared statements against the same pool.",
+    "expect": {
+      "edit": {
+        "identifier": "postgres-connection-gotcha",
+        "domain": "infra"
+      },
+      "forbid_new_engram": true
+    }
+  },
+  {
+    "id": "cap-super-07",
+    "workspace": "chronos",
+    "task_type": "supersede",
+    "question": "Deployments moved from ArgoCD to a homegrown release operator; ArgoCD is decommissioned. Update knowledge properly, preserving history.",
+    "expect": {
+      "supersede": {
+        "old_identifier": "deployment-process",
+        "domain": "platform"
+      }
+    }
+  },
+  {
+    "id": "cap-super-08",
+    "workspace": "chronos",
+    "task_type": "supersede",
+    "question": "We retired OIDC service tokens in favor of SPIFFE identities. Reflect this in the knowledge base correctly.",
+    "expect": {
+      "supersede": {
+        "old_identifier": "service-auth",
+        "domain": "platform"
+      }
+    }
+  },
+  {
+    "id": "cap-tbound-06",
+    "workspace": "acme",
+    "task_type": "temporal_bounded",
+    "question": "Record with its expiry: the manual chargeback review workaround runs until 2026-11-30.",
+    "expect": {
+      "write": {
+        "domain": "payments",
+        "tags_required": true,
+        "content_min_lines": 3,
+        "metadata_has": [
+          "valid_to"
+        ],
+        "content_any": [
+          "manual",
+          "review"
+        ]
+      }
+    }
+  },
+  {
+    "id": "cap-tunbound-05",
+    "workspace": "acme",
+    "task_type": "temporal_unbounded",
+    "question": "Record this rule that will always hold: every schema migration ships with a rollback script. Set validity to forever.",
+    "expect": {
+      "capture": {
+        "domain": "infra",
+        "content_any": [
+          "rollback script"
+        ],
+        "metadata_lacks": [
+          "valid_from",
+          "valid_to"
+        ]
+      }
+    }
+  },
+  {
+    "id": "cap-tunbound-04",
+    "workspace": "nimbus",
+    "task_type": "temporal_unbounded",
+    "question": "Store permanently: Atlas never deletes user data without an explicit request. Make the validity permanent.",
+    "expect": {
+      "capture": {
+        "domain": "product-atlas",
+        "content_any": [
+          "explicit request"
+        ],
+        "metadata_lacks": [
+          "valid_from",
+          "valid_to"
+        ]
+      }
+    }
+  },
+  {
+    "id": "cap-domain-05",
+    "workspace": "acme",
+    "task_type": "domain_choice",
+    "question": "The incident review decided chargeback escalations get a dedicated rotation next quarter, run by support leadership. Capture this decision where it belongs.",
+    "expect": {
+      "capture": {
+        "domain": "people-ops",
+        "content_any": [
+          "dedicated rotation",
+          "support leadership"
+        ]
+      }
+    }
+  },
+  {
+    "id": "cap-rel-05",
+    "workspace": "nimbus",
+    "task_type": "relation_link",
+    "question": "Capture and link to the conflict resolution engram: merge conflicts surface in the activity feed for a week.",
+    "expect": {
+      "capture": {
+        "domain": "product-atlas",
+        "content_any": [
+          "activity feed"
+        ]
+      },
+      "relation_to": "Conflict Resolution"
+    }
+  },
+  {
+    "id": "cap-nocap-07",
+    "workspace": "acme",
+    "task_type": "no_capture",
+    "question": "Debugging leftovers: I hardcoded the invoice counter to 999 locally, will undo. What format do real invoice numbers follow?",
+    "expect": {
+      "forbid_any_write": true,
+      "answer_any": [
+        "acme-"
+      ]
+    }
+  }
+]

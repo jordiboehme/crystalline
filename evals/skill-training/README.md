@@ -1,6 +1,8 @@
 # Skill training harness
 
-Trains and evaluates the shipped Crystalline skills with [SkillOpt](https://github.com/microsoft/SkillOpt), a text-space optimizer that treats a skill markdown document as the trainable state of a frozen agent: rollout, reflect, bounded edits and a held-out validation gate that only accepts strict improvements. The pilot benchmark covers `crystalline-routing`.
+Trains and evaluates the shipped Crystalline skills with [SkillOpt](https://github.com/microsoft/SkillOpt), a text-space optimizer that treats a skill markdown document as the trainable state of a frozen agent: rollout, reflect, bounded edits and a held-out validation gate that only accepts strict improvements. Two benchmarks so far: `crystalline-routing` (read side) and `crystalline-capture` (write side).
+
+The capture benchmark scores what the agent actually wrote: `crystalline verify --format json` runs on every sandbox domain before and after the session and any new error fails the item, plus transcript assertions (search before write, edit over create, no writes for transient scratch) and post-state assertions (supersede recipe, wikilink relations, bounded vs unbounded validity). Config: `configs/capture.yaml`, data: `data/capture_split/`, driver: `overnight-capture.sh` for an unattended baselines-plus-training sequence with rate-limit retries.
 
 How a task runs: each item launches a real headless Claude Code session against a sandboxed crystalline MCP server (`crystalline mcp --embedded` with its own config, index and state directory), with the candidate skill body appended as system prompt. The transcript's tool calls and final answer are scored deterministically against the item's `expect` object - no LLM judge. See `envs/crystalline_routing/scoring.py` for the full expectation vocabulary.
 

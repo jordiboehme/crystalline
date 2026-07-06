@@ -1,18 +1,21 @@
-"""Build the seed skill for training runs.
+"""Build the seed skills for training runs.
 
-The trainable document is the body of skills/crystalline-routing/SKILL.md
-with the YAML frontmatter stripped: the frontmatter (name, description)
-is harness install metadata, not prompt content, and the optimizer must
-never edit it. The body is written to outputs/seed_routing.md, which the
-training config points at via env.skill_init.
+The trainable document is a SKILL.md body with the YAML frontmatter
+stripped: the frontmatter (name, description) is harness install
+metadata, not prompt content, and the optimizer must never edit it. The
+bodies are written under outputs/, where the training configs point via
+env.skill_init.
 """
 from __future__ import annotations
 
 from pathlib import Path
 
 HARNESS_ROOT = Path(__file__).resolve().parent
-SKILL_MD = HARNESS_ROOT.parent.parent / "skills" / "crystalline-routing" / "SKILL.md"
-SEED_PATH = HARNESS_ROOT / "outputs" / "seed_routing.md"
+SKILLS_DIR = HARNESS_ROOT.parent.parent / "skills"
+SEEDS = {
+    "crystalline-routing": HARNESS_ROOT / "outputs" / "seed_routing.md",
+    "crystalline-capture": HARNESS_ROOT / "outputs" / "seed_capture.md",
+}
 EMPTY_PATH = HARNESS_ROOT / "outputs" / "empty_skill.md"
 
 
@@ -26,11 +29,13 @@ def strip_frontmatter(text: str) -> str:
 
 
 def make_seed() -> Path:
-    body = strip_frontmatter(SKILL_MD.read_text(encoding="utf-8"))
-    SEED_PATH.parent.mkdir(parents=True, exist_ok=True)
-    SEED_PATH.write_text(body, encoding="utf-8")
+    EMPTY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    for skill_name, seed_path in SEEDS.items():
+        source = SKILLS_DIR / skill_name / "SKILL.md"
+        body = strip_frontmatter(source.read_text(encoding="utf-8"))
+        seed_path.write_text(body, encoding="utf-8")
     EMPTY_PATH.write_text("", encoding="utf-8")
-    return SEED_PATH
+    return SEEDS["crystalline-routing"]
 
 
 def ensure_prompts() -> None:
