@@ -5,10 +5,16 @@
 # trailing-comma-before-and house style.
 set -euo pipefail
 
+# Paths from git ls-files are relative to the working directory; run from
+# the repository root so the exclusion patterns below always match.
+cd "$(git rev-parse --show-toplevel)"
+
 fail=0
 
-# Tracked markdown and Rust files, excluding build output.
-files=$(git ls-files -- '*.md' '*.rs' | grep -v '/target/' | grep -v '^target/' || true)
+# Tracked markdown and Rust files, excluding build output and vendored
+# third-party files, which must stay byte-identical to their upstream
+# (see evals/skill-training/vendor/README.md).
+files=$(git ls-files -- '*.md' '*.rs' | grep -v '/target/' | grep -v '^target/' | grep -v '^evals/skill-training/vendor/' || true)
 
 if [ -z "$files" ]; then
     echo "style-lint: no tracked .md or .rs files found"
