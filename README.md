@@ -151,6 +151,8 @@ Any other harness: configure a stdio MCP server that runs `crystalline` with the
 
 The first agent to connect starts a background daemon that loads the embedding model once and watches every registered domain for changes; every later connection - other agents, other terminals, other harnesses - attaches to that same daemon instead of starting a second copy. One shared instance, one loaded model, one consistent view of the index, no matter how many agents are talking to it at once.
 
+Every connection is also onboarded automatically: the server's initialize instructions carry a live routing block, one line per registered domain (see Session onboarding below).
+
 ## Deployment scenarios
 
 Crystalline runs the same way in every scenario: a daemon in the middle keeps one search index in sync with knowledge files on disk, and one or more agents connect to it, whether that connection is a local stdio pipe or a network HTTP endpoint. The seven scenarios below are variations on that one architecture.
@@ -169,7 +171,7 @@ flowchart LR
 
 ### Claude Desktop extension
 
-For someone who never opens a terminal, the `.mcpb` bundle wraps the same binary in a one-click Claude Desktop extension. Claude Desktop renders a native folder picker from the bundle manifest; every picked folder is prepared as a domain automatically, MANIFEST.md included, and `Documents/Crystalline/Personal` is created as the starter domain out of the box. Under the hood Claude Desktop spawns `crystalline mcp --domain <folder>` per picked folder over stdio, landing on the same daemon as the personal workstation shape. Removing a folder from the settings never deletes its knowledge.
+For someone who never opens a terminal, the `.mcpb` bundle wraps the same binary in a one-click Claude Desktop extension. Claude Desktop renders a native folder picker from the bundle manifest; every picked folder is prepared as a domain automatically, MANIFEST.md included, and `Documents/Crystalline/Personal` is created as the starter domain out of the box. Under the hood Claude Desktop spawns `crystalline mcp --domain <folder>` per picked folder over stdio, landing on the same daemon as the personal workstation shape. Removing a folder from the settings never deletes its knowledge. Onboarding is automatic - the server's instructions deliver the routing block on every connection - and the release's crystalline-skill zip adds capture and collaboration best practices as an uploadable skill (see Skills below).
 
 ```mermaid
 flowchart LR
@@ -300,11 +302,13 @@ An immutable image with no `config.yaml` to mount or edit configures purely thro
 
 ### Read-only deployments
 
-Pass `--read-only` to `serve` (or to `mcp`), set `service.read_only: true` in the config, or set `CRYSTALLINE_SERVICE_READ_ONLY=true` (the container-native spelling, see Configure through environment variables above) to serve the content API read-only. The four content-mutating tools (`write_engram`, `edit_engram`, `move_engram` and `delete_engram`) disappear from the MCP tool list and are refused if a client calls one by name, while `search_engrams`, `read_engram`, `list_domains` and the rest of the read tools stay. Sync, the file watcher and embedding keep running, so the index still follows external edits such as a git pull. `crystalline prompt system` follows the same mode: it drops the write guidance and states that the knowledge is curated externally, and `--read-only` forces that variant on demand. This is the natural pairing for the git-sync setup in `compose.git-sync.yaml`, where knowledge arrives by reviewed git commits and agents only consume it. The mode is fixed for the daemon's lifetime, so an agent attaching to a running daemon gets that daemon's mode. Operator tooling on the host (`verify`, `import`, `domain init`/`add`/`remove` and `model download`) is unaffected: the boundary is that the served API is read-only, not the machine.
+Pass `--read-only` to `serve` (or to `mcp`), set `service.read_only: true` in the config, or set `CRYSTALLINE_SERVICE_READ_ONLY=true` (the container-native spelling, see Configure through environment variables above) to serve the content API read-only. The four content-mutating tools (`write_engram`, `edit_engram`, `move_engram` and `delete_engram`) disappear from the MCP tool list and are refused if a client calls one by name, while `search_engrams`, `read_engram`, `list_domains` and the rest of the read tools stay. Sync, the file watcher and embedding keep running, so the index still follows external edits such as a git pull. `crystalline prompt system` and the server's own initialize instructions follow the same mode: both drop the write guidance and state that the knowledge is curated externally, and `prompt system --read-only` forces that variant on demand. This is the natural pairing for the git-sync setup in `compose.git-sync.yaml`, where knowledge arrives by reviewed git commits and agents only consume it. The mode is fixed for the daemon's lifetime, so an agent attaching to a running daemon gets that daemon's mode. Operator tooling on the host (`verify`, `import`, `domain init`/`add`/`remove` and `model download`) is unaffected: the boundary is that the served API is read-only, not the machine.
 
 Agents connect to the containerized daemon over its HTTP MCP endpoint, `http://localhost:7411` from the host (the image's default command is `serve --http 0.0.0.0:7411`, since a container has to bind every interface to be reachable at all - binding `127.0.0.1` inside a container is only reachable from inside that same container). The stdio `crystalline mcp` transport from Connect your agent above is for local, non-containerized processes; point a harness at the HTTP endpoint instead when Crystalline runs in a container.
 
 ## Session onboarding
+
+Every MCP client gets a baseline automatically: the crystalline server's instructions, returned when a client connects, carry a routing block - one line per registered domain plus the behavior rules - rebuilt from the registered MANIFESTs for each new connection. Claude Desktop and any harness that shows the model its MCP server instructions need no further setup. Over MCP there is no workspace, so `prompt.rules` filters and repo-local `preferred_domains` do not apply there; the hook recipe below is the workspace-scoped path.
 
 Run `crystalline prompt system` at the start of a session and feed its output to the agent as context. It reads every registered domain's `MANIFEST.md` and renders a compact routing block: one line per domain summarizing when to use it, plus the behavior rules (narrow question -> search that domain; broad question -> sweep all of them; writes always name a domain explicitly). The output names the exact crystalline MCP tools each rule refers to (`search_engrams`, `write_engram` and the rest), so an agent with several MCP servers connected knows exactly which tool on which server to call. `prompt` takes a subcommand naming the kind of prompt to generate; `system` is the only kind today.
 
@@ -415,18 +419,23 @@ Two more commands keep a knowledge base trustworthy:
 
 ## Skills
 
-The `skills/` folder ships four harness-agnostic agent skills that teach an agent how to use Crystalline well:
+The `skills/` folder ships four harness-agnostic agent skills plus one consolidated skill, teaching an agent how to use Crystalline well:
 
 - **`crystalline-routing`** - which domain(s) to search for a task, when to sweep every domain instead, temporal filtering for "what is true now", and when to fall back to reading a MANIFEST directly.
 - **`crystalline-capture`** - when captured knowledge is worth writing down, searching before writing to avoid duplicates, editing an existing engram instead of forking the topic, and the observation-category and temporal-field conventions that keep engrams useful later.
 - **`crystalline-schema`** - authoring a Picoschema schema engram for a domain that wants structure, inferring one from what is already captured, and validating conformance.
 - **`crystalline-collaboration`** - working in a domain that has a team origin: checking status at session start, updating before deep work, sharing a coherent unit of knowledge as a proposal and relaying its review URL, conflict etiquette and connecting a new teammate end to end.
+- **`crystalline-memory`** - a single consolidated skill for Claude Desktop and other harnesses that install one skill at a time: recall, capture, read-only stand-down and team sharing essentials in one file.
 
 Each is a plain folder with a `SKILL.md`; install by copying the folder into wherever your harness looks for skills. For Claude Code, that is `.claude/skills/` in a project or `~/.claude/skills/` globally:
 
 ```sh
 cp -r skills/crystalline-routing skills/crystalline-capture skills/crystalline-schema skills/crystalline-collaboration ~/.claude/skills/
 ```
+
+Installing from a release instead of a clone: download `crystalline-skills-v<version>.zip` from the [latest release](https://github.com/jordiboehme/crystalline/releases/latest) and unpack it into `~/.claude/skills/`.
+
+Claude Desktop: download `crystalline-skill-v<version>.zip` from the latest release, then open Settings > Capabilities > Skills and upload the zip as-is (it contains the `crystalline-memory` folder; do not unpack it). Routing itself needs no skill - the server's instructions deliver it automatically; the skill adds capture and collaboration best practices.
 
 Other harnesses that support a similar skill or instruction-file convention can point at the same folders directly; the content only assumes the MCP tools documented above, never a specific harness.
 
