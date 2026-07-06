@@ -103,9 +103,6 @@ pub(crate) const RETIRED_SKILLS: &[&str] = &[];
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ReconcileMode {
     Install,
-    // TODO(later task): remove this allow once the session-start
-    // auto-reconcile path constructs this variant outside of tests.
-    #[allow(dead_code)]
     Auto,
 }
 
@@ -1257,6 +1254,110 @@ pub fn run_uninstall(
         );
     }
     Ok(())
+}
+
+// --- session-start auto-reconcile ---------------------------------------------
+
+/// The session-start auto-update: called by `crystalline prompt system`
+/// before it emits the routing prompt. Every receipt entry that applies here
+/// (all user-scope installs, plus project-scope installs recorded for
+/// exactly this working directory) and was last reconciled by a different
+/// binary version gets its hooks and skills parts re-run with the options
+/// that install recorded. Never the MCP part: registration is
+/// version-independent and shelling out to a harness CLI from inside a
+/// running hook is slow and fragile.
+///
+/// Fast by requirement: the no-op path (matching versions, or no receipt at
+/// all) costs one small-file read and string compares - no hashing, no
+/// skill IO and no cwd canonicalize unless a version-mismatched
+/// project-scope entry exists.
+///
+/// Best-effort by design: this runs inside a SessionStart hook, so nothing
+/// here may ever break the routing prompt. Every outcome, success or
+/// failure, is at most a one-line notice in the returned list.
+pub(crate) fn auto_reconcile(current_version: &str, cwd: &Path) -> Vec<String> {
+    let Ok(path) = receipt::receipt_path() else {
+        return Vec::new();
+    };
+    let Ok(mut book) = receipt::load(&path) else {
+        return Vec::new();
+    };
+
+    // Resolved lazily: the canonicalize syscall only happens once a
+    // version-mismatched project entry actually needs matching.
+    let mut cwd_key: Option<String> = None;
+    let mut notices = Vec::new();
+    let mut changed = false;
+    for entry in &mut book.installs {
+        if entry.version == current_version {
+            continue;
+        }
+        let applies = match entry.scope.as_str() {
+            "user" => true,
+            "project" => {
+                let key = cwd_key.get_or_insert_with(|| {
+                    cwd.canonicalize()
+                        .unwrap_or_else(|_| cwd.to_path_buf())
+                        .display()
+                        .to_string()
+                });
+                entry.project_path.as_deref() == Some(key.as_str())
+            }
+            _ => false,
+        };
+        if !applies {
+            continue;
+        }
+        let Some(harness) = harness_from_id(&entry.harness) else {
+            continue;
+        };
+        let paths = harness_paths(harness, entry.scope == "project");
+        match reconcile_entry(entry, &paths) {
+            Ok(()) => {
+                notices.push(format!(
+                    "[crystalline] Refreshed the {} install ({} -> {current_version}); updated skills load fresh next session.",
+                    entry.harness, entry.version
+                ));
+                entry.version = current_version.to_string();
+                changed = true;
+            }
+            Err(e) => notices.push(format!(
+                "[crystalline] Refreshing the {} install to {current_version} failed: {e}. Run `crystalline install {}` by hand.",
+                entry.harness, entry.harness
+            )),
+        }
+    }
+    if changed && receipt::save(&path, &book).is_err() {
+        notices.push(
+            "[crystalline] Could not rewrite the install receipt; the refresh may re-run next session."
+                .to_string(),
+        );
+    }
+    notices
+}
+
+/// Re-run one receipt entry's hooks and skills parts. Project-scope paths
+/// from `harness_paths` are relative to the working directory, which is
+/// exactly the recorded project directory whenever this is called.
+fn reconcile_entry(entry: &mut receipt::InstallRecord, paths: &HarnessPaths) -> anyhow::Result<()> {
+    if entry.parts.hooks {
+        install_hooks(&paths.settings)?;
+    }
+    if entry.parts.skills {
+        let (_, records) = reconcile_skills(&paths.skills_dir, &entry.skills, ReconcileMode::Auto)?;
+        entry.skills = records;
+    }
+    Ok(())
+}
+
+/// The `HarnessKind` for a receipt-recorded id; `None` for an id a future
+/// binary wrote that this one does not know.
+fn harness_from_id(id: &str) -> Option<HarnessKind> {
+    match id {
+        "claude-code" => Some(HarnessKind::ClaudeCode),
+        "codex" => Some(HarnessKind::Codex),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

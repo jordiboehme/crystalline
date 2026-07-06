@@ -1954,6 +1954,16 @@ fn run_prompt(
     db: Option<PathBuf>,
     json_flag: bool,
 ) -> anyhow::Result<()> {
+    // Session-start auto-update: a binary upgraded since the last install
+    // refreshes the installed hooks and skills before this session's routing
+    // prompt goes out. Cheap when versions match (one small-file read) and
+    // best-effort always; outcomes surface only as trailing notice lines on
+    // the text output.
+    let reconcile_notices = install::auto_reconcile(
+        env!("CARGO_PKG_VERSION"),
+        &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+    );
+
     let workspace = workspace.unwrap_or_else(|| PathBuf::from("."));
     // The single load chokepoint resolves the config path (flag, then
     // CRYSTALLINE_CONFIG, then the default) and applies the environment overlay,
@@ -1996,6 +2006,9 @@ fn run_prompt(
         println!("{}", crystalline_core::render_json(&output));
     } else {
         print!("{}", crystalline_core::render_text(&output));
+        for note in &reconcile_notices {
+            println!("{note}");
+        }
     }
     Ok(())
 }

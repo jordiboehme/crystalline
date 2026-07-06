@@ -665,3 +665,209 @@ fn a_corrupt_receipt_never_blocks_install() {
     let receipt = read_json(&receipt_path);
     assert_eq!(receipt["installs"][0]["harness"], "claude-code");
 }
+
+/// Rewrite the receipt with a mutation applied, for simulating an install
+/// performed by a different binary version.
+fn tamper_receipt(home: &Path, mutate: impl FnOnce(&mut Value)) {
+    let path = receipt_file(home);
+    let mut receipt = read_json(&path);
+    mutate(&mut receipt);
+    std::fs::write(&path, serde_json::to_string_pretty(&receipt).unwrap()).unwrap();
+}
+
+/// The embedded routing skill, byte-identical to what install writes.
+const ROUTING_SKILL: &str = include_str!("../../../skills/crystalline-routing/SKILL.md");
+const CAPTURE_SKILL: &str = include_str!("../../../skills/crystalline-capture/SKILL.md");
+
+#[test]
+fn prompt_system_reconciles_an_install_from_another_version() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let bin_dir = work.path().join("bin");
+    let log = work.path().join("claude.log");
+    write_shim(&bin_dir, "claude", &log);
+
+    install_cmd(&home, &bin_dir)
+        .args(["install", "claude-code"])
+        .assert()
+        .success();
+
+    // Simulate the aftermath of an upgrade: the receipt says 0.0.1 wrote
+    // this install, one skill is an old clean copy (file and receipt hash
+    // agree), one was edited by a person, one was deleted and one retired
+    // name from a past version is still on disk.
+    let old_body = "routing as an older release shipped it";
+    std::fs::write(claude_skill(&home, "crystalline-routing"), old_body).unwrap();
+    std::fs::write(claude_skill(&home, "crystalline-capture"), "my edits").unwrap();
+    std::fs::remove_dir_all(claude_skill(&home, "crystalline-schema").parent().unwrap()).unwrap();
+    let legacy_dir = home
+        .join(".claude")
+        .join("skills")
+        .join("crystalline-legacy");
+    std::fs::create_dir_all(&legacy_dir).unwrap();
+    std::fs::write(legacy_dir.join("SKILL.md"), "legacy body").unwrap();
+    tamper_receipt(&home, |receipt| {
+        let entry = &mut receipt["installs"][0];
+        entry["version"] = json!("0.0.1");
+        let skills = entry["skills"].as_array_mut().unwrap();
+        for s in skills.iter_mut() {
+            if s["name"] == "crystalline-routing" {
+                s["sha256"] = json!(sha256_hex(old_body.as_bytes()));
+            }
+        }
+        skills.push(json!({
+            "name": "crystalline-legacy",
+            "sha256": sha256_hex(b"legacy body")
+        }));
+    });
+
+    let out = install_cmd(&home, &bin_dir)
+        .args(["prompt", "system"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "the hook path must succeed");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains("[crystalline]"),
+        "a reconcile leaves a notice line: {stdout}"
+    );
+
+    // Old clean copy: updated in place, no backup.
+    assert_eq!(
+        std::fs::read_to_string(claude_skill(&home, "crystalline-routing")).unwrap(),
+        ROUTING_SKILL
+    );
+    assert!(
+        !claude_skill(&home, "crystalline-routing")
+            .with_file_name("SKILL.md.bak")
+            .exists(),
+        "a clean old copy earns no backup"
+    );
+    // Edited copy: updated, edits preserved beside it.
+    assert_eq!(
+        std::fs::read_to_string(claude_skill(&home, "crystalline-capture")).unwrap(),
+        CAPTURE_SKILL
+    );
+    assert_eq!(
+        std::fs::read_to_string(
+            claude_skill(&home, "crystalline-capture").with_file_name("SKILL.md.bak")
+        )
+        .unwrap(),
+        "my edits"
+    );
+    // Deleted skill: the deletion is respected.
+    assert!(
+        !claude_skill(&home, "crystalline-schema").exists(),
+        "auto-reconcile never resurrects a deleted skill"
+    );
+    // Retired leftover with a matching hash: removed, folder and all.
+    assert!(!legacy_dir.exists(), "the retired leftover is removed");
+
+    // Receipt: version current, schema and legacy dropped from the records.
+    let receipt = read_json(&receipt_file(&home));
+    let entry = &receipt["installs"][0];
+    assert_eq!(entry["version"], env!("CARGO_PKG_VERSION"));
+    let names: Vec<&str> = entry["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"crystalline-routing"));
+    assert!(names.contains(&"crystalline-capture"));
+    assert!(names.contains(&"crystalline-collaboration"));
+    assert!(
+        !names.contains(&"crystalline-schema"),
+        "deleted skill left the receipt"
+    );
+    assert!(
+        !names.contains(&"crystalline-legacy"),
+        "retired skill left the receipt"
+    );
+
+    // A second run is quiet: versions match, nothing to do.
+    let out = install_cmd(&home, &bin_dir)
+        .args(["prompt", "system"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        !stdout.contains("[crystalline]"),
+        "a matching version reconciles nothing: {stdout}"
+    );
+}
+
+#[test]
+fn prompt_system_survives_a_corrupt_receipt_untouched() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let bin_dir = work.path().join("bin");
+    let receipt_path = receipt_file(&home);
+    std::fs::create_dir_all(receipt_path.parent().unwrap()).unwrap();
+    std::fs::write(&receipt_path, "{ not a receipt").unwrap();
+    std::fs::create_dir_all(&bin_dir).unwrap();
+
+    let out = install_cmd(&home, &bin_dir)
+        .args(["prompt", "system"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "a corrupt receipt never breaks the hook"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&receipt_path).unwrap(),
+        "{ not a receipt",
+        "the hook never rewrites a file it does not understand"
+    );
+}
+
+#[test]
+fn prompt_system_reconciles_a_project_install_only_from_its_directory() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let bin_dir = work.path().join("bin");
+    let log = work.path().join("claude.log");
+    write_shim(&bin_dir, "claude", &log);
+    let project = work.path().join("repo");
+    std::fs::create_dir_all(&project).unwrap();
+
+    install_cmd(&home, &bin_dir)
+        .current_dir(&project)
+        .args(["install", "claude-code", "--project"])
+        .assert()
+        .success();
+    let skill = project
+        .join(".claude")
+        .join("skills")
+        .join("crystalline-routing")
+        .join("SKILL.md");
+    std::fs::write(&skill, "stale body").unwrap();
+    tamper_receipt(&home, |receipt| {
+        receipt["installs"][0]["version"] = json!("0.0.1");
+    });
+
+    // From an unrelated directory the project entry does not apply.
+    install_cmd(&home, &bin_dir)
+        .current_dir(work.path())
+        .args(["prompt", "system"])
+        .assert()
+        .success();
+    assert_eq!(
+        std::fs::read_to_string(&skill).unwrap(),
+        "stale body",
+        "a project install is never touched from outside its directory"
+    );
+
+    // From the project directory it reconciles.
+    install_cmd(&home, &bin_dir)
+        .current_dir(&project)
+        .args(["prompt", "system"])
+        .assert()
+        .success();
+    assert_eq!(
+        std::fs::read_to_string(&skill).unwrap(),
+        ROUTING_SKILL,
+        "the project install reconciles from its own directory"
+    );
+}
