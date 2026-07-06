@@ -306,6 +306,34 @@ jobs:
           path: mcpb-out/*.mcpb
           if-no-files-found: error
 
+      # Skill zips: crystalline-skill carries the consolidated crystalline-memory
+      # skill Claude Desktop users upload as-is (the skill FOLDER must sit at the
+      # zip root, hence zipping from inside skills/); crystalline-skills carries
+      # the four topical skills for harnesses that install skill folders directly.
+      - name: Package skill zips
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          mkdir -p skill-out
+          (cd skills && zip -qr "../skill-out/crystalline-skill-v${version}.zip" crystalline-memory)
+          (cd skills && zip -qr "../skill-out/crystalline-skills-v${version}.zip" \
+            crystalline-routing crystalline-capture crystalline-schema crystalline-collaboration)
+          # Exact-path assertions: each skill folder must sit at the zip ROOT
+          # (an unanchored grep would also match a wrong skills/<name> layout)
+          # and every topical skill must be present in the bundle zip.
+          unzip -Z1 "skill-out/crystalline-skill-v${version}.zip" | grep -qx 'crystalline-memory/SKILL.md'
+          for s in crystalline-routing crystalline-capture crystalline-schema crystalline-collaboration; do
+            unzip -Z1 "skill-out/crystalline-skills-v${version}.zip" | grep -qx "$s/SKILL.md"
+          done
+
+      - name: Upload skill zips artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: skill-zips
+          path: skill-out/*.zip
+          if-no-files-found: error
+
   publish:
     name: publish release
     needs: [build, mcpb]

@@ -99,6 +99,10 @@ async fn run_embedded_stdio(
         }
     });
 
+    // Prime the routing cache before serving so the very first `initialize`
+    // renders complete instructions, never racing the background sync above.
+    engine.refresh_routing_cache().await;
+
     let server = McpServer::new(engine);
     let running = rmcp::serve_server(server, (tokio::io::stdin(), tokio::io::stdout())).await?;
     let _ = running.waiting().await;

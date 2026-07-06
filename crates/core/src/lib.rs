@@ -33,7 +33,10 @@ pub use engram::{
 };
 pub use manifest::Manifest;
 pub use parse::{LosslessEngram, ParseError, parse_engram, parse_engram_lossless};
-pub use prompt::{PromptDomain, PromptOutput, generate_prompt, render_json, render_text};
+pub use prompt::{
+    PromptDomain, PromptOutput, generate_prompt, generate_prompt_unscoped, render_instructions,
+    render_json, render_text,
+};
 pub use schema::{
     FieldDecl, FieldType, ScalarType, Schema, SchemaDrift, SchemaIssue, ValidationMode,
 };

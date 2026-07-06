@@ -7,7 +7,7 @@ description: Use when durable knowledge is learned while working, when the user 
 
 Capturing what you learn while you work, as engrams, is the core of Crystalline. Treat it as a normal byproduct of the task, not a separate chore to remember at the end.
 
-Some deployments are read-only: if the routing prompt says this deployment's knowledge is read-only and curated externally, stand down on capture. The write tools are not exposed there and this whole skill does not apply; search and read instead.
+Some deployments are read-only: if the server instructions or an injected prompt say this deployment's knowledge is read-only and curated externally, stand down on capture. The write tools are not exposed there and this whole skill does not apply; search and read instead.
 
 ## What to capture
 
@@ -23,13 +23,7 @@ Every write requires an explicit `domain` - there is no default domain for write
 
 ## Search before you write
 
-Before creating anything, search for it:
-
-```json
-{ "tool": "search_engrams", "arguments": { "query": "retry queue backoff", "domains": ["payments"] } }
-```
-
-A hit can be a whole engram or a single observation inside one (`search_engrams` returns both kinds in the same result set, an observation hit carries its source line) - check both before deciding there is nothing to update. When the knowledge could plausibly live in another domain too, run one more sweep with `domains` omitted.
+Before creating anything, search for it - the same `search_engrams` call `crystalline-routing` already shows, scoped or broad. A hit can be a whole engram or a single observation inside one (`search_engrams` returns both kinds in the same result set, an observation hit carries its source line) - check both before deciding there is nothing to update. When the knowledge could plausibly live in another domain too, run one more sweep with `domains` omitted.
 
 ## Edit over create
 
