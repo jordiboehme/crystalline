@@ -32,9 +32,12 @@ pub fn use_daemon(db: Option<&Path>, config_path: Option<&Path>) -> bool {
     db.is_none() && config_path.is_none()
 }
 
-/// The `crystalline mcp` stdio entry: attach to (or spawn) a daemon and pump
-/// bytes, or run the full stack in-process when embedded or when no daemon can
-/// be started.
+/// The `crystalline mcp` stdio entry: attach to (or spawn) a daemon and relay
+/// the session, or run the full stack in-process when embedded or when no
+/// daemon can be started. The relay survives a daemon restart (a version
+/// takeover after an upgrade, a crash): it reconnects, replays the MCP
+/// handshake and continues the session, so the harness never sees its stdio
+/// transport die just because the daemon was replaced.
 pub async fn run_mcp(
     embedded: bool,
     db: Option<&Path>,
@@ -49,7 +52,7 @@ pub async fn run_mcp(
     match ensure_daemon(true, db, config_path, read_only).await {
         Ok(conn) => {
             let stream = conn.into_mcp().await?;
-            pump_stdio(stream).await
+            pump_stdio(stream, db, config_path, read_only).await
         }
         Err(e) => {
             init_tracing();
@@ -59,22 +62,249 @@ pub async fn run_mcp(
     }
 }
 
-/// Proxy stdin and stdout to the daemon socket. Exits when either side closes.
-async fn pump_stdio(stream: IpcStream) -> anyhow::Result<()> {
-    let (mut sock_read, mut sock_write) = tokio::io::split(stream);
-    let mut stdin = tokio::io::stdin();
-    let mut stdout = tokio::io::stdout();
-    tokio::select! {
-        r = tokio::io::copy(&mut stdin, &mut sock_write) => {
-            r?;
-            let _ = sock_write.shutdown().await;
-        }
-        r = tokio::io::copy(&mut sock_read, &mut stdout) => {
-            r?;
-            let _ = stdout.flush().await;
+/// How one relay session over a daemon socket ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionEnd {
+    /// The MCP client closed its side; the bridge is done.
+    StdinClosed,
+    /// The daemon side closed or failed; the bridge should reconnect.
+    SocketClosed,
+}
+
+/// What the relay remembers across daemon restarts: the client's handshake
+/// lines to replay verbatim and the ids of requests still waiting for a
+/// response, which get an error answer after a restart instead of silence.
+#[derive(Default)]
+struct RelayState {
+    init_request: Option<String>,
+    init_id: Option<Value>,
+    initialized_note: Option<String>,
+    outstanding: std::collections::HashMap<String, Value>,
+}
+
+impl RelayState {
+    /// Record a client-to-daemon line: the initialize handshake, the
+    /// initialized notification and every request id awaiting a response. A
+    /// client line with an id but no method is the client answering a
+    /// server-initiated request and is not tracked.
+    fn note_client_line(&mut self, line: &str) {
+        let Ok(msg) = serde_json::from_str::<Value>(line) else {
+            return;
+        };
+        let method = msg.get("method").and_then(|m| m.as_str());
+        let id = msg.get("id");
+        match (method, id) {
+            (Some("initialize"), Some(id)) => {
+                self.init_request = Some(line.to_string());
+                self.init_id = Some(id.clone());
+                self.outstanding.insert(id.to_string(), id.clone());
+            }
+            (Some("notifications/initialized"), _) => {
+                self.initialized_note = Some(line.to_string());
+            }
+            (Some(_), Some(id)) => {
+                self.outstanding.insert(id.to_string(), id.clone());
+            }
+            _ => {}
         }
     }
+
+    /// Record a daemon-to-client line: a response (an id without a method)
+    /// settles its outstanding request.
+    fn note_server_line(&mut self, line: &str) {
+        let Ok(msg) = serde_json::from_str::<Value>(line) else {
+            return;
+        };
+        if msg.get("method").is_none()
+            && let Some(id) = msg.get("id")
+        {
+            self.outstanding.remove(&id.to_string());
+        }
+    }
+}
+
+/// One connected relay session: the daemon socket split into a line reader
+/// and a writer that both live for the whole session, so no buffered bytes
+/// are lost between the handshake replay and the relay loop.
+struct Session<S> {
+    sock_lines: tokio::io::Lines<BufReader<tokio::io::ReadHalf<S>>>,
+    sock_write: tokio::io::WriteHalf<S>,
+}
+
+impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> Session<S> {
+    fn new(stream: S) -> Self {
+        let (read, write) = tokio::io::split(stream);
+        Session {
+            sock_lines: BufReader::new(read).lines(),
+            sock_write: write,
+        }
+    }
+}
+
+/// Relay lines both ways until one side ends. Returns how the session ended
+/// and whether any daemon line was forwarded, the signal that the connection
+/// was genuinely serving rather than dying straight after a reconnect.
+async fn relay_loop<In, Out, S>(
+    relay: &mut RelayState,
+    stdin: &mut tokio::io::Lines<BufReader<In>>,
+    stdout: &mut Out,
+    session: &mut Session<S>,
+) -> std::io::Result<(SessionEnd, bool)>
+where
+    In: tokio::io::AsyncRead + Unpin,
+    Out: AsyncWriteExt + Unpin,
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let mut served_any = false;
+    loop {
+        tokio::select! {
+            line = stdin.next_line() => match line? {
+                None => {
+                    let _ = session.sock_write.shutdown().await;
+                    return Ok((SessionEnd::StdinClosed, served_any));
+                }
+                Some(line) => {
+                    relay.note_client_line(&line);
+                    let sent = session.sock_write.write_all(line.as_bytes()).await.is_ok()
+                        && session.sock_write.write_all(b"\n").await.is_ok()
+                        && session.sock_write.flush().await.is_ok();
+                    if !sent {
+                        return Ok((SessionEnd::SocketClosed, served_any));
+                    }
+                }
+            },
+            line = session.sock_lines.next_line() => match line {
+                Ok(Some(line)) => {
+                    relay.note_server_line(&line);
+                    stdout.write_all(line.as_bytes()).await?;
+                    stdout.write_all(b"\n").await?;
+                    stdout.flush().await?;
+                    served_any = true;
+                }
+                Ok(None) | Err(_) => return Ok((SessionEnd::SocketClosed, served_any)),
+            },
+        }
+    }
+}
+
+/// Re-establish the MCP session on a fresh daemon connection: replay the
+/// client's `initialize` verbatim and swallow the daemon's answer (the client
+/// already holds one), replay `notifications/initialized`, then answer every
+/// request the restart orphaned with a JSON-RPC error so the client can retry
+/// instead of hanging.
+async fn resync<Out, S>(
+    relay: &mut RelayState,
+    session: &mut Session<S>,
+    stdout: &mut Out,
+) -> std::io::Result<()>
+where
+    Out: AsyncWriteExt + Unpin,
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    if let Some(init) = relay.init_request.clone() {
+        session.sock_write.write_all(init.as_bytes()).await?;
+        session.sock_write.write_all(b"\n").await?;
+        session.sock_write.flush().await?;
+        let init_key = relay.init_id.as_ref().map(|id| id.to_string());
+        loop {
+            let Some(line) = session.sock_lines.next_line().await? else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "daemon closed during handshake replay",
+                ));
+            };
+            let msg: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
+            let is_init_response =
+                msg.get("method").is_none() && msg.get("id").map(|id| id.to_string()) == init_key;
+            if is_init_response {
+                break;
+            }
+            // Anything the daemon volunteers before answering the replayed
+            // initialize predates the client's view of this session; drop it.
+        }
+        if let Some(note) = relay.initialized_note.clone() {
+            session.sock_write.write_all(note.as_bytes()).await?;
+            session.sock_write.write_all(b"\n").await?;
+            session.sock_write.flush().await?;
+        }
+    }
+
+    let orphaned: Vec<Value> = relay
+        .outstanding
+        .drain()
+        .filter(|(key, _)| Some(key) != relay.init_id.as_ref().map(|id| id.to_string()).as_ref())
+        .map(|(_, id)| id)
+        .collect();
+    for id in orphaned {
+        let error = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {
+                "code": -32000,
+                "message": "crystalline daemon restarted; retry this request",
+            },
+        });
+        stdout.write_all(error.to_string().as_bytes()).await?;
+        stdout.write_all(b"\n").await?;
+    }
+    stdout.flush().await?;
     Ok(())
+}
+
+/// Relay stdin and stdout to the daemon socket, reconnecting when the daemon
+/// goes away mid-session. Gives up after several consecutive reconnects that
+/// never manage to serve a line, so a crash-looping daemon fails the bridge
+/// loudly instead of spinning forever.
+async fn pump_stdio(
+    stream: IpcStream,
+    db: Option<&Path>,
+    config_path: Option<&Path>,
+    read_only: bool,
+) -> anyhow::Result<()> {
+    let mut relay = RelayState::default();
+    let mut stdin = BufReader::new(tokio::io::stdin()).lines();
+    let mut stdout = tokio::io::stdout();
+    let mut session = Session::new(stream);
+    let mut fruitless_reconnects = 0u32;
+
+    loop {
+        let (end, served_any) =
+            relay_loop(&mut relay, &mut stdin, &mut stdout, &mut session).await?;
+        if end == SessionEnd::StdinClosed {
+            return Ok(());
+        }
+        if served_any {
+            fruitless_reconnects = 0;
+        }
+        loop {
+            fruitless_reconnects += 1;
+            if fruitless_reconnects > 5 {
+                anyhow::bail!(
+                    "the crystalline daemon connection was lost and could not be re-established"
+                );
+            }
+            tracing::warn!("daemon connection lost; reconnecting");
+            let conn = match ensure_daemon(true, db, config_path, read_only).await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    tracing::warn!("reconnect failed: {e}");
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    continue;
+                }
+            };
+            let Ok(stream) = conn.into_mcp().await else {
+                continue;
+            };
+            session = Session::new(stream);
+            match resync(&mut relay, &mut session, &mut stdout).await {
+                Ok(()) => break,
+                Err(e) => {
+                    tracing::warn!("session replay failed: {e}");
+                    continue;
+                }
+            }
+        }
+    }
 }
 
 /// The full in-process stack over stdio. Takes the lock; refuses if held.
@@ -640,4 +870,149 @@ fn init_tracing() {
         .with_writer(std::io::stderr)
         .with_max_level(tracing::Level::WARN)
         .try_init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    fn lines_from(bytes: &'static [u8]) -> tokio::io::Lines<BufReader<&'static [u8]>> {
+        BufReader::new(bytes).lines()
+    }
+
+    #[test]
+    fn relay_state_tracks_the_handshake_and_outstanding_requests() {
+        let mut relay = RelayState::default();
+        relay.note_client_line(r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}"#);
+        relay.note_client_line(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
+        relay.note_client_line(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{}}"#);
+        relay.note_client_line(r#"{"jsonrpc":"2.0","id":9,"result":{}}"#);
+
+        assert!(relay.init_request.as_ref().unwrap().contains("initialize"));
+        assert_eq!(relay.init_id, Some(serde_json::json!(0)));
+        assert!(relay.initialized_note.is_some());
+        assert!(relay.outstanding.contains_key("1"));
+        assert!(
+            !relay.outstanding.contains_key("9"),
+            "a client response to a server request is not outstanding"
+        );
+
+        relay.note_server_line(r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#);
+        assert!(!relay.outstanding.contains_key("1"));
+        relay.note_server_line(r#"{"jsonrpc":"2.0","id":2,"method":"sampling/createMessage"}"#);
+        assert!(
+            relay.outstanding.contains_key("0"),
+            "a server request never settles an id"
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_loop_forwards_both_ways_and_reports_socket_eof() {
+        let (bridge_side, daemon_side) = tokio::io::duplex(4096);
+        let daemon = tokio::spawn(async move {
+            let (read, mut write) = tokio::io::split(daemon_side);
+            let mut lines = BufReader::new(read).lines();
+            let request = lines.next_line().await.unwrap().unwrap();
+            assert!(request.contains("tools/call"));
+            write
+                .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n")
+                .await
+                .unwrap();
+            write.flush().await.unwrap();
+            // Then the daemon dies.
+            drop(write);
+            drop(lines);
+        });
+
+        // stdin stays open (the writer half is kept alive), so the loop ends
+        // on the daemon's EOF, not on a client close racing the response.
+        let (mut stdin_feed, stdin_read) = tokio::io::duplex(1024);
+        stdin_feed
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\"}\n")
+            .await
+            .unwrap();
+        let mut relay = RelayState::default();
+        let mut stdin = BufReader::new(stdin_read).lines();
+        let mut stdout = Vec::new();
+        let mut session = Session::new(bridge_side);
+
+        let (end, served) = relay_loop(&mut relay, &mut stdin, &mut stdout, &mut session)
+            .await
+            .unwrap();
+        assert_eq!(end, SessionEnd::SocketClosed);
+        assert!(served);
+        let out = String::from_utf8(stdout).unwrap();
+        assert!(out.contains("\"id\":1"), "{out}");
+        assert!(relay.outstanding.is_empty(), "the response settled the id");
+        daemon.await.unwrap();
+        drop(stdin_feed);
+    }
+
+    #[tokio::test]
+    async fn resync_replays_the_handshake_and_fails_orphaned_requests() {
+        let mut relay = RelayState::default();
+        relay.note_client_line(
+            r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"clientInfo":{}}}"#,
+        );
+        relay.note_server_line(r#"{"jsonrpc":"2.0","id":0,"result":{"serverInfo":{}}}"#);
+        relay.note_client_line(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
+        relay.note_client_line(r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{}}"#);
+
+        let (bridge_side, daemon_side) = tokio::io::duplex(4096);
+        let daemon = tokio::spawn(async move {
+            let (read, mut write) = tokio::io::split(daemon_side);
+            let mut lines = BufReader::new(read).lines();
+            let init = lines.next_line().await.unwrap().unwrap();
+            assert!(init.contains("\"initialize\""), "{init}");
+            // A notification the fresh daemon volunteers before answering.
+            write
+                .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\"}\n")
+                .await
+                .unwrap();
+            write
+                .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"serverInfo\":{}}}\n")
+                .await
+                .unwrap();
+            write.flush().await.unwrap();
+            let note = lines.next_line().await.unwrap().unwrap();
+            assert!(note.contains("notifications/initialized"), "{note}");
+            (init, note)
+        });
+
+        let mut stdout = Vec::new();
+        let mut session = Session::new(bridge_side);
+        resync(&mut relay, &mut session, &mut stdout).await.unwrap();
+
+        let out = String::from_utf8(stdout).unwrap();
+        assert!(
+            out.contains("\"id\":7") && out.contains("daemon restarted"),
+            "the orphaned request gets an error answer: {out}"
+        );
+        assert!(
+            !out.contains("serverInfo") && !out.contains("notifications/message"),
+            "nothing from the replayed handshake reaches the client: {out}"
+        );
+        assert!(relay.outstanding.is_empty());
+        daemon.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn relay_loop_reports_stdin_closed_on_client_eof() {
+        let (bridge_side, mut daemon_side) = tokio::io::duplex(4096);
+        let mut relay = RelayState::default();
+        let mut stdin = lines_from(b"");
+        let mut stdout = Vec::new();
+        let mut session = Session::new(bridge_side);
+
+        let (end, served) = relay_loop(&mut relay, &mut stdin, &mut stdout, &mut session)
+            .await
+            .unwrap();
+        assert_eq!(end, SessionEnd::StdinClosed);
+        assert!(!served);
+        // The daemon side sees EOF from the shutdown.
+        let mut buf = Vec::new();
+        daemon_side.read_to_end(&mut buf).await.unwrap();
+        assert!(buf.is_empty());
+    }
 }
