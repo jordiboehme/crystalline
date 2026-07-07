@@ -3967,6 +3967,17 @@ fn build_markdown(
     };
     fm.recorded_at = chrono::NaiveDate::parse_from_str(recorded_at, "%Y-%m-%d").ok();
     fm.timestamp = DateTime::parse_from_rfc3339(timestamp).ok();
+    // Models routinely double-encode nested tool arguments, so an object
+    // arriving as a JSON string is accepted by parsing it first.
+    let decoded;
+    let metadata = match metadata {
+        Some(Value::String(raw)) => {
+            decoded = serde_json::from_str::<Value>(raw)
+                .map_err(|_| EngineError::Invalid("metadata must be an object".into()))?;
+            Some(&decoded)
+        }
+        other => other,
+    };
     if let Some(Value::Object(map)) = metadata {
         for (k, v) in map {
             if is_reserved_key(k) {

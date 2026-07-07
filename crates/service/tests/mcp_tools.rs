@@ -658,3 +658,46 @@ async fn validate_and_infer_schema() {
     assert_eq!(inferred["type"], json!("note"));
     assert!(inferred["count"].as_u64().unwrap() >= 2);
 }
+
+/// Models routinely double-encode nested tool arguments: a `metadata`
+/// object arriving as a JSON string is accepted by parsing it first, so
+/// temporal bounds set that way land in the frontmatter instead of
+/// erroring. Anything that is not an object, before or after decoding,
+/// still fails with the plain must-be-an-object error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_engram_accepts_metadata_as_a_json_encoded_string() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    call(
+        peer,
+        "write_engram",
+        json!({
+            "domain": "eng",
+            "title": "Bounded policy",
+            "content": "A bounded rule.\n\n- [fact] bounded #eng\n- [fact] expires soon #eng",
+            "tags": ["eng"],
+            "metadata": "{\"valid_to\": \"2026-09-30\"}",
+        }),
+    )
+    .await
+    .unwrap();
+    let text = std::fs::read_to_string(h.root.join("eng/bounded-policy.md")).unwrap();
+    assert!(text.contains("valid_to"), "valid_to missing: {text}");
+    assert!(text.contains("2026-09-30"), "bound value missing: {text}");
+
+    let err = call(
+        peer,
+        "write_engram",
+        json!({
+            "domain": "eng",
+            "title": "Nope",
+            "content": "x",
+            "metadata": "not json at all",
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("must be an object"), "unexpected error: {err}");
+}
