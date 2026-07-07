@@ -4,6 +4,13 @@
 //! exclusive lock held on `service.lock` for the owner's lifetime; the socket
 //! (a Unix domain socket, or the named pipe `\\.\pipe\crystalline` on Windows)
 //! is how everyone else reaches it. See `research/single-instance-ipc.md`.
+//!
+//! Attaching is version aware: the lock record carries the owner's version,
+//! and a client built from a newer version displaces an older daemon with a
+//! graceful ctl shutdown before taking over, so a binary upgrade needs no
+//! manual daemon restart. The takeover is one-way on purpose - an older
+//! client attaches to a newer daemon as-is - which keeps lingering
+//! old-binary bridges from flip-flopping an upgraded daemon back.
 
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -144,18 +151,111 @@ pub fn read_lock_info() -> Option<LockInfo> {
 
 /// Attach to a running daemon if one is reachable. Returns `None` when no live
 /// daemon owns the index (no lock record, a dead pid or an unreachable socket),
-/// which is the signal that ownership is takeable.
+/// which is the signal that ownership is takeable. A daemon older than this
+/// binary is displaced first (graceful shutdown, then `None`), so the caller
+/// proceeds exactly as if no daemon ran and the next spawn runs the new
+/// version.
 pub async fn try_attach() -> Option<Connection> {
     let info = read_lock_info()?;
     if !process_alive(info.pid) {
         return None;
     }
+    if attach_policy(&info.version, crystalline_core::VERSION) == AttachPolicy::Displace {
+        let sock = config::service_sock_path().ok()?;
+        tracing::info!(
+            "displacing crystalline daemon v{} (pid {}) in favor of v{}",
+            info.version,
+            info.pid,
+            crystalline_core::VERSION
+        );
+        if displace(&sock, info.pid).await {
+            return None;
+        }
+        tracing::warn!(
+            "daemon v{} (pid {}) did not shut down; attaching to it as-is",
+            info.version,
+            info.pid
+        );
+    }
+    connect_socket().await
+}
+
+/// Connect to the daemon socket at its configured path.
+async fn connect_socket() -> Option<Connection> {
     let sock = config::service_sock_path().ok()?;
     let name = socket_name(&sock).ok()?;
     match IpcStream::connect(name).await {
         Ok(stream) => Some(Connection { stream }),
         Err(_) => None,
     }
+}
+
+/// What a client should do about a running daemon, given both versions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachPolicy {
+    /// Attach normally: same version, a newer daemon or an unparseable pair.
+    Attach,
+    /// The daemon is older than this binary: shut it down and take over.
+    Displace,
+}
+
+/// Decide between attaching and displacing. Only a strictly newer client
+/// displaces; everything else, including versions that fail to parse,
+/// attaches, so an odd lock record can never trigger a shutdown.
+pub fn attach_policy(daemon_version: &str, own_version: &str) -> AttachPolicy {
+    match (version_triple(daemon_version), version_triple(own_version)) {
+        (Some(daemon), Some(own)) if daemon < own => AttachPolicy::Displace,
+        _ => AttachPolicy::Attach,
+    }
+}
+
+/// Parse a version string's numeric `major.minor.patch` triple, ignoring any
+/// pre-release or build suffix.
+fn version_triple(version: &str) -> Option<(u64, u64, u64)> {
+    let core = version.split(['-', '+']).next().unwrap_or(version);
+    let mut parts = core.split('.');
+    let major = parts.next()?.trim().parse().ok()?;
+    let minor = parts.next()?.trim().parse().ok()?;
+    let patch = parts.next().unwrap_or("0").trim().parse().ok()?;
+    Some((major, minor, patch))
+}
+
+/// Ask the daemon behind `sock` to shut down gracefully and wait for `pid` to
+/// exit. Returns true once the process is gone, meaning ownership is takeable;
+/// false leaves the daemon in place and the caller attaches to it as before,
+/// so a failed takeover degrades to the old behavior instead of contending
+/// for the index.
+async fn displace(sock: &Path, pid: u32) -> bool {
+    let Ok(name) = socket_name(sock) else {
+        return false;
+    };
+    let stream = match IpcStream::connect(name).await {
+        Ok(stream) => stream,
+        // Nothing answers: gone already, or wedged beyond a graceful ask.
+        Err(_) => return !process_alive(pid),
+    };
+    let conn = Connection { stream };
+    let Ok(mut stream) = conn.into_ctl().await else {
+        return false;
+    };
+    if stream
+        .write_all(b"{\"v\":1,\"cmd\":\"shutdown\"}\n")
+        .await
+        .is_err()
+        || stream.flush().await.is_err()
+    {
+        return false;
+    }
+    // Read the ack best-effort, then wait for the process to leave.
+    let mut buf = [0u8; 256];
+    let _ = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf)).await;
+    for _ in 0..100 {
+        if !process_alive(pid) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    false
 }
 
 /// Attach to a daemon, spawning one detached and polling for readiness (up to
@@ -295,5 +395,124 @@ pub fn process_alive(pid: u32) -> bool {
     {
         let _ = pid;
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attach_policy_displaces_only_a_strictly_older_daemon() {
+        assert_eq!(attach_policy("0.5.1", "0.5.2"), AttachPolicy::Displace);
+        assert_eq!(attach_policy("0.4.9", "0.5.0"), AttachPolicy::Displace);
+        assert_eq!(attach_policy("0.5.2", "0.5.2"), AttachPolicy::Attach);
+        assert_eq!(
+            attach_policy("0.6.0", "0.5.2"),
+            AttachPolicy::Attach,
+            "an older client never displaces a newer daemon"
+        );
+    }
+
+    #[test]
+    fn attach_policy_never_displaces_on_unparseable_versions() {
+        assert_eq!(attach_policy("", "0.5.2"), AttachPolicy::Attach);
+        assert_eq!(attach_policy("dev", "0.5.2"), AttachPolicy::Attach);
+        assert_eq!(attach_policy("0.5.1", "junk"), AttachPolicy::Attach);
+    }
+
+    #[test]
+    fn version_triples_ignore_suffixes_and_tolerate_two_parts() {
+        assert_eq!(version_triple("1.2.3"), Some((1, 2, 3)));
+        assert_eq!(version_triple("1.2.3-rc.1"), Some((1, 2, 3)));
+        assert_eq!(version_triple("1.2.3+build7"), Some((1, 2, 3)));
+        assert_eq!(version_triple("1.2"), Some((1, 2, 0)));
+        assert_eq!(version_triple("nope"), None);
+    }
+
+    /// The displacement mechanics against a scripted daemon: a mini ctl
+    /// server on a temp socket that records the shutdown request and a real
+    /// child process standing in for the daemon pid.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn displace_sends_shutdown_and_waits_for_the_pid_to_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("crystalline.sock");
+        let name = socket_name(&sock).unwrap();
+        let listener = ListenerOptions::new().name(name).create_tokio().unwrap();
+
+        // A long-lived child stands in for the daemon process.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+
+        let server = tokio::spawn(async move {
+            let mut stream = listener.accept().await.unwrap();
+            let mode = read_mode_line(&mut stream).await.unwrap();
+            let mut line = Vec::new();
+            let mut byte = [0u8; 1];
+            loop {
+                let n = stream.read(&mut byte).await.unwrap();
+                if n == 0 || byte[0] == b'\n' {
+                    break;
+                }
+                line.push(byte[0]);
+            }
+            stream.write_all(b"{\"ok\":true}\n").await.unwrap();
+            stream.flush().await.unwrap();
+            (mode, String::from_utf8(line).unwrap())
+        });
+
+        // Kill the stand-in shortly after the ask, like a daemon exiting.
+        let killer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let _ = child.kill();
+            let _ = child.wait();
+        });
+
+        assert!(displace(&sock, pid).await, "the daemon pid went away");
+        let (mode, request) = server.await.unwrap();
+        assert_eq!(mode, "ctl");
+        assert!(request.contains("\"shutdown\""), "{request}");
+        killer.await.unwrap();
+    }
+
+    /// A daemon that ignores the ask is left in place: displace reports
+    /// failure so the caller attaches to it instead of contending.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn displace_reports_failure_when_the_pid_stays() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("crystalline.sock");
+        let name = socket_name(&sock).unwrap();
+        let listener = ListenerOptions::new().name(name).create_tokio().unwrap();
+
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+
+        let server = tokio::spawn(async move {
+            let mut stream = listener.accept().await.unwrap();
+            let _ = read_mode_line(&mut stream).await;
+            let mut sink = [0u8; 64];
+            let _ = stream.read(&mut sink).await;
+            stream.write_all(b"{\"ok\":true}\n").await.unwrap();
+            stream.flush().await.unwrap();
+            // Keep the stream open; the "daemon" never exits.
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        });
+
+        assert!(!displace(&sock, pid).await, "the pid never went away");
+        server.abort();
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
