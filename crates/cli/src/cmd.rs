@@ -1297,55 +1297,101 @@ pub(crate) fn bare_host(auth_base: &str) -> Option<String> {
 /// own `HEALTHCHECK`, a Kubernetes `httpGet` probe, a load balancer) sees, so
 /// a green result here means those see green too. `0.0.0.0` and `[::]` are
 /// rewritten to `127.0.0.1` first - valid addresses to bind, never valid to
-/// dial as a client. On success, prints the health body (the
+/// dial as a client. The whole probe runs under one 4s wall-clock deadline,
+/// comfortably inside the container image's 5s `HEALTHCHECK` timeout:
+/// `set_read_timeout` alone only bounds a single syscall, not the whole read,
+/// so a peer trickling bytes could re-arm the clock indefinitely; connect,
+/// write and every read are instead each capped at whatever time remains
+/// before the deadline, tracked by hand since there is no thread involved to
+/// enforce it from outside. On success, prints the health body (the
 /// `{"status":"ok","version":...}` JSON that also lands in `docker inspect`)
 /// and returns `Ok`; any failure - connection refused, a timeout, a non-200
-/// status or a malformed response - comes back as an `Err` naming the
-/// address it failed against, so the process exits nonzero through the
+/// status or a malformed response - comes back as a single-line `Err` naming
+/// the address it failed against, so the process exits nonzero through the
 /// normal error path.
 pub fn healthcheck(addr: &str) -> Result<()> {
     use std::io::{Read, Write};
     use std::net::{TcpStream, ToSocketAddrs};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
+    let deadline = Instant::now() + Duration::from_secs(4);
     let connect_addr = loopback_connect_addr(addr);
+
+    // The one thing standing in for a real aggregate deadline: recompute the
+    // time left before every blocking step and refuse to arm a timeout once
+    // it hits zero (a zero-duration `set_read_timeout` is an error on some
+    // platforms, so this also guards that case).
+    let remaining_or_bail = || -> Result<Duration> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            bail!("health probe to {connect_addr} exceeded its 4s deadline");
+        }
+        Ok(remaining)
+    };
+
     let socket_addr = connect_addr
         .as_str()
         .to_socket_addrs()
-        .with_context(|| format!("resolving {connect_addr}"))?
+        .map_err(|e| anyhow!("resolving {connect_addr}: {e}"))?
         .next()
         .ok_or_else(|| anyhow!("no address resolved for {connect_addr}"))?;
 
-    let mut stream = TcpStream::connect_timeout(&socket_addr, Duration::from_secs(2))
-        .with_context(|| format!("connecting to {connect_addr}"))?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(3)))
-        .with_context(|| format!("setting a read timeout for {connect_addr}"))?;
-    stream
-        .set_write_timeout(Some(Duration::from_secs(3)))
-        .with_context(|| format!("setting a write timeout for {connect_addr}"))?;
+    let connect_timeout = remaining_or_bail()?.min(Duration::from_secs(2));
+    let mut stream = TcpStream::connect_timeout(&socket_addr, connect_timeout)
+        .map_err(|e| anyhow!("connecting to {connect_addr}: {e}"))?;
 
-    let request = format!("GET /health HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    let write_timeout = remaining_or_bail()?.min(Duration::from_secs(2));
+    stream
+        .set_write_timeout(Some(write_timeout))
+        .map_err(|e| anyhow!("setting a write timeout for {connect_addr}: {e}"))?;
+
+    let request =
+        format!("GET /health HTTP/1.1\r\nHost: {connect_addr}\r\nConnection: close\r\n\r\n");
     stream
         .write_all(request.as_bytes())
-        .with_context(|| format!("sending the health request to {connect_addr}"))?;
+        .map_err(|e| anyhow!("sending the health request to {connect_addr}: {e}"))?;
 
-    let mut response = String::new();
-    stream
-        .read_to_string(&mut response)
-        .with_context(|| format!("reading the health response from {connect_addr}"))?;
+    // A manual read loop instead of a bare `read_to_string`: that call would
+    // block until EOF with only a per-syscall timeout behind it, so a slow
+    // peer could keep it alive well past the aggregate deadline above.
+    let mut buf = [0u8; 4096];
+    let mut response = Vec::new();
+    loop {
+        let remaining = remaining_or_bail()?;
+        stream
+            .set_read_timeout(Some(remaining))
+            .map_err(|e| anyhow!("setting a read timeout for {connect_addr}: {e}"))?;
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => response.extend_from_slice(&buf[..n]),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                bail!("health probe to {connect_addr} exceeded its 4s deadline");
+            }
+            Err(e) => bail!("reading the health response from {connect_addr}: {e}"),
+        }
+    }
+    let response = String::from_utf8_lossy(&response).into_owned();
 
     let status_line = response
         .lines()
         .next()
         .ok_or_else(|| anyhow!("empty response from {connect_addr}"))?;
-    if !status_line.contains("200") {
+    let mut tokens = status_line.split_ascii_whitespace();
+    let (Some(_), Some(code)) = (tokens.next(), tokens.next()) else {
+        bail!("malformed status line from {connect_addr}: {status_line}");
+    };
+    if code != "200" {
         bail!("unhealthy response from {connect_addr}: {status_line}");
     }
 
-    let body = response
-        .split_once("\r\n\r\n")
-        .map_or(response.as_str(), |(_, body)| body);
+    let (_, body) = response.split_once("\r\n\r\n").ok_or_else(|| {
+        anyhow!("malformed response from {connect_addr}: missing header separator")
+    })?;
     println!("{}", body.trim());
     Ok(())
 }

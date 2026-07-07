@@ -980,18 +980,35 @@ fn wait_port(addr: &str) {
 /// `crystalline healthcheck` against a port nothing is listening on: the
 /// connection is refused immediately, so this needs no daemon spawn and no
 /// wait, unlike the success path piggybacked on the HTTP smoke test above.
+///
+/// The aggregate 4s read deadline itself is not exercised here (that would
+/// need a peer that trickles bytes forever, i.e. a dedicated trickle server);
+/// this only checks the failure-message shape, which every I/O path shares.
 #[test]
 fn healthcheck_against_nothing_exits_nonzero() {
     let port = free_port();
-    let status = Command::new(bin())
+    let output = Command::new(bin())
         .args(["healthcheck", &format!("127.0.0.1:{port}")])
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+        .output()
         .unwrap();
     assert!(
-        !status.success(),
+        !output.status.success(),
         "healthcheck against a closed port exits nonzero"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr.lines().count(),
+        1,
+        "healthcheck failure is a single line, not an anyhow Debug chain: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("Caused by"),
+        "healthcheck failure must not print anyhow's multi-line Debug chain: {stderr:?}"
+    );
+    assert!(
+        stderr.contains(&format!("127.0.0.1:{port}")),
+        "healthcheck failure names the address it failed against: {stderr:?}"
     );
 }
 
