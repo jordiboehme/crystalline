@@ -72,8 +72,10 @@ with `systemctl status crystalline` and `journalctl -u crystalline` rather
 than `crystalline ctl` (the daemon's socket lives under the service user, out
 of reach of a login shell). A tarball install gets the same unit from the
 repository at `crates/cli/debian/crystalline.service`, copied to
-`/etc/systemd/system/`. Upgrading the package restarts the service only if it
-is running; a disabled unit stays untouched.
+`/etc/systemd/system/` with ExecStart adjusted to where the binary landed (a
+standalone binary is often `/usr/local/bin/crystalline`). Upgrading the
+package restarts the service only if it is running; a disabled unit stays
+untouched.
 
 ```mermaid
 flowchart LR

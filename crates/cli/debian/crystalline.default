@@ -10,6 +10,8 @@
 #CRYSTALLINE_SERVICE_READ_ONLY=true
 
 # Self-provision a team domain from GitHub on first start.
+# Domain folders outside /var/lib/crystalline need a ReadWritePaths= drop-in
+# (sudo systemctl edit crystalline) - the sandbox is read-only elsewhere.
 #CRYSTALLINE_GITHUB_ENABLED=true
 #CRYSTALLINE_GITHUB_TOKEN=ghp_replace_me
 #CRYSTALLINE_DOMAIN_TEAM=/srv/knowledge/team

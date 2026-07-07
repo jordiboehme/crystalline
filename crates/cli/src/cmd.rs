@@ -1290,6 +1290,10 @@ pub(crate) fn bare_host(auth_base: &str) -> Option<String> {
 
 // --- healthcheck ---------------------------------------------------------------
 
+/// Wall-clock deadline for the whole probe in [`healthcheck`], comfortably
+/// inside the container image's 5s `HEALTHCHECK` timeout.
+const HEALTHCHECK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(4);
+
 /// `crystalline healthcheck`: probe a serving daemon's `GET /health` endpoint
 /// with a hand-rolled HTTP/1.1 request over a plain `TcpStream` - no tokio
 /// runtime, no TLS, no daemon socket, config or database touched. That
@@ -1297,24 +1301,24 @@ pub(crate) fn bare_host(auth_base: &str) -> Option<String> {
 /// own `HEALTHCHECK`, a Kubernetes `httpGet` probe, a load balancer) sees, so
 /// a green result here means those see green too. `0.0.0.0` and `[::]` are
 /// rewritten to `127.0.0.1` first - valid addresses to bind, never valid to
-/// dial as a client. The whole probe runs under one 4s wall-clock deadline,
-/// comfortably inside the container image's 5s `HEALTHCHECK` timeout:
-/// `set_read_timeout` alone only bounds a single syscall, not the whole read,
-/// so a peer trickling bytes could re-arm the clock indefinitely; connect,
-/// write and every read are instead each capped at whatever time remains
-/// before the deadline, tracked by hand since there is no thread involved to
-/// enforce it from outside. On success, prints the health body (the
-/// `{"status":"ok","version":...}` JSON that also lands in `docker inspect`)
-/// and returns `Ok`; any failure - connection refused, a timeout, a non-200
-/// status or a malformed response - comes back as a single-line `Err` naming
-/// the address it failed against, so the process exits nonzero through the
-/// normal error path.
-pub fn healthcheck(addr: &str) -> Result<()> {
+/// dial as a client. The whole probe runs under one [`HEALTHCHECK_DEADLINE`]
+/// wall-clock deadline, comfortably inside the container image's 5s
+/// `HEALTHCHECK` timeout: `set_read_timeout` alone only bounds a single
+/// syscall, not the whole read, so a peer trickling bytes could re-arm the
+/// clock indefinitely; connect, write and every read are instead each
+/// capped at whatever time remains before the deadline, tracked by hand
+/// since there is no thread involved to enforce it from outside. On
+/// success, prints the health body (the `{"status":"ok","version":...}` JSON
+/// that also lands in `docker inspect`) and returns `Ok`; any failure -
+/// connection refused, a timeout, a non-200 status or a malformed response -
+/// comes back as a single-line `Err` naming the address it failed against,
+/// so the process exits nonzero through the normal error path.
+pub(crate) fn healthcheck(addr: &str) -> Result<()> {
     use std::io::{Read, Write};
     use std::net::{TcpStream, ToSocketAddrs};
     use std::time::{Duration, Instant};
 
-    let deadline = Instant::now() + Duration::from_secs(4);
+    let deadline = Instant::now() + HEALTHCHECK_DEADLINE;
     let connect_addr = loopback_connect_addr(addr);
 
     // The one thing standing in for a real aggregate deadline: recompute the
@@ -1324,7 +1328,10 @@ pub fn healthcheck(addr: &str) -> Result<()> {
     let remaining_or_bail = || -> Result<Duration> {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            bail!("health probe to {connect_addr} exceeded its 4s deadline");
+            bail!(
+                "health probe to {connect_addr} exceeded its {}s deadline",
+                HEALTHCHECK_DEADLINE.as_secs()
+            );
         }
         Ok(remaining)
     };
@@ -1370,7 +1377,10 @@ pub fn healthcheck(addr: &str) -> Result<()> {
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 ) =>
             {
-                bail!("health probe to {connect_addr} exceeded its 4s deadline");
+                bail!(
+                    "health probe to {connect_addr} exceeded its {}s deadline",
+                    HEALTHCHECK_DEADLINE.as_secs()
+                );
             }
             Err(e) => bail!("reading the health response from {connect_addr}: {e}"),
         }
