@@ -930,6 +930,30 @@ pub fn render_status(data: &serde_json::Value, daemon_note: &str) {
         }
     );
 
+    // What the daemon is doing right now; only its report carries this.
+    if let Some(activity) = data.get("activity") {
+        let running = activity["now"].as_array().cloned().unwrap_or_default();
+        if running.is_empty() {
+            println!("Activity: idle");
+        }
+        for entry in &running {
+            let domain = entry["domain"]
+                .as_str()
+                .map(|d| format!(" '{d}'"))
+                .unwrap_or_default();
+            println!(
+                "Activity: {}{} ({}s)",
+                entry["kind"].as_str().unwrap_or("working"),
+                domain,
+                entry["for_secs"].as_u64().unwrap_or(0)
+            );
+        }
+        let backlog = activity["embedding_backlog"].as_u64().unwrap_or(0);
+        if backlog > 0 {
+            println!("  embedding backlog: {backlog} chunks");
+        }
+    }
+
     let domains = data["domains"].as_array().cloned().unwrap_or_default();
     if domains.is_empty() && registered.is_empty() {
         println!("No domains indexed yet.");
@@ -953,6 +977,35 @@ pub fn render_status(data: &serde_json::Value, daemon_note: &str) {
         if !indexed_names.contains(name) {
             println!("{name}\t(not indexed yet)");
         }
+    }
+
+    // Team-origin schedule: what the background poller has planned and how
+    // its last pass went, present only when collaboration is enabled.
+    for d in data["origins"]["domains"]
+        .as_array()
+        .iter()
+        .flat_map(|a| a.iter())
+    {
+        let next = d["next_due"]
+            .as_str()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|t| {
+                let secs = (t.with_timezone(&chrono::Utc) - chrono::Utc::now()).num_seconds();
+                if secs > 0 {
+                    format!("in {secs}s")
+                } else {
+                    "due now".to_string()
+                }
+            })
+            .unwrap_or_else(|| "not scheduled".to_string());
+        let last = d["last_result"]["outcome"].as_str().unwrap_or("never");
+        println!(
+            "Origin '{}' ({}): next poll {}, last {}",
+            d["domain"].as_str().unwrap_or(""),
+            d["repo"].as_str().unwrap_or(""),
+            next,
+            last
+        );
     }
 }
 

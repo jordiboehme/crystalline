@@ -965,6 +965,7 @@ fn status_with_a_daemon_renders_text_with_the_daemon_line() {
     assert!(ok, "{out}");
     assert!(out.starts_with("Daemon: running (pid "), "{out}");
     assert!(out.contains("Index: "), "{out}");
+    assert!(out.contains("Activity: "), "{out}");
     assert!(out.contains("eng\t"), "{out}");
 
     let (ok, out) = env.run(&["status", "--json"]);

@@ -356,6 +356,94 @@ pub struct Engine {
     // virtual-source write, and read here under the lock. Empty at construction
     // and for an engine that never serves MCP.
     routing_virtual: std::sync::RwLock<BTreeMap<String, Vec<String>>>,
+    // A live view of what this engine is doing (sync, embed, reindex), fed by
+    // RAII guards from the maintenance operations and read by `status_report`'s
+    // activity block. Behind an `Arc` so a guard owns its own handle and a
+    // panicking or early-returning operation still clears its entry on drop.
+    activity: Arc<std::sync::Mutex<ActivityState>>,
+}
+
+/// The engine's observable activity: what is running now and what finished
+/// last. Fed exclusively through [`ActivityGuard`]s.
+#[derive(Default)]
+pub(crate) struct ActivityState {
+    next_token: u64,
+    current: Vec<(u64, ActivityEntry)>,
+    last_done: Option<(ActivityEntry, chrono::DateTime<chrono::Utc>)>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ActivityEntry {
+    kind: &'static str,
+    domain: Option<String>,
+    started_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl ActivityState {
+    /// Register an operation and hand back the guard that ends it.
+    pub(crate) fn begin(
+        state: &Arc<std::sync::Mutex<ActivityState>>,
+        kind: &'static str,
+        domain: Option<&str>,
+    ) -> ActivityGuard {
+        let mut inner = state.lock().unwrap();
+        inner.next_token += 1;
+        let token = inner.next_token;
+        inner.current.push((
+            token,
+            ActivityEntry {
+                kind,
+                domain: domain.map(str::to_string),
+                started_at: chrono::Utc::now(),
+            },
+        ));
+        ActivityGuard {
+            state: Arc::clone(state),
+            token,
+        }
+    }
+
+    /// The status-report shape: `now` lists running operations with their
+    /// elapsed seconds, `last` the most recently finished one.
+    pub(crate) fn snapshot_json(&self) -> Value {
+        let now = chrono::Utc::now();
+        let current: Vec<Value> = self
+            .current
+            .iter()
+            .map(|(_, e)| {
+                json!({
+                    "kind": e.kind,
+                    "domain": e.domain,
+                    "for_secs": (now - e.started_at).num_seconds().max(0),
+                })
+            })
+            .collect();
+        let last = self.last_done.as_ref().map(|(e, at)| {
+            json!({
+                "kind": e.kind,
+                "domain": e.domain,
+                "finished_at": at.to_rfc3339(),
+            })
+        });
+        json!({ "now": current, "last": last })
+    }
+}
+
+/// Ends the activity it belongs to on drop, recording it as the last
+/// finished operation.
+pub(crate) struct ActivityGuard {
+    state: Arc<std::sync::Mutex<ActivityState>>,
+    token: u64,
+}
+
+impl Drop for ActivityGuard {
+    fn drop(&mut self) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(pos) = state.current.iter().position(|(t, _)| *t == self.token) {
+            let (_, entry) = state.current.remove(pos);
+            state.last_done = Some((entry, chrono::Utc::now()));
+        }
+    }
 }
 
 impl Engine {
@@ -401,6 +489,7 @@ impl Engine {
             token_store_dir_override: None,
             origin_poller: poller::OriginPollerState::default(),
             routing_virtual: std::sync::RwLock::new(BTreeMap::new()),
+            activity: Arc::default(),
         }
     }
 
@@ -2164,6 +2253,7 @@ impl Engine {
     /// named one and `take_over` forces the claim. Outside collaboration mode
     /// (standalone, single-instance) nothing is claimed and every target syncs.
     pub async fn sync_take_over(&self, only: Option<&str>, take_over: bool) -> Result<Value> {
+        let _activity = ActivityState::begin(&self.activity, "sync", only);
         let targets = self.sync_targets(only)?;
         let collab = !self.instance_id.is_empty();
         let store = self.store.lock().await;
@@ -2209,6 +2299,7 @@ impl Engine {
     /// untouched (neither cleared nor resynced), so a non-host never rebuilds the
     /// host's rows out from under it.
     pub async fn reindex(&self, full: bool) -> Result<Value> {
+        let _activity = ActivityState::begin(&self.activity, "reindex", None);
         let targets = self.sync_targets(None)?;
         let collab = !self.instance_id.is_empty();
         let store = self.store.lock().await;
@@ -2316,6 +2407,13 @@ impl Engine {
             .keys()
             .cloned()
             .collect();
+        let mut activity = self.activity.lock().unwrap().snapshot_json();
+        if let Value::Object(map) = &mut activity {
+            map.insert(
+                "embedding_backlog".to_string(),
+                json!(coverage.total_chunks.saturating_sub(active_embedded)),
+            );
+        }
         let mut result = json!({
             "fts_mode": info.fts_mode,
             "schema_version": info.schema_version,
@@ -2331,6 +2429,7 @@ impl Engine {
                 "total_chunks": coverage.total_chunks,
                 "hybrid_available": coverage.has_active_embeddings(&self.model_id),
             },
+            "activity": activity,
         });
         // Omitted entirely while collaboration is off, so pre-feature output
         // stays byte-stable for an install that never touches GitHub.
@@ -2401,6 +2500,7 @@ impl Engine {
         if jobs.is_empty() {
             return Ok(0);
         }
+        let _activity = ActivityState::begin(&self.activity, "embed", None);
         let mut embedded = 0usize;
         for batch in jobs.chunks(EMBED_BATCH) {
             let texts: Vec<String> = batch.iter().map(|j| j.text.clone()).collect();
@@ -4070,5 +4170,40 @@ fn json_to_yaml(v: &Value) -> YamlValue {
                 .map(|(k, v)| (k.clone(), json_to_yaml(v)))
                 .collect(),
         ),
+    }
+}
+
+#[cfg(test)]
+mod activity_tests {
+    use super::*;
+
+    #[test]
+    fn activity_guard_registers_and_clears_on_drop() {
+        let state = Arc::new(std::sync::Mutex::new(ActivityState::default()));
+        let guard = ActivityState::begin(&state, "sync", Some("payments"));
+        let snap = state.lock().unwrap().snapshot_json();
+        assert_eq!(snap["now"][0]["kind"], "sync");
+        assert_eq!(snap["now"][0]["domain"], "payments");
+        assert!(snap["last"].is_null());
+
+        drop(guard);
+        let snap = state.lock().unwrap().snapshot_json();
+        assert_eq!(snap["now"], serde_json::json!([]));
+        assert_eq!(snap["last"]["kind"], "sync");
+        assert_eq!(snap["last"]["domain"], "payments");
+    }
+
+    #[test]
+    fn overlapping_activity_guards_clear_independently() {
+        let state = Arc::new(std::sync::Mutex::new(ActivityState::default()));
+        let sync = ActivityState::begin(&state, "sync", None);
+        let embed = ActivityState::begin(&state, "embed", None);
+
+        drop(sync);
+        let snap = state.lock().unwrap().snapshot_json();
+        assert_eq!(snap["now"].as_array().unwrap().len(), 1);
+        assert_eq!(snap["now"][0]["kind"], "embed");
+        assert_eq!(snap["last"]["kind"], "sync");
+        drop(embed);
     }
 }
