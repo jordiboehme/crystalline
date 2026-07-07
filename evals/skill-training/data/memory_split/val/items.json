@@ -1,0 +1,354 @@
+[
+  {
+    "id": "cap-dedupe-06",
+    "workspace": "acme",
+    "task_type": "dedupe_edit",
+    "question": "Add to the knowledge base: credit notes share the invoice number sequence with a CN prefix.",
+    "expect": {
+      "edit": {
+        "identifier": "invoice-numbering-convention",
+        "domain": "payments"
+      },
+      "forbid_new_engram": true
+    },
+    "bench": "capture"
+  },
+  {
+    "id": "cap-domain-03",
+    "workspace": "acme",
+    "task_type": "domain_choice",
+    "question": "The payments retro taught us refund escalation pages should include the invoice number - the duty manager asked for it. Capture where it belongs.",
+    "expect": {
+      "edit": {
+        "identifier": "refund-escalation-rotation",
+        "domain": "people-ops"
+      },
+      "forbid_new_engram": true
+    },
+    "bench": "capture"
+  },
+  {
+    "id": "cap-fresh-09",
+    "workspace": "acme",
+    "task_type": "fresh_capture",
+    "question": "Store: the staging environment refreshes from production snapshots every Monday.",
+    "expect": {
+      "capture": {
+        "domain": "infra",
+        "content_any": [
+          "monday"
+        ]
+      }
+    },
+    "bench": "capture"
+  },
+  {
+    "id": "cap-fresh-10",
+    "workspace": "nimbus",
+    "task_type": "fresh_capture",
+    "question": "Capture: Atlas mobile clients throttle sync to every 15 minutes on cellular.",
+    "expect": {
+      "capture": {
+        "domain": "product-atlas",
+        "content_any": [
+          "15 minute",
+          "every 15"
+        ]
+      }
+    },
+    "bench": "capture"
+  },
+  {
+    "id": "cap-nocap-05",
+    "workspace": "horizon",
+    "task_type": "no_capture",
+    "question": "Draft thought I have not verified: maybe we should raise prices next year? Anyway, what does the standard plan cost right now?",
+    "expect": {
+      "forbid_any_write": true,
+      "answer_any": [
+        "49"
+      ]
+    },
+    "bench": "capture"
+  },
+  {
+    "id": "cap-rel-04",
+    "workspace": "nimbus",
+    "task_type": "relation_link",
+    "question": "Store this and relate it to the sharing model: audit logs record every role change on a shared document.",
+    "expect": {
+      "capture": {
+        "domain": "product-atlas",
+        "content_any": [
+          "audit log"
+        ]
+      },
+      "relation_to": "Sharing Model"
+    },
+    "bench": "capture"
+  },
+  {
+    "id": "cap-super-05",
+    "workspace": "chronos",
+    "task_type": "supersede",
+    "question": "Pipelines moved off Dagster onto Temporal; Dagster is gone. Bring the knowledge base up to date, keeping the history intact.",
+    "expect": {
+      "supersede": {
+        "old_identifier": "pipeline-orchestrator",
+        "domain": "platform"
+      }
+    },
+    "bench": "capture"
+  },
+  {
+    "id": "cap-tbound-04",
+    "workspace": "horizon",
+    "task_type": "temporal_bounded",
+    "question": "Store with validity: beta customers get free premium support until 2026-10-31.",
+    "expect": {
+      "write": {
+        "domain": "policies",
+        "tags_required": true,
+        "content_min_lines": 3,
+        "metadata_has": [
+          "valid_to"
+        ],
+        "content_any": [
+          "premium support"
+        ]
+      }
+    },
+    "bench": "capture"
+  },
+  {
+    "id": "cap-tbound-05",
+    "workspace": "horizon",
+    "task_type": "temporal_bounded",
+    "question": "Capture properly: the revised SLA terms take effect from 2026-09-01.",
+    "expect": {
+      "write": {
+        "domain": "policies",
+        "tags_required": true,
+        "content_min_lines": 3,
+        "metadata_has": [
+          "valid_from"
+        ],
+        "content_any": [
+          "sla"
+        ]
+      }
+    },
+    "bench": "capture"
+  },
+  {
+    "id": "cap-tunbound-03",
+    "workspace": "acme",
+    "task_type": "temporal_unbounded",
+    "question": "Capture this evergreen rule: every offer letter is reviewed by two people. This is valid forever.",
+    "expect": {
+      "capture": {
+        "domain": "people-ops",
+        "content_any": [
+          "two people",
+          "2 people"
+        ],
+        "metadata_lacks": [
+          "valid_from",
+          "valid_to"
+        ]
+      }
+    },
+    "bench": "capture"
+  },
+  {
+    "id": "acme-context-02",
+    "workspace": "acme",
+    "task_type": "context_nav",
+    "question": "Starting from crystalline://infra/deploy-pipeline, what surrounds the deploy pipeline?",
+    "expect": {
+      "build_context_anchor": "crystalline://infra/deploy-pipeline",
+      "answer_any": [
+        "rollback"
+      ],
+      "forbid_write": true
+    },
+    "bench": "routing"
+  },
+  {
+    "id": "acme-narrow-11",
+    "workspace": "acme",
+    "task_type": "narrow",
+    "question": "How long do we keep raw logs?",
+    "expect": {
+      "search": {
+        "domains": [
+          "infra"
+        ]
+      },
+      "answer_any": [
+        "30"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    },
+    "bench": "routing"
+  },
+  {
+    "id": "acme-narrow-12",
+    "workspace": "acme",
+    "task_type": "narrow",
+    "question": "How long does the onboarding buddy period last?",
+    "expect": {
+      "search": {
+        "domains": [
+          "people-ops"
+        ]
+      },
+      "answer_any": [
+        "6 week",
+        "six week"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    },
+    "bench": "routing"
+  },
+  {
+    "id": "acme-structure-02",
+    "workspace": "acme",
+    "task_type": "structure",
+    "question": "Summarize what the infra domain is responsible for.",
+    "expect": {
+      "require_manifest_read": true,
+      "manifest_read_ok": true,
+      "answer_any": [
+        "rollback",
+        "kubernetes",
+        "logging"
+      ],
+      "forbid_write": true
+    },
+    "bench": "routing"
+  },
+  {
+    "id": "acme-sweep-03",
+    "workspace": "acme",
+    "task_type": "sweep",
+    "question": "Which rotation handles weekend refund escalations?",
+    "expect": {
+      "search": {
+        "reaches_domain": "people-ops"
+      },
+      "answer_any": [
+        "support duty",
+        "same rotation"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    },
+    "bench": "routing"
+  },
+  {
+    "id": "chronos-history-04",
+    "workspace": "chronos",
+    "task_type": "history",
+    "question": "Which CI system did deploys use before the current setup?",
+    "expect": {
+      "search": {
+        "domains": [
+          "platform"
+        ],
+        "forbid_status": true
+      },
+      "answer_any": [
+        "jenkins"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    },
+    "bench": "routing"
+  },
+  {
+    "id": "chronos-proposal-02",
+    "workspace": "chronos",
+    "task_type": "proposal",
+    "question": "What is the status of the event bus rework?",
+    "expect": {
+      "search": {
+        "domains": [
+          "platform"
+        ],
+        "forbid_status": true
+      },
+      "answer_any": [
+        "propos"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    },
+    "bench": "routing"
+  },
+  {
+    "id": "horizon-now-03",
+    "workspace": "horizon",
+    "task_type": "temporal_now",
+    "question": "What is the standard plan price right now?",
+    "expect": {
+      "search": {
+        "domains": [
+          "policies"
+        ],
+        "status": "current"
+      },
+      "forbid_metadata_filters": true,
+      "answer_any": [
+        "49"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    },
+    "bench": "routing"
+  },
+  {
+    "id": "horizon-window-04",
+    "workspace": "horizon",
+    "task_type": "temporal_window",
+    "question": "What did a standard plan subscriber pay in November 2025?",
+    "expect": {
+      "search": {
+        "domains": [
+          "policies"
+        ],
+        "metadata_filters_keys": [
+          "valid_from",
+          "valid_to"
+        ]
+      },
+      "answer_any": [
+        "39"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    },
+    "bench": "routing"
+  },
+  {
+    "id": "nimbus-narrow-06",
+    "workspace": "nimbus",
+    "task_type": "narrow",
+    "question": "Who can revoke an Atlas share link?",
+    "expect": {
+      "search": {
+        "domains": [
+          "product-atlas"
+        ]
+      },
+      "answer_any": [
+        "owner"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    },
+    "bench": "routing"
+  }
+]

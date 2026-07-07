@@ -1,0 +1,690 @@
+[
+  {
+    "id": "cap-dedupe-01",
+    "workspace": "acme",
+    "task_type": "dedupe_edit",
+    "question": "We just learned the retry queue also drops jobs whose payload exceeds 1 MB. Add this to our knowledge base.",
+    "expect": {
+      "edit": {
+        "identifier": "retry-queue-gotcha",
+        "domain": "payments"
+      },
+      "forbid_new_engram": true
+    },
+    "bench": "capture"
+  },
+  {
+    "id": "cap-dedupe-03",
+    "workspace": "acme",
+    "task_type": "dedupe_edit",
+    "question": "Record this clarification: the under-75-EUR no-receipt rule does not apply to travel expenses.",
+    "expect": {
+      "edit": {
+        "identifier": "expense-policy",
+        "domain": "people-ops"
+      },
+      "forbid_new_engram": true
+    },
+    "bench": "capture"
+  },
+  {
+    "id": "cap-dedupe-05",
+    "workspace": "acme",
+    "task_type": "dedupe_edit",
+    "question": "Capture this nuance: EU tenant raw logs are kept 90 days instead of 30.",
+    "expect": {
+      "edit": {
+        "identifier": "log-retention",
+        "domain": "infra"
+      },
+      "forbid_new_engram": true
+    },
+    "bench": "capture"
+  },
+  {
+    "id": "cap-domain-02",
+    "workspace": "acme",
+    "task_type": "domain_choice",
+    "question": "While debugging the deploy pipeline we found out the on-call stipend also covers release weekends. Store it.",
+    "expect": {
+      "edit": {
+        "identifier": "on-call-compensation",
+        "domain": "people-ops"
+      },
+      "forbid_new_engram": true
+    },
+    "bench": "capture"
+  },
+  {
+    "id": "cap-fresh-01",
+    "workspace": "acme",
+    "task_type": "fresh_capture",
+    "question": "We confirmed with the vendor today: the payment gateway sandbox resets every Sunday at 02:00 UTC. Capture this in the knowledge base.",
+    "expect": {
+      "capture": {
+        "domain": "payments",
+        "content_any": [
+          "02:00",
+          "sunday"
+        ]
+      }
+    },
+    "bench": "capture"
+  },
+  {
+    "id": "cap-fresh-02",
+    "workspace": "acme",
+    "task_type": "fresh_capture",
+    "question": "New fact for the knowledge base: canary deploys bake for 45 minutes before full rollout. Please store it.",
+    "expect": {
+      "capture": {
+        "domain": "infra",
+        "content_any": [
+          "45"
+        ]
+      }
+    },
+    "bench": "capture"
+  },
+  {
+    "id": "cap-fresh-03",
+    "workspace": "acme",
+    "task_type": "fresh_capture",
+    "question": "Please capture: the conference budget is 1500 EUR per person per year.",
+    "expect": {
+      "capture": {
+        "domain": "people-ops",
+        "content_any": [
+          "1500"
+        ]
+      }
+    },
+    "bench": "capture"
+  },
+  {
+    "id": "cap-fresh-06",
+    "workspace": "horizon",
+    "task_type": "fresh_capture",
+    "question": "Store this policy: support answers within one business day.",
+    "expect": {
+      "capture": {
+        "domain": "policies",
+        "content_any": [
+          "one business day",
+          "1 business day"
+        ]
+      }
+    },
+    "bench": "capture"
+  },
+  {
+    "id": "cap-fresh-07",
+    "workspace": "nimbus",
+    "task_type": "fresh_capture",
+    "question": "We might experiment with WebGPU rendering for Atlas previews someday - just an idea. Capture it in scratch so it is not lost.",
+    "expect": {
+      "capture": {
+        "domain": "scratch",
+        "content_any": [
+          "webgpu"
+        ]
+      }
+    },
+    "bench": "capture"
+  },
+  {
+    "id": "cap-nocap-01",
+    "workspace": "acme",
+    "task_type": "no_capture",
+    "question": "I temporarily bumped the worker count to 12 while debugging; I will revert it within the hour. Anyway: how long does a production deploy take end to end?",
+    "expect": {
+      "forbid_any_write": true,
+      "answer_any": [
+        "18"
+      ]
+    },
+    "bench": "capture"
+  },
+  {
+    "id": "cap-nocap-02",
+    "workspace": "acme",
+    "task_type": "no_capture",
+    "question": "Note to self, ignore this: I skipped the flaky test locally. Quick question - what is the pgbouncer client connection cap?",
+    "expect": {
+      "forbid_any_write": true,
+      "answer_any": [
+        "400"
+      ]
+    },
+    "bench": "capture"
+  },
+  {
+    "id": "cap-nocap-03",
+    "workspace": "nimbus",
+    "task_type": "no_capture",
+    "question": "I am halfway through a scratch refactor of the sync mock, nothing final. How long can Atlas run offline before re-auth?",
+    "expect": {
+      "forbid_any_write": true,
+      "answer_any": [
+        "30"
+      ]
+    },
+    "bench": "capture"
+  },
+  {
+    "id": "cap-rel-01",
+    "workspace": "nimbus",
+    "task_type": "relation_link",
+    "question": "Capture this and link it to the sync engine overview: Atlas now supports selective sync per folder, built on the same CRDT machinery.",
+    "expect": {
+      "capture": {
+        "domain": "product-atlas",
+        "content_any": [
+          "selective sync"
+        ]
+      },
+      "relation_to": "Sync Engine Overview"
+    },
+    "bench": "capture"
+  },
+  {
+    "id": "cap-rel-03",
+    "workspace": "nimbus",
+    "task_type": "relation_link",
+    "question": "Capture, connected to the offline mode engram: offline edits older than the offline window are quarantined for manual merge.",
+    "expect": {
+      "capture": {
+        "domain": "product-atlas",
+        "content_any": [
+          "quarantine"
+        ]
+      },
+      "relation_to": "Offline Mode"
+    },
+    "bench": "capture"
+  },
+  {
+    "id": "cap-super-01",
+    "workspace": "chronos",
+    "task_type": "supersede",
+    "question": "Big change: we migrated data pipelines from Dagster to Prefect last week and Dagster is fully retired. Update the knowledge base properly.",
+    "expect": {
+      "supersede": {
+        "old_identifier": "pipeline-orchestrator",
+        "domain": "platform"
+      }
+    },
+    "bench": "capture"
+  },
+  {
+    "id": "cap-super-03",
+    "workspace": "chronos",
+    "task_type": "supersede",
+    "question": "Service auth switched from OIDC tokens to mutual TLS certificates today; the OIDC approach is retired. Update the knowledge base the right way.",
+    "expect": {
+      "supersede": {
+        "old_identifier": "service-auth",
+        "domain": "platform"
+      }
+    },
+    "bench": "capture"
+  },
+  {
+    "id": "cap-super-04",
+    "workspace": "horizon",
+    "task_type": "supersede",
+    "question": "The residency policy changed: EU customer data now lives in eu-west-1, replacing the eu-central-1 rule. Capture the change properly.",
+    "expect": {
+      "supersede": {
+        "old_identifier": "data-residency-policy",
+        "domain": "policies"
+      }
+    },
+    "bench": "capture"
+  },
+  {
+    "id": "cap-tbound-01",
+    "workspace": "horizon",
+    "task_type": "temporal_bounded",
+    "question": "Capture with its validity: we run a 20 percent discount on the standard plan until 2026-12-31.",
+    "expect": {
+      "write": {
+        "domain": "policies",
+        "tags_required": true,
+        "content_min_lines": 3,
+        "metadata_has": [
+          "valid_to"
+        ],
+        "content_any": [
+          "20 percent",
+          "20%"
+        ]
+      }
+    },
+    "bench": "capture"
+  },
+  {
+    "id": "cap-tbound-03",
+    "workspace": "acme",
+    "task_type": "temporal_bounded",
+    "question": "Capture with its window: production deploys are frozen from 2026-12-20 to 2027-01-05.",
+    "expect": {
+      "write": {
+        "domain": "infra",
+        "tags_required": true,
+        "content_min_lines": 3,
+        "metadata_has": [
+          "valid_from",
+          "valid_to"
+        ],
+        "content_any": [
+          "frozen",
+          "freeze"
+        ]
+      }
+    },
+    "bench": "capture"
+  },
+  {
+    "id": "cap-tunbound-01",
+    "workspace": "acme",
+    "task_type": "temporal_unbounded",
+    "question": "Store this permanent rule: refunds always go back to the original payment method. This holds forever, so make sure the validity reflects that.",
+    "expect": {
+      "capture": {
+        "domain": "payments",
+        "content_any": [
+          "original payment method"
+        ],
+        "metadata_lacks": [
+          "valid_from",
+          "valid_to"
+        ]
+      }
+    },
+    "bench": "capture"
+  },
+  {
+    "id": "acme-narrow-01",
+    "workspace": "acme",
+    "task_type": "narrow",
+    "question": "How old can a job get before the retry queue drops it?",
+    "expect": {
+      "search": {
+        "domains": [
+          "payments"
+        ]
+      },
+      "answer_any": [
+        "24"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    },
+    "bench": "routing"
+  },
+  {
+    "id": "acme-narrow-02",
+    "workspace": "acme",
+    "task_type": "narrow",
+    "question": "What is the approved way to dispute a chargeback?",
+    "expect": {
+      "search": {
+        "domains": [
+          "payments"
+        ]
+      },
+      "answer_any": [
+        "dashboard"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    },
+    "bench": "routing"
+  },
+  {
+    "id": "acme-narrow-03",
+    "workspace": "acme",
+    "task_type": "narrow",
+    "question": "What format do our invoice numbers follow?",
+    "expect": {
+      "search": {
+        "domains": [
+          "payments"
+        ]
+      },
+      "answer_any": [
+        "acme-"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    },
+    "bench": "routing"
+  },
+  {
+    "id": "acme-narrow-04",
+    "workspace": "acme",
+    "task_type": "narrow",
+    "question": "How many days of dual-write did the card vault migration need?",
+    "expect": {
+      "search": {
+        "domains": [
+          "payments"
+        ]
+      },
+      "answer_any": [
+        "30"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    },
+    "bench": "routing"
+  },
+  {
+    "id": "acme-narrow-09",
+    "workspace": "acme",
+    "task_type": "narrow",
+    "question": "How many stages does the interview loop have?",
+    "expect": {
+      "search": {
+        "domains": [
+          "people-ops"
+        ]
+      },
+      "answer_any": [
+        "four",
+        "4"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    },
+    "bench": "routing"
+  },
+  {
+    "id": "acme-structure-01",
+    "workspace": "acme",
+    "task_type": "structure",
+    "question": "What kinds of knowledge does the payments domain cover?",
+    "expect": {
+      "require_manifest_read": true,
+      "manifest_read_ok": true,
+      "answer_all": [
+        "refund",
+        "chargeback"
+      ],
+      "forbid_write": true
+    },
+    "bench": "routing"
+  },
+  {
+    "id": "acme-sweep-01",
+    "workspace": "acme",
+    "task_type": "sweep",
+    "question": "Who gets paged when a refund needs escalation?",
+    "expect": {
+      "search": {
+        "reaches_domain": "people-ops"
+      },
+      "answer_any": [
+        "support duty manager"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    },
+    "bench": "routing"
+  },
+  {
+    "id": "chronos-history-01",
+    "workspace": "chronos",
+    "task_type": "history",
+    "question": "How has our deployment tooling changed over time?",
+    "expect": {
+      "search": {
+        "domains": [
+          "platform"
+        ],
+        "forbid_status": true
+      },
+      "answer_all": [
+        "jenkins",
+        "argocd"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    },
+    "bench": "routing"
+  },
+  {
+    "id": "chronos-now-01",
+    "workspace": "chronos",
+    "task_type": "temporal_now",
+    "question": "What do we deploy with right now?",
+    "expect": {
+      "search": {
+        "domains": [
+          "platform"
+        ],
+        "status": "current"
+      },
+      "forbid_metadata_filters": true,
+      "answer_any": [
+        "argocd"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    },
+    "bench": "routing"
+  },
+  {
+    "id": "chronos-now-02",
+    "workspace": "chronos",
+    "task_type": "temporal_now",
+    "question": "How do services authenticate today?",
+    "expect": {
+      "search": {
+        "domains": [
+          "platform"
+        ],
+        "status": "current"
+      },
+      "forbid_metadata_filters": true,
+      "answer_any": [
+        "oidc"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    },
+    "bench": "routing"
+  },
+  {
+    "id": "chronos-proposal-01",
+    "workspace": "chronos",
+    "task_type": "proposal",
+    "question": "Are we running on NATS JetStream?",
+    "expect": {
+      "search": {
+        "domains": [
+          "platform"
+        ],
+        "forbid_status": true
+      },
+      "answer_any": [
+        "propos"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    },
+    "bench": "routing"
+  },
+  {
+    "id": "horizon-narrow-03",
+    "workspace": "horizon",
+    "task_type": "narrow",
+    "question": "Where must EU customer data stay?",
+    "expect": {
+      "search": {
+        "domains": [
+          "policies"
+        ]
+      },
+      "answer_any": [
+        "eu-central-1"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    },
+    "bench": "routing"
+  },
+  {
+    "id": "horizon-now-01",
+    "workspace": "horizon",
+    "task_type": "temporal_now",
+    "question": "What does the standard plan cost today?",
+    "expect": {
+      "search": {
+        "domains": [
+          "policies"
+        ],
+        "status": "current"
+      },
+      "forbid_metadata_filters": true,
+      "answer_any": [
+        "49"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    },
+    "bench": "routing"
+  },
+  {
+    "id": "horizon-window-01",
+    "workspace": "horizon",
+    "task_type": "temporal_window",
+    "question": "What did the standard plan cost in June 2025?",
+    "expect": {
+      "search": {
+        "domains": [
+          "policies"
+        ],
+        "metadata_filters_keys": [
+          "valid_from",
+          "valid_to"
+        ]
+      },
+      "answer_any": [
+        "39"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    },
+    "bench": "routing"
+  },
+  {
+    "id": "horizon-window-03",
+    "workspace": "horizon",
+    "task_type": "temporal_window",
+    "question": "Which standard plan pricing applied on 2025-08-01?",
+    "expect": {
+      "search": {
+        "domains": [
+          "policies"
+        ],
+        "metadata_filters_keys": [
+          "valid_from",
+          "valid_to"
+        ]
+      },
+      "answer_any": [
+        "39"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    },
+    "bench": "routing"
+  },
+  {
+    "id": "nimbus-context-02",
+    "workspace": "nimbus",
+    "task_type": "context_nav",
+    "question": "Use the knowledge around crystalline://product-atlas/offline-mode to explain offline behavior and what it depends on.",
+    "expect": {
+      "build_context_anchor": "crystalline://product-atlas/offline-mode",
+      "answer_all": [
+        "30",
+        "sync"
+      ],
+      "forbid_write": true
+    },
+    "bench": "routing"
+  },
+  {
+    "id": "nimbus-narrow-03",
+    "workspace": "nimbus",
+    "task_type": "narrow",
+    "question": "What sharing roles exist in Atlas?",
+    "expect": {
+      "search": {
+        "domains": [
+          "product-atlas"
+        ]
+      },
+      "answer_all": [
+        "viewer",
+        "owner"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    },
+    "bench": "routing"
+  },
+  {
+    "id": "nimbus-narrow-04",
+    "workspace": "nimbus",
+    "task_type": "narrow",
+    "question": "How stale can Atlas search results be right after a sync?",
+    "expect": {
+      "search": {
+        "domains": [
+          "product-atlas"
+        ]
+      },
+      "answer_any": [
+        "60"
+      ],
+      "forbid_write": true,
+      "manifest_read_ok": false
+    },
+    "bench": "routing"
+  },
+  {
+    "id": "nimbus-structure-01",
+    "workspace": "nimbus",
+    "task_type": "structure",
+    "question": "What does the product-atlas domain cover?",
+    "expect": {
+      "require_manifest_read": true,
+      "manifest_read_ok": true,
+      "answer_all": [
+        "sync",
+        "shar"
+      ],
+      "forbid_write": true
+    },
+    "bench": "routing"
+  },
+  {
+    "id": "nimbus-structure-02",
+    "workspace": "nimbus",
+    "task_type": "structure",
+    "question": "What is the scratch domain for and when should it be used?",
+    "expect": {
+      "require_manifest_read": true,
+      "manifest_read_ok": true,
+      "answer_any": [
+        "experiment"
+      ],
+      "forbid_write": true
+    },
+    "bench": "routing"
+  }
+]
