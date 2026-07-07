@@ -26,12 +26,25 @@ starting from zero in every session. An agent is onboarded via a generated \
 routing prompt, taught information through curated domains and stores its \
 learnings and experiences as engrams while it works - becoming a useful and \
 productive peer over time."""
+maintainer-scripts = "debian/"
 assets = [
     ["target/release/crystalline", "usr/bin/", "755"],
     ["../../README.md", "usr/share/doc/crystalline/README.md", "644"],
     ["../../docs/deployment.md", "usr/share/doc/crystalline/docs/deployment.md", "644"],
     ["../../LICENSE", "usr/share/doc/crystalline/LICENSE", "644"],
+    ["debian/crystalline.default", "etc/default/crystalline", "644"],
 ]
+
+# The unit ships installed but disabled: enable = false leaves activation to
+# the admin (systemctl enable --now crystalline) and start = false never
+# starts it on install. restart-after-upgrade stays true on purpose: with
+# start = false cargo-deb emits a try-restart guarded by "upgrade only", so a
+# unit the admin runs is restarted onto the new binary and a disabled unit is
+# never touched.
+[package.metadata.deb.systemd-units]
+enable = false
+start = false
+restart-after-upgrade = true
 
 [features]
 # Forwarded to crystalline-index so `--no-default-features` on the workspace

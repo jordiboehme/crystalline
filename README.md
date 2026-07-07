@@ -64,6 +64,8 @@ sudo dpkg -i "crystalline_${version#v}_${arch}.deb"
 crystalline --version
 ```
 
+The package also ships a systemd unit, installed disabled - see [Linux server with systemd](docs/deployment.md#linux-server-with-systemd) to run the daemon as a managed service.
+
 Windows, via MSI: download `crystalline-<version>-windows-amd64.msi` from the [latest release](https://github.com/jordiboehme/crystalline/releases/latest) and double-click it, or install silently with `msiexec /i <file> /qn`. The installer adds Crystalline to the system PATH and upgrades in place. Releases are not code signed yet, so verify against `SHA256SUMS` and confirm any SmartScreen prompt (More info > Run anyway).
 
 Every [release](https://github.com/jordiboehme/crystalline/releases/latest) also ships the standalone `crystalline` binary for macOS (Apple Silicon), Linux (x86_64 and arm64, statically linked) and Windows, with a `SHA256SUMS` file for verification - or build from a clone with `cargo build --release`.
@@ -295,6 +297,7 @@ Crystalline runs the same way in every scenario: a daemon in the middle keeps on
 | [Personal workstation](docs/deployment.md#personal-workstation) | The default: local folders, agents over stdio, one shared background daemon |
 | [Claude Desktop extension](docs/deployment.md#claude-desktop-extension) | One-click `.mcpb` install with a folder picker, no terminal involved |
 | [Team server](docs/deployment.md#team-server) | One container on the network, every agent connects over HTTP |
+| [Linux server with systemd](docs/deployment.md#linux-server-with-systemd) | The .deb ships a unit, disabled by default; enable it once and agents connect over HTTP |
 | [Published read-only knowledge base](docs/deployment.md#published-read-only-knowledge-base) | Knowledge curated in a git repository, served read-only to agents |
 | [Air-gapped or egress-restricted](docs/deployment.md#air-gapped-or-egress-restricted) | The `with-model` image or a pre-fetched model directory; nothing at runtime needs the network |
 | [Shared database collaboration](docs/deployment.md#shared-database-collaboration) | Several instances share one PostgreSQL index, so every capture is visible to all |

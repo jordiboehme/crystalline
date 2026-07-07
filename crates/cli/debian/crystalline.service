@@ -1,0 +1,30 @@
+[Unit]
+Description=Crystalline daemon: knowledge service for AI agents
+Documentation=https://github.com/jordiboehme/crystalline
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+StateDirectory=crystalline
+CacheDirectory=crystalline
+ConfigurationDirectory=crystalline
+# Crystalline resolves every path through XDG: state (index, lock, socket)
+# lands in /var/lib/crystalline, the model cache in /var/cache/crystalline
+# and the config in /etc/crystalline/config.yaml.
+Environment=HOME=%S/crystalline
+Environment=XDG_STATE_HOME=%S
+Environment=XDG_CACHE_HOME=%C
+Environment=XDG_CONFIG_HOME=%E
+# The bind address comes from the environment, never from an ExecStart flag,
+# so /etc/default/crystalline (read after these lines, later entries win) can
+# override it.
+Environment=CRYSTALLINE_SERVICE_HTTP=127.0.0.1:7411
+EnvironmentFile=-/etc/default/crystalline
+ExecStart=/usr/bin/crystalline serve
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

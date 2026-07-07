@@ -1,0 +1,19 @@
+# Environment overrides for the crystalline systemd service.
+# systemd EnvironmentFile syntax: KEY=value lines, no shell expansion.
+# See /usr/share/doc/crystalline/docs/deployment.md for the full variable list.
+
+# Bind address for the streamable HTTP endpoint. The unit defaults to
+# 127.0.0.1:7411; uncomment to serve agents across the network.
+#CRYSTALLINE_SERVICE_HTTP=0.0.0.0:7411
+
+# Serve the content API read-only.
+#CRYSTALLINE_SERVICE_READ_ONLY=true
+
+# Self-provision a team domain from GitHub on first start.
+#CRYSTALLINE_GITHUB_ENABLED=true
+#CRYSTALLINE_GITHUB_TOKEN=ghp_replace_me
+#CRYSTALLINE_DOMAIN_TEAM=/srv/knowledge/team
+#CRYSTALLINE_DOMAIN_TEAM_ORIGIN=owner/repo@main
+
+# Point at a pre-fetched embedding model directory (air-gapped hosts).
+#CRYSTALLINE_MODELS_DIR=/opt/crystalline/models

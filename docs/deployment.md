@@ -1,6 +1,6 @@
 # Deploy Crystalline
 
-Crystalline runs the same way in every scenario: a daemon in the middle keeps one search index in sync with knowledge, and one or more agents connect to it, whether that connection is a local stdio pipe or a network HTTP endpoint. The seven scenarios below are variations on that one architecture.
+Crystalline runs the same way in every scenario: a daemon in the middle keeps one search index in sync with knowledge, and one or more agents connect to it, whether that connection is a local stdio pipe or a network HTTP endpoint. The eight scenarios below are variations on that one architecture.
 
 See [Get started](../README.md#get-started) in the README to install the binary and wire up an agent; this guide covers where the daemon, its knowledge and its index live in each shape.
 
@@ -44,6 +44,44 @@ flowchart LR
     A2[Agent] -->|HTTP :7411| D
     D -->|bind mount| K[Knowledge files]
     D -->|volume| I[Index]
+```
+
+## Linux server with systemd
+
+The team server shape without a container: the `.deb` ships a systemd unit,
+installed disabled, so installing the package never starts anything. Put any
+overrides in `/etc/default/crystalline` (bind address, read-only mode, team
+domains - the same variables as [Configure through environment
+variables](#configure-through-environment-variables)) and turn the service on:
+
+```sh
+sudo systemctl enable --now crystalline
+```
+
+The unit runs `crystalline serve` in the foreground under a dynamic service
+user: the index and socket live in `/var/lib/crystalline`, the model cache in
+`/var/cache/crystalline` and the config in `/etc/crystalline/config.yaml`.
+HTTP binds `127.0.0.1:7411` by default; set
+`CRYSTALLINE_SERVICE_HTTP=0.0.0.0:7411` in `/etc/default/crystalline` to let
+agents on the network learn from it, and probe `GET /health` from a load
+balancer or uptime monitor without an MCP handshake. The sandbox makes the
+filesystem read-only outside those directories, so grant each knowledge
+folder a write allowance with a drop-in: `sudo systemctl edit crystalline`,
+then `ReadWritePaths=/srv/knowledge` under `[Service]`. Check on the daemon
+with `systemctl status crystalline` and `journalctl -u crystalline` rather
+than `crystalline ctl` (the daemon's socket lives under the service user, out
+of reach of a login shell). A tarball install gets the same unit from the
+repository at `crates/cli/debian/crystalline.service`, copied to
+`/etc/systemd/system/`. Upgrading the package restarts the service only if it
+is running; a disabled unit stays untouched.
+
+```mermaid
+flowchart LR
+    M[Uptime monitor] -->|GET /health| D[Daemon under systemd]
+    A1[Agent] -->|HTTP :7411| D
+    A2[Agent] -->|HTTP :7411| D
+    D --> K[Knowledge folders]
+    D --> I[Index in /var/lib/crystalline]
 ```
 
 ## Published read-only knowledge base
