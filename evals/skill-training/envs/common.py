@@ -24,6 +24,13 @@ Env-specific behavior enters through two callbacks:
   sandbox is still alive, so post-state checks can read the domain
   files. It returns ``(hard, soft, failed_check_descriptions)``.
 
+An env that needs to own sandbox construction entirely (the
+collaboration benchmark starts a fake GitHub server whose URL must be
+in the MCP config) passes ``setup(item, sandbox)`` returning
+``(mcp_config_path, prepared)`` instead of ``prepare``, plus an
+optional ``teardown(prepared)`` that runs after scoring even on
+failure.
+
 Results are resume-aware per out_root: a task whose result.json already
 exists is loaded, not re-run, matching the built-in envs' behavior.
 """
@@ -47,6 +54,8 @@ TRANSIENT_API_STATUS = {401, 403, 429, 500, 502, 503, 529}
 
 PrepareFn = Callable[[dict, Path], Any]
 ScoreFn = Callable[[dict, Path, list[dict], str, Any], tuple[int, float, list[str]]]
+SetupFn = Callable[[dict, Path], tuple[Path, Any]]
+TeardownFn = Callable[[Any], None]
 
 
 class TransientRolloutError(RuntimeError):
@@ -91,18 +100,25 @@ def setup_sandbox(
     sandbox: Path,
     fixture_dir: Path,
     crystalline_bin: str,
+    extra_env: dict | None = None,
 ) -> Path:
-    """Copy fixture domains in and register them; return the mcp config path."""
+    """Copy fixture domains in and register them; return the mcp config path.
+
+    ``extra_env`` is merged into both the registration commands and the
+    MCP server's environment in mcp.json (the collaboration benchmark
+    routes GitHub calls to its fake server this way).
+    """
     domains_src = fixture_dir / "domains"
     domains_dst = sandbox / "domains"
     shutil.copytree(domains_src, domains_dst)
-    (sandbox / "state").mkdir()
-    (sandbox / "xdg-config").mkdir()
-    (sandbox / "work").mkdir()
+    (sandbox / "state").mkdir(exist_ok=True)
+    (sandbox / "xdg-config").mkdir(exist_ok=True)
+    (sandbox / "work").mkdir(exist_ok=True)
 
     config = sandbox / "config.yaml"
     db = sandbox / "index.db"
     env = sandbox_env(sandbox)
+    env.update(extra_env or {})
     for domain_dir in sorted(domains_dst.iterdir()):
         if not domain_dir.is_dir():
             continue
@@ -132,6 +148,7 @@ def setup_sandbox(
                 "env": {
                     "XDG_STATE_HOME": str(sandbox / "state"),
                     "XDG_CONFIG_HOME": str(sandbox / "xdg-config"),
+                    **(extra_env or {}),
                 },
             }
         }
@@ -246,6 +263,8 @@ def rollout_one(
     exec_timeout: int,
     score: ScoreFn,
     prepare: PrepareFn | None = None,
+    setup: SetupFn | None = None,
+    teardown: TeardownFn | None = None,
     default_task_type: str,
     sandbox_prefix: str,
 ) -> dict:
@@ -274,9 +293,13 @@ def rollout_one(
 
     sandbox = Path(tempfile.mkdtemp(prefix=sandbox_prefix))
     fail_reason = ""
+    prepared = None
     try:
-        mcp_config = setup_sandbox(sandbox, fixture_dir, crystalline_bin)
-        prepared = prepare(item, sandbox) if prepare else None
+        if setup is not None:
+            mcp_config, prepared = setup(item, sandbox)
+        else:
+            mcp_config = setup_sandbox(sandbox, fixture_dir, crystalline_bin)
+            prepared = prepare(item, sandbox) if prepare else None
 
         skill_path = sandbox / "skill.md"
         skill_path.write_text(skill_content or "", encoding="utf-8")
@@ -329,6 +352,8 @@ def rollout_one(
         # the domain files the agent may have written.
         hard, soft, failed_checks = score(item, sandbox, tool_calls, answer, prepared)
     finally:
+        if teardown is not None:
+            teardown(prepared)
         shutil.rmtree(sandbox, ignore_errors=True)
 
     if fail_reason:
@@ -370,6 +395,8 @@ def run_batch(
     exec_timeout: int,
     score: ScoreFn,
     prepare: PrepareFn | None = None,
+    setup: SetupFn | None = None,
+    teardown: TeardownFn | None = None,
     default_task_type: str,
     sandbox_prefix: str,
 ) -> list[dict]:
@@ -389,6 +416,8 @@ def run_batch(
             exec_timeout=exec_timeout,
             score=score,
             prepare=prepare,
+            setup=setup,
+            teardown=teardown,
             default_task_type=default_task_type,
             sandbox_prefix=sandbox_prefix,
         )
