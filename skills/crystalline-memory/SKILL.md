@@ -13,7 +13,9 @@ At connection you are handed a routing block as your instructions: one line per 
 
 ## Recall before you answer
 
-Never answer from pre-trained knowledge alone when a domain could cover it; search first. One domain obviously owns the task: a scoped search (`domains: ["that-domain"]`); broad or cross-cutting: a sweep with `domains` omitted. For a "what is true now" question, filter on `status: current`. Follow a strong hit with `build_context` to pull in what surrounds it. If a first phrasing turns up nothing, reformulate once before concluding the knowledge was not captured.
+Never answer from pre-trained knowledge alone when a domain could cover it; search first. One domain obviously owns the task: a scoped search (`domains: ["that-domain"]`); broad or cross-cutting: a sweep with `domains` omitted. For a "what is true now" question, filter on `status: current`. Follow a strong hit with `build_context` to pull in what surrounds it - it returns titles and relations only, so reads follow it. If a first phrasing turns up nothing, reformulate once before concluding the knowledge was not captured.
+
+A search hit's snippet is a short window around the match, not the engram: `read_engram` an engram before citing or summarizing its content. For an overview question ("what is X about?") read every strong hit before drafting - what you read earlier for a different task is not coverage for this one - and when something relevant stays unread, say so instead of presenting partial coverage as complete.
 
 ## Capture what you learn
 

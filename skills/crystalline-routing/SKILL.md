@@ -38,7 +38,7 @@ When the question is also about the present-day state, put `domains` and `status
 }
 ```
 
-If a hit's snippet already states the fact you need, answering from it is fine. Reserve `read_engram` for when you need the full body, its relations or an exact quote - and pass the hit's permalink as `identifier` (bare or as a `crystalline://domain/permalink` URL); there is no `permalink` argument on `read_engram`.
+A hit's `snippet` is a window of roughly 200 characters around the match, often `...`-truncated - a targeting aid, never the engram. Answering straight from it is acceptable only for a single atomic fact that is completely visible in the snippet ("the retry limit is 5"). Anything that summarizes, characterizes, compares or quotes an engram's content requires `read_engram` first - pass the hit's permalink as `identifier` (bare or as a `crystalline://domain/permalink` URL); there is no `permalink` argument on `read_engram`.
 
 ### Broad: sweep, then narrow
 
@@ -54,6 +54,12 @@ Omit `domains` entirely - `search_engrams` defaults to every registered domain, 
 Do not pre-filter to the domains you recognize from the routing block; a domain returning no hits for one phrasing does not mean the knowledge is not captured there under different words. If hits span several domains and the guidance conflicts, say so explicitly and name which domain each answer came from rather than picking one silently.
 
 Zero hits is not the only signal to broaden. A scoped search can return plausible hits that do not actually answer the question - common when the question's subject belongs to one domain but the question itself is about ownership, escalation or roles, which another domain owns (who gets paged about refunds is a people question, not a payments one). When the obvious subject-matter domain keeps surfacing near-misses after a rephrasing or two, stop rephrasing inside it and run one unscoped sweep.
+
+## Read before you answer
+
+For an overview or synthesis question - "what is X about", "summarize the strategy", "give me the full picture" - decide coverage by what a full answer requires, not by what is already in context. List the strong hits, then read each one with `read_engram` before drafting; a snippet that looks sufficient is exactly how the authoritative source goes unread. An unread hit whose title names the primary document for the question (a narrative, a strategy, a decision record), whose `type` or `status` marks it authoritative, or that another engram cites as its source must be read, not skimmed from its snippet.
+
+Content read earlier in the session for a different task is not coverage for the current question. Re-ask what this question needs, search again when the earlier reads served another purpose and read what is missing - anchoring on the engram that happens to be in context produces answers that are accurate but thin. When something relevant stays unread, say so in the answer rather than presenting partial coverage as complete.
 
 ## Temporal filtering: "what is true now"
 
@@ -116,12 +122,13 @@ Once you have an anchor engram, follow its relations and links (including across
 }
 ```
 
-A `/*` suffix on the anchor globs a permalink prefix, useful for pulling in an entire topic's engrams at once, for example `crystalline://payments/retry-queue/*`.
+A `/*` suffix on the anchor globs a permalink prefix, useful for pulling in an entire topic's engrams at once, for example `crystalline://payments/retry-queue/*`. The result carries titles and relations only, no content - follow it with `read_engram` on the nodes that matter.
 
 ## Quick reference
 
 - One domain obviously owns it (even if unnamed) -> `search_engrams` with `domains: ["that-domain"]`.
 - Broad, unclear or cross-domain -> `search_engrams` with `domains` omitted (an all-domain sweep).
+- Overview or synthesis question ("what is X about") -> read every strong hit with `read_engram` before drafting; a snippet is never a source.
 - Scoped hits keep missing the point -> one unscoped sweep; the question's owner may not be the subject's owner.
 - "What is true now" -> `status: "current"`; add `valid_from`/`valid_to` filters only for a specific bounded-in-time question.
 - "Did we adopt X" -> search without a status filter and narrate each hit's status.
