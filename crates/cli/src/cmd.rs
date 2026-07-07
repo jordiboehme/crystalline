@@ -1288,6 +1288,81 @@ pub(crate) fn bare_host(auth_base: &str) -> Option<String> {
     }
 }
 
+// --- healthcheck ---------------------------------------------------------------
+
+/// `crystalline healthcheck`: probe a serving daemon's `GET /health` endpoint
+/// with a hand-rolled HTTP/1.1 request over a plain `TcpStream` - no tokio
+/// runtime, no TLS, no daemon socket, config or database touched. That
+/// narrow surface is the point: this is what an external monitor (Docker's
+/// own `HEALTHCHECK`, a Kubernetes `httpGet` probe, a load balancer) sees, so
+/// a green result here means those see green too. `0.0.0.0` and `[::]` are
+/// rewritten to `127.0.0.1` first - valid addresses to bind, never valid to
+/// dial as a client. On success, prints the health body (the
+/// `{"status":"ok","version":...}` JSON that also lands in `docker inspect`)
+/// and returns `Ok`; any failure - connection refused, a timeout, a non-200
+/// status or a malformed response - comes back as an `Err` naming the
+/// address it failed against, so the process exits nonzero through the
+/// normal error path.
+pub fn healthcheck(addr: &str) -> Result<()> {
+    use std::io::{Read, Write};
+    use std::net::{TcpStream, ToSocketAddrs};
+    use std::time::Duration;
+
+    let connect_addr = loopback_connect_addr(addr);
+    let socket_addr = connect_addr
+        .as_str()
+        .to_socket_addrs()
+        .with_context(|| format!("resolving {connect_addr}"))?
+        .next()
+        .ok_or_else(|| anyhow!("no address resolved for {connect_addr}"))?;
+
+    let mut stream = TcpStream::connect_timeout(&socket_addr, Duration::from_secs(2))
+        .with_context(|| format!("connecting to {connect_addr}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .with_context(|| format!("setting a read timeout for {connect_addr}"))?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(3)))
+        .with_context(|| format!("setting a write timeout for {connect_addr}"))?;
+
+    let request = format!("GET /health HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .with_context(|| format!("sending the health request to {connect_addr}"))?;
+
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .with_context(|| format!("reading the health response from {connect_addr}"))?;
+
+    let status_line = response
+        .lines()
+        .next()
+        .ok_or_else(|| anyhow!("empty response from {connect_addr}"))?;
+    if !status_line.contains("200") {
+        bail!("unhealthy response from {connect_addr}: {status_line}");
+    }
+
+    let body = response
+        .split_once("\r\n\r\n")
+        .map_or(response.as_str(), |(_, body)| body);
+    println!("{}", body.trim());
+    Ok(())
+}
+
+/// Rewrite an unroutable bind address to its loopback equivalent: `0.0.0.0`
+/// and `[::]` are addresses a server can listen on but a client can never
+/// dial, and people naturally paste the same address they gave `serve --http`.
+fn loopback_connect_addr(addr: &str) -> String {
+    if let Some(port) = addr.strip_prefix("0.0.0.0:") {
+        format!("127.0.0.1:{port}")
+    } else if let Some(port) = addr.strip_prefix("[::]:") {
+        format!("127.0.0.1:{port}")
+    } else {
+        addr.to_string()
+    }
+}
+
 // --- shared helpers ----------------------------------------------------------
 
 fn select_domains(cfg: &GlobalConfig, only: Option<&str>) -> Result<Vec<(String, DomainEntry)>> {

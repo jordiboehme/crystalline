@@ -838,6 +838,23 @@ fn http_smoke_initialize_list_and_search() {
         "{body}"
     );
 
+    // `crystalline healthcheck` probes the same endpoint over a plain
+    // TcpStream, no daemon socket involved: this is the exact command the
+    // container image runs as its Docker HEALTHCHECK.
+    let healthcheck = Command::new(bin())
+        .args(["healthcheck", &addr])
+        .output()
+        .unwrap();
+    assert!(
+        healthcheck.status.success(),
+        "healthcheck against a live daemon exits 0: {healthcheck:?}"
+    );
+    let healthcheck_stdout = String::from_utf8_lossy(&healthcheck.stdout);
+    assert!(
+        healthcheck_stdout.contains("\"status\":\"ok\""),
+        "healthcheck prints the health body: {healthcheck_stdout}"
+    );
+
     // initialize
     let resp = client
         .post(&url)
@@ -958,6 +975,24 @@ fn wait_port(addr: &str) {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// `crystalline healthcheck` against a port nothing is listening on: the
+/// connection is refused immediately, so this needs no daemon spawn and no
+/// wait, unlike the success path piggybacked on the HTTP smoke test above.
+#[test]
+fn healthcheck_against_nothing_exits_nonzero() {
+    let port = free_port();
+    let status = Command::new(bin())
+        .args(["healthcheck", &format!("127.0.0.1:{port}")])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(
+        !status.success(),
+        "healthcheck against a closed port exits nonzero"
+    );
 }
 
 // --- status output and daemon visibility ------------------------------------

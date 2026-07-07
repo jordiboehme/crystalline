@@ -204,6 +204,16 @@ enum Command {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// Probe a serving daemon's HTTP health endpoint, exiting 0 when healthy.
+    /// Speaks only plain HTTP over a loopback `TcpStream` - no daemon socket,
+    /// config or database is touched - so it exercises exactly the surface an
+    /// external monitor sees. Built for the distroless container image, which
+    /// has no shell or curl to run a `HEALTHCHECK` with otherwise.
+    Healthcheck {
+        /// Address of the HTTP endpoint to probe.
+        #[arg(default_value = "127.0.0.1:7411")]
+        addr: String,
+    },
     /// Run the single-instance daemon: watch domains, embed and serve MCP and ctl
     /// over the socket, optionally over HTTP.
     Serve {
@@ -856,6 +866,7 @@ fn main() -> anyhow::Result<()> {
             fix,
             config,
         }) => on_runtime(move || run_doctor(domain, fix, config, cli.db, cli.json)),
+        Some(Command::Healthcheck { addr }) => cmd::healthcheck(&addr),
         Some(Command::Serve {
             http,
             daemon,

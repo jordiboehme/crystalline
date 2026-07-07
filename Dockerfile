@@ -44,6 +44,13 @@ ENV HOME=/home/nonroot \
 VOLUME /data
 EXPOSE 7411
 
+# The image probes itself through the same surface external monitors use:
+# a plain GET /health against the serving port. Exec form - distroless has
+# no shell. The listener answers before the first-start model download
+# finishes, so a short start period is enough.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD ["/usr/local/bin/crystalline", "healthcheck"]
+
 USER nonroot
 
 ENTRYPOINT ["/usr/local/bin/crystalline"]
