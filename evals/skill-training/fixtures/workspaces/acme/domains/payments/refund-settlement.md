@@ -5,8 +5,8 @@ permalink: refund-settlement
 tags:
 - payments
 status: current
-recorded_at: 2026-07-06
-timestamp: 2026-07-06T15:08:06.263285+00:00
+recorded_at: 2026-07-07
+timestamp: 2026-07-07T05:06:43.373829+00:00
 ---
 
 How long customers wait for a refund to land.

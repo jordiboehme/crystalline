@@ -6,8 +6,8 @@ tags:
 - gotcha
 - payments
 status: current
-recorded_at: 2026-07-06
-timestamp: 2026-07-06T15:08:06.238085+00:00
+recorded_at: 2026-07-07
+timestamp: 2026-07-07T05:06:43.345334+00:00
 ---
 
 A pitfall that regularly surprises new payment work.

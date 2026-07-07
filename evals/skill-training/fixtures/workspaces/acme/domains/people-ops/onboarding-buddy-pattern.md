@@ -6,8 +6,8 @@ tags:
 - pattern
 - people-ops
 status: current
-recorded_at: 2026-07-06
-timestamp: 2026-07-06T15:08:06.355690+00:00
+recorded_at: 2026-07-07
+timestamp: 2026-07-07T05:06:43.470285+00:00
 ---
 
 How new hires get up to speed.

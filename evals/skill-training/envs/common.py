@@ -402,3 +402,66 @@ def run_batch(
     with open(out / "rollouts.json", "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
     return results
+
+
+# ── Sandbox post-state helpers (verify snapshots, frontmatter) ────────────
+
+def snapshot(sandbox: Path, crystalline_bin: str) -> dict:
+    """Capture the domain state: verify issues and the file listing.
+
+    ``verify_errors`` keeps the capture benchmark's original shape (a set
+    of ``(path, rule)`` for error-severity issues); ``verify_issues``
+    carries every severity as ``(path, rule, severity)`` for envs that
+    need to track warnings too.
+    """
+    domains_root = sandbox / "domains"
+    errors: set[tuple[str, str]] = set()
+    issues: set[tuple[str, str, str]] = set()
+    for domain_dir in sorted(p for p in domains_root.iterdir() if p.is_dir()):
+        proc = run_cmd(
+            [crystalline_bin, "verify", str(domain_dir), "--format", "json"],
+            env=sandbox_env(sandbox), timeout=60,
+        )
+        if proc.returncode not in (0, 1):
+            raise RuntimeError(
+                f"verify failed on {domain_dir.name}: {proc.stderr.strip()}"
+            )
+        report = json.loads(proc.stdout or "{}")
+        for issue in report.get("issues", []):
+            severity = str(issue.get("severity", "")).lower()
+            rel = str(issue.get("path", "")).replace("\\", "/")
+            rel = rel.split("/domains/", 1)[-1]
+            rule = str(issue.get("rule", ""))
+            issues.add((rel, rule, severity))
+            if severity == "error":
+                errors.add((rel, rule))
+    files = {
+        str(p.relative_to(domains_root))
+        for p in domains_root.rglob("*.md")
+    }
+    return {"verify_errors": errors, "verify_issues": issues, "files": files}
+
+
+def read_frontmatter(path: Path) -> dict:
+    import yaml
+
+    text = path.read_text(encoding="utf-8")
+    if not text.startswith("---\n"):
+        return {}
+    end = text.find("\n---\n", 4)
+    if end < 0:
+        return {}
+    try:
+        parsed = yaml.safe_load(text[4:end])
+    except yaml.YAMLError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def find_engram_file(sandbox: Path, domain: str, permalink: str) -> Path | None:
+    domain_dir = sandbox / "domains" / domain
+    slug = permalink.strip("/").split("/")[-1]
+    for p in domain_dir.rglob("*.md"):
+        if p.stem == slug:
+            return p
+    return None

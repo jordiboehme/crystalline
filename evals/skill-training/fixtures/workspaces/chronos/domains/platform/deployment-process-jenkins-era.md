@@ -6,8 +6,8 @@ tags:
 - platform
 - deploy
 status: superseded
-recorded_at: 2026-07-06
-timestamp: 2026-07-06T15:08:06.386142+00:00
+recorded_at: 2026-07-07
+timestamp: 2026-07-07T05:06:43.502236+00:00
 ---
 
 The previous deployment mechanism, kept for history.

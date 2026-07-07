@@ -6,8 +6,8 @@ tags:
 - lesson
 - payments
 status: current
-recorded_at: 2026-07-06
-timestamp: 2026-07-06T15:08:06.256914+00:00
+recorded_at: 2026-07-07
+timestamp: 2026-07-07T05:06:43.367447+00:00
 ---
 
 What the card vault migration taught us.

@@ -6,8 +6,8 @@ tags:
 - platform
 - proposal
 status: proposed
-recorded_at: 2026-07-06
-timestamp: 2026-07-06T15:08:06.419617+00:00
+recorded_at: 2026-07-07
+timestamp: 2026-07-07T05:06:43.536468+00:00
 ---
 
 A pending proposal, not current fact.

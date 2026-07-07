@@ -6,8 +6,8 @@ tags:
 - gotcha
 - infra
 status: current
-recorded_at: 2026-07-06
-timestamp: 2026-07-06T15:08:06.296502+00:00
+recorded_at: 2026-07-07
+timestamp: 2026-07-07T05:06:43.406540+00:00
 ---
 
 A database limit that bites under load.

@@ -19,6 +19,7 @@ from scripts import eval_only as skillopt_eval
 
 from envs.crystalline_capture.adapter import CrystallineCaptureAdapter
 from envs.crystalline_routing.adapter import CrystallineRoutingAdapter
+from envs.crystalline_schema.adapter import CrystallineSchemaAdapter
 from seed import ensure_prompts, make_seed
 
 
@@ -27,6 +28,7 @@ def main() -> None:
     ensure_prompts()
     skillopt_eval._ENV_REGISTRY["crystalline_routing"] = CrystallineRoutingAdapter
     skillopt_eval._ENV_REGISTRY["crystalline_capture"] = CrystallineCaptureAdapter
+    skillopt_eval._ENV_REGISTRY["crystalline_schema"] = CrystallineSchemaAdapter
     skillopt_eval.main()
 
 

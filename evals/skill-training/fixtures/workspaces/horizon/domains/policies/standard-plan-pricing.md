@@ -6,8 +6,8 @@ tags:
 - pricing
 - policies
 status: current
-recorded_at: 2026-07-06
-timestamp: 2026-07-06T15:08:06.441725+00:00
+recorded_at: 2026-07-07
+timestamp: 2026-07-07T05:06:43.561696+00:00
 valid_from: 2026-01-01
 ---
 

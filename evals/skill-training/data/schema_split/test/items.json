@@ -1,0 +1,253 @@
+[
+  {
+    "id": "sch-author-12",
+    "workspace": "acme",
+    "task_type": "author_schema",
+    "question": "Author a schema for role engrams in people-ops: a required mission observation and a required owner frontmatter field. Warn mode to begin with.",
+    "expect": {
+      "schema_engram": {
+        "domain": "people-ops",
+        "entity": "role",
+        "validation": "warn",
+        "requires": [
+          "mission"
+        ],
+        "fm_requires": [
+          "owner"
+        ]
+      }
+    }
+  },
+  {
+    "id": "sch-author-13",
+    "workspace": "chronos",
+    "task_type": "author_schema",
+    "question": "Give platform a schema for runbook engrams: required objective and step observations, adopted in warn mode.",
+    "expect": {
+      "schema_engram": {
+        "domain": "platform",
+        "entity": "runbook",
+        "validation": "warn",
+        "requires": [
+          "objective",
+          "step"
+        ]
+      }
+    }
+  },
+  {
+    "id": "sch-author-14",
+    "workspace": "horizon",
+    "task_type": "author_schema",
+    "question": "Create a schema for notice engrams in policies: required statement observation plus a channel enum of email and banner. Start as warn.",
+    "expect": {
+      "schema_engram": {
+        "domain": "policies",
+        "entity": "notice",
+        "validation": "warn",
+        "requires": [
+          "statement"
+        ],
+        "enums": {
+          "channel": [
+            "email",
+            "banner"
+          ]
+        }
+      }
+    }
+  },
+  {
+    "id": "sch-infer-05",
+    "workspace": "meridian",
+    "task_type": "infer_bootstrap",
+    "question": "Rather than guessing, infer the incident schema for delivery from the captured incidents and save the result.",
+    "expect": {
+      "used_tool": {
+        "name": "infer_schema",
+        "domain": "delivery",
+        "type": "incident"
+      },
+      "schema_engram": {
+        "domain": "delivery",
+        "entity": "incident",
+        "requires": [
+          "fact",
+          "lesson"
+        ]
+      }
+    }
+  },
+  {
+    "id": "sch-infer-06",
+    "workspace": "chronos",
+    "task_type": "infer_bootstrap",
+    "question": "Derive a schema for platform's engram type from its existing engrams and store it as a schema engram.",
+    "expect": {
+      "used_tool": {
+        "name": "infer_schema",
+        "domain": "platform",
+        "type": "engram"
+      },
+      "schema_engram": {
+        "domain": "platform",
+        "entity": "engram"
+      }
+    }
+  },
+  {
+    "id": "sch-report-08",
+    "workspace": "meridian",
+    "task_type": "conformance_report",
+    "question": "Audit the delivery decisions against their schema and name every failing engram and field.",
+    "expect": {
+      "forbid_any_write": true,
+      "used_tool": {
+        "name": "validate_engrams",
+        "domain": "delivery"
+      },
+      "answer_all": [
+        "summary",
+        "owner"
+      ]
+    }
+  },
+  {
+    "id": "sch-report-09",
+    "workspace": "meridian",
+    "task_type": "conformance_report",
+    "question": "Do the retro engrams in delivery satisfy their schema? Answer yes or no with reasons.",
+    "expect": {
+      "forbid_any_write": true,
+      "used_tool": {
+        "name": "validate_engrams",
+        "domain": "delivery"
+      },
+      "answer_any": [
+        "yes"
+      ]
+    }
+  },
+  {
+    "id": "sch-report-10",
+    "workspace": "meridian",
+    "task_type": "conformance_report",
+    "question": "Which field of which delivery decision is outside its allowed enum values?",
+    "expect": {
+      "forbid_any_write": true,
+      "used_tool": {
+        "name": "validate_engrams",
+        "domain": "delivery"
+      },
+      "answer_all": [
+        "priority",
+        "urgent"
+      ]
+    }
+  },
+  {
+    "id": "sch-fix-08",
+    "workspace": "meridian",
+    "task_type": "fix_violation",
+    "question": "The delivery domain should be free of decision conformance warnings; make it so, defaulting unknown owners to lena.",
+    "expect": {
+      "resolve_verify_issue": {
+        "path_contains": "rushed-cache-migration",
+        "rule": "S021"
+      }
+    }
+  },
+  {
+    "id": "sch-fix-09",
+    "workspace": "meridian",
+    "task_type": "fix_violation",
+    "question": "One delivery decision has an illegal priority value; correct it to high.",
+    "expect": {
+      "resolve_verify_issue": {
+        "path_contains": "undocumented-vendor-swap",
+        "rule": "S022"
+      }
+    }
+  },
+  {
+    "id": "sch-play-07",
+    "workspace": "meridian",
+    "task_type": "schema_aware_capture",
+    "question": "Capture a quarterly access review playbook in delivery, owner lena: export the grants, review with team leads, revoke stale access.",
+    "expect": {
+      "write": {
+        "domain": "delivery",
+        "engram_type": "playbook",
+        "content_any": [
+          "stale"
+        ]
+      }
+    }
+  },
+  {
+    "id": "sch-play-08",
+    "workspace": "meridian",
+    "task_type": "schema_aware_capture",
+    "question": "Add a postmortem drill playbook to delivery, owner dana: pick a past incident, replay the timeline, extract one action item.",
+    "expect": {
+      "write": {
+        "domain": "delivery",
+        "engram_type": "playbook",
+        "content_any": [
+          "timeline"
+        ]
+      }
+    }
+  },
+  {
+    "id": "sch-promote-04",
+    "workspace": "meridian",
+    "task_type": "promote_validation",
+    "question": "Enforce the retro schema in delivery strictly from now on.",
+    "expect": {
+      "schema_engram": {
+        "domain": "delivery",
+        "entity": "retro",
+        "validation": "strict"
+      }
+    }
+  },
+  {
+    "id": "sch-noop-05",
+    "workspace": "acme",
+    "task_type": "no_schema_noop",
+    "question": "Validate infra against its schemas and summarize the findings.",
+    "expect": {
+      "used_tool": {
+        "name": "validate_engrams",
+        "domain": "infra"
+      },
+      "forbid_any_write": true,
+      "answer_any": [
+        "no schema",
+        "not governed",
+        "without a schema",
+        "none defined"
+      ]
+    }
+  },
+  {
+    "id": "sch-noop-06",
+    "workspace": "nimbus",
+    "task_type": "no_schema_noop",
+    "question": "Do the scratch engrams pass schema validation?",
+    "expect": {
+      "used_tool": {
+        "name": "validate_engrams",
+        "domain": "scratch"
+      },
+      "forbid_any_write": true,
+      "answer_any": [
+        "no schema",
+        "not governed",
+        "without a schema",
+        "none defined"
+      ]
+    }
+  }
+]

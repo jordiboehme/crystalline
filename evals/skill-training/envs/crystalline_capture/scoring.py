@@ -53,7 +53,9 @@ import json
 import re
 from pathlib import Path
 
-from envs.common import run_cmd, sandbox_env
+from envs.common import find_engram_file, read_frontmatter, snapshot
+
+__all__ = ["score_item", "snapshot", "describe_expectations"]
 
 MCP_PREFIX = "mcp__crystalline__"
 MUTATING_TOOLS = ("write_engram", "edit_engram", "delete_engram", "move_engram")
@@ -75,58 +77,10 @@ def _mutating_indices(tool_calls: list[dict]) -> list[int]:
     ]
 
 
-# ── Sandbox state ─────────────────────────────────────────────────────────
+# ── Sandbox state helpers live in envs.common (shared across envs) ──────
 
-def snapshot(sandbox: Path, crystalline_bin: str) -> dict:
-    """Capture the pre-run domain state: verify errors and file listing."""
-    domains_root = sandbox / "domains"
-    errors: set[tuple[str, str]] = set()
-    for domain_dir in sorted(p for p in domains_root.iterdir() if p.is_dir()):
-        proc = run_cmd(
-            [crystalline_bin, "verify", str(domain_dir), "--format", "json"],
-            env=sandbox_env(sandbox), timeout=60,
-        )
-        if proc.returncode not in (0, 1):
-            raise RuntimeError(
-                f"verify failed on {domain_dir.name}: {proc.stderr.strip()}"
-            )
-        report = json.loads(proc.stdout or "{}")
-        for issue in report.get("issues", []):
-            if str(issue.get("severity", "")).lower() != "error":
-                continue
-            rel = str(issue.get("path", "")).replace("\\", "/")
-            rel = rel.split("/domains/", 1)[-1]
-            errors.add((rel, str(issue.get("rule", ""))))
-    files = {
-        str(p.relative_to(domains_root))
-        for p in domains_root.rglob("*.md")
-    }
-    return {"verify_errors": errors, "files": files}
-
-
-def _frontmatter(path: Path) -> dict:
-    import yaml
-
-    text = path.read_text(encoding="utf-8")
-    if not text.startswith("---\n"):
-        return {}
-    end = text.find("\n---\n", 4)
-    if end < 0:
-        return {}
-    try:
-        parsed = yaml.safe_load(text[4:end])
-    except yaml.YAMLError:
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
-
-
-def _find_engram_file(sandbox: Path, domain: str, permalink: str) -> Path | None:
-    domain_dir = sandbox / "domains" / domain
-    slug = permalink.strip("/").split("/")[-1]
-    for p in domain_dir.rglob("*.md"):
-        if p.stem == slug:
-            return p
-    return None
+_frontmatter = read_frontmatter
+_find_engram_file = find_engram_file
 
 
 def _identifier_matches(raw: str, expected_permalink: str) -> bool:
@@ -141,6 +95,8 @@ def _identifier_matches(raw: str, expected_permalink: str) -> bool:
 
 def _write_matches(spec: dict, call: dict) -> bool:
     if spec.get("domain") and str(call.get("domain", "")) != spec["domain"]:
+        return False
+    if spec.get("engram_type") and str(call.get("type", "")) != spec["engram_type"]:
         return False
     if spec.get("tags_required"):
         tags = call.get("tags")

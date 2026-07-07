@@ -1,0 +1,252 @@
+[
+  {
+    "id": "sch-author-08",
+    "workspace": "acme",
+    "task_type": "author_schema",
+    "question": "Author a schema for runbook engrams in infra: required objective and step observations, warn mode.",
+    "expect": {
+      "schema_engram": {
+        "domain": "infra",
+        "entity": "runbook",
+        "validation": "warn",
+        "requires": [
+          "objective",
+          "step"
+        ]
+      }
+    }
+  },
+  {
+    "id": "sch-author-09",
+    "workspace": "horizon",
+    "task_type": "author_schema",
+    "question": "Give policies a schema for exception engrams: a required reason observation and a required owner frontmatter field, starting in warn mode.",
+    "expect": {
+      "schema_engram": {
+        "domain": "policies",
+        "entity": "exception",
+        "validation": "warn",
+        "requires": [
+          "reason"
+        ],
+        "fm_requires": [
+          "owner"
+        ]
+      }
+    }
+  },
+  {
+    "id": "sch-author-10",
+    "workspace": "acme",
+    "task_type": "author_schema",
+    "question": "Create a schema for dispute engrams in payments: required summary observation plus an outcome enum of won, lost and pending. Warn first.",
+    "expect": {
+      "schema_engram": {
+        "domain": "payments",
+        "entity": "dispute",
+        "validation": "warn",
+        "requires": [
+          "summary"
+        ],
+        "enums": {
+          "outcome": [
+            "won",
+            "lost",
+            "pending"
+          ]
+        }
+      }
+    }
+  },
+  {
+    "id": "sch-author-11",
+    "workspace": "nimbus",
+    "task_type": "author_schema",
+    "question": "Define a schema for quirk engrams in product-atlas: required behavior observation, optional workaround observation, warn mode.",
+    "expect": {
+      "schema_engram": {
+        "domain": "product-atlas",
+        "entity": "quirk",
+        "validation": "warn",
+        "requires": [
+          "behavior"
+        ],
+        "optional": [
+          "workaround"
+        ]
+      }
+    }
+  },
+  {
+    "id": "sch-infer-03",
+    "workspace": "meridian",
+    "task_type": "infer_bootstrap",
+    "question": "The delivery incidents already share a shape; infer their schema from the corpus and save it rather than writing one by hand.",
+    "expect": {
+      "used_tool": {
+        "name": "infer_schema",
+        "domain": "delivery",
+        "type": "incident"
+      },
+      "schema_engram": {
+        "domain": "delivery",
+        "entity": "incident",
+        "requires": [
+          "fact",
+          "lesson"
+        ]
+      }
+    }
+  },
+  {
+    "id": "sch-infer-07",
+    "workspace": "nimbus",
+    "task_type": "infer_bootstrap",
+    "question": "Bootstrap a schema for the engram type in product-atlas from existing entries and store the draft.",
+    "expect": {
+      "used_tool": {
+        "name": "infer_schema",
+        "domain": "product-atlas",
+        "type": "engram"
+      },
+      "schema_engram": {
+        "domain": "product-atlas",
+        "entity": "engram"
+      }
+    }
+  },
+  {
+    "id": "sch-report-06",
+    "workspace": "meridian",
+    "task_type": "conformance_report",
+    "question": "Run a full conformance sweep of delivery: what would break if every schema were strict?",
+    "expect": {
+      "forbid_any_write": true,
+      "used_tool": {
+        "name": "validate_engrams",
+        "domain": "delivery"
+      },
+      "answer_all": [
+        "summary",
+        "owner"
+      ]
+    }
+  },
+  {
+    "id": "sch-report-07",
+    "workspace": "meridian",
+    "task_type": "conformance_report",
+    "question": "Does the undocumented vendor swap decision meet the decision schema?",
+    "expect": {
+      "forbid_any_write": true,
+      "used_tool": {
+        "name": "validate_engrams",
+        "domain": "delivery"
+      },
+      "answer_all": [
+        "owner",
+        "urgent"
+      ]
+    }
+  },
+  {
+    "id": "sch-report-11",
+    "workspace": "meridian",
+    "task_type": "conformance_report",
+    "question": "List every schema currently defined in delivery and its enforcement mode.",
+    "expect": {
+      "forbid_any_write": true,
+      "answer_all": [
+        "decision",
+        "playbook",
+        "retro"
+      ]
+    }
+  },
+  {
+    "id": "sch-fix-06",
+    "workspace": "meridian",
+    "task_type": "fix_violation",
+    "question": "Every delivery decision needs its owner on record; fix any that lack one - lena owned the vendor swap.",
+    "expect": {
+      "resolve_verify_issue": {
+        "path_contains": "undocumented-vendor-swap",
+        "rule": "S030"
+      }
+    }
+  },
+  {
+    "id": "sch-fix-07",
+    "workspace": "meridian",
+    "task_type": "fix_violation",
+    "question": "Normalize the vendor swap decision's priority to a legal enum value; treat it as high.",
+    "expect": {
+      "resolve_verify_issue": {
+        "path_contains": "undocumented-vendor-swap",
+        "rule": "S022"
+      }
+    }
+  },
+  {
+    "id": "sch-play-05",
+    "workspace": "meridian",
+    "task_type": "schema_aware_capture",
+    "question": "Add a delivery playbook for warming the cache after a flush, owner dana: replay the top queries, watch hit rates, ramp traffic.",
+    "expect": {
+      "write": {
+        "domain": "delivery",
+        "engram_type": "playbook",
+        "content_any": [
+          "hit rate"
+        ]
+      }
+    }
+  },
+  {
+    "id": "sch-play-06",
+    "workspace": "meridian",
+    "task_type": "schema_aware_capture",
+    "question": "Capture a failover drill playbook in delivery, owner priya: announce the drill, fail the primary over, verify writes, fail back.",
+    "expect": {
+      "write": {
+        "domain": "delivery",
+        "engram_type": "playbook",
+        "content_any": [
+          "drill"
+        ]
+      }
+    }
+  },
+  {
+    "id": "sch-promote-03",
+    "workspace": "meridian",
+    "task_type": "promote_validation",
+    "question": "Graduate the retro schema in delivery from warn to strict.",
+    "expect": {
+      "schema_engram": {
+        "domain": "delivery",
+        "entity": "retro",
+        "validation": "strict"
+      }
+    }
+  },
+  {
+    "id": "sch-noop-04",
+    "workspace": "chronos",
+    "task_type": "no_schema_noop",
+    "question": "Check the platform domain for schema conformance issues.",
+    "expect": {
+      "used_tool": {
+        "name": "validate_engrams",
+        "domain": "platform"
+      },
+      "forbid_any_write": true,
+      "answer_any": [
+        "no schema",
+        "not governed",
+        "without a schema",
+        "none defined"
+      ]
+    }
+  }
+]

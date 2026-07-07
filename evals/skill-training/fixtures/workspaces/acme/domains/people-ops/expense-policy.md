@@ -6,8 +6,8 @@ tags:
 - policy
 - people-ops
 status: current
-recorded_at: 2026-07-06
-timestamp: 2026-07-06T15:08:06.330566+00:00
+recorded_at: 2026-07-07
+timestamp: 2026-07-07T05:06:43.442676+00:00
 ---
 
 What needs a receipt and what does not.

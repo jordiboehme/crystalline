@@ -330,6 +330,243 @@ WORKSPACES: dict[str, dict] = {
             ],
         },
     },
+    # Schema-governed workspace for the crystalline-schema benchmark:
+    # a warn schema with deliberate violations (warnings keep generation
+    # green), a strict schema over fully conforming engrams (so a new
+    # nonconforming write becomes a verify error), a warn schema ready
+    # for strict promotion and an unschema'd corpus for inference.
+    "meridian": {
+        "delivery": {
+            "scope": [
+                "Delivery workstream knowledge with schema-governed engram types: decisions, playbooks and retros",
+                "Incident notes that have not been given a schema yet",
+            ],
+            "when": [
+                "Questions about delivery decisions, playbooks, retros or incidents and whether they conform to their schemas",
+            ],
+            "notes": ["Three engram types here carry schemas; check conformance before restructuring"],
+            "engrams": [
+                engram(
+                    "Decision Schema",
+                    "The shape for decision engrams in this domain.\n\n"
+                    "- [convention] Decisions carry a one line summary and a priority #delivery\n"
+                    "- [convention] The deciding owner is recorded in frontmatter #delivery",
+                    tags="schema,delivery",
+                    engram_type="schema",
+                    metadata={
+                        "entity": "decision",
+                        "version": 1,
+                        "schema": {
+                            "summary": "string, one line summary of the decision",
+                            "rationale?": "string",
+                            "priority(enum)": ["low", "medium", "high"],
+                            "supersedes?": "Decision",
+                        },
+                        "settings": {
+                            "validation": "warn",
+                            "frontmatter": {"owner": "string"},
+                        },
+                    },
+                ),
+                engram(
+                    "Adopt trunk based development",
+                    "A branching model decision.\n\n"
+                    "- [summary] All delivery repos move to trunk based development\n"
+                    "- [rationale] Long lived branches caused two release trainwrecks in Q1\n"
+                    "- [priority] high",
+                    tags="delivery,decision",
+                    engram_type="decision",
+                    metadata={"owner": "dana"},
+                ),
+                engram(
+                    "Choose postgres for ledger",
+                    "A storage decision.\n\n"
+                    "- [summary] The ledger service stores balances in postgres\n"
+                    "- [priority] medium",
+                    tags="delivery,decision",
+                    engram_type="decision",
+                    metadata={"owner": "miguel"},
+                ),
+                engram(
+                    "Retire nightly batch",
+                    "A pipeline decision.\n\n"
+                    "- [summary] The nightly reconciliation batch is retired in favor of streaming\n"
+                    "- [rationale] The batch window kept colliding with the backup window\n"
+                    "- [priority] low",
+                    tags="delivery,decision",
+                    engram_type="decision",
+                    metadata={"owner": "dana"},
+                ),
+                engram(
+                    "Standardize error budgets",
+                    "A reliability decision.\n\n"
+                    "- [summary] Every delivery service gets a quarterly error budget\n"
+                    "- [priority] medium",
+                    tags="delivery,decision",
+                    engram_type="decision",
+                    metadata={"owner": "priya"},
+                ),
+                engram(
+                    "Rushed cache migration",
+                    "A decision captured in a hurry; the summary bullet never made it in.\n\n"
+                    "- [rationale] The old cache cluster was out of support\n"
+                    "- [priority] high",
+                    tags="delivery,decision",
+                    engram_type="decision",
+                    metadata={"owner": "lena"},
+                ),
+                engram(
+                    "Undocumented vendor swap",
+                    "A decision captured without its owner and with a made-up priority.\n\n"
+                    "- [summary] The payments vendor was swapped during the outage\n"
+                    "- [priority] urgent",
+                    tags="delivery,decision",
+                    engram_type="decision",
+                ),
+                engram(
+                    "Playbook Schema",
+                    "The shape for playbook engrams in this domain, enforced strictly.\n\n"
+                    "- [convention] Playbooks state an objective and numbered steps #delivery\n"
+                    "- [convention] Every playbook names its owner #delivery",
+                    tags="schema,delivery",
+                    engram_type="schema",
+                    metadata={
+                        "entity": "playbook",
+                        "version": 1,
+                        "schema": {
+                            "objective": "string, what the playbook achieves",
+                            "step(array)": "string",
+                        },
+                        "settings": {
+                            "validation": "strict",
+                            "frontmatter": {"owner": "string"},
+                        },
+                    },
+                ),
+                engram(
+                    "Rollback playbook",
+                    "How to take a bad release back out.\n\n"
+                    "- [objective] Restore the previous release within ten minutes\n"
+                    "- [step] Freeze the deploy pipeline\n"
+                    "- [step] Re-promote the previous color\n"
+                    "- [step] Confirm error rates return to baseline",
+                    tags="delivery,playbook",
+                    engram_type="playbook",
+                    metadata={"owner": "miguel"},
+                ),
+                engram(
+                    "Incident comms playbook",
+                    "Who says what during an incident.\n\n"
+                    "- [objective] Keep stakeholders informed without distracting responders\n"
+                    "- [step] Open a dedicated incident channel\n"
+                    "- [step] Post a status update every thirty minutes",
+                    tags="delivery,playbook",
+                    engram_type="playbook",
+                    metadata={"owner": "priya"},
+                ),
+                engram(
+                    "Dependency upgrade playbook",
+                    "How routine upgrades roll through the fleet.\n\n"
+                    "- [objective] Upgrade shared dependencies without breaking consumers\n"
+                    "- [step] Upgrade the canary service first\n"
+                    "- [step] Watch its error budget for a full day\n"
+                    "- [step] Roll the remaining services in dependency order",
+                    tags="delivery,playbook",
+                    engram_type="playbook",
+                    metadata={"owner": "dana"},
+                ),
+                engram(
+                    "Retro Schema",
+                    "The shape for retro engrams, still in its adoption phase.\n\n"
+                    "- [convention] Retros record what went well and what needs work #delivery\n"
+                    "- [convention] Action items are optional but encouraged #delivery",
+                    tags="schema,delivery",
+                    engram_type="schema",
+                    metadata={
+                        "entity": "retro",
+                        "version": 1,
+                        "schema": {
+                            "went_well": "string",
+                            "needs_work": "string",
+                            "action?(array)": "string",
+                        },
+                        "settings": {"validation": "warn"},
+                    },
+                ),
+                engram(
+                    "Q1 latency retro",
+                    "Looking back at the latency push.\n\n"
+                    "- [went_well] P99 latency halved without a rollback\n"
+                    "- [needs_work] Load test coverage lagged the changes\n"
+                    "- [action] Add a load test stage to the deploy pipeline",
+                    tags="delivery,retro",
+                    engram_type="retro",
+                ),
+                engram(
+                    "Launch retro",
+                    "Looking back at the spring launch.\n\n"
+                    "- [went_well] The launch checklist caught two blockers early\n"
+                    "- [needs_work] Support was looped in a week too late",
+                    tags="delivery,retro",
+                    engram_type="retro",
+                ),
+                engram(
+                    "Oncall retro",
+                    "Looking back at the rotation change.\n\n"
+                    "- [went_well] Page volume dropped after the alert cleanup\n"
+                    "- [needs_work] Handover notes were inconsistent\n"
+                    "- [action] Adopt a handover template",
+                    tags="delivery,retro",
+                    engram_type="retro",
+                ),
+                engram(
+                    "Incident 2026-03 payment lag",
+                    "A queue depth incident.\n\n"
+                    "- [fact] Payment confirmations lagged by four minutes at peak\n"
+                    "- [lesson] Queue depth alerts fired too late to matter",
+                    tags="delivery,incident",
+                    engram_type="incident",
+                    metadata={"owner": "lena"},
+                ),
+                engram(
+                    "Incident 2026-04 cache storm",
+                    "A thundering herd incident.\n\n"
+                    "- [fact] A cache flush stampeded the primary database\n"
+                    "- [lesson] Cache flushes need jittered expiry",
+                    tags="delivery,incident",
+                    engram_type="incident",
+                    metadata={"owner": "dana"},
+                ),
+                engram(
+                    "Incident 2026-05 dns flap",
+                    "A resolver incident.\n\n"
+                    "- [fact] Internal DNS flapped for eleven minutes during the resolver upgrade\n"
+                    "- [lesson] Resolver upgrades belong in the maintenance window",
+                    tags="delivery,incident",
+                    engram_type="incident",
+                    metadata={"owner": "miguel"},
+                ),
+                engram(
+                    "Incident 2026-06 queue backlog",
+                    "A consumer stall incident.\n\n"
+                    "- [fact] A stalled consumer group backed the event queue up for an hour\n"
+                    "- [lesson] Consumer lag needs its own alert, not just queue depth",
+                    tags="delivery,incident",
+                    engram_type="incident",
+                    metadata={"owner": "priya"},
+                ),
+                engram(
+                    "Incident 2026-06 cert expiry",
+                    "An expiry incident.\n\n"
+                    "- [fact] An internal certificate expired unnoticed and broke service auth\n"
+                    "- [lesson] Certificate expiry belongs on the rotation calendar",
+                    tags="delivery,incident",
+                    engram_type="incident",
+                    metadata={"owner": "lena"},
+                ),
+            ],
+        },
+    },
     # Linked product knowledge plus a near-empty distractor domain: tests
     # build_context navigation and structure questions where a MANIFEST
     # read is the right move.

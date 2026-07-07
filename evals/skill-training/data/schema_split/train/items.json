@@ -1,0 +1,505 @@
+[
+  {
+    "id": "sch-author-01",
+    "workspace": "acme",
+    "task_type": "author_schema",
+    "question": "Author a schema in the payments domain for runbook engrams: a required objective observation and a required list of step observations, both strings. Start it in warn mode.",
+    "expect": {
+      "schema_engram": {
+        "domain": "payments",
+        "entity": "runbook",
+        "validation": "warn",
+        "requires": [
+          "objective",
+          "step"
+        ]
+      }
+    }
+  },
+  {
+    "id": "sch-author-02",
+    "workspace": "acme",
+    "task_type": "author_schema",
+    "question": "Give infra a schema for incident engrams: required impact and timeline observations, an optional followup observation. Adopt it in warn mode first.",
+    "expect": {
+      "schema_engram": {
+        "domain": "infra",
+        "entity": "incident",
+        "validation": "warn",
+        "requires": [
+          "impact",
+          "timeline"
+        ],
+        "optional": [
+          "followup"
+        ]
+      }
+    }
+  },
+  {
+    "id": "sch-author-03",
+    "workspace": "acme",
+    "task_type": "author_schema",
+    "question": "Create a schema for policy engrams in people-ops: a required rule observation and an audience enum limited to engineering or everyone. Warn mode to start.",
+    "expect": {
+      "schema_engram": {
+        "domain": "people-ops",
+        "entity": "policy",
+        "validation": "warn",
+        "requires": [
+          "rule"
+        ],
+        "enums": {
+          "audience": [
+            "engineering",
+            "everyone"
+          ]
+        }
+      }
+    }
+  },
+  {
+    "id": "sch-author-04",
+    "workspace": "nimbus",
+    "task_type": "author_schema",
+    "question": "Define a schema for feature engrams in product-atlas: required summary observation, optional limitation observation and an optional depends_on relation pointing at other Feature engrams. Start in warn mode.",
+    "expect": {
+      "schema_engram": {
+        "domain": "product-atlas",
+        "entity": "feature",
+        "validation": "warn",
+        "requires": [
+          "summary"
+        ],
+        "optional": [
+          "limitation"
+        ],
+        "relations": {
+          "depends_on": "Feature"
+        }
+      }
+    }
+  },
+  {
+    "id": "sch-author-05",
+    "workspace": "horizon",
+    "task_type": "author_schema",
+    "question": "Give the policies domain a schema for policy engrams: a required statement observation, and every policy must name an owner in frontmatter. Warn mode first.",
+    "expect": {
+      "schema_engram": {
+        "domain": "policies",
+        "entity": "policy",
+        "validation": "warn",
+        "requires": [
+          "statement"
+        ],
+        "fm_requires": [
+          "owner"
+        ]
+      }
+    }
+  },
+  {
+    "id": "sch-author-06",
+    "workspace": "chronos",
+    "task_type": "author_schema",
+    "question": "Author a schema for migration engrams on platform: required motivation and outcome observations plus a risk enum of low, medium and high. Start it as warn.",
+    "expect": {
+      "schema_engram": {
+        "domain": "platform",
+        "entity": "migration",
+        "validation": "warn",
+        "requires": [
+          "motivation",
+          "outcome"
+        ],
+        "enums": {
+          "risk": [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      }
+    }
+  },
+  {
+    "id": "sch-author-07",
+    "workspace": "nimbus",
+    "task_type": "author_schema",
+    "question": "Even scratch wants light structure: schema for experiment engrams with a required hypothesis observation and an optional result observation, warn mode.",
+    "expect": {
+      "schema_engram": {
+        "domain": "scratch",
+        "entity": "experiment",
+        "validation": "warn",
+        "requires": [
+          "hypothesis"
+        ],
+        "optional": [
+          "result"
+        ]
+      }
+    }
+  },
+  {
+    "id": "sch-author-15",
+    "workspace": "chronos",
+    "task_type": "author_schema",
+    "question": "Create a schema for checklist engrams in platform: a required item observation list. Adopt in warn mode.",
+    "expect": {
+      "schema_engram": {
+        "domain": "platform",
+        "entity": "checklist",
+        "validation": "warn",
+        "requires": [
+          "item"
+        ]
+      }
+    }
+  },
+  {
+    "id": "sch-infer-01",
+    "workspace": "meridian",
+    "task_type": "infer_bootstrap",
+    "question": "Bootstrap a schema for incident engrams in delivery from what is already captured there, then save the draft as a schema engram.",
+    "expect": {
+      "used_tool": {
+        "name": "infer_schema",
+        "domain": "delivery",
+        "type": "incident"
+      },
+      "schema_engram": {
+        "domain": "delivery",
+        "entity": "incident",
+        "requires": [
+          "fact",
+          "lesson"
+        ]
+      }
+    }
+  },
+  {
+    "id": "sch-infer-02",
+    "workspace": "chronos",
+    "task_type": "infer_bootstrap",
+    "question": "Generalize a schema for the platform domain's engram type from the existing content rather than guessing, and save it.",
+    "expect": {
+      "used_tool": {
+        "name": "infer_schema",
+        "domain": "platform",
+        "type": "engram"
+      },
+      "schema_engram": {
+        "domain": "platform",
+        "entity": "engram",
+        "requires": [
+          "fact"
+        ]
+      }
+    }
+  },
+  {
+    "id": "sch-infer-04",
+    "workspace": "nimbus",
+    "task_type": "infer_bootstrap",
+    "question": "Use inference to draft a schema for product-atlas engram-type entries from what exists, then store it.",
+    "expect": {
+      "used_tool": {
+        "name": "infer_schema",
+        "domain": "product-atlas",
+        "type": "engram"
+      },
+      "schema_engram": {
+        "domain": "product-atlas",
+        "entity": "engram"
+      }
+    }
+  },
+  {
+    "id": "sch-report-01",
+    "workspace": "meridian",
+    "task_type": "conformance_report",
+    "question": "Do the decision engrams in delivery conform to their schema? Report exactly what is broken.",
+    "expect": {
+      "forbid_any_write": true,
+      "used_tool": {
+        "name": "validate_engrams",
+        "domain": "delivery"
+      },
+      "answer_all": [
+        "summary",
+        "priority",
+        "owner"
+      ]
+    }
+  },
+  {
+    "id": "sch-report-02",
+    "workspace": "meridian",
+    "task_type": "conformance_report",
+    "question": "Which delivery decision engrams have conformance problems?",
+    "expect": {
+      "forbid_any_write": true,
+      "used_tool": {
+        "name": "validate_engrams",
+        "domain": "delivery"
+      },
+      "answer_all": [
+        "rushed",
+        "vendor"
+      ]
+    }
+  },
+  {
+    "id": "sch-report-03",
+    "workspace": "meridian",
+    "task_type": "conformance_report",
+    "question": "Is the rushed cache migration decision valid against its schema?",
+    "expect": {
+      "forbid_any_write": true,
+      "used_tool": {
+        "name": "validate_engrams",
+        "domain": "delivery"
+      },
+      "answer_all": [
+        "summary"
+      ]
+    }
+  },
+  {
+    "id": "sch-report-04",
+    "workspace": "meridian",
+    "task_type": "conformance_report",
+    "question": "Do our delivery playbooks conform to their schema?",
+    "expect": {
+      "forbid_any_write": true,
+      "used_tool": {
+        "name": "validate_engrams",
+        "domain": "delivery"
+      },
+      "answer_any": [
+        "conform",
+        "no issue",
+        "no problem",
+        "all pass",
+        "clean"
+      ]
+    }
+  },
+  {
+    "id": "sch-report-05",
+    "workspace": "meridian",
+    "task_type": "conformance_report",
+    "question": "How strictly is the retro schema in delivery enforced right now?",
+    "expect": {
+      "forbid_any_write": true,
+      "answer_any": [
+        "warn"
+      ]
+    }
+  },
+  {
+    "id": "sch-fix-01",
+    "workspace": "meridian",
+    "task_type": "fix_violation",
+    "question": "Bring the rushed cache migration decision into conformance with the decision schema.",
+    "expect": {
+      "resolve_verify_issue": {
+        "path_contains": "rushed-cache-migration",
+        "rule": "S021"
+      }
+    }
+  },
+  {
+    "id": "sch-fix-02",
+    "workspace": "meridian",
+    "task_type": "fix_violation",
+    "question": "Fix the missing owner on the undocumented vendor swap decision; the owner was lena.",
+    "expect": {
+      "resolve_verify_issue": {
+        "path_contains": "undocumented-vendor-swap",
+        "rule": "S030"
+      }
+    }
+  },
+  {
+    "id": "sch-fix-03",
+    "workspace": "meridian",
+    "task_type": "fix_violation",
+    "question": "The undocumented vendor swap decision carries a priority that is not a legal value; it was really a high priority call. Fix it.",
+    "expect": {
+      "resolve_verify_issue": {
+        "path_contains": "undocumented-vendor-swap",
+        "rule": "S022"
+      }
+    }
+  },
+  {
+    "id": "sch-fix-04",
+    "workspace": "meridian",
+    "task_type": "fix_violation",
+    "question": "Make every delivery decision pass its schema; fill gaps sensibly and use lena as owner where unknown.",
+    "expect": {
+      "resolve_verify_issue": {
+        "path_contains": "rushed-cache-migration",
+        "rule": "S021"
+      }
+    }
+  },
+  {
+    "id": "sch-fix-05",
+    "workspace": "meridian",
+    "task_type": "fix_violation",
+    "question": "The rushed cache migration decision is missing its required summary; it was about moving to the managed cache cluster. Repair it.",
+    "expect": {
+      "resolve_verify_issue": {
+        "path_contains": "rushed-cache-migration",
+        "rule": "S021"
+      }
+    }
+  },
+  {
+    "id": "sch-play-01",
+    "workspace": "meridian",
+    "task_type": "schema_aware_capture",
+    "question": "Capture a new playbook in delivery, owned by miguel: freeing disk on the log cluster. Objective plus steps: identify the biggest indices, archive them to cold storage, compact what remains.",
+    "expect": {
+      "write": {
+        "domain": "delivery",
+        "engram_type": "playbook",
+        "content_any": [
+          "cold storage"
+        ]
+      }
+    }
+  },
+  {
+    "id": "sch-play-02",
+    "workspace": "meridian",
+    "task_type": "schema_aware_capture",
+    "question": "Add a delivery playbook for rotating API keys, owner dana: inventory the keys, issue replacements, revoke the old ones.",
+    "expect": {
+      "write": {
+        "domain": "delivery",
+        "engram_type": "playbook",
+        "content_any": [
+          "revoke"
+        ]
+      }
+    }
+  },
+  {
+    "id": "sch-play-03",
+    "workspace": "meridian",
+    "task_type": "schema_aware_capture",
+    "question": "New delivery playbook, owner priya: onboarding a service. Register it in the catalog, add its alerts, give it an error budget.",
+    "expect": {
+      "write": {
+        "domain": "delivery",
+        "engram_type": "playbook",
+        "content_any": [
+          "catalog"
+        ]
+      }
+    }
+  },
+  {
+    "id": "sch-play-04",
+    "workspace": "meridian",
+    "task_type": "schema_aware_capture",
+    "question": "Capture a playbook for restoring the ledger from backup, owner miguel: freeze writes, restore the snapshot, replay events, unfreeze.",
+    "expect": {
+      "write": {
+        "domain": "delivery",
+        "engram_type": "playbook",
+        "content_any": [
+          "snapshot"
+        ]
+      }
+    }
+  },
+  {
+    "id": "sch-promote-01",
+    "workspace": "meridian",
+    "task_type": "promote_validation",
+    "question": "The retros have converged on their shape; promote the retro schema in delivery to strict enforcement.",
+    "expect": {
+      "schema_engram": {
+        "domain": "delivery",
+        "entity": "retro",
+        "validation": "strict"
+      }
+    }
+  },
+  {
+    "id": "sch-promote-02",
+    "workspace": "meridian",
+    "task_type": "promote_validation",
+    "question": "Turn enforcement up to strict for retro engrams in the delivery domain.",
+    "expect": {
+      "schema_engram": {
+        "domain": "delivery",
+        "entity": "retro",
+        "validation": "strict"
+      }
+    }
+  },
+  {
+    "id": "sch-noop-01",
+    "workspace": "acme",
+    "task_type": "no_schema_noop",
+    "question": "Check whether the payments engrams conform to their schemas.",
+    "expect": {
+      "used_tool": {
+        "name": "validate_engrams",
+        "domain": "payments"
+      },
+      "forbid_any_write": true,
+      "answer_any": [
+        "no schema",
+        "not governed",
+        "without a schema",
+        "none defined"
+      ]
+    }
+  },
+  {
+    "id": "sch-noop-02",
+    "workspace": "nimbus",
+    "task_type": "no_schema_noop",
+    "question": "Run a conformance check over product-atlas and tell me what fails.",
+    "expect": {
+      "used_tool": {
+        "name": "validate_engrams",
+        "domain": "product-atlas"
+      },
+      "forbid_any_write": true,
+      "answer_any": [
+        "no schema",
+        "not governed",
+        "without a schema",
+        "none defined"
+      ]
+    }
+  },
+  {
+    "id": "sch-noop-03",
+    "workspace": "horizon",
+    "task_type": "no_schema_noop",
+    "question": "Validate the policies domain against its schemas and report.",
+    "expect": {
+      "used_tool": {
+        "name": "validate_engrams",
+        "domain": "policies"
+      },
+      "forbid_any_write": true,
+      "answer_any": [
+        "no schema",
+        "not governed",
+        "without a schema",
+        "none defined"
+      ]
+    }
+  }
+]

@@ -6,8 +6,8 @@ tags:
 - people-ops
 - rotation
 status: current
-recorded_at: 2026-07-06
-timestamp: 2026-07-06T15:08:06.342867+00:00
+recorded_at: 2026-07-07
+timestamp: 2026-07-07T05:06:43.456127+00:00
 ---
 
 Who to page when a refund case escalates.

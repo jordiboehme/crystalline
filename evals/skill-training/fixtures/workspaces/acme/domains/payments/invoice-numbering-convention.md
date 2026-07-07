@@ -6,8 +6,8 @@ tags:
 - convention
 - payments
 status: current
-recorded_at: 2026-07-06
-timestamp: 2026-07-06T15:08:06.250401+00:00
+recorded_at: 2026-07-07
+timestamp: 2026-07-07T05:06:43.360777+00:00
 ---
 
 How invoice identifiers are constructed.

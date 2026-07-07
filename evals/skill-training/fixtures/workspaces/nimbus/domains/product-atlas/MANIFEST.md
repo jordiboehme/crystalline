@@ -5,7 +5,7 @@ permalink: manifest
 tags:
   - manifest
 status: current
-recorded_at: 2026-07-06
+recorded_at: 2026-07-07
 ---
 
 # product-atlas
