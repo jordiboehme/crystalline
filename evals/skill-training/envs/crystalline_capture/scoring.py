@@ -292,14 +292,20 @@ def score_item(
     relation_to = expect.get("relation_to")
     if relation_to:
         needle = f"[[{relation_to}]]".lower()
+        slug = re.sub(r"[^a-z0-9]+", "-", relation_to.lower()).strip("-")
         ok = any(
             needle in (sandbox / "domains" / f).read_text(encoding="utf-8").lower()
             for f in new_files
         ) or any(
             needle in str(c.get("content", "")).lower()
             for c in writes + edits
+        ) or any(
+            # Capturing the knowledge inside the named engram itself
+            # connects it intrinsically; a self-link would even be wrong.
+            _identifier_matches(c.get("identifier", ""), slug)
+            for c in edits
         )
-        checks.append((ok, f"the captured knowledge links [[{relation_to}]]"))
+        checks.append((ok, f"the captured knowledge links [[{relation_to}]] or lands inside that engram"))
 
     lowered = (answer or "").lower()
     answer_any = expect.get("answer_any")
