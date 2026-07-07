@@ -13,6 +13,13 @@ Supported ``expect`` keys:
   least one of them (case-insensitive).
 - ``answer_all``: list of substrings; the final answer must contain all
   of them (case-insensitive).
+- ``answer_none``: list of substrings; the final answer must contain
+  none of them (claims that only appear when a shallow preview was
+  trusted over the engram's own content).
+- ``reads``: object with ``identifiers``, a list of permalinks; for
+  every one a read_engram call must exist whose identifier matches it
+  (bare, domain-qualified or as a crystalline:// URL). The check that a
+  snippet was not treated as a source.
 - ``search``: object describing at least one required search_engrams
   call. Subkeys:
     - ``domains``: exact set of the domains argument on a matching call.
@@ -65,6 +72,15 @@ def _domains_of(call_input: dict) -> list[str]:
     return sorted(str(d) for d in domains)
 
 
+def _read_matches(identifier_arg, expected: str) -> bool:
+    """The read_engram identifier names the expected engram, whether it
+    came as a bare permalink, domain/permalink or a crystalline:// URL."""
+    raw = str(identifier_arg or "").strip().lower()
+    tail = raw.removeprefix("crystalline://").strip("/").split("/")[-1]
+    want = str(expected).strip("/").split("/")[-1].lower()
+    return bool(tail) and tail == want
+
+
 def _is_manifest_read(tool_calls: list[dict]) -> bool:
     for call_input in _mcp_calls(tool_calls, "read_engram"):
         identifier = str(call_input.get("identifier", "") or "")
@@ -91,6 +107,26 @@ def score_item(
     if answer_all:
         ok = all(str(s).lower() in lowered for s in answer_all)
         checks.append((ok, f"answer must mention all of {answer_all}"))
+    answer_none = expect.get("answer_none")
+    if answer_none:
+        found = [s for s in answer_none if str(s).lower() in lowered]
+        checks.append((
+            not found,
+            f"answer must not claim any of {answer_none} (found {found})",
+        ))
+
+    reads_expect = expect.get("reads")
+    if reads_expect:
+        read_calls = _mcp_calls(tool_calls, "read_engram")
+        for ident in reads_expect.get("identifiers") or []:
+            ok = any(
+                _read_matches(c.get("identifier"), ident) for c in read_calls
+            )
+            checks.append((
+                ok,
+                f"read_engram on '{ident}' (the full engram, not its "
+                "search snippet)",
+            ))
 
     search_expect = expect.get("search")
     if search_expect:
@@ -230,6 +266,21 @@ def describe_expectations(expect: dict[str, Any]) -> str:
     if expect.get("answer_any"):
         lines.append(
             f"The final answer had to mention one of {expect['answer_any']}."
+        )
+    reads_expect = expect.get("reads")
+    if reads_expect:
+        lines.append(
+            "A search hit's snippet is a partial window, not the engram: "
+            f"the full content of {reads_expect.get('identifiers')} had to "
+            "be read with read_engram before drafting the answer, because "
+            "the load-bearing facts sit deep in the body where no snippet "
+            "reaches."
+        )
+    if expect.get("answer_none"):
+        lines.append(
+            f"The answer must not repeat {expect['answer_none']}: that "
+            "claim comes from a shallow preview and the engram's own "
+            "content corrects it."
         )
     if expect.get("forbid_write"):
         lines.append("No write tools were allowed; the task is read-only.")
