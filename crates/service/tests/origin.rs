@@ -319,6 +319,124 @@ async fn origin_add_creates_folder_registers_domain_and_indexes_engrams() {
 }
 
 #[tokio::test]
+async fn origin_add_connects_a_registered_domain_in_place() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        (
+            "notes/alpha.md",
+            engram("Alpha", "alpha", "the team version"),
+        ),
+        (
+            "notes/beta.md",
+            engram("Beta", "beta", "only upstream has this"),
+        ),
+    ]));
+    mock.set_branch("main", &commit);
+
+    // A plain file domain, already registered and on disk, whose alpha
+    // differs from upstream and which has no beta at all.
+    let root = tmp.path().join("brand-knowledge");
+    std::fs::create_dir_all(root.join("notes")).unwrap();
+    std::fs::write(root.join("MANIFEST.md"), manifest()).unwrap();
+    std::fs::write(
+        root.join("notes/alpha.md"),
+        engram("Alpha", "alpha", "my local take"),
+    )
+    .unwrap();
+
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let mut cfg = config(true);
+    cfg.domains.insert(
+        "brand".to_string(),
+        crystalline_core::config::DomainEntry {
+            kind: crystalline_core::config::DomainKind::File,
+            path: Some(root.clone()),
+            origin: None,
+        },
+    );
+    let eng = Engine::new(
+        Arc::new(Mutex::new(store)),
+        cfg,
+        None,
+        Some(config_path.clone()),
+    )
+    .with_origin_provider(mock)
+    .with_origins_dir(origins_dir);
+
+    let result = eng
+        .origin_add("acme/brand-knowledge", Some("brand"), None, None, None)
+        .await
+        .expect("a registered origin-less domain connects in place");
+
+    assert_eq!(result["domain"], "brand");
+    assert_eq!(result["root"], root.display().to_string());
+    assert_eq!(result["adopted"], true);
+    assert_eq!(result["local_changes"], 1, "the differing alpha");
+
+    // Local knowledge kept, missing upstream knowledge arrived.
+    let alpha = std::fs::read_to_string(root.join("notes/alpha.md")).unwrap();
+    assert!(alpha.contains("my local take"), "{alpha}");
+    assert!(root.join("notes/beta.md").exists());
+
+    // The entry kept its root and gained the origin, persisted to disk.
+    let on_disk: GlobalConfig = crystalline_core::config::load_yaml(&config_path).unwrap();
+    let entry = on_disk.domains.get("brand").unwrap();
+    assert_eq!(entry.origin.as_ref().unwrap().repo, "acme/brand-knowledge");
+    assert_eq!(entry.file_path().as_deref(), Some(root.as_path()));
+}
+
+#[tokio::test]
+async fn origin_add_on_a_registered_domain_refuses_a_different_folder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[("MANIFEST.md", manifest())]));
+    mock.set_branch("main", &commit);
+
+    let root = tmp.path().join("brand-knowledge");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("MANIFEST.md"), manifest()).unwrap();
+
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let mut cfg = config(true);
+    cfg.domains.insert(
+        "brand".to_string(),
+        crystalline_core::config::DomainEntry {
+            kind: crystalline_core::config::DomainKind::File,
+            path: Some(root.clone()),
+            origin: None,
+        },
+    );
+    let eng = Engine::new(
+        Arc::new(Mutex::new(store)),
+        cfg,
+        None,
+        Some(config_path.clone()),
+    )
+    .with_origin_provider(mock)
+    .with_origins_dir(origins_dir);
+
+    let elsewhere = tmp.path().join("elsewhere");
+    let err = eng
+        .origin_add(
+            "acme/brand-knowledge",
+            Some("brand"),
+            None,
+            None,
+            Some(elsewhere.to_str().unwrap()),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EngineError::Conflict(_)), "{err}");
+    assert!(!elsewhere.exists(), "a refused add must not touch disk");
+}
+
+#[tokio::test]
 async fn origin_add_refuses_a_domain_name_already_registered() {
     let tmp = tempfile::tempdir().unwrap();
     let mock = Arc::new(MockProvider::new());

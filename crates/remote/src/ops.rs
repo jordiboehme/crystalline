@@ -67,13 +67,20 @@ const MAX_COMPARE_FILES: usize = 50;
 pub struct SubscribeReport {
     /// The commit the domain was subscribed at, now the base snapshot.
     pub base_commit: String,
-    /// How many files were written to the working tree.
+    /// How many files were written to the working tree (for an adopted
+    /// target, only the upstream files that had no local counterpart).
     pub files_written: usize,
-    /// How many of those files are engrams (`.md`).
+    /// How many extracted upstream files are engrams (`.md`).
     pub engrams: usize,
     /// Upstream files skipped for exceeding [`MAX_SHARED_FILE_BYTES`], each
     /// with its size in bytes.
     pub skipped_large: Vec<(String, u64)>,
+    /// Whether the target already held files and was connected in place.
+    pub adopted: bool,
+    /// How many local files differ from the new base snapshot right after
+    /// subscribing: kept local edits plus local-only files, all shareable or
+    /// updatable through the ordinary flows. Always 0 for a fresh download.
+    pub local_changes: usize,
 }
 
 /// What [`pull`] did to bring a domain up to date with its origin.
@@ -213,13 +220,16 @@ struct UpstreamEdit {
 }
 
 /// Connects a domain to its origin for the first time: downloads the tracked
-/// subtree at the branch head, writes it to `domain_root`, records the
-/// identical set as the base snapshot and saves a fresh [`OriginState`].
+/// subtree at the branch head, records it as the base snapshot and saves a
+/// fresh [`OriginState`].
 ///
-/// The target must look like a domain (a `MANIFEST.md` at the subtree root)
-/// and `domain_root` must be absent or an empty directory; both are checked
-/// before anything is written, so a rejected subscribe leaves the disk
-/// untouched.
+/// The origin must look like a domain (a `MANIFEST.md` at the subtree root),
+/// checked before anything is written, so a rejected subscribe leaves the
+/// disk untouched. An absent or empty `domain_root` receives the full tree; a
+/// non-empty one is adopted in place: only upstream files with no local
+/// counterpart are materialized and no local file is ever overwritten or
+/// deleted, so an existing file that differs from the origin simply becomes
+/// an ordinary local change against the new base, ready to share or update.
 pub async fn subscribe(
     provider: &dyn Provider,
     spec: &OriginSpec,
@@ -252,27 +262,30 @@ pub async fn subscribe(
         });
     }
 
-    if domain_root.exists() {
-        let mut entries = std::fs::read_dir(domain_root)?;
-        if entries.next().is_some() {
-            return Err(RemoteError::State(format!(
-                "{} already exists and is not empty",
-                domain_root.display()
-            )));
-        }
-    }
+    let adopted = domain_root.exists() && std::fs::read_dir(domain_root)?.next().is_some();
 
-    // One pass writes the working tree and the base snapshot together and
-    // stamps the manifest from the same bytes, so the base is never read back.
+    // One pass writes the base snapshot and stamps the manifest from the same
+    // bytes, so the base is never read back. The working tree only receives
+    // upstream files that do not exist locally: on a fresh target that is the
+    // whole tree, on an adopted one every local file stays exactly as it was.
     let mut files = BTreeMap::new();
+    let mut files_written = 0usize;
     for (rel, content) in &extracted {
         let wt_path = checked_working_path(state_dir, domain_root, rel)?;
-        write_working_file(&wt_path, content)?;
+        if !wt_path.exists() {
+            write_working_file(&wt_path, content)?;
+            files_written += 1;
+        }
         state::write_base_file(state_dir, rel, content)?;
         files.insert(rel.clone(), stamp(content));
     }
 
     let engrams = extracted.keys().filter(|p| p.ends_with(".md")).count();
+    let local_changes = if adopted {
+        detect_local_changes(domain_root, &files)?.changes.len()
+    } else {
+        0
+    };
 
     let mut origin_state = OriginState::new(spec.repo.clone(), spec.branch.clone());
     origin_state.base_commit = head.clone();
@@ -283,9 +296,11 @@ pub async fn subscribe(
 
     Ok(SubscribeReport {
         base_commit: head,
-        files_written: extracted.len(),
+        files_written,
         engrams,
         skipped_large,
+        adopted,
+        local_changes,
     })
 }
 

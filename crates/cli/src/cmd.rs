@@ -351,8 +351,9 @@ pub(crate) fn absolute_path(path: &Path) -> Result<PathBuf> {
 }
 
 /// Print `domain add --origin`'s result: the connected team domain, its
-/// downloaded root, how many engrams it holds and the base commit it is
-/// synced to.
+/// root, how many engrams it holds and the base commit it is synced to.
+/// For a target adopted in place, also how many local files were kept as
+/// local changes against the origin.
 pub(crate) fn print_origin_add(repo: &str, data: &serde_json::Value, json: bool) {
     if json {
         println!("{data}");
@@ -366,6 +367,16 @@ pub(crate) fn print_origin_add(repo: &str, data: &serde_json::Value, json: bool)
         data["engrams"].as_u64().unwrap_or(0),
         data["base_commit"].as_str().unwrap_or("")
     );
+    if data["adopted"].as_bool().unwrap_or(false) {
+        let changes = data["local_changes"].as_u64().unwrap_or(0);
+        println!(
+            "  connected in place: existing files kept, {} added from the origin",
+            data["files_added"].as_u64().unwrap_or(0)
+        );
+        if changes > 0 {
+            println!("  {changes} local file(s) differ from the origin, ready to share or update");
+        }
+    }
     println!("Run: crystalline origin status --domain {name}");
 }
 

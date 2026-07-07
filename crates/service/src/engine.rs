@@ -2553,27 +2553,56 @@ impl Engine {
             Some(d) => d.to_string(),
             None => origin::default_domain_name(repo),
         };
-        if self.domain_entry(&domain_name).is_ok() {
-            // An env-defined domain names the variable that owns it, so the
-            // operator knows to unset it rather than pick another name.
-            let msg = match self.overlay.env_domain(&domain_name) {
-                Some(env) => format!(
-                    "domain '{domain_name}' is defined by the environment variable {}; unset it to manage this domain in the config file",
-                    env.var
-                ),
-                None => format!(
-                    "domain '{domain_name}' is already registered; pass a domain name to connect this origin under a different one"
-                ),
-            };
-            return Err(EngineError::Conflict(msg));
-        }
+        // A registered name is adoptable when it is an origin-less file
+        // domain and the caller does not point somewhere else: the origin
+        // attaches to the existing root in place and local knowledge is
+        // kept. Anything else stays a conflict.
+        let existing_root = match self.domain_entry(&domain_name) {
+            Err(_) => None,
+            Ok(entry) => {
+                // An env-defined domain names the variable that owns it, so
+                // the operator knows to unset it rather than pick another
+                // name.
+                if let Some(env) = self.overlay.env_domain(&domain_name) {
+                    return Err(EngineError::Conflict(format!(
+                        "domain '{domain_name}' is defined by the environment variable {}; unset it to manage this domain in the config file",
+                        env.var
+                    )));
+                }
+                if let Some(origin_cfg) = &entry.origin {
+                    return Err(EngineError::Conflict(format!(
+                        "domain '{domain_name}' is already connected to {}; pass a domain name to connect this origin under a different one",
+                        origin_cfg.repo
+                    )));
+                }
+                let Some(registered_root) = entry.file_path() else {
+                    return Err(EngineError::Conflict(format!(
+                        "domain '{domain_name}' is a virtual domain; an origin connects a file domain, so pass a different domain name"
+                    )));
+                };
+                if let Some(f) = folder {
+                    let wanted = crystalline_core::config::expand_tilde(f);
+                    if wanted != registered_root {
+                        return Err(EngineError::Conflict(format!(
+                            "domain '{domain_name}' is rooted at {}; omit the folder to connect it in place, or pass a different domain name",
+                            registered_root.display()
+                        )));
+                    }
+                }
+                Some(registered_root)
+            }
+        };
 
         let lock = self.origin_lock(&domain_name);
         let _guard = lock.lock().await;
 
-        let root = match folder {
-            Some(f) => crystalline_core::config::expand_tilde(f),
-            None => origin::default_domain_folder(&domain_name),
+        let adopts_registered = existing_root.is_some();
+        let root = match existing_root {
+            Some(r) => r,
+            None => match folder {
+                Some(f) => crystalline_core::config::expand_tilde(f),
+                None => origin::default_domain_folder(&domain_name),
+            },
         };
         let branch_name = branch.unwrap_or("main").to_string();
         let spec = OriginSpec {
@@ -2617,8 +2646,8 @@ impl Engine {
         // searchable immediately even outside a daemon (a standalone CLI
         // command, or a race with the watcher's async catch-up); sync is
         // checksum idempotent, so the watcher repeating it moments later is a
-        // harmless no-op.
-        if let Some(tx) = &self.watch_tx {
+        // harmless no-op. An adopted registered domain is already watched.
+        if !adopts_registered && let Some(tx) = &self.watch_tx {
             let _ = tx.send(WatchEvent::Add(domain_name.clone(), root.clone()));
         }
 
@@ -2632,6 +2661,9 @@ impl Engine {
             "root": root.display().to_string(),
             "engrams": report.engrams,
             "base_commit": report.base_commit,
+            "adopted": report.adopted || adopts_registered,
+            "files_added": report.files_written,
+            "local_changes": report.local_changes,
         }))
     }
 

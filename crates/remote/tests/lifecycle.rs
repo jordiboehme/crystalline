@@ -155,7 +155,7 @@ fn seed_proposal(state_dir: &Path, number: u64, path: &str, sha256: Option<Strin
 
 // Scenario 1: subscribe lays down the working tree, the base snapshot and the
 // origin state; a missing MANIFEST is refused without touching the target; a
-// non-empty target is refused.
+// non-empty target is adopted in place, keeping every local file.
 
 #[tokio::test]
 async fn scenario_01_subscribe_writes_tree_base_and_state() {
@@ -225,26 +225,79 @@ async fn scenario_01_subscribe_without_manifest_is_not_a_domain_and_writes_nothi
 }
 
 #[tokio::test]
-async fn scenario_01_subscribe_into_a_non_empty_directory_is_refused() {
+async fn scenario_01_subscribe_into_a_non_empty_directory_adopts_in_place() {
     let mock = MockProvider::new();
-    let c1 = mock.add_commit(commit_files(&[("MANIFEST.md", b"# Manifest")]), None);
+    let c1 = mock.add_commit(
+        commit_files(&[
+            ("MANIFEST.md", b"# Manifest"),
+            ("notes/a.md", b"alpha"),
+            ("notes/team.md", b"team version"),
+        ]),
+        None,
+    );
     mock.set_branch("main", &c1);
 
     let work = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
     let domain_root = work.path().join("domain");
-    write(&domain_root.join("pre-existing.md"), b"already here");
+    // Pre-existing local knowledge: one file identical upstream, one whose
+    // content differs and one upstream does not know about.
+    write(&domain_root.join("MANIFEST.md"), b"# Manifest");
+    write(&domain_root.join("notes/team.md"), b"local version");
+    write(&domain_root.join("notes/local-only.md"), b"mine");
     let state_dir = state.path().join("origin");
 
-    let err = subscribe(&mock, &spec(), &domain_root, &state_dir)
+    let report = subscribe(&mock, &spec(), &domain_root, &state_dir)
         .await
-        .unwrap_err();
-    assert!(
-        matches!(err, crystalline_remote::RemoteError::State(_)),
-        "{err:?}"
+        .expect("a non-empty target is connected in place");
+
+    assert!(report.adopted);
+    assert_eq!(report.base_commit, c1);
+    assert_eq!(
+        report.files_written, 1,
+        "only the upstream file with no local counterpart is materialized"
     );
-    // The pre-existing file is left alone.
-    assert_eq!(read(&domain_root.join("pre-existing.md")), b"already here");
+    assert_eq!(
+        report.local_changes, 2,
+        "the differing file and the local-only file"
+    );
+
+    // Local content is never overwritten; the missing upstream file arrives.
+    assert_eq!(read(&domain_root.join("notes/team.md")), b"local version");
+    assert_eq!(read(&domain_root.join("notes/local-only.md")), b"mine");
+    assert_eq!(read(&domain_root.join("notes/a.md")), b"alpha");
+
+    // The base snapshot records upstream's side, so the kept local file is an
+    // ordinary Modified change and the local-only file an Added one, exactly
+    // what status, share and pull already understand.
+    assert_eq!(
+        crystalline_remote::state::read_base_file(&state_dir, "notes/team.md").unwrap(),
+        Some(b"team version".to_vec())
+    );
+    let st = OriginState::load(&state_dir).unwrap().unwrap();
+    assert_eq!(st.base_commit, c1);
+    assert_eq!(st.files.len(), 3, "the base manifest is upstream's tree");
+    let local = crystalline_remote::changes::detect_local_changes(&domain_root, &st.files).unwrap();
+    let mut classified: Vec<(&str, &str)> = local
+        .changes
+        .iter()
+        .map(|c| {
+            let kind = match c {
+                crystalline_remote::changes::LocalChange::Added { .. } => "added",
+                crystalline_remote::changes::LocalChange::Modified { .. } => "modified",
+                crystalline_remote::changes::LocalChange::Deleted { .. } => "deleted",
+            };
+            (kind, c.path())
+        })
+        .collect();
+    classified.sort();
+    assert_eq!(
+        classified,
+        vec![
+            ("added", "notes/local-only.md"),
+            ("modified", "notes/team.md"),
+        ]
+    );
 }
 
 // Scenario 2: a pull with no upstream movement reports up to date and writes

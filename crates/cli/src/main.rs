@@ -534,23 +534,25 @@ enum DomainCommand {
     /// Register a domain in the global config, then index it immediately. A file
     /// domain refuses without a MANIFEST.md; `--virtual` registers a
     /// database-backed domain (no path) and scaffolds its MANIFEST in the index;
-    /// `--origin` connects it to a GitHub repository instead of an existing local
-    /// folder, downloading its tracked subtree as the domain's files.
+    /// `--origin` connects it to a GitHub repository, downloading its tracked
+    /// subtree. A non-empty target folder, or a domain name that is already
+    /// registered without an origin, connects in place: local files are kept
+    /// and ones that differ from the repository become shareable local changes.
     Add {
         /// The domain name used everywhere it is referenced.
         name: String,
         /// The domain root directory. Omitted for a virtual domain. With
-        /// `--origin`, this is where the downloaded team domain is written;
-        /// defaults to ~/Documents/Crystalline/<name> when omitted.
+        /// `--origin`, this is where the team domain lives on this machine
+        /// (existing files are kept); defaults to
+        /// ~/Documents/Crystalline/<name> when omitted.
         path: Option<PathBuf>,
         /// Register a virtual domain: engrams live in the database, not on disk.
         /// Incompatible with a path argument.
         #[arg(long = "virtual")]
         is_virtual: bool,
-        /// Connect to a GitHub repository instead of an existing local folder:
-        /// owner/repo, or owner/repo/subpath when the team domain is a
-        /// subfolder of the repository. Requires github.enabled and a prior
-        /// `crystalline connect github`.
+        /// Connect to a GitHub repository: owner/repo, or owner/repo/subpath
+        /// when the team domain is a subfolder of the repository. Requires
+        /// github.enabled and a prior `crystalline connect github`.
         #[arg(long)]
         origin: Option<String>,
         /// The branch to track. Only meaningful with --origin; defaults to

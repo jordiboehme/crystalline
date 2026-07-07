@@ -360,7 +360,7 @@ impl McpServer {
 
     #[tool(
         name = "add_domain",
-        description = "Add a team domain from GitHub: registers the repository as a local domain and downloads its knowledge so the agent can learn from it and share back. repo is owner/name; path points at a subfolder when the domain lives inside a bigger repository."
+        description = "Add a team domain from GitHub: registers the repository as a local domain and downloads its knowledge so the agent can learn from it and share back. repo is owner/name; path points at a subfolder when the domain lives inside a bigger repository. An existing folder or an already-registered domain without an origin connects in place: local files are never overwritten and ones that differ from the repository become local changes to share or update."
     )]
     async fn add_domain(
         &self,
