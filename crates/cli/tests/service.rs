@@ -947,3 +947,106 @@ fn wait_port(addr: &str) {
         std::thread::sleep(Duration::from_millis(100));
     }
 }
+
+// --- status output and daemon visibility ------------------------------------
+
+/// With a daemon running, `status` renders human text with a daemon line;
+/// `--json` yields the daemon's merged report as one JSON object.
+#[test]
+fn status_with_a_daemon_renders_text_with_the_daemon_line() {
+    let env = Env::new("status-up");
+    env.setup_domain("eng");
+
+    let mut client = Mcp::spawn(&env);
+    client.initialize();
+    env.wait_ready();
+
+    let (ok, out) = env.run(&["status"]);
+    assert!(ok, "{out}");
+    assert!(out.starts_with("Daemon: running (pid "), "{out}");
+    assert!(out.contains("Index: "), "{out}");
+    assert!(out.contains("eng\t"), "{out}");
+
+    let (ok, out) = env.run(&["status", "--json"]);
+    assert!(ok, "{out}");
+    let value: Value = serde_json::from_str(out.trim()).expect("one JSON object");
+    assert!(value["pid"].as_u64().is_some(), "{value}");
+    assert!(value["domains"].is_array(), "{value}");
+}
+
+/// Without a daemon, `status` says so in its first line and renders the same
+/// human shape from a direct index read; a registered domain that was never
+/// synced shows as not indexed yet rather than disappearing.
+#[test]
+fn status_without_a_daemon_says_not_running() {
+    let env = Env::new("status-down");
+
+    let (ok, out) = env.run(&["status"]);
+    assert!(ok, "{out}");
+    assert!(
+        out.starts_with("Daemon: not running; reading the index directly"),
+        "{out}"
+    );
+    assert!(out.contains("No index at "), "{out}");
+}
+
+/// `--db`/`--config` overrides bypass the daemon on purpose; the first line
+/// says so instead of pretending to be the daemon's view.
+#[test]
+fn status_with_an_override_says_bypassed() {
+    let env = Env::new("status-bypass");
+    let side = env.dir.join("side.db");
+
+    let mut cmd = Command::new(bin());
+    env.apply(&mut cmd);
+    let out = cmd.args(["status", "--db"]).arg(&side).output().unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.starts_with("Daemon: bypassed (--db/--config override)"),
+        "{stdout}"
+    );
+}
+
+/// A lock record naming a live pid that answers on no socket produces a
+/// stderr note, so a fallback read never silently masquerades as the
+/// daemon's view - the "status says nothing is indexed" confusion.
+#[test]
+fn status_notes_an_unreachable_daemon_on_stderr() {
+    let env = Env::new("status-orphan");
+    std::fs::create_dir_all(env.state_dir()).unwrap();
+    // A disposable child stands in for the daemon: alive, but its socket
+    // path holds nothing. A same-or-newer version sidesteps the takeover
+    // path, and Env::drop's kill -9 of the lock pid only hits the stand-in.
+    let mut stand_in = Command::new("sleep")
+        .arg("30")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    std::fs::write(
+        env.lock_path(),
+        serde_json::to_string(&json!({
+            "pid": stand_in.id(),
+            "socket_path": env.sock_path().display().to_string(),
+            "version": "99.0.0",
+            "started_at": "2026-01-01T00:00:00Z",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let mut cmd = Command::new(bin());
+    env.apply(&mut cmd);
+    let out = cmd.arg("status").output().unwrap();
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("did not answer"),
+        "expected the unreachable-daemon note, got: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.starts_with("Daemon: not running"), "{stdout}");
+    let _ = stand_in.kill();
+    let _ = stand_in.wait();
+}

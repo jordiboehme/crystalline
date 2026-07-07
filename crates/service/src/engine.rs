@@ -2308,12 +2308,21 @@ impl Engine {
                 v
             })
             .collect();
+        let registered: Vec<String> = self
+            .config
+            .read()
+            .unwrap()
+            .domains
+            .keys()
+            .cloned()
+            .collect();
         let mut result = json!({
             "fts_mode": info.fts_mode,
             "schema_version": info.schema_version,
             "db_path": info.db_path,
             "db_size": info.db_size,
             "instance_id": if self.instance_id.is_empty() { Value::Null } else { json!(self.instance_id) },
+            "registered": registered,
             "domains": serde_json::to_value(&domains).unwrap_or(Value::Null),
             "embeddings": {
                 "active_model": self.model_id,

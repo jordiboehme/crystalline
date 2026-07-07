@@ -826,27 +826,25 @@ pub async fn reindex(
 
 // --- status ------------------------------------------------------------------
 
-/// Show per-domain counts and index diagnostics.
-pub async fn status(
+/// Build the in-process status report in the same shape the daemon's ctl
+/// `status` returns (minus its liveness fields), so both paths render through
+/// [`render_status`] and `--json` yields one stable shape either way.
+pub async fn status_value(
     config_override: Option<&Path>,
     db_override: Option<&Path>,
-    json: bool,
-) -> Result<()> {
+) -> Result<serde_json::Value> {
     let cfg = load(config_override)?.effective;
+    let registered: Vec<String> = cfg.domains.keys().cloned().collect();
     // Only the Turso backend has a local file whose absence means "no index
     // yet"; Postgres is always opened.
     if backend_is_turso(&cfg) {
         let db = db_path(db_override)?;
         if !db.exists() {
-            if json {
-                println!(
-                    "{}",
-                    serde_json::json!({ "indexed": false, "db_path": db.display().to_string() })
-                );
-            } else {
-                println!("No index at {} yet. Run: crystalline sync", db.display());
-            }
-            return Ok(());
+            return Ok(serde_json::json!({
+                "indexed": false,
+                "db_path": db.display().to_string(),
+                "registered": registered,
+            }));
         }
     }
 
@@ -871,60 +869,106 @@ pub async fn status(
     let active_embedded = coverage.embedded_for(&active_model);
     let hybrid_available = coverage.has_active_embeddings(&active_model);
 
-    if json {
+    Ok(serde_json::json!({
+        "indexed": true,
+        "fts_mode": info.fts_mode,
+        "schema_version": info.schema_version,
+        "db_path": info.db_path,
+        "db_size": info.db_size,
+        "domains": stats,
+        "registered": registered,
+        "embeddings": {
+            "active_model": active_model,
+            "embedded_chunks": active_embedded,
+            "total_chunks": coverage.total_chunks,
+            "hybrid_available": hybrid_available,
+            "models": coverage.models,
+        },
+    }))
+}
+
+/// Render a status report (the daemon's or the in-process one) as human
+/// text. `daemon_note` says where the numbers come from - the one line that
+/// keeps a fallback read from masquerading as the daemon's view.
+pub fn render_status(data: &serde_json::Value, daemon_note: &str) {
+    use serde_json::Value;
+
+    println!("Daemon: {daemon_note}");
+    let registered: Vec<&str> = data["registered"]
+        .as_array()
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+
+    if !data.get("indexed").and_then(Value::as_bool).unwrap_or(true) {
         println!(
-            "{}",
-            serde_json::json!({
-                "indexed": true,
-                "store": info,
-                "domains": stats,
-                "registered": cfg.domains.keys().collect::<Vec<_>>(),
-                "embeddings": {
-                    "active_model": active_model,
-                    "embedded_chunks": active_embedded,
-                    "total_chunks": coverage.total_chunks,
-                    "hybrid_available": hybrid_available,
-                    "models": coverage.models,
-                },
-            })
+            "No index at {} yet. Run: crystalline sync",
+            data["db_path"].as_str().unwrap_or("(unknown)")
         );
-        return Ok(());
+        for name in registered {
+            println!("{name}\t(not indexed yet)");
+        }
+        return;
     }
 
     println!(
         "Index: {} ({} bytes, schema v{}, fts {})",
-        info.db_path.as_deref().unwrap_or("(memory)"),
-        info.db_size.unwrap_or(0),
-        info.schema_version,
-        match info.fts_mode {
-            crystalline_index::FtsMode::Native => "native",
-            crystalline_index::FtsMode::CandidateScan => "candidate-scan",
+        data["db_path"].as_str().unwrap_or("(memory)"),
+        data["db_size"].as_u64().unwrap_or(0),
+        data["schema_version"].as_u64().unwrap_or(0),
+        data["fts_mode"].as_str().unwrap_or("unknown")
+    );
+    let emb = &data["embeddings"];
+    println!(
+        "Embeddings: {}/{} chunks embedded with '{}', default search: {}",
+        emb["embedded_chunks"].as_u64().unwrap_or(0),
+        emb["total_chunks"].as_u64().unwrap_or(0),
+        emb["active_model"].as_str().unwrap_or(""),
+        if emb["hybrid_available"].as_bool().unwrap_or(false) {
+            "hybrid"
+        } else {
+            "text"
         }
     );
-    println!(
-        "Embeddings: {active_embedded}/{} chunks embedded with '{active_model}' ({} dims), default search: {}",
-        coverage.total_chunks,
-        coverage
-            .models
-            .iter()
-            .find(|m| m.model == active_model)
-            .map(|m| m.dims)
-            .unwrap_or(0),
-        if hybrid_available { "hybrid" } else { "text" }
-    );
-    if stats.is_empty() {
+
+    let domains = data["domains"].as_array().cloned().unwrap_or_default();
+    if domains.is_empty() && registered.is_empty() {
         println!("No domains indexed yet.");
     }
-    for d in &stats {
+    let mut indexed_names = std::collections::BTreeSet::new();
+    for d in &domains {
+        let name = d["name"].as_str().unwrap_or("");
+        indexed_names.insert(name.to_string());
         println!(
             "{}\t{} engrams, {} observations, {} relations ({} unresolved)\tlast sync {}",
-            d.name,
-            d.engrams,
-            d.observations,
-            d.relations,
-            d.unresolved_relations,
-            d.last_sync.as_deref().unwrap_or("never")
+            name,
+            d["engrams"].as_u64().unwrap_or(0),
+            d["observations"].as_u64().unwrap_or(0),
+            d["relations"].as_u64().unwrap_or(0),
+            d["unresolved_relations"].as_u64().unwrap_or(0),
+            d["last_sync"].as_str().unwrap_or("never")
         );
+    }
+    // Registered domains the index holds no row for yet.
+    for name in registered {
+        if !indexed_names.contains(name) {
+            println!("{name}\t(not indexed yet)");
+        }
+    }
+}
+
+/// Show per-domain counts and index diagnostics from a directly opened
+/// index. `daemon_note` explains why the daemon was not consulted.
+pub async fn status(
+    config_override: Option<&Path>,
+    db_override: Option<&Path>,
+    json: bool,
+    daemon_note: &str,
+) -> Result<()> {
+    let value = status_value(config_override, db_override).await?;
+    if json {
+        println!("{value}");
+    } else {
+        render_status(&value, daemon_note);
     }
     Ok(())
 }

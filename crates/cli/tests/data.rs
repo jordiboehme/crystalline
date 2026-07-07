@@ -116,10 +116,7 @@ fn init_add_sync_status_end_to_end() {
     assert!(out.status.success());
     let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(status["indexed"], serde_json::json!(true));
-    assert_eq!(
-        status["store"]["fts_mode"],
-        serde_json::json!("candidate-scan")
-    );
+    assert_eq!(status["fts_mode"], serde_json::json!("candidate-scan"));
     let engrams = status["domains"][0]["engrams"].as_i64().unwrap();
     assert_eq!(engrams, 2);
 

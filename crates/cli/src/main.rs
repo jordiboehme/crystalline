@@ -934,20 +934,63 @@ fn opt_vec(v: Vec<String>) -> Option<Vec<String>> {
 /// `--config`/`--db` override was given, else open the index directly. An
 /// override names an exact config and index the running daemon may not serve, so
 /// it always takes the direct path (see [`crystalline_service::use_daemon`]).
+/// Both paths render the same human shape (or, with `--json`, the same JSON
+/// shape), and the first output line always says which view this is - the
+/// daemon's, a direct read because none runs, or a direct read because an
+/// override bypassed it.
 async fn status_dispatch(
     config: Option<PathBuf>,
     db: Option<PathBuf>,
     json: bool,
 ) -> anyhow::Result<()> {
     use serde_json::json;
-    if crystalline_service::use_daemon(db.as_deref(), config.as_deref())
-        && let Some(data) =
+    let bypassed = db.is_some() || config.is_some();
+    if !bypassed {
+        if let Some(data) =
             crystalline_service::ctl_if_running(json!({ "v": 1, "cmd": "status" })).await?
-    {
-        print_value(&data, json);
-        return Ok(());
+        {
+            if json {
+                println!("{data}");
+            } else {
+                let note = format!(
+                    "running (pid {}, v{}, up {})",
+                    data["pid"].as_u64().unwrap_or(0),
+                    data["version"].as_str().unwrap_or("unknown"),
+                    format_uptime(data["uptime_secs"].as_u64().unwrap_or(0)),
+                );
+                cmd::render_status(&data, &note);
+            }
+            return Ok(());
+        }
+        // A live daemon that did not answer means the numbers below come
+        // from a different index than the one agents are using; say so
+        // instead of silently reporting an empty view.
+        if let Some(info) = crystalline_service::instance::read_lock_info()
+            && crystalline_service::instance::process_alive(info.pid)
+        {
+            eprintln!(
+                "note: a daemon (pid {}, v{}) holds {} but did not answer; reporting from a direct index read instead",
+                info.pid, info.version, info.socket_path
+            );
+        }
     }
-    cmd::status(config.as_deref(), db.as_deref(), json).await
+    let note = if bypassed {
+        "bypassed (--db/--config override); reading the index directly"
+    } else {
+        "not running; reading the index directly"
+    };
+    cmd::status(config.as_deref(), db.as_deref(), json, note).await
+}
+
+/// Render seconds of uptime compactly: `42s`, `12m` or `3h07m`.
+fn format_uptime(secs: u64) -> String {
+    if secs >= 3600 {
+        format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
+    } else if secs >= 60 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{secs}s")
+    }
 }
 
 /// `sync`: route to the daemon when one owns the index and no explicit
