@@ -826,6 +826,18 @@ fn http_smoke_initialize_list_and_search() {
     let client = reqwest::blocking::Client::new();
     let url = format!("http://{addr}/");
 
+    // /health answers without an MCP handshake: static liveness for load
+    // balancers and uptime monitors.
+    let health = client.get(format!("http://{addr}/health")).send().unwrap();
+    assert_eq!(health.status().as_u16(), 200, "GET /health is 200");
+    let body: Value = health.json().unwrap();
+    assert_eq!(body["status"], "ok", "{body}");
+    assert_eq!(
+        body["version"].as_str().unwrap(),
+        crystalline_core::VERSION,
+        "{body}"
+    );
+
     // initialize
     let resp = client
         .post(&url)

@@ -598,12 +598,24 @@ async fn run_http(
         session_manager,
         StreamableHttpServerConfig::default(),
     );
-    let router = axum::Router::new().fallback_service(service);
+    let router = axum::Router::new()
+        .route("/health", axum::routing::get(health))
+        .fallback_service(service);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, router)
         .with_graceful_shutdown(async move { wait_true(&mut shutdown).await })
         .await?;
     Ok(())
+}
+
+/// Liveness probe for load balancers and uptime monitors: a static payload
+/// with no engine or database work, so a probe can never queue behind
+/// indexing and never needs an MCP handshake.
+async fn health() -> axum::Json<Value> {
+    axum::Json(serde_json::json!({
+        "status": "ok",
+        "version": crystalline_core::VERSION,
+    }))
 }
 
 /// Renew this instance's host locks every `secs` seconds until shutdown, so a
