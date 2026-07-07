@@ -47,6 +47,9 @@ pub async fn run_mcp(
     if embedded {
         return run_embedded_stdio(db, config_path, read_only).await;
     }
+    // Log to stderr from the start: the relay's takeover and reconnect
+    // notices must be visible in the harness's server log, not swallowed.
+    init_tracing();
     // `read_only` is forwarded only to a daemon this call spawns; attaching to
     // an already-running daemon uses that daemon's own mode.
     match ensure_daemon(true, db, config_path, read_only).await {
@@ -55,7 +58,6 @@ pub async fn run_mcp(
             pump_stdio(stream, db, config_path, read_only).await
         }
         Err(e) => {
-            init_tracing();
             tracing::warn!("no daemon available ({e}); running embedded");
             run_embedded_stdio(db, config_path, read_only).await
         }

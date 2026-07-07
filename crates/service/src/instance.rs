@@ -171,11 +171,20 @@ pub async fn try_attach() -> Option<Connection> {
         if displace(&sock, info.pid).await {
             return None;
         }
-        tracing::warn!(
-            "daemon v{} (pid {}) did not shut down; attaching to it as-is",
-            info.version,
-            info.pid
-        );
+        // The wait ran out. Another client may have finished the takeover
+        // in the meantime (its bridge respawns a daemon the moment the old
+        // one leaves), so re-read the record: a different pid means the
+        // socket already belongs to the successor and attaching is right.
+        match read_lock_info() {
+            Some(now) if now.pid != info.pid => {}
+            _ => {
+                tracing::warn!(
+                    "daemon v{} (pid {}) did not shut down; attaching to it as-is",
+                    info.version,
+                    info.pid
+                );
+            }
+        }
     }
     connect_socket().await
 }
@@ -246,10 +255,12 @@ async fn displace(sock: &Path, pid: u32) -> bool {
     {
         return false;
     }
-    // Read the ack best-effort, then wait for the process to leave.
+    // Read the ack best-effort, then wait for the process to leave. A
+    // graceful exit drains active sessions first, which takes several
+    // seconds with bridges attached, so the window is generous.
     let mut buf = [0u8; 256];
     let _ = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf)).await;
-    for _ in 0..100 {
+    for _ in 0..240 {
         if !process_alive(pid) {
             return true;
         }
