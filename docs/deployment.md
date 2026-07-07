@@ -16,6 +16,12 @@ flowchart LR
     D --> I[Index]
 ```
 
+### Daemon lifecycle
+
+It does not matter who or where starts the daemon. The first `crystalline mcp` connection spawns it as a fully detached process (its own session, no controlling terminal, stdio closed) that serves the user's state directory and outlives every client that connects to it; later connections and plain CLI verbs attach to the same daemon over its local socket. Stopping it is one command, `crystalline ctl shutdown`, and the next connection simply spawns a fresh one.
+
+Upgrades need no manual restart: attaching is version aware, so the first client built from a newer binary (after a `brew upgrade`, say) asks the older daemon to shut down gracefully and a new daemon starts on the current version. The takeover is one-way - an older client attaches to a newer daemon rather than displacing it back. Agent sessions ride through the swap, because the stdio bridge reconnects when its daemon goes away, replays the MCP handshake and answers any request the restart orphaned with a retryable error instead of silence.
+
 ## Claude Desktop extension
 
 For someone who never opens a terminal, the `.mcpb` bundle wraps the same binary in a one-click Claude Desktop extension. Claude Desktop renders a native folder picker from the bundle manifest; every picked folder is prepared as a domain automatically, MANIFEST.md included, and `Documents/Crystalline/Personal` is created as the starter domain out of the box. Under the hood Claude Desktop spawns `crystalline mcp --domain <folder>` per picked folder over stdio, landing on the same daemon as the personal workstation shape. Removing a folder from the settings never deletes its knowledge. Onboarding is automatic - the server's instructions deliver the routing block on every connection - and the release's crystalline-claude-desktop-skill zip adds capture and collaboration best practices as an uploadable skill (see [Skills](../README.md#skills) in the README).

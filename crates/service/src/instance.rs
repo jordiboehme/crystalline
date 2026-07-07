@@ -313,9 +313,19 @@ fn spawn_daemon(
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        // New session so the daemon survives the parent and ignores the
-        // controlling terminal's signals.
-        cmd.process_group(0);
+        // A full new session, not just a process group: the daemon leads its
+        // own session with no controlling terminal, so it survives whichever
+        // client spawned it and never sees that client's terminal signals.
+        // It does not matter who or where starts the daemon; it serves the
+        // user's state directory and outlives its clients.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
     }
     cmd.spawn()?;
     Ok(())
