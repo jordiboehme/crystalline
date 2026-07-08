@@ -13,6 +13,20 @@ use std::collections::BTreeMap;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
+/// Deserialize a field that may be missing, `null` or a real value, mapping
+/// both an absent key and an explicit `null` to `T::default()`. Paired with
+/// `#[serde(default)]` (which covers the missing key) so a bare `Vec`/`BTreeMap`
+/// param still tolerates the `null` that some clients and the CLI send for an
+/// empty list, while the generated schema stays a plain `array`/`object` rather
+/// than a `["array", "null"]` union.
+fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 /// Parameters for `write_engram`.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct WriteParams {
@@ -31,7 +45,7 @@ pub struct WriteParams {
     #[serde(rename = "type", default)]
     pub engram_type: Option<String>,
     /// Tags, lowercase-with-hyphens. At least one is recommended.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub tags: Vec<String>,
     /// Lifecycle `status`. Defaults to `current`. Recommended values: current,
     /// implemented, draft, proposed, idea, poc, deprecated, superseded, archived,
@@ -128,13 +142,13 @@ pub struct SearchParams {
     #[serde(default)]
     pub query: Option<String>,
     /// Restrict to these domains. Defaults to every registered domain.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub domains: Vec<String>,
     /// Filter by `type`.
     #[serde(rename = "type", default)]
     pub engram_type: Option<String>,
     /// Require all of these tags.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub tags: Vec<String>,
     /// Filter by `status`.
     #[serde(default)]
@@ -169,7 +183,7 @@ pub struct ContextParams {
     #[serde(default)]
     pub depth: Option<u8>,
     /// Restrict the returned neighborhood to these domains.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub domains: Vec<String>,
     /// A recency window such as `7d`; advisory in this version.
     #[serde(default)]
@@ -183,13 +197,13 @@ pub struct ContextParams {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct RecentParams {
     /// Restrict to these domains. Defaults to every registered domain.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub domains: Vec<String>,
     /// A recency window such as `7d`, `24h` or `2w`. Defaults to `7d`.
     #[serde(default)]
     pub timeframe: Option<String>,
     /// Restrict to these `type` values.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub types: Vec<String>,
 }
 
@@ -253,11 +267,11 @@ pub struct ConfigureParams {
     /// "true" }. Applied in ascending key order; the first invalid key or
     /// value stops the rest and reports what was already applied. Omit or
     /// pass an empty object to leave settings unchanged.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub set: BTreeMap<String, String>,
     /// Setting keys to reset to their default, applied after `set`. Omit or
     /// pass an empty array to leave settings unchanged.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub unset: Vec<String>,
     /// Pass "github" to link a GitHub account: starts a short code to
     /// confirm at github.com/login/device, or reports an already-pending
@@ -356,4 +370,40 @@ pub struct ResolveConflictParams {
     /// The merged markdown content. Required when `resolution` is merged.
     #[serde(default)]
     pub content: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// The list and map params switched to bare `Vec`/`BTreeMap` for a plain
+    /// schema type must still accept an explicit `null` (which the CLI and some
+    /// clients send for an empty list) and a missing key, both as empty, while
+    /// a real value round-trips.
+    #[test]
+    fn list_and_map_params_tolerate_null_and_missing() {
+        let s: SearchParams = serde_json::from_value(json!({
+            "domains": null,
+            "tags": null,
+        }))
+        .unwrap();
+        assert!(s.domains.is_empty() && s.tags.is_empty());
+
+        let c: ConfigureParams = serde_json::from_value(json!({
+            "set": null,
+            "unset": null,
+        }))
+        .unwrap();
+        assert!(c.set.is_empty() && c.unset.is_empty());
+
+        let missing: SearchParams = serde_json::from_value(json!({})).unwrap();
+        assert!(missing.domains.is_empty() && missing.tags.is_empty());
+
+        let real: SearchParams = serde_json::from_value(json!({
+            "domains": ["a", "b"],
+        }))
+        .unwrap();
+        assert_eq!(real.domains, vec!["a".to_string(), "b".to_string()]);
+    }
 }
