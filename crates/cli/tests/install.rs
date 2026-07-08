@@ -645,6 +645,106 @@ fn copilot_home_env_var_relocates_the_user_install() {
     );
 }
 
+/// A `gh` shim standing in for the GitHub CLI's forwarding form: crystalline
+/// invokes it as `gh copilot -- <verb args>`, so the MCP verbs arrive two
+/// positions later than on the plain shim ($3/$4 instead of $1/$2). Exits 1
+/// for `mcp get` like [`write_shim`], 0 otherwise.
+fn write_gh_shim(bin_dir: &Path, log: &Path) {
+    std::fs::create_dir_all(bin_dir).unwrap();
+    let script = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$3\" = mcp ] && [ \"$4\" = get ]; then\n  exit 1\nfi\nexit 0\n",
+        log.display()
+    );
+    let path = bin_dir.join("gh");
+    std::fs::write(&path, script).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[test]
+fn copilot_falls_back_to_gh_when_copilot_is_missing() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let bin_dir = work.path().join("bin");
+    let log = work.path().join("gh.log");
+    // Only `gh` is on the PATH, the machine the GitHub CLI installed
+    // Copilot on.
+    write_gh_shim(&bin_dir, &log);
+
+    install_cmd(&home, &bin_dir)
+        .args(["install", "copilot"])
+        .assert()
+        .success();
+
+    let logged = read_log(&log);
+    assert!(
+        logged.contains("copilot -- mcp get crystalline"),
+        "the get went through gh's forwarding form: {logged}"
+    );
+    assert!(
+        logged.contains("copilot -- mcp add crystalline -- crystalline mcp"),
+        "the add went through gh's forwarding form: {logged}"
+    );
+    assert!(
+        copilot_hooks_file(&home).exists(),
+        "hooks still installed through the fallback"
+    );
+    assert!(
+        copilot_skill(&home, "crystalline-routing").exists(),
+        "skills still installed through the fallback"
+    );
+}
+
+#[test]
+fn a_missing_copilot_and_gh_print_the_plain_manual_command() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let empty_bin = work.path().join("empty-bin");
+    std::fs::create_dir_all(&empty_bin).unwrap();
+
+    let out = install_cmd(&home, &empty_bin)
+        .args(["install", "copilot"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "a missing harness CLI is never fatal");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains("copilot mcp add crystalline -- crystalline mcp"),
+        "the manual command shows the plain copilot form: {stdout}"
+    );
+    assert!(
+        !stdout.contains("gh copilot"),
+        "the manual command never shows the gh spelling: {stdout}"
+    );
+    assert!(copilot_hooks_file(&home).exists(), "hooks still written");
+}
+
+#[test]
+fn copilot_prefers_the_copilot_binary_over_gh() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let bin_dir = work.path().join("bin");
+    let copilot_log = work.path().join("copilot.log");
+    let gh_log = work.path().join("gh.log");
+    write_shim(&bin_dir, "copilot", &copilot_log);
+    write_gh_shim(&bin_dir, &gh_log);
+
+    install_cmd(&home, &bin_dir)
+        .args(["install", "copilot"])
+        .assert()
+        .success();
+
+    assert!(
+        read_log(&copilot_log).contains("mcp add crystalline -- crystalline mcp"),
+        "the standalone binary handled the registration: {}",
+        read_log(&copilot_log)
+    );
+    assert!(
+        read_log(&gh_log).is_empty(),
+        "gh is never consulted while copilot exists: {}",
+        read_log(&gh_log)
+    );
+}
+
 #[test]
 fn project_scope_writes_relative_to_the_working_directory() {
     let work = tempfile::tempdir().unwrap();

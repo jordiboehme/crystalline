@@ -183,6 +183,21 @@ impl HarnessKind {
             HarnessKind::Copilot => HooksStyle::Owned,
         }
     }
+
+    /// Candidate argv forms for this harness's CLI, tried in order: each is
+    /// the program name followed by prefix args placed before the verb args.
+    /// The Copilot CLI is also reachable as `gh copilot` (the GitHub CLI
+    /// forwards args it does not recognize), so a machine with only `gh`
+    /// still registers; a `gh` whose first run wants to install Copilot
+    /// fails fast against the null stdin, which degrades to the printed
+    /// manual command like any other failure.
+    fn cli_invocations(self) -> &'static [&'static [&'static str]] {
+        match self {
+            HarnessKind::ClaudeCode => &[&["claude"]],
+            HarnessKind::Codex => &[&["codex"]],
+            HarnessKind::Copilot => &[&["copilot"], &["gh", "copilot", "--"]],
+        }
+    }
 }
 
 /// The knobs `install` reads. `uninstall` takes its two flags directly, since
@@ -599,6 +614,24 @@ fn run_cli(program: &str, args: &[&str]) -> CliRun {
     }
 }
 
+/// Run a harness CLI trying each of its candidate invocations in order: a
+/// missing binary moves on to the next candidate, any other outcome is
+/// final. Only when every candidate is missing does the whole run read as
+/// [`CliRun::NotFound`].
+fn run_harness_cli(harness: HarnessKind, args: &[&str]) -> CliRun {
+    for candidate in harness.cli_invocations() {
+        let (program, prefix) = candidate
+            .split_first()
+            .expect("a candidate invocation always names a program");
+        let full: Vec<&str> = prefix.iter().chain(args.iter()).copied().collect();
+        match run_cli(program, &full) {
+            CliRun::NotFound => continue,
+            outcome => return outcome,
+        }
+    }
+    CliRun::NotFound
+}
+
 /// The `mcp add` argument vector for a harness. Claude Code takes an explicit
 /// `--scope`; Codex and Copilot register MCP servers per user only, so
 /// `--project` still lands globally (called out in the printed notice).
@@ -662,20 +695,20 @@ fn path_binary_notice() -> Option<String> {
 
 /// Register the MCP server: check presence with `mcp get` first, then `mcp
 /// add`. A missing CLI or a failing add never aborts the install; it records
-/// the command to run by hand instead.
+/// the command to run by hand instead. The manual command always shows the
+/// harness's own plain CLI form, whatever candidate actually ran.
 fn install_mcp(harness: HarnessKind, project: bool) -> McpReport {
-    let program = harness.cli();
     let add_args = mcp_add_args(harness, project);
-    let manual = format!("{program} {}", add_args.join(" "));
+    let manual = format!("{} {}", harness.cli(), add_args.join(" "));
 
-    match run_cli(program, &["mcp", "get", "crystalline"]) {
+    match run_harness_cli(harness, &["mcp", "get", "crystalline"]) {
         CliRun::NotFound => return McpReport::new("cli-missing", Some(manual)),
         CliRun::Ok => return McpReport::new("already-present", None),
         CliRun::Failed => {}
     }
 
     let add_ref: Vec<&str> = add_args.iter().map(String::as_str).collect();
-    match run_cli(program, &add_ref) {
+    match run_harness_cli(harness, &add_ref) {
         CliRun::NotFound => McpReport::new("cli-missing", Some(manual)),
         CliRun::Ok => McpReport::new("registered", None),
         CliRun::Failed => McpReport::new("failed", Some(manual)),
@@ -685,9 +718,8 @@ fn install_mcp(harness: HarnessKind, project: bool) -> McpReport {
 /// Deregister the MCP server, tolerantly: a missing CLI records the manual
 /// command, a non-zero exit is read as already gone.
 fn uninstall_mcp(harness: HarnessKind) -> McpReport {
-    let program = harness.cli();
-    let manual = format!("{program} mcp remove crystalline");
-    match run_cli(program, &["mcp", "remove", "crystalline"]) {
+    let manual = format!("{} mcp remove crystalline", harness.cli());
+    match run_harness_cli(harness, &["mcp", "remove", "crystalline"]) {
         CliRun::NotFound => McpReport::new("cli-missing", Some(manual)),
         CliRun::Ok => McpReport::new("removed", None),
         CliRun::Failed => McpReport::new("not-present", None),
