@@ -7,6 +7,10 @@ uses to dispatch scoring. Train and val sample both sources evenly per
 task type; test keeps both source test splits whole so memory numbers
 stay directly comparable to the per-skill baselines.
 
+The committed split is frozen for this training cycle - it predates the
+routing split's aurora growth - so this cycle's memory numbers stay
+comparable; regenerate at the start of the next memory training cycle.
+
 Regenerate after editing the source splits:
 
     uv run python data/memory_split/build.py
