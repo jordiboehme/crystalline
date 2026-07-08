@@ -1,0 +1,19 @@
+[
+  {
+    "id": "collab-val-01",
+    "workspace": "harbor",
+    "task_type": "status",
+    "question": "Check where the fieldwork domain stands against its team origin.",
+    "origin": {
+      "tree": "fieldwork",
+      "repo": "harbor/fieldwork",
+      "domain": "fieldwork"
+    },
+    "expect": {
+      "used_tool": {
+        "name": "origin_status",
+        "domain": "fieldwork"
+      }
+    }
+  }
+]

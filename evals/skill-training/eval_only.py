@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from scripts import eval_only as skillopt_eval
 
 from envs.crystalline_capture.adapter import CrystallineCaptureAdapter
+from envs.crystalline_collaboration.adapter import CrystallineCollaborationAdapter
 from envs.crystalline_memory.adapter import CrystallineMemoryAdapter
 from envs.crystalline_routing.adapter import CrystallineRoutingAdapter
 from envs.crystalline_schema.adapter import CrystallineSchemaAdapter
@@ -31,6 +32,9 @@ def main() -> None:
     skillopt_eval._ENV_REGISTRY["crystalline_capture"] = CrystallineCaptureAdapter
     skillopt_eval._ENV_REGISTRY["crystalline_schema"] = CrystallineSchemaAdapter
     skillopt_eval._ENV_REGISTRY["crystalline_memory"] = CrystallineMemoryAdapter
+    skillopt_eval._ENV_REGISTRY["crystalline_collaboration"] = (
+        CrystallineCollaborationAdapter
+    )
     skillopt_eval.main()
 
 

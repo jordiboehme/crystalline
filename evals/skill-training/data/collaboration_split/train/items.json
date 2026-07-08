@@ -1,0 +1,19 @@
+[
+  {
+    "id": "collab-train-01",
+    "workspace": "harbor",
+    "task_type": "status",
+    "question": "Which of our domains are shared with the team, and where do they stand?",
+    "origin": {
+      "tree": "fieldwork",
+      "repo": "harbor/fieldwork",
+      "domain": "fieldwork"
+    },
+    "expect": {
+      "used_tool": {
+        "name": "origin_status",
+        "domain": "fieldwork"
+      }
+    }
+  }
+]

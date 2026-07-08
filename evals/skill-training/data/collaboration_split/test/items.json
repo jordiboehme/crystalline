@@ -1,0 +1,123 @@
+[
+  {
+    "id": "collab-smoke-01",
+    "workspace": "harbor",
+    "task_type": "status",
+    "question": "I am about to dig into the fieldwork domain. Is our copy current with the team, or has something landed upstream I should pull first?",
+    "origin": {
+      "tree": "fieldwork",
+      "repo": "harbor/fieldwork",
+      "domain": "fieldwork",
+      "upstream_commit": {
+        "storm-surge-readiness.md": {
+          "content": "---\ntype: runbook\ntitle: Storm surge readiness\npermalink: storm-surge-readiness\ntags:\n- fieldwork\n- weather\nstatus: current\nrecorded_at: 2026-07-08\n---\n\nHow the field team prepares when a storm surge is forecast.\n\n- [fact] The team hauls out every skiff once the surge forecast tops one metre above the predicted tide #fieldwork\n- [decision] Fieldwork is stood down for the day the moment a surge warning is issued, no exceptions #fieldwork\n"
+        }
+      }
+    },
+    "expect": {
+      "used_tool": {
+        "name": "origin_status",
+        "domain": "fieldwork"
+      },
+      "answer_any": [
+        "behind",
+        "out of date",
+        "not current",
+        "update",
+        "pull"
+      ]
+    }
+  },
+  {
+    "id": "collab-smoke-02",
+    "workspace": "harbor",
+    "task_type": "update",
+    "question": "The team has been busy in fieldwork. Bring our copy up to date with theirs before I start working.",
+    "origin": {
+      "tree": "fieldwork",
+      "repo": "harbor/fieldwork",
+      "domain": "fieldwork",
+      "upstream_commit": {
+        "storm-surge-readiness.md": {
+          "content": "---\ntype: runbook\ntitle: Storm surge readiness\npermalink: storm-surge-readiness\ntags:\n- fieldwork\n- weather\nstatus: current\nrecorded_at: 2026-07-08\n---\n\nHow the field team prepares when a storm surge is forecast.\n\n- [fact] The team hauls out every skiff once the surge forecast tops one metre above the predicted tide #fieldwork\n- [decision] Fieldwork is stood down for the day the moment a surge warning is issued, no exceptions #fieldwork\n"
+        }
+      }
+    },
+    "expect": {
+      "used_tool": {
+        "name": "update_domain",
+        "domain": "fieldwork"
+      },
+      "updated": {
+        "domain": "fieldwork",
+        "file_any": [
+          "storm-surge-readiness.md"
+        ]
+      }
+    }
+  },
+  {
+    "id": "collab-smoke-03",
+    "workspace": "harbor",
+    "task_type": "share",
+    "question": "I just corrected the tide window timing in fieldwork: the survey window opens three hours before high water now, not two. Share that update with the team for review.",
+    "origin": {
+      "tree": "fieldwork",
+      "repo": "harbor/fieldwork",
+      "domain": "fieldwork",
+      "local_edits": {
+        "tide-window-procedure.md": {
+          "replace": [
+            "two hours before high water",
+            "three hours before high water"
+          ]
+        }
+      }
+    },
+    "expect": {
+      "used_tool": {
+        "name": "share_changes",
+        "domain": "fieldwork"
+      },
+      "share": {
+        "domain": "fieldwork",
+        "url_relayed": true
+      }
+    }
+  },
+  {
+    "id": "collab-smoke-04",
+    "workspace": "harbor",
+    "task_type": "conflict",
+    "question": "There is a conflict on our tide window procedure in fieldwork after the last team update. Sort it out, keeping our local version of the muster point.",
+    "origin": {
+      "tree": "fieldwork",
+      "repo": "harbor/fieldwork",
+      "domain": "fieldwork",
+      "local_edits": {
+        "tide-window-procedure.md": {
+          "replace": [
+            "north jetty",
+            "east breakwater"
+          ]
+        }
+      },
+      "upstream_commit": {
+        "tide-window-procedure.md": {
+          "replace": [
+            "north jetty",
+            "south slipway"
+          ]
+        }
+      },
+      "materialize_conflict": true
+    },
+    "expect": {
+      "conflict_resolved": {
+        "domain": "fieldwork",
+        "path": "tide-window-procedure.md",
+        "resolution": "mine"
+      }
+    }
+  }
+]

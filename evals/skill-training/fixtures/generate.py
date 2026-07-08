@@ -7,11 +7,20 @@ domains are scaffolded with `domain init`, engrams written with
 Registration state and the index used during generation live in a
 throwaway directory; the committed fixture is only the domain folders.
 
+A workspace may also carry an `origins` table alongside its domains: each
+entry is an origin tree served as a fake GitHub repo by the collaboration
+benchmark, written under `origins/<tree>/` with the same shape as a
+domain folder (MANIFEST.md plus engram files). An entry is either a full
+domain spec (scope, when, notes, engrams), scaffolded fresh, or
+`{"mirror": "<local_domain>"}`, a byte-for-byte copy of an already-built
+local domain so a preconnect adopts it with no spurious local changes.
+
 Regenerate after editing the content tables below (name workspaces to
 rebuild only those and leave the rest untouched):
 
     bash fixtures/generate.sh
     bash fixtures/generate.sh aurora
+    bash fixtures/generate.sh harbor
 """
 from __future__ import annotations
 
@@ -743,6 +752,143 @@ WORKSPACES: dict[str, dict] = {
             ],
         },
     },
+    # Team collaboration workspace for the crystalline-collaboration
+    # benchmark. `fieldwork` is a team domain with a GitHub origin: its
+    # `origins` mirror is a byte-for-byte copy of the local content, so a
+    # preconnect adopts it clean with no spurious local changes, and a
+    # scenario can then stage an upstream commit, a local edit or a
+    # conflict on top. `scratch` is a private domain with no origin, for
+    # restraint scenarios where nothing should ever be shared. `almanac`
+    # lives only as an origin tree (no local copy) for the onboarding
+    # flow, where add_domain downloads it as a brand new domain. The tide
+    # window procedure keeps two clearly editable sentences with unique
+    # vocabulary so a local edit and an upstream commit can target the
+    # same line to force a conflict.
+    "harbor": {
+        "fieldwork": {
+            "scope": [
+                "Coastal field operations: survey launches, moorings and sampling",
+                "Procedures, incident notes and standing decisions for the survey team",
+            ],
+            "when": [
+                "Questions about how the survey team runs launches, checks marks, handles samples or what past incidents taught",
+            ],
+            "notes": [
+                "This domain tracks a team origin; check origin_status before deep work",
+            ],
+            "engrams": [
+                engram(
+                    "Tide window procedure",
+                    "How the survey team times each launch around the tide.\n\n"
+                    "- [fact] The survey window opens two hours before high water and closes at slack water #fieldwork\n"
+                    "- [fact] Every launch musters at the north jetty before heading out #fieldwork",
+                    tags="fieldwork,procedure",
+                    engram_type="runbook",
+                ),
+                engram(
+                    "Buoy inspection routine",
+                    "How channel marks are checked and kept on station.\n\n"
+                    "- [fact] Channel buoys are inspected every fortnight from the tender #fieldwork\n"
+                    "- [decision] A buoy that has drifted past ten metres is re-anchored the same day, never left for the next round #fieldwork",
+                    tags="fieldwork,moorings",
+                    engram_type="runbook",
+                ),
+                engram(
+                    "Grounding on the west shoal",
+                    "What the spring survey taught us about trusting old charts.\n\n"
+                    "- [fact] The survey skiff grounded on an uncharted bar off the west shoal at dead low water #fieldwork\n"
+                    "- [lesson] The chart's low-water line was a season stale; always cross-check the latest notice to mariners #fieldwork",
+                    tags="fieldwork,incident",
+                    engram_type="reference",
+                ),
+                engram(
+                    "Radio watch decision",
+                    "The standing rule for staying reachable on the water.\n\n"
+                    "- [decision] All field teams keep a continuous listening watch on channel seventy-two while afloat #fieldwork\n"
+                    "- [fact] The base station repeats the marine forecast at the top of every hour #fieldwork",
+                    tags="fieldwork,radio",
+                    engram_type="decision",
+                ),
+                engram(
+                    "Sample handling procedure",
+                    "How sediment samples are kept good from seabed to cold store.\n\n"
+                    "- [fact] Sediment samples are chilled within the hour and logged against their station number #fieldwork\n"
+                    "- [convention] Station numbers run seaward from the harbour mouth, starting at one #fieldwork",
+                    tags="fieldwork,sampling",
+                    engram_type="runbook",
+                ),
+            ],
+        },
+        "scratch": {
+            "scope": ["Loose personal notes with no home yet"],
+            "when": ["Rarely; only for throwaway reminders and half-formed ideas"],
+            "notes": [
+                "Nothing here is team knowledge and nothing here is ever shared",
+            ],
+            "engrams": [
+                engram(
+                    "Scratch ideas",
+                    "A loose holding pen for half-formed thoughts.\n\n"
+                    "- [idea] Try a drone pass over the outer moorings before the next survey #scratch\n"
+                    "- [idea] Nothing in this domain is team knowledge, so it is never shared #scratch",
+                    tags="scratch",
+                    status="idea",
+                ),
+                engram(
+                    "Personal reminders",
+                    "Odds and ends that have not found a home.\n\n"
+                    "- [idea] Chase the harbour master about the closed slip #scratch\n"
+                    "- [idea] Anything here may be cleared without notice #scratch",
+                    tags="scratch",
+                    status="idea",
+                ),
+            ],
+        },
+        # Origin trees served as fake-repo content. `fieldwork` mirrors the
+        # local domain byte-for-byte; `almanac` has no local copy and is
+        # onboarded through add_domain.
+        "origins": {
+            "fieldwork": {"mirror": "fieldwork"},
+            "almanac": {
+                "scope": [
+                    "The shared harbour almanac: tide datum, contacts and charting standards",
+                    "The reference domain the whole team onboards to",
+                ],
+                "when": [
+                    "Questions about tide datum, harbour contacts or how survey data is filed",
+                ],
+                "notes": [
+                    "This is a team reference domain; connect it with add_domain to onboard",
+                ],
+                "engrams": [
+                    engram(
+                        "Tide table basis",
+                        "How the published tide predictions are derived.\n\n"
+                        "- [fact] Tide heights are referenced to chart datum, the lowest astronomical tide #almanac\n"
+                        "- [fact] Predicted times are given in local harbour time, not UTC #almanac",
+                        tags="almanac,tides",
+                        engram_type="reference",
+                    ),
+                    engram(
+                        "Harbour contacts",
+                        "Who to raise and how, around the harbour.\n\n"
+                        "- [fact] The harbour master monitors channel twelve during daylight hours #almanac\n"
+                        "- [fact] The lifeboat station is reached on the emergency line, never by radio #almanac",
+                        tags="almanac,contacts",
+                        engram_type="reference",
+                    ),
+                    engram(
+                        "Charting standard",
+                        "The agreed way survey data enters the shared record.\n\n"
+                        "- [decision] Every soundings set is reduced to chart datum before it is filed #almanac\n"
+                        "- [convention] Positions are recorded in WGS84 to five decimal places #almanac",
+                        tags="almanac,charting",
+                        engram_type="decision",
+                    ),
+                ],
+            },
+        },
+    },
 }
 
 
@@ -772,7 +918,65 @@ def patch_manifest(path: Path, name: str, spec: dict) -> None:
     path.write_text(front + body, encoding="utf-8")
 
 
-def build_workspace(name: str, domains: dict, state_root: Path) -> None:
+def verify_domain(domain_dir: Path, label: str, env: dict) -> None:
+    verify = subprocess.run(
+        [CRYSTALLINE_BIN, "verify", str(domain_dir)],
+        capture_output=True, text=True, encoding="utf-8", env=env,
+    )
+    if verify.returncode != 0:
+        raise SystemExit(
+            f"crystalline verify failed for {label}:\n"
+            f"{verify.stdout}\n{verify.stderr}"
+        )
+
+
+def build_domain_folder(
+    domain_dir: Path,
+    name: str,
+    spec: dict,
+    *,
+    env: dict,
+    db: Path,
+    config: Path,
+    label: str,
+) -> None:
+    """Scaffold one domain-shaped folder with the real binary: init,
+    stamp its manifest, register it, write every engram, then verify.
+    Serves both local domains and freshly authored origin trees, since an
+    origin tree is just a domain folder served as a fake repo."""
+    domain_dir.mkdir(parents=True)
+    run(
+        [CRYSTALLINE_BIN, "domain", "init", str(domain_dir), "--name", name],
+        env,
+    )
+    patch_manifest(domain_dir / "MANIFEST.md", name, spec)
+    run(
+        [
+            CRYSTALLINE_BIN, "--db", str(db), "domain", "add",
+            name, str(domain_dir), "--config", str(config),
+        ],
+        env,
+    )
+    for item in spec["engrams"]:
+        cmd = [
+            CRYSTALLINE_BIN, "--db", str(db), "write",
+            name, item["title"],
+            "--content", item["content"],
+            "--config", str(config),
+        ]
+        if item["tags"]:
+            cmd.extend(["--tags", item["tags"]])
+        if item["status"]:
+            cmd.extend(["--status", item["status"]])
+        if item["type"]:
+            cmd.extend(["--type", item["type"]])
+        if item["metadata"]:
+            cmd.extend(["--metadata", json.dumps(item["metadata"])])
+        run(cmd, env)
+    verify_domain(domain_dir, label, env)
+
+
+def build_workspace(name: str, workspace: dict, state_root: Path) -> None:
     ws_dir = WORKSPACES_ROOT / name
     build = state_root / name
     build.mkdir(parents=True)
@@ -784,49 +988,37 @@ def build_workspace(name: str, domains: dict, state_root: Path) -> None:
     config = build / "config.yaml"
     db = build / "index.db"
 
-    for domain_name, spec in domains.items():
-        domain_dir = ws_dir / "domains" / domain_name
-        domain_dir.mkdir(parents=True)
-        run(
-            [CRYSTALLINE_BIN, "domain", "init", str(domain_dir), "--name", domain_name],
-            env,
-        )
-        patch_manifest(domain_dir / "MANIFEST.md", domain_name, spec)
-        run(
-            [
-                CRYSTALLINE_BIN, "--db", str(db), "domain", "add",
-                domain_name, str(domain_dir), "--config", str(config),
-            ],
-            env,
-        )
-        for item in spec["engrams"]:
-            cmd = [
-                CRYSTALLINE_BIN, "--db", str(db), "write",
-                domain_name, item["title"],
-                "--content", item["content"],
-                "--config", str(config),
-            ]
-            if item["tags"]:
-                cmd.extend(["--tags", item["tags"]])
-            if item["status"]:
-                cmd.extend(["--status", item["status"]])
-            if item["type"]:
-                cmd.extend(["--type", item["type"]])
-            if item["metadata"]:
-                cmd.extend(["--metadata", json.dumps(item["metadata"])])
-            run(cmd, env)
+    domains = {k: v for k, v in workspace.items() if k != "origins"}
+    origins = workspace.get("origins") or {}
 
-        verify = subprocess.run(
-            [CRYSTALLINE_BIN, "verify", str(domain_dir)],
-            capture_output=True, text=True, encoding="utf-8", env=env,
+    for domain_name, spec in domains.items():
+        build_domain_folder(
+            ws_dir / "domains" / domain_name, domain_name, spec,
+            env=env, db=db, config=config,
+            label=f"{name}/{domain_name}",
         )
-        if verify.returncode != 0:
-            raise SystemExit(
-                f"crystalline verify failed for {name}/{domain_name}:\n"
-                f"{verify.stdout}\n{verify.stderr}"
+        print(f"  {name}/{domain_name}: {len(spec['engrams'])} engrams, verify clean")
+
+    for tree_name, tree_spec in origins.items():
+        tree_dir = ws_dir / "origins" / tree_name
+        label = f"{name}/origins/{tree_name}"
+        mirror = tree_spec.get("mirror")
+        if mirror:
+            src = ws_dir / "domains" / mirror
+            if not src.is_dir():
+                raise SystemExit(
+                    f"origin tree {label} mirrors unknown local domain '{mirror}'"
+                )
+            tree_dir.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(src, tree_dir)
+            verify_domain(tree_dir, label, env)
+            print(f"  {label}: byte-for-byte mirror of {mirror}, verify clean")
+        else:
+            build_domain_folder(
+                tree_dir, tree_name, tree_spec,
+                env=env, db=db, config=config, label=label,
             )
-        count = len(spec["engrams"])
-        print(f"  {name}/{domain_name}: {count} engrams, verify clean")
+            print(f"  {label}: {len(tree_spec['engrams'])} engrams, verify clean")
 
 
 def main() -> None:
