@@ -359,5 +359,109 @@
       ],
       "forbid_write": true
     }
+  },
+  {
+    "id": "aurora-deep-07",
+    "workspace": "aurora",
+    "task_type": "deep_read",
+    "question": "In the last phase of the Aurora rollout, who has the final say before an agent's suggested move actually goes through?",
+    "expect": {
+      "search": {
+        "domains": [
+          "aurora"
+        ]
+      },
+      "reads": {
+        "identifiers": [
+          "crystalline://aurora/phase-plan"
+        ]
+      },
+      "answer_any": [
+        "human approval",
+        "under human approval"
+      ],
+      "forbid_write": true
+    }
+  },
+  {
+    "id": "aurora-deep-08",
+    "workspace": "aurora",
+    "task_type": "deep_read",
+    "question": "Beyond our closest rival, is anyone else circling the same buyers Aurora is going after?",
+    "expect": {
+      "search": {
+        "reaches_domain": "aurora"
+      },
+      "reads": {
+        "identifiers": [
+          "crystalline://aurora/competitive-watch"
+        ]
+      },
+      "answer_any": [
+        "adjacent platform vendors",
+        "operations chairs we sell to",
+        "two adjacent"
+      ],
+      "forbid_write": true
+    }
+  },
+  {
+    "id": "aurora-trap-06",
+    "workspace": "aurora",
+    "task_type": "snippet_trap",
+    "question": "How many integrations do we need to build for the Aurora launch?",
+    "expect": {
+      "reads": {
+        "identifiers": [
+          "crystalline://aurora/strategy-narrative"
+        ]
+      },
+      "answer_any": [
+        "four",
+        "4"
+      ],
+      "answer_none": [
+        "twelve"
+      ],
+      "forbid_write": true
+    }
+  },
+  {
+    "id": "aurora-synth-05",
+    "workspace": "aurora",
+    "task_type": "synthesis",
+    "question": "A rival just made a play for our buyers. Given that, would it have been safer to just extend our older product instead of building something new, and when did the rival actually move?",
+    "expect": {
+      "reads": {
+        "identifiers": [
+          "crystalline://aurora/strategy-narrative",
+          "crystalline://aurora/competitive-watch"
+        ]
+      },
+      "answer_all": [
+        "installed base",
+        "april"
+      ],
+      "forbid_write": true
+    }
+  },
+  {
+    "id": "aurora-synth-06",
+    "workspace": "aurora",
+    "task_type": "synthesis",
+    "question": "Aurora's last phase has agents suggesting how to shift resources around. Before one of those suggestions goes ahead, how does the platform judge what the move is worth, and who has the final say?",
+    "expect": {
+      "reads": {
+        "identifiers": [
+          "crystalline://aurora/phase-plan",
+          "crystalline://aurora/platform-architecture"
+        ]
+      },
+      "answer_all": [
+        "replay",
+        "human"
+      ],
+      "forbid_write": true
+    }
   }
 ]

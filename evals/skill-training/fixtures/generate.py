@@ -7,9 +7,11 @@ domains are scaffolded with `domain init`, engrams written with
 Registration state and the index used during generation live in a
 throwaway directory; the committed fixture is only the domain folders.
 
-Regenerate after editing the content tables below:
+Regenerate after editing the content tables below (name workspaces to
+rebuild only those and leave the rest untouched):
 
     bash fixtures/generate.sh
+    bash fixtures/generate.sh aurora
 """
 from __future__ import annotations
 
@@ -636,6 +638,111 @@ WORKSPACES: dict[str, dict] = {
             ],
         },
     },
+    # Strategic-initiative knowledge base for the retrieval-depth items:
+    # every load-bearing fact sits deep in an engram body, past the first
+    # 200 characters and away from the vocabulary a natural query would
+    # use, so no search snippet (a 70/140-char window around the first
+    # term match, or a 200-char lead-in) can surface it. The initiative
+    # name and the generic concept nouns live in each title and lead
+    # paragraph, pinning any matched window to the shallow text. The
+    # platform overview deliberately carries a stale illustrative claim
+    # in its lead that only the strategy narrative corrects.
+    "aurora": {
+        "aurora": {
+            "scope": [
+                "The Aurora program: strategy, platform architecture and delivery phases",
+                "Why the pivot exists, who buys it and what ships when",
+            ],
+            "when": [
+                "Any question about Aurora: its strategy, buyers, platform, phases or competitors",
+            ],
+            "notes": [
+                "The strategy narrative is authoritative where documents disagree",
+            ],
+            "engrams": [
+                engram(
+                    "Strategy narrative",
+                    "The strategic rationale for Aurora, the company's pivot "
+                    "from selling standalone dashboards to operating a "
+                    "governed insight platform. This narrative records why "
+                    "the program exists, who buys it, which capability ships "
+                    "first, how many connectors are in scope and what would "
+                    "make us stop.\n\n"
+                    "Approved by the leadership team in the spring cycle, "
+                    "superseding the earlier concept memo. The bullets below "
+                    "are decisions, not aspirations.\n\n"
+                    "- [decision] The purchase call sits with a three-seat committee: the operations chair, the finance owner and the technology validator #strategy\n"
+                    "- [decision] The bet is walked back if fewer than three lighthouse customers renew by month eighteen #strategy\n"
+                    "- [decision] The road not taken: bolt analytics onto our older suite and ride the installed base for another decade #strategy\n"
+                    "- [decision] The first build focus is governed recovery with outcome-based planning, superseding the illustrative list in the platform overview #strategy\n"
+                    "- [decision] Opening scope trims the connectors to four sources, not the dozen sketched in the platform overview #strategy",
+                    tags="aurora,strategy",
+                    engram_type="strategy",
+                ),
+                engram(
+                    "Platform architecture",
+                    "An early sketch of the Aurora platform. As a working "
+                    "illustration this overview shows scenario budgeting as "
+                    "the first capability and twelve source connectors at "
+                    "launch; the strategy narrative holds the committed "
+                    "scope. Four layers move signals from ingestion to "
+                    "reasoning and on to reallocation decisions.\n\n"
+                    "The layers below are stable even where the capability "
+                    "list above is not.\n\n"
+                    "- [fact] The ingestion layer normalizes execution signals from work trackers into the outcome ledger #architecture\n"
+                    "- [fact] The outcome ledger is the platform's core asset: an append-only record linking each decision to what actually happened #architecture\n"
+                    "- [fact] The reasoning layer replays past decisions against the ledger to price each reallocation move #architecture\n"
+                    "- refines [[Strategy narrative]]",
+                    tags="aurora,architecture",
+                    engram_type="architecture",
+                    status="draft",
+                ),
+                engram(
+                    "Phase plan",
+                    "The phased delivery plan for Aurora, from first "
+                    "shipment through platform buildout. Three phases pace "
+                    "the program: what ships first, who receives it and the "
+                    "gate each phase must clear before the next begins.\n\n"
+                    "Dates move with capacity; the gates and the order do "
+                    "not. Each phase closes with a written review before the "
+                    "next opens, re-baselined quarterly with the program "
+                    "board.\n\n"
+                    "- [decision] The opening phase ships governed recovery to the five design partners before any platform work #plan\n"
+                    "- [fact] The second phase begins only after the outcome ledger holds two full quarters of signals #plan\n"
+                    "- [fact] The third phase lets agents propose reallocation moves under human approval #plan",
+                    tags="aurora,plan",
+                    engram_type="plan",
+                ),
+                engram(
+                    "Competitive watch",
+                    "Tracking rivals and adjacent platforms around Aurora. "
+                    "Standing watch notes on who moves toward our buyers, "
+                    "our category and our positioning; refreshed as material "
+                    "events land rather than on a schedule.\n\n"
+                    "Raw press coverage stays out; only moves that change "
+                    "our posture get recorded here, with the source noted "
+                    "for each entry.\n\n"
+                    "- [fact] The nearest rival shipped a positioning paper aimed straight at our buying committee in April #strategy\n"
+                    "- [fact] Two adjacent platform vendors are courting the same operations chairs we sell to #strategy",
+                    tags="aurora,strategy",
+                ),
+            ],
+        },
+        "workbench": {
+            "scope": ["Personal working notes, logistics and scratch material"],
+            "when": ["Offsite logistics, meeting notes and other scratch lookups"],
+            "notes": ["Nothing here is Aurora program knowledge"],
+            "engrams": [
+                engram(
+                    "Offsite logistics",
+                    "Notes for the spring offsite.\n\n"
+                    "- [fact] The offsite venue holds forty people #workbench\n"
+                    "- [fact] Catering needs final numbers a week ahead #workbench",
+                    tags="workbench",
+                ),
+            ],
+        },
+    },
 }
 
 
@@ -728,10 +835,20 @@ def main() -> None:
             f"crystalline binary not found at {CRYSTALLINE_BIN}; "
             "run `cargo build --release` first or set CRYSTALLINE_BIN"
         )
-    if WORKSPACES_ROOT.exists():
-        shutil.rmtree(WORKSPACES_ROOT)
+    names = sys.argv[1:]
+    unknown = sorted(set(names) - set(WORKSPACES))
+    if unknown:
+        raise SystemExit(f"unknown workspace(s): {', '.join(unknown)}")
+    if names:
+        targets = {name: WORKSPACES[name] for name in names}
+        for name in targets:
+            shutil.rmtree(WORKSPACES_ROOT / name, ignore_errors=True)
+    else:
+        targets = WORKSPACES
+        if WORKSPACES_ROOT.exists():
+            shutil.rmtree(WORKSPACES_ROOT)
     with tempfile.TemporaryDirectory(prefix="cst-fixture-build-") as state_root:
-        for name, domains in WORKSPACES.items():
+        for name, domains in targets.items():
             build_workspace(name, domains, Path(state_root))
     print(f"fixtures written to {WORKSPACES_ROOT}")
 

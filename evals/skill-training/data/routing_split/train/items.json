@@ -721,5 +721,214 @@
       "forbid_write": true,
       "manifest_read_ok": false
     }
+  },
+  {
+    "id": "aurora-deep-01",
+    "workspace": "aurora",
+    "task_type": "deep_read",
+    "question": "If Aurora ever reaches a purchase decision, whose sign-off do we actually need on the buyer's side?",
+    "expect": {
+      "search": {
+        "domains": [
+          "aurora"
+        ]
+      },
+      "reads": {
+        "identifiers": [
+          "crystalline://aurora/strategy-narrative"
+        ]
+      },
+      "answer_any": [
+        "operations chair",
+        "finance owner",
+        "technology validator"
+      ],
+      "forbid_write": true
+    }
+  },
+  {
+    "id": "aurora-deep-02",
+    "workspace": "aurora",
+    "task_type": "deep_read",
+    "question": "Under what condition would leadership actually pull the plug on the Aurora bet?",
+    "expect": {
+      "search": {
+        "reaches_domain": "aurora"
+      },
+      "reads": {
+        "identifiers": [
+          "crystalline://aurora/strategy-narrative"
+        ]
+      },
+      "answer_any": [
+        "eighteen months",
+        "month eighteen",
+        "18"
+      ],
+      "forbid_write": true
+    }
+  },
+  {
+    "id": "aurora-deep-03",
+    "workspace": "aurora",
+    "task_type": "deep_read",
+    "question": "Instead of building a brand new platform, what alternative did Aurora's leadership consider and turn down?",
+    "expect": {
+      "search": {
+        "domains": [
+          "aurora"
+        ]
+      },
+      "reads": {
+        "identifiers": [
+          "crystalline://aurora/strategy-narrative"
+        ]
+      },
+      "answer_any": [
+        "installed base",
+        "older suite",
+        "another decade"
+      ],
+      "forbid_write": true
+    }
+  },
+  {
+    "id": "aurora-deep-04",
+    "workspace": "aurora",
+    "task_type": "deep_read",
+    "question": "Where does the raw signal that feeds Aurora's platform actually come from, and what happens to it on the way in?",
+    "expect": {
+      "search": {
+        "reaches_domain": "aurora"
+      },
+      "reads": {
+        "identifiers": [
+          "crystalline://aurora/platform-architecture"
+        ]
+      },
+      "answer_any": [
+        "work trackers",
+        "normalizes execution signals"
+      ],
+      "forbid_write": true
+    }
+  },
+  {
+    "id": "aurora-trap-01",
+    "workspace": "aurora",
+    "task_type": "snippet_trap",
+    "question": "What capability did leadership actually commit Aurora to delivering first?",
+    "expect": {
+      "reads": {
+        "identifiers": [
+          "crystalline://aurora/strategy-narrative"
+        ]
+      },
+      "answer_any": [
+        "governed recovery"
+      ],
+      "answer_none": [
+        "scenario budgeting"
+      ],
+      "forbid_write": true
+    }
+  },
+  {
+    "id": "aurora-trap-02",
+    "workspace": "aurora",
+    "task_type": "snippet_trap",
+    "question": "How many data sources are we integrating with when Aurora launches?",
+    "expect": {
+      "reads": {
+        "identifiers": [
+          "crystalline://aurora/strategy-narrative"
+        ]
+      },
+      "answer_any": [
+        "four",
+        "4"
+      ],
+      "answer_none": [
+        "twelve"
+      ],
+      "forbid_write": true
+    }
+  },
+  {
+    "id": "aurora-trap-03",
+    "workspace": "aurora",
+    "task_type": "snippet_trap",
+    "question": "Our sales team has been pitching Aurora from an early product sketch. Before the next pitch goes out, what should they name as the first capability, going by what leadership actually signed off on?",
+    "expect": {
+      "reads": {
+        "identifiers": [
+          "crystalline://aurora/strategy-narrative"
+        ]
+      },
+      "answer_any": [
+        "governed recovery"
+      ],
+      "answer_none": [
+        "scenario budgeting"
+      ],
+      "forbid_write": true
+    }
+  },
+  {
+    "id": "aurora-synth-01",
+    "workspace": "aurora",
+    "task_type": "synthesis",
+    "question": "Our nearest rival just aimed a positioning paper at our buying committee this spring. Remind me exactly which roles make up that committee on our side, and when the paper landed.",
+    "expect": {
+      "reads": {
+        "identifiers": [
+          "crystalline://aurora/strategy-narrative",
+          "crystalline://aurora/competitive-watch"
+        ]
+      },
+      "answer_all": [
+        "april",
+        "operations chair"
+      ],
+      "forbid_write": true
+    }
+  },
+  {
+    "id": "aurora-synth-02",
+    "workspace": "aurora",
+    "task_type": "synthesis",
+    "question": "Before Aurora's second phase can start, how long does the outcome ledger need to have been running, and what kind of record does it actually keep?",
+    "expect": {
+      "reads": {
+        "identifiers": [
+          "crystalline://aurora/phase-plan",
+          "crystalline://aurora/platform-architecture"
+        ]
+      },
+      "answer_all": [
+        "two full quarters",
+        "append-only"
+      ],
+      "forbid_write": true
+    }
+  },
+  {
+    "id": "aurora-synth-03",
+    "workspace": "aurora",
+    "task_type": "synthesis",
+    "question": "Is the very first thing Aurora's team builds the same as the very first thing customers actually receive? If they match, which customers get it?",
+    "expect": {
+      "reads": {
+        "identifiers": [
+          "crystalline://aurora/strategy-narrative",
+          "crystalline://aurora/phase-plan"
+        ]
+      },
+      "answer_all": [
+        "outcome-based planning",
+        "design partners"
+      ],
+      "forbid_write": true
+    }
   }
 ]

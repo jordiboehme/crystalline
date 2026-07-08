@@ -361,5 +361,105 @@
       ],
       "forbid_write": true
     }
+  },
+  {
+    "id": "aurora-deep-05",
+    "workspace": "aurora",
+    "task_type": "deep_read",
+    "question": "When Aurora's platform weighs whether a proposed shift of resources is worth making, how does it put a value on the move?",
+    "expect": {
+      "search": {
+        "domains": [
+          "aurora"
+        ]
+      },
+      "reads": {
+        "identifiers": [
+          "crystalline://aurora/platform-architecture"
+        ]
+      },
+      "answer_any": [
+        "replay",
+        "price each reallocation"
+      ],
+      "forbid_write": true
+    }
+  },
+  {
+    "id": "aurora-deep-06",
+    "workspace": "aurora",
+    "task_type": "deep_read",
+    "question": "Who is first in line for the very first thing Aurora ships, before the platform team even starts building?",
+    "expect": {
+      "search": {
+        "reaches_domain": "aurora"
+      },
+      "reads": {
+        "identifiers": [
+          "crystalline://aurora/phase-plan"
+        ]
+      },
+      "answer_any": [
+        "five design partners",
+        "design partners"
+      ],
+      "forbid_write": true
+    }
+  },
+  {
+    "id": "aurora-trap-04",
+    "workspace": "aurora",
+    "task_type": "snippet_trap",
+    "question": "Is the platform architecture note's list of capabilities and connector count still the plan we're building to?",
+    "expect": {
+      "reads": {
+        "identifiers": [
+          "crystalline://aurora/strategy-narrative",
+          "crystalline://aurora/platform-architecture"
+        ]
+      },
+      "answer_any": [
+        "governed recovery",
+        "four sources"
+      ],
+      "forbid_write": true
+    }
+  },
+  {
+    "id": "aurora-trap-05",
+    "workspace": "aurora",
+    "task_type": "snippet_trap",
+    "question": "The platform overview and the strategy narrative disagree about what ships first for Aurora. Which one should I trust, and what does it actually say?",
+    "expect": {
+      "reads": {
+        "identifiers": [
+          "crystalline://aurora/strategy-narrative",
+          "crystalline://aurora/platform-architecture"
+        ]
+      },
+      "answer_any": [
+        "governed recovery"
+      ],
+      "forbid_write": true
+    }
+  },
+  {
+    "id": "aurora-synth-04",
+    "workspace": "aurora",
+    "task_type": "synthesis",
+    "question": "What's the first thing Aurora is actually committed to building, and what kind of systems does its raw signal get pulled out of?",
+    "expect": {
+      "reads": {
+        "identifiers": [
+          "crystalline://aurora/strategy-narrative",
+          "crystalline://aurora/platform-architecture"
+        ]
+      },
+      "answer_all": [
+        "governed recovery",
+        "work trackers"
+      ],
+      "forbid_write": true
+    }
   }
 ]
