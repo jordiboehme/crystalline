@@ -30,6 +30,13 @@ Dependency direction: core <- index <- service <- cli.
 - Lint: `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check`
 - Style check: `bash scripts/style-lint.sh`
 
+## Toolchain
+
+rustup is installed via Homebrew (`brew install rustup`). The Homebrew formula does not create cargo/rustc proxies and `~/.cargo/bin` is not on PATH, so bare `cargo` and `rustc` do not resolve; the commands above must be run through rustup. The pinned toolchain (`rust-toolchain.toml` -> 1.96.1) is installed under `~/.rustup` and is auto-selected in-repo by the override file.
+
+- Run any cargo command with `rustup run 1.96.1 cargo ...` (for example `rustup run 1.96.1 cargo build --release`)
+- To get bare `cargo` on PATH instead, install the missing toolchain and set it as the default proxy: `rustup default 1.96.1`, then add `~/.cargo/bin` to PATH
+
 ## Local folders (gitignored)
 
 - `plans/` - implementation plans. Read the newest plan before starting work; store any new plan here
