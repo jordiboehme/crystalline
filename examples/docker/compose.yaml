@@ -11,7 +11,10 @@
 # Agents connect over the HTTP MCP endpoint at http://localhost:7411 from
 # the host (or http://crystalline:7411 from another container on this
 # compose network) - stdio `crystalline mcp` is for local, non-containerized
-# processes.
+# processes. http://localhost:7411 works out of the box; reaching the daemon
+# by any other name (the crystalline service-name, a LAN host or a reverse
+# proxy) needs that host in CRYSTALLINE_SERVICE_ALLOWED_HOSTS, since the
+# transport validates the Host header to block DNS rebinding.
 #
 # Start it:
 #   docker compose -f examples/docker/compose.yaml up -d
@@ -39,6 +42,11 @@ services:
     # watching and embedding still run, so the index keeps following external
     # edits to ./knowledge. Swap the command line above for:
     # command: ["serve", "--http", "0.0.0.0:7411", "--read-only"]
+    # environment:
+    #   # Reach the daemon by hostname / compose service-name / reverse proxy,
+    #   # not just http://localhost:7411. Loopback is always allowed; list the
+    #   # extra Host values (comma-separated), or "*" behind a trusted proxy.
+    #   CRYSTALLINE_SERVICE_ALLOWED_HOSTS: "crystalline,muthur.lan"
     ports:
       - "7411:7411"
     volumes:

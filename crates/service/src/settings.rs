@@ -167,6 +167,15 @@ pub fn registry() -> &'static [SettingSpec] {
             effective: http_effective,
         },
         SettingSpec {
+            key: "service.allowed_hosts",
+            doc: "Comma-separated Host header values the HTTP transport accepts (DNS-rebinding guard); loopback is always allowed and a single * allows any Host; the serve --allowed-host flag wins when given (applies at the next daemon start)",
+            kind: SettingKind::String,
+            startup_effective: true,
+            apply: set_allowed_hosts,
+            clear: clear_allowed_hosts,
+            effective: allowed_hosts_effective,
+        },
+        SettingSpec {
             key: "database.backend",
             doc: "Which storage backend serves the derived index, turso or postgres (applies at the next daemon start)",
             kind: SettingKind::String,
@@ -525,6 +534,58 @@ fn http_effective(config: &GlobalConfig) -> (String, bool) {
     }
 }
 
+// --- service.allowed_hosts -------------------------------------------------
+
+/// Split a comma-separated Host list into trimmed, non-empty entries. Shared by
+/// the settings apply path and the daemon's flag resolver so both normalize the
+/// same way.
+pub(crate) fn parse_allowed_hosts(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn set_allowed_hosts(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
+    let hosts = parse_allowed_hosts(value);
+    if let Some(bad) = hosts.iter().find(|h| h.contains(char::is_whitespace)) {
+        return Err(SettingsError(format!(
+            "service.allowed_hosts entries must not contain whitespace, got '{bad}'"
+        )));
+    }
+    // An empty list means "no extra hosts": clear the setting (and drop the
+    // service block if it is now empty) rather than persist an empty vec.
+    if hosts.is_empty() {
+        clear_allowed_hosts(config);
+        return Ok(());
+    }
+    config
+        .service
+        .get_or_insert_with(ServiceConfig::default)
+        .allowed_hosts = Some(hosts);
+    Ok(())
+}
+
+fn clear_allowed_hosts(config: &mut GlobalConfig) {
+    if let Some(s) = config.service.as_mut() {
+        s.allowed_hosts = None;
+    }
+    drop_service_if_empty(config);
+}
+
+fn allowed_hosts_effective(config: &GlobalConfig) -> (String, bool) {
+    match config
+        .service
+        .as_ref()
+        .and_then(|s| s.allowed_hosts.as_ref())
+    {
+        Some(hosts) if !hosts.is_empty() => (hosts.join(","), false),
+        _ => (String::new(), true),
+    }
+}
+
 // --- database.backend ----------------------------------------------------------
 
 fn set_database_backend(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
@@ -622,7 +683,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_lists_exactly_the_nine_keys_in_order() {
+    fn registry_lists_exactly_the_ten_keys_in_order() {
         assert_eq!(
             known_keys(),
             vec![
@@ -633,6 +694,7 @@ mod tests {
                 "github.oauth_client_id",
                 "service.read_only",
                 "service.http",
+                "service.allowed_hosts",
                 "database.backend",
                 "database.url",
             ]
@@ -663,6 +725,10 @@ mod tests {
                 ),
                 ("service.http", "CRYSTALLINE_SERVICE_HTTP".to_string()),
                 (
+                    "service.allowed_hosts",
+                    "CRYSTALLINE_SERVICE_ALLOWED_HOSTS".to_string()
+                ),
+                (
                     "database.backend",
                     "CRYSTALLINE_DATABASE_BACKEND".to_string()
                 ),
@@ -681,6 +747,7 @@ mod tests {
         assert!(change_note("github.oauth_client_id", &no_env).is_none());
         assert!(change_note("service.read_only", &no_env).is_some());
         assert!(change_note("service.http", &no_env).is_some());
+        assert!(change_note("service.allowed_hosts", &no_env).is_some());
         assert!(change_note("database.backend", &no_env).is_some());
         assert!(change_note("database.url", &no_env).is_some());
         assert!(change_note("github.bogus", &no_env).is_none());
@@ -715,6 +782,47 @@ mod tests {
         let note = change_note("service.read_only", &overlay).unwrap();
         assert!(note.contains("the next time the daemon starts"), "{note}");
         assert!(note.contains("CRYSTALLINE_SERVICE_READ_ONLY"), "{note}");
+    }
+
+    #[test]
+    fn apply_allowed_hosts_parses_and_round_trips() {
+        let mut cfg = GlobalConfig::default();
+        apply(
+            &mut cfg,
+            "service.allowed_hosts",
+            " muthur.lan, mcp.example.com ",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.service
+                .as_ref()
+                .and_then(|s| s.allowed_hosts.as_deref()),
+            Some(["muthur.lan".to_string(), "mcp.example.com".to_string()].as_slice())
+        );
+        // effective() joins the list back into the comma-separated form.
+        assert_eq!(
+            allowed_hosts_effective(&cfg),
+            ("muthur.lan,mcp.example.com".to_string(), false)
+        );
+    }
+
+    #[test]
+    fn apply_allowed_hosts_rejects_whitespace_in_a_host() {
+        let mut cfg = GlobalConfig::default();
+        let err = apply(&mut cfg, "service.allowed_hosts", "bad host").unwrap_err();
+        assert!(err.0.contains("whitespace"), "{}", err.0);
+    }
+
+    #[test]
+    fn apply_allowed_hosts_empty_clears_and_drops_the_service_block() {
+        let mut cfg = GlobalConfig::default();
+        apply(&mut cfg, "service.allowed_hosts", "muthur.lan").unwrap();
+        assert!(cfg.service.is_some());
+        // Clearing the only set field drops the empty service block entirely,
+        // and effective() reports the default (loopback-only).
+        apply(&mut cfg, "service.allowed_hosts", "").unwrap();
+        assert!(cfg.service.is_none());
+        assert_eq!(allowed_hosts_effective(&cfg), (String::new(), true));
     }
 
     #[test]
@@ -872,7 +980,7 @@ mod tests {
         apply(&mut cfg, "github.enabled", "true").unwrap();
 
         let views = snapshot(&cfg, &EnvOverlay::default());
-        assert_eq!(views.len(), 9);
+        assert_eq!(views.len(), 10);
         assert_eq!(
             views.iter().map(|v| v.key.as_str()).collect::<Vec<_>>(),
             vec![
@@ -883,6 +991,7 @@ mod tests {
                 "github.oauth_client_id",
                 "service.read_only",
                 "service.http",
+                "service.allowed_hosts",
                 "database.backend",
                 "database.url",
             ]
@@ -921,11 +1030,15 @@ mod tests {
         assert_eq!(http.value, "false");
         assert_eq!(http.source, SettingSource::Default);
 
-        let backend = &views[7];
+        let allowed_hosts = &views[7];
+        assert_eq!(allowed_hosts.value, "");
+        assert_eq!(allowed_hosts.source, SettingSource::Default);
+
+        let backend = &views[8];
         assert_eq!(backend.value, "turso");
         assert_eq!(backend.source, SettingSource::Default);
 
-        let url = &views[8];
+        let url = &views[9];
         assert_eq!(url.value, "");
         assert_eq!(url.source, SettingSource::Default);
     }

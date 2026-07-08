@@ -595,6 +595,10 @@ mod tests {
             ("CRYSTALLINE_GITHUB_OAUTH_CLIENT_ID", "client-xyz"),
             ("CRYSTALLINE_SERVICE_READ_ONLY", "true"),
             ("CRYSTALLINE_SERVICE_HTTP", "0.0.0.0:7411"),
+            (
+                "CRYSTALLINE_SERVICE_ALLOWED_HOSTS",
+                "muthur.lan,mcp.example.com",
+            ),
             ("CRYSTALLINE_DATABASE_BACKEND", "postgres"),
             ("CRYSTALLINE_DATABASE_URL", "postgres://u:p@db/crystalline"),
         ])
@@ -608,6 +612,7 @@ mod tests {
             "github.oauth_client_id",
             "service.read_only",
             "service.http",
+            "service.allowed_hosts",
             "database.backend",
             "database.url",
         ] {
@@ -621,6 +626,13 @@ mod tests {
         );
         assert!(effective.github_enabled());
         assert!(effective.read_only());
+        assert_eq!(
+            effective
+                .service
+                .as_ref()
+                .and_then(|s| s.allowed_hosts.as_deref()),
+            Some(["muthur.lan".to_string(), "mcp.example.com".to_string()].as_slice())
+        );
         assert_eq!(effective.database().backend, DatabaseBackend::Postgres);
         assert_eq!(
             effective.database().url.as_deref(),

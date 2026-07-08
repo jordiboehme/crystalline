@@ -303,6 +303,13 @@ pub struct ServiceConfig {
     /// Absent means read-write.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_only: Option<bool>,
+    /// Extra `Host` header values the HTTP transport accepts, on top of the
+    /// always-allowed loopback set. This is the DNS-rebinding guard: rmcp
+    /// rejects any request whose `Host` is not allowed. A single `*` entry
+    /// allows any Host (only safe behind a trusted reverse proxy or firewall).
+    /// Absent means loopback-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_hosts: Option<Vec<String>>,
 }
 
 /// The `service.http` value: either enabled/disabled, or a bind address.

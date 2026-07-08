@@ -138,6 +138,7 @@ impl Shared {
 pub async fn run_serve(
     daemon_flag: bool,
     http_flag: Option<String>,
+    allowed_host_flag: Vec<String>,
     db: Option<PathBuf>,
     config_path: Option<PathBuf>,
     read_only: bool,
@@ -156,6 +157,7 @@ pub async fn run_serve(
     let read_only = read_only || loaded.effective.read_only();
     let db_path = resolve_db(db.as_deref())?;
     let http_addr = resolve_http(http_flag.as_deref(), &loaded.effective);
+    let allowed_hosts = resolve_allowed_hosts(&allowed_host_flag, &loaded.effective);
 
     // An env-defined domain that shadows a config file entry is worth one
     // startup warning (not one per `apply`, which runs constantly): the file
@@ -340,7 +342,7 @@ pub async fn run_serve(
         let sessions = http_sessions.clone();
         let rx = shared.watch();
         tokio::spawn(async move {
-            if let Err(err) = run_http(addr, e, sessions, rx).await {
+            if let Err(err) = run_http(addr, allowed_hosts, e, sessions, rx).await {
                 tracing::warn!("HTTP endpoint stopped: {err}");
             }
         });
@@ -576,17 +578,18 @@ async fn run_watcher(
     Ok(())
 }
 
-/// Serve the tool router over streamable HTTP until shutdown.
+/// Serve the tool router over streamable HTTP until shutdown. `allowed_hosts`
+/// carries the resolved `Host` header allow-list on top of loopback (a single
+/// `*` disables the guard); see [`http_config`].
 async fn run_http(
     addr: String,
+    allowed_hosts: Vec<String>,
     engine: Arc<Engine>,
     http_sessions: Arc<AtomicUsize>,
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
-    use rmcp::transport::streamable_http_server::tower::{
-        StreamableHttpServerConfig, StreamableHttpService,
-    };
+    use rmcp::transport::streamable_http_server::tower::StreamableHttpService;
 
     let session_manager = Arc::new(LocalSessionManager::default());
     let factory_engine = engine.clone();
@@ -596,7 +599,7 @@ async fn run_http(
             Ok(McpServer::new(factory_engine.clone()))
         },
         session_manager,
-        StreamableHttpServerConfig::default(),
+        http_config(&allowed_hosts),
     );
     let router = axum::Router::new()
         .route("/health", axum::routing::get(health))
@@ -737,6 +740,51 @@ fn resolve_http(flag: Option<&str>, config: &GlobalConfig) -> Option<String> {
     }
 }
 
+/// Resolve the HTTP `Host` allow-list from the flag then the config. The
+/// repeatable `--allowed-host` flag wins over the comma-separated
+/// `service.allowed_hosts` setting; both normalize the same way. An empty
+/// result means loopback-only (the secure default).
+fn resolve_allowed_hosts(flag: &[String], config: &GlobalConfig) -> Vec<String> {
+    let split = |entries: &[String]| -> Vec<String> {
+        entries
+            .iter()
+            .flat_map(|s| crate::settings::parse_allowed_hosts(s))
+            .collect()
+    };
+    if !flag.is_empty() {
+        return split(flag);
+    }
+    config
+        .service
+        .as_ref()
+        .and_then(|s| s.allowed_hosts.as_deref())
+        .map(split)
+        .unwrap_or_default()
+}
+
+/// Build the streamable-HTTP config, applying the DNS-rebinding `Host` guard.
+/// An empty list keeps rmcp's loopback-only default; a single `*` disables the
+/// guard (any Host allowed); otherwise loopback is merged with the configured
+/// hosts so local access never breaks.
+fn http_config(
+    allowed_hosts: &[String],
+) -> rmcp::transport::streamable_http_server::tower::StreamableHttpServerConfig {
+    use rmcp::transport::streamable_http_server::tower::StreamableHttpServerConfig;
+    if allowed_hosts.iter().any(|h| h == "*") {
+        return StreamableHttpServerConfig::default().disable_allowed_hosts();
+    }
+    if allowed_hosts.is_empty() {
+        return StreamableHttpServerConfig::default();
+    }
+    let mut hosts = vec![
+        "localhost".to_string(),
+        "127.0.0.1".to_string(),
+        "::1".to_string(),
+    ];
+    hosts.extend(allowed_hosts.iter().cloned());
+    StreamableHttpServerConfig::default().with_allowed_hosts(hosts)
+}
+
 pub(crate) fn resolve_db(db: Option<&Path>) -> anyhow::Result<PathBuf> {
     match db {
         Some(p) => Ok(p.to_path_buf()),
@@ -810,5 +858,64 @@ mod tests {
     fn resolve_http_none_without_flag_or_config() {
         let config = GlobalConfig::default();
         assert_eq!(resolve_http(None, &config), None);
+    }
+
+    fn config_with_allowed_hosts(hosts: Vec<String>) -> GlobalConfig {
+        let mut config = GlobalConfig::default();
+        config.service = Some(crystalline_core::config::ServiceConfig {
+            allowed_hosts: Some(hosts),
+            ..Default::default()
+        });
+        config
+    }
+
+    #[test]
+    fn resolve_allowed_hosts_flag_wins_and_splits_commas() {
+        let config = config_with_allowed_hosts(vec!["ignored.example".to_string()]);
+        // A single flag value may itself carry a comma-separated list.
+        let flag = vec!["muthur.lan, mcp.example.com".to_string()];
+        assert_eq!(
+            resolve_allowed_hosts(&flag, &config),
+            vec!["muthur.lan".to_string(), "mcp.example.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn resolve_allowed_hosts_falls_back_to_config() {
+        let config = config_with_allowed_hosts(vec!["muthur.lan".to_string()]);
+        assert_eq!(
+            resolve_allowed_hosts(&[], &config),
+            vec!["muthur.lan".to_string()]
+        );
+    }
+
+    #[test]
+    fn resolve_allowed_hosts_empty_without_flag_or_config() {
+        let config = GlobalConfig::default();
+        assert!(resolve_allowed_hosts(&[], &config).is_empty());
+    }
+
+    #[test]
+    fn http_config_empty_keeps_loopback_only_default() {
+        let cfg = http_config(&[]);
+        assert_eq!(cfg.allowed_hosts, vec!["localhost", "127.0.0.1", "::1"]);
+    }
+
+    #[test]
+    fn http_config_star_disables_the_guard() {
+        let cfg = http_config(&["*".to_string()]);
+        assert!(
+            cfg.allowed_hosts.is_empty(),
+            "an empty allow-list makes rmcp accept any Host"
+        );
+    }
+
+    #[test]
+    fn http_config_merges_loopback_with_configured_hosts() {
+        let cfg = http_config(&["muthur.lan".to_string()]);
+        assert_eq!(
+            cfg.allowed_hosts,
+            vec!["localhost", "127.0.0.1", "::1", "muthur.lan"]
+        );
     }
 }

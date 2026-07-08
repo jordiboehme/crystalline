@@ -368,7 +368,7 @@ Only when told to. It does not exit when the last agent disconnects or on idle -
 
 **Is the HTTP endpoint authenticated?**
 
-Not yet - the optional HTTP transport is unauthenticated regardless of bind address. That is fine on the `127.0.0.1` default; the container image binds `0.0.0.0` (see [Run in a container](docs/deployment.md#run-in-a-container)) so agents on the host can reach it, so treat the network boundary around the container (a private network, a reverse proxy, firewall rules) as the access control until built-in authentication ships.
+Not yet - the optional HTTP transport is unauthenticated regardless of bind address. That is fine on the `127.0.0.1` default; the container image binds `0.0.0.0` (see [Run in a container](docs/deployment.md#run-in-a-container)) so agents on the host can reach it, so treat the network boundary around the container (a private network, a reverse proxy, firewall rules) as the access control until built-in authentication ships. It does validate the request `Host` header to block DNS rebinding: loopback is accepted by default, and any other hostname (a reverse proxy, a LAN name, a compose service-name) must be added via `CRYSTALLINE_SERVICE_ALLOWED_HOSTS` or `serve --allowed-host` (see [Configure through environment variables](docs/deployment.md#configure-through-environment-variables)).
 
 **Where does my knowledge actually live?**
 

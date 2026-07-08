@@ -221,6 +221,11 @@ enum Command {
         /// Serve the tool router over streamable HTTP at this localhost address.
         #[arg(long)]
         http: Option<String>,
+        /// Accept this `Host` header value on the HTTP transport (repeatable).
+        /// Loopback is always allowed; a single `*` allows any Host (quote it).
+        /// Wins over CRYSTALLINE_SERVICE_ALLOWED_HOSTS and service.allowed_hosts.
+        #[arg(long = "allowed-host", value_name = "HOST")]
+        allowed_host: Vec<String>,
         /// Run as a background daemon (quiet output).
         #[arg(long)]
         daemon: bool,
@@ -893,12 +898,21 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Healthcheck { addr }) => cmd::healthcheck(&addr),
         Some(Command::Serve {
             http,
+            allowed_host,
             daemon,
             read_only,
             take_over,
             config,
         }) => on_runtime(move || {
-            crystalline_service::run_serve(daemon, http, cli.db, config, read_only, take_over)
+            crystalline_service::run_serve(
+                daemon,
+                http,
+                allowed_host,
+                cli.db,
+                config,
+                read_only,
+                take_over,
+            )
         }),
         Some(Command::Mcp {
             embedded,

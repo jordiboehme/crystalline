@@ -36,7 +36,7 @@ fn config_show_set_unset_round_trip_against_a_temp_config() {
     assert!(out.status.success());
     let shown: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     let settings = shown["settings"].as_array().unwrap();
-    assert_eq!(settings.len(), 9);
+    assert_eq!(settings.len(), 10);
     assert!(settings.iter().all(|s| s["source"] == "default"));
 
     // Set writes the config file and returns the new effective value.
