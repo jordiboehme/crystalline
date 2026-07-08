@@ -22,12 +22,12 @@ fn good_domain_has_no_issues() {
     write(
         dir.path(),
         "MANIFEST.md",
-        "---\ntype: manifest\ntitle: MANIFEST\npermalink: astronomy/manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\ntimestamp: 2026-01-01T00:00:00+00:00\n---\n\n## Scope\n\n- Facts about the solar system\n\n## When to Use\n\n- When asked about moons or planets\n",
+        "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\ntimestamp: 2026-01-01T00:00:00+00:00\n---\n\n## Scope\n\n- Facts about the solar system\n\n## When to Use\n\n- When asked about moons or planets\n",
     );
     write(
         dir.path(),
         "phobos.md",
-        "---\ntype: engram\ntitle: Phobos\npermalink: astronomy/phobos\ntags:\n- moons\nstatus: current\nrecorded_at: 2026-01-01\ntimestamp: 2026-01-01T00:00:00+00:00\n---\n\n# Phobos\n\nThe larger and closer of the two small moons that orbit Mars. It completes\nan orbit in under eight hours.\n",
+        "---\ntype: engram\ntitle: Phobos\npermalink: phobos\ntags:\n- moons\nstatus: current\nrecorded_at: 2026-01-01\ntimestamp: 2026-01-01T00:00:00+00:00\n---\n\n# Phobos\n\nThe larger and closer of the two small moons that orbit Mars. It completes\nan orbit in under eight hours.\n",
     );
 
     let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
@@ -48,7 +48,7 @@ fn missing_manifest_is_m001_error() {
     write(
         dir.path(),
         "phobos.md",
-        "---\ntype: engram\ntitle: Phobos\npermalink: astronomy/phobos\ntags:\n- moons\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nBody text with enough lines.\nSecond line.\nThird line.\n",
+        "---\ntype: engram\ntitle: Phobos\npermalink: phobos\ntags:\n- moons\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nBody text with enough lines.\nSecond line.\nThird line.\n",
     );
 
     let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
@@ -67,13 +67,13 @@ fn required_field_and_encoding_and_temporal_and_quality_rules_fire() {
     write(
         dir.path(),
         "MANIFEST.md",
-        "---\ntype: manifest\ntitle: MANIFEST\npermalink: gardening/manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n## Scope\n\n- Gardening facts\n\n## When to Use\n\n- When asked about plants\n",
+        "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n## Scope\n\n- Gardening facts\n\n## When to Use\n\n- When asked about plants\n",
     );
     // Missing tags/status/recorded_at, near-empty body -> E004, T001 (x2), Q001.
     write(
         dir.path(),
         "bad.md",
-        "---\ntype: engram\ntitle: Bad Engram\npermalink: gardening/bad\n---\n\nOne line only.\n",
+        "---\ntype: engram\ntitle: Bad Engram\npermalink: bad\n---\n\nOne line only.\n",
     );
 
     let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
@@ -84,12 +84,66 @@ fn required_field_and_encoding_and_temporal_and_quality_rules_fire() {
 }
 
 #[test]
+fn domain_prefixed_permalink_is_e008_warning() {
+    let dir = tempdir().unwrap();
+    // The domain root's folder name IS the domain name the scanner derives.
+    let root = dir.path().join("astronomy");
+    write(
+        &root,
+        "MANIFEST.md",
+        "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n## Scope\n\n- Facts about the solar system\n\n## When to Use\n\n- When asked about moons or planets\n",
+    );
+    // The permalink repeats the domain name without a folder to justify it.
+    write(
+        &root,
+        "phobos.md",
+        "---\ntype: engram\ntitle: Phobos\npermalink: astronomy/phobos\ntags:\n- moons\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Phobos\n\nThe larger and closer of the two small moons that orbit Mars. It completes\nan orbit in under eight hours.\n",
+    );
+
+    let report = verify::verify_paths([&root], &VerifyOptions::default()).unwrap();
+    let e008 = report
+        .issues
+        .iter()
+        .find(|i| i.rule == "E008")
+        .expect("E008 present");
+    assert_eq!(e008.severity, Severity::Warning);
+    assert!(e008.message.contains("domain-relative"), "{}", e008.message);
+    // A warning alone never fails the run.
+    assert_eq!(report.exit_code(), 0);
+}
+
+#[test]
+fn a_real_subfolder_sharing_the_domain_name_is_not_e008() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("astronomy");
+    write(
+        &root,
+        "MANIFEST.md",
+        "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n## Scope\n\n- Facts about the solar system\n\n## When to Use\n\n- When asked about moons or planets\n",
+    );
+    // The file genuinely lives in a subfolder named like the domain, so the
+    // permalink is the path made explicit - correct by path, not a prefix.
+    write(
+        &root,
+        "astronomy/deimos.md",
+        "---\ntype: engram\ntitle: Deimos\npermalink: astronomy/deimos\ntags:\n- moons\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Deimos\n\nThe smaller and farther of the two moons of Mars. It completes an orbit\nin about thirty hours.\n",
+    );
+
+    let report = verify::verify_paths([&root], &VerifyOptions::default()).unwrap();
+    assert!(
+        !report.issues.iter().any(|i| i.rule == "E008"),
+        "a path-explained prefix must not warn: {:#?}",
+        report.issues
+    );
+}
+
+#[test]
 fn strict_promotes_warning_rules_to_error() {
     let dir = tempdir().unwrap();
     write(
         dir.path(),
         "MANIFEST.md",
-        "---\ntype: manifest\ntitle: MANIFEST\npermalink: gardening/manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n## Scope\n\n- Gardening facts\n",
+        "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n## Scope\n\n- Gardening facts\n",
     );
 
     let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();

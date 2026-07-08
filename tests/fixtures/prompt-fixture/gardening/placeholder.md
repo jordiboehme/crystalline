@@ -1,7 +1,7 @@
 ---
 type: engram
 title: Gardening Placeholder
-permalink: gardening/placeholder
+permalink: placeholder
 tags:
 - placeholder
 status: current

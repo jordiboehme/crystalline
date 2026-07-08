@@ -837,10 +837,16 @@ impl Engine {
         }
     }
 
-    /// Resolve an identifier (permalink, domain/permalink, title or
-    /// `crystalline://` URL) to a descriptor and the content source to read it
-    /// through. Resolution goes through the store, so a virtual domain (or any
-    /// database-only domain) resolves without a filesystem root.
+    /// Resolve an identifier to a descriptor and the content source to read
+    /// it through. The grammar is deliberately two-form: a bare permalink or
+    /// title is domain-relative (within the passed `domain`, or across all
+    /// domains when none is passed) and a `crystalline://` URL is the one
+    /// absolute, cross-domain form - mirroring the `[[target]]` /
+    /// `[[domain:target]]` wikilink pair. A scheme-less `domain/permalink`
+    /// composite is not part of the grammar, since domain names are per-user
+    /// configuration and must never ride inside an identifier. Resolution
+    /// goes through the store, so a virtual domain (or any database-only
+    /// domain) resolves without a filesystem root.
     async fn resolve(
         &self,
         identifier: &str,
@@ -865,23 +871,25 @@ impl Engine {
         if let Some(dom) = domain {
             let store = self.store.lock().await;
             let d = store.find_engram(dom, identifier).await?.ok_or_else(|| {
-                EngineError::NotFound(format!("no engram '{identifier}' in domain '{dom}'"))
+                // The one wrong shape agents keep producing is the domain
+                // glued onto the permalink; the error teaches the fix so a
+                // stumble recovers in one step.
+                match identifier
+                    .strip_prefix(dom)
+                    .and_then(|r| r.strip_prefix('/'))
+                    .filter(|r| !r.is_empty())
+                {
+                    Some(rest) => EngineError::NotFound(format!(
+                        "no engram '{identifier}' in domain '{dom}'. An identifier without crystalline:// is domain-relative - retry with '{rest}'"
+                    )),
+                    None => EngineError::NotFound(format!(
+                        "no engram '{identifier}' in domain '{dom}'"
+                    )),
+                }
             })?;
             drop(store);
             let source = self.read_source(dom);
             return Ok((d, source));
-        }
-
-        // `domain/permalink` form: the leading segment is a known domain.
-        if let Some((maybe_dom, rest)) = identifier.split_once('/')
-            && self.domain_entry(maybe_dom).is_ok()
-        {
-            let store = self.store.lock().await;
-            if let Some(d) = store.find_engram(maybe_dom, rest).await? {
-                drop(store);
-                let source = self.read_source(maybe_dom);
-                return Ok((d, source));
-            }
         }
 
         // Bare identifier across all domains.

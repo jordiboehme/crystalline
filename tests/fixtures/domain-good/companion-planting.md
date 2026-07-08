@@ -1,7 +1,7 @@
 ---
 type: guide
 title: Companion Planting and Pollinators
-permalink: domain-good/companion-planting-pollinators
+permalink: companion-planting-pollinators
 tags: pollinators, companion-planting, gardening
 status: current
 recorded_at: 2026-01-06

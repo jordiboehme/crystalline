@@ -1,7 +1,7 @@
 ---
 type: engram
 title: MANIFEST
-permalink: domain-bad/manifest
+permalink: manifest
 tags:
 - manifest
 status: current

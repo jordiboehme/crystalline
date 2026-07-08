@@ -1,7 +1,7 @@
 ---
 type: manifest
 title: MANIFEST
-permalink: domain-good/manifest
+permalink: manifest
 tags:
 - manifest
 - entry-point

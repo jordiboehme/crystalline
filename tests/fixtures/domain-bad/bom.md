@@ -1,7 +1,7 @@
 ﻿---
 type: engram
 title: Bom Prefixed
-permalink: domain-bad/bom-prefixed
+permalink: bom-prefixed
 tags:
 - encoding
 status: current

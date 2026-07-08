@@ -464,7 +464,7 @@ mod tests {
     fn manifest_source(when_to_use: &[&str]) -> String {
         let bullets: String = when_to_use.iter().map(|b| format!("- {b}\n")).collect();
         format!(
-            "---\ntype: manifest\ntitle: MANIFEST\npermalink: test/manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\ntimestamp: 2026-01-01T00:00:00+00:00\n---\n\n# Test Domain\n\n## Scope\n\n- test scope\n\n## When to Use\n\n{bullets}"
+            "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\ntimestamp: 2026-01-01T00:00:00+00:00\n---\n\n# Test Domain\n\n## Scope\n\n- test scope\n\n## When to Use\n\n{bullets}"
         )
     }
 

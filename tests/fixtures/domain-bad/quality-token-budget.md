@@ -1,7 +1,7 @@
 ---
 type: engram
 title: Quality Token Budget
-permalink: domain-bad/quality-token-budget
+permalink: quality-token-budget
 tags:
 - quality
 status: current

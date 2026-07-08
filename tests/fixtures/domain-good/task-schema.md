@@ -1,7 +1,7 @@
 ---
 type: schema
 title: Task Schema
-permalink: domain-good/schemas/task-schema
+permalink: schemas/task-schema
 tags:
 - schema
 status: current

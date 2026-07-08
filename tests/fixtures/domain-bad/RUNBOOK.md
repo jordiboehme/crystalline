@@ -1,7 +1,7 @@
 ---
 type: runbook
 title: Runbook
-permalink: domain-bad/runbook
+permalink: runbook
 tags:
 - runbook
 status: current

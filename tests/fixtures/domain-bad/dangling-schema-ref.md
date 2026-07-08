@@ -1,7 +1,7 @@
 ---
 type: engram
 title: Dangling Schema Reference
-permalink: domain-bad/dangling-schema-ref
+permalink: dangling-schema-ref
 tags:
 - schema
 status: current

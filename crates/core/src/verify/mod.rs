@@ -225,7 +225,7 @@ fn run_rules(domains: &[scanner::Domain], options: &VerifyOptions) -> VerifyRepo
         schema_rules::check(domain, &mut sink);
         links::check(domain, &domain_names, &lookup, &mut sink);
         for file in &domain.files {
-            format::check(file, &mut sink);
+            format::check(file, &domain.name, &mut sink);
             temporal::check(file, &mut sink);
             quality::check(file, domain, &mut sink);
         }

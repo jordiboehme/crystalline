@@ -1,7 +1,7 @@
 ---
 type: engram
 title: Temporal Status Unrecommended
-permalink: domain-bad/temporal-status-unrecommended
+permalink: temporal-status-unrecommended
 tags:
 - temporal
 status: on-hold

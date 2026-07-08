@@ -1,7 +1,7 @@
 ---
 type: task
 title: Schema Violation Task
-permalink: domain-bad/schema-violation-task
+permalink: schema-violation-task
 tags:
 - schema
 status: current

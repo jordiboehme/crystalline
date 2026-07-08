@@ -1,7 +1,7 @@
 ---
 type: engram
 title: Quality Near Miss
-permalink: domain-bad/quality-near-miss
+permalink: quality-near-miss
 tags:
 - quality
 status: current

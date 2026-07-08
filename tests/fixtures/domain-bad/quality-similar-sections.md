@@ -1,7 +1,7 @@
 ---
 type: engram
 title: Quality Similar Sections
-permalink: domain-bad/quality-similar-sections
+permalink: quality-similar-sections
 tags:
 - quality
 status: current

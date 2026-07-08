@@ -1,7 +1,7 @@
 ---
 type: engram
 title: Cross Domain Issues
-permalink: domain-bad/cross-domain-issues
+permalink: cross-domain-issues
 tags:
 - links
 status: current

@@ -1,7 +1,7 @@
 ---
 type: schema
 title: Malformed Declaration Schema
-permalink: domain-bad/schemas/malformed-declaration-schema
+permalink: schemas/malformed-declaration-schema
 tags:
 - schema
 status: current

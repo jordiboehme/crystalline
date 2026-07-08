@@ -1,7 +1,7 @@
 ---
 type: task
 title: Schema Violation Task Two
-permalink: domain-bad/schema-violation-task-two
+permalink: schema-violation-task-two
 tags:
 - schema
 status: proposed

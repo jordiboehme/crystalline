@@ -1,7 +1,7 @@
 ---
 type: engram
 title: Link Broken And Self
-permalink: domain-bad/link-broken-and-self
+permalink: link-broken-and-self
 tags:
 - links
 status: current

@@ -1,7 +1,7 @@
 ---
 type: engram
 title: Duplicate Permalink A
-permalink: domain-bad/shared-permalink
+permalink: shared-permalink
 tags:
 - links
 status: current

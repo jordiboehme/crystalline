@@ -1,7 +1,7 @@
 ---
 type: engram
 title: Quality Empty
-permalink: domain-bad/quality-empty
+permalink: quality-empty
 tags:
 - quality
 status: current

@@ -395,6 +395,77 @@ async fn edit_operations_and_subsection_regression() {
     assert!(read["content"].as_str().unwrap().contains("appended line"));
 }
 
+/// The identifier grammar is strict: an identifier without the
+/// crystalline:// scheme is domain-relative, always, so a domain-prefixed
+/// composite never resolves - and when a domain is passed alongside, the
+/// error teaches the bare form back so an agent recovers in one step.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_domain_prefixed_identifier_never_resolves_and_the_error_teaches_the_fix() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Guide", "content": "the guide body text" }),
+    )
+    .await
+    .unwrap();
+
+    // edit_engram with the composite identifier plus domain: the exact
+    // failing call agents keep producing; the hint names the bare form.
+    let err = call(
+        peer,
+        "edit_engram",
+        json!({
+            "identifier": "eng/guide", "domain": "eng",
+            "operation": "append", "content": "x",
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("retry with 'guide'"), "{err}");
+
+    // read_engram with both earns the same hint.
+    let err = call(
+        peer,
+        "read_engram",
+        json!({ "identifier": "eng/guide", "domain": "eng" }),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("retry with 'guide'"), "{err}");
+
+    // A plain miss keeps the plain message, no hint.
+    let err = call(
+        peer,
+        "read_engram",
+        json!({ "identifier": "nope", "domain": "eng" }),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("no engram"), "{err}");
+    assert!(!err.contains("retry with"), "{err}");
+
+    // Without a domain the composite still never resolves: scheme-less is
+    // domain-relative, never a domain prefix.
+    let err = call(peer, "read_engram", json!({ "identifier": "eng/guide" }))
+        .await
+        .unwrap_err();
+    assert!(err.contains("no engram matches"), "{err}");
+
+    // The one absolute, cross-domain form is the crystalline:// URL.
+    let read = call(
+        peer,
+        "read_engram",
+        json!({ "identifier": "crystalline://eng/guide" }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(read["title"], json!("Guide"));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn search_filter_only_and_text_fallback() {
     let h = Harness::new(&["eng"]).await;

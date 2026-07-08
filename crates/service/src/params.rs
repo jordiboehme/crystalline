@@ -49,7 +49,8 @@ pub struct WriteParams {
 /// Parameters for `read_engram`.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ReadParams {
-    /// A permalink, `domain/permalink`, title or `crystalline://` URL.
+    /// A bare permalink, title or `crystalline://` URL. Without the scheme
+    /// the identifier is domain-relative: never prefix it with a domain name.
     pub identifier: String,
     /// Restrict resolution to this domain.
     #[serde(default)]
@@ -59,7 +60,8 @@ pub struct ReadParams {
 /// Parameters for `edit_engram`.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct EditParams {
-    /// A permalink, `domain/permalink`, title or `crystalline://` URL.
+    /// A bare permalink, title or `crystalline://` URL. Without the scheme
+    /// the identifier is domain-relative: never prefix it with a domain name.
     pub identifier: String,
     /// The engram's domain.
     pub domain: String,
@@ -93,7 +95,8 @@ pub struct EditParams {
 /// Parameters for `move_engram`.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct MoveParams {
-    /// A permalink, `domain/permalink`, title or `crystalline://` URL.
+    /// A bare permalink, title or `crystalline://` URL. Without the scheme
+    /// the identifier is domain-relative: never prefix it with a domain name.
     pub identifier: String,
     /// The engram's current domain.
     pub domain: String,
@@ -111,7 +114,8 @@ pub struct MoveParams {
 /// Parameters for `delete_engram`.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct DeleteParams {
-    /// A permalink, `domain/permalink`, title or `crystalline://` URL.
+    /// A bare permalink, title or `crystalline://` URL. Without the scheme
+    /// the identifier is domain-relative: never prefix it with a domain name.
     pub identifier: String,
     /// The engram's domain.
     pub domain: String,

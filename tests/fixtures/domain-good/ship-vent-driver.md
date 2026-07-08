@@ -1,7 +1,7 @@
 ---
 type: engram
 title: Ship the Vent Driver
-permalink: domain-good/ship-the-vent-driver
+permalink: ship-the-vent-driver
 tags:
 - product
 - task

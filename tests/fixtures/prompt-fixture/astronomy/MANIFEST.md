@@ -1,7 +1,7 @@
 ---
 type: manifest
 title: MANIFEST
-permalink: astronomy/manifest
+permalink: manifest
 tags:
 - manifest
 status: current

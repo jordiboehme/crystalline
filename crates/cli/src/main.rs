@@ -300,7 +300,9 @@ enum Command {
     },
     /// Read an engram's markdown and metadata.
     Read {
-        /// A permalink, domain/permalink, title or crystalline:// URL.
+        /// A bare permalink, title or crystalline:// URL. Without the scheme
+        /// the identifier is domain-relative: never prefix it with a domain
+        /// name.
         identifier: String,
         /// Restrict resolution to this domain.
         #[arg(long)]
@@ -311,7 +313,9 @@ enum Command {
     },
     /// Edit an engram in place.
     Edit {
-        /// A permalink, domain/permalink, title or crystalline:// URL.
+        /// A bare permalink, title or crystalline:// URL. Without the scheme
+        /// the identifier is domain-relative: never prefix it with a domain
+        /// name.
         identifier: String,
         /// The engram's domain.
         domain: String,
@@ -345,7 +349,9 @@ enum Command {
     },
     /// Move an engram to a new path or domain.
     Move {
-        /// A permalink, domain/permalink, title or crystalline:// URL.
+        /// A bare permalink, title or crystalline:// URL. Without the scheme
+        /// the identifier is domain-relative: never prefix it with a domain
+        /// name.
         identifier: String,
         /// The engram's current domain.
         domain: String,
@@ -363,7 +369,9 @@ enum Command {
     },
     /// Delete an engram.
     Delete {
-        /// A permalink, domain/permalink, title or crystalline:// URL.
+        /// A bare permalink, title or crystalline:// URL. Without the scheme
+        /// the identifier is domain-relative: never prefix it with a domain
+        /// name.
         identifier: String,
         /// The engram's domain.
         domain: String,

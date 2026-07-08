@@ -1,7 +1,7 @@
 ---
 type: engram
 title: Temporal Bad Dates
-permalink: domain-bad/temporal-bad-dates
+permalink: temporal-bad-dates
 tags:
 - temporal
 status: current

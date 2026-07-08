@@ -4,7 +4,11 @@
 //! carry the four required fields and use a lowercase slug permalink with
 //! clean UTF-8. `E007` (tag format) and the outside-the-recommended-set half
 //! of `E003` are softer: Crystalline never enforces a closed `type` or
-//! `status` vocabulary, so those two only ever inform.
+//! `status` vocabulary, so those two only ever inform. `E008` warns when a
+//! permalink starts with the domain's own name: a permalink is
+//! domain-relative (the OKF Concept ID made explicit) and the domain name is
+//! per-user configuration, so persisting it into a file misleads as soon as
+//! the domain is registered under another name.
 
 use crate::address::slugify;
 use crate::engram::RECOMMENDED_TYPES;
@@ -13,7 +17,7 @@ use crate::parse::ParseError;
 use super::scanner::ScannedFile;
 use super::{Severity, Sink};
 
-pub(crate) fn check(file: &ScannedFile, sink: &mut Sink) {
+pub(crate) fn check(file: &ScannedFile, domain_name: &str, sink: &mut Sink) {
     let engram = match &file.parsed {
         Ok(e) => e,
         Err(ParseError::Bom) => {
@@ -133,6 +137,27 @@ pub(crate) fn check(file: &ScannedFile, sink: &mut Sink) {
             Severity::Error,
             format!("permalink `{p}` is not a lowercase slug path"),
             Some(format!("use `{}`", slugify(p))),
+        );
+    }
+
+    // E008: a permalink that opens with the domain's own name persists
+    // per-user configuration into content. Exempt when the whole permalink
+    // is just the file's own path slug: then the leading segment is a real
+    // subfolder that happens to share the name, correct by path.
+    if let Some(p) = &fm.permalink
+        && let Some(rest) = p.strip_prefix(&format!("{}/", slugify(domain_name)))
+        && !rest.is_empty()
+        && *p != slugify(&file.rel_path.to_string_lossy())
+    {
+        sink.emit(
+            &file.path,
+            None,
+            "E008",
+            Severity::Warning,
+            format!(
+                "permalink `{p}` starts with the domain name; permalinks are domain-relative and the domain name is per-user configuration"
+            ),
+            Some(format!("use `{rest}`")),
         );
     }
 

@@ -1,7 +1,7 @@
 ---
 type: engram
 title: Quality Dup Heading
-permalink: domain-bad/quality-dup-heading
+permalink: quality-dup-heading
 tags:
 - quality
 status: current

@@ -1,7 +1,7 @@
 ---
 type: engram
 title: Phobos
-permalink: domain-good/phobos
+permalink: phobos
 tags:
 - moons
 - mars

@@ -150,7 +150,7 @@ impl McpServer {
 
     #[tool(
         name = "read_engram",
-        description = "Read an engram's full markdown and resolved frontmatter to learn what is already known before acting or writing. Identify it by permalink, domain/permalink, title or a crystalline:// URL; pass domain to disambiguate a bare identifier."
+        description = "Read an engram's full markdown and resolved frontmatter to learn what is already known before acting or writing. Identify it by bare permalink, title or a crystalline:// URL; pass domain to disambiguate. An identifier without crystalline:// is domain-relative: 'onboarding/setup', never 'mydomain/onboarding/setup'."
     )]
     async fn read_engram(
         &self,

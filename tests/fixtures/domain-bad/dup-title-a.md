@@ -1,7 +1,7 @@
 ---
 type: engram
 title: Shared Title
-permalink: domain-bad/dup-title-a
+permalink: dup-title-a
 tags:
 - links
 status: current

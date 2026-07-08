@@ -1,7 +1,7 @@
 ---
 type: schema
 title: Broken Schema
-permalink: domain-bad/schemas/broken-schema
+permalink: schemas/broken-schema
 tags:
 - schema
 status: current

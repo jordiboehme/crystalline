@@ -1,7 +1,7 @@
 ---
 type: engram
 title: Temporal Confidence And Sentinel
-permalink: domain-bad/temporal-confidence-and-sentinel
+permalink: temporal-confidence-and-sentinel
 tags:
 - temporal
 status: current

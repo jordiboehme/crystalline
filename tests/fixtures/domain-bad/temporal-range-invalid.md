@@ -1,7 +1,7 @@
 ---
 type: engram
 title: Temporal Range Invalid
-permalink: domain-bad/temporal-range-invalid
+permalink: temporal-range-invalid
 tags:
 - temporal
 status: current

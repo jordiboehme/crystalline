@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "count": 56,
+  "count": 57,
   "issues": [
     {
       "path": "domain-bad/CHECKLIST.md",
@@ -70,6 +70,11 @@
     {
       "path": "domain-bad/dangling-schema-ref.md",
       "rule": "S010",
+      "severity": "warning"
+    },
+    {
+      "path": "domain-bad/domain-prefixed-permalink.md",
+      "rule": "E008",
       "severity": "warning"
     },
     {

@@ -1,7 +1,7 @@
 ---
 type: reference
 title: Checklist
-permalink: domain-bad/checklist
+permalink: checklist
 tags:
 - checklist
 status: current

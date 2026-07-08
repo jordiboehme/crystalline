@@ -1,7 +1,7 @@
 ---
 type: engram
 title: Temporal Status Superseded
-permalink: domain-bad/temporal-status-superseded
+permalink: temporal-status-superseded
 tags:
 - temporal
 status: superseded
