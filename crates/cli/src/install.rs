@@ -69,6 +69,16 @@ pub(crate) const STOP_COMMAND: &str = "crystalline hook stop";
 /// other harnesses get.
 pub(crate) const SESSION_START_COMMAND_COPILOT: &str = "crystalline prompt system --format copilot";
 
+/// The `SessionStart` command a harness's managed hook runs, reused by
+/// `doctor` so its presence test asks for the same spelling `install`
+/// writes.
+pub(crate) fn session_start_command(harness: HarnessKind) -> &'static str {
+    match harness {
+        HarnessKind::ClaudeCode | HarnessKind::Codex => SESSION_START_COMMAND,
+        HarnessKind::Copilot => SESSION_START_COMMAND_COPILOT,
+    }
+}
+
 /// The `SessionStart` matcher: re-route on a fresh start, after `/clear` and
 /// after a compaction. `resume` is deliberately excluded, since a resumed
 /// transcript already carries the earlier routing block.
@@ -452,6 +462,21 @@ fn is_managed_owned_entry(entry: &Value) -> bool {
             || c == SESSION_START_COMMAND
             || c == STOP_COMMAND
     )
+}
+
+/// Whether the parsed settings root carries the harness's managed hook for
+/// `event`, dispatching on the harness's hooks style. The one presence
+/// predicate `doctor` calls, so it never learns either file shape itself.
+pub(crate) fn harness_hook_present(
+    harness: HarnessKind,
+    root: &Map<String, Value>,
+    event: &str,
+    command: &str,
+) -> bool {
+    match harness.hooks_style() {
+        HooksStyle::Merged => hook_present(root, event, command),
+        HooksStyle::Owned => owned_hook_present(root, event, command),
+    }
 }
 
 /// Whether the parsed owned file already runs `command` under `event`, by

@@ -647,18 +647,18 @@ fn render_origin(origin: &OriginConfig) -> String {
     s
 }
 
-/// Filesystem-only diagnostics for both coding harnesses `crystalline
-/// install` wires up: whether a settings/hooks file exists, whether it
-/// parses, whether it carries our two managed hooks and how many of the
-/// four managed skills are present. No shell-out to `claude` or `codex`, so
-/// this stays fast and works offline; user scope only, reusing `install`'s
-/// own presence predicate and skill list rather than duplicating either.
-/// `None` when neither harness leaves any trace at all, the same
-/// "omit the section rather than show it empty" rule [`check_environment`]
-/// and [`check_github`] follow.
+/// Filesystem-only diagnostics for each coding harness `crystalline
+/// install` wires up (`claude-code`, `codex` and `copilot`): whether a
+/// settings/hooks file exists, whether it parses, whether it carries our two
+/// managed hooks and how many of the four managed skills are present. No
+/// shell-out to any harness CLI, so this stays fast and works offline; user
+/// scope only, reusing `install`'s own presence predicate and skill list
+/// rather than duplicating either. `None` when no harness leaves any trace
+/// at all, the same "omit the section rather than show it empty" rule
+/// [`check_environment`] and [`check_github`] follow.
 ///
 /// The install receipt is loaded once here rather than inside
-/// [`check_one_harness`], since both harnesses' user-scope entries live in
+/// [`check_one_harness`], since every harness's user-scope entry lives in
 /// the same file: a missing or corrupt receipt reads as the empty one
 /// (nothing recorded), exactly like `install` itself treats it as disposable
 /// derived state.
@@ -667,10 +667,14 @@ fn check_harnesses() -> Option<Vec<HarnessDoctor>> {
         .ok()
         .and_then(|p| receipt::load(&p).ok())
         .unwrap_or_default();
-    let harnesses: Vec<HarnessDoctor> = [HarnessKind::ClaudeCode, HarnessKind::Codex]
-        .into_iter()
-        .map(|kind| check_one_harness(kind, book.find(kind.id(), "user", None)))
-        .collect();
+    let harnesses: Vec<HarnessDoctor> = [
+        HarnessKind::ClaudeCode,
+        HarnessKind::Codex,
+        HarnessKind::Copilot,
+    ]
+    .into_iter()
+    .map(|kind| check_one_harness(kind, book.find(kind.id(), "user", None)))
+    .collect();
     let any_trace = harnesses
         .iter()
         .any(|h| h.settings_present || h.skills_installed > 0);
@@ -678,8 +682,9 @@ fn check_harnesses() -> Option<Vec<HarnessDoctor>> {
 }
 
 /// One harness's diagnostics: read its settings/hooks file read-only, check
-/// both managed hooks via [`install::hook_present`] and count how many of
-/// [`install::MANAGED_SKILLS`] are present (and, of those, how many were
+/// both managed hooks via [`install::harness_hook_present`] (which knows
+/// each harness's file shape and session start command) and count how many
+/// of [`install::MANAGED_SKILLS`] are present (and, of those, how many were
 /// locally modified against either the embedded copy or `entry`'s recorded
 /// hash) at its skills folder. `entry` is this harness's user-scope install
 /// receipt record, `None` when it was never installed or predates receipts.
@@ -693,8 +698,13 @@ fn check_one_harness(
     let (session_start_hook, stop_hook, settings_parse_error) =
         match install::read_settings(&paths.settings) {
             Ok(root) => (
-                install::hook_present(&root, "SessionStart", install::SESSION_START_COMMAND),
-                install::hook_present(&root, "Stop", install::STOP_COMMAND),
+                install::harness_hook_present(
+                    harness,
+                    &root,
+                    "SessionStart",
+                    install::session_start_command(harness),
+                ),
+                install::harness_hook_present(harness, &root, "Stop", install::STOP_COMMAND),
                 None,
             ),
             Err(e) => (false, false, Some(e.to_string())),

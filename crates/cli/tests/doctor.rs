@@ -377,7 +377,10 @@ fn apply_home(cmd: &mut Command, home: &Path) {
     cmd.env("HOME", home)
         .env("XDG_CONFIG_HOME", home.join("config"))
         .env("XDG_STATE_HOME", home.join("state"))
-        .env("XDG_CACHE_HOME", home.join("cache"));
+        .env("XDG_CACHE_HOME", home.join("cache"))
+        // A developer machine's own Copilot home must never leak into the
+        // harnesses section's path resolution.
+        .env_remove("COPILOT_HOME");
 }
 
 /// A team domain's config entry, with a real MANIFEST.md at `domain_dir` so
@@ -830,6 +833,79 @@ fn harnesses_section_counts_a_corrupt_settings_file_as_a_problem() {
     };
     let human = String::from_utf8(human).unwrap();
     assert!(human.contains("not valid JSON"), "{human}");
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// The regression trap for reading the Copilot-owned hooks file with the
+/// Claude-shaped presence predicate: Copilot entries are flat and carry the
+/// copilot session start command, so only the shape-aware dispatch reports
+/// them present.
+#[test]
+#[cfg(unix)]
+fn harnesses_section_reports_copilot_hooks_present_after_install() {
+    let (home, _state_dir) = isolated_home("harness-copilot");
+    let work = tempfile::tempdir().unwrap();
+    let (config, db) = empty_config(work.path());
+
+    let mut install_cmd = bin();
+    apply_home(&mut install_cmd, &home);
+    install_cmd
+        .args(["install", "copilot", "--skip-mcp", "--skip-skills"])
+        .assert()
+        .success();
+
+    let mut cmd = bin();
+    apply_home(&mut cmd, &home);
+    let out = cmd
+        .args(["--json", "doctor", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&out).unwrap();
+    let copilot = harness_entry(&report, "copilot");
+    assert_eq!(copilot["settings_present"], serde_json::json!(true));
+    assert_eq!(copilot["settings_parse_error"], serde_json::Value::Null);
+    assert_eq!(copilot["session_start_hook"], serde_json::json!(true));
+    assert_eq!(copilot["stop_hook"], serde_json::json!(true));
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+#[cfg(unix)]
+fn harnesses_section_counts_a_corrupt_copilot_file_as_a_problem() {
+    let (home, _state_dir) = isolated_home("harness-copilot-corrupt");
+    let work = tempfile::tempdir().unwrap();
+    let (config, db) = empty_config(work.path());
+
+    let hooks_dir = home.join(".copilot").join("hooks");
+    std::fs::create_dir_all(&hooks_dir).unwrap();
+    std::fs::write(hooks_dir.join("crystalline.json"), "{ not valid json").unwrap();
+
+    let mut cmd = bin();
+    apply_home(&mut cmd, &home);
+    let out = cmd
+        .args(["--json", "doctor", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .code(1)
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&out).unwrap();
+    let copilot = harness_entry(&report, "copilot");
+    assert!(
+        copilot["settings_parse_error"].is_string(),
+        "a corrupt owned hooks file must report a parse error: {report}"
+    );
 
     let _ = std::fs::remove_dir_all(&home);
 }
