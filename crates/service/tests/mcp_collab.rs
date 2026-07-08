@@ -945,7 +945,9 @@ async fn add_domain_local_honors_the_configured_domains_root() {
         .await
         .unwrap();
     assert_eq!(out["kind"], json!("file"));
-    let root = out["root"].as_str().unwrap();
+    // Normalise separators so the suffix check holds on Windows, where the
+    // configured root is joined to the domain name with a backslash.
+    let root = out["root"].as_str().unwrap().replace('\\', "/");
     assert!(root.ends_with("root/notes"), "{root}");
     assert!(tmp.path().join("root/notes/MANIFEST.md").exists());
 }
