@@ -3,13 +3,15 @@
 //! client used by the CLI operator commands.
 
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use interprocess::local_socket::tokio::Stream as IpcStream;
 use rmcp::model::{CallToolRequestParams, CallToolResult};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader, ReadBuf};
 
 use crate::daemon::{open_store, resolve_db};
 use crate::engine::{Engine, open_standalone};
@@ -30,6 +32,104 @@ use crate::params::*;
 /// the override it actually has.
 pub fn use_daemon(db: Option<&Path>, config_path: Option<&Path>) -> bool {
     db.is_none() && config_path.is_none()
+}
+
+/// If `line` is a JSON-RPC request for a known pre-`initialize` probe that
+/// rmcp 2.x cannot handle gracefully in its init loop, return the JSON-RPC
+/// `-32601 Method not found` response to send back so the client falls
+/// back to plain `initialize` instead of seeing our stdio close and
+/// classifying the connection as a network error.
+///
+/// The confirmed case is the TypeScript MCP SDK's dual-era negotiation
+/// probe `server/discover`, added by the `versionNegotiation.mode = "auto"`
+/// path and shipped by Claude Desktop chat mode as of July 2026. rmcp's
+/// init loop returns `ExpectedInitializeRequest` for any pre-init request
+/// that is not `ping` or `initialize` and does not send a response, so the
+/// process exits and the client sees a closed connection. The TypeScript
+/// SDK's probe classifier maps a closed connection to `network-error` and
+/// aborts the session; a `-32601` reply would be classified as `legacy`
+/// and trigger a normal `initialize` retry on the same pipe.
+///
+/// Only `server/discover` is intercepted; every other message flows to
+/// rmcp unchanged so a real client bug is still visible. Broaden the set
+/// here (or move to a "reply to any pre-init request" model) if further
+/// probe methods are observed in the wild.
+fn preinit_probe_reply(line: &str) -> Option<String> {
+    let msg: Value = serde_json::from_str(line).ok()?;
+    let method = msg.get("method")?.as_str()?;
+    if method != "server/discover" {
+        return None;
+    }
+    let id = msg.get("id")?;
+    let reply = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": -32601,
+            "message": format!("Method not found: {method}"),
+        },
+    });
+    Some(reply.to_string())
+}
+
+/// An [`AsyncRead`] wrapper that yields a buffered `prefix` slice before
+/// delegating to `inner`. Used by [`run_embedded_stdio`] to hand rmcp the
+/// `initialize` line that was already read off stdin during the pre-init
+/// probe drain, together with anything the underlying `BufReader` had
+/// buffered past it.
+struct Prefixed<R> {
+    prefix: Vec<u8>,
+    inner: R,
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for Prefixed<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if !self.prefix.is_empty() {
+            let n = std::cmp::min(self.prefix.len(), buf.remaining());
+            buf.put_slice(&self.prefix[..n]);
+            self.prefix.drain(..n);
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+/// Read lines off `reader` until an `initialize` request arrives, replying
+/// to any [`preinit_probe_reply`]-eligible line on `stdout` in the
+/// meantime. Returns the raw `initialize` line so the caller can prepend
+/// it to a wrapped reader before handing to `rmcp::serve_server`, or
+/// `None` on stdin EOF before any `initialize`. Non-JSON, notifications
+/// and unrecognized requests fall through untouched so rmcp still sees
+/// them and rejects them the way it always has.
+async fn drain_preinit_probes<R, W>(
+    reader: &mut BufReader<R>,
+    stdout: &mut W,
+) -> std::io::Result<Option<String>>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWriteExt + Unpin,
+{
+    let mut buf = String::new();
+    loop {
+        buf.clear();
+        let n = reader.read_line(&mut buf).await?;
+        if n == 0 {
+            return Ok(None);
+        }
+        // read_line keeps the trailing newline; strip it to canonicalize.
+        let line = buf.trim_end_matches(['\r', '\n']).to_string();
+        if let Some(reply) = preinit_probe_reply(&line) {
+            stdout.write_all(reply.as_bytes()).await?;
+            stdout.write_all(b"\n").await?;
+            stdout.flush().await?;
+            continue;
+        }
+        return Ok(Some(line));
+    }
 }
 
 /// The `crystalline mcp` stdio entry: attach to (or spawn) a daemon and relay
@@ -166,6 +266,12 @@ where
                     return Ok((SessionEnd::StdinClosed, served_any));
                 }
                 Some(line) => {
+                    if let Some(reply) = preinit_probe_reply(&line) {
+                        stdout.write_all(reply.as_bytes()).await?;
+                        stdout.write_all(b"\n").await?;
+                        stdout.flush().await?;
+                        continue;
+                    }
                     relay.note_client_line(&line);
                     let sent = session.sock_write.write_all(line.as_bytes()).await.is_ok()
                         && session.sock_write.write_all(b"\n").await.is_ok()
@@ -350,7 +456,28 @@ async fn run_embedded_stdio(
     engine.refresh_routing_cache().await;
 
     let server = McpServer::new(engine);
-    let running = rmcp::serve_server(server, (tokio::io::stdin(), tokio::io::stdout())).await?;
+    // Drain any pre-`initialize` probe (Claude Desktop chat mode's
+    // `server/discover`) before handing stdin to rmcp: see
+    // [`preinit_probe_reply`] for why. We keep the same `BufReader` across
+    // the drain and rmcp handoff so bytes buffered past the probe are not
+    // lost.
+    let mut stdout = tokio::io::stdout();
+    let mut reader = BufReader::new(tokio::io::stdin());
+    let Some(init_line) = drain_preinit_probes(&mut reader, &mut stdout).await? else {
+        drop(ownership);
+        return Ok(());
+    };
+    let buffered = reader.buffer().to_vec();
+    let stdin = reader.into_inner();
+    let mut prefix = Vec::with_capacity(init_line.len() + 1 + buffered.len());
+    prefix.extend_from_slice(init_line.as_bytes());
+    prefix.push(b'\n');
+    prefix.extend_from_slice(&buffered);
+    let primed = Prefixed {
+        prefix,
+        inner: stdin,
+    };
+    let running = rmcp::serve_server(server, (primed, stdout)).await?;
     let _ = running.waiting().await;
     drop(ownership);
     Ok(())
@@ -1016,5 +1143,126 @@ mod tests {
         let mut buf = Vec::new();
         daemon_side.read_to_end(&mut buf).await.unwrap();
         assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn preinit_probe_reply_answers_server_discover_only() {
+        // The TypeScript SDK dual-era probe with a numeric id.
+        let reply = preinit_probe_reply(r#"{"jsonrpc":"2.0","id":0,"method":"server/discover"}"#)
+            .expect("server/discover is intercepted");
+        let v: Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(v["id"], serde_json::json!(0));
+        assert_eq!(v["error"]["code"], serde_json::json!(-32601));
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("server/discover")
+        );
+
+        // A string id must round-trip verbatim.
+        let reply = preinit_probe_reply(
+            r#"{"jsonrpc":"2.0","id":"abc","method":"server/discover","params":{}}"#,
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(v["id"], serde_json::json!("abc"));
+
+        // initialize, notifications, tool calls, and garbage all fall through.
+        assert!(preinit_probe_reply(r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#).is_none());
+        assert!(
+            preinit_probe_reply(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
+                .is_none()
+        );
+        assert!(preinit_probe_reply(r#"{"jsonrpc":"2.0","id":2,"method":"tools/call"}"#).is_none());
+        assert!(preinit_probe_reply("not json at all").is_none());
+    }
+
+    #[tokio::test]
+    async fn drain_preinit_probes_answers_probes_and_returns_initialize() {
+        let input: &[u8] = b"{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"server/discover\"}\n\
+            {\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n\
+            extra-buffered-past-initialize\n";
+        let mut reader = BufReader::new(input);
+        let mut stdout = Vec::new();
+        let init = drain_preinit_probes(&mut reader, &mut stdout)
+            .await
+            .unwrap()
+            .expect("initialize is returned");
+        assert!(init.contains("\"initialize\""), "{init}");
+
+        // The probe got a -32601 answer on stdout.
+        let out = String::from_utf8(stdout).unwrap();
+        let reply_line = out.lines().next().unwrap();
+        let v: Value = serde_json::from_str(reply_line).unwrap();
+        assert_eq!(v["id"], serde_json::json!(0));
+        assert_eq!(v["error"]["code"], serde_json::json!(-32601));
+
+        // The bytes buffered past `initialize` are still readable off the reader.
+        let mut rest = String::new();
+        reader.read_to_string(&mut rest).await.unwrap();
+        assert!(rest.contains("extra-buffered-past-initialize"), "{rest}");
+    }
+
+    #[tokio::test]
+    async fn drain_preinit_probes_returns_none_on_eof_before_initialize() {
+        let input: &[u8] = b"{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"server/discover\"}\n";
+        let mut reader = BufReader::new(input);
+        let mut stdout = Vec::new();
+        let got = drain_preinit_probes(&mut reader, &mut stdout)
+            .await
+            .unwrap();
+        assert!(got.is_none());
+        // But the probe still got answered before EOF.
+        let out = String::from_utf8(stdout).unwrap();
+        assert!(out.contains("\"code\":-32601"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn prefixed_reader_yields_prefix_then_inner() {
+        let inner: &[u8] = b"world";
+        let mut reader = Prefixed {
+            prefix: b"hello ".to_vec(),
+            inner,
+        };
+        let mut out = String::new();
+        reader.read_to_string(&mut out).await.unwrap();
+        assert_eq!(out, "hello world");
+    }
+
+    #[tokio::test]
+    async fn relay_loop_intercepts_server_discover_without_forwarding_to_daemon() {
+        let (bridge_side, mut daemon_side) = tokio::io::duplex(4096);
+        let (mut stdin_feed, stdin_read) = tokio::io::duplex(4096);
+        stdin_feed
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"server/discover\"}\n")
+            .await
+            .unwrap();
+        drop(stdin_feed);
+
+        let mut relay = RelayState::default();
+        let mut stdin = BufReader::new(stdin_read).lines();
+        let mut stdout = Vec::new();
+        let mut session = Session::new(bridge_side);
+
+        let (end, _) = relay_loop(&mut relay, &mut stdin, &mut stdout, &mut session)
+            .await
+            .unwrap();
+        assert_eq!(end, SessionEnd::StdinClosed);
+
+        // The client saw the -32601 reply.
+        let out = String::from_utf8(stdout).unwrap();
+        assert!(out.contains("\"code\":-32601"), "{out}");
+        assert!(out.contains("server/discover"), "{out}");
+
+        // The daemon never saw the probe.
+        drop(session);
+        let mut buf = Vec::new();
+        daemon_side.read_to_end(&mut buf).await.unwrap();
+        assert!(buf.is_empty(), "the probe leaked to the daemon: {buf:?}");
+        assert!(
+            relay.init_request.is_none() && !relay.outstanding.contains_key("0"),
+            "the probe polluted relay state"
+        );
     }
 }
