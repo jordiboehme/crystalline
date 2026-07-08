@@ -1066,7 +1066,7 @@ impl Engine {
             .clone()
             .unwrap_or_else(|| "engram".to_string());
         let status = p.status.clone().unwrap_or_else(|| "current".to_string());
-        let tags = p.tags.clone().unwrap_or_default();
+        let tags = p.tags.clone();
 
         let folder = p.folder.clone().unwrap_or_default();
         let title_slug = slugify(&p.title);
@@ -1544,10 +1544,10 @@ impl Engine {
         let text = p.query.clone().filter(|s| !s.trim().is_empty());
         let mut query = SearchQuery {
             text: text.clone(),
-            domains: p.domains.clone().filter(|d| !d.is_empty()),
+            domains: Some(p.domains.clone()).filter(|d| !d.is_empty()),
             engram_type: p.engram_type.clone(),
             status: p.status.clone(),
-            tags: p.tags.clone().filter(|t| !t.is_empty()),
+            tags: Some(p.tags.clone()).filter(|t| !t.is_empty()),
             after: p.after.clone(),
             min_similarity: p.min_similarity,
             limit: p.limit.unwrap_or(10).max(1),
@@ -1616,7 +1616,7 @@ impl Engine {
         })?;
         let depth = p.depth.unwrap_or(1).clamp(1, 3);
         let max_related = p.max_related.unwrap_or(10);
-        let domain_filter = p.domains.clone().filter(|d| !d.is_empty());
+        let domain_filter = Some(p.domains.clone()).filter(|d| !d.is_empty());
 
         let store = self.store.lock().await;
         let seeds: Vec<EngramDescriptor> = if url.glob {
@@ -1706,9 +1706,9 @@ impl Engine {
     pub async fn recent_activity(&self, p: &RecentParams) -> Result<Value> {
         let timeframe = p.timeframe.clone().unwrap_or_else(|| "7d".to_string());
         let filter = RecentFilter {
-            domains: p.domains.clone().filter(|d| !d.is_empty()),
+            domains: Some(p.domains.clone()).filter(|d| !d.is_empty()),
             after: timeframe_cutoff(&timeframe),
-            engram_types: p.types.clone().filter(|t| !t.is_empty()),
+            engram_types: Some(p.types.clone()).filter(|t| !t.is_empty()),
             limit: 50,
         };
         let store = self.store.lock().await;

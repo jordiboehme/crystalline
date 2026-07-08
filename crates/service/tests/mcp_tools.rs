@@ -143,6 +143,37 @@ async fn list_tools_exposes_the_core_tools_plus_configure_and_add_domain() {
     assert_eq!(names.len(), 14, "exactly 14 tools: {names:?}");
 }
 
+/// The `configure` tool's `set` and `unset` inputs must advertise the plain
+/// `object`/`array` JSON Schema `type` rather than a `["object", "null"]` or
+/// `["array", "null"]` union: some MCP clients (Claude Desktop) do not
+/// recognize the union form and stringify object/array values on the wire,
+/// which then fails to deserialize with `expected a map`/`expected a sequence`.
+/// Regression guard for that class of client-side stringification.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configure_tool_schema_advertises_plain_object_and_array_types() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let tools = client.peer().list_tools(Default::default()).await.unwrap();
+    let configure = tools
+        .tools
+        .iter()
+        .find(|t| t.name == "configure")
+        .expect("configure tool present");
+    let schema = serde_json::to_value(&configure.input_schema).unwrap();
+    let set_type = &schema["properties"]["set"]["type"];
+    assert_eq!(
+        set_type,
+        &json!("object"),
+        "configure.set must advertise a plain object type, got {set_type}"
+    );
+    let unset_type = &schema["properties"]["unset"]["type"];
+    assert_eq!(
+        unset_type,
+        &json!("array"),
+        "configure.unset must advertise a plain array type, got {unset_type}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn read_only_hides_the_write_gated_tools() {
     let h = Harness::new_read_only(&["eng"]).await;

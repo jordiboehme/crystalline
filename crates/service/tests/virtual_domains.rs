@@ -88,7 +88,7 @@ fn write_params(title: &str, content: &str) -> WriteParams {
         content: content.to_string(),
         folder: None,
         engram_type: None,
-        tags: None,
+        tags: Vec::new(),
         status: None,
         metadata: None,
         overwrite: false,
@@ -155,7 +155,7 @@ async fn virtual_crud(store: Arc<Mutex<dyn Store>>) {
     let hits = engine
         .search_engrams(&SearchParams {
             query: Some("appended".to_string()),
-            domains: Some(vec!["notes".to_string()]),
+            domains: vec!["notes".to_string()],
             ..SearchParams::default()
         })
         .await

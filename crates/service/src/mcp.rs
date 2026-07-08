@@ -502,31 +502,27 @@ impl McpServer {
     /// never has to guess the resulting state.
     async fn apply_settings(&self, p: &ConfigureParams) -> Result<(), ErrorData> {
         let mut applied: Vec<String> = Vec::new();
-        if let Some(set) = &p.set {
-            for (key, value) in set {
-                match self
-                    .engine
-                    .configure(&ConfigureAction::Set {
-                        key: key.clone(),
-                        value: value.clone(),
-                    })
-                    .await
-                {
-                    Ok(_) => applied.push(key.clone()),
-                    Err(e) => return Err(applied_failure(&applied, key, e)),
-                }
+        for (key, value) in &p.set {
+            match self
+                .engine
+                .configure(&ConfigureAction::Set {
+                    key: key.clone(),
+                    value: value.clone(),
+                })
+                .await
+            {
+                Ok(_) => applied.push(key.clone()),
+                Err(e) => return Err(applied_failure(&applied, key, e)),
             }
         }
-        if let Some(unset) = &p.unset {
-            for key in unset {
-                match self
-                    .engine
-                    .configure(&ConfigureAction::Unset { key: key.clone() })
-                    .await
-                {
-                    Ok(_) => applied.push(key.clone()),
-                    Err(e) => return Err(applied_failure(&applied, key, e)),
-                }
+        for key in &p.unset {
+            match self
+                .engine
+                .configure(&ConfigureAction::Unset { key: key.clone() })
+                .await
+            {
+                Ok(_) => applied.push(key.clone()),
+                Err(e) => return Err(applied_failure(&applied, key, e)),
             }
         }
         Ok(())

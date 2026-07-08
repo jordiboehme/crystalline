@@ -91,7 +91,7 @@ fn write_params(domain: &str, title: &str, content: &str) -> WriteParams {
         content: content.to_string(),
         folder: None,
         engram_type: None,
-        tags: None,
+        tags: Vec::new(),
         status: None,
         metadata: None,
         overwrite: false,
