@@ -250,13 +250,6 @@ enum Command {
         /// already-running daemon uses that daemon's mode instead.
         #[arg(long)]
         read_only: bool,
-        /// Ensure each folder is registered as a domain (creating it and a
-        /// MANIFEST.md when needed) before serving. Repeatable, and a single
-        /// occurrence may itself list more than one path, matching how Claude
-        /// Desktop expands an MCPB bundle's picked-folders array into
-        /// `--domain a b`. A restart with the same folders is a cheap no-op.
-        #[arg(long, num_args = 1.., action = clap::ArgAction::Append)]
-        domain: Vec<PathBuf>,
         /// Load the global config from this file instead of the default path.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -910,9 +903,8 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Mcp {
             embedded,
             read_only,
-            domain,
             config,
-        }) => on_runtime(move || mcp_dispatch(domain, embedded, read_only, config, cli.db)),
+        }) => on_runtime(move || mcp_dispatch(embedded, read_only, config, cli.db)),
         Some(Command::Ctl { command }) => on_runtime(move || run_ctl(command, cli.json)),
         Some(
             cmd @ (Command::Write { .. }
@@ -1775,59 +1767,16 @@ async fn domain_export_dispatch(
     Ok(())
 }
 
-/// `mcp`: ensure every `--domain` folder is registered (the Claude Desktop
-/// MCPB bundle entry point) before deciding whether to attach to a running
-/// daemon or start one, so both paths see the registration - a freshly
-/// spawned daemon reads it from its own fresh config load, an already-running
-/// one is told to sync (and start watching) it here, mirroring
-/// `domain_add_dispatch`. A folder that fails to register (a bad path, an
-/// unwritable parent) or fails to sync with a live daemon is reported to
-/// stderr and skipped rather than aborting: the MCP server must still start
-/// even when one picked folder is broken.
+/// `mcp`: attach to a running daemon (or start one), or run the stack
+/// in-process, and serve MCP over stdio. The server starts cleanly with no
+/// domains registered; domains are created at runtime through the `add_domain`
+/// tool, so nothing is pre-seeded here.
 async fn mcp_dispatch(
-    domains: Vec<PathBuf>,
     embedded: bool,
     read_only: bool,
     config: Option<PathBuf>,
     db: Option<PathBuf>,
 ) -> anyhow::Result<()> {
-    use serde_json::json;
-    for path in &domains {
-        match cmd::ensure_domain_registered(path, config.as_deref()) {
-            Ok(Some(name)) => {
-                eprintln!(
-                    "crystalline mcp: registered domain '{name}' at {}",
-                    path.display()
-                );
-                // Nudge a running daemon to sync (and start watching) the new
-                // root only when the registration landed in the daemon's own
-                // config; an explicit --config wrote a different file the daemon
-                // does not serve, so it has nothing to sync. The --db override
-                // is deliberately not gated on here: `run_mcp` below attaches to
-                // a running daemon regardless of --db, so the notify must still
-                // fire whenever the domain reached the daemon's config, keeping
-                // this session and the daemon in step.
-                if config.is_none()
-                    && let Err(e) = crystalline_service::ctl_if_running(
-                        json!({ "v": 1, "cmd": "sync", "domain": name, "embed": false }),
-                    )
-                    .await
-                {
-                    eprintln!(
-                        "crystalline mcp: warning: could not sync newly registered domain '{name}' with the running daemon: {e}"
-                    );
-                }
-            }
-            Ok(None) => {}
-            Err(e) => {
-                eprintln!(
-                    "crystalline mcp: warning: could not register domain at {}: {e}",
-                    path.display()
-                );
-            }
-        }
-    }
-
     crystalline_service::run_mcp(embedded, db.as_deref(), config.as_deref(), read_only).await
 }
 

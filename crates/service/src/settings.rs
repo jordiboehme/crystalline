@@ -7,6 +7,8 @@
 //! tool all read [`registry`] for the key list and documentation and call
 //! [`apply`], [`unset`] and [`snapshot`] to act on one.
 
+use std::path::PathBuf;
+
 use crystalline_core::config::{
     DatabaseBackend, DatabaseConfig, GitHubConfig, GlobalConfig, HttpSetting, ServiceConfig,
 };
@@ -101,6 +103,15 @@ const DEFAULT_API_URL: &str = "https://api.github.com";
 /// itself.
 pub fn registry() -> &'static [SettingSpec] {
     &[
+        SettingSpec {
+            key: "domains_root",
+            doc: "The default root folder new file domains are created under (default ~/Documents/Crystalline)",
+            kind: SettingKind::String,
+            startup_effective: false,
+            apply: set_domains_root,
+            clear: clear_domains_root,
+            effective: domains_root_effective,
+        },
         SettingSpec {
             key: "github.enabled",
             doc: "Turn GitHub team collaboration on or off",
@@ -578,6 +589,30 @@ fn database_url_effective(config: &GlobalConfig) -> (String, bool) {
     (stored.unwrap_or_default(), is_default)
 }
 
+// --- domains_root ----------------------------------------------------------
+
+fn set_domains_root(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
+    if value.trim().is_empty() {
+        return Err(SettingsError("domains_root must not be empty".to_string()));
+    }
+    config.domains_root = Some(PathBuf::from(value.trim()));
+    Ok(())
+}
+
+fn clear_domains_root(config: &mut GlobalConfig) {
+    config.domains_root = None;
+}
+
+fn domains_root_effective(config: &GlobalConfig) -> (String, bool) {
+    // The shown value is always the resolved root (the configured path or the
+    // built-in default), so an operator sees where domains actually land; the
+    // default flag reflects whether it was explicitly set.
+    (
+        config.domains_root().display().to_string(),
+        config.domains_root.is_none(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -587,10 +622,11 @@ mod tests {
     }
 
     #[test]
-    fn registry_lists_exactly_the_eight_keys_in_order() {
+    fn registry_lists_exactly_the_nine_keys_in_order() {
         assert_eq!(
             known_keys(),
             vec![
+                "domains_root",
                 "github.enabled",
                 "github.poll_secs",
                 "github.api_url",
@@ -610,6 +646,7 @@ mod tests {
         assert_eq!(
             derived,
             vec![
+                ("domains_root", "CRYSTALLINE_DOMAINS_ROOT".to_string()),
                 ("github.enabled", "CRYSTALLINE_GITHUB_ENABLED".to_string()),
                 (
                     "github.poll_secs",
@@ -637,6 +674,7 @@ mod tests {
     #[test]
     fn change_note_is_present_only_for_startup_effective_keys() {
         let no_env = EnvOverlay::default();
+        assert!(change_note("domains_root", &no_env).is_none());
         assert!(change_note("github.enabled", &no_env).is_none());
         assert!(change_note("github.poll_secs", &no_env).is_none());
         assert!(change_note("github.api_url", &no_env).is_none());
@@ -834,10 +872,11 @@ mod tests {
         apply(&mut cfg, "github.enabled", "true").unwrap();
 
         let views = snapshot(&cfg, &EnvOverlay::default());
-        assert_eq!(views.len(), 8);
+        assert_eq!(views.len(), 9);
         assert_eq!(
             views.iter().map(|v| v.key.as_str()).collect::<Vec<_>>(),
             vec![
+                "domains_root",
                 "github.enabled",
                 "github.poll_secs",
                 "github.api_url",
@@ -849,36 +888,44 @@ mod tests {
             ]
         );
 
-        let enabled = &views[0];
+        let domains_root = &views[0];
+        assert!(
+            domains_root.value.ends_with("Documents/Crystalline"),
+            "{}",
+            domains_root.value
+        );
+        assert_eq!(domains_root.source, SettingSource::Default);
+
+        let enabled = &views[1];
         assert_eq!(enabled.value, "true");
         assert_eq!(enabled.source, SettingSource::Config);
         assert!(!enabled.doc.is_empty());
 
-        let poll_secs = &views[1];
+        let poll_secs = &views[2];
         assert_eq!(poll_secs.value, "300");
         assert_eq!(poll_secs.source, SettingSource::Default);
 
-        let api_url = &views[2];
+        let api_url = &views[3];
         assert_eq!(api_url.value, "https://api.github.com");
         assert_eq!(api_url.source, SettingSource::Default);
 
-        let oauth = &views[3];
+        let oauth = &views[4];
         assert_eq!(oauth.value, crystalline_remote::GITHUB_CLIENT_ID);
         assert_eq!(oauth.source, SettingSource::Default);
 
-        let read_only = &views[4];
+        let read_only = &views[5];
         assert_eq!(read_only.value, "false");
         assert_eq!(read_only.source, SettingSource::Default);
 
-        let http = &views[5];
+        let http = &views[6];
         assert_eq!(http.value, "false");
         assert_eq!(http.source, SettingSource::Default);
 
-        let backend = &views[6];
+        let backend = &views[7];
         assert_eq!(backend.value, "turso");
         assert_eq!(backend.source, SettingSource::Default);
 
-        let url = &views[7];
+        let url = &views[8];
         assert_eq!(url.value, "");
         assert_eq!(url.source, SettingSource::Default);
     }
@@ -1048,6 +1095,46 @@ mod tests {
             !yaml.contains("database"),
             "an emptied database block must not round-trip into the yaml: {yaml}"
         );
+    }
+
+    // --- domains_root ----------------------------------------------------------
+
+    #[test]
+    fn apply_domains_root_happy_path() {
+        let mut cfg = GlobalConfig::default();
+        apply(&mut cfg, "domains_root", "/srv/knowledge").unwrap();
+        assert_eq!(
+            cfg.domains_root.as_deref(),
+            Some(std::path::Path::new("/srv/knowledge"))
+        );
+        assert_eq!(cfg.domains_root().display().to_string(), "/srv/knowledge");
+    }
+
+    #[test]
+    fn apply_domains_root_rejects_empty() {
+        let mut cfg = GlobalConfig::default();
+        let err = apply(&mut cfg, "domains_root", "   ").unwrap_err();
+        assert!(err.to_string().contains("empty"));
+    }
+
+    #[test]
+    fn unset_domains_root_returns_to_default() {
+        let mut cfg = GlobalConfig::default();
+        apply(&mut cfg, "domains_root", "/srv/knowledge").unwrap();
+        unset(&mut cfg, "domains_root").unwrap();
+        assert!(cfg.domains_root.is_none());
+        // Back to the built-in default, not empty.
+        assert!(
+            cfg.domains_root()
+                .display()
+                .to_string()
+                .ends_with("Documents/Crystalline"),
+            "{}",
+            cfg.domains_root().display()
+        );
+
+        let yaml = serde_yaml_ng::to_string(&cfg).unwrap();
+        assert!(!yaml.contains("domains_root"), "{yaml}");
     }
 
     // --- database.url ----------------------------------------------------------

@@ -182,6 +182,34 @@ fn legacy_config_without_origin_or_github_round_trips_byte_identical() {
 }
 
 #[test]
+fn domains_root_round_trips_and_is_absent_by_default() {
+    // Absent by default: it never appears in a config that does not set it, and
+    // the resolver falls back to the built-in Documents/Crystalline default.
+    let cfg = GlobalConfig::default();
+    let yaml = serde_yaml_ng::to_string(&cfg).unwrap();
+    assert!(!yaml.contains("domains_root"), "{yaml}");
+    assert!(
+        cfg.domains_root()
+            .display()
+            .to_string()
+            .ends_with("Documents/Crystalline"),
+        "{}",
+        cfg.domains_root().display()
+    );
+
+    // Set: serializes as one line and round-trips.
+    let with_root = GlobalConfig {
+        domains_root: Some(std::path::PathBuf::from("/srv/knowledge")),
+        ..GlobalConfig::default()
+    };
+    let yaml = serde_yaml_ng::to_string(&with_root).unwrap();
+    assert!(yaml.contains("domains_root: /srv/knowledge\n"), "{yaml}");
+    let back: GlobalConfig = serde_yaml_ng::from_str(&yaml).unwrap();
+    assert_eq!(back, with_root);
+    assert_eq!(back.domains_root().display().to_string(), "/srv/knowledge");
+}
+
+#[test]
 fn origin_and_github_config_round_trip() {
     let yaml = "\
 domains:

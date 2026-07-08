@@ -51,49 +51,48 @@ use serde_json::Value;
 
 use crystalline_remote::RemoteError;
 
-/// The four content-mutating tools. In read-only mode they are hidden from
-/// `list_tools` and `get_tool`, while their routes stay registered so a client
-/// that calls one by name still reaches the engine guard and gets the read-only
-/// error rather than a bare "tool not found".
-const WRITE_TOOLS: [&str; 4] = [
+/// The tools hidden in read-only mode: the four content-mutating engram tools
+/// plus `add_domain`, which creates a domain (writing config, and files for a
+/// local domain). In read-only mode they are hidden from `list_tools` and
+/// `get_tool`, while their routes stay registered so a client that calls one by
+/// name still reaches the engine guard and gets the read-only error rather than
+/// a bare "tool not found".
+const WRITE_TOOLS: [&str; 5] = [
     "write_engram",
     "edit_engram",
     "move_engram",
     "delete_engram",
+    "add_domain",
 ];
 
-/// Whether a tool name is one of the four content-mutating tools.
+/// Whether a tool name is one of the write-gated tools (hidden in read-only
+/// mode).
 fn is_write_tool(name: &str) -> bool {
     WRITE_TOOLS.contains(&name)
 }
 
-/// The six GitHub collaboration tools, gated on the engine's live
+/// The five GitHub collaboration tools, gated on the engine's live
 /// `github.enabled` setting (all but `configure`) and `read_only` flag (see
-/// `COLLAB_WRITE_TOOLS`).
-const COLLAB_TOOLS: [&str; 6] = [
+/// `COLLAB_WRITE_TOOLS`). `add_domain` is not among them: it creates domains of
+/// every kind, so it is a write-gated tool (see `WRITE_TOOLS`), and only its
+/// team-domain branch needs `github.enabled`, enforced in the engine.
+const COLLAB_TOOLS: [&str; 5] = [
     "configure",
-    "add_domain",
     "share_changes",
     "update_domain",
     "origin_status",
     "resolve_conflict",
 ];
 
-/// Of the six collaboration tools, the four also hidden in read-only mode:
+/// Of the five collaboration tools, the three also hidden in read-only mode:
 /// `configure` (settings and this machine's GitHub identity are frozen the
-/// same way content is), `add_domain`, `share_changes` and `resolve_conflict`
-/// (each writes content, a proposal or config). `update_domain` and
-/// `origin_status` stay visible read-only, mirroring their engine-level
-/// exemption (a pull is a derived-truth update like sync; status is a pure
-/// read).
-const COLLAB_WRITE_TOOLS: [&str; 4] = [
-    "configure",
-    "add_domain",
-    "share_changes",
-    "resolve_conflict",
-];
+/// same way content is), `share_changes` and `resolve_conflict` (each writes a
+/// proposal or config). `update_domain` and `origin_status` stay visible
+/// read-only, mirroring their engine-level exemption (a pull is a derived-truth
+/// update like sync; status is a pure read).
+const COLLAB_WRITE_TOOLS: [&str; 3] = ["configure", "share_changes", "resolve_conflict"];
 
-/// Whether `name` is one of the six collaboration tools.
+/// Whether `name` is one of the five collaboration tools.
 fn is_collab_tool(name: &str) -> bool {
     COLLAB_TOOLS.contains(&name)
 }
@@ -102,7 +101,7 @@ fn is_collab_tool(name: &str) -> bool {
 /// `github.enabled` and `read_only` state. Not meaningful for a non-collab
 /// tool name; callers check [`is_write_tool`] separately for those. The net
 /// matrix: disabled and read-write shows only `configure`; disabled and
-/// read-only shows none of the six; enabled and read-write shows all six;
+/// read-only shows none of the five; enabled and read-write shows all five;
 /// enabled and read-only shows `update_domain` and `origin_status` only.
 fn hidden_collab_tool(name: &str, github_enabled: bool, read_only: bool) -> bool {
     if read_only && COLLAB_WRITE_TOOLS.contains(&name) {
@@ -360,20 +359,53 @@ impl McpServer {
 
     #[tool(
         name = "add_domain",
-        description = "Add a team domain from GitHub: registers the repository as a local domain and downloads its knowledge so the agent can learn from it and share back. repo is owner/name; path points at a subfolder when the domain lives inside a bigger repository. An existing folder or an already-registered domain without an origin connects in place: local files are never overwritten and ones that differ from the repository become local changes to share or update."
+        description = "Create or connect a domain to store engrams in - the way to give the agent somewhere to capture knowledge, so it works even on an instance with no domains yet. Three modes follow the arguments: a local domain of markdown files on disk (pass folder, or just domain to use the default root at <domains_root>/<domain>) that is created with a starter MANIFEST when new and adopted in place when it already holds engrams; a virtual database-backed domain with no files (virtual: true with a domain name); or a GitHub team domain that downloads shared knowledge to learn from and share back (repo is owner/name, needs GitHub enabled via configure). repo and virtual are mutually exclusive. Available whenever the instance is writable; only the team mode needs GitHub turned on."
     )]
     async fn add_domain(
         &self,
         Parameters(p): Parameters<AddDomainParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        if p.repo.is_some() && p.is_virtual {
+            return Err(to_error(EngineError::Invalid(
+                "add_domain: repo and virtual are mutually exclusive; a team domain is file-backed"
+                    .to_string(),
+            )));
+        }
+        if let Some(repo) = p.repo.as_deref() {
+            return self
+                .engine
+                .origin_add(
+                    repo,
+                    p.domain.as_deref(),
+                    p.path.as_deref(),
+                    p.branch.as_deref(),
+                    p.folder.as_deref(),
+                )
+                .await
+                .map_err(to_error)
+                .and_then(ok);
+        }
+        if p.is_virtual {
+            if p.folder.is_some() {
+                return Err(to_error(EngineError::Invalid(
+                    "add_domain: a virtual domain has no folder; omit folder or drop virtual"
+                        .to_string(),
+                )));
+            }
+            let Some(domain) = p.domain.as_deref() else {
+                return Err(to_error(EngineError::Invalid(
+                    "add_domain: a virtual domain requires a domain name".to_string(),
+                )));
+            };
+            return self
+                .engine
+                .domain_add_virtual(domain)
+                .await
+                .map_err(to_error)
+                .and_then(ok);
+        }
         self.engine
-            .origin_add(
-                &p.repo,
-                p.domain.as_deref(),
-                p.path.as_deref(),
-                p.branch.as_deref(),
-                p.folder.as_deref(),
-            )
+            .domain_add_local(p.domain.as_deref(), p.folder.as_deref())
             .await
             .map_err(to_error)
             .and_then(ok)
@@ -538,13 +570,14 @@ impl ServerHandler for McpServer {
         info
     }
 
-    /// List the exposed tools. In read-only mode the four content-mutating
-    /// tools are filtered out so they are absent from `tools/list`, while their
-    /// routes stay registered for the call-by-name guard (see `WRITE_TOOLS`).
-    /// The six collaboration tools are filtered the same way against the
-    /// engine's live `github.enabled` and `read_only` state (see
-    /// `hidden_collab_tool`), consulted fresh on every call rather than
-    /// cached, since `configure` can flip `github.enabled` mid-session.
+    /// List the exposed tools. In read-only mode the write-gated tools (the
+    /// four content-mutating engram tools plus `add_domain`) are filtered out so
+    /// they are absent from `tools/list`, while their routes stay registered for
+    /// the call-by-name guard (see `WRITE_TOOLS`). The five collaboration tools
+    /// are filtered the same way against the engine's live `github.enabled` and
+    /// `read_only` state (see `hidden_collab_tool`), consulted fresh on every
+    /// call rather than cached, since `configure` can flip `github.enabled`
+    /// mid-session.
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
@@ -720,20 +753,22 @@ mod tests {
     }
 
     #[test]
-    fn is_collab_tool_recognizes_exactly_the_six() {
+    fn is_collab_tool_recognizes_exactly_the_five() {
         for name in COLLAB_TOOLS {
             assert!(is_collab_tool(name), "{name}");
         }
+        // add_domain is write-gated, not collab-gated.
+        assert!(!is_collab_tool("add_domain"));
+        assert!(is_write_tool("add_domain"));
         assert!(!is_collab_tool("write_engram"));
         assert!(!is_collab_tool("search_engrams"));
     }
 
     #[test]
     fn hidden_collab_tool_matches_the_locked_gating_matrix() {
-        // disabled + read-write: only configure of the six is visible.
+        // disabled + read-write: only configure of the five is visible.
         assert!(!hidden_collab_tool("configure", false, false));
         for name in [
-            "add_domain",
             "share_changes",
             "update_domain",
             "origin_status",
@@ -742,12 +777,12 @@ mod tests {
             assert!(hidden_collab_tool(name, false, false), "{name}");
         }
 
-        // disabled + read-only: none of the six are visible.
+        // disabled + read-only: none of the five are visible.
         for name in COLLAB_TOOLS {
             assert!(hidden_collab_tool(name, false, true), "{name}");
         }
 
-        // enabled + read-write: all six are visible.
+        // enabled + read-write: all five are visible.
         for name in COLLAB_TOOLS {
             assert!(!hidden_collab_tool(name, true, false), "{name}");
         }
@@ -756,12 +791,7 @@ mod tests {
         for name in ["update_domain", "origin_status"] {
             assert!(!hidden_collab_tool(name, true, true), "{name}");
         }
-        for name in [
-            "configure",
-            "add_domain",
-            "share_changes",
-            "resolve_conflict",
-        ] {
+        for name in ["configure", "share_changes", "resolve_conflict"] {
             assert!(hidden_collab_tool(name, true, true), "{name}");
         }
     }

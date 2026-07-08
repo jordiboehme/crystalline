@@ -13,6 +13,32 @@ use crate::parse::{body_lines, locate, parse_heading};
 const SCOPE: &str = "scope";
 const WHEN_TO_USE: &str = "when to use";
 
+/// The starter MANIFEST engram for a new domain: valid frontmatter and the two
+/// required routing sections (`Scope`, `When to Use`) plus a `Notes for Agents`
+/// section, all as prompts to fill in. `today` is a pre-formatted `%Y-%m-%d`
+/// date so this stays free of a time dependency. Shared by `domain init`,
+/// `domain add --virtual` and the MCP `add_domain` tool so every scaffold looks
+/// the same.
+pub fn manifest_template(name: &str, today: &str) -> String {
+    format!(
+        "---\n\
+type: manifest\n\
+title: {name}\n\
+permalink: manifest\n\
+tags:\n  - manifest\n\
+status: current\n\
+recorded_at: {today}\n\
+---\n\n\
+# {name}\n\n\
+## Scope\n\n\
+- Describe the knowledge this domain covers\n\n\
+## When to Use\n\n\
+- Describe when an agent should route here\n\n\
+## Notes for Agents\n\n\
+- Add guidance for agents working in this domain\n"
+    )
+}
+
 /// A parsed Manifest: the H2 sections and their top-level bullets.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Manifest {

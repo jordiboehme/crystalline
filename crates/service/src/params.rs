@@ -273,27 +273,42 @@ pub struct ConfigureParams {
     pub host: Option<String>,
 }
 
-/// Parameters for `add_domain`.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
+/// Parameters for `add_domain`. The mode follows the parameters: `repo` makes
+/// it a GitHub team domain, `virtual: true` a database-backed domain, and
+/// otherwise it is a local folder domain. `repo` and `virtual` are mutually
+/// exclusive.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 pub struct AddDomainParams {
-    /// The GitHub repository, `owner/name`.
-    pub repo: String,
-    /// The domain name to register the repository under. Defaults to the
-    /// repository's own name.
+    /// The domain name. Optional for a team domain (defaults to the
+    /// repository's own name) and for a local domain given a `folder` (defaults
+    /// to the folder's name); required for a virtual domain.
     #[serde(default)]
     pub domain: Option<String>,
-    /// A subfolder within the repository that is the domain root, for a
-    /// domain living inside a bigger repository. Defaults to the repository
-    /// root.
-    #[serde(default)]
-    pub path: Option<String>,
-    /// The branch to track. Defaults to `main`.
-    #[serde(default)]
-    pub branch: Option<String>,
-    /// Where to download the domain's engrams on this machine. Defaults to
-    /// `~/Documents/Crystalline/<domain>`.
+    /// A local folder domain, engrams as markdown files on disk. Where the
+    /// domain lives on this machine; created and given a starter `MANIFEST.md`
+    /// when empty, adopted in place when it already holds engrams. Defaults to
+    /// the configured domains root at `<root>/<domain>` (root default
+    /// `~/Documents/Crystalline`). The default mode when neither `repo` nor
+    /// `virtual` is given.
     #[serde(default)]
     pub folder: Option<String>,
+    /// A database-backed virtual domain with no files on disk. Requires
+    /// `domain`; cannot be combined with `repo` or `folder`.
+    #[serde(rename = "virtual", default)]
+    pub is_virtual: bool,
+    /// A GitHub team domain: the repository, `owner/name`. Registers the
+    /// repository as a local domain and downloads its knowledge to share back.
+    /// Requires GitHub collaboration to be enabled first (configure
+    /// github.enabled). Cannot be combined with `virtual`.
+    #[serde(default)]
+    pub repo: Option<String>,
+    /// A subfolder within `repo` that is the domain root, for a team domain
+    /// living inside a bigger repository. Defaults to the repository root.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// The branch to track, for a team domain. Defaults to `main`.
+    #[serde(default)]
+    pub branch: Option<String>,
 }
 
 /// Parameters for `share_changes`.

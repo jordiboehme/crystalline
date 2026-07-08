@@ -2635,6 +2635,198 @@ impl Engine {
         })
     }
 
+    // --- domain add (local and virtual) ---------------------------------------
+
+    /// Create or adopt a local file domain and bring it into the index, the
+    /// non-GitHub half of `add_domain`. Resolves the on-disk root (an explicit
+    /// `folder`, otherwise `<domains_root>/<name>`), creates it, scaffolds a
+    /// `MANIFEST.md` when the folder does not already carry one (so a fresh
+    /// folder becomes a domain and an existing one is adopted in place, its
+    /// files untouched), registers it in the global config and syncs.
+    ///
+    /// At least one of `name`/`folder` is required. Without `name`, the name is
+    /// derived from the folder's basename (auto-suffixed on collision); with an
+    /// explicit `name`, a different-folder or virtual clash is refused. Pointing
+    /// at a folder already registered adopts it idempotently. Refuses on a
+    /// read-only instance; no `github.enabled` gate, so it works on a fresh
+    /// install. Returns `{ domain, root, kind, manifest_created, adopted, sync }`.
+    pub async fn domain_add_local(
+        &self,
+        name: Option<&str>,
+        folder: Option<&str>,
+    ) -> Result<Value> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        if name.is_none() && folder.is_none() {
+            return Err(EngineError::Invalid(
+                "provide a domain name, a folder, or both".to_string(),
+            ));
+        }
+
+        // An explicit folder wins; otherwise a named domain lands under the
+        // configured root at `<root>/<name>`.
+        let root = match folder {
+            Some(f) => crystalline_core::config::expand_tilde(f),
+            None => {
+                let domains_root = self.config.read().unwrap().domains_root();
+                origin::default_domain_folder(&domains_root, name.expect("checked above"))
+            }
+        };
+        std::fs::create_dir_all(&root).map_err(|e| {
+            EngineError::Internal(format!("creating domain directory {}: {e}", root.display()))
+        })?;
+        let canonical = std::fs::canonicalize(&root)
+            .map_err(|e| EngineError::Internal(format!("resolving {}: {e}", root.display())))?;
+
+        // Decide the domain name and whether we adopt an existing registration.
+        let (domain_name, adopted) = {
+            let cfg = self.config.read().unwrap();
+            match name {
+                Some(n) => {
+                    // An env-defined domain of this name is owned by its variable.
+                    if let Some(env) = self.overlay.env_domain(n) {
+                        return Err(EngineError::Conflict(format!(
+                            "domain '{n}' is defined by the environment variable {}; unset it to manage this domain in the config file",
+                            env.var
+                        )));
+                    }
+                    match cfg.domains.get(n) {
+                        None => (n.to_string(), false),
+                        Some(entry) if entry.is_virtual() => {
+                            return Err(EngineError::Conflict(format!(
+                                "domain '{n}' is a virtual domain; pass a different name"
+                            )));
+                        }
+                        Some(entry) => match canonicalized_file_path(entry) {
+                            Some(p) if p == canonical => (n.to_string(), true),
+                            _ => {
+                                return Err(EngineError::Conflict(format!(
+                                    "domain '{n}' is already registered at a different folder; pass a different name or omit the folder to connect it in place"
+                                )));
+                            }
+                        },
+                    }
+                }
+                // No name: adopt an existing registration of this exact folder,
+                // else derive a fresh unique name from the folder basename.
+                None => match existing_file_domain_at(&canonical, &cfg) {
+                    Some(existing) => (existing.to_string(), true),
+                    None => (unique_domain_name(&canonical, &cfg), false),
+                },
+            }
+        };
+
+        // Create-or-adopt: scaffold a MANIFEST.md only when the folder lacks one.
+        let manifest = canonical.join("MANIFEST.md");
+        let manifest_created = if manifest.exists() {
+            false
+        } else {
+            let today = Utc::now().date_naive().format("%Y-%m-%d").to_string();
+            std::fs::write(
+                &manifest,
+                crystalline_core::manifest_template(&domain_name, &today),
+            )
+            .map_err(|e| EngineError::Internal(format!("writing {}: {e}", manifest.display())))?;
+            true
+        };
+
+        // Register a genuinely new domain, mirroring `origin_add`'s write-lock-
+        // first file-then-effective pattern so a concurrent read never observes a
+        // half-applied config and no env value bakes into the saved file. An
+        // adopted registration is already in the config.
+        if !adopted {
+            let mut file_guard = self.file_config.write().unwrap();
+            let mut file = file_guard.clone();
+            file.domains
+                .insert(domain_name.clone(), DomainEntry::file(canonical.clone()));
+            self.persist_config(&file)?;
+            let effective = self.overlay.apply(&file);
+            *file_guard = file;
+            *self.config.write().unwrap() = effective;
+        }
+
+        // Tell a running daemon's watcher to watch the new root; an adopted
+        // domain is already watched. This engine's own sync runs regardless.
+        if !adopted && let Some(tx) = &self.watch_tx {
+            let _ = tx.send(WatchEvent::Add(domain_name.clone(), canonical.clone()));
+        }
+
+        let sync = self.sync(Some(&domain_name)).await?;
+        if let Err(e) = self.embed_pending().await {
+            tracing::warn!("embedding after creating '{domain_name}' failed: {e}");
+        }
+
+        Ok(json!({
+            "domain": domain_name,
+            "root": canonical.display().to_string(),
+            "kind": "file",
+            "manifest_created": manifest_created,
+            "adopted": adopted,
+            "sync": sync,
+        }))
+    }
+
+    /// Create a virtual (database-backed) domain, the DB half of `add_domain`.
+    /// Registers a `DomainEntry::virtual_domain()` in the global config, then
+    /// scaffolds a `MANIFEST.md` engram into the database (a no-op when one is
+    /// already present). Re-creating an existing virtual domain is idempotent; a
+    /// file domain of the same name is refused. No filesystem root, no watcher,
+    /// no sync. Refuses on a read-only instance; no `github.enabled` gate.
+    /// Returns `{ domain, kind, manifest_created, registered }`.
+    pub async fn domain_add_virtual(&self, name: &str) -> Result<Value> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        let is_new = {
+            let cfg = self.config.read().unwrap();
+            if let Some(env) = self.overlay.env_domain(name) {
+                return Err(EngineError::Conflict(format!(
+                    "domain '{name}' is defined by the environment variable {}; unset it to manage this domain in the config file",
+                    env.var
+                )));
+            }
+            match cfg.domains.get(name) {
+                None => true,
+                Some(entry) if entry.is_virtual() => false,
+                Some(_) => {
+                    return Err(EngineError::Conflict(format!(
+                        "domain '{name}' is a file domain; pass a different name"
+                    )));
+                }
+            }
+        };
+
+        // Register before scaffolding: `scaffold_virtual_manifest` reads the
+        // content source, which requires the domain to already be registered.
+        if is_new {
+            let mut file_guard = self.file_config.write().unwrap();
+            let mut file = file_guard.clone();
+            file.domains
+                .insert(name.to_string(), DomainEntry::virtual_domain());
+            self.persist_config(&file)?;
+            let effective = self.overlay.apply(&file);
+            *file_guard = file;
+            *self.config.write().unwrap() = effective;
+        }
+
+        let today = Utc::now().date_naive().format("%Y-%m-%d").to_string();
+        let scaffold = self
+            .scaffold_virtual_manifest(name, &crystalline_core::manifest_template(name, &today))
+            .await?;
+        let manifest_created = scaffold
+            .get("created")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
+        Ok(json!({
+            "domain": name,
+            "kind": "virtual",
+            "manifest_created": manifest_created,
+            "registered": is_new,
+        }))
+    }
+
     // --- origin (GitHub collaboration) ----------------------------------------
 
     /// Connects a new domain to a GitHub repository: downloads its tracked
@@ -2718,7 +2910,10 @@ impl Engine {
             Some(r) => r,
             None => match folder {
                 Some(f) => crystalline_core::config::expand_tilde(f),
-                None => origin::default_domain_folder(&domain_name),
+                None => {
+                    let domains_root = self.config.read().unwrap().domains_root();
+                    origin::default_domain_folder(&domains_root, &domain_name)
+                }
             },
         };
         let branch_name = branch.unwrap_or("main").to_string();
@@ -3945,6 +4140,63 @@ fn read_engram_file(root: &Path, rel: &str) -> Option<Engram> {
     let abs = join_rel(root, rel);
     let source = std::fs::read_to_string(abs).ok()?;
     parse_engram(&source).ok()
+}
+
+/// A registered file domain's root, canonicalized. Falls back to the expanded
+/// (non-canonical) path when it no longer resolves, so a domain whose folder
+/// moved away still compares by its last-known path instead of silently
+/// dropping out of the comparison. A virtual domain has no path, so `None`.
+fn canonicalized_file_path(entry: &DomainEntry) -> Option<PathBuf> {
+    let path = entry.file_path()?;
+    Some(std::fs::canonicalize(&path).unwrap_or(path))
+}
+
+/// The name of the file domain already rooted at `canonical`, if any: the
+/// idempotency hook so re-creating the same folder adopts its existing
+/// registration rather than adding a second domain over the same files.
+fn existing_file_domain_at<'a>(canonical: &Path, cfg: &'a GlobalConfig) -> Option<&'a str> {
+    cfg.domains.iter().find_map(|(name, entry)| {
+        (canonicalized_file_path(entry).as_deref() == Some(canonical)).then_some(name.as_str())
+    })
+}
+
+/// Whether `name` is registered to a path other than `canonical`. A virtual
+/// domain already using `name` counts as taken, since it has no path to
+/// compare. Drives [`unique_domain_name`]'s collision search.
+fn name_taken_by_other(name: &str, canonical: &Path, cfg: &GlobalConfig) -> bool {
+    match cfg.domains.get(name) {
+        None => false,
+        Some(entry) => canonicalized_file_path(entry).as_deref() != Some(canonical),
+    }
+}
+
+/// Derive a domain name from a folder's basename using the same slug rules as a
+/// permalink, falling back to `domain` for a basename that slugifies to nothing
+/// (a root path, or one made only of punctuation). Appends `-2`, `-3`... when
+/// the name is already registered to a different path, so a derived name never
+/// silently collides with an unrelated domain.
+fn unique_domain_name(canonical: &Path, cfg: &GlobalConfig) -> String {
+    let basename = canonical
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| canonical.display().to_string());
+    let base = slugify(&basename);
+    let base = if base.is_empty() {
+        "domain".to_string()
+    } else {
+        base
+    };
+    if !name_taken_by_other(&base, canonical, cfg) {
+        return base;
+    }
+    let mut n = 2;
+    loop {
+        let candidate = format!("{base}-{n}");
+        if !name_taken_by_other(&candidate, canonical, cfg) {
+            return candidate;
+        }
+        n += 1;
+    }
 }
 
 /// Every `.md` file under `root` as `(forward-slashed relative path, absolute

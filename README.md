@@ -90,7 +90,7 @@ Start a session. The agent is onboarded automatically (see [Session onboarding](
 
 ### Claude Desktop
 
-No terminal needed. Download the `.mcpb` file for your platform from the [latest release](https://github.com/jordiboehme/crystalline/releases/latest), then in Claude Desktop open Settings > Extensions > Advanced settings > Install Extension... and pick the file. Choose your knowledge folders in the extension settings; Crystalline prepares each folder as a domain automatically and creates `Documents/Crystalline/Personal` as the starter domain. Onboarding is automatic on every connection (see [Session onboarding](#session-onboarding)). The optional companion skill adds capture and collaboration best practices (see [Skills](#skills)); the [Claude Desktop extension scenario](docs/deployment.md#claude-desktop-extension) shows how it works underneath.
+No terminal needed. Download the `.mcpb` file for your platform from the [latest release](https://github.com/jordiboehme/crystalline/releases/latest), then in Claude Desktop open Settings > Extensions > Advanced settings > Install Extension... and pick the file. It starts with no domains: the agent creates one whenever it needs somewhere to capture knowledge, with the `add_domain` tool, as a folder of markdown files under your `Documents/Crystalline` folder, a database-backed domain or a GitHub team domain. Onboarding is automatic on every connection (see [Session onboarding](#session-onboarding)). The optional companion skill adds capture and collaboration best practices (see [Skills](#skills)); the [Claude Desktop extension scenario](docs/deployment.md#claude-desktop-extension) shows how it works underneath.
 
 ### Codex CLI
 
@@ -195,7 +195,7 @@ The other half of what `crystalline install` wires: a `Stop` hook running `cryst
 
 ## Teach and learn
 
-The MCP server exposes 13 tools, 18 once team domains are turned on (see [Share knowledge with a team](#share-knowledge-with-a-team)); capturing knowledge as a byproduct of work is the core loop:
+The MCP server exposes 14 tools, 18 once team domains are turned on (see [Share knowledge with a team](#share-knowledge-with-a-team)); capturing knowledge as a byproduct of work is the core loop:
 
 - **`write_engram`** - capture a new engram. `domain` is always required (there is no default domain for writes, so an agent never writes into the wrong place). `permalink`, `status` and `recorded_at` are filled in for you.
 - **`search_engrams`** - search before writing, and search to recall what is already known. Defaults to hybrid text-plus-semantic ranking across every domain; pass `domains` to narrow it, or filter by `type`, `tags`, `status` or arbitrary `metadata_filters` with no query text at all.
@@ -251,7 +251,7 @@ Bring a team repository in as a domain:
 crystalline domain add design --origin acme/design-knowledge --branch main
 ```
 
-`--origin` takes `owner/repo` or `owner/repo/subpath` when the domain is a subfolder of a bigger repository; the local folder defaults to `~/Documents/Crystalline/<name>` and the domain is downloaded and indexed immediately. An agent does the same with the `add_domain` MCP tool.
+`--origin` takes `owner/repo` or `owner/repo/subpath` when the domain is a subfolder of a bigger repository; the local folder defaults to `<domains_root>/<name>` (the domains root is `~/Documents/Crystalline` unless you set `domains_root` or `CRYSTALLINE_DOMAINS_ROOT`) and the domain is downloaded and indexed immediately. An agent does the same with the `add_domain` MCP tool.
 
 From there, `crystalline origin` covers the team domain lifecycle:
 
@@ -261,7 +261,7 @@ From there, `crystalline origin` covers the team domain lifecycle:
 - **`origin resolve <name> <path> --keep mine|theirs`** (or `--content-file <f>` for a hand-merged result) - settle a flagged conflict.
 - **`origin discard <name> --proposal <n>`** - abandon a declined or no-longer-wanted proposal, restoring local files that were not touched since sharing them.
 
-The same actions are MCP tools an agent calls directly: `update_domain`, `origin_status`, `share_changes`, `resolve_conflict` and `add_domain`, plus `configure` for settings and connecting. The five beyond `configure` only appear once `github.enabled` is true, so an install that never uses team domains carries no extra tool beyond `configure` itself. Sharing always ends with the agent relaying the proposal's review URL to the person it is working with, since review and merging happen on GitHub, by a person, never by the agent.
+The same actions are MCP tools an agent calls directly: `update_domain`, `origin_status`, `share_changes` and `resolve_conflict`, plus `configure` for settings and connecting. These four only appear once `github.enabled` is true, so an install that never uses team domains carries no extra tool beyond `configure` itself. `add_domain` is not among them: it creates domains of every kind (local, virtual, team) and is always available, though its team-domain branch still needs `github.enabled`. Sharing always ends with the agent relaying the proposal's review URL to the person it is working with, since review and merging happen on GitHub, by a person, never by the agent.
 
 `crystalline config show`, `set <key> <value>` and `unset <key>` read and write the same settings registry the `configure` MCP tool exposes, today the `github.*` block. Every settings key also maps to a `CRYSTALLINE_*` environment variable, so a container never needs to mount this file at all - see [Configure through environment variables](docs/deployment.md#configure-through-environment-variables) for the full list. A domain's origin and the global `github` block look like this in `config.yaml`:
 
@@ -307,7 +307,7 @@ Crystalline runs the same way in every scenario: a daemon in the middle keeps on
 | Scenario | In one line |
 |---|---|
 | [Personal workstation](docs/deployment.md#personal-workstation) | The default: local folders, agents over stdio, one shared background daemon |
-| [Claude Desktop extension](docs/deployment.md#claude-desktop-extension) | One-click `.mcpb` install with a folder picker, no terminal involved |
+| [Claude Desktop extension](docs/deployment.md#claude-desktop-extension) | One-click `.mcpb` install, no terminal involved; the agent creates domains at runtime |
 | [Team server](docs/deployment.md#team-server) | One container on the network, every agent connects over HTTP |
 | [Linux server with systemd](docs/deployment.md#linux-server-with-systemd) | The .deb ships a unit, disabled by default; enable it once and agents connect over HTTP |
 | [Published read-only knowledge base](docs/deployment.md#published-read-only-knowledge-base) | Knowledge curated in a git repository, served read-only to agents |

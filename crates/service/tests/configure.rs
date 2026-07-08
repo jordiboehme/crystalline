@@ -56,14 +56,21 @@ async fn show_lists_every_registry_key_at_its_default() {
 
     let data = engine.configure(&ConfigureAction::Show).await.unwrap();
     let views = settings_of(&data);
-    assert_eq!(views.len(), 8);
+    assert_eq!(views.len(), 9);
     assert!(
         views
             .iter()
             .all(|v| v.source == crystalline_service::settings::SettingSource::Default)
     );
-    assert_eq!(views[0].key, "github.enabled");
-    assert_eq!(views[0].value, "false");
+    // domains_root leads the registry; github.enabled follows it.
+    assert_eq!(views[0].key, "domains_root");
+    assert!(
+        views[0].value.ends_with("Documents/Crystalline"),
+        "{}",
+        views[0].value
+    );
+    assert_eq!(views[1].key, "github.enabled");
+    assert_eq!(views[1].value, "false");
 }
 
 #[tokio::test]

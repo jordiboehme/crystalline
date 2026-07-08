@@ -1,8 +1,10 @@
-//! MCP-layer tests for the six GitHub collaboration tools: the runtime
+//! MCP-layer tests for the five GitHub collaboration tools: the runtime
 //! gating matrix over `list_tools`/`get_tool`, the clean refusal a direct
 //! call to a hidden tool still gets, the `configure` tool's snapshot, set
 //! flow and GitHub connect state machine, and wiring smoke tests for the
-//! five origin tools against the engine with an injected `MockProvider`.
+//! origin tools against the engine with an injected `MockProvider`. Also the
+//! non-GitHub `add_domain` modes (local and virtual), which are not
+//! collaboration-gated and work on a fresh instance with GitHub off.
 //!
 //! Every test that touches a GitHub connection injects either
 //! `support::MockProvider` (via `Engine::with_origin_provider`) or a local
@@ -127,10 +129,10 @@ where
     panic!("condition was not met within two seconds");
 }
 
-/// The six collaboration tool names, in the order the task brief lists them.
-const ALL_SIX: [&str; 6] = [
+/// The five collaboration tool names. `add_domain` is deliberately not here:
+/// it is write-gated, not collaboration-gated (see `add_domain_*` tests below).
+const ALL_FIVE: [&str; 5] = [
     "configure",
-    "add_domain",
     "share_changes",
     "update_domain",
     "origin_status",
@@ -144,7 +146,7 @@ async fn gating_matrix_over_list_tools() {
     let cases: [(bool, bool, &[&str]); 4] = [
         (false, false, &["configure"]),
         (false, true, &[]),
-        (true, false, &ALL_SIX),
+        (true, false, &ALL_FIVE),
         (true, true, &["update_domain", "origin_status"]),
     ];
     for (github_enabled, read_only, visible) in cases {
@@ -154,7 +156,7 @@ async fn gating_matrix_over_list_tools() {
         let (client, _server) = connect(eng).await;
         let tools = client.peer().list_tools(Default::default()).await.unwrap();
         let names: Vec<String> = tools.tools.iter().map(|t| t.name.to_string()).collect();
-        for name in ALL_SIX {
+        for name in ALL_FIVE {
             let should_be_visible = visible.contains(&name);
             assert_eq!(
                 names.contains(&name.to_string()),
@@ -172,7 +174,7 @@ async fn gating_matrix_over_get_tool() {
     let cases: [(bool, bool, &[&str]); 4] = [
         (false, false, &["configure"]),
         (false, true, &[]),
-        (true, false, &ALL_SIX),
+        (true, false, &ALL_FIVE),
         (true, true, &["update_domain", "origin_status"]),
     ];
     for (github_enabled, read_only, visible) in cases {
@@ -180,7 +182,7 @@ async fn gating_matrix_over_get_tool() {
         let eng =
             Arc::new(engine(&tmp.path().join("config.yaml"), github_enabled, read_only).await);
         let server = McpServer::new(eng);
-        for name in ALL_SIX {
+        for name in ALL_FIVE {
             let should_be_visible = visible.contains(&name);
             assert_eq!(
                 server.get_tool(name).is_some(),
@@ -192,14 +194,38 @@ async fn gating_matrix_over_get_tool() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn add_domain_is_visible_unless_read_only_regardless_of_github() {
+    use rmcp::ServerHandler;
+    // add_domain is write-gated, not collaboration-gated: visible with GitHub
+    // off, visible with GitHub on, and hidden only in read-only mode.
+    for (github_enabled, read_only, visible) in [
+        (false, false, true),
+        (true, false, true),
+        (false, true, false),
+        (true, true, false),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let eng =
+            Arc::new(engine(&tmp.path().join("config.yaml"), github_enabled, read_only).await);
+        let server = McpServer::new(eng);
+        assert_eq!(
+            server.get_tool("add_domain").is_some(),
+            visible,
+            "github_enabled={github_enabled} read_only={read_only}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn flipping_github_enabled_mid_session_changes_the_next_list_tools_result() {
     let tmp = tempfile::tempdir().unwrap();
     let eng = Arc::new(engine(&tmp.path().join("config.yaml"), false, false).await);
     let (client, _server) = connect(eng.clone()).await;
     let peer = client.peer();
 
+    // share_changes is a collaboration tool, so it is hidden while github is off.
     let tools = peer.list_tools(Default::default()).await.unwrap();
-    assert!(!tools.tools.iter().any(|t| t.name == "add_domain"));
+    assert!(!tools.tools.iter().any(|t| t.name == "share_changes"));
 
     call(
         peer,
@@ -211,8 +237,8 @@ async fn flipping_github_enabled_mid_session_changes_the_next_list_tools_result(
 
     let tools = peer.list_tools(Default::default()).await.unwrap();
     assert!(
-        tools.tools.iter().any(|t| t.name == "add_domain"),
-        "add_domain must appear once github.enabled flips to true"
+        tools.tools.iter().any(|t| t.name == "share_changes"),
+        "share_changes must appear once github.enabled flips to true"
     );
 }
 
@@ -225,8 +251,7 @@ async fn hidden_collab_tools_route_to_not_enabled_when_github_is_disabled() {
     let (client, _server) = connect(eng).await;
     let peer = client.peer();
 
-    let cases: [(&str, Value); 5] = [
-        ("add_domain", json!({"repo": "acme/brand-knowledge"})),
+    let cases: [(&str, Value); 4] = [
         ("share_changes", json!({"domain": "eng"})),
         ("update_domain", json!({})),
         ("origin_status", json!({})),
@@ -245,6 +270,21 @@ async fn hidden_collab_tools_route_to_not_enabled_when_github_is_disabled() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn add_domain_team_mode_routes_to_not_enabled_when_github_is_disabled() {
+    // add_domain itself is visible with GitHub off, but its team-domain branch
+    // (repo present) still refuses cleanly until collaboration is enabled.
+    let tmp = tempfile::tempdir().unwrap();
+    let eng = Arc::new(engine(&tmp.path().join("config.yaml"), false, false).await);
+    let (client, _server) = connect(eng).await;
+    let peer = client.peer();
+
+    let err = call(peer, "add_domain", json!({"repo": "acme/brand-knowledge"}))
+        .await
+        .unwrap_err();
+    assert!(err.contains("not enabled"), "{err}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hidden_write_collab_tools_route_to_read_only_when_enabled_and_read_only() {
     let tmp = tempfile::tempdir().unwrap();
     let eng = Arc::new(engine(&tmp.path().join("config.yaml"), true, true).await);
@@ -254,10 +294,25 @@ async fn hidden_write_collab_tools_route_to_read_only_when_enabled_and_read_only
     let err = call(peer, "configure", json!({})).await.unwrap_err();
     assert!(err.contains("read-only"), "{err}");
 
+    // add_domain refuses read-only in every mode: team (repo), local and virtual.
     let err = call(peer, "add_domain", json!({"repo": "acme/brand-knowledge"}))
         .await
         .unwrap_err();
     assert!(err.contains("read-only"), "{err}");
+
+    let err = call(peer, "add_domain", json!({"domain": "scratch"}))
+        .await
+        .unwrap_err();
+    assert!(err.contains("read-only"), "local add_domain: {err}");
+
+    let err = call(
+        peer,
+        "add_domain",
+        json!({"domain": "mem", "virtual": true}),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("read-only"), "virtual add_domain: {err}");
 
     let err = call(peer, "share_changes", json!({"domain": "eng"}))
         .await
@@ -285,8 +340,9 @@ async fn configure_with_no_args_reports_the_settings_snapshot_and_github_block()
 
     let out = call(peer, "configure", json!({})).await.unwrap();
     let settings = out["settings"].as_array().unwrap();
-    assert_eq!(settings.len(), 8, "{settings:?}");
+    assert_eq!(settings.len(), 9, "{settings:?}");
     assert!(settings.iter().any(|s| s["key"] == "github.enabled"));
+    assert!(settings.iter().any(|s| s["key"] == "domains_root"));
     assert_eq!(out["github"]["connected"], json!(false));
     assert!(out["github"]["pending_connect"].is_null());
 }
@@ -732,6 +788,166 @@ async fn add_domain_tool_wires_through_to_origin_add() {
     assert_eq!(out["engrams"], json!(2));
     assert_eq!(out["base_commit"], json!(commit));
     assert!(root.join("MANIFEST.md").exists());
+}
+
+// --- add_domain: local and virtual modes (no GitHub) ------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn add_domain_local_creates_and_scaffolds_with_github_disabled() {
+    // GitHub is off (the engine helper's default): creating a local domain must
+    // still work, which is the whole point - an agent can start from zero.
+    let tmp = tempfile::tempdir().unwrap();
+    let eng = Arc::new(engine(&tmp.path().join("config.yaml"), false, false).await);
+    let folder = tmp.path().join("scratch");
+    let (client, _server) = connect(eng).await;
+    let peer = client.peer();
+
+    let out = call(
+        peer,
+        "add_domain",
+        json!({ "domain": "scratch", "folder": folder.to_str().unwrap() }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out["domain"], json!("scratch"));
+    assert_eq!(out["kind"], json!("file"));
+    assert_eq!(out["manifest_created"], json!(true));
+    assert_eq!(out["adopted"], json!(false));
+    assert!(folder.join("MANIFEST.md").exists());
+
+    // It is registered and routable now: a second read tool sees it.
+    let domains = call(peer, "list_domains", json!({})).await.unwrap();
+    assert!(
+        serde_json::to_string(&domains).unwrap().contains("scratch"),
+        "{domains:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn add_domain_local_adopts_an_existing_folder_and_is_idempotent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let eng = Arc::new(engine(&tmp.path().join("config.yaml"), false, false).await);
+    // A folder that already holds a MANIFEST and an engram is adopted in place:
+    // its MANIFEST is not overwritten and its engram is synced.
+    let folder = tmp.path().join("existing");
+    std::fs::create_dir_all(folder.join("notes")).unwrap();
+    std::fs::write(folder.join("MANIFEST.md"), manifest()).unwrap();
+    std::fs::write(
+        folder.join("notes/alpha.md"),
+        engram("Alpha", "alpha", "turbine notes"),
+    )
+    .unwrap();
+
+    let (client, _server) = connect(eng).await;
+    let peer = client.peer();
+
+    let out = call(
+        peer,
+        "add_domain",
+        json!({ "domain": "existing", "folder": folder.to_str().unwrap() }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out["manifest_created"], json!(false));
+    assert_eq!(out["adopted"], json!(false));
+
+    // Re-adding the same folder is idempotent: already registered, so adopted.
+    let again = call(
+        peer,
+        "add_domain",
+        json!({ "domain": "existing", "folder": folder.to_str().unwrap() }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(again["adopted"], json!(true));
+    assert_eq!(again["manifest_created"], json!(false));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn add_domain_virtual_registers_and_scaffolds_and_is_idempotent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let eng = Arc::new(engine(&tmp.path().join("config.yaml"), false, false).await);
+    let (client, _server) = connect(eng).await;
+    let peer = client.peer();
+
+    let out = call(
+        peer,
+        "add_domain",
+        json!({ "domain": "mem", "virtual": true }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out["domain"], json!("mem"));
+    assert_eq!(out["kind"], json!("virtual"));
+    assert_eq!(out["manifest_created"], json!(true));
+    assert_eq!(out["registered"], json!(true));
+
+    let again = call(
+        peer,
+        "add_domain",
+        json!({ "domain": "mem", "virtual": true }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(again["registered"], json!(false));
+    assert_eq!(again["manifest_created"], json!(false));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn add_domain_rejects_repo_and_virtual_together() {
+    let tmp = tempfile::tempdir().unwrap();
+    let eng = Arc::new(engine(&tmp.path().join("config.yaml"), true, false).await);
+    let (client, _server) = connect(eng).await;
+    let peer = client.peer();
+
+    let err = call(
+        peer,
+        "add_domain",
+        json!({ "repo": "acme/brand-knowledge", "virtual": true }),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("mutually exclusive"), "{err}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn add_domain_virtual_requires_a_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let eng = Arc::new(engine(&tmp.path().join("config.yaml"), false, false).await);
+    let (client, _server) = connect(eng).await;
+    let peer = client.peer();
+
+    let err = call(peer, "add_domain", json!({ "virtual": true }))
+        .await
+        .unwrap_err();
+    assert!(err.contains("requires a domain name"), "{err}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn add_domain_local_honors_the_configured_domains_root() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let cfg = GlobalConfig {
+        domains_root: Some(tmp.path().join("root")),
+        ..GlobalConfig::default()
+    };
+    let eng = Arc::new(Engine::new(
+        Arc::new(Mutex::new(store)),
+        cfg,
+        None,
+        Some(tmp.path().join("config.yaml")),
+    ));
+    let (client, _server) = connect(eng).await;
+    let peer = client.peer();
+
+    // No folder given: the domain lands under the configured root at <root>/<name>.
+    let out = call(peer, "add_domain", json!({ "domain": "notes" }))
+        .await
+        .unwrap();
+    assert_eq!(out["kind"], json!("file"));
+    let root = out["root"].as_str().unwrap();
+    assert!(root.ends_with("root/notes"), "{root}");
+    assert!(tmp.path().join("root/notes/MANIFEST.md").exists());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -44,6 +44,12 @@ pub struct GlobalConfig {
     /// Registered domains, name to entry, in order.
     #[serde(default)]
     pub domains: IndexMap<String, DomainEntry>,
+    /// The default root folder new file domains are created under, when the
+    /// caller does not give an explicit path: a domain named `foo` lands at
+    /// `<domains_root>/foo`. Absent means `~/Documents/Crystalline`, so every
+    /// existing config keeps working untouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domains_root: Option<PathBuf>,
     /// Service settings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service: Option<ServiceConfig>,
@@ -81,6 +87,16 @@ impl GlobalConfig {
     /// before opening a backend.
     pub fn database(&self) -> DatabaseConfig {
         self.database.clone().unwrap_or_default()
+    }
+
+    /// The root folder new file domains are created under, from `domains_root`
+    /// (tilde-expanded), or `~/Documents/Crystalline` when unset. A domain
+    /// created without an explicit path lands at `<domains_root>/<name>`.
+    pub fn domains_root(&self) -> PathBuf {
+        match &self.domains_root {
+            Some(p) => expand_tilde(&p.to_string_lossy()),
+            None => expand_tilde("~/Documents/Crystalline"),
+        }
     }
 
     /// Whether GitHub collaboration is turned on, from `github.enabled`.

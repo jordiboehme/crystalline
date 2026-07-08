@@ -101,10 +101,12 @@ async fn call(peer: &Peer<RoleClient>, tool: &str, args: Value) -> Result<Value,
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn list_tools_exposes_the_twelve_core_tools_plus_configure() {
+async fn list_tools_exposes_the_core_tools_plus_configure_and_add_domain() {
     // With GitHub collaboration off (the default), `configure` is the only
-    // one of the six collaboration tools that is ever visible: see
+    // one of the five collaboration tools that is ever visible: see
     // `crate::mcp::hidden_collab_tool` and its dedicated gating matrix tests.
+    // `add_domain` is not collaboration-gated: it creates domains of every kind
+    // and is visible whenever the instance is writable.
     let h = Harness::new(&["eng"]).await;
     let (client, _server) = h.connect().await;
     let tools = client.peer().list_tools(Default::default()).await.unwrap();
@@ -123,11 +125,11 @@ async fn list_tools_exposes_the_twelve_core_tools_plus_configure() {
         "validate_engrams",
         "infer_schema",
         "configure",
+        "add_domain",
     ] {
         assert!(names.contains(&expected.to_string()), "missing {expected}");
     }
     for hidden in [
-        "add_domain",
         "share_changes",
         "update_domain",
         "origin_status",
@@ -138,22 +140,24 @@ async fn list_tools_exposes_the_twelve_core_tools_plus_configure() {
             "{hidden} must be hidden while github.enabled is off: {names:?}"
         );
     }
-    assert_eq!(names.len(), 13, "exactly 13 tools: {names:?}");
+    assert_eq!(names.len(), 14, "exactly 14 tools: {names:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn read_only_hides_the_four_mutating_tools() {
+async fn read_only_hides_the_write_gated_tools() {
     let h = Harness::new_read_only(&["eng"]).await;
     let (client, _server) = h.connect().await;
     let tools = client.peer().list_tools(Default::default()).await.unwrap();
     let names: Vec<String> = tools.tools.iter().map(|t| t.name.to_string()).collect();
 
-    // The four content-mutating tools are absent from the surface.
+    // The five write-gated tools (four content-mutating plus add_domain, which
+    // creates domains) are absent from the surface.
     for hidden in [
         "write_engram",
         "edit_engram",
         "move_engram",
         "delete_engram",
+        "add_domain",
     ] {
         assert!(
             !names.contains(&hidden.to_string()),
@@ -173,12 +177,11 @@ async fn read_only_hides_the_four_mutating_tools() {
     ] {
         assert!(names.contains(&expected.to_string()), "missing {expected}");
     }
-    // Read-only and GitHub collaboration off together hide all six
+    // Read-only and GitHub collaboration off together hide all five
     // collaboration tools too (the full gating matrix lives in
     // tests/mcp_collab.rs).
     for hidden in [
         "configure",
-        "add_domain",
         "share_changes",
         "update_domain",
         "origin_status",

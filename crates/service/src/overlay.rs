@@ -585,6 +585,7 @@ mod tests {
     #[test]
     fn every_setting_variable_is_recognized_and_applied() {
         let ov = overlay(&[
+            ("CRYSTALLINE_DOMAINS_ROOT", "/srv/knowledge"),
             ("CRYSTALLINE_GITHUB_ENABLED", "true"),
             ("CRYSTALLINE_GITHUB_POLL_SECS", "120"),
             (
@@ -600,6 +601,7 @@ mod tests {
         .unwrap();
 
         for key in [
+            "domains_root",
             "github.enabled",
             "github.poll_secs",
             "github.api_url",
@@ -613,6 +615,10 @@ mod tests {
         }
 
         let effective = ov.apply(&GlobalConfig::default());
+        assert_eq!(
+            effective.domains_root().display().to_string(),
+            "/srv/knowledge"
+        );
         assert!(effective.github_enabled());
         assert!(effective.read_only());
         assert_eq!(effective.database().backend, DatabaseBackend::Postgres);
@@ -620,6 +626,21 @@ mod tests {
             effective.database().url.as_deref(),
             Some("postgres://u:p@db/crystalline")
         );
+    }
+
+    #[test]
+    fn domains_root_is_a_setting_not_an_env_domain() {
+        // CRYSTALLINE_DOMAINS_ROOT must be read as the domains_root setting, and
+        // never mistaken for a CRYSTALLINE_DOMAIN_<NAME> env-defined domain.
+        let ov = overlay(&[("CRYSTALLINE_DOMAINS_ROOT", "/srv/knowledge")]).unwrap();
+        assert!(ov.overrides_key("domains_root"));
+        assert_eq!(ov.env_domains().count(), 0);
+        let effective = ov.apply(&GlobalConfig::default());
+        assert_eq!(
+            effective.domains_root().display().to_string(),
+            "/srv/knowledge"
+        );
+        assert!(effective.domains.is_empty());
     }
 
     #[test]

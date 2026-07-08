@@ -12,7 +12,7 @@
 //! token-store host key, a validated conflict resolution) and the outputs
 //! (aggregate JSON) around those calls.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use crystalline_remote::RemoteError;
@@ -38,11 +38,13 @@ pub(crate) fn default_domain_name(repo: &str) -> String {
     }
 }
 
-/// The domain folder `origin_add` uses when the caller does not supply one:
-/// `~/Documents/Crystalline/<domain>`, tilde-expanded via the core helper so
-/// it resolves the same way every other configured path does.
-pub(crate) fn default_domain_folder(domain: &str) -> PathBuf {
-    crystalline_core::config::expand_tilde(&format!("~/Documents/Crystalline/{domain}"))
+/// The domain folder a domain-creating call uses when the caller does not
+/// supply one: `<root>/<domain>`, where `root` is the configured domains root
+/// (`GlobalConfig::domains_root`, `~/Documents/Crystalline` by default). Kept a
+/// free function over the already-resolved root so both `origin_add` and the
+/// local-domain path share one placement rule.
+pub(crate) fn default_domain_folder(root: &Path, domain: &str) -> PathBuf {
+    root.join(domain)
 }
 
 /// Parses an origin spec of the form `owner/repo[/subpath...]` into
@@ -336,8 +338,10 @@ mod tests {
     }
 
     #[test]
-    fn default_domain_folder_expands_under_documents_crystalline() {
-        let folder = default_domain_folder("brand-knowledge");
+    fn default_domain_folder_joins_the_domain_under_the_root() {
+        use crystalline_core::config::GlobalConfig;
+        let root = GlobalConfig::default().domains_root();
+        let folder = default_domain_folder(&root, "brand-knowledge");
         let s = folder.display().to_string();
         assert!(s.ends_with("Documents/Crystalline/brand-knowledge"), "{s}");
         assert!(!s.starts_with('~'), "{s}");
