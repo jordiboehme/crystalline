@@ -108,6 +108,16 @@ crystalline domain init ~/knowledge/engineering --name engineering
 crystalline domain add engineering ~/knowledge/engineering
 ```
 
+### GitHub Copilot CLI
+
+The same integration for the agentic Copilot CLI, one command (Copilot too keeps MCP registration user-level even with `--project`). The installer drives the `copilot` binary and falls back to `gh copilot` when only the GitHub CLI form is installed:
+
+```sh
+crystalline install copilot
+```
+
+Hooks land in a dedicated `~/.copilot/hooks/crystalline.json` and skills in `~/.copilot/skills` (both honor `COPILOT_HOME`); with `--project` they go to `.github/hooks` and `.github/skills` instead, which Copilot loads once you trust the folder. Then give the agent its first domain as above.
+
 ### Any MCP harness
 
 Crystalline runs as an MCP server over stdio; the server command is always `crystalline mcp`. Everything the installer does can also be done by hand:
@@ -115,6 +125,7 @@ Crystalline runs as an MCP server over stdio; the server command is always `crys
 ```sh
 claude mcp add crystalline --scope user crystalline mcp   # Claude Code, all projects
 codex mcp add crystalline -- crystalline mcp              # Codex CLI
+copilot mcp add crystalline -- crystalline mcp            # GitHub Copilot CLI
 ```
 
 The first agent to connect starts a background daemon that loads the embedding model once and watches every registered domain; every later connection - other agents, other terminals, other harnesses - attaches to that same daemon, so there is always one shared instance and one consistent view of the index. A daemon running in a container is reached over HTTP instead of stdio - see [Run in a container](docs/deployment.md#run-in-a-container).
@@ -207,7 +218,7 @@ The `skills/` folder ships four harness-agnostic agent skills plus one consolida
 - **`crystalline-collaboration`** - working in a domain that has a team origin: checking status at session start, updating before deep work, sharing a coherent unit of knowledge as a proposal and relaying its review URL, conflict etiquette and connecting a new teammate end to end.
 - **`crystalline-memory`** - a single consolidated skill for Claude Desktop and other harnesses that install one skill at a time: recall, capture, read-only stand-down and team sharing essentials in one file.
 
-`crystalline install claude-code` (or `codex`) copies these same four skills into place automatically - `~/.claude/skills` for Claude Code, `~/.agents/skills` for Codex - and leaves `crystalline-memory` alone, since it is Claude Desktop's own consolidated skill. Each is a plain folder with a `SKILL.md`; to do it by hand instead, copy the folder into wherever your harness looks for skills. For Claude Code, that is `.claude/skills/` in a project or `~/.claude/skills/` globally:
+`crystalline install claude-code` (or `codex` or `copilot`) copies these same four skills into place automatically - `~/.claude/skills` for Claude Code, `~/.agents/skills` for Codex, `~/.copilot/skills` for the Copilot CLI - and leaves `crystalline-memory` alone, since it is Claude Desktop's own consolidated skill. Each is a plain folder with a `SKILL.md`; to do it by hand instead, copy the folder into wherever your harness looks for skills. For Claude Code, that is `.claude/skills/` in a project or `~/.claude/skills/` globally:
 
 ```sh
 cp -r skills/crystalline-routing skills/crystalline-capture skills/crystalline-schema skills/crystalline-collaboration ~/.claude/skills/
