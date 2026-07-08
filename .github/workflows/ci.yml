@@ -107,3 +107,18 @@ jobs:
 
       - name: Build crystalline for musl
         run: cargo build --release --target x86_64-unknown-linux-musl -p crystalline
+
+  # Dogfoods the bundled action end to end: it downloads the latest release
+  # binary from jordiboehme/crystalline and verifies a fixture domain. A
+  # regression to the caller's repo (the github.action_repository quirk that
+  # this job guards against) would fail at the download step.
+  verify-action:
+    name: verify-action
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: ./action
+        with:
+          paths: tests/fixtures/domain-good
+          comment: 'false'

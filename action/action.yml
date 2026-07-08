@@ -6,12 +6,6 @@ description: >-
   connection is used beyond downloading the pinned release binary itself.
 author: 'Crystalline'
 
-# Note: crystalline does not publish release binaries until milestone M7 of
-# the project plan. This action is forward-looking and syntactically valid
-# ahead of that release, but the download step below will fail with a 404
-# until a matching release exists. Pin `version` to a real tag once one is
-# published.
-
 inputs:
   paths:
     description: 'Space-separated Domain root paths to verify.'
@@ -51,7 +45,7 @@ runs:
       run: |
         set -euo pipefail
         if [ "$VERSION_INPUT" = "latest" ]; then
-          version=$(gh release view --repo "${{ github.action_repository || github.repository }}" --json tagName --jq .tagName)
+          version=$(gh release view --repo jordiboehme/crystalline --json tagName --jq .tagName)
         else
           version="$VERSION_INPUT"
         fi
@@ -88,7 +82,7 @@ runs:
         mkdir -p "$workdir"
         cd "$workdir"
         gh release download "$version" \
-          --repo "${{ github.action_repository || github.repository }}" \
+          --repo jordiboehme/crystalline \
           --pattern "$archive" --pattern "SHA256SUMS" --clobber
         echo "archive=$archive" >> "$GITHUB_ENV"
         echo "crystalline_workdir=$workdir" >> "$GITHUB_ENV"
@@ -169,8 +163,6 @@ runs:
           if [ "$total_issues" -gt 20 ]; then
             echo "- ...and $((total_issues - 20)) more issue(s); see the full JSON report in the workflow run."
           fi
-          echo
-          echo "_Note: crystalline release binaries ship starting at project milestone M7; until then this action downloads a release that may not exist yet._"
         } > "$body_file"
 
         existing_id=$(gh api "repos/$REPO/issues/$PR_NUMBER/comments" --paginate \
