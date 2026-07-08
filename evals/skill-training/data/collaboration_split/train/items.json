@@ -1,9 +1,70 @@
 [
   {
-    "id": "collab-train-01",
+    "id": "collab-status-01",
     "workspace": "harbor",
     "task_type": "status",
-    "question": "Which of our domains are shared with the team, and where do they stand?",
+    "question": "I am about to dig into the fieldwork domain. Is our copy current with the team, or has something landed upstream I should pull first?",
+    "origin": {
+      "tree": "fieldwork",
+      "repo": "harbor/fieldwork",
+      "domain": "fieldwork",
+      "upstream_commit": {
+        "storm-surge-readiness.md": {
+          "content": "---\ntype: runbook\ntitle: Storm surge readiness\npermalink: storm-surge-readiness\ntags:\n- fieldwork\n- weather\nstatus: current\nrecorded_at: 2026-07-08\n---\n\nHow the field team prepares when a storm surge is forecast.\n\n- [fact] The team hauls out every skiff once the surge forecast tops one metre above the predicted tide #fieldwork\n- [decision] Fieldwork is stood down for the day the moment a surge warning is issued, no exceptions #fieldwork\n"
+        }
+      }
+    },
+    "expect": {
+      "used_tool": {
+        "name": "origin_status",
+        "domain": "fieldwork"
+      },
+      "answer_any": [
+        "behind",
+        "out of date",
+        "not current",
+        "update",
+        "pull"
+      ]
+    }
+  },
+  {
+    "id": "collab-status-02",
+    "workspace": "harbor",
+    "task_type": "status",
+    "question": "Before I touch the buoy notes, has the team changed anything on their side of fieldwork that I am missing?",
+    "origin": {
+      "tree": "fieldwork",
+      "repo": "harbor/fieldwork",
+      "domain": "fieldwork",
+      "upstream_commit": {
+        "buoy-inspection-routine.md": {
+          "replace": [
+            "every fortnight",
+            "every ten days"
+          ]
+        }
+      }
+    },
+    "expect": {
+      "used_tool": {
+        "name": "origin_status",
+        "domain": "fieldwork"
+      },
+      "answer_any": [
+        "behind",
+        "out of date",
+        "not current",
+        "update",
+        "pull"
+      ]
+    }
+  },
+  {
+    "id": "collab-status-05",
+    "workspace": "harbor",
+    "task_type": "status",
+    "question": "Quick check before I start: is our fieldwork copy already level with the team, or is there anything to pull?",
     "origin": {
       "tree": "fieldwork",
       "repo": "harbor/fieldwork",
@@ -13,7 +74,791 @@
       "used_tool": {
         "name": "origin_status",
         "domain": "fieldwork"
+      },
+      "answer_any": [
+        "up to date",
+        "current",
+        "in sync",
+        "nothing to pull",
+        "no changes",
+        "matches its origin"
+      ]
+    }
+  },
+  {
+    "id": "collab-status-06",
+    "workspace": "harbor",
+    "task_type": "status",
+    "question": "Are we in sync with the team on fieldwork right now?",
+    "origin": {
+      "tree": "fieldwork",
+      "repo": "harbor/fieldwork",
+      "domain": "fieldwork"
+    },
+    "expect": {
+      "used_tool": {
+        "name": "origin_status",
+        "domain": "fieldwork"
+      },
+      "answer_any": [
+        "up to date",
+        "current",
+        "in sync",
+        "nothing to pull",
+        "no changes",
+        "matches its origin"
+      ]
+    }
+  },
+  {
+    "id": "collab-status-08",
+    "workspace": "harbor",
+    "task_type": "status",
+    "question": "A while back I put our muster-point change up for the team. Is that proposal still open or has it been dealt with?",
+    "origin": {
+      "tree": "fieldwork",
+      "repo": "harbor/fieldwork",
+      "domain": "fieldwork",
+      "local_edits": {
+        "tide-window-procedure.md": {
+          "replace": [
+            "north jetty",
+            "east breakwater"
+          ]
+        }
+      },
+      "share_first": "Move the muster point to the east breakwater"
+    },
+    "expect": {
+      "used_tool": {
+        "name": "origin_status",
+        "domain": "fieldwork"
+      },
+      "answer_any": [
+        "open",
+        "awaiting",
+        "pending",
+        "under review",
+        "not yet merged",
+        "still up"
+      ]
+    }
+  },
+  {
+    "id": "collab-update-01",
+    "workspace": "harbor",
+    "task_type": "update",
+    "question": "The moorings crew has been busy. Bring our fieldwork copy up to date with the team before I look at the buoy routine.",
+    "origin": {
+      "tree": "fieldwork",
+      "repo": "harbor/fieldwork",
+      "domain": "fieldwork",
+      "upstream_commit": {
+        "buoy-inspection-routine.md": {
+          "replace": [
+            "every fortnight",
+            "every ten days"
+          ]
+        }
       }
+    },
+    "expect": {
+      "used_tool": {
+        "name": "update_domain",
+        "domain": "fieldwork"
+      },
+      "updated": {
+        "domain": "fieldwork",
+        "file_any": [
+          "buoy-inspection-routine.md"
+        ]
+      }
+    }
+  },
+  {
+    "id": "collab-update-02",
+    "workspace": "harbor",
+    "task_type": "update",
+    "question": "Pull down whatever the team has changed in fieldwork so I am working from their latest.",
+    "origin": {
+      "tree": "fieldwork",
+      "repo": "harbor/fieldwork",
+      "domain": "fieldwork",
+      "upstream_commit": {
+        "radio-watch-decision.md": {
+          "replace": [
+            "channel seventy-two",
+            "channel sixteen"
+          ]
+        }
+      }
+    },
+    "expect": {
+      "used_tool": {
+        "name": "update_domain",
+        "domain": "fieldwork"
+      },
+      "updated": {
+        "domain": "fieldwork",
+        "file_any": [
+          "radio-watch-decision.md"
+        ]
+      }
+    }
+  },
+  {
+    "id": "collab-update-04",
+    "workspace": "harbor",
+    "task_type": "update",
+    "question": "Get fieldwork current with the team please - I think they pushed a couple of changes over the weekend.",
+    "origin": {
+      "tree": "fieldwork",
+      "repo": "harbor/fieldwork",
+      "domain": "fieldwork",
+      "upstream_commit": {
+        "buoy-inspection-routine.md": {
+          "replace": [
+            "every fortnight",
+            "every ten days"
+          ]
+        },
+        "sample-handling-procedure.md": {
+          "replace": [
+            "chilled within the hour",
+            "chilled within ninety minutes"
+          ]
+        }
+      }
+    },
+    "expect": {
+      "used_tool": {
+        "name": "update_domain",
+        "domain": "fieldwork"
+      },
+      "updated": {
+        "domain": "fieldwork",
+        "file_any": [
+          "buoy-inspection-routine.md"
+        ]
+      }
+    }
+  },
+  {
+    "id": "collab-update-06",
+    "workspace": "harbor",
+    "task_type": "update",
+    "question": "I tweaked the buoy inspection note in our copy already. Before I keep going, pull in whatever the team has changed on their end.",
+    "origin": {
+      "tree": "fieldwork",
+      "repo": "harbor/fieldwork",
+      "domain": "fieldwork",
+      "local_edits": {
+        "buoy-inspection-routine.md": {
+          "replace": [
+            "every fortnight",
+            "every week"
+          ]
+        }
+      },
+      "upstream_commit": {
+        "tide-window-procedure.md": {
+          "replace": [
+            "two hours before high water",
+            "ninety minutes before high water"
+          ]
+        }
+      }
+    },
+    "expect": {
+      "used_tool": {
+        "name": "update_domain",
+        "domain": "fieldwork"
+      },
+      "updated": {
+        "domain": "fieldwork",
+        "file_any": [
+          "tide-window-procedure.md"
+        ]
+      }
+    }
+  },
+  {
+    "id": "collab-update-08",
+    "workspace": "harbor",
+    "task_type": "update",
+    "question": "Bring fieldwork up to date, then tell me what the team changed about how often the buoys get inspected.",
+    "origin": {
+      "tree": "fieldwork",
+      "repo": "harbor/fieldwork",
+      "domain": "fieldwork",
+      "upstream_commit": {
+        "buoy-inspection-routine.md": {
+          "replace": [
+            "every fortnight",
+            "every week"
+          ]
+        }
+      }
+    },
+    "expect": {
+      "used_tool": {
+        "name": "update_domain",
+        "domain": "fieldwork"
+      },
+      "updated": {
+        "domain": "fieldwork",
+        "file_any": [
+          "buoy-inspection-routine.md"
+        ]
+      },
+      "answer_any": [
+        "every week",
+        "week"
+      ]
+    }
+  },
+  {
+    "id": "collab-share-01",
+    "workspace": "harbor",
+    "task_type": "share",
+    "question": "I just corrected the tide window timing in fieldwork: the survey window opens three hours before high water now, not two. Share that update with the team for review.",
+    "origin": {
+      "tree": "fieldwork",
+      "repo": "harbor/fieldwork",
+      "domain": "fieldwork",
+      "local_edits": {
+        "tide-window-procedure.md": {
+          "replace": [
+            "two hours before high water",
+            "three hours before high water"
+          ]
+        }
+      }
+    },
+    "expect": {
+      "used_tool": {
+        "name": "share_changes",
+        "domain": "fieldwork"
+      },
+      "share": {
+        "domain": "fieldwork",
+        "url_relayed": true,
+        "title_any": [
+          "tide",
+          "window",
+          "high water"
+        ]
+      },
+      "forbid_any_write": true
+    }
+  },
+  {
+    "id": "collab-share-02",
+    "workspace": "harbor",
+    "task_type": "share",
+    "question": "I have already updated the buoy routine in our copy so a drifted buoy is re-anchored within the hour. Put that up for the team to review.",
+    "origin": {
+      "tree": "fieldwork",
+      "repo": "harbor/fieldwork",
+      "domain": "fieldwork",
+      "local_edits": {
+        "buoy-inspection-routine.md": {
+          "replace": [
+            "re-anchored the same day",
+            "re-anchored within the hour"
+          ]
+        }
+      }
+    },
+    "expect": {
+      "used_tool": {
+        "name": "share_changes",
+        "domain": "fieldwork"
+      },
+      "share": {
+        "domain": "fieldwork",
+        "url_relayed": true,
+        "title_any": [
+          "buoy",
+          "re-anchor",
+          "mooring"
+        ]
+      },
+      "forbid_any_write": true
+    }
+  },
+  {
+    "id": "collab-share-05",
+    "workspace": "harbor",
+    "task_type": "share",
+    "question": "Add a line to the fieldwork radio watch note that the base station also answers on channel sixteen in an emergency, then share it with the team for review.",
+    "origin": {
+      "tree": "fieldwork",
+      "repo": "harbor/fieldwork",
+      "domain": "fieldwork"
+    },
+    "expect": {
+      "used_tool": {
+        "name": "share_changes",
+        "domain": "fieldwork"
+      },
+      "share": {
+        "domain": "fieldwork",
+        "url_relayed": true,
+        "title_any": [
+          "radio",
+          "channel",
+          "watch"
+        ]
+      }
+    }
+  },
+  {
+    "id": "collab-share-08",
+    "workspace": "harbor",
+    "task_type": "share",
+    "question": "I moved our muster point to the east breakwater in fieldwork. The team has been busy too, so get us current with them and then put my change up for review.",
+    "origin": {
+      "tree": "fieldwork",
+      "repo": "harbor/fieldwork",
+      "domain": "fieldwork",
+      "local_edits": {
+        "tide-window-procedure.md": {
+          "replace": [
+            "north jetty",
+            "east breakwater"
+          ]
+        }
+      },
+      "upstream_commit": {
+        "buoy-inspection-routine.md": {
+          "replace": [
+            "every fortnight",
+            "every ten days"
+          ]
+        }
+      }
+    },
+    "expect": {
+      "used_tool": {
+        "name": "share_changes",
+        "domain": "fieldwork"
+      },
+      "share": {
+        "domain": "fieldwork",
+        "url_relayed": true,
+        "title_any": [
+          "muster",
+          "breakwater",
+          "tide"
+        ]
+      }
+    }
+  },
+  {
+    "id": "collab-share-09",
+    "workspace": "harbor",
+    "task_type": "share",
+    "question": "Our sample chilling is down to thirty minutes in fieldwork now. Bring us up to date with the team first, then propose my edit to them.",
+    "origin": {
+      "tree": "fieldwork",
+      "repo": "harbor/fieldwork",
+      "domain": "fieldwork",
+      "local_edits": {
+        "sample-handling-procedure.md": {
+          "replace": [
+            "chilled within the hour",
+            "chilled within thirty minutes"
+          ]
+        }
+      },
+      "upstream_commit": {
+        "radio-watch-decision.md": {
+          "replace": [
+            "channel seventy-two",
+            "channel sixteen"
+          ]
+        }
+      }
+    },
+    "expect": {
+      "used_tool": {
+        "name": "share_changes",
+        "domain": "fieldwork"
+      },
+      "share": {
+        "domain": "fieldwork",
+        "url_relayed": true
+      }
+    }
+  },
+  {
+    "id": "collab-conflict-01",
+    "workspace": "harbor",
+    "task_type": "conflict",
+    "question": "There is a conflict on our tide window procedure in fieldwork after the last team update. Sort it out, keeping our version of the muster point.",
+    "origin": {
+      "tree": "fieldwork",
+      "repo": "harbor/fieldwork",
+      "domain": "fieldwork",
+      "local_edits": {
+        "tide-window-procedure.md": {
+          "replace": [
+            "north jetty",
+            "east breakwater"
+          ]
+        }
+      },
+      "upstream_commit": {
+        "tide-window-procedure.md": {
+          "replace": [
+            "north jetty",
+            "south slipway"
+          ]
+        }
+      },
+      "materialize_conflict": true
+    },
+    "expect": {
+      "conflict_resolved": {
+        "domain": "fieldwork",
+        "path": "tide-window-procedure.md",
+        "resolution": "mine",
+        "content_any": [
+          "east breakwater"
+        ]
+      }
+    }
+  },
+  {
+    "id": "collab-conflict-02",
+    "workspace": "harbor",
+    "task_type": "conflict",
+    "question": "The radio watch note in fieldwork is conflicted with the team's copy. Settle it and keep our working channel, not theirs.",
+    "origin": {
+      "tree": "fieldwork",
+      "repo": "harbor/fieldwork",
+      "domain": "fieldwork",
+      "local_edits": {
+        "radio-watch-decision.md": {
+          "replace": [
+            "channel seventy-two",
+            "channel six eight"
+          ]
+        }
+      },
+      "upstream_commit": {
+        "radio-watch-decision.md": {
+          "replace": [
+            "channel seventy-two",
+            "channel one six"
+          ]
+        }
+      },
+      "materialize_conflict": true
+    },
+    "expect": {
+      "conflict_resolved": {
+        "domain": "fieldwork",
+        "path": "radio-watch-decision.md",
+        "resolution": "mine",
+        "content_any": [
+          "channel six eight"
+        ]
+      }
+    }
+  },
+  {
+    "id": "collab-conflict-04",
+    "workspace": "harbor",
+    "task_type": "conflict",
+    "question": "The sample handling note in fieldwork is in conflict after the team's pull. Resolve it by taking the team's chilling limit over ours.",
+    "origin": {
+      "tree": "fieldwork",
+      "repo": "harbor/fieldwork",
+      "domain": "fieldwork",
+      "local_edits": {
+        "sample-handling-procedure.md": {
+          "replace": [
+            "chilled within the hour",
+            "chilled within thirty minutes"
+          ]
+        }
+      },
+      "upstream_commit": {
+        "sample-handling-procedure.md": {
+          "replace": [
+            "chilled within the hour",
+            "chilled within two hours"
+          ]
+        }
+      },
+      "materialize_conflict": true
+    },
+    "expect": {
+      "conflict_resolved": {
+        "domain": "fieldwork",
+        "path": "sample-handling-procedure.md",
+        "resolution": "theirs",
+        "content_any": [
+          "chilled within two hours"
+        ]
+      }
+    }
+  },
+  {
+    "id": "collab-conflict-07",
+    "workspace": "harbor",
+    "task_type": "conflict",
+    "question": "The tide window note in fieldwork is conflicted. We moved the muster point to the east breakwater, the team moved it to the south slipway. Both are usable, so combine them so either one is on record.",
+    "origin": {
+      "tree": "fieldwork",
+      "repo": "harbor/fieldwork",
+      "domain": "fieldwork",
+      "local_edits": {
+        "tide-window-procedure.md": {
+          "replace": [
+            "north jetty",
+            "east breakwater"
+          ]
+        }
+      },
+      "upstream_commit": {
+        "tide-window-procedure.md": {
+          "replace": [
+            "north jetty",
+            "south slipway"
+          ]
+        }
+      },
+      "materialize_conflict": true
+    },
+    "expect": {
+      "conflict_resolved": {
+        "domain": "fieldwork",
+        "path": "tide-window-procedure.md",
+        "resolution": "merged",
+        "content_any": [
+          "east breakwater",
+          "south slipway"
+        ]
+      }
+    }
+  },
+  {
+    "id": "collab-conflict-09",
+    "workspace": "harbor",
+    "task_type": "conflict",
+    "question": "The sample handling note in fieldwork clashes. We say samples are chilled within thirty minutes, the team says within two hours. Combine both so our target and their outer limit are both there.",
+    "origin": {
+      "tree": "fieldwork",
+      "repo": "harbor/fieldwork",
+      "domain": "fieldwork",
+      "local_edits": {
+        "sample-handling-procedure.md": {
+          "replace": [
+            "chilled within the hour",
+            "chilled within thirty minutes"
+          ]
+        }
+      },
+      "upstream_commit": {
+        "sample-handling-procedure.md": {
+          "replace": [
+            "chilled within the hour",
+            "chilled within two hours"
+          ]
+        }
+      },
+      "materialize_conflict": true
+    },
+    "expect": {
+      "conflict_resolved": {
+        "domain": "fieldwork",
+        "path": "sample-handling-procedure.md",
+        "resolution": "merged",
+        "content_any": [
+          "thirty minutes",
+          "two hours"
+        ]
+      }
+    }
+  },
+  {
+    "id": "collab-onboard-01",
+    "workspace": "harbor",
+    "task_type": "onboard",
+    "question": "The team keeps a shared harbour almanac in a repo called harbor/almanac. Connect it for us so I can learn from it.",
+    "origin": {
+      "tree": "almanac",
+      "repo": "harbor/almanac",
+      "domain": "almanac",
+      "preconnect": false
+    },
+    "expect": {
+      "domain_added": {
+        "domain": "almanac",
+        "repo": "harbor/almanac",
+        "file_any": [
+          "tide-table-basis.md"
+        ]
+      },
+      "answer_any": [
+        "connected",
+        "added",
+        "downloaded",
+        "onboarded",
+        "searchable",
+        "now have",
+        "ready"
+      ]
+    }
+  },
+  {
+    "id": "collab-onboard-04",
+    "workspace": "harbor",
+    "task_type": "onboard",
+    "question": "Connect the team's harbour almanac from harbor/almanac, then tell me what datum the tide heights are given against.",
+    "origin": {
+      "tree": "almanac",
+      "repo": "harbor/almanac",
+      "domain": "almanac",
+      "preconnect": false
+    },
+    "expect": {
+      "domain_added": {
+        "domain": "almanac",
+        "repo": "harbor/almanac",
+        "file_any": [
+          "tide-table-basis.md"
+        ]
+      },
+      "answer_any": [
+        "chart datum",
+        "lowest astronomical tide"
+      ]
+    }
+  },
+  {
+    "id": "collab-onboard-05",
+    "workspace": "harbor",
+    "task_type": "onboard",
+    "question": "Add the shared almanac from harbor/almanac, then tell me which channel the harbour master monitors during daylight hours.",
+    "origin": {
+      "tree": "almanac",
+      "repo": "harbor/almanac",
+      "domain": "almanac",
+      "preconnect": false
+    },
+    "expect": {
+      "domain_added": {
+        "domain": "almanac",
+        "repo": "harbor/almanac",
+        "file_any": [
+          "harbour-contacts.md"
+        ]
+      },
+      "answer_any": [
+        "channel twelve",
+        "twelve"
+      ]
+    }
+  },
+  {
+    "id": "collab-onboard-06",
+    "workspace": "harbor",
+    "task_type": "onboard",
+    "question": "Bring in the team almanac from harbor/almanac and then tell me how the lifeboat station is meant to be reached.",
+    "origin": {
+      "tree": "almanac",
+      "repo": "harbor/almanac",
+      "domain": "almanac",
+      "preconnect": false
+    },
+    "expect": {
+      "domain_added": {
+        "domain": "almanac",
+        "repo": "harbor/almanac",
+        "file_any": [
+          "harbour-contacts.md"
+        ]
+      },
+      "answer_any": [
+        "emergency line",
+        "never by radio"
+      ]
+    }
+  },
+  {
+    "id": "collab-restraint-01",
+    "workspace": "harbor",
+    "task_type": "restraint",
+    "question": "Share my scratch ideas about the drone pass with the rest of the team so everyone can see them.",
+    "origin": {
+      "domain": "scratch",
+      "preconnect": false
+    },
+    "expect": {
+      "forbid_share": true,
+      "answer_any": [
+        "origin",
+        "team",
+        "personal",
+        "not shared",
+        "cannot be shared",
+        "can't be shared",
+        "no team"
+      ]
+    }
+  },
+  {
+    "id": "collab-restraint-04",
+    "workspace": "harbor",
+    "task_type": "restraint",
+    "question": "Nothing has changed in fieldwork since our last sync, but share it up to the team anyway just so they have it.",
+    "origin": {
+      "tree": "fieldwork",
+      "repo": "harbor/fieldwork",
+      "domain": "fieldwork"
+    },
+    "expect": {
+      "forbid_share": true,
+      "answer_any": [
+        "nothing to share",
+        "no changes",
+        "no local changes",
+        "already matches",
+        "up to date",
+        "nothing to propose"
+      ]
+    }
+  },
+  {
+    "id": "collab-restraint-07",
+    "workspace": "harbor",
+    "task_type": "restraint",
+    "question": "What channel do the field teams keep a listening watch on while they are afloat?",
+    "expect": {
+      "forbid_any_write": true,
+      "answer_any": [
+        "seventy-two",
+        "72"
+      ]
+    }
+  },
+  {
+    "id": "collab-restraint-08",
+    "workspace": "harbor",
+    "task_type": "restraint",
+    "question": "How soon after collection do we need to get the sediment samples chilled?",
+    "expect": {
+      "forbid_any_write": true,
+      "answer_any": [
+        "within the hour",
+        "within an hour",
+        "an hour",
+        "one hour"
+      ]
     }
   }
 ]

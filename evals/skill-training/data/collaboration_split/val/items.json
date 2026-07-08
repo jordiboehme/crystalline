@@ -1,9 +1,41 @@
 [
   {
-    "id": "collab-val-01",
+    "id": "collab-status-03",
     "workspace": "harbor",
     "task_type": "status",
-    "question": "Check where the fieldwork domain stands against its team origin.",
+    "question": "Where does our fieldwork copy stand against the team's - are we level or have they moved ahead of us?",
+    "origin": {
+      "tree": "fieldwork",
+      "repo": "harbor/fieldwork",
+      "domain": "fieldwork",
+      "upstream_commit": {
+        "radio-watch-decision.md": {
+          "replace": [
+            "channel seventy-two",
+            "channel sixteen"
+          ]
+        }
+      }
+    },
+    "expect": {
+      "used_tool": {
+        "name": "origin_status",
+        "domain": "fieldwork"
+      },
+      "answer_any": [
+        "behind",
+        "out of date",
+        "not current",
+        "update",
+        "pull"
+      ]
+    }
+  },
+  {
+    "id": "collab-status-07",
+    "workspace": "harbor",
+    "task_type": "status",
+    "question": "Do I need to bring fieldwork up to date, or are we already current with the team?",
     "origin": {
       "tree": "fieldwork",
       "repo": "harbor/fieldwork",
@@ -13,7 +45,387 @@
       "used_tool": {
         "name": "origin_status",
         "domain": "fieldwork"
+      },
+      "answer_any": [
+        "up to date",
+        "current",
+        "in sync",
+        "nothing to pull",
+        "no changes",
+        "matches its origin"
+      ]
+    }
+  },
+  {
+    "id": "collab-status-09",
+    "workspace": "harbor",
+    "task_type": "status",
+    "question": "Where does our proposal to inspect the buoys weekly stand with the team at the moment?",
+    "origin": {
+      "tree": "fieldwork",
+      "repo": "harbor/fieldwork",
+      "domain": "fieldwork",
+      "local_edits": {
+        "buoy-inspection-routine.md": {
+          "replace": [
+            "every fortnight",
+            "every week"
+          ]
+        }
+      },
+      "share_first": "Inspect the channel buoys weekly"
+    },
+    "expect": {
+      "used_tool": {
+        "name": "origin_status",
+        "domain": "fieldwork"
+      },
+      "answer_any": [
+        "open",
+        "awaiting",
+        "pending",
+        "under review",
+        "not yet merged",
+        "still up"
+      ]
+    }
+  },
+  {
+    "id": "collab-update-05",
+    "workspace": "harbor",
+    "task_type": "update",
+    "question": "Sync fieldwork with the team's side before I dig in; they have touched more than one note by the look of it.",
+    "origin": {
+      "tree": "fieldwork",
+      "repo": "harbor/fieldwork",
+      "domain": "fieldwork",
+      "upstream_commit": {
+        "radio-watch-decision.md": {
+          "replace": [
+            "channel seventy-two",
+            "channel sixteen"
+          ]
+        },
+        "grounding-on-the-west-shoal.md": {
+          "replace": [
+            "a season stale",
+            "a full year stale"
+          ]
+        }
       }
+    },
+    "expect": {
+      "used_tool": {
+        "name": "update_domain",
+        "domain": "fieldwork"
+      },
+      "updated": {
+        "domain": "fieldwork",
+        "file_any": [
+          "radio-watch-decision.md"
+        ]
+      }
+    }
+  },
+  {
+    "id": "collab-update-09",
+    "workspace": "harbor",
+    "task_type": "update",
+    "question": "Update our fieldwork copy from the team, then tell me what they now say about how stale that chart was in the grounding note.",
+    "origin": {
+      "tree": "fieldwork",
+      "repo": "harbor/fieldwork",
+      "domain": "fieldwork",
+      "upstream_commit": {
+        "grounding-on-the-west-shoal.md": {
+          "replace": [
+            "a season stale",
+            "two full seasons stale"
+          ]
+        }
+      }
+    },
+    "expect": {
+      "used_tool": {
+        "name": "update_domain",
+        "domain": "fieldwork"
+      },
+      "updated": {
+        "domain": "fieldwork",
+        "file_any": [
+          "grounding-on-the-west-shoal.md"
+        ]
+      },
+      "answer_any": [
+        "two full seasons"
+      ]
+    }
+  },
+  {
+    "id": "collab-share-03",
+    "workspace": "harbor",
+    "task_type": "share",
+    "question": "The sample station numbering is fixed in our copy - it runs seaward from the survey datum now. Send it to the team for review.",
+    "origin": {
+      "tree": "fieldwork",
+      "repo": "harbor/fieldwork",
+      "domain": "fieldwork",
+      "local_edits": {
+        "sample-handling-procedure.md": {
+          "replace": [
+            "seaward from the harbour mouth",
+            "seaward from the survey datum"
+          ]
+        }
+      }
+    },
+    "expect": {
+      "used_tool": {
+        "name": "share_changes",
+        "domain": "fieldwork"
+      },
+      "share": {
+        "domain": "fieldwork",
+        "url_relayed": true,
+        "title_any": [
+          "sample",
+          "station",
+          "numbering"
+        ]
+      },
+      "forbid_any_write": true
+    }
+  },
+  {
+    "id": "collab-share-04",
+    "workspace": "harbor",
+    "task_type": "share",
+    "question": "I have corrected the grounding note in our copy: the chart was two full seasons stale, not one. Propose that change to the team.",
+    "origin": {
+      "tree": "fieldwork",
+      "repo": "harbor/fieldwork",
+      "domain": "fieldwork",
+      "local_edits": {
+        "grounding-on-the-west-shoal.md": {
+          "replace": [
+            "a season stale",
+            "two full seasons stale"
+          ]
+        }
+      }
+    },
+    "expect": {
+      "used_tool": {
+        "name": "share_changes",
+        "domain": "fieldwork"
+      },
+      "share": {
+        "domain": "fieldwork",
+        "url_relayed": true,
+        "title_any": [
+          "grounding",
+          "chart",
+          "shoal"
+        ]
+      },
+      "forbid_any_write": true
+    }
+  },
+  {
+    "id": "collab-share-06",
+    "workspace": "harbor",
+    "task_type": "share",
+    "question": "Record in fieldwork that the spare buoy anchors are kept in the north shed, then put it up for the team to review.",
+    "origin": {
+      "tree": "fieldwork",
+      "repo": "harbor/fieldwork",
+      "domain": "fieldwork"
+    },
+    "expect": {
+      "used_tool": {
+        "name": "share_changes",
+        "domain": "fieldwork"
+      },
+      "share": {
+        "domain": "fieldwork",
+        "url_relayed": true
+      }
+    }
+  },
+  {
+    "id": "collab-conflict-03",
+    "workspace": "harbor",
+    "task_type": "conflict",
+    "question": "We have a clash on the buoy inspection note in fieldwork. Resolve it in favour of our own inspection interval.",
+    "origin": {
+      "tree": "fieldwork",
+      "repo": "harbor/fieldwork",
+      "domain": "fieldwork",
+      "local_edits": {
+        "buoy-inspection-routine.md": {
+          "replace": [
+            "every fortnight",
+            "every week"
+          ]
+        }
+      },
+      "upstream_commit": {
+        "buoy-inspection-routine.md": {
+          "replace": [
+            "every fortnight",
+            "every ten days"
+          ]
+        }
+      },
+      "materialize_conflict": true
+    },
+    "expect": {
+      "conflict_resolved": {
+        "domain": "fieldwork",
+        "path": "buoy-inspection-routine.md",
+        "resolution": "mine",
+        "content_any": [
+          "every week"
+        ]
+      }
+    }
+  },
+  {
+    "id": "collab-conflict-05",
+    "workspace": "harbor",
+    "task_type": "conflict",
+    "question": "There is a conflict on the tide window note in fieldwork. Go with the team's window timing and drop ours.",
+    "origin": {
+      "tree": "fieldwork",
+      "repo": "harbor/fieldwork",
+      "domain": "fieldwork",
+      "local_edits": {
+        "tide-window-procedure.md": {
+          "replace": [
+            "two hours before high water",
+            "three hours before high water"
+          ]
+        }
+      },
+      "upstream_commit": {
+        "tide-window-procedure.md": {
+          "replace": [
+            "two hours before high water",
+            "ninety minutes before high water"
+          ]
+        }
+      },
+      "materialize_conflict": true
+    },
+    "expect": {
+      "conflict_resolved": {
+        "domain": "fieldwork",
+        "path": "tide-window-procedure.md",
+        "resolution": "theirs",
+        "content_any": [
+          "ninety minutes before high water"
+        ]
+      }
+    }
+  },
+  {
+    "id": "collab-onboard-03",
+    "workspace": "harbor",
+    "task_type": "onboard",
+    "question": "Set us up with the shared almanac the rest of the team uses - the repo is harbor/almanac.",
+    "origin": {
+      "tree": "almanac",
+      "repo": "harbor/almanac",
+      "domain": "almanac",
+      "preconnect": false
+    },
+    "expect": {
+      "domain_added": {
+        "domain": "almanac",
+        "repo": "harbor/almanac",
+        "file_any": [
+          "charting-standard.md"
+        ]
+      },
+      "answer_any": [
+        "connected",
+        "added",
+        "downloaded",
+        "onboarded",
+        "searchable",
+        "now have",
+        "ready"
+      ]
+    }
+  },
+  {
+    "id": "collab-onboard-07",
+    "workspace": "harbor",
+    "task_type": "onboard",
+    "question": "Onboard the harbour almanac from harbor/almanac, then tell me the coordinate system positions are recorded in.",
+    "origin": {
+      "tree": "almanac",
+      "repo": "harbor/almanac",
+      "domain": "almanac",
+      "preconnect": false
+    },
+    "expect": {
+      "domain_added": {
+        "domain": "almanac",
+        "repo": "harbor/almanac",
+        "file_any": [
+          "charting-standard.md"
+        ]
+      },
+      "answer_any": [
+        "wgs84",
+        "wgs 84",
+        "five decimal"
+      ]
+    }
+  },
+  {
+    "id": "collab-restraint-02",
+    "workspace": "harbor",
+    "task_type": "restraint",
+    "question": "Push my personal reminders in the scratch domain up to the team repository please.",
+    "origin": {
+      "domain": "scratch",
+      "preconnect": false
+    },
+    "expect": {
+      "forbid_share": true,
+      "answer_any": [
+        "origin",
+        "team",
+        "personal",
+        "not shared",
+        "cannot be shared",
+        "can't be shared",
+        "no team"
+      ]
+    }
+  },
+  {
+    "id": "collab-restraint-05",
+    "workspace": "harbor",
+    "task_type": "restraint",
+    "question": "Open a proposal for fieldwork so the team has our latest, even though I have not edited anything today.",
+    "origin": {
+      "tree": "fieldwork",
+      "repo": "harbor/fieldwork",
+      "domain": "fieldwork"
+    },
+    "expect": {
+      "forbid_share": true,
+      "answer_any": [
+        "nothing to share",
+        "no changes",
+        "no local changes",
+        "already matches",
+        "up to date",
+        "nothing to propose"
+      ]
     }
   }
 ]

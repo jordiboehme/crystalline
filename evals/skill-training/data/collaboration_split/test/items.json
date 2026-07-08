@@ -1,16 +1,25 @@
 [
   {
-    "id": "collab-smoke-01",
+    "id": "collab-status-04",
     "workspace": "harbor",
     "task_type": "status",
-    "question": "I am about to dig into the fieldwork domain. Is our copy current with the team, or has something landed upstream I should pull first?",
+    "question": "Give me a read on fieldwork before this morning's work - is our copy the same as the team's or do they have newer knowledge than us?",
     "origin": {
       "tree": "fieldwork",
       "repo": "harbor/fieldwork",
       "domain": "fieldwork",
       "upstream_commit": {
-        "storm-surge-readiness.md": {
-          "content": "---\ntype: runbook\ntitle: Storm surge readiness\npermalink: storm-surge-readiness\ntags:\n- fieldwork\n- weather\nstatus: current\nrecorded_at: 2026-07-08\n---\n\nHow the field team prepares when a storm surge is forecast.\n\n- [fact] The team hauls out every skiff once the surge forecast tops one metre above the predicted tide #fieldwork\n- [decision] Fieldwork is stood down for the day the moment a surge warning is issued, no exceptions #fieldwork\n"
+        "tide-window-procedure.md": {
+          "replace": [
+            "two hours before high water",
+            "ninety minutes before high water"
+          ]
+        },
+        "sample-handling-procedure.md": {
+          "replace": [
+            "chilled within the hour",
+            "chilled within ninety minutes"
+          ]
         }
       }
     },
@@ -29,7 +38,41 @@
     }
   },
   {
-    "id": "collab-smoke-02",
+    "id": "collab-status-10",
+    "workspace": "harbor",
+    "task_type": "status",
+    "question": "Has the team acted on the sample-station renumbering I proposed, or is it still waiting?",
+    "origin": {
+      "tree": "fieldwork",
+      "repo": "harbor/fieldwork",
+      "domain": "fieldwork",
+      "local_edits": {
+        "sample-handling-procedure.md": {
+          "replace": [
+            "seaward from the harbour mouth",
+            "seaward from the survey datum"
+          ]
+        }
+      },
+      "share_first": "Number sample stations from the survey datum"
+    },
+    "expect": {
+      "used_tool": {
+        "name": "origin_status",
+        "domain": "fieldwork"
+      },
+      "answer_any": [
+        "open",
+        "awaiting",
+        "pending",
+        "under review",
+        "not yet merged",
+        "still up"
+      ]
+    }
+  },
+  {
+    "id": "collab-update-03",
     "workspace": "harbor",
     "task_type": "update",
     "question": "The team has been busy in fieldwork. Bring our copy up to date with theirs before I start working.",
@@ -57,19 +100,121 @@
     }
   },
   {
-    "id": "collab-smoke-03",
+    "id": "collab-update-07",
     "workspace": "harbor",
-    "task_type": "share",
-    "question": "I just corrected the tide window timing in fieldwork: the survey window opens three hours before high water now, not two. Share that update with the team for review.",
+    "task_type": "update",
+    "question": "I have a local change on the radio watch note that I want to keep. Still, bring down the team's latest fieldwork so I am not building on stale knowledge.",
     "origin": {
       "tree": "fieldwork",
       "repo": "harbor/fieldwork",
       "domain": "fieldwork",
       "local_edits": {
-        "tide-window-procedure.md": {
+        "radio-watch-decision.md": {
           "replace": [
-            "two hours before high water",
-            "three hours before high water"
+            "channel seventy-two",
+            "channel sixteen"
+          ]
+        }
+      },
+      "upstream_commit": {
+        "sample-handling-procedure.md": {
+          "replace": [
+            "chilled within the hour",
+            "chilled within ninety minutes"
+          ]
+        }
+      }
+    },
+    "expect": {
+      "used_tool": {
+        "name": "update_domain",
+        "domain": "fieldwork"
+      },
+      "updated": {
+        "domain": "fieldwork",
+        "file_any": [
+          "sample-handling-procedure.md"
+        ]
+      }
+    }
+  },
+  {
+    "id": "collab-update-10",
+    "workspace": "harbor",
+    "task_type": "update",
+    "question": "Pull the team's latest into fieldwork and tell me what changed about how the sample station numbers are counted.",
+    "origin": {
+      "tree": "fieldwork",
+      "repo": "harbor/fieldwork",
+      "domain": "fieldwork",
+      "upstream_commit": {
+        "sample-handling-procedure.md": {
+          "replace": [
+            "seaward from the harbour mouth",
+            "seaward from the survey datum"
+          ]
+        }
+      }
+    },
+    "expect": {
+      "used_tool": {
+        "name": "update_domain",
+        "domain": "fieldwork"
+      },
+      "updated": {
+        "domain": "fieldwork",
+        "file_any": [
+          "sample-handling-procedure.md"
+        ]
+      },
+      "answer_any": [
+        "survey datum"
+      ]
+    }
+  },
+  {
+    "id": "collab-share-07",
+    "workspace": "harbor",
+    "task_type": "share",
+    "question": "Note in the fieldwork sample procedure that every sample is photographed before it is chilled, then share that change with the team.",
+    "origin": {
+      "tree": "fieldwork",
+      "repo": "harbor/fieldwork",
+      "domain": "fieldwork"
+    },
+    "expect": {
+      "used_tool": {
+        "name": "share_changes",
+        "domain": "fieldwork"
+      },
+      "share": {
+        "domain": "fieldwork",
+        "url_relayed": true
+      }
+    }
+  },
+  {
+    "id": "collab-share-10",
+    "workspace": "harbor",
+    "task_type": "share",
+    "question": "I reworded the grounding note to call it a shifting sandbar. Sync the team's latest fieldwork first, then share mine for review.",
+    "origin": {
+      "tree": "fieldwork",
+      "repo": "harbor/fieldwork",
+      "domain": "fieldwork",
+      "local_edits": {
+        "grounding-on-the-west-shoal.md": {
+          "replace": [
+            "an uncharted bar",
+            "a shifting sandbar"
+          ]
+        }
+      },
+      "upstream_commit": {
+        "buoy-inspection-routine.md": {
+          "replace": [
+            "re-anchored the same day",
+            "re-anchored before nightfall"
           ]
         }
       }
@@ -86,27 +231,27 @@
     }
   },
   {
-    "id": "collab-smoke-04",
+    "id": "collab-conflict-06",
     "workspace": "harbor",
     "task_type": "conflict",
-    "question": "There is a conflict on our tide window procedure in fieldwork after the last team update. Sort it out, keeping our local version of the muster point.",
+    "question": "The grounding note in fieldwork clashes with the team's copy. Settle it by using the team's wording, not ours.",
     "origin": {
       "tree": "fieldwork",
       "repo": "harbor/fieldwork",
       "domain": "fieldwork",
       "local_edits": {
-        "tide-window-procedure.md": {
+        "grounding-on-the-west-shoal.md": {
           "replace": [
-            "north jetty",
-            "east breakwater"
+            "a season stale",
+            "two seasons stale"
           ]
         }
       },
       "upstream_commit": {
-        "tide-window-procedure.md": {
+        "grounding-on-the-west-shoal.md": {
           "replace": [
-            "north jetty",
-            "south slipway"
+            "a season stale",
+            "a full year stale"
           ]
         }
       },
@@ -115,9 +260,163 @@
     "expect": {
       "conflict_resolved": {
         "domain": "fieldwork",
-        "path": "tide-window-procedure.md",
-        "resolution": "mine"
+        "path": "grounding-on-the-west-shoal.md",
+        "resolution": "theirs",
+        "content_any": [
+          "a full year stale"
+        ]
       }
+    }
+  },
+  {
+    "id": "collab-conflict-08",
+    "workspace": "harbor",
+    "task_type": "conflict",
+    "question": "There is a conflict on the buoy inspection note in fieldwork. Our copy says a drifted buoy is re-anchored within the hour, the team says before nightfall. Reconcile the two so both the target and the deadline are kept.",
+    "origin": {
+      "tree": "fieldwork",
+      "repo": "harbor/fieldwork",
+      "domain": "fieldwork",
+      "local_edits": {
+        "buoy-inspection-routine.md": {
+          "replace": [
+            "re-anchored the same day",
+            "re-anchored within the hour"
+          ]
+        }
+      },
+      "upstream_commit": {
+        "buoy-inspection-routine.md": {
+          "replace": [
+            "re-anchored the same day",
+            "re-anchored before nightfall"
+          ]
+        }
+      },
+      "materialize_conflict": true
+    },
+    "expect": {
+      "conflict_resolved": {
+        "domain": "fieldwork",
+        "path": "buoy-inspection-routine.md",
+        "resolution": "merged",
+        "content_any": [
+          "within the hour",
+          "nightfall"
+        ]
+      }
+    }
+  },
+  {
+    "id": "collab-onboard-02",
+    "workspace": "harbor",
+    "task_type": "onboard",
+    "question": "Bring in the team's harbour almanac from harbor/almanac and get its knowledge onto this machine so it is searchable.",
+    "origin": {
+      "tree": "almanac",
+      "repo": "harbor/almanac",
+      "domain": "almanac",
+      "preconnect": false
+    },
+    "expect": {
+      "domain_added": {
+        "domain": "almanac",
+        "repo": "harbor/almanac",
+        "file_any": [
+          "harbour-contacts.md"
+        ]
+      },
+      "answer_any": [
+        "connected",
+        "added",
+        "downloaded",
+        "onboarded",
+        "searchable",
+        "now have",
+        "ready"
+      ]
+    }
+  },
+  {
+    "id": "collab-onboard-08",
+    "workspace": "harbor",
+    "task_type": "onboard",
+    "question": "Connect the team's almanac from harbor/almanac and then tell me what is done to a soundings set before it is filed.",
+    "origin": {
+      "tree": "almanac",
+      "repo": "harbor/almanac",
+      "domain": "almanac",
+      "preconnect": false
+    },
+    "expect": {
+      "domain_added": {
+        "domain": "almanac",
+        "repo": "harbor/almanac",
+        "file_any": [
+          "charting-standard.md"
+        ]
+      },
+      "answer_any": [
+        "chart datum",
+        "reduced to chart datum"
+      ]
+    }
+  },
+  {
+    "id": "collab-restraint-03",
+    "workspace": "harbor",
+    "task_type": "restraint",
+    "question": "Can you propose the scratch notes to the team so they land in the shared record?",
+    "origin": {
+      "domain": "scratch",
+      "preconnect": false
+    },
+    "expect": {
+      "forbid_share": true,
+      "answer_any": [
+        "origin",
+        "team",
+        "personal",
+        "not shared",
+        "cannot be shared",
+        "can't be shared",
+        "no team"
+      ]
+    }
+  },
+  {
+    "id": "collab-restraint-06",
+    "workspace": "harbor",
+    "task_type": "restraint",
+    "question": "Push fieldwork up to the team for me - I know I have not touched it but let us be safe.",
+    "origin": {
+      "tree": "fieldwork",
+      "repo": "harbor/fieldwork",
+      "domain": "fieldwork"
+    },
+    "expect": {
+      "forbid_share": true,
+      "answer_any": [
+        "nothing to share",
+        "no changes",
+        "no local changes",
+        "already matches",
+        "up to date",
+        "nothing to propose"
+      ]
+    }
+  },
+  {
+    "id": "collab-restraint-09",
+    "workspace": "harbor",
+    "task_type": "restraint",
+    "question": "When a channel buoy has drifted off station, how quickly do we re-anchor it?",
+    "expect": {
+      "forbid_any_write": true,
+      "answer_any": [
+        "same day",
+        "the same day"
+      ]
     }
   }
 ]
