@@ -878,7 +878,7 @@
     "id": "aurora-synth-01",
     "workspace": "aurora",
     "task_type": "synthesis",
-    "question": "Our nearest rival just aimed a positioning paper at our buying committee this spring. Remind me exactly which roles make up that committee on our side, and when the paper landed.",
+    "question": "A rival just sent some competitive outreach at the people who sign off on our purchases. Remind me exactly which roles make up that group on our side, and when the rival actually made that move.",
     "expect": {
       "reads": {
         "identifiers": [
