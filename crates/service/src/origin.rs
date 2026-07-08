@@ -342,7 +342,9 @@ mod tests {
         use crystalline_core::config::GlobalConfig;
         let root = GlobalConfig::default().domains_root();
         let folder = default_domain_folder(&root, "brand-knowledge");
-        let s = folder.display().to_string();
+        // Normalise separators so the suffix check holds on Windows, where the
+        // join appends a backslash (`Documents/Crystalline\brand-knowledge`).
+        let s = folder.display().to_string().replace('\\', "/");
         assert!(s.ends_with("Documents/Crystalline/brand-knowledge"), "{s}");
         assert!(!s.starts_with('~'), "{s}");
     }
