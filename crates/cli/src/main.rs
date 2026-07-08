@@ -486,7 +486,28 @@ enum PromptKind {
         /// config path.
         #[arg(long)]
         config: Option<PathBuf>,
+        /// Output format: text, json or copilot.
+        #[arg(long, value_enum)]
+        format: Option<PromptFormat>,
     },
+}
+
+/// How `prompt system` renders its output. `Text` and `Json` are the two
+/// shapes the command always had (`--json` still selects `Json`); `Copilot`
+/// exists because the GitHub Copilot CLI parses a hook's stdout as one JSON
+/// document and silently drops anything else, so the routing prompt must
+/// travel inside an `additionalContext` envelope.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum PromptFormat {
+    /// Plain text, the default.
+    Text,
+    /// The routing JSON `--json` renders.
+    Json,
+    /// One JSON line of session context for a GitHub Copilot CLI
+    /// SessionStart hook: reads the event payload from stdin, prints nothing
+    /// on a resumed session and wraps the routing prompt in
+    /// `{"additionalContext": ...}` otherwise.
+    Copilot,
 }
 
 #[derive(Subcommand, Debug)]
@@ -794,7 +815,8 @@ fn main() -> anyhow::Result<()> {
                 workspace,
                 read_only,
                 config,
-            } => run_prompt(workspace, read_only, config, cli.db, cli.json),
+                format,
+            } => run_prompt(workspace, read_only, config, cli.db, cli.json, format),
         },
         Some(Command::Domain { command }) => run_domain(command, cli.db, cli.json),
         Some(Command::Connect { command }) => on_runtime(move || run_connect(command, cli.json)),
@@ -2009,7 +2031,29 @@ fn run_prompt(
     config_path: Option<PathBuf>,
     db: Option<PathBuf>,
     json_flag: bool,
+    format: Option<PromptFormat>,
 ) -> anyhow::Result<()> {
+    // An explicit --format wins; the global --json keeps selecting the JSON
+    // shape it always has; the default is plain text.
+    let format = match format {
+        Some(f) => f,
+        None if json_flag => PromptFormat::Json,
+        None => PromptFormat::Text,
+    };
+
+    // The copilot format is a SessionStart hook responder, so the event
+    // payload arrives on stdin. A resumed session already carries the earlier
+    // routing block in its transcript, exactly the case the Claude matcher
+    // excludes with `resume`; Copilot's sessionStart has no matcher, so the
+    // suppression lives here instead. Everything about the read is tolerant -
+    // a terminal stdin (someone running the command by hand must not hang),
+    // a read error, empty input or unparseable JSON all mean "fresh start".
+    if format == PromptFormat::Copilot
+        && let Some("resume") = session_start_source().as_deref()
+    {
+        return Ok(());
+    }
+
     // Session-start auto-update: a binary upgraded since the last install
     // refreshes the installed hooks and skills before this session's routing
     // prompt goes out. Cheap when versions match (one small-file read) and
@@ -2058,15 +2102,50 @@ fn run_prompt(
         eprintln!("crystalline prompt system: warning: {w}");
     }
 
-    if json_flag {
-        println!("{}", crystalline_core::render_json(&output));
-    } else {
-        print!("{}", crystalline_core::render_text(&output));
-        for note in &reconcile_notices {
-            println!("{note}");
+    match format {
+        PromptFormat::Json => println!("{}", crystalline_core::render_json(&output)),
+        PromptFormat::Text => {
+            print!("{}", crystalline_core::render_text(&output));
+            for note in &reconcile_notices {
+                println!("{note}");
+            }
+        }
+        PromptFormat::Copilot => {
+            // The notices ride inside the envelope: Copilot parses stdout as
+            // one JSON document, so a bare trailing line would corrupt it.
+            let mut text = crystalline_core::render_text(&output);
+            for note in &reconcile_notices {
+                text.push_str(note);
+                text.push('\n');
+            }
+            println!(
+                "{}",
+                serde_json::to_string(&serde_json::json!({ "additionalContext": text }))?
+            );
         }
     }
     Ok(())
+}
+
+/// The `source` field of the SessionStart payload on stdin, when there is
+/// one to read: `None` when stdin is a terminal (a person at a shell, never
+/// block on them), on any read error and on input that is not the expected
+/// JSON object - every one of those proceeds as a fresh start. The read is
+/// capped at a megabyte like the Stop hook's, so a misbehaving harness
+/// cannot balloon this process.
+fn session_start_source() -> Option<String> {
+    use std::io::Read;
+    let stdin = std::io::stdin();
+    if stdin.is_terminal() {
+        return None;
+    }
+    let mut raw = String::new();
+    stdin.take(1024 * 1024).read_to_string(&mut raw).ok()?;
+    let payload: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    payload
+        .get("source")
+        .and_then(serde_json::Value::as_str)
+        .map(String::from)
 }
 
 fn resolve_format(format: Option<OutputFormat>, json_flag: bool) -> OutputFormat {

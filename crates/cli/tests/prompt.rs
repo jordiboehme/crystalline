@@ -168,6 +168,100 @@ fn prompt_system_output_is_byte_identical_across_separate_invocations() {
     );
 }
 
+/// The copilot format answers a GitHub Copilot CLI SessionStart hook: one
+/// JSON line whose `additionalContext` string carries the same routing
+/// prompt the text format prints.
+#[test]
+fn prompt_copilot_format_matches_snapshot() {
+    let output = Command::cargo_bin("crystalline")
+        .unwrap()
+        .current_dir(fixtures_dir().join("prompt-fixture"))
+        .args([
+            "prompt",
+            "system",
+            "--workspace",
+            "workspace",
+            "--config",
+            "config.yaml",
+            "--format",
+            "copilot",
+        ])
+        .write_stdin(r#"{"source":"startup"}"#)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let line = String::from_utf8(output).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+    let context = parsed["additionalContext"].as_str().unwrap();
+    assert!(
+        !context.is_empty(),
+        "additionalContext must carry the routing prompt"
+    );
+    insta::assert_snapshot!(line);
+}
+
+/// A resumed session already carries the earlier routing block in its
+/// transcript, so the copilot format prints nothing at all for it.
+#[test]
+fn prompt_copilot_format_suppresses_resume() {
+    Command::cargo_bin("crystalline")
+        .unwrap()
+        .current_dir(fixtures_dir().join("prompt-fixture"))
+        .args([
+            "prompt",
+            "system",
+            "--workspace",
+            "workspace",
+            "--config",
+            "config.yaml",
+            "--format",
+            "copilot",
+        ])
+        .write_stdin(r#"{"source":"resume"}"#)
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+}
+
+/// The stdin read is tolerant: an empty payload and a garbage payload both
+/// proceed as a fresh start and emit the full JSON line.
+#[test]
+fn prompt_copilot_format_tolerates_missing_and_garbage_stdin() {
+    for stdin in ["", "not json"] {
+        let output = Command::cargo_bin("crystalline")
+            .unwrap()
+            .current_dir(fixtures_dir().join("prompt-fixture"))
+            .args([
+                "prompt",
+                "system",
+                "--workspace",
+                "workspace",
+                "--config",
+                "config.yaml",
+                "--format",
+                "copilot",
+            ])
+            .write_stdin(stdin)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+
+        let line = String::from_utf8(output).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(line.trim())
+            .unwrap_or_else(|e| panic!("stdin {stdin:?} must still emit one JSON line: {e}"));
+        let context = parsed["additionalContext"].as_str().unwrap();
+        assert!(
+            context.contains("astronomy"),
+            "stdin {stdin:?} must emit the routing prompt naming the fixture domain:\n{context}"
+        );
+    }
+}
+
 /// Bare `crystalline prompt` (no kind) is a missing-subcommand error: clap
 /// prints its standard subcommand help and exits non-zero, never silently
 /// doing nothing.
