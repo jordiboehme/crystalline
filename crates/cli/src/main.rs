@@ -84,8 +84,9 @@ enum Command {
         #[arg(value_enum)]
         harness: install::HarnessKind,
         /// Write into the current repository's harness config (.claude,
-        /// .codex or .agents under the working directory) instead of this
-        /// user's global one. Codex still registers its MCP server per user.
+        /// .codex, .agents or .github under the working directory) instead
+        /// of this user's global one. Codex and Copilot still register their
+        /// MCP server per user.
         #[arg(long)]
         project: bool,
         /// Skip registering the MCP server.

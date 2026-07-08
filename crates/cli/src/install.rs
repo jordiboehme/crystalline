@@ -32,9 +32,17 @@
 //! Presence is decided by command string, ignoring the hook group's matcher,
 //! so the README's hand-written `startup` recipe counts as already installed
 //! (no duplicate is added) and is removed on uninstall like any managed
-//! entry. The MCP registration shells out to the harness's own CLI (`claude`
-//! or `codex`); a missing or failing CLI is never fatal - it prints the
-//! command to run by hand and the rest of the install still proceeds.
+//! entry. The MCP registration shells out to the harness's own CLI (`claude`,
+//! `codex` or `copilot`); a missing or failing CLI is never fatal - it prints
+//! the command to run by hand and the rest of the install still proceeds.
+//!
+//! Hooks come in two styles. Claude Code and Codex share a settings file
+//! with other tools, so their hooks are merged into it under the
+//! foreign-data rule above. The GitHub Copilot CLI instead reads every
+//! `*.json` under its hooks folder, so Crystalline writes a dedicated
+//! `crystalline.json` there: entirely its own by name, created on install
+//! and deleted on uninstall (unless a person added their own entries into
+//! it, which survive like any foreign data).
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -54,6 +62,13 @@ pub(crate) const SESSION_START_COMMAND: &str = "crystalline prompt system";
 /// decided by [`crate::hook`].
 pub(crate) const STOP_COMMAND: &str = "crystalline hook stop";
 
+/// The `SessionStart` command for the GitHub Copilot CLI, which parses a
+/// hook's stdout as one JSON document and drops plain text: the copilot
+/// format wraps the routing prompt in an `additionalContext` envelope and
+/// suppresses itself on a resumed session, standing in for the matcher the
+/// other harnesses get.
+pub(crate) const SESSION_START_COMMAND_COPILOT: &str = "crystalline prompt system --format copilot";
+
 /// The `SessionStart` matcher: re-route on a fresh start, after `/clear` and
 /// after a compaction. `resume` is deliberately excluded, since a resumed
 /// transcript already carries the earlier routing block.
@@ -64,7 +79,7 @@ const SESSION_START_MATCHER: &str = "startup|clear|compact";
 /// is generous headroom, not a real budget.
 const HOOK_TIMEOUT_SECS: u64 = 10;
 
-/// The topical skills copied into a harness for both Claude Code and Codex,
+/// The topical skills copied into every harness's skills folder,
 /// each as `(folder name, embedded SKILL.md)`. Embedded with `include_str!`
 /// so the binary is self-contained and an install from a downloaded release
 /// carries the same skills a clone would. `crystalline-memory` is deliberately
@@ -107,7 +122,7 @@ pub(crate) enum ReconcileMode {
 }
 
 /// Which harness `install`/`uninstall` targets. The `clap::ValueEnum`
-/// spellings are `claude-code` and `codex`.
+/// spellings are `claude-code`, `codex` and `copilot`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum HarnessKind {
     /// Anthropic's Claude Code CLI: hooks in `settings.json`, skills in a
@@ -116,6 +131,19 @@ pub enum HarnessKind {
     /// The Codex CLI: hooks in a dedicated `hooks.json`, skills under
     /// `.agents/skills`.
     Codex,
+    /// The GitHub Copilot CLI: hooks in a wholly Crystalline-owned
+    /// `crystalline.json` under Copilot's hooks folder, skills under
+    /// `.copilot/skills` (user) or `.github/skills` (project).
+    Copilot,
+}
+
+/// How a harness stores its hooks: merged into a shared settings file it
+/// does not own (the foreign-data-preserving group shape) or written into a
+/// dedicated file named for Crystalline (the flat Copilot entry shape).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum HooksStyle {
+    Merged,
+    Owned,
 }
 
 impl HarnessKind {
@@ -126,6 +154,7 @@ impl HarnessKind {
         match self {
             HarnessKind::ClaudeCode => "claude-code",
             HarnessKind::Codex => "codex",
+            HarnessKind::Copilot => "copilot",
         }
     }
 
@@ -134,6 +163,7 @@ impl HarnessKind {
         match self {
             HarnessKind::ClaudeCode => "Claude Code",
             HarnessKind::Codex => "Codex",
+            HarnessKind::Copilot => "GitHub Copilot CLI",
         }
     }
 
@@ -142,6 +172,15 @@ impl HarnessKind {
         match self {
             HarnessKind::ClaudeCode => "claude",
             HarnessKind::Codex => "codex",
+            HarnessKind::Copilot => "copilot",
+        }
+    }
+
+    /// Which of the two hook storage styles this harness uses.
+    pub(crate) fn hooks_style(self) -> HooksStyle {
+        match self {
+            HarnessKind::ClaudeCode | HarnessKind::Codex => HooksStyle::Merged,
+            HarnessKind::Copilot => HooksStyle::Owned,
         }
     }
 }
@@ -195,6 +234,24 @@ pub(crate) fn harness_paths(harness: HarnessKind, project: bool) -> HarnessPaths
             settings: PathBuf::from(".codex/hooks.json"),
             skills_dir: PathBuf::from(".agents/skills"),
         },
+        (HarnessKind::Copilot, false) => HarnessPaths {
+            settings: copilot_home().join("hooks").join("crystalline.json"),
+            skills_dir: copilot_home().join("skills"),
+        },
+        (HarnessKind::Copilot, true) => HarnessPaths {
+            settings: PathBuf::from(".github/hooks/crystalline.json"),
+            skills_dir: PathBuf::from(".github/skills"),
+        },
+    }
+}
+
+/// Copilot's home folder: `$COPILOT_HOME` when it is set and non-empty,
+/// `~/.copilot` otherwise, matching how the Copilot CLI itself resolves its
+/// hooks and skills locations.
+fn copilot_home() -> PathBuf {
+    match std::env::var_os("COPILOT_HOME") {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => config::expand_tilde("~/.copilot"),
     }
 }
 
@@ -358,6 +415,117 @@ pub(crate) fn remove_managed_hooks(root: &mut Map<String, Value>) -> bool {
     changed
 }
 
+// --- Copilot-owned hooks file --------------------------------------------------
+
+/// One managed flat entry in the Copilot-owned hooks file. PascalCase event
+/// names select Copilot's VS Code compatible payloads (snake_case fields),
+/// the same shape Claude Code and Codex send, so `crystalline hook stop`
+/// serves all three harnesses unchanged. `command` is Copilot's
+/// cross-platform field and `timeoutSec` its spelling of the shared timeout.
+fn owned_entry(command: &str) -> Value {
+    json!({ "type": "command", "command": command, "timeoutSec": HOOK_TIMEOUT_SECS })
+}
+
+/// Whether a flat entry is one Crystalline manages, by its `command` string.
+/// The plain routing command (without `--format copilot`) is claimed too: in
+/// a Copilot hooks file its text output would be silently dropped, so a
+/// hand-written plain entry is broken and ours to remove.
+fn is_managed_owned_entry(entry: &Value) -> bool {
+    matches!(
+        entry.get("command").and_then(Value::as_str),
+        Some(c) if c == SESSION_START_COMMAND_COPILOT
+            || c == SESSION_START_COMMAND
+            || c == STOP_COMMAND
+    )
+}
+
+/// Whether the parsed owned file already runs `command` under `event`, by
+/// exact match on each flat entry's `command` field. Also the doctor's
+/// presence predicate for the owned style.
+pub(crate) fn owned_hook_present(root: &Map<String, Value>, event: &str, command: &str) -> bool {
+    root.get("hooks")
+        .and_then(Value::as_object)
+        .and_then(|hooks| hooks.get(event))
+        .and_then(Value::as_array)
+        .is_some_and(|entries| {
+            entries
+                .iter()
+                .any(|e| e.get("command").and_then(Value::as_str) == Some(command))
+        })
+}
+
+/// Append one managed flat entry when its command is not already present.
+/// Same contract as [`ensure_group`]: returns whether the root changed, and
+/// a `hooks` value or event value of an unexpected JSON type is left
+/// entirely untouched, reported as no change.
+fn ensure_owned_entry(root: &mut Map<String, Value>, event: &str, command: &str) -> bool {
+    let hooks_entry = root
+        .entry("hooks")
+        .or_insert_with(|| Value::Object(Map::new()));
+    let Some(hooks) = hooks_entry.as_object_mut() else {
+        return false;
+    };
+    let event_entry = hooks
+        .entry(event)
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let Some(entries) = event_entry.as_array_mut() else {
+        return false;
+    };
+    if entries
+        .iter()
+        .any(|e| e.get("command").and_then(Value::as_str) == Some(command))
+    {
+        return false;
+    }
+    entries.push(owned_entry(command));
+    true
+}
+
+/// Merge the managed entries plus the file's `version` marker into the owned
+/// root, returning whether anything changed. Idempotent like
+/// [`add_managed_hooks`]. `version` is only ever written when absent, so a
+/// value a person set by hand is not fought over.
+pub(crate) fn add_owned_hooks(root: &mut Map<String, Value>) -> bool {
+    let mut changed = false;
+    if !root.contains_key("version") {
+        root.insert("version".to_string(), json!(1));
+        changed = true;
+    }
+    changed |= ensure_owned_entry(root, "SessionStart", SESSION_START_COMMAND_COPILOT);
+    changed |= ensure_owned_entry(root, "Stop", STOP_COMMAND);
+    changed
+}
+
+/// Strip every managed flat entry from the owned root, pruning an event
+/// array emptied of its last entry and the `hooks` object once it holds
+/// nothing, returning whether anything changed. Entries a person added into
+/// our file survive, like any foreign data.
+pub(crate) fn remove_owned_hooks(root: &mut Map<String, Value>) -> bool {
+    let Some(hooks) = root.get_mut("hooks").and_then(Value::as_object_mut) else {
+        return false;
+    };
+    let mut changed = false;
+    let events: Vec<String> = hooks.keys().cloned().collect();
+    for event in events {
+        let Some(entries) = hooks.get_mut(&event).and_then(Value::as_array_mut) else {
+            continue;
+        };
+        let before = entries.len();
+        entries.retain(|e| !is_managed_owned_entry(e));
+        if entries.len() == before {
+            continue;
+        }
+        changed = true;
+        if entries.is_empty() {
+            hooks.remove(&event);
+        }
+    }
+    if changed && hooks.is_empty() {
+        root.remove("hooks");
+    }
+    changed
+}
+
 // --- settings file IO --------------------------------------------------------
 
 /// Read a settings file into its top-level object. A missing file is the empty
@@ -432,8 +600,8 @@ fn run_cli(program: &str, args: &[&str]) -> CliRun {
 }
 
 /// The `mcp add` argument vector for a harness. Claude Code takes an explicit
-/// `--scope`; Codex registers MCP servers per user only, so `--project` still
-/// lands globally (called out in the printed notice).
+/// `--scope`; Codex and Copilot register MCP servers per user only, so
+/// `--project` still lands globally (called out in the printed notice).
 fn mcp_add_args(harness: HarnessKind, project: bool) -> Vec<String> {
     let args: Vec<&str> = match harness {
         HarnessKind::ClaudeCode => {
@@ -449,6 +617,9 @@ fn mcp_add_args(harness: HarnessKind, project: bool) -> Vec<String> {
             ]
         }
         HarnessKind::Codex => vec!["mcp", "add", "crystalline", "--", "crystalline", "mcp"],
+        // The same stdio form as Codex, kept as its own arm so the two can
+        // diverge without surprises.
+        HarnessKind::Copilot => vec!["mcp", "add", "crystalline", "--", "crystalline", "mcp"],
     };
     args.into_iter().map(String::from).collect()
 }
@@ -525,8 +696,26 @@ fn uninstall_mcp(harness: HarnessKind) -> McpReport {
 
 // --- hooks install / uninstall -----------------------------------------------
 
-/// Merge the managed hooks into the settings file, writing only on change.
-fn install_hooks(path: &Path) -> anyhow::Result<HooksReport> {
+/// Install the managed hooks for a harness, dispatching on its storage
+/// style.
+fn install_hooks(harness: HarnessKind, path: &Path) -> anyhow::Result<HooksReport> {
+    match harness.hooks_style() {
+        HooksStyle::Merged => install_merged_hooks(path),
+        HooksStyle::Owned => install_owned_hooks(path),
+    }
+}
+
+/// Remove the managed hooks for a harness, dispatching on its storage style.
+fn uninstall_hooks(harness: HarnessKind, path: &Path) -> anyhow::Result<HooksReport> {
+    match harness.hooks_style() {
+        HooksStyle::Merged => uninstall_merged_hooks(path),
+        HooksStyle::Owned => uninstall_owned_hooks(path),
+    }
+}
+
+/// Merge the managed hooks into the shared settings file, writing only on
+/// change.
+fn install_merged_hooks(path: &Path) -> anyhow::Result<HooksReport> {
     let mut root = read_settings(path)?;
     let had_session_start = hook_present(&root, "SessionStart", SESSION_START_COMMAND);
     let had_stop = hook_present(&root, "Stop", STOP_COMMAND);
@@ -546,14 +735,83 @@ fn install_hooks(path: &Path) -> anyhow::Result<HooksReport> {
     })
 }
 
-/// Remove the managed hooks from the settings file, writing only on change.
-fn uninstall_hooks(path: &Path) -> anyhow::Result<HooksReport> {
+/// Remove the managed hooks from the shared settings file, writing only on
+/// change.
+fn uninstall_merged_hooks(path: &Path) -> anyhow::Result<HooksReport> {
     let mut root = read_settings(path)?;
     let had_session_start = hook_present(&root, "SessionStart", SESSION_START_COMMAND);
     let had_stop = hook_present(&root, "Stop", STOP_COMMAND);
     let changed = remove_managed_hooks(&mut root);
     if changed {
         write_settings(path, &root)?;
+    }
+    Ok(HooksReport {
+        path: path.display().to_string(),
+        session_start: if had_session_start {
+            "removed"
+        } else {
+            "absent"
+        },
+        stop: if had_stop { "removed" } else { "absent" },
+        written: changed,
+    })
+}
+
+/// Write the managed entries into the Copilot-owned hooks file, writing only
+/// on change. The file is Crystalline's by name, but an unparseable one is
+/// still a hard error naming the path rather than an overwrite: a person may
+/// have edited it.
+fn install_owned_hooks(path: &Path) -> anyhow::Result<HooksReport> {
+    let mut root = read_settings(path)?;
+    let had_session_start =
+        owned_hook_present(&root, "SessionStart", SESSION_START_COMMAND_COPILOT);
+    let had_stop = owned_hook_present(&root, "Stop", STOP_COMMAND);
+    let changed = add_owned_hooks(&mut root);
+    if changed {
+        write_settings(path, &root)?;
+    }
+    Ok(HooksReport {
+        path: path.display().to_string(),
+        session_start: if had_session_start {
+            "already-present"
+        } else {
+            "added"
+        },
+        stop: if had_stop { "already-present" } else { "added" },
+        written: changed,
+    })
+}
+
+/// Strip the managed entries from the Copilot-owned hooks file. Install
+/// created the file, so once nothing but the version marker remains it is an
+/// empty husk that would read as installed forever and is deleted outright,
+/// its hooks folder pruned when that leaves it empty. Anything a person
+/// added into the file keeps it alive via a rewrite instead, like any
+/// foreign data.
+fn uninstall_owned_hooks(path: &Path) -> anyhow::Result<HooksReport> {
+    let mut root = read_settings(path)?;
+    let had_session_start =
+        owned_hook_present(&root, "SessionStart", SESSION_START_COMMAND_COPILOT);
+    let had_stop = owned_hook_present(&root, "Stop", STOP_COMMAND);
+    let changed = remove_owned_hooks(&mut root);
+    if changed {
+        if root.keys().all(|k| k == "version") {
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(anyhow::anyhow!("could not remove {}: {e}", path.display()));
+                }
+            }
+            if let Some(dir) = path.parent()
+                && let Ok(mut entries) = std::fs::read_dir(dir)
+                && entries.next().is_none()
+            {
+                let _ = std::fs::remove_dir(dir);
+            }
+        } else {
+            write_settings(path, &root)?;
+        }
     }
     Ok(HooksReport {
         path: path.display().to_string(),
@@ -1073,7 +1331,7 @@ pub fn run_install(opts: InstallOptions, json: bool) -> anyhow::Result<()> {
     let hooks = if opts.skip_hooks {
         None
     } else {
-        Some(install_hooks(&paths.settings)?)
+        Some(install_hooks(opts.harness, &paths.settings)?)
     };
     let mut new_records = None;
     let skills = if opts.skip_skills {
@@ -1110,6 +1368,20 @@ pub fn run_install(opts: InstallOptions, json: bool) -> anyhow::Result<()> {
                         .to_string(),
                 );
             }
+        }
+    }
+    if opts.harness == HarnessKind::Copilot && opts.project {
+        if !opts.skip_mcp {
+            notices.push(
+                "GitHub Copilot registers MCP servers for your user, so the crystalline server was added globally even with --project."
+                    .to_string(),
+            );
+        }
+        if !opts.skip_hooks || !opts.skip_skills {
+            notices.push(
+                "Copilot loads repository hooks and skills only in a trusted folder. Confirm the trust prompt for this repository so the .github hooks and skills can load."
+                    .to_string(),
+            );
         }
     }
 
@@ -1251,7 +1523,7 @@ pub fn run_uninstall(
         .cloned();
 
     let mcp = uninstall_mcp(harness);
-    let hooks = uninstall_hooks(&paths.settings)?;
+    let hooks = uninstall_hooks(harness, &paths.settings)?;
     let prior_skills = prior.as_ref().map(|p| p.skills.as_slice()).unwrap_or(&[]);
     let skills = uninstall_skills(&paths.skills_dir, prior_skills, force)?;
 
@@ -1384,7 +1656,7 @@ pub(crate) fn auto_reconcile(current_version: &str, cwd: &Path) -> Vec<String> {
             continue;
         };
         let paths = harness_paths(harness, entry.scope == "project");
-        match reconcile_entry(entry, &paths) {
+        match reconcile_entry(harness, entry, &paths) {
             Ok(()) => {
                 notices.push(format!(
                     "[crystalline] Refreshed the {} install ({} -> {current_version}); updated skills load fresh next session.",
@@ -1411,9 +1683,13 @@ pub(crate) fn auto_reconcile(current_version: &str, cwd: &Path) -> Vec<String> {
 /// Re-run one receipt entry's hooks and skills parts. Project-scope paths
 /// from `harness_paths` are relative to the working directory, which is
 /// exactly the recorded project directory whenever this is called.
-fn reconcile_entry(entry: &mut receipt::InstallRecord, paths: &HarnessPaths) -> anyhow::Result<()> {
+fn reconcile_entry(
+    harness: HarnessKind,
+    entry: &mut receipt::InstallRecord,
+    paths: &HarnessPaths,
+) -> anyhow::Result<()> {
     if entry.parts.hooks {
-        install_hooks(&paths.settings)?;
+        install_hooks(harness, &paths.settings)?;
     }
     if entry.parts.skills {
         let (_, records) = reconcile_skills(&paths.skills_dir, &entry.skills, ReconcileMode::Auto)?;
@@ -1428,6 +1704,7 @@ fn harness_from_id(id: &str) -> Option<HarnessKind> {
     match id {
         "claude-code" => Some(HarnessKind::ClaudeCode),
         "codex" => Some(HarnessKind::Codex),
+        "copilot" => Some(HarnessKind::Copilot),
         _ => None,
     }
 }
@@ -1817,6 +2094,108 @@ mod tests {
             );
             assert!(err.contains(name), "the error names the path: {err}");
         }
+    }
+
+    // --- the Copilot-owned hooks file ----------------------------------------
+
+    #[test]
+    fn add_owned_hooks_creates_the_exact_file_shape_and_is_idempotent() {
+        let mut root = Map::new();
+        assert!(add_owned_hooks(&mut root), "first add changes the root");
+        // The exact managed shape: the version marker, both PascalCase
+        // events, flat command entries with Copilot's field spellings and no
+        // matcher anywhere.
+        assert_eq!(root["version"], 1);
+        let session_start = &root["hooks"]["SessionStart"][0];
+        assert_eq!(session_start["type"], "command");
+        assert_eq!(session_start["command"], SESSION_START_COMMAND_COPILOT);
+        assert_eq!(session_start["timeoutSec"], 10);
+        assert!(session_start.get("matcher").is_none());
+        assert!(session_start.get("hooks").is_none(), "entries are flat");
+        let stop = &root["hooks"]["Stop"][0];
+        assert_eq!(stop["type"], "command");
+        assert_eq!(stop["command"], STOP_COMMAND);
+        assert_eq!(stop["timeoutSec"], 10);
+        assert!(owned_hook_present(
+            &root,
+            "SessionStart",
+            SESSION_START_COMMAND_COPILOT
+        ));
+        assert!(owned_hook_present(&root, "Stop", STOP_COMMAND));
+        assert!(
+            !add_owned_hooks(&mut root),
+            "second add must not change the root"
+        );
+    }
+
+    #[test]
+    fn add_owned_hooks_keeps_a_hand_set_version_value() {
+        let mut root = root(json!({ "version": 2 }));
+        assert!(add_owned_hooks(&mut root));
+        assert_eq!(root["version"], 2, "a present version is not fought over");
+    }
+
+    #[test]
+    fn remove_owned_hooks_strips_ours_and_keeps_user_entries() {
+        let mut root = Map::new();
+        add_owned_hooks(&mut root);
+        // A user entry inside our file, under a managed event and under an
+        // event of their own.
+        root["hooks"]["Stop"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({ "type": "command", "command": "my-own-stop" }));
+        root["hooks"].as_object_mut().unwrap().insert(
+            "PreToolUse".to_string(),
+            json!([{ "type": "command", "command": "echo hi" }]),
+        );
+
+        assert!(remove_owned_hooks(&mut root));
+        // Our emptied SessionStart is pruned; the user's data survives.
+        assert!(root["hooks"].get("SessionStart").is_none());
+        assert_eq!(root["hooks"]["Stop"][0]["command"], "my-own-stop");
+        assert_eq!(root["hooks"]["PreToolUse"][0]["command"], "echo hi");
+    }
+
+    #[test]
+    fn remove_owned_hooks_claims_a_plain_session_start_command() {
+        // A hand-written plain routing command is broken in a Copilot file
+        // (its text output is dropped), so removal claims it as ours.
+        let mut root = root(json!({
+            "version": 1,
+            "hooks": {
+                "SessionStart": [ { "type": "command", "command": SESSION_START_COMMAND } ]
+            }
+        }));
+        assert!(remove_owned_hooks(&mut root));
+        assert!(root.get("hooks").is_none(), "the emptied hooks object goes");
+    }
+
+    #[test]
+    fn add_owned_hooks_leaves_a_foreign_typed_hooks_value_untouched() {
+        // A scalar hooks value is foreign data of an unexpected type: adding
+        // the version marker still counts as a change, but the hooks value
+        // itself is never coerced.
+        let mut root = root(json!({ "hooks": "not an object" }));
+        assert!(add_owned_hooks(&mut root), "the version marker is added");
+        assert_eq!(root["hooks"], "not an object");
+        assert!(!owned_hook_present(&root, "Stop", STOP_COMMAND));
+    }
+
+    #[test]
+    fn owned_hook_present_is_an_exact_command_match() {
+        let mut root = Map::new();
+        add_owned_hooks(&mut root);
+        assert!(!owned_hook_present(
+            &root,
+            "SessionStart",
+            SESSION_START_COMMAND
+        ));
+        assert!(!owned_hook_present(
+            &root,
+            "SessionStart",
+            "crystalline prompt system --format copilot --extra"
+        ));
     }
 
     // --- skill reconcile ------------------------------------------------

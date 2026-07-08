@@ -48,8 +48,8 @@ impl Default for Receipt {
 /// later version tell "old but untouched" from "user-edited".
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct InstallRecord {
-    /// The harness id, `"claude-code"` or `"codex"` (the same spelling
-    /// `HarnessKind::id` produces).
+    /// The harness id, `"claude-code"`, `"codex"` or `"copilot"` (the same
+    /// spelling `HarnessKind::id` produces).
     pub(crate) harness: String,
     /// `"user"` or `"project"`.
     pub(crate) scope: String,

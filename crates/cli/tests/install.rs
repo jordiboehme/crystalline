@@ -1,18 +1,18 @@
 //! Integration tests for `crystalline install` / `crystalline uninstall`,
 //! spawning the real `crystalline` binary. Every scenario needs control over
-//! the harness paths (`~/.claude`, `~/.codex`, `~/.agents`), reachable only
-//! through `HOME` and the XDG base directories, so the same isolation
-//! technique `crates/cli/tests/hook.rs` uses applies here: the environment is
-//! set per child with `assert_cmd`'s `.env`, never a process-global
-//! `std::env::set_var`.
+//! the harness paths (`~/.claude`, `~/.codex`, `~/.agents`, `~/.copilot`),
+//! reachable only through `HOME` and the XDG base directories, so the same
+//! isolation technique `crates/cli/tests/hook.rs` uses applies here: the
+//! environment is set per child with `assert_cmd`'s `.env`, never a
+//! process-global `std::env::set_var`.
 //!
-//! The harness CLIs (`claude`, `codex`) are never the real tools. Each test
-//! that exercises MCP registration drops a tiny shell shim into a bin folder,
-//! makes it executable, points the child's `PATH` at that folder alone and
-//! reads back the log of arguments the shim was called with. A shim exits 1
-//! for `mcp get` (so the install always proceeds to `mcp add`) and 0 for
-//! everything else. The missing-CLI test points `PATH` at an empty folder so
-//! no shim is found at all.
+//! The harness CLIs (`claude`, `codex`, `copilot`) are never the real tools.
+//! Each test that exercises MCP registration drops a tiny shell shim into a
+//! bin folder, makes it executable, points the child's `PATH` at that folder
+//! alone and reads back the log of arguments the shim was called with. A shim
+//! exits 1 for `mcp get` (so the install always proceeds to `mcp add`) and 0
+//! for everything else. The missing-CLI test points `PATH` at an empty folder
+//! so no shim is found at all.
 //!
 //! Unix-only: `etcetera`'s base-directory resolution on Windows does not
 //! honor these variables the way the XDG strategy the isolation relies on
@@ -38,6 +38,9 @@ fn install_cmd(home: &Path, bin_dir: &Path) -> Command {
         .env("XDG_CONFIG_HOME", home.join("config"))
         .env("XDG_STATE_HOME", home.join("state"))
         .env("XDG_CACHE_HOME", home.join("cache"))
+        // A developer machine's own Copilot home must never leak into a
+        // test's path resolution.
+        .env_remove("COPILOT_HOME")
         .env("PATH", bin_dir);
     cmd
 }
@@ -391,6 +394,254 @@ fn codex_writes_hooks_json_and_agents_skills_with_a_trust_notice() {
     assert!(
         logged.contains("mcp add crystalline -- crystalline mcp"),
         "codex add form: {logged}"
+    );
+}
+
+/// The Copilot-owned hooks file under an isolated `home`.
+fn copilot_hooks_file(home: &Path) -> PathBuf {
+    home.join(".copilot").join("hooks").join("crystalline.json")
+}
+
+/// A managed skill's SKILL.md under the Copilot user skills folder.
+fn copilot_skill(home: &Path, name: &str) -> PathBuf {
+    home.join(".copilot")
+        .join("skills")
+        .join(name)
+        .join("SKILL.md")
+}
+
+/// The exact managed content of the Copilot-owned hooks file: the version
+/// marker, PascalCase event names (they select the snake_case payloads
+/// `crystalline hook stop` already parses) and flat command entries in
+/// Copilot's field spellings.
+fn copilot_managed_hooks() -> Value {
+    json!({
+        "version": 1,
+        "hooks": {
+            "SessionStart": [
+                { "type": "command", "command": "crystalline prompt system --format copilot", "timeoutSec": 10 }
+            ],
+            "Stop": [
+                { "type": "command", "command": "crystalline hook stop", "timeoutSec": 10 }
+            ]
+        }
+    })
+}
+
+#[test]
+fn copilot_writes_an_owned_hooks_file_and_copilot_skills() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let bin_dir = work.path().join("bin");
+    let log = work.path().join("copilot.log");
+    write_shim(&bin_dir, "copilot", &log);
+
+    let out = install_cmd(&home, &bin_dir)
+        .args(["install", "copilot"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "install must succeed");
+
+    // The owned file carries exactly the managed shape, nothing else.
+    let hooks = read_json(&copilot_hooks_file(&home));
+    assert_eq!(hooks, copilot_managed_hooks(), "crystalline.json shape");
+
+    // All four skills land under ~/.copilot/skills.
+    for name in [
+        "crystalline-routing",
+        "crystalline-capture",
+        "crystalline-schema",
+        "crystalline-collaboration",
+    ] {
+        assert!(
+            copilot_skill(&home, name).exists(),
+            "skill {name} installed"
+        );
+    }
+
+    // MCP registration uses the stdio `--` form, at user level.
+    let logged = read_log(&log);
+    assert!(
+        logged.contains("mcp get crystalline"),
+        "get first: {logged}"
+    );
+    assert!(
+        logged.contains("mcp add crystalline -- crystalline mcp"),
+        "copilot add form: {logged}"
+    );
+}
+
+#[test]
+fn a_second_copilot_install_is_a_byte_identical_no_op() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let bin_dir = work.path().join("bin");
+    let log = work.path().join("copilot.log");
+    write_shim(&bin_dir, "copilot", &log);
+
+    install_cmd(&home, &bin_dir)
+        .args(["install", "copilot"])
+        .assert()
+        .success();
+    let after_first = std::fs::read(copilot_hooks_file(&home)).unwrap();
+
+    install_cmd(&home, &bin_dir)
+        .args(["install", "copilot"])
+        .assert()
+        .success();
+    let after_second = std::fs::read(copilot_hooks_file(&home)).unwrap();
+
+    assert_eq!(
+        after_first, after_second,
+        "a re-run must not rewrite the owned hooks file"
+    );
+}
+
+#[test]
+fn copilot_uninstall_deletes_an_untouched_owned_file_but_keeps_user_entries() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let bin_dir = work.path().join("bin");
+    let log = work.path().join("copilot.log");
+    write_shim(&bin_dir, "copilot", &log);
+
+    // Round one: an untouched owned file disappears entirely, its emptied
+    // hooks folder with it.
+    install_cmd(&home, &bin_dir)
+        .args(["install", "copilot"])
+        .assert()
+        .success();
+    install_cmd(&home, &bin_dir)
+        .args(["uninstall", "copilot"])
+        .assert()
+        .success();
+    assert!(
+        !copilot_hooks_file(&home).exists(),
+        "an untouched owned file is deleted"
+    );
+    assert!(
+        !home.join(".copilot").join("hooks").exists(),
+        "the emptied hooks folder is pruned"
+    );
+
+    // Round two: a user entry added into our file keeps it alive.
+    install_cmd(&home, &bin_dir)
+        .args(["install", "copilot"])
+        .assert()
+        .success();
+    let path = copilot_hooks_file(&home);
+    let mut root = read_json(&path);
+    root["hooks"]["Stop"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({ "type": "command", "command": "my-own-stop" }));
+    std::fs::write(&path, serde_json::to_string_pretty(&root).unwrap()).unwrap();
+
+    install_cmd(&home, &bin_dir)
+        .args(["uninstall", "copilot"])
+        .assert()
+        .success();
+    let after = read_json(&path);
+    assert_eq!(
+        after,
+        json!({
+            "version": 1,
+            "hooks": { "Stop": [ { "type": "command", "command": "my-own-stop" } ] }
+        }),
+        "only the user's entry survives"
+    );
+}
+
+#[test]
+fn copilot_project_scope_writes_under_dot_github() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let bin_dir = work.path().join("bin");
+    let log = work.path().join("copilot.log");
+    write_shim(&bin_dir, "copilot", &log);
+    let project = work.path().join("repo");
+    std::fs::create_dir_all(&project).unwrap();
+
+    let out = install_cmd(&home, &bin_dir)
+        .current_dir(&project)
+        .args(["install", "copilot", "--project"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    // Hooks and skills land under the project's .github, nothing in home.
+    assert_eq!(
+        read_json(
+            &project
+                .join(".github")
+                .join("hooks")
+                .join("crystalline.json")
+        ),
+        copilot_managed_hooks()
+    );
+    assert!(
+        project
+            .join(".github")
+            .join("skills")
+            .join("crystalline-routing")
+            .join("SKILL.md")
+            .exists(),
+        "project skills under .github/skills"
+    );
+    assert!(
+        !copilot_hooks_file(&home).exists(),
+        "nothing is written into the user home under --project"
+    );
+
+    // Copilot has no project MCP scope and gates repository hooks and
+    // skills behind folder trust; both notices are printed.
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains("added globally even with --project"),
+        "the user-level MCP notice is printed: {stdout}"
+    );
+    assert!(
+        stdout.contains("trusted folder"),
+        "the trust notice is printed: {stdout}"
+    );
+    assert!(
+        read_log(&log).contains("mcp add crystalline -- crystalline mcp"),
+        "the add form carries no scope: {}",
+        read_log(&log)
+    );
+}
+
+#[test]
+fn copilot_home_env_var_relocates_the_user_install() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let bin_dir = work.path().join("bin");
+    let log = work.path().join("copilot.log");
+    write_shim(&bin_dir, "copilot", &log);
+    let copilot_home = work.path().join("relocated-copilot");
+
+    install_cmd(&home, &bin_dir)
+        .env("COPILOT_HOME", &copilot_home)
+        .args(["install", "copilot"])
+        .assert()
+        .success();
+
+    assert_eq!(
+        read_json(&copilot_home.join("hooks").join("crystalline.json")),
+        copilot_managed_hooks(),
+        "hooks land under COPILOT_HOME"
+    );
+    assert!(
+        copilot_home
+            .join("skills")
+            .join("crystalline-routing")
+            .join("SKILL.md")
+            .exists(),
+        "skills land under COPILOT_HOME"
+    );
+    assert!(
+        !home.join(".copilot").exists(),
+        "nothing is written under ~/.copilot when COPILOT_HOME is set"
     );
 }
 
@@ -843,6 +1094,97 @@ fn prompt_system_reconciles_an_install_from_another_version() {
         !stdout.contains("[crystalline]"),
         "a matching version reconciles nothing: {stdout}"
     );
+}
+
+#[test]
+fn copilot_receipt_entry_records_harness_copilot() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let bin_dir = work.path().join("bin");
+    let log = work.path().join("copilot.log");
+    write_shim(&bin_dir, "copilot", &log);
+
+    install_cmd(&home, &bin_dir)
+        .args(["install", "copilot"])
+        .assert()
+        .success();
+
+    let receipt = read_json(&receipt_file(&home));
+    let entry = &receipt["installs"][0];
+    assert_eq!(entry["harness"], "copilot");
+    assert_eq!(entry["scope"], "user");
+    assert_eq!(
+        entry["parts"],
+        json!({ "mcp": true, "hooks": true, "skills": true })
+    );
+    assert_eq!(
+        entry["skills"].as_array().unwrap().len(),
+        4,
+        "all four managed skills recorded"
+    );
+
+    install_cmd(&home, &bin_dir)
+        .args(["uninstall", "copilot"])
+        .assert()
+        .success();
+    let receipt = read_json(&receipt_file(&home));
+    assert!(
+        receipt["installs"].as_array().unwrap().is_empty(),
+        "uninstall prunes the entry"
+    );
+}
+
+/// The copilot flavor of the reconcile test doubles as the notice-flow test
+/// for the copilot prompt format: an upgrade replays the hooks part (the
+/// deleted owned file comes back in the managed shape) and the reconcile
+/// notice rides inside the single JSON document, never beside it.
+#[test]
+fn prompt_system_reconciles_a_copilot_install_from_another_version() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let bin_dir = work.path().join("bin");
+    let log = work.path().join("copilot.log");
+    write_shim(&bin_dir, "copilot", &log);
+
+    install_cmd(&home, &bin_dir)
+        .args(["install", "copilot"])
+        .assert()
+        .success();
+
+    // Simulate the aftermath of an upgrade: an older binary wrote this
+    // install and its hooks file has since gone missing.
+    std::fs::remove_file(copilot_hooks_file(&home)).unwrap();
+    tamper_receipt(&home, |receipt| {
+        receipt["installs"][0]["version"] = json!("0.0.1");
+    });
+
+    let out = install_cmd(&home, &bin_dir)
+        .args(["prompt", "system", "--format", "copilot"])
+        .write_stdin(r#"{"source":"startup"}"#)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "the hook path must succeed");
+
+    // The whole stdout is one JSON document; the reconcile notice sits
+    // inside the envelope.
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let parsed: Value = serde_json::from_str(stdout.trim())
+        .expect("copilot hook stdout must be a single JSON document");
+    let context = parsed["additionalContext"].as_str().unwrap();
+    assert!(
+        context.contains("[crystalline]"),
+        "the reconcile notice rides inside the envelope: {context}"
+    );
+
+    // The owned hooks file is back in the managed shape and the receipt is
+    // stamped current.
+    assert_eq!(
+        read_json(&copilot_hooks_file(&home)),
+        copilot_managed_hooks(),
+        "the hooks part was replayed"
+    );
+    let receipt = read_json(&receipt_file(&home));
+    assert_eq!(receipt["installs"][0]["version"], env!("CARGO_PKG_VERSION"));
 }
 
 #[test]
