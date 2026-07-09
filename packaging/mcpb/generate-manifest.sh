@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # Generates a manifest.json for one platform of the Crystalline MCP Bundle
-# (.mcpb). The release workflow calls this once per platform, then packs the
-# staged directory with the `@anthropic-ai/mcpb` CLI.
+# (.mcpb) and stages the bundle icon next to it. The release workflow calls
+# this once per platform, then packs the staged directory with the
+# `@anthropic-ai/mcpb` CLI.
 #
 # Usage: generate-manifest.sh <platform> <version> <outdir>
 #   platform  one of macos-arm64, windows-amd64, linux-amd64, linux-arm64
 #   version   release version without a leading v, e.g. 0.2.0
-#   outdir    directory manifest.json is written into (created if missing)
+#   outdir    directory manifest.json and icon.png are written into
+#             (created if missing)
 set -euo pipefail
 
 usage() {
@@ -98,6 +100,7 @@ cat >"$manifest_path" <<JSON
   },
   "homepage": "https://github.com/jordiboehme/crystalline",
   "support": "https://github.com/jordiboehme/crystalline/issues",
+  "icon": "icon.png",
   "license": "AGPL-3.0-or-later",
   "keywords": ["knowledge", "memory", "agent", "mcp", "markdown"],
   "server": {
@@ -179,5 +182,7 @@ if ! jq . "$manifest_path" >/dev/null; then
     echo "error: generated manifest is not valid JSON: $manifest_path" >&2
     exit 1
 fi
+
+cp "$repo_root/assets/crystalline.png" "$outdir/icon.png"
 
 echo "wrote $manifest_path"
