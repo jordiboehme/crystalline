@@ -12,8 +12,8 @@ name = "crystalline"
 path = "src/main.rs"
 
 [package.metadata.deb]
-maintainer = "Jordi Boehme <jordi@boehme-lopez.de>"
-copyright = "2026, Jordi Boehme <jordi@boehme-lopez.de>"
+maintainer = "Jordi Böhme <jordi@boehme-lopez.de>"
+copyright = "2026, Jordi Böhme <jordi@boehme-lopez.de>"
 license-file = ["../../LICENSE", "4"]
 section = "utils"
 priority = "optional"

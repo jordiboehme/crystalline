@@ -53,6 +53,8 @@ There is no rustup, so the `rust-toolchain.toml` pin (channel 1.96.1) is not enf
 - Commit after each completed milestone or task
 - Use the latest stable versions of dependencies and standards; verify on crates.io rather than assuming
 - docs/deployment.md holds the deployment documentation: every scenario (text plus one mermaid chart per scenario), the container guide, the environment variable reference and read-only serving; the README keeps a Deployment section with a one-line-per-scenario table linking into it. Any change that adds or alters a deployment mode (new serve flag, new image variant, new compose example, new transport) must update docs/deployment.md and the README table in the same change
+- Store every implementation plan in plans/ with a dated filename before starting work
+- Delegate implementation to subagents with the model matched to task complexity: opus for design-heavy or intricate work, sonnet for routine or mechanical work. The orchestrator reviews, gates and commits
 
 ## Known upstream workarounds
 
