@@ -154,14 +154,28 @@ pub fn read_lock_info() -> Option<LockInfo> {
 /// which is the signal that ownership is takeable. A daemon older than this
 /// binary is displaced first (graceful shutdown, then `None`), so the caller
 /// proceeds exactly as if no daemon ran and the next spawn runs the new
-/// version.
+/// version. A thin wrapper over [`try_attach_reporting`] for callers that do
+/// not need the displacement flag.
 pub async fn try_attach() -> Option<Connection> {
-    let info = read_lock_info()?;
+    try_attach_reporting().await.0
+}
+
+/// As [`try_attach`], additionally reporting whether this call itself
+/// displaced an older daemon (the `Displace` arm ran and `displace` returned
+/// true). `ensure_daemon`'s readiness poll needs this to tell "no daemon yet,
+/// still starting" apart from "no daemon because this very poll iteration
+/// just tore one down", which calls for a re-spawn rather than another wait.
+pub async fn try_attach_reporting() -> (Option<Connection>, bool) {
+    let Some(info) = read_lock_info() else {
+        return (None, false);
+    };
     if !process_alive(info.pid) {
-        return None;
+        return (None, false);
     }
     if attach_policy(&info.version, crystalline_core::VERSION) == AttachPolicy::Displace {
-        let sock = config::service_sock_path().ok()?;
+        let Some(sock) = config::service_sock_path().ok() else {
+            return (None, false);
+        };
         tracing::info!(
             "displacing crystalline daemon v{} (pid {}) in favor of v{}",
             info.version,
@@ -169,7 +183,7 @@ pub async fn try_attach() -> Option<Connection> {
             crystalline_core::VERSION
         );
         if displace(&sock, info.pid).await {
-            return None;
+            return (None, true);
         }
         // The wait ran out. Another client may have finished the takeover
         // in the meantime (its bridge respawns a daemon the moment the old
@@ -186,7 +200,7 @@ pub async fn try_attach() -> Option<Connection> {
             }
         }
     }
-    connect_socket().await
+    (connect_socket().await, false)
 }
 
 /// Connect to the daemon socket at its configured path.
@@ -255,9 +269,11 @@ async fn displace(sock: &Path, pid: u32) -> bool {
     {
         return false;
     }
-    // Read the ack best-effort, then wait for the process to leave. A
-    // graceful exit drains active sessions first, which takes several
-    // seconds with bridges attached, so the window is generous.
+    // Read the ack best-effort, then wait for the process to leave. The
+    // daemon exits promptly after the ack - it does not drain active
+    // sessions, it cancels them, and bridges resync and answer their
+    // orphaned requests with a retry error - so the generous window here
+    // tolerates OS process teardown, not a session drain.
     let mut buf = [0u8; 256];
     let _ = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf)).await;
     for _ in 0..240 {
@@ -289,10 +305,25 @@ pub async fn ensure_daemon(
         anyhow::bail!("no Crystalline daemon is running; start one with `crystalline serve`");
     }
     spawn_daemon(db, config_path, read_only)?;
-    // Poll readiness: lock record present and socket connectable.
+    // Poll readiness: lock record present and socket connectable. Another
+    // client's lingering old-binary bridge can be reconnecting during this
+    // same takeover window: it reads the empty lock this call's displacement
+    // (if any) left behind, spawns a daemon from its own old binary and that
+    // daemon can win the version-blind `acquire_ownership` race before this
+    // call's own spawn lands. `try_attach_reporting` surfaces an in-poll
+    // displacement so this loop re-drives `spawn_daemon` instead of waiting
+    // out the budget behind a daemon it just tore down again; bounded to 3
+    // re-spawns so a pathological interleaving of respawning bridges cannot
+    // spawn-storm within the 15s budget.
+    let mut respawns = 0u32;
     for _ in 0..300 {
-        if let Some(conn) = try_attach().await {
+        let (conn, displaced) = try_attach_reporting().await;
+        if let Some(conn) = conn {
             return Ok(conn);
+        }
+        if displaced && respawns < 3 {
+            respawns += 1;
+            spawn_daemon(db, config_path, read_only)?;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -535,5 +566,175 @@ mod tests {
         server.abort();
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    // `try_attach_reporting` tests below. A true two-version end-to-end is
+    // impossible in a single build: `crystalline_core::VERSION` is a
+    // compile-time constant, so one test binary can never hold two different
+    // versions of itself. These fabricate the lock record's version string
+    // directly (older, or the binary's own) against a scripted daemon on a
+    // scratch socket instead, the same substitution `displace_*` above makes
+    // for the daemon process itself.
+
+    /// Guards `HOME`/`XDG_*_HOME` for the two tests below: `try_attach_reporting`
+    /// resolves the real `crystalline_core::config::state_dir()` through
+    /// these, and cargo runs test functions from this file on multiple
+    /// threads, so both tests take this lock for their duration to avoid
+    /// observing each other's env var state. The same pattern
+    /// `crates/core/tests/config.rs` uses for `CRYSTALLINE_MODELS_DIR`.
+    static STATE_DIR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Points `HOME`/`XDG_*_HOME` at a fresh scratch directory for the
+    /// duration of one test, restoring whatever the surrounding environment
+    /// had on drop. A short `/tmp/cq-...` path rather than
+    /// `tempfile::tempdir()`'s deeper one: the socket bound under it must stay
+    /// within the ~104 byte unix socket path limit on macOS, the same reason
+    /// the CLI integration tests' `Env` helper uses a short base.
+    struct ScratchHome {
+        dir: PathBuf,
+        previous: Vec<(&'static str, Option<String>)>,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl ScratchHome {
+        fn new(tag: &str) -> ScratchHome {
+            let guard = STATE_DIR_ENV_LOCK.lock().unwrap();
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let dir = PathBuf::from("/tmp").join(format!("cq-{tag}-{nanos}"));
+            std::fs::create_dir_all(dir.join("config")).unwrap();
+            std::fs::create_dir_all(dir.join("state")).unwrap();
+            std::fs::create_dir_all(dir.join("cache")).unwrap();
+            let vars = [
+                "HOME",
+                "XDG_CONFIG_HOME",
+                "XDG_STATE_HOME",
+                "XDG_CACHE_HOME",
+            ];
+            let previous = vars.iter().map(|v| (*v, std::env::var(v).ok())).collect();
+            unsafe {
+                std::env::set_var("HOME", &dir);
+                std::env::set_var("XDG_CONFIG_HOME", dir.join("config"));
+                std::env::set_var("XDG_STATE_HOME", dir.join("state"));
+                std::env::set_var("XDG_CACHE_HOME", dir.join("cache"));
+            }
+            // `state_dir()` itself never creates its directory (only
+            // `acquire_ownership` does, which these tests bypass), so the
+            // lock file's parent must exist before it is written below.
+            std::fs::create_dir_all(config::state_dir().unwrap()).unwrap();
+            ScratchHome {
+                dir,
+                previous,
+                _guard: guard,
+            }
+        }
+    }
+
+    impl Drop for ScratchHome {
+        fn drop(&mut self) {
+            for (var, value) in &self.previous {
+                unsafe {
+                    match value {
+                        Some(v) => std::env::set_var(var, v),
+                        None => std::env::remove_var(var),
+                    }
+                }
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// An old-version lock record whose pid is a real, killable child: the
+    /// Displace arm shuts it down, the pid goes away and the call reports a
+    /// completed displacement with no connection, exactly the case
+    /// `ensure_daemon`'s readiness poll must react to by re-spawning.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn try_attach_reporting_reports_a_completed_displacement() {
+        let home = ScratchHome::new("try-attach-old");
+        let sock = config::service_sock_path().unwrap();
+        let name = socket_name(&sock).unwrap();
+        let listener = ListenerOptions::new().name(name).create_tokio().unwrap();
+
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+
+        let lock_path = config::service_lock_path().unwrap();
+        let info = LockInfo {
+            pid,
+            socket_path: sock.display().to_string(),
+            version: "0.0.1".to_string(),
+            started_at: chrono::Utc::now().to_rfc3339(),
+        };
+        std::fs::write(&lock_path, serde_json::to_string(&info).unwrap()).unwrap();
+
+        let server = tokio::spawn(async move {
+            let mut stream = listener.accept().await.unwrap();
+            let _ = read_mode_line(&mut stream).await;
+            let mut sink = [0u8; 256];
+            let _ = stream.read(&mut sink).await;
+            stream.write_all(b"{\"ok\":true}\n").await.unwrap();
+            stream.flush().await.unwrap();
+        });
+        let killer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let _ = child.kill();
+            let _ = child.wait();
+        });
+
+        let (conn, displaced) = try_attach_reporting().await;
+        assert!(
+            conn.is_none(),
+            "the displaced daemon's socket is gone; nothing to attach to yet"
+        );
+        assert!(displaced, "the Displace arm ran and the pid went away");
+
+        server.await.unwrap();
+        killer.await.unwrap();
+        drop(home);
+    }
+
+    /// A lock record at this binary's own version never reaches the Displace
+    /// arm, so a live stub socket just attaches and reports no displacement.
+    /// The lock's pid is this test process itself (always alive), which
+    /// stands in for a live daemon without spawning a child.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn try_attach_reporting_does_not_report_when_attaching() {
+        let home = ScratchHome::new("try-attach-current");
+        let sock = config::service_sock_path().unwrap();
+        let name = socket_name(&sock).unwrap();
+        let listener = ListenerOptions::new().name(name).create_tokio().unwrap();
+
+        let lock_path = config::service_lock_path().unwrap();
+        let info = LockInfo {
+            pid: std::process::id(),
+            socket_path: sock.display().to_string(),
+            version: crystalline_core::VERSION.to_string(),
+            started_at: chrono::Utc::now().to_rfc3339(),
+        };
+        std::fs::write(&lock_path, serde_json::to_string(&info).unwrap()).unwrap();
+
+        let server = tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+
+        let (conn, displaced) = try_attach_reporting().await;
+        assert!(
+            conn.is_some(),
+            "a live stub socket at the own version attaches"
+        );
+        assert!(!displaced, "attaching never runs the Displace arm");
+
+        drop(conn);
+        server.await.unwrap();
+        drop(home);
     }
 }
