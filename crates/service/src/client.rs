@@ -72,11 +72,34 @@ fn preinit_probe_reply(line: &str) -> Option<String> {
     Some(reply.to_string())
 }
 
+/// Build a JSON-RPC error response to the `initialize` request in `init_line`,
+/// answering it with `err_text` when the embedded startup fails before rmcp
+/// ever takes over stdio. Without this the client would see nothing but a
+/// closed pipe; the TypeScript SDK's negotiation window reads a mid-handshake
+/// close as an unrecoverable network error and never retries, so a readable
+/// `initialize` failure is strictly better than dying silently. Returns `None`
+/// when the line carries no id to answer (malformed JSON, or a notification),
+/// in which case the caller skips the write and just propagates the error.
+fn initialize_error_reply(init_line: &str, err_text: &str) -> Option<String> {
+    let msg: Value = serde_json::from_str(init_line).ok()?;
+    let id = msg.get("id")?;
+    let reply = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": -32000,
+            "message": format!("crystalline mcp failed to start: {err_text}"),
+        },
+    });
+    Some(reply.to_string())
+}
+
 /// An [`AsyncRead`] wrapper that yields a buffered `prefix` slice before
-/// delegating to `inner`. Used by [`run_embedded_stdio`] to hand rmcp the
-/// `initialize` line that was already read off stdin during the pre-init
-/// probe drain, together with anything the underlying `BufReader` had
-/// buffered past it.
+/// delegating to `inner`. [`run_mcp`] builds one after the pre-init probe
+/// drain to re-front the `initialize` line it already read off stdin, together
+/// with anything the underlying `BufReader` had buffered past it, so the
+/// serving path (the daemon relay or the embedded rmcp server) sees the
+/// `initialize` as its first line with no special replay.
 struct Prefixed<R> {
     prefix: Vec<u8>,
     inner: R,
@@ -144,24 +167,89 @@ pub async fn run_mcp(
     config_path: Option<&Path>,
     read_only: bool,
 ) -> anyhow::Result<()> {
-    if embedded {
-        return run_embedded_stdio(db, config_path, read_only).await;
-    }
-    // Log to stderr from the start: the relay's takeover and reconnect
-    // notices must be visible in the harness's server log, not swallowed.
+    // Log to stderr from the start, for both modes: the relay's takeover and
+    // reconnect notices and any embedded startup failure must be visible in the
+    // harness's server log, not swallowed.
     init_tracing();
-    // `read_only` is forwarded only to a daemon this call spawns; attaching to
-    // an already-running daemon uses that daemon's own mode.
-    match ensure_daemon(true, db, config_path, read_only).await {
-        Ok(conn) => {
-            let stream = conn.into_mcp().await?;
-            pump_stdio(stream, db, config_path, read_only).await
-        }
-        Err(e) => {
-            tracing::warn!("no daemon available ({e}); running embedded");
-            run_embedded_stdio(db, config_path, read_only).await
+
+    // Answering the version-negotiation probe (Claude Desktop chat mode's
+    // `server/discover`, see [`preinit_probe_reply`]) needs only stdin and
+    // stdout, so drive the drain concurrently with daemon acquisition: the
+    // probe is answered in milliseconds while a cold daemon spawns in parallel,
+    // instead of the client waiting out the whole startup for its reply. A
+    // transport close during that window is a terminal error the SDK never
+    // retries, so a slow start is survivable but an exit here is not. Embedded
+    // mode has no daemon half; it only drains.
+    let mut stdout = tokio::io::stdout();
+    let mut reader = BufReader::new(tokio::io::stdin());
+    let (drained, daemon) = if embedded {
+        (drain_preinit_probes(&mut reader, &mut stdout).await, None)
+    } else {
+        // `read_only` is forwarded only to a daemon this call spawns; attaching
+        // to an already-running daemon uses that daemon's own mode.
+        let (drained, daemon) = tokio::join!(
+            drain_preinit_probes(&mut reader, &mut stdout),
+            ensure_daemon(true, db, config_path, read_only),
+        );
+        (drained, Some(daemon))
+    };
+
+    // Stdin EOF before any `initialize` means the client left mid-window; a
+    // daemon this call spawned staying up is fine by design, so exit cleanly.
+    // A real drain I/O error propagates.
+    let Some(init_line) = drained? else {
+        return Ok(());
+    };
+    // Re-front the drained `initialize` (plus anything buffered past it) so the
+    // serving path reads it as its first stdin line with no special replay.
+    let primed = prime_reader(&init_line, reader);
+
+    // A daemon is up: relay through it. A failed `mcp` handshake falls through
+    // to the embedded path rather than propagating, so an unreachable daemon
+    // still yields a working in-process server instead of a mid-window close.
+    if let Some(daemon) = daemon {
+        match daemon {
+            Ok(conn) => match conn.into_mcp().await {
+                Ok(stream) => return pump_stdio(stream, primed, db, config_path, read_only).await,
+                Err(e) => tracing::warn!("daemon MCP handshake failed ({e}); running embedded"),
+            },
+            Err(e) => tracing::warn!("no daemon available ({e}); running embedded"),
         }
     }
+
+    // Embedded path: the explicit flag, or a daemon that could not be reached.
+    // A terminal startup failure (lock held, config or store error) happens
+    // before rmcp answers anything, so reply to the held `initialize` with a
+    // JSON-RPC error rather than closing stdio, which the negotiation window
+    // reads as an unrecoverable network error. The process still exits non-zero
+    // (stderr carries the chain for the Desktop log).
+    match run_embedded_stdio(primed, db, config_path, read_only).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            if let Some(reply) = initialize_error_reply(&init_line, &format!("{e:#}")) {
+                let _ = stdout.write_all(reply.as_bytes()).await;
+                let _ = stdout.write_all(b"\n").await;
+                let _ = stdout.flush().await;
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Re-front the drained `initialize` line ahead of stdin: the prefix is the
+/// line, a newline and whatever the `BufReader` buffered past it, the inner is
+/// the raw stdin. See [`Prefixed`].
+fn prime_reader(
+    init_line: &str,
+    reader: BufReader<tokio::io::Stdin>,
+) -> Prefixed<tokio::io::Stdin> {
+    let buffered = reader.buffer().to_vec();
+    let inner = reader.into_inner();
+    let mut prefix = Vec::with_capacity(init_line.len() + 1 + buffered.len());
+    prefix.extend_from_slice(init_line.as_bytes());
+    prefix.push(b'\n');
+    prefix.extend_from_slice(&buffered);
+    Prefixed { prefix, inner }
 }
 
 /// How one relay session over a daemon socket ended.
@@ -363,14 +451,18 @@ where
 /// goes away mid-session. Gives up after several consecutive reconnects that
 /// never manage to serve a line, so a crash-looping daemon fails the bridge
 /// loudly instead of spinning forever.
-async fn pump_stdio(
+async fn pump_stdio<R>(
     stream: IpcStream,
+    reader: R,
     db: Option<&Path>,
     config_path: Option<&Path>,
     read_only: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<()>
+where
+    R: AsyncRead + Unpin,
+{
     let mut relay = RelayState::default();
-    let mut stdin = BufReader::new(tokio::io::stdin()).lines();
+    let mut stdin = BufReader::new(reader).lines();
     let mut stdout = tokio::io::stdout();
     let mut session = Session::new(stream);
     let mut fruitless_reconnects = 0u32;
@@ -415,14 +507,22 @@ async fn pump_stdio(
     }
 }
 
-/// The full in-process stack over stdio. Takes the lock; refuses if held.
-/// The effective mode is the explicit flag or `service.read_only`.
-async fn run_embedded_stdio(
+/// The full in-process stack over stdio. Takes the lock; refuses if held. The
+/// effective mode is the explicit flag or `service.read_only`. `reader` is the
+/// primed stdin [`run_mcp`] already fronted with the drained `initialize`, so
+/// this path never touches the pre-init probe itself; it hands the reader
+/// straight to `rmcp::serve_server`. A startup error returned here reaches
+/// `run_mcp` before rmcp ever answers, which is where the terminal-failure
+/// `initialize` reply is written.
+async fn run_embedded_stdio<R>(
+    reader: R,
     db: Option<&Path>,
     config_path: Option<&Path>,
     read_only: bool,
-) -> anyhow::Result<()> {
-    init_tracing();
+) -> anyhow::Result<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
     let ownership = acquire_ownership()
         .map_err(|e| anyhow::anyhow!("cannot run an embedded MCP server: {e}"))?;
     let loaded = overlay::load(config_path)?;
@@ -456,28 +556,8 @@ async fn run_embedded_stdio(
     engine.refresh_routing_cache().await;
 
     let server = McpServer::new(engine);
-    // Drain any pre-`initialize` probe (Claude Desktop chat mode's
-    // `server/discover`) before handing stdin to rmcp: see
-    // [`preinit_probe_reply`] for why. We keep the same `BufReader` across
-    // the drain and rmcp handoff so bytes buffered past the probe are not
-    // lost.
-    let mut stdout = tokio::io::stdout();
-    let mut reader = BufReader::new(tokio::io::stdin());
-    let Some(init_line) = drain_preinit_probes(&mut reader, &mut stdout).await? else {
-        drop(ownership);
-        return Ok(());
-    };
-    let buffered = reader.buffer().to_vec();
-    let stdin = reader.into_inner();
-    let mut prefix = Vec::with_capacity(init_line.len() + 1 + buffered.len());
-    prefix.extend_from_slice(init_line.as_bytes());
-    prefix.push(b'\n');
-    prefix.extend_from_slice(&buffered);
-    let primed = Prefixed {
-        prefix,
-        inner: stdin,
-    };
-    let running = rmcp::serve_server(server, (primed, stdout)).await?;
+    let stdout = tokio::io::stdout();
+    let running = rmcp::serve_server(server, (reader, stdout)).await?;
     let _ = running.waiting().await;
     drop(ownership);
     Ok(())
@@ -1264,5 +1344,94 @@ mod tests {
             relay.init_request.is_none() && !relay.outstanding.contains_key("0"),
             "the probe polluted relay state"
         );
+    }
+
+    #[test]
+    fn initialize_error_reply_builds_a_response_for_the_initialize_id() {
+        // A numeric id is echoed exactly and the message carries the error text.
+        let reply = initialize_error_reply(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+            "another Crystalline instance owns the index (pid 42)",
+        )
+        .expect("an initialize carrying an id is answered");
+        let v: Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(v["id"], serde_json::json!(1));
+        assert_eq!(v["error"]["code"], serde_json::json!(-32000));
+        let message = v["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("crystalline mcp failed to start"),
+            "{message}"
+        );
+        assert!(
+            message.contains("another Crystalline instance owns the index (pid 42)"),
+            "{message}"
+        );
+
+        // A string id round-trips verbatim.
+        let reply = initialize_error_reply(
+            r#"{"jsonrpc":"2.0","id":"init-7","method":"initialize"}"#,
+            "boom",
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(v["id"], serde_json::json!("init-7"));
+    }
+
+    #[test]
+    fn initialize_error_reply_skips_lines_without_an_id() {
+        // Malformed JSON has no id to answer.
+        assert!(initialize_error_reply("not json at all", "boom").is_none());
+        // A notification (no id field) has nothing to reply to.
+        assert!(
+            initialize_error_reply(
+                r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+                "boom",
+            )
+            .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn primed_reader_hands_relay_loop_the_initialize_then_follow_up() {
+        // The primed reader carries the drained `initialize` line as its prefix
+        // and whatever the client sent next in its inner reader. Fed through
+        // `BufReader::new(reader).lines()` exactly as `pump_stdio` does, the
+        // relay must forward `initialize` first and the follow-up next, proving
+        // the handoff preserves ordering with no special replay.
+        let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+        let follow: &[u8] = b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n";
+        let mut prefix = Vec::with_capacity(init.len() + 1);
+        prefix.extend_from_slice(init.as_bytes());
+        prefix.push(b'\n');
+        let primed = Prefixed {
+            prefix,
+            inner: follow,
+        };
+        let mut stdin = BufReader::new(primed).lines();
+
+        let (bridge_side, daemon_side) = tokio::io::duplex(4096);
+        let daemon = tokio::spawn(async move {
+            let (read, _write) = tokio::io::split(daemon_side);
+            let mut lines = BufReader::new(read).lines();
+            let first = lines.next_line().await.unwrap().unwrap();
+            let second = lines.next_line().await.unwrap().unwrap();
+            (first, second)
+        });
+
+        let mut relay = RelayState::default();
+        let mut stdout = Vec::new();
+        let mut session = Session::new(bridge_side);
+        let (end, _) = relay_loop(&mut relay, &mut stdin, &mut stdout, &mut session)
+            .await
+            .unwrap();
+        assert_eq!(end, SessionEnd::StdinClosed);
+
+        let (first, second) = daemon.await.unwrap();
+        assert!(first.contains("\"initialize\""), "{first}");
+        assert!(second.contains("tools/list"), "{second}");
+        // The relay recorded the primed initialize as the handshake, so a later
+        // daemon restart can replay it.
+        assert!(relay.init_request.as_ref().unwrap().contains("initialize"));
+        assert_eq!(relay.init_id, Some(serde_json::json!(1)));
     }
 }
