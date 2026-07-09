@@ -582,6 +582,9 @@ mod tests {
     /// threads, so both tests take this lock for their duration to avoid
     /// observing each other's env var state. The same pattern
     /// `crates/core/tests/config.rs` uses for `CRYSTALLINE_MODELS_DIR`.
+    /// `cfg(unix)` like the two tests that use it, so the Windows build does
+    /// not carry it as dead code.
+    #[cfg(unix)]
     static STATE_DIR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Points `HOME`/`XDG_*_HOME` at a fresh scratch directory for the
@@ -590,12 +593,14 @@ mod tests {
     /// `tempfile::tempdir()`'s deeper one: the socket bound under it must stay
     /// within the ~104 byte unix socket path limit on macOS, the same reason
     /// the CLI integration tests' `Env` helper uses a short base.
+    #[cfg(unix)]
     struct ScratchHome {
         dir: PathBuf,
         previous: Vec<(&'static str, Option<String>)>,
         _guard: std::sync::MutexGuard<'static, ()>,
     }
 
+    #[cfg(unix)]
     impl ScratchHome {
         fn new(tag: &str) -> ScratchHome {
             let guard = STATE_DIR_ENV_LOCK.lock().unwrap();
@@ -632,6 +637,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     impl Drop for ScratchHome {
         fn drop(&mut self) {
             for (var, value) in &self.previous {
