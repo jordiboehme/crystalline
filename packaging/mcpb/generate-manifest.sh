@@ -57,7 +57,7 @@ esac
 # Author identity: prefer the workspace Cargo.toml's [workspace.package]
 # authors field (a TOML array of "Name <email>" strings, first entry wins),
 # fall back to the maintainer identity when the field is absent.
-author_name="Jordi Böhme"
+author_name="Jordi Boehme"
 author_email="jordi@boehme-lopez.de"
 cargo_toml="$repo_root/Cargo.toml"
 

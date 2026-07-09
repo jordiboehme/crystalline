@@ -10,7 +10,7 @@ members = [
 
 [workspace.package]
 version = "0.7.2"
-authors = ["Jordi Böhme <jordi@boehme-lopez.de>"]
+authors = ["Jordi Boehme <jordi@boehme-lopez.de>"]
 edition = "2024"
 license = "AGPL-3.0-or-later"
 rust-version = "1.96"
