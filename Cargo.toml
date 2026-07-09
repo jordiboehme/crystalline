@@ -27,7 +27,7 @@ crystalline-service = { path = "crates/service" }
 
 clap = { version = "4.6.1", features = ["derive"] }
 tokio = { version = "1.52.3", features = ["full"] }
-rmcp = "2.1.0"
+rmcp = "2.2.0"
 turso = "0.6.1"
 candle-core = "0.11.0"
 candle-nn = "0.11.0"
