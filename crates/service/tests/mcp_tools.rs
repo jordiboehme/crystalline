@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use crystalline_core::config::{DomainEntry, GlobalConfig};
+use crystalline_core::config::{DomainEntry, GitHubConfig, GlobalConfig};
 use crystalline_index::TursoStore;
 use crystalline_service::Engine;
 use crystalline_service::mcp::McpServer;
@@ -805,4 +805,260 @@ async fn write_engram_accepts_metadata_as_a_json_encoded_string() {
     .await
     .unwrap_err();
     assert!(err.contains("must be an object"), "unexpected error: {err}");
+}
+
+/// The locked MCP tool annotation table: one row per tool, each a tuple of
+/// (name, title, read_only_hint, destructive_hint, idempotent_hint,
+/// open_world_hint). A hint of `None` means the attribute is deliberately
+/// absent from the wire (destructive and idempotent are omitted on the read
+/// tools, where they are meaningless per the MCP spec). This is the source of
+/// truth the tests below lock the router against.
+type AnnotationRow = (
+    &'static str,
+    &'static str,
+    Option<bool>,
+    Option<bool>,
+    Option<bool>,
+    Option<bool>,
+);
+
+const EXPECTED_ANNOTATIONS: [AnnotationRow; 18] = [
+    (
+        "write_engram",
+        "Capture engram",
+        Some(false),
+        Some(false),
+        Some(false),
+        Some(false),
+    ),
+    (
+        "read_engram",
+        "Read engram",
+        Some(true),
+        None,
+        None,
+        Some(false),
+    ),
+    (
+        "edit_engram",
+        "Edit engram",
+        Some(false),
+        Some(true),
+        Some(false),
+        Some(false),
+    ),
+    (
+        "move_engram",
+        "Move engram",
+        Some(false),
+        Some(true),
+        Some(false),
+        Some(false),
+    ),
+    (
+        "delete_engram",
+        "Delete engram",
+        Some(false),
+        Some(true),
+        Some(true),
+        Some(false),
+    ),
+    (
+        "search_engrams",
+        "Search engrams",
+        Some(true),
+        None,
+        None,
+        Some(false),
+    ),
+    (
+        "build_context",
+        "Build context",
+        Some(true),
+        None,
+        None,
+        Some(false),
+    ),
+    (
+        "recent_activity",
+        "Recent activity",
+        Some(true),
+        None,
+        None,
+        Some(false),
+    ),
+    (
+        "list_domains",
+        "List domains",
+        Some(true),
+        None,
+        None,
+        Some(false),
+    ),
+    (
+        "browse_domain",
+        "Browse domain",
+        Some(true),
+        None,
+        None,
+        Some(false),
+    ),
+    (
+        "validate_engrams",
+        "Validate engrams",
+        Some(true),
+        None,
+        None,
+        Some(false),
+    ),
+    (
+        "infer_schema",
+        "Infer schema",
+        Some(true),
+        None,
+        None,
+        Some(false),
+    ),
+    (
+        "configure",
+        "Configure Crystalline",
+        Some(false),
+        Some(true),
+        Some(false),
+        Some(true),
+    ),
+    (
+        "add_domain",
+        "Add domain",
+        Some(false),
+        Some(false),
+        Some(false),
+        Some(true),
+    ),
+    (
+        "share_changes",
+        "Share changes",
+        Some(false),
+        Some(false),
+        Some(false),
+        Some(true),
+    ),
+    (
+        "update_domain",
+        "Update domain",
+        Some(false),
+        Some(false),
+        Some(true),
+        Some(true),
+    ),
+    (
+        "origin_status",
+        "Origin status",
+        Some(true),
+        None,
+        None,
+        Some(true),
+    ),
+    (
+        "resolve_conflict",
+        "Resolve conflict",
+        Some(false),
+        Some(true),
+        Some(false),
+        Some(false),
+    ),
+];
+
+/// A GitHub-enabled server with no domains, built solely to inspect the tool
+/// surface and its annotations. GitHub on plus read-write makes all 18 tools
+/// visible through `get_tool`; read-only narrows it to the read tools plus
+/// `update_domain` and `origin_status`.
+async fn annotation_server(read_only: bool) -> McpServer {
+    let cfg = GlobalConfig {
+        github: Some(GitHubConfig {
+            enabled: Some(true),
+            ..GitHubConfig::default()
+        }),
+        ..GlobalConfig::default()
+    };
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let engine = Arc::new(
+        Engine::new(Arc::new(Mutex::new(store)), cfg, None, None).with_read_only(read_only),
+    );
+    McpServer::new(engine)
+}
+
+/// Every tool advertises exactly the title and the four annotation hints from
+/// the locked table, and never the annotation-level title (only the top-level
+/// `Tool.title`). GitHub is enabled and the engine read-write so all 18 tools
+/// are visible.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tool_annotations_match_the_locked_table() {
+    use rmcp::ServerHandler;
+
+    let server = annotation_server(false).await;
+    for (name, title, read_only, destructive, idempotent, open_world) in EXPECTED_ANNOTATIONS {
+        let tool = server
+            .get_tool(name)
+            .unwrap_or_else(|| panic!("tool {name} must be visible"));
+        assert_eq!(tool.title.as_deref(), Some(title), "{name} title");
+        let ann = tool
+            .annotations
+            .as_ref()
+            .unwrap_or_else(|| panic!("{name} must carry annotations"));
+        assert_eq!(ann.read_only_hint, read_only, "{name} read_only_hint");
+        assert_eq!(ann.destructive_hint, destructive, "{name} destructive_hint");
+        assert_eq!(ann.idempotent_hint, idempotent, "{name} idempotent_hint");
+        assert_eq!(ann.open_world_hint, open_world, "{name} open_world_hint");
+        assert_eq!(ann.title, None, "{name} annotations.title must stay unset");
+    }
+}
+
+/// Two invariants tie the advisory hints back to the runtime gating. First,
+/// every write-gated tool advertises read_only_hint == Some(false). Second,
+/// every tool still visible in read-only mode is a read tool (read_only_hint ==
+/// Some(true)) or exactly `update_domain`, the documented derived-truth
+/// exemption that a pull shares with sync.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn annotation_hints_line_up_with_the_gating() {
+    use rmcp::ServerHandler;
+
+    // The eight write-gated tools (the five WRITE_TOOLS plus the three
+    // collaboration tools hidden in read-only mode) must each disclaim
+    // read-only.
+    let rw = annotation_server(false).await;
+    for name in [
+        "write_engram",
+        "edit_engram",
+        "move_engram",
+        "delete_engram",
+        "add_domain",
+        "configure",
+        "share_changes",
+        "resolve_conflict",
+    ] {
+        let tool = rw
+            .get_tool(name)
+            .unwrap_or_else(|| panic!("tool {name} must be visible"));
+        let read_only_hint = tool.annotations.as_ref().and_then(|a| a.read_only_hint);
+        assert_eq!(
+            read_only_hint,
+            Some(false),
+            "{name} is write-gated so it must not advertise read-only"
+        );
+    }
+
+    // Everything still visible on a read-only server is a read tool or exactly
+    // update_domain.
+    let ro = annotation_server(true).await;
+    for (name, ..) in EXPECTED_ANNOTATIONS {
+        let Some(tool) = ro.get_tool(name) else {
+            continue;
+        };
+        let read_only_hint = tool.annotations.as_ref().and_then(|a| a.read_only_hint);
+        assert!(
+            read_only_hint == Some(true) || name == "update_domain",
+            "{name} is visible read-only but is neither a read tool nor update_domain"
+        );
+    }
 }

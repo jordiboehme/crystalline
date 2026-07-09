@@ -37,6 +37,17 @@
 //! whenever a `set`/`unset` call flips `github.enabled`, so a client that
 //! honours the notification refreshes its tool list immediately rather than
 //! waiting for its own next poll.
+//!
+//! Every tool also advertises MCP tool annotations: a display `title` plus the
+//! readOnly/destructive/idempotent/openWorld hints, so a client can tune its
+//! confirmation UX and batch the read-only calls. The hints are advisory only;
+//! enforcement stays the runtime gating (`WRITE_TOOLS`, `hidden_collab_tool`)
+//! and the engine guards. Two calls are deliberate: `write_engram` advertises
+//! non-destructive because its default behaviour is additive (it errors on an
+//! existing permalink unless `overwrite`), and `open_world` is true only for
+//! the tools that talk to GitHub - `configure` through its connect flow,
+//! `add_domain` through team mode, `share_changes`, `update_domain` and
+//! `origin_status`.
 
 use std::sync::Arc;
 
@@ -134,7 +145,14 @@ impl McpServer {
 impl McpServer {
     #[tool(
         name = "write_engram",
-        description = "Capture a new engram - a unit of knowledge - into a domain. Writes the markdown file and indexes it. Body bullets: '- [decision] we chose X #tag' become observations, '- rel_type [[Target]]' become relations. domain is required so an engram never lands in the wrong place. permalink, status, recorded_at and timestamp are filled in; valid_from/valid_to are never set, since absence means always valid. Recommended type values: engram, guide, decision, architecture, runbook, reference. Recommended status values (guidance, not enforced): current, implemented, draft, proposed, idea, poc, deprecated, superseded, archived, legacy. Errors if the permalink exists unless overwrite is true."
+        title = "Capture engram",
+        description = "Capture a new engram - a unit of knowledge - into a domain. Writes the markdown file and indexes it. Body bullets: '- [decision] we chose X #tag' become observations, '- rel_type [[Target]]' become relations. domain is required so an engram never lands in the wrong place. permalink, status, recorded_at and timestamp are filled in; valid_from/valid_to are never set, since absence means always valid. Recommended type values: engram, guide, decision, architecture, runbook, reference. Recommended status values (guidance, not enforced): current, implemented, draft, proposed, idea, poc, deprecated, superseded, archived, legacy. Errors if the permalink exists unless overwrite is true.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn write_engram(
         &self,
@@ -149,7 +167,9 @@ impl McpServer {
 
     #[tool(
         name = "read_engram",
-        description = "Read an engram's full markdown and resolved frontmatter to learn what is already known before acting or writing. Identify it by bare permalink, title or a crystalline:// URL; pass domain to disambiguate. An identifier without crystalline:// is domain-relative: 'onboarding/setup', never 'mydomain/onboarding/setup'."
+        title = "Read engram",
+        description = "Read an engram's full markdown and resolved frontmatter to learn what is already known before acting or writing. Identify it by bare permalink, title or a crystalline:// URL; pass domain to disambiguate. An identifier without crystalline:// is domain-relative: 'onboarding/setup', never 'mydomain/onboarding/setup'.",
+        annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn read_engram(
         &self,
@@ -164,7 +184,14 @@ impl McpServer {
 
     #[tool(
         name = "edit_engram",
-        description = "Refine an existing engram in place as understanding evolves. Sections are addressed by heading path such as '## API > ### Auth'; replace_section keeps deeper subsections unless include_subsections is set. operation is one of append, prepend, find_replace, replace_section, insert_before_section, insert_after_section. find_replace takes find_text and an optional expected_replacements guard that fails on a count mismatch. Pass expected_checksum (from read_engram) to guard a virtual-domain edit against a change since your read: a conflict is refused if it changed, so re-read and retry; omit it for last-write-wins. The timestamp is refreshed. Status values to reflect a changed lifecycle (recommended values: see write_engram)."
+        title = "Edit engram",
+        description = "Refine an existing engram in place as understanding evolves. Sections are addressed by heading path such as '## API > ### Auth'; replace_section keeps deeper subsections unless include_subsections is set. operation is one of append, prepend, find_replace, replace_section, insert_before_section, insert_after_section. find_replace takes find_text and an optional expected_replacements guard that fails on a count mismatch. Pass expected_checksum (from read_engram) to guard a virtual-domain edit against a change since your read: a conflict is refused if it changed, so re-read and retry; omit it for last-write-wins. The timestamp is refreshed. Status values to reflect a changed lifecycle (recommended values: see write_engram).",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn edit_engram(
         &self,
@@ -179,7 +206,14 @@ impl McpServer {
 
     #[tool(
         name = "move_engram",
-        description = "Re-home an engram to a new path or domain as the knowledge base is reorganized. On a cross-domain move, inbound bare links from other domains are rewritten to the domain-prefixed [[domain:Target]] form so nothing dangles. Set update_links to false to skip that."
+        title = "Move engram",
+        description = "Re-home an engram to a new path or domain as the knowledge base is reorganized. On a cross-domain move, inbound bare links from other domains are rewritten to the domain-prefixed [[domain:Target]] form so nothing dangles. Set update_links to false to skip that.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn move_engram(
         &self,
@@ -194,7 +228,14 @@ impl McpServer {
 
     #[tool(
         name = "delete_engram",
-        description = "Remove an engram when its knowledge is retired. Deletes the file and its index rows. Prefer setting status to deprecated or superseded when the history still matters."
+        title = "Delete engram",
+        description = "Remove an engram when its knowledge is retired. Deletes the file and its index rows. Prefer setting status to deprecated or superseded when the history still matters.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn delete_engram(
         &self,
@@ -209,7 +250,9 @@ impl McpServer {
 
     #[tool(
         name = "search_engrams",
-        description = "Search across every registered domain by default (an all-domain sweep) or a chosen few to recall relevant knowledge and experience. Defaults to hybrid lexical-plus-semantic ranking and falls back to plain text when embeddings are not ready. Filter by type, tags, status, arbitrary frontmatter or a recorded-after date; a filter-only search with no query text is allowed. Every hit is labelled with its domain, and a hit inside an observation carries its line. A hit's snippet is a short window around the match, never the whole engram: read_engram returns the full content, so read before citing or summarizing what a hit only previews."
+        title = "Search engrams",
+        description = "Search across every registered domain by default (an all-domain sweep) or a chosen few to recall relevant knowledge and experience. Defaults to hybrid lexical-plus-semantic ranking and falls back to plain text when embeddings are not ready. Filter by type, tags, status, arbitrary frontmatter or a recorded-after date; a filter-only search with no query text is allowed. Every hit is labelled with its domain, and a hit inside an observation carries its line. A hit's snippet is a short window around the match, never the whole engram: read_engram returns the full content, so read before citing or summarizing what a hit only previews.",
+        annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn search_engrams(
         &self,
@@ -224,7 +267,9 @@ impl McpServer {
 
     #[tool(
         name = "build_context",
-        description = "Assemble the neighbourhood around an anchor engram by following its relations and links, across domains too, to gather related context before a task. The anchor is a crystalline:// URL; a /* suffix globs a permalink prefix. depth is 1 to 3."
+        title = "Build context",
+        description = "Assemble the neighbourhood around an anchor engram by following its relations and links, across domains too, to gather related context before a task. The anchor is a crystalline:// URL; a /* suffix globs a permalink prefix. depth is 1 to 3.",
+        annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn build_context(
         &self,
@@ -239,7 +284,9 @@ impl McpServer {
 
     #[tool(
         name = "recent_activity",
-        description = "Review what has been captured recently across domains to catch up on new knowledge and experience. Defaults to the last 7 days; timeframe accepts values like 24h, 7d or 2w."
+        title = "Recent activity",
+        description = "Review what has been captured recently across domains to catch up on new knowledge and experience. Defaults to the last 7 days; timeframe accepts values like 24h, 7d or 2w.",
+        annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn recent_activity(
         &self,
@@ -254,7 +301,9 @@ impl McpServer {
 
     #[tool(
         name = "list_domains",
-        description = "List the registered domains with their engram counts to see what the agent has been taught. Set include_routing to also get each domain's When to Use routing bullets from its MANIFEST - the routing source the server instructions summarize, with every bullet included."
+        title = "List domains",
+        description = "List the registered domains with their engram counts to see what the agent has been taught. Set include_routing to also get each domain's When to Use routing bullets from its MANIFEST - the routing source the server instructions summarize, with every bullet included.",
+        annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn list_domains(
         &self,
@@ -269,7 +318,9 @@ impl McpServer {
 
     #[tool(
         name = "browse_domain",
-        description = "Browse a domain's engrams by folder to explore how its knowledge is organized. path defaults to the root; depth controls how many folder levels are listed."
+        title = "Browse domain",
+        description = "Browse a domain's engrams by folder to explore how its knowledge is organized. path defaults to the root; depth controls how many folder levels are listed.",
+        annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn browse_domain(
         &self,
@@ -284,7 +335,9 @@ impl McpServer {
 
     #[tool(
         name = "validate_engrams",
-        description = "Check a domain's engrams against its schema engrams to keep captured knowledge well-formed. Optionally narrow to one engram by identifier or to one type."
+        title = "Validate engrams",
+        description = "Check a domain's engrams against its schema engrams to keep captured knowledge well-formed. Optionally narrow to one engram by identifier or to one type.",
+        annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn validate_engrams(
         &self,
@@ -299,7 +352,9 @@ impl McpServer {
 
     #[tool(
         name = "infer_schema",
-        description = "Suggest a Picoschema for a type by generalizing over the engrams already captured in a domain, as a starting point for a schema engram. threshold is the frequency at or above which a field is suggested."
+        title = "Infer schema",
+        description = "Suggest a Picoschema for a type by generalizing over the engrams already captured in a domain, as a starting point for a schema engram. threshold is the frequency at or above which a field is suggested.",
+        annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn infer_schema(
         &self,
@@ -314,7 +369,14 @@ impl McpServer {
 
     #[tool(
         name = "configure",
-        description = "View and adjust Crystalline's settings, like an app's preferences page: call with no arguments to see them, set to change them (for example github.enabled to turn on team collaboration) and connect to link your GitHub account with a short code you confirm in the browser. With a token it accepts a personal access token instead."
+        title = "Configure Crystalline",
+        description = "View and adjust Crystalline's settings, like an app's preferences page: call with no arguments to see them, set to change them (for example github.enabled to turn on team collaboration) and connect to link your GitHub account with a short code you confirm in the browser. With a token it accepts a personal access token instead.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
     )]
     async fn configure(
         &self,
@@ -359,7 +421,14 @@ impl McpServer {
 
     #[tool(
         name = "add_domain",
-        description = "Create or connect a domain to store engrams in - the way to give the agent somewhere to capture knowledge, so it works even on an instance with no domains yet. Three modes follow the arguments: a local domain of markdown files on disk (pass folder, or just domain to use the default root at <domains_root>/<domain>) that is created with a starter MANIFEST when new and adopted in place when it already holds engrams; a virtual database-backed domain with no files (virtual: true with a domain name); or a GitHub team domain that downloads shared knowledge to learn from and share back (repo is owner/name, needs GitHub enabled via configure). repo and virtual are mutually exclusive. Available whenever the instance is writable; only the team mode needs GitHub turned on."
+        title = "Add domain",
+        description = "Create or connect a domain to store engrams in - the way to give the agent somewhere to capture knowledge, so it works even on an instance with no domains yet. Three modes follow the arguments: a local domain of markdown files on disk (pass folder, or just domain to use the default root at <domains_root>/<domain>) that is created with a starter MANIFEST when new and adopted in place when it already holds engrams; a virtual database-backed domain with no files (virtual: true with a domain name); or a GitHub team domain that downloads shared knowledge to learn from and share back (repo is owner/name, needs GitHub enabled via configure). repo and virtual are mutually exclusive. Available whenever the instance is writable; only the team mode needs GitHub turned on.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
     )]
     async fn add_domain(
         &self,
@@ -413,7 +482,14 @@ impl McpServer {
 
     #[tool(
         name = "share_changes",
-        description = "Share this domain's new knowledge and experience with the team as a proposal they review on GitHub; returns the review URL to hand to the user. Refuses while conflicts are unsettled so the team always reviews a clean proposal."
+        title = "Share changes",
+        description = "Share this domain's new knowledge and experience with the team as a proposal they review on GitHub; returns the review URL to hand to the user. Refuses while conflicts are unsettled so the team always reviews a clean proposal.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
     )]
     async fn share_changes(
         &self,
@@ -428,7 +504,14 @@ impl McpServer {
 
     #[tool(
         name = "update_domain",
-        description = "Learn the team's latest knowledge: pulls what was merged upstream into the domain (or every shared domain), merging cleanly where possible and flagging real conflicts for resolve_conflict."
+        title = "Update domain",
+        description = "Learn the team's latest knowledge: pulls what was merged upstream into the domain (or every shared domain), merging cleanly where possible and flagging real conflicts for resolve_conflict.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
     )]
     async fn update_domain(
         &self,
@@ -443,7 +526,9 @@ impl McpServer {
 
     #[tool(
         name = "origin_status",
-        description = "Review each shared domain's standing: whether the team has new knowledge to learn, what is waiting to be shared, open and declined proposals and any conflicts to settle."
+        title = "Origin status",
+        description = "Review each shared domain's standing: whether the team has new knowledge to learn, what is waiting to be shared, open and declined proposals and any conflicts to settle.",
+        annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn origin_status(
         &self,
@@ -458,7 +543,14 @@ impl McpServer {
 
     #[tool(
         name = "resolve_conflict",
-        description = "Settle a flagged conflict by keeping your version (mine), taking the team's version (theirs) or providing merged content. The engram then counts as ordinary local knowledge you can share."
+        title = "Resolve conflict",
+        description = "Settle a flagged conflict by keeping your version (mine), taking the team's version (theirs) or providing merged content. The engram then counts as ordinary local knowledge you can share.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn resolve_conflict(
         &self,
