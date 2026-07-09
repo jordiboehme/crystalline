@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use crystalline_core::config::{GitHubConfig, GlobalConfig};
 use crystalline_index::TursoStore;
-use crystalline_remote::{DeviceFlowStart, RemoteError};
+use crystalline_remote::{DeviceFlowStart, RemoteError, StoredToken, TokenStore};
 use crystalline_service::Engine;
 use crystalline_service::EnvOverlay;
 use crystalline_service::engine::{ConnectAuth, EngineError};
@@ -740,6 +740,121 @@ async fn device_flow_failure_is_reported_once_as_an_error_then_the_slot_clears()
     let after = eng.configure_snapshot().await.unwrap();
     assert_eq!(after["github"]["connected"], json!(false));
     assert!(after["github"]["pending_connect"].is_null());
+}
+
+// --- process-lifetime token cache -------------------------------------------
+
+/// Writes a token file into `dir` exactly where the engine's test override
+/// reads it, simulating a credential already on disk (from an earlier connect
+/// or a standalone CLI), with no keychain and no network.
+fn seed_token_file(dir: &std::path::Path, user: &str) {
+    TokenStore::File {
+        path: dir.join("github-token.json"),
+    }
+    .save(&StoredToken {
+        access_token: "seeded-token".to_string(),
+        host: "github.com".to_string(),
+        user: user.to_string(),
+        created_at: chrono::Utc::now(),
+    })
+    .unwrap();
+}
+
+#[tokio::test]
+async fn configure_snapshot_serves_the_cached_token_after_the_backing_file_is_deleted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let auth = fake_auth(
+        Err(RemoteError::NotConnected),
+        Err(RemoteError::NotConnected),
+        Ok("octocat".to_string()),
+    );
+    let eng = engine_for_connect(auth, tmp.path()).await;
+
+    // Connect writes the token once and refreshes the cache.
+    let result = eng.connect_with_token("pat-123", None).await.unwrap();
+    assert_eq!(result["github"]["connected"], json!(true));
+
+    // The backing file is deleted: the cached credential still answers, so the
+    // snapshot stays connected without re-reading (and, in production, without
+    // re-prompting) the credential store.
+    std::fs::remove_file(tmp.path().join("github-token.json")).unwrap();
+    let snap = eng.configure_snapshot().await.unwrap();
+    assert_eq!(
+        snap["github"]["connected"],
+        json!(true),
+        "the cache must serve the token after the backing file is gone"
+    );
+    assert_eq!(snap["github"]["user"], json!("octocat"));
+}
+
+#[tokio::test]
+async fn connect_with_token_refreshes_the_cached_credential() {
+    let tmp = tempfile::tempdir().unwrap();
+    // A stale identity is already cached from an earlier read.
+    seed_token_file(tmp.path(), "olduser");
+    let auth = fake_auth(
+        Err(RemoteError::NotConnected),
+        Err(RemoteError::NotConnected),
+        Ok("octocat".to_string()),
+    );
+    let eng = engine_for_connect(auth, tmp.path()).await;
+
+    // Populate the cache with the stale identity.
+    let before = eng.configure_snapshot().await.unwrap();
+    assert_eq!(before["github"]["user"], json!("olduser"));
+
+    // Connecting a new token must refresh the cache, not leave the old
+    // identity behind: the connect's own report already shows the new login.
+    let result = eng.connect_with_token("pat-new", None).await.unwrap();
+    assert_eq!(
+        result["github"]["user"],
+        json!("octocat"),
+        "connect must refresh the cache, so its own report is the new identity"
+    );
+
+    // With the backing file removed, only a refreshed cache can still serve
+    // the new identity; a stale cache would answer with the old login.
+    std::fs::remove_file(tmp.path().join("github-token.json")).unwrap();
+    let after = eng.configure_snapshot().await.unwrap();
+    assert_eq!(after["github"]["connected"], json!(true));
+    assert_eq!(after["github"]["user"], json!("octocat"));
+}
+
+#[tokio::test]
+async fn a_landed_device_flow_refreshes_the_cached_credential() {
+    let tmp = tempfile::tempdir().unwrap();
+    // A stale identity is already cached before the flow starts.
+    seed_token_file(tmp.path(), "olduser");
+    let auth = fake_auth(
+        Ok(device_flow_start()),
+        Ok("device-token".to_string()),
+        Ok("octocat".to_string()),
+    );
+    let eng = engine_for_connect(auth.clone(), tmp.path()).await;
+
+    // Populate the cache with the stale identity, then start the flow.
+    let before = eng.configure_snapshot().await.unwrap();
+    assert_eq!(before["github"]["user"], json!("olduser"));
+    eng.start_device_connect(None).await.unwrap();
+
+    // Let the background task run to completion; its save (moved into the
+    // task as a TokenSavePlan) must refresh the cache with the new identity.
+    auth.run_gate.notify_one();
+    let landed = wait_until(|| async {
+        let snap = eng.configure_snapshot().await.unwrap();
+        (snap["github"]["pending_connect"].is_null() && snap["github"]["connected"] == json!(true))
+            .then_some(snap)
+    })
+    .await;
+    assert_eq!(landed["github"]["user"], json!("octocat"));
+
+    // With the backing file gone, only the refreshed cache can still serve the
+    // device-flow identity; a task that saved but never refreshed the cache
+    // would leave the stale login behind here.
+    std::fs::remove_file(tmp.path().join("github-token.json")).unwrap();
+    let after = eng.configure_snapshot().await.unwrap();
+    assert_eq!(after["github"]["connected"], json!(true));
+    assert_eq!(after["github"]["user"], json!("octocat"));
 }
 
 // --- origin tool wiring (happy path, via the injected MockProvider) ---------

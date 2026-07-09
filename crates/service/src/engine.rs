@@ -36,7 +36,9 @@ use crystalline_index::{
     configured_model_id, parse_metadata_filters, provider_from_config, sync_domain_with,
 };
 use crystalline_remote::ops;
-use crystalline_remote::{GitHubProvider, OriginSpec, Provider, RemoteError, TokenStore};
+use crystalline_remote::{
+    GitHubProvider, OriginSpec, Provider, RemoteError, StoredToken, TokenStore,
+};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
@@ -335,11 +337,25 @@ pub struct Engine {
     // See `PendingConnect` and `Engine::start_device_connect`.
     pending_connect: std::sync::Mutex<Option<PendingConnect>>,
     // Forces the GitHub token store to a plain file under this directory
-    // instead of probing the real OS keychain, for tests: connect and
-    // configure tests must never read, write or prompt for the developer's
-    // actual credential store. `None` (production) uses the real
-    // `TokenStore::resolve`.
+    // instead of the real OS keychain, for tests: connect and configure tests
+    // must never read, write or prompt for the developer's actual credential
+    // store. `None` (production) resolves through `TokenStore::resolve_and_load`
+    // and `save_resolving`, cached per process in `github_tokens`.
     token_store_dir_override: Option<PathBuf>,
+    // A process-lifetime cache of the resolved GitHub token store and the
+    // token it holds, keyed by token host ("" for GitHub.com, the bare host
+    // for a GitHub Enterprise Server). The point is that one machine reads its
+    // OS keychain at most once per process: the first `github_credential`
+    // touch for a host performs the single keychain read and every later one
+    // is served from here, so a daemon polling N team domains prompts the
+    // keychain once, not once per domain per tick. A std (not tokio) mutex on
+    // purpose: the critical section never awaits, and holding the lock across
+    // that one keychain read single-flights concurrent first touches into a
+    // single prompt rather than a race of N. Only present-token outcomes are
+    // cached (an entry existing means a token exists); a `None` stays live so
+    // a `connect` landing later - in this process or a standalone CLI writing
+    // the same keychain item - is picked up on the very next call.
+    github_tokens: Arc<std::sync::Mutex<HashMap<String, CachedGithub>>>,
     // The background origin poller's observable state: every domain's poll
     // schedule and most recent result, plus the poller's one shared
     // rate-limit pause. Always present (not an `Option`), whether or not
@@ -361,6 +377,17 @@ pub struct Engine {
     // activity block. Behind an `Arc` so a guard owns its own handle and a
     // panicking or early-returning operation still clears its entry on drop.
     activity: Arc<std::sync::Mutex<ActivityState>>,
+}
+
+/// One host's cached GitHub credential: the resolved store and the token it
+/// held at the single keychain read this process ever does for that host. The
+/// token is non-optional - only a present-token outcome is ever cached, so an
+/// entry existing in [`Engine::github_tokens`] means a token exists - and the
+/// type carries no `Debug` impl, so a cached secret cannot reach a log line or
+/// panic message through the engine's own `Debug`.
+struct CachedGithub {
+    store: TokenStore,
+    token: StoredToken,
 }
 
 /// The engine's observable activity: what is running now and what finished
@@ -487,6 +514,7 @@ impl Engine {
             connect_auth: Arc::new(RealConnectAuth),
             pending_connect: std::sync::Mutex::new(None),
             token_store_dir_override: None,
+            github_tokens: Arc::default(),
             origin_poller: poller::OriginPollerState::default(),
             routing_virtual: std::sync::RwLock::new(BTreeMap::new()),
             activity: Arc::default(),
@@ -544,9 +572,10 @@ impl Engine {
     /// Inject a fixed provider for every origin operation (`origin_add`,
     /// `origin_update`, `origin_status`), bypassing the production
     /// per-operation `GitHubProvider` build from config and the token store.
-    /// Test-only: production code always leaves this unset so a fresh token
-    /// is read on every operation and a new `connect` is picked up without a
-    /// restart.
+    /// Test-only: production code always leaves this unset so the provider is
+    /// built from the cached GitHub token (read from the keychain at most once
+    /// per process, see [`Engine::github_credential`]) and a new `connect` is
+    /// still picked up without a restart.
     pub fn with_origin_provider(mut self, provider: Arc<dyn Provider>) -> Engine {
         self.origin_provider_override = Some(provider);
         self
@@ -2925,7 +2954,9 @@ impl Engine {
         let state_dir = self.origin_state_dir(&domain_name)?;
 
         let provider = self.resolve_origin_provider()?;
-        let report = ops::subscribe(provider.as_ref(), &spec, &root, &state_dir).await?;
+        let report = ops::subscribe(provider.as_ref(), &spec, &root, &state_dir)
+            .await
+            .inspect_err(|e| self.drop_github_credential_on_auth(e))?;
 
         // Register the domain and persist, mirroring `configure`'s file-then-
         // effective write-lock-first pattern so a concurrent read never observes
@@ -3030,7 +3061,9 @@ impl Engine {
         }
 
         let provider = self.resolve_origin_provider()?;
-        let report = ops::pull(provider.as_ref(), &spec, &root, &state_dir).await?;
+        let report = ops::pull(provider.as_ref(), &spec, &root, &state_dir)
+            .await
+            .inspect_err(|e| self.drop_github_credential_on_auth(e))?;
 
         self.sync(Some(name)).await?;
         if let Err(e) = self.embed_pending().await {
@@ -3076,7 +3109,9 @@ impl Engine {
                 root.display()
             ))
         })?;
-        let report = ops::subscribe(provider.as_ref(), spec, root, state_dir).await?;
+        let report = ops::subscribe(provider.as_ref(), spec, root, state_dir)
+            .await
+            .inspect_err(|e| self.drop_github_credential_on_auth(e))?;
 
         // Tell a running daemon's watcher to start watching the freshly
         // provisioned root, the same signal `origin_add` sends.
@@ -3213,6 +3248,12 @@ impl Engine {
         match ops::status(&spec, &root, &state_dir, probe.as_deref()).await {
             Ok(report) => Ok(origin::status_report_json(name, &report, None)),
             Err(e) if probe.is_some() && origin::is_probe_transport_error(&e) => {
+                // AuthExpired is one of the transport errors this arm catches
+                // (see `origin::is_probe_transport_error`), so a probe that
+                // failed because the token was revoked drops the cached
+                // credential here too; the retry below runs probe-free, so
+                // status still comes back offline.
+                self.drop_github_credential_on_auth(&e);
                 let report = ops::status(&spec, &root, &state_dir, None).await?;
                 Ok(origin::status_report_json(
                     name,
@@ -3386,11 +3427,8 @@ impl Engine {
             .as_ref()
             .and_then(|g| g.api_url.clone());
         let host = origin::token_host(api_url.as_deref());
-        let Ok(store) = self.resolve_token_store(host.as_deref()) else {
-            return (false, None);
-        };
-        match store.load() {
-            Ok(Some(_)) => (true, Some(store.kind())),
+        match self.github_credential(host.as_deref()) {
+            Ok((store, Some(_))) => (true, Some(store.kind())),
             _ => (false, None),
         }
     }
@@ -3477,6 +3515,7 @@ impl Engine {
             description,
         )
         .await
+        .inspect_err(|e| self.drop_github_credential_on_auth(e))
         {
             Ok(outcome) => Ok(origin::propose_outcome_json(&outcome)),
             Err(RemoteError::ConflictsPending { count }) => {
@@ -3666,10 +3705,13 @@ impl Engine {
 
     /// Resolves the provider an origin operation runs its GitHub calls
     /// through: the injected test provider when one is set, or a fresh
-    /// `GitHubProvider` built from the current config and a token read from
-    /// the token store right now, so a `connect` earlier this same process
-    /// is picked up without a restart. Errors with `RemoteError::NotConnected`
-    /// when no token has been saved and no test provider is injected.
+    /// `GitHubProvider` built from the current config and the cached GitHub
+    /// token (read from the OS keychain at most once per process, see
+    /// [`Engine::github_credential`]). A `connect` earlier this same process
+    /// is picked up without a restart - the connect refreshes the cache - and
+    /// a machine that has not connected yet is never cached, so a later
+    /// connect is seen too. Errors with `RemoteError::NotConnected` when no
+    /// token has been saved and no test provider is injected.
     fn resolve_origin_provider(&self) -> Result<Arc<dyn Provider>> {
         if let Some(p) = &self.origin_provider_override {
             return Ok(p.clone());
@@ -3682,8 +3724,8 @@ impl Engine {
             .as_ref()
             .and_then(|g| g.api_url.clone());
         let host = origin::token_host(api_url.as_deref());
-        let store = self.resolve_token_store(host.as_deref())?;
-        let token = store.load()?.ok_or(RemoteError::NotConnected)?;
+        let (_store, token) = self.github_credential(host.as_deref())?;
+        let token = token.ok_or(RemoteError::NotConnected)?;
         Ok(Arc::new(GitHubProvider::new(
             api_url,
             Some(token.access_token),
@@ -3710,8 +3752,7 @@ impl Engine {
             .as_ref()
             .and_then(|g| g.api_url.clone());
         let host = origin::token_host(api_url.as_deref());
-        let store = self.resolve_token_store(host.as_deref())?;
-        let token = store.load()?;
+        let (store, token) = self.github_credential(host.as_deref())?;
         Ok(json!({
             "connected": token.is_some(),
             "user": token.as_ref().and_then(|t| t.user_display()),
@@ -3719,26 +3760,96 @@ impl Engine {
         }))
     }
 
-    /// Resolves the `TokenStore` backend for `host`: the environment token
-    /// first (`CRYSTALLINE_GITHUB_TOKEN`, via `self.overlay`), then the test
-    /// override (see [`Engine::with_token_store_dir`]), a plain file store
-    /// that never touches the real OS keychain, otherwise the real
-    /// `TokenStore::resolve` (the keyring when a cheap probe says it works,
-    /// else a file under the origins state directory). The environment wins
-    /// over the test override too, so a poller or connect test can prove the
-    /// env token is actually what gets used even when a token directory is
-    /// also wired up.
-    fn resolve_token_store(&self, host: Option<&str>) -> Result<TokenStore> {
+    /// The GitHub token store for `host` and the token it holds, reading the
+    /// OS keychain at most once per process. The environment token wins first
+    /// (`CRYSTALLINE_GITHUB_TOKEN`, via `self.overlay`; keyring-free and never
+    /// cached, so unsetting it is picked up live); then a cached present-token
+    /// for this host; then the resolved store - the test file override (see
+    /// [`Engine::with_token_store_dir`], a plain file that never touches the
+    /// real OS keychain), or the real `TokenStore::resolve_and_load`, whose
+    /// single `get_password` both picks the backend and loads the token. Only
+    /// a present token is cached: a `None` stays live so a later `connect`
+    /// (here, or from a standalone CLI writing the same keychain item) is seen
+    /// on the next call without a restart. Replaces the old per-operation
+    /// resolve-then-load double read that turned every origin op into two
+    /// keychain touches.
+    ///
+    /// The environment wins over the test override too, so a poller or connect
+    /// test can prove the env token is actually what gets used even when a
+    /// token directory is also wired up.
+    fn github_credential(&self, host: Option<&str>) -> Result<(TokenStore, Option<StoredToken>)> {
         if let Some(token) = self.overlay.github_token() {
-            return Ok(TokenStore::env(token, host));
+            let store = TokenStore::env(token, host);
+            let stored = store.load()?;
+            return Ok((store, stored));
         }
-        if let Some(dir) = &self.token_store_dir_override {
-            return Ok(TokenStore::File {
-                path: dir.join("github-token.json"),
-            });
+        let key = host.unwrap_or("").to_string();
+        // The std mutex is held across the keychain read on a cache miss on
+        // purpose: the critical section never awaits, and single-flighting the
+        // first touch under the lock collapses N concurrent first reads (a
+        // daemon resolving several team domains at once) into a single keychain
+        // prompt instead of a race of N. Every later call is a cache hit and
+        // never reaches the read.
+        let mut cache = self.github_tokens.lock().unwrap();
+        if let Some(cached) = cache.get(&key) {
+            return Ok((cached.store.clone(), Some(cached.token.clone())));
         }
-        let base = self.origins_base_dir()?;
-        Ok(TokenStore::resolve(host, &base))
+        let (store, token) = match &self.token_store_dir_override {
+            Some(dir) => {
+                let store = TokenStore::File {
+                    path: dir.join("github-token.json"),
+                };
+                let token = store.load()?;
+                (store, token)
+            }
+            None => {
+                let base = self.origins_base_dir()?;
+                TokenStore::resolve_and_load(host, &base)?
+            }
+        };
+        if let Some(token) = &token {
+            cache.insert(
+                key,
+                CachedGithub {
+                    store: store.clone(),
+                    token: token.clone(),
+                },
+            );
+        }
+        Ok((store, token))
+    }
+
+    /// The plan a connect flow saves its token through: the test file override
+    /// or a real `save_resolving`, plus a handle to the token cache to refresh
+    /// after the write. `host` is the token host this connect targets, captured
+    /// by value so the device-flow task can own the plan across the spawn.
+    fn github_save_plan(&self, host: Option<&str>) -> Result<TokenSavePlan> {
+        let target = match &self.token_store_dir_override {
+            Some(dir) => SaveTarget::File(dir.join("github-token.json")),
+            None => SaveTarget::Resolve {
+                fallback_dir: self.origins_base_dir()?,
+            },
+        };
+        Ok(TokenSavePlan {
+            host: host.map(str::to_string),
+            target,
+            cache: Arc::clone(&self.github_tokens),
+        })
+    }
+
+    /// Clears the whole GitHub token cache when `e` is
+    /// [`RemoteError::AuthExpired`] - the mapped GitHub 401, see
+    /// `crystalline_remote::github` - so a token rotated or revoked out from
+    /// under a long-running daemon is dropped and the next `github_credential`
+    /// re-reads from the keychain or file, picking up a standalone CLI connect
+    /// that wrote a fresh token while the daemon ran. Coarse on purpose:
+    /// clearing every host's entry (there is at most one per host) avoids
+    /// threading the offending host through every provider-op call site and
+    /// costs only one extra keychain read per host on the next touch.
+    fn drop_github_credential_on_auth(&self, e: &RemoteError) {
+        if matches!(e, RemoteError::AuthExpired) {
+            self.github_tokens.lock().unwrap().clear();
+        }
     }
 
     // --- configure: GitHub connect ------------------------------------------
@@ -3867,8 +3978,8 @@ impl Engine {
             .validate_token(api_url.as_deref(), token)
             .await?;
         let token_host = origin::token_host(api_url.as_deref());
-        let store = self.resolve_token_store(token_host.as_deref())?;
-        store.save(&crystalline_remote::StoredToken {
+        let plan = self.github_save_plan(token_host.as_deref())?;
+        plan.save(&StoredToken {
             access_token: token.to_string(),
             host: token_host.unwrap_or_else(|| "github.com".to_string()),
             user: user.clone(),
@@ -3930,14 +4041,14 @@ impl Engine {
 
         let auth = self.connect_auth.clone();
         let token_host = origin::token_host(api_url.as_deref());
-        let store = self.resolve_token_store(token_host.as_deref())?;
+        let plan = self.github_save_plan(token_host.as_deref())?;
         tokio::spawn(async move {
             let result: std::result::Result<String, RemoteError> = async {
                 let access_token = auth.run_device_flow(&auth_base, &client_id, &start).await?;
                 let user = auth
                     .validate_token(api_url.as_deref(), &access_token)
                     .await?;
-                store.save(&crystalline_remote::StoredToken {
+                plan.save(&StoredToken {
                     access_token,
                     host: token_host
                         .clone()
@@ -3977,6 +4088,65 @@ struct PendingConnect {
     /// task that runs the flow to completion, to either the signed-in login
     /// or the error that ended the flow (expired, declined, offline).
     outcome: Arc<std::sync::Mutex<Option<std::result::Result<String, RemoteError>>>>,
+}
+
+/// How a connect flow persists a freshly issued token: where it writes and the
+/// cache it refreshes afterwards, bundled so both the inline
+/// [`Engine::connect_with_token`] path and the spawned
+/// [`Engine::start_device_connect`] task save through exactly one code path.
+/// Built by [`Engine::github_save_plan`]; the device-flow task owns its plan by
+/// value (an `Arc` handle to the cache plus an owned host and target),
+/// mirroring how the pending outcome slot is moved into that task.
+struct TokenSavePlan {
+    /// The token host this connect targets, `None` for GitHub.com. Owned so
+    /// the plan survives the move into the device-flow task.
+    host: Option<String>,
+    /// Where the write lands.
+    target: SaveTarget,
+    /// The engine's token cache, refreshed after a successful write so the
+    /// next `github_credential` serves the new identity with no keychain read.
+    cache: Arc<std::sync::Mutex<HashMap<String, CachedGithub>>>,
+}
+
+/// Where a [`TokenSavePlan`] writes: a fixed file under a test override, or a
+/// real `save_resolving` that writes through the keychain and lands in a file
+/// only when the keychain write itself fails.
+enum SaveTarget {
+    /// The test token-directory override's fixed file path.
+    File(PathBuf),
+    /// Production: `save_resolving` under this origins state directory.
+    Resolve {
+        /// The origins state directory the file fallback lives under.
+        fallback_dir: PathBuf,
+    },
+}
+
+impl TokenSavePlan {
+    /// Writes `token` once (through the override file or `save_resolving`) then
+    /// refreshes this host's cache entry, so the very next `github_credential`
+    /// serves the new identity without another keychain read. A connect is
+    /// therefore one keychain write and zero reads.
+    fn save(&self, token: &StoredToken) -> std::result::Result<(), RemoteError> {
+        let store = match &self.target {
+            SaveTarget::File(path) => {
+                let store = TokenStore::File { path: path.clone() };
+                store.save(token)?;
+                store
+            }
+            SaveTarget::Resolve { fallback_dir } => {
+                TokenStore::save_resolving(self.host.as_deref(), fallback_dir, token)?
+            }
+        };
+        let key = self.host.clone().unwrap_or_default();
+        self.cache.lock().unwrap().insert(
+            key,
+            CachedGithub {
+                store,
+                token: token.clone(),
+            },
+        );
+        Ok(())
+    }
 }
 
 /// The requested settings action for [`Engine::configure`], mirroring the

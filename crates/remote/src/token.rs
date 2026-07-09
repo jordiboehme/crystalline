@@ -2,15 +2,19 @@
 //! keychain when it works, a permissions-locked file on disk when it does
 //! not, or a read-only view over a value the environment already supplied.
 //!
-//! [`TokenStore::resolve`] decides which backend to use, once, the first
-//! time a machine needs to save a token; every later save, load or delete
-//! goes through whichever variant was picked. Keeping the choice in the
-//! `TokenStore` value rather than re-probing on every call means a single
-//! sign-in session always reads back what it just wrote, even on a machine
-//! whose keychain the probe judged unusable.
+//! [`TokenStore::resolve_and_load`] fuses the backend choice with the one
+//! read that decides it: a single keychain `get_password` both picks the
+//! store and hands back whatever token was already there, so a caller never
+//! reads twice (once to probe, once to load) and a machine that has granted
+//! keychain access is prompted at most once. [`TokenStore::save_resolving`]
+//! is its write-side twin, writing straight through the keychain with no
+//! pre-save probe read and landing in the file store only when the keychain
+//! write itself fails. Keeping the chosen backend in the returned
+//! `TokenStore` value means a single sign-in session always reads back what
+//! it just wrote, even on a machine whose keychain the read judged unusable.
 //!
 //! [`TokenStore::env`] builds the third backend directly rather than through
-//! `resolve`: this crate never reads the process environment itself
+//! a keychain read: this crate never reads the process environment itself
 //! (`CRYSTALLINE_GITHUB_TOKEN` is read exactly once, in
 //! `crystalline_service::overlay::EnvOverlay::from_process_env`), so a caller
 //! that already has the value in hand constructs the store explicitly.
@@ -73,7 +77,10 @@ impl std::fmt::Debug for StoredToken {
     }
 }
 
-/// Where a GitHub access token is persisted between runs.
+/// Where a GitHub access token is persisted between runs. `Clone` so the
+/// engine can cache a resolved store for the process lifetime and hand out
+/// copies without re-resolving; the manual redacting `Debug` below stays.
+#[derive(Clone)]
 pub enum TokenStore {
     /// The OS-native credential store (Keychain, Credential Manager, the
     /// Secret Service), addressed by account name within the shared
@@ -92,9 +99,9 @@ pub enum TokenStore {
     /// A token supplied directly by the `CRYSTALLINE_GITHUB_TOKEN`
     /// environment variable: read-only, since the environment is the source
     /// of truth and there is nothing here for `save` or `delete` to change.
-    /// Never produced by [`TokenStore::resolve`]; built directly with
-    /// [`TokenStore::env`] by a caller that already holds the value (see the
-    /// module docs).
+    /// Never produced by [`TokenStore::resolve_and_load`] or
+    /// [`TokenStore::save_resolving`]; built directly with [`TokenStore::env`]
+    /// by a caller that already holds the value (see the module docs).
     Env {
         /// The token value, exactly as `CRYSTALLINE_GITHUB_TOKEN` carries it.
         token: String,
@@ -124,19 +131,70 @@ impl std::fmt::Debug for TokenStore {
 }
 
 impl TokenStore {
-    /// Picks a backend for `host` (`None` for GitHub.com, `Some(host)` for
-    /// a GitHub Enterprise Server host): the OS keychain if a cheap probe
-    /// says it works, otherwise a file under `fallback_dir` (the origins
-    /// state directory).
-    pub fn resolve(host: Option<&str>, fallback_dir: &Path) -> TokenStore {
+    /// Picks a backend for `host` and loads whatever token it already holds,
+    /// in exactly one keychain read. `host` is `None` for GitHub.com,
+    /// `Some(host)` for a GitHub Enterprise Server host; `fallback_dir` is the
+    /// origins state directory the file store lives under.
+    ///
+    /// The single `get_password` both chooses the store and returns its
+    /// contents: `Ok(json)` means the keychain works and already holds a
+    /// token, so `(Keyring, Some(token))`; `Err(NoEntry)` means the keychain
+    /// works but is empty, so `(Keyring, None)` (an absent item never prompts
+    /// on macOS, so a machine that has not connected yet is re-read freely);
+    /// anything else - including failing to even build the entry - means the
+    /// backend itself is unusable (headless Linux with no session bus, most CI
+    /// runners), so the file fallback plus whatever that file holds. Callers
+    /// that need both a token and the backend choice - every origin operation
+    /// and the offline connection probe - get both here without the old
+    /// probe-then-load double read that made every such call two keychain
+    /// touches, one dialog each until the user grants "Always Allow".
+    pub fn resolve_and_load(
+        host: Option<&str>,
+        fallback_dir: &Path,
+    ) -> Result<(TokenStore, Option<StoredToken>), RemoteError> {
         let account = account_for(host);
-        if keyring_probe_ok(&account) {
-            TokenStore::Keyring { account }
-        } else {
-            TokenStore::File {
-                path: fallback_dir.join(TOKEN_FILE_NAME),
+        let read = keyring::Entry::new(KEYRING_SERVICE, &account)
+            .ok()
+            .map(|entry| entry.get_password());
+        match read {
+            Some(Ok(json)) => Ok((TokenStore::Keyring { account }, Some(from_json(&json)?))),
+            Some(Err(keyring::Error::NoEntry)) => Ok((TokenStore::Keyring { account }, None)),
+            _ => {
+                let store = file_fallback(fallback_dir);
+                let token = store.load()?;
+                Ok((store, token))
             }
         }
+    }
+
+    /// Saves `token` for `host` and returns the store that now holds it,
+    /// writing through the keychain when it works and the file under
+    /// `fallback_dir` when it does not - without the probe read
+    /// [`TokenStore::resolve_and_load`] does, since a save has the value in
+    /// hand and learns the same thing from the write itself.
+    ///
+    /// The keychain is tried first with a direct `set_password`; any failure
+    /// (or failing to build the entry, or serialize the token) lands the token
+    /// in the file store instead. The trade-off is deliberate: a keychain that
+    /// reads fine but fails this one write puts the token in the file, and the
+    /// user simply retries connect - judged far rarer and more recoverable
+    /// than re-probing on every save, which is the prompt storm this module
+    /// exists to avoid.
+    pub fn save_resolving(
+        host: Option<&str>,
+        fallback_dir: &Path,
+        token: &StoredToken,
+    ) -> Result<TokenStore, RemoteError> {
+        let account = account_for(host);
+        if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &account)
+            && let Ok(json) = to_json(token)
+            && entry.set_password(&json).is_ok()
+        {
+            return Ok(TokenStore::Keyring { account });
+        }
+        let store = file_fallback(fallback_dir);
+        store.save(token)?;
+        Ok(store)
     }
 
     /// Builds the read-only [`TokenStore::Env`] backend for a token the
@@ -230,26 +288,13 @@ fn keyring_entry(account: &str) -> Result<keyring::Entry, RemoteError> {
     keyring::Entry::new(KEYRING_SERVICE, account).map_err(|e| credential_error("open", e))
 }
 
-/// Probes whether the platform keyring backend actually works, so
-/// [`TokenStore::resolve`] can land on the file fallback instead when it
-/// does not (headless Linux with no D-Bus session, most CI runners, or any
-/// other platform with no usable native credential store).
-///
-/// A freshly probed account has never had a secret saved to it, so the only
-/// outcome a genuinely working backend can give here is
-/// `Err(keyring::Error::NoEntry)` (or `Ok`, if unusually something was
-/// already saved under this exact account by an earlier run). Any other
-/// outcome, starting with failing to even build the entry, means the
-/// backend itself is unavailable rather than just empty; this is the one
-/// place that distinction is made, so both `resolve` and anyone reasoning
-/// about it later only need to look here.
-fn keyring_probe_ok(account: &str) -> bool {
-    match keyring::Entry::new(KEYRING_SERVICE, account) {
-        Ok(entry) => !matches!(
-            entry.get_password(),
-            Err(e) if !matches!(e, keyring::Error::NoEntry)
-        ),
-        Err(_) => false,
+/// The file-backed store under `fallback_dir`, the single place the token
+/// file's location is derived so [`TokenStore::resolve_and_load`] and
+/// [`TokenStore::save_resolving`] never disagree about where the fallback
+/// lives.
+fn file_fallback(fallback_dir: &Path) -> TokenStore {
+    TokenStore::File {
+        path: fallback_dir.join(TOKEN_FILE_NAME),
     }
 }
 
@@ -340,13 +385,54 @@ mod tests {
         }
     }
 
-    // `resolve` is intentionally not exercised here: proving its keyring
-    // arm actually gets picked would mean probing the real platform
-    // keychain from the test suite, which is exactly what this crate's
-    // tests must never do. Its file fallback is covered indirectly by
-    // exercising the `File` variant directly below, which is the same
-    // code `resolve` would have picked on a machine with no working
-    // keyring backend.
+    // The keyring arms of `resolve_and_load` and `save_resolving` are
+    // intentionally never exercised here: proving them would mean reading,
+    // writing or prompting the real platform keychain from the test suite,
+    // which is exactly what this crate's tests must never do. Their file
+    // fallback is covered by driving the `File` variant directly below and by
+    // `file_fallback_store_round_trips_under_the_fallback_dir`, which exercises
+    // the exact store both functions build on a machine with no usable keyring
+    // backend.
+
+    #[test]
+    fn file_fallback_store_round_trips_under_the_fallback_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = file_fallback(dir.path());
+        assert_eq!(store.kind(), "file");
+        // The fallback lands at the documented file name under the given dir,
+        // so a save here is found again by a later resolve on the same machine.
+        match &store {
+            TokenStore::File { path } => assert_eq!(path, &dir.path().join(TOKEN_FILE_NAME)),
+            other => panic!("expected a file store, got {other:?}"),
+        }
+
+        assert_eq!(store.load().unwrap(), None, "nothing saved yet");
+        let token = sample_token();
+        store.save(&token).unwrap();
+        assert_eq!(store.load().unwrap(), Some(token));
+    }
+
+    #[test]
+    fn token_store_clone_preserves_backend_and_redaction() {
+        // The engine caches a cloned store, so a clone must keep each variant's
+        // identity and, for the secret-carrying variant, its redaction.
+        let file = TokenStore::File {
+            path: PathBuf::from("/nonexistent/github-token.json"),
+        };
+        assert_eq!(file.clone().kind(), "file");
+
+        let keyring = TokenStore::Keyring {
+            account: "github".to_string(),
+        };
+        assert_eq!(keyring.clone().kind(), "keyring");
+
+        let env = TokenStore::env("gho_SECRETSECRET", Some("ghe.example.com"));
+        let cloned = env.clone();
+        assert_eq!(cloned.kind(), "environment");
+        let debugged = format!("{cloned:?}");
+        assert!(!debugged.contains("SECRET"), "{debugged}");
+        assert!(debugged.contains("<redacted>"), "{debugged}");
+    }
 
     #[test]
     fn file_store_round_trips_save_load_and_delete() {

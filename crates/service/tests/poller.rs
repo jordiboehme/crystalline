@@ -462,6 +462,110 @@ async fn unauthenticated_poller_makes_no_calls_and_a_landed_token_starts_activit
     assert_eq!(status["origins"]["connected"], true);
 }
 
+// --- process-lifetime token cache ---------------------------------------------
+
+#[tokio::test]
+async fn poller_keeps_polling_with_the_cached_token_after_the_backing_file_disappears() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[("MANIFEST.md", manifest())]));
+    mock.set_branch("main", &commit);
+
+    let token_dir = tmp.path().join("token");
+    let eng = engine_with(
+        &tmp.path().join("config.yaml"),
+        &tmp.path().join("origins"),
+        &token_dir,
+        mock.clone(),
+        Some(60),
+    )
+    .await;
+    write_fake_token(&token_dir);
+    let root = tmp.path().join("brand-knowledge");
+    eng.origin_add(
+        "acme/brand-knowledge",
+        Some("brand"),
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+    )
+    .await
+    .unwrap();
+
+    // The first tick reads the token once through the connectivity gate,
+    // caching it for the process lifetime, and polls the domain.
+    let now = Instant::now();
+    eng.origin_poll_tick(now, Utc::now()).await;
+    let calls_after_first_tick = mock.branch_head_calls();
+    assert!(
+        calls_after_first_tick > 0,
+        "the first tick should have polled"
+    );
+
+    // The backing token file vanishes (a stray delete, a wiped state dir):
+    // the cached credential still holds, so a due tick keeps polling instead
+    // of re-reading the now-absent file and skipping for lack of a connection.
+    std::fs::remove_file(token_dir.join("github-token.json")).unwrap();
+    eng.origin_poll_tick(now + std::time::Duration::from_secs(3600), Utc::now())
+        .await;
+    assert!(
+        mock.branch_head_calls() > calls_after_first_tick,
+        "a due tick should keep polling from the cached token after the file disappeared"
+    );
+    let status = eng.status_report().await.unwrap();
+    assert_eq!(status["origins"]["connected"], true);
+}
+
+#[tokio::test]
+async fn an_auth_expired_pull_drops_the_cached_token_so_the_gate_rereads() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[("MANIFEST.md", manifest())]));
+    mock.set_branch("main", &commit);
+
+    let token_dir = tmp.path().join("token");
+    let eng = engine_with(
+        &tmp.path().join("config.yaml"),
+        &tmp.path().join("origins"),
+        &token_dir,
+        mock.clone(),
+        Some(60),
+    )
+    .await;
+    write_fake_token(&token_dir);
+    let root = tmp.path().join("brand-knowledge");
+    eng.origin_add(
+        "acme/brand-knowledge",
+        Some("brand"),
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+    )
+    .await
+    .unwrap();
+
+    // The token is revoked out from under the daemon: the next pull's probe
+    // returns AuthExpired. The first tick caches the token (gate), then the
+    // pull fails and drops the whole cache.
+    mock.fail_branch_head_auth_expired("main");
+    let now = Instant::now();
+    eng.origin_poll_tick(now, Utc::now()).await;
+    assert!(
+        mock.branch_head_calls() > 0,
+        "the tick should have attempted the pull"
+    );
+
+    // Prove the credential was dropped rather than left cached: with the
+    // backing file also gone (the token really was invalidated), a fresh
+    // read reports disconnected. A stale cache would still say connected.
+    std::fs::remove_file(token_dir.join("github-token.json")).unwrap();
+    let status = eng.status_report().await.unwrap();
+    assert_eq!(
+        status["origins"]["connected"], false,
+        "an auth-expired pull must drop the cached token so the gate re-reads and sees none"
+    );
+}
+
 // --- rate limiting -------------------------------------------------------------
 
 #[tokio::test]

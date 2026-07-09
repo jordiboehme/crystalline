@@ -1075,15 +1075,19 @@ pub async fn connect_github(
 
     let state_dir = config::origins_state_dir()
         .map_err(|e| anyhow!("could not resolve the state directory: {e}"))?;
-    let store = crystalline_remote::TokenStore::resolve(token_host.as_deref(), &state_dir);
-    store
-        .save(&crystalline_remote::StoredToken {
-            access_token,
-            host: token_host.unwrap_or_else(|| "github.com".to_string()),
-            user: login.clone(),
-            created_at: chrono::Utc::now(),
-        })
-        .map_err(|e| anyhow!("{e}"))?;
+    // One keychain write, no read: `save_resolving` writes straight through
+    // and lands in the file store only if the keychain write itself fails.
+    let stored = crystalline_remote::StoredToken {
+        access_token,
+        host: token_host
+            .clone()
+            .unwrap_or_else(|| "github.com".to_string()),
+        user: login.clone(),
+        created_at: chrono::Utc::now(),
+    };
+    let store =
+        crystalline_remote::TokenStore::save_resolving(token_host.as_deref(), &state_dir, &stored)
+            .map_err(|e| anyhow!("{e}"))?;
 
     if json {
         println!(
@@ -1150,8 +1154,9 @@ fn print_device_code(start: &crystalline_remote::DeviceFlowStart) {
     eprint!("Waiting for confirmation");
 }
 
-/// The bare host `TokenStore::resolve` addresses, derived from an auth base
-/// the same way the engine's origin operations derive it from
+/// The bare host `TokenStore::save_resolving` and `resolve_and_load` address,
+/// derived from an auth base the same way the engine's origin operations derive
+/// it from
 /// `github.api_url`: `None` for GitHub.com, the bare host for a GitHub
 /// Enterprise Server auth base. Kept in step with
 /// `crystalline_service::origin`'s private twin of this function so a token

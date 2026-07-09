@@ -61,6 +61,12 @@ struct Inner {
     /// machine. Set through `MockProvider::fail_branch_head_rate_limited`,
     /// cleared through `MockProvider::clear_branch_head_rate_limited`.
     rate_limited_branches: HashMap<String, Option<chrono::DateTime<chrono::Utc>>>,
+    /// Branches whose `branch_head` probe should fail with
+    /// `RemoteError::AuthExpired`, the mapped GitHub 401, simulating a token
+    /// revoked or rotated out from under this machine while a connection was
+    /// still on file. Set through `MockProvider::fail_branch_head_auth_expired`,
+    /// cleared through `MockProvider::clear_branch_head_auth_expired`.
+    auth_expired_branches: HashSet<String>,
     /// The lifecycle state `proposal_state` reports for a given proposal
     /// number, set through `MockProvider::set_proposal_state`. A number with
     /// no entry here errors as unknown, matching a genuinely nonexistent
@@ -163,6 +169,23 @@ impl MockProvider {
         inner.rate_limited_branches.remove(branch);
     }
 
+    /// Marks `branch` as authenticating with a revoked or rotated token:
+    /// every subsequent `branch_head` probe against it returns
+    /// `Err(RemoteError::AuthExpired)`, simulating a token that stopped
+    /// working while a connection was still on file, so a pull or status
+    /// probe trips the engine's auth-invalidation path.
+    pub fn fail_branch_head_auth_expired(&self, branch: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.auth_expired_branches.insert(branch.to_string());
+    }
+
+    /// Clears a previously injected auth-expired failure for `branch`,
+    /// simulating a fresh token being connected in its place.
+    pub fn clear_branch_head_auth_expired(&self, branch: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.auth_expired_branches.remove(branch);
+    }
+
     /// How many times `branch_head` has been called so far.
     pub fn branch_head_calls(&self) -> usize {
         self.inner.lock().unwrap().branch_head_calls
@@ -196,6 +219,9 @@ impl Provider for MockProvider {
         inner.branch_head_calls += 1;
         if inner.offline_branches.contains(&origin.branch) {
             return Err(RemoteError::Offline);
+        }
+        if inner.auth_expired_branches.contains(&origin.branch) {
+            return Err(RemoteError::AuthExpired);
         }
         if let Some(reset) = inner.rate_limited_branches.get(&origin.branch) {
             return Err(RemoteError::RateLimited { reset: *reset });

@@ -792,17 +792,24 @@ fn check_github(
 ) -> Result<GithubDoctor> {
     let api_url = cfg.github.as_ref().and_then(|g| g.api_url.clone());
     let host = cmd::bare_host(&auth_base(api_url.as_deref()));
-    let store = match overlay.github_token() {
-        Some(token) => TokenStore::env(token, host.as_deref()),
+    let (store, token) = match overlay.github_token() {
+        Some(token) => {
+            let store = TokenStore::env(token, host.as_deref());
+            let stored = store
+                .load()
+                .map_err(|e| anyhow!("could not read the saved GitHub token: {e}"))?;
+            (store, stored)
+        }
+        // The non-env doctor read fuses the backend probe and the token load
+        // into a single keychain access (down from two), the same one-read
+        // path the engine uses.
         None => {
             let state_base = config::origins_state_dir()
                 .map_err(|e| anyhow!("could not resolve the origins state directory: {e}"))?;
-            TokenStore::resolve(host.as_deref(), &state_base)
+            TokenStore::resolve_and_load(host.as_deref(), &state_base)
+                .map_err(|e| anyhow!("could not read the saved GitHub token: {e}"))?
         }
     };
-    let token = store
-        .load()
-        .map_err(|e| anyhow!("could not read the saved GitHub token: {e}"))?;
 
     let mut origins = Vec::new();
     for (name, entry) in targets {

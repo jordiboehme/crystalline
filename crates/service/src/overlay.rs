@@ -65,10 +65,10 @@ const DOMAIN_ORIGIN_SUFFIX: &str = "_ORIGIN";
 
 /// The variable carrying a GitHub token for a headless node:
 /// `CRYSTALLINE_GITHUB_TOKEN`. Checked before the keyring and the file store
-/// (see `Engine::resolve_token_store`), so a container with this variable set
+/// (see `Engine::github_credential`), so a container with this variable set
 /// never needs an interactive sign-in. Read-only: a saved token is never
 /// consulted while this is set, `connect github` refuses and `crates/remote`
-/// never reads it itself (see [`crate::engine::Engine::resolve_token_store`]
+/// never reads it itself (see [`crate::engine::Engine::github_credential`]
 /// and the `crystalline_remote::token` module docs).
 pub const GITHUB_TOKEN_ENV: &str = "CRYSTALLINE_GITHUB_TOKEN";
 
@@ -341,7 +341,7 @@ impl EnvOverlay {
     }
 
     /// The GitHub token from [`GITHUB_TOKEN_ENV`], if the environment set
-    /// one. `Engine::resolve_token_store` checks this before the keyring and
+    /// one. `Engine::github_credential` checks this before the keyring and
     /// the file store; nothing else in the process reads
     /// `CRYSTALLINE_GITHUB_TOKEN` directly.
     pub fn github_token(&self) -> Option<&str> {
