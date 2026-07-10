@@ -157,6 +157,11 @@ pub struct DomainEntry {
     /// no origin (the common case, and every domain predating this feature).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<OriginConfig>,
+    /// Whether this domain's declared artifacts are provisioned into harnesses.
+    /// Absent means undecided: the domain's artifacts are surfaced as awaiting a
+    /// decision but nothing installs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provision: Option<bool>,
 }
 
 impl DomainEntry {
@@ -166,6 +171,7 @@ impl DomainEntry {
             kind: DomainKind::File,
             path: Some(path.into()),
             origin: None,
+            provision: None,
         }
     }
 
@@ -175,6 +181,7 @@ impl DomainEntry {
             kind: DomainKind::Virtual,
             path: None,
             origin: None,
+            provision: None,
         }
     }
 
@@ -742,5 +749,49 @@ mod tests {
         let entry = cfg.domains.get("eng").unwrap();
         assert!(!entry.is_virtual());
         assert_eq!(entry.file_path(), Some(PathBuf::from("/knowledge/eng")));
+    }
+
+    #[test]
+    fn constructors_default_provision_to_none() {
+        assert_eq!(DomainEntry::file("/knowledge/eng").provision, None);
+        assert_eq!(DomainEntry::virtual_domain().provision, None);
+    }
+
+    #[test]
+    fn pre_existing_shape_round_trips_byte_identically_with_provision_absent() {
+        // A config written before `provision` existed - a bare path entry with
+        // no kind, no origin, no provision - must serialize back to exactly
+        // the same bytes, with no `provision:` key anywhere.
+        let yaml = "domains:\n  eng:\n    path: /knowledge/eng\n";
+        let cfg: GlobalConfig = serde_yaml_ng::from_str(yaml).unwrap();
+        assert_eq!(cfg.domains.get("eng").unwrap().provision, None);
+        let out = serde_yaml_ng::to_string(&cfg).unwrap();
+        assert!(
+            !out.contains("provision"),
+            "no provision line for a pre-existing entry: {out}"
+        );
+        assert_eq!(out, yaml);
+    }
+
+    #[test]
+    fn provision_true_and_false_round_trip() {
+        let mut domains = IndexMap::new();
+        let mut allowed = DomainEntry::file("/knowledge/allowed");
+        allowed.provision = Some(true);
+        domains.insert("allowed".to_string(), allowed);
+        let mut denied = DomainEntry::file("/knowledge/denied");
+        denied.provision = Some(false);
+        domains.insert("denied".to_string(), denied);
+        let cfg = GlobalConfig {
+            domains,
+            ..GlobalConfig::default()
+        };
+
+        let yaml = serde_yaml_ng::to_string(&cfg).unwrap();
+        assert!(yaml.contains("provision: true"), "{yaml}");
+        assert!(yaml.contains("provision: false"), "{yaml}");
+        let back: GlobalConfig = serde_yaml_ng::from_str(&yaml).unwrap();
+        assert_eq!(back.domains.get("allowed").unwrap().provision, Some(true));
+        assert_eq!(back.domains.get("denied").unwrap().provision, Some(false));
     }
 }

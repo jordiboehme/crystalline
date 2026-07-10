@@ -356,6 +356,7 @@ async fn origin_add_connects_a_registered_domain_in_place() {
             kind: crystalline_core::config::DomainKind::File,
             path: Some(root.clone()),
             origin: None,
+            provision: None,
         },
     );
     let eng = Engine::new(
@@ -410,6 +411,7 @@ async fn origin_add_on_a_registered_domain_refuses_a_different_folder() {
             kind: crystalline_core::config::DomainKind::File,
             path: Some(root.clone()),
             origin: None,
+            provision: None,
         },
     );
     let eng = Engine::new(

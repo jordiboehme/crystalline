@@ -2975,6 +2975,7 @@ impl Engine {
                         branch: branch.map(str::to_string),
                         poll_secs: None,
                     }),
+                    provision: None,
                 },
             );
             self.persist_config(&file)?;
