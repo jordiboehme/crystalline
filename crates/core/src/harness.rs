@@ -13,6 +13,7 @@
 use std::path::PathBuf;
 
 use crate::config;
+use crate::manifest::ArtifactType;
 
 /// Which coding harness is being targeted. [`HarnessKind::id`] produces the
 /// stable spellings `claude-code`, `codex` and `copilot`, mirrored by the
@@ -109,7 +110,7 @@ pub fn harness_paths(harness: HarnessKind, project: bool) -> HarnessPaths {
     match (harness, project) {
         (HarnessKind::ClaudeCode, false) => HarnessPaths {
             settings: config::expand_tilde("~/.claude/settings.json"),
-            skills_dir: config::expand_tilde("~/.claude/skills"),
+            skills_dir: user_skills_dir(harness),
         },
         (HarnessKind::ClaudeCode, true) => HarnessPaths {
             settings: PathBuf::from(".claude/settings.json"),
@@ -117,7 +118,7 @@ pub fn harness_paths(harness: HarnessKind, project: bool) -> HarnessPaths {
         },
         (HarnessKind::Codex, false) => HarnessPaths {
             settings: config::expand_tilde("~/.codex/hooks.json"),
-            skills_dir: config::expand_tilde("~/.agents/skills"),
+            skills_dir: user_skills_dir(harness),
         },
         (HarnessKind::Codex, true) => HarnessPaths {
             settings: PathBuf::from(".codex/hooks.json"),
@@ -125,13 +126,56 @@ pub fn harness_paths(harness: HarnessKind, project: bool) -> HarnessPaths {
         },
         (HarnessKind::Copilot, false) => HarnessPaths {
             settings: copilot_home().join("hooks").join("crystalline.json"),
-            skills_dir: copilot_home().join("skills"),
+            skills_dir: user_skills_dir(harness),
         },
         (HarnessKind::Copilot, true) => HarnessPaths {
             settings: PathBuf::from(".github/hooks/crystalline.json"),
             skills_dir: PathBuf::from(".github/skills"),
         },
     }
+}
+
+/// The user-scope skills folder for a harness. The single source of truth for
+/// that path, shared by [`harness_paths`] (which surfaces it as
+/// `skills_dir`) and [`artifact_base`] (which returns it for
+/// [`ArtifactType::Skills`]) so the two can never drift.
+fn user_skills_dir(harness: HarnessKind) -> PathBuf {
+    match harness {
+        HarnessKind::ClaudeCode => config::expand_tilde("~/.claude/skills"),
+        HarnessKind::Codex => config::expand_tilde("~/.agents/skills"),
+        HarnessKind::Copilot => copilot_home().join("skills"),
+    }
+}
+
+/// The user-scope directory a harness stores artifacts of `kind` under, or
+/// `None` when this harness keeps that kind nowhere on disk: an MCP config is
+/// registered through the harness CLI rather than written as a file, and a
+/// harness that does not provision a kind yet has no folder for it. A
+/// reconcile engine maps a desired key `"<kind>/<rel>"` to a real path by
+/// joining `rel` onto this base.
+///
+/// User scope only, which is where a domain provisions today. This milestone's
+/// matrix: Claude Code stores skills, commands and agents under `~/.claude`
+/// (and registers MCP servers through its CLI, so `Mcps` is `None`); Codex and
+/// GitHub Copilot store skills only, each under its own skills folder shared
+/// with [`harness_paths`]. M11 extends this as Codex and Copilot gain command,
+/// agent and MCP support of their own.
+pub fn artifact_base(harness: HarnessKind, kind: ArtifactType) -> anyhow::Result<Option<PathBuf>> {
+    let base = match (harness, kind) {
+        (_, ArtifactType::Skills) => Some(user_skills_dir(harness)),
+        (HarnessKind::ClaudeCode, ArtifactType::Commands) => {
+            Some(config::expand_tilde("~/.claude/commands"))
+        }
+        (HarnessKind::ClaudeCode, ArtifactType::Agents) => {
+            Some(config::expand_tilde("~/.claude/agents"))
+        }
+        // Claude Code registers MCP servers through its own CLI, never as a
+        // file on disk; Codex and Copilot provision nothing but skills yet.
+        (HarnessKind::ClaudeCode, ArtifactType::Mcps)
+        | (HarnessKind::Codex, _)
+        | (HarnessKind::Copilot, _) => None,
+    };
+    Ok(base)
 }
 
 /// Copilot's home folder: `$COPILOT_HOME` when it is set and non-empty,
@@ -187,5 +231,72 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn artifact_base_maps_each_kind_to_its_user_scope_folder() {
+        // Claude Code keeps skills, commands and agents as files, each under
+        // its own `~/.claude` folder, but registers MCP servers through its
+        // CLI - so those three resolve to a base and `Mcps` does not.
+        assert_eq!(
+            artifact_base(HarnessKind::ClaudeCode, ArtifactType::Skills).unwrap(),
+            Some(config::expand_tilde("~/.claude/skills"))
+        );
+        assert_eq!(
+            artifact_base(HarnessKind::ClaudeCode, ArtifactType::Commands).unwrap(),
+            Some(config::expand_tilde("~/.claude/commands"))
+        );
+        assert_eq!(
+            artifact_base(HarnessKind::ClaudeCode, ArtifactType::Agents).unwrap(),
+            Some(config::expand_tilde("~/.claude/agents"))
+        );
+        assert_eq!(
+            artifact_base(HarnessKind::ClaudeCode, ArtifactType::Mcps).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn artifact_base_skills_folder_never_drifts_from_harness_paths() {
+        // The skills base and `harness_paths`' `skills_dir` share one helper,
+        // so every harness must agree on where skills land.
+        for harness in [
+            HarnessKind::ClaudeCode,
+            HarnessKind::Codex,
+            HarnessKind::Copilot,
+        ] {
+            assert_eq!(
+                artifact_base(harness, ArtifactType::Skills).unwrap(),
+                Some(harness_paths(harness, false).skills_dir)
+            );
+        }
+    }
+
+    #[test]
+    fn artifact_base_codex_and_copilot_provision_skills_only() {
+        for harness in [HarnessKind::Codex, HarnessKind::Copilot] {
+            assert!(
+                artifact_base(harness, ArtifactType::Skills)
+                    .unwrap()
+                    .is_some()
+            );
+            for kind in [
+                ArtifactType::Commands,
+                ArtifactType::Agents,
+                ArtifactType::Mcps,
+            ] {
+                assert_eq!(artifact_base(harness, kind).unwrap(), None);
+            }
+        }
+    }
+
+    #[test]
+    fn artifact_base_copilot_skills_honor_copilot_home() {
+        // Copilot's skills base rides on the same `COPILOT_HOME` helper the
+        // rest of Copilot's paths use.
+        let copilot = artifact_base(HarnessKind::Copilot, ArtifactType::Skills)
+            .unwrap()
+            .unwrap();
+        assert_eq!(copilot, copilot_home().join("skills"));
     }
 }

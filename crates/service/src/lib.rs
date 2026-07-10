@@ -28,7 +28,7 @@ pub use client::{
 };
 pub use daemon::run_serve;
 pub use engine::{Engine, EngineError};
-pub use harness_cli::{CliRun, run_harness_cli};
+pub use harness_cli::{CliRun, SystemMcpRunner, run_harness_cli};
 pub use mcp::McpServer;
 pub use origin::parse_origin_spec;
 pub use overlay::{EnvDomain, EnvOverlay, LoadedConfig};

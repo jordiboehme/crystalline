@@ -33,7 +33,7 @@ pub use engram::{
     Engram, Frontmatter, Heading, LinkTarget, Observation, RECOMMENDED_STATUSES, RECOMMENDED_TYPES,
     Relation, SchemaDef, WikiLink,
 };
-pub use harness::{HarnessKind, HarnessPaths, harness_paths};
+pub use harness::{HarnessKind, HarnessPaths, artifact_base, harness_paths};
 pub use manifest::{
     ArtifactType, Manifest, ProblemKind, ProvisioningDecl, ProvisioningProblem,
     ProvisioningSection, in_root_artifact_dirs, manifest_template,
@@ -44,9 +44,10 @@ pub use prompt::{
     render_json, render_text,
 };
 pub use provision::{
-    ArtifactFile, DesiredFile, DesiredMcp, DesiredSet, DomainArtifacts, DomainSources,
-    HarnessState, InstalledFile, InstalledMcp, McpArtifact, ProvisionReceipt, SourceStamp,
-    desired_set, harness_supports, is_plain_component, resolve_source_roots, scan_domain,
+    ActionStatus, ArtifactAction, ArtifactFile, DesiredFile, DesiredMcp, DesiredSet,
+    DomainArtifacts, DomainSources, HarnessState, InstalledFile, InstalledMcp, McpArtifact,
+    McpOutcome, McpRunner, ProvisionReceipt, SourceStamp, desired_set, harness_supports,
+    is_plain_component, reconcile_harness, resolve_source_roots, scan_domain,
 };
 pub use schema::{
     FieldDecl, FieldType, ScalarType, Schema, SchemaDrift, SchemaIssue, ValidationMode,
