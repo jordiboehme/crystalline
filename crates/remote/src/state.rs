@@ -7,9 +7,11 @@
 //! one directory per domain):
 //!
 //! ```text
-//! <dir>/state.json      the OriginState, saved atomically
-//! <dir>/base/           a snapshot of the domain subtree as of base_commit
-//! <dir>/conflicts/<id>/ per-conflict copies of the base and upstream sides
+//! <dir>/state.json        the OriginState, saved atomically
+//! <dir>/base/             a snapshot of the domain subtree as of base_commit
+//! <dir>/artifacts/<kind>/ the team-domain mirror of the out-of-subtree
+//!                         artifact folders (skills, mcps) a MANIFEST declares
+//! <dir>/conflicts/<id>/   per-conflict copies of the base and upstream sides
 //! ```
 //!
 //! Relative paths are always forward-slash normalized in [`OriginState`] and
@@ -26,7 +28,7 @@
 //! nothing about async runtimes, and callers on an async runtime wrap calls
 //! in `spawn_blocking` themselves.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -51,6 +53,7 @@ const BASE_TMP_DIR_NAME: &str = "base.tmp";
 const CONFLICTS_DIR_NAME: &str = "conflicts";
 const CONFLICT_BASE_FILE_NAME: &str = "base";
 const CONFLICT_UPSTREAM_FILE_NAME: &str = "upstream";
+const ARTIFACTS_DIR_NAME: &str = "artifacts";
 
 /// The durable state of one domain's connection to its GitHub origin.
 ///
@@ -356,6 +359,97 @@ pub fn replace_base_tree(dir: &Path, files: &BTreeMap<String, Vec<u8>>) -> Resul
         std::fs::remove_dir_all(&base_root)?;
     }
     std::fs::rename(&tmp_root, &base_root)?;
+    Ok(())
+}
+
+/// The team-domain artifact mirror directory under `dir`, `<dir>/artifacts`.
+/// Holds one subdirectory per provisioned artifact kind, each mirroring the
+/// upstream folder an out-of-subtree provisioning decl points at, so a team
+/// domain's `resolve_source_roots` can scan its skills or MCP configs from
+/// here even though only the domain subtree was materialized into the working
+/// tree.
+pub fn artifacts_dir(dir: &Path) -> PathBuf {
+    dir.join(ARTIFACTS_DIR_NAME)
+}
+
+/// The mirror subdirectory for one artifact `kind_id` (`skills`, `commands`,
+/// `agents` or `mcps`), `<dir>/artifacts/<kind_id>`.
+///
+/// `kind_id` is always one of the four fixed
+/// `crystalline_core::manifest::ArtifactType` identifiers, produced by this
+/// crate rather than read off untrusted upstream content, so it carries no
+/// traversal risk of its own; the file paths written beneath it are the
+/// untrusted part and are validated by [`to_platform_path`] like every other
+/// write in this module.
+fn artifact_kind_dir(dir: &Path, kind_id: &str) -> PathBuf {
+    artifacts_dir(dir).join(kind_id)
+}
+
+/// Clears `<dir>/artifacts/<kind_id>` and rewrites it from `files` (relative
+/// path to bytes), creating parent directories as needed.
+///
+/// Clear-then-write: the kind directory is removed first, so an upstream
+/// folder that shed files or went empty leaves no stale bytes behind. An
+/// empty `files` therefore leaves the kind directory absent, which the scan
+/// reads as nothing to provision.
+///
+/// Every key in `files` is validated by [`to_platform_path`] before it is
+/// written: the first one shaped like a traversal, an absolute path or a
+/// Windows drive-prefix attempt fails the whole call with
+/// [`RemoteError::State`] naming the offending path, so upstream artifact
+/// content can never escape the mirror.
+pub fn replace_artifact_kind(
+    dir: &Path,
+    kind_id: &str,
+    files: &BTreeMap<String, Vec<u8>>,
+) -> Result<(), RemoteError> {
+    let kind_dir = artifact_kind_dir(dir, kind_id);
+    match std::fs::remove_dir_all(&kind_dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    for (rel, bytes) in files {
+        let path = kind_dir.join(to_platform_path(rel)?);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, bytes)?;
+    }
+    Ok(())
+}
+
+/// Prunes `<dir>/artifacts` down to exactly the kind directories in `keep`:
+/// any other entry (a kind whose decl was dropped upstream, or stray content)
+/// is removed, and the `artifacts` directory itself is removed once nothing
+/// is left, so a MANIFEST that dropped its whole Provisioning section leaves
+/// no mirror behind. A missing `artifacts` directory is not an error.
+pub fn prune_artifact_kinds(dir: &Path, keep: &BTreeSet<&str>) -> Result<(), RemoteError> {
+    let artifacts = artifacts_dir(dir);
+    let entries = match std::fs::read_dir(&artifacts) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if keep.contains(name.as_str()) {
+            continue;
+        }
+        let path = entry.path();
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            std::fs::remove_dir_all(&path)?;
+        } else {
+            std::fs::remove_file(&path)?;
+        }
+    }
+    let now_empty = std::fs::read_dir(&artifacts)
+        .map(|mut e| e.next().is_none())
+        .unwrap_or(false);
+    if now_empty {
+        let _ = std::fs::remove_dir(&artifacts);
+    }
     Ok(())
 }
 
@@ -825,6 +919,78 @@ mod tests {
             bad,
             vec!["mismatched.md".to_string(), "missing.md".to_string()]
         );
+    }
+
+    #[test]
+    fn replace_artifact_kind_clears_then_writes_and_drops_stale_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut v1 = BTreeMap::new();
+        v1.insert("tide-tables/SKILL.md".to_string(), b"v1".to_vec());
+        v1.insert(
+            "tide-tables/scripts/chart.sh".to_string(),
+            b"chart".to_vec(),
+        );
+        replace_artifact_kind(dir.path(), "skills", &v1).unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join("artifacts/skills/tide-tables/SKILL.md")).unwrap(),
+            b"v1"
+        );
+
+        // A rewrite with a different file set clears the stale one first.
+        let mut v2 = BTreeMap::new();
+        v2.insert("harbor/SKILL.md".to_string(), b"v2".to_vec());
+        replace_artifact_kind(dir.path(), "skills", &v2).unwrap();
+        assert!(!dir.path().join("artifacts/skills/tide-tables").exists());
+        assert_eq!(
+            std::fs::read(dir.path().join("artifacts/skills/harbor/SKILL.md")).unwrap(),
+            b"v2"
+        );
+    }
+
+    #[test]
+    fn replace_artifact_kind_with_empty_files_leaves_the_kind_dir_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut v1 = BTreeMap::new();
+        v1.insert("tide-tables/SKILL.md".to_string(), b"v1".to_vec());
+        replace_artifact_kind(dir.path(), "skills", &v1).unwrap();
+        replace_artifact_kind(dir.path(), "skills", &BTreeMap::new()).unwrap();
+        assert!(!dir.path().join("artifacts/skills").exists());
+    }
+
+    #[test]
+    fn replace_artifact_kind_rejects_a_traversal_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut files = BTreeMap::new();
+        files.insert("../evil.md".to_string(), b"nope".to_vec());
+        let err = replace_artifact_kind(dir.path(), "skills", &files).unwrap_err();
+        assert!(matches!(err, RemoteError::State(_)));
+    }
+
+    #[test]
+    fn prune_artifact_kinds_removes_undesired_and_empties_the_artifacts_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut skills = BTreeMap::new();
+        skills.insert("a/SKILL.md".to_string(), b"a".to_vec());
+        replace_artifact_kind(dir.path(), "skills", &skills).unwrap();
+        let mut agents = BTreeMap::new();
+        agents.insert("pilot.md".to_string(), b"pilot".to_vec());
+        replace_artifact_kind(dir.path(), "agents", &agents).unwrap();
+
+        let keep: BTreeSet<&str> = ["skills"].into_iter().collect();
+        prune_artifact_kinds(dir.path(), &keep).unwrap();
+        assert!(dir.path().join("artifacts/skills").exists());
+        assert!(!dir.path().join("artifacts/agents").exists());
+
+        let none: BTreeSet<&str> = BTreeSet::new();
+        prune_artifact_kinds(dir.path(), &none).unwrap();
+        assert!(!dir.path().join("artifacts").exists());
+    }
+
+    #[test]
+    fn prune_artifact_kinds_with_no_artifacts_dir_is_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let keep: BTreeSet<&str> = BTreeSet::new();
+        prune_artifact_kinds(dir.path(), &keep).unwrap();
     }
 
     #[test]

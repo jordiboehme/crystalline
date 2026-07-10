@@ -137,6 +137,22 @@ pub fn extract_tarball(bytes: &[u8], subpath: Option<&str>) -> Result<ExtractedF
     Ok((files, skipped_large))
 }
 
+/// Extracts the files under repo-relative `root` from a tarball, re-keyed
+/// relative to `root` and subject to the exact same entry guards as
+/// [`extract_tarball`] (top-level strip, hidden and oversized skipping, `..`
+/// and `:` rejection).
+///
+/// This is [`extract_tarball`] itself viewed as a repo-relative-root
+/// extractor rather than a domain-subtree extractor: the team-domain artifact
+/// mirror uses it to lift one declared out-of-subtree folder (`skills`,
+/// `mcps`) out of the same tarball a subscribe or pull already fetched,
+/// reusing every guard rather than walking the archive a second way. An empty
+/// `root` selects the whole repository tree.
+pub fn extract_repo_subtree(bytes: &[u8], root: &str) -> Result<ExtractedFiles, RemoteError> {
+    let subpath = if root.is_empty() { None } else { Some(root) };
+    extract_tarball(bytes, subpath)
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Write;
@@ -304,6 +320,41 @@ mod tests {
 
         let err = extract_tarball(&bytes, None).unwrap_err();
         assert!(matches!(err, crate::error::RemoteError::State(_)));
+    }
+
+    #[test]
+    fn extract_repo_subtree_selects_and_rekeys_one_root() {
+        let bytes = TarballBuilder::new("team-knowledge-abc123")
+            .add_file("knowledge/MANIFEST.md", b"# Manifest")
+            .add_file("skills/tide-tables/SKILL.md", b"skill")
+            .add_file("skills/tide-tables/scripts/chart.sh", b"chart")
+            .finish_gz();
+
+        let (files, skipped) = extract_repo_subtree(&bytes, "skills").unwrap();
+        assert!(skipped.is_empty());
+        assert_eq!(files.len(), 2);
+        assert_eq!(
+            files.get("tide-tables/SKILL.md").map(Vec::as_slice),
+            Some(&b"skill"[..])
+        );
+        assert_eq!(
+            files.get("tide-tables/scripts/chart.sh").map(Vec::as_slice),
+            Some(&b"chart"[..])
+        );
+        assert!(!files.contains_key("knowledge/MANIFEST.md"));
+    }
+
+    #[test]
+    fn extract_repo_subtree_empty_root_is_the_whole_tree() {
+        let bytes = TarballBuilder::new("team-knowledge-abc123")
+            .add_file("a.md", b"a")
+            .add_file("nested/b.md", b"b")
+            .finish_gz();
+
+        let (files, _skipped) = extract_repo_subtree(&bytes, "").unwrap();
+        assert_eq!(files.len(), 2);
+        assert!(files.contains_key("a.md"));
+        assert!(files.contains_key("nested/b.md"));
     }
 
     #[test]

@@ -318,7 +318,13 @@ fn normalize_in_root(path: &str) -> Option<PathBuf> {
 /// climbs above that root, which `normalize_in_root` treats as leaving no
 /// in-root folder to exclude, and `provision::resolve_source_roots` treats as
 /// a decl that resolves from somewhere else entirely.
-pub(crate) fn normalize_relative(path: &str) -> (Vec<&str>, usize) {
+///
+/// Public so the `crystalline-remote` crate can reuse the exact same `.`/`..`
+/// semantics when it decides which team-domain decls point out of the fetched
+/// subtree and where they land relative to the repository root, keeping the
+/// mirror it populates in step with the source roots `resolve_source_roots`
+/// resolves against it.
+pub fn normalize_relative(path: &str) -> (Vec<&str>, usize) {
     let mut kept: Vec<&str> = Vec::new();
     let mut climbs: usize = 0;
     for component in path.split('/') {
