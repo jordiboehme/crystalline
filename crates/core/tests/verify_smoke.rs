@@ -201,3 +201,177 @@ fn nonexistent_path_is_a_scan_error() {
         other => panic!("expected NotFound, got {other:?}"),
     }
 }
+
+// --- Provisioning rules (M005, M104, M105, M106) and scan exclusion ----------
+
+/// A structurally valid harbor MANIFEST whose `## Provisioning` section carries
+/// `prov`, so a provisioning rule fires in isolation from the other M-rules.
+fn manifest_with_provisioning(prov: &str) -> String {
+    format!(
+        "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n## Scope\n\n- Charts of the harbor\n\n## When to Use\n\n- When asked about the harbor\n\n## Provisioning\n\n{prov}"
+    )
+}
+
+#[test]
+fn invalid_provisioning_path_is_m005_error() {
+    let dir = tempdir().unwrap();
+    write(
+        dir.path(),
+        "MANIFEST.md",
+        &manifest_with_provisioning("- skills: /abs\n"),
+    );
+    let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+    let m005 = report
+        .issues
+        .iter()
+        .find(|i| i.rule == "M005")
+        .expect("M005 present");
+    assert_eq!(m005.severity, Severity::Error);
+    assert_eq!(report.exit_code(), 1);
+
+    // A valid in-root decl (its folder present) does not trigger M005.
+    let ok = tempdir().unwrap();
+    write(
+        ok.path(),
+        "MANIFEST.md",
+        &manifest_with_provisioning("- skills: skills\n"),
+    );
+    std::fs::create_dir_all(ok.path().join("skills")).unwrap();
+    let report = verify::verify_paths([ok.path()], &VerifyOptions::default()).unwrap();
+    assert!(!report.issues.iter().any(|i| i.rule == "M005"));
+}
+
+#[test]
+fn unknown_provisioning_type_is_m104_warning() {
+    let dir = tempdir().unwrap();
+    write(
+        dir.path(),
+        "MANIFEST.md",
+        &manifest_with_provisioning("- prompts: ../prompts\n"),
+    );
+    let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+    let m104 = report
+        .issues
+        .iter()
+        .find(|i| i.rule == "M104")
+        .expect("M104 present");
+    assert_eq!(m104.severity, Severity::Warning);
+    assert!(m104.message.contains("prompts"), "{}", m104.message);
+    assert_eq!(report.exit_code(), 0);
+
+    // A known type does not trigger M104.
+    let ok = tempdir().unwrap();
+    write(
+        ok.path(),
+        "MANIFEST.md",
+        &manifest_with_provisioning("- skills: ../skills\n"),
+    );
+    let report = verify::verify_paths([ok.path()], &VerifyOptions::default()).unwrap();
+    assert!(!report.issues.iter().any(|i| i.rule == "M104"));
+}
+
+#[test]
+fn missing_in_root_provisioning_folder_is_m105_warning() {
+    // In-root decl whose folder is absent on disk: warns.
+    let missing = tempdir().unwrap();
+    write(
+        missing.path(),
+        "MANIFEST.md",
+        &manifest_with_provisioning("- skills: skills\n"),
+    );
+    let report = verify::verify_paths([missing.path()], &VerifyOptions::default()).unwrap();
+    let m105 = report
+        .issues
+        .iter()
+        .find(|i| i.rule == "M105")
+        .expect("M105 present");
+    assert_eq!(m105.severity, Severity::Warning);
+    assert!(m105.message.contains("skills"), "{}", m105.message);
+
+    // The same decl with the folder present does not warn.
+    let present = tempdir().unwrap();
+    write(
+        present.path(),
+        "MANIFEST.md",
+        &manifest_with_provisioning("- skills: skills\n"),
+    );
+    std::fs::create_dir_all(present.path().join("skills")).unwrap();
+    let report = verify::verify_paths([present.path()], &VerifyOptions::default()).unwrap();
+    assert!(!report.issues.iter().any(|i| i.rule == "M105"));
+
+    // An out-of-root decl is never disk-checked, so a missing `../skills` does
+    // not warn.
+    let out = tempdir().unwrap();
+    write(
+        out.path(),
+        "MANIFEST.md",
+        &manifest_with_provisioning("- skills: ../skills\n"),
+    );
+    let report = verify::verify_paths([out.path()], &VerifyOptions::default()).unwrap();
+    assert!(!report.issues.iter().any(|i| i.rule == "M105"));
+}
+
+#[test]
+fn malformed_and_duplicate_provisioning_are_m106_warnings() {
+    let dir = tempdir().unwrap();
+    write(
+        dir.path(),
+        "MANIFEST.md",
+        &manifest_with_provisioning(
+            "- skills without a colon\n- skills: ../skills\n- skills: ../other\n",
+        ),
+    );
+    let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+    let m106: Vec<_> = report.issues.iter().filter(|i| i.rule == "M106").collect();
+    assert_eq!(m106.len(), 2, "malformed + duplicate: {:#?}", report.issues);
+    assert!(m106.iter().all(|i| i.severity == Severity::Warning));
+
+    // A clean section triggers no M106.
+    let ok = tempdir().unwrap();
+    write(
+        ok.path(),
+        "MANIFEST.md",
+        &manifest_with_provisioning("- skills: ../skills\n"),
+    );
+    let report = verify::verify_paths([ok.path()], &VerifyOptions::default()).unwrap();
+    assert!(!report.issues.iter().any(|i| i.rule == "M106"));
+}
+
+#[test]
+fn provisioned_in_root_folder_is_excluded_from_the_scan() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "MANIFEST.md",
+        &manifest_with_provisioning("- skills: skills\n"),
+    );
+    // An artifact under the declared folder must not be scanned as an engram.
+    write(
+        root,
+        "skills/tide-tables/SKILL.md",
+        "---\ntype: skill\ntitle: Tide Tables\n---\n\n# Tide Tables\n",
+    );
+    // A sibling engram outside the folder is still collected.
+    write(
+        root,
+        "notes/harbor-log.md",
+        "---\ntype: engram\ntitle: Harbor Log\npermalink: notes/harbor-log\ntags:\n- log\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Harbor Log\n\nThe tide came in twice today, as it always does at this port.\n",
+    );
+    // A near-miss sibling whose name merely starts with `skills` is a normal
+    // folder: exclusion matches whole path components, not string prefixes.
+    write(
+        root,
+        "skills-tables/berth-notes.md",
+        "---\ntype: engram\ntitle: Berth Notes\npermalink: skills-tables/berth-notes\ntags:\n- log\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Berth Notes\n\nBerth three is shallow at low tide and best avoided by deep keels.\n",
+    );
+
+    let report = verify::verify_paths([root], &VerifyOptions::default()).unwrap();
+    // MANIFEST.md and both engrams are scanned; only the SKILL.md is pruned.
+    assert_eq!(report.summary.files_scanned, 3, "{:#?}", report.issues);
+    assert!(
+        !report.issues.iter().any(|i| i.path.ends_with("SKILL.md")),
+        "the excluded artifact must raise no issues: {:#?}",
+        report.issues
+    );
+}

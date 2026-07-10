@@ -32,8 +32,8 @@ pub use engram::{
     Relation, SchemaDef, WikiLink,
 };
 pub use manifest::{
-    ArtifactType, Manifest, ProvisioningDecl, ProvisioningProblem, ProvisioningSection,
-    manifest_template,
+    ArtifactType, Manifest, ProblemKind, ProvisioningDecl, ProvisioningProblem,
+    ProvisioningSection, in_root_artifact_dirs, manifest_template,
 };
 pub use parse::{LosslessEngram, ParseError, parse_engram, parse_engram_lossless};
 pub use prompt::{

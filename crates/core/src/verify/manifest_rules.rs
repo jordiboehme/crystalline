@@ -10,7 +10,7 @@
 use indexmap::IndexMap;
 
 use crate::engram::Heading;
-use crate::manifest::Manifest;
+use crate::manifest::{Manifest, ProblemKind, ProvisioningSection, in_root_artifact_dirs};
 
 use super::scanner::Domain;
 use super::{Severity, Sink};
@@ -113,7 +113,58 @@ fn check_manifest(domain: &Domain, sink: &mut Sink) {
         }
     }
 
+    if let Some(section) = manifest.provisioning() {
+        check_provisioning(&section, &file.path, &domain.root, sink);
+    }
+
     check_duplicate_h2(&engram.headings, &file.path, sink);
+}
+
+/// The `## Provisioning` rules. Parse problems route to a rule by their
+/// [`ProblemKind`] so no message text is matched: an invalid path is an error
+/// (`M005`, never provisioned), an unknown type is a warning (`M104`) and a
+/// malformed or duplicate bullet is a warning (`M106`). `M105` then warns about
+/// a valid decl whose in-root folder is missing on disk.
+fn check_provisioning(
+    section: &ProvisioningSection,
+    path: &std::path::Path,
+    root: &std::path::Path,
+    sink: &mut Sink,
+) {
+    for problem in &section.problems {
+        let (rule, severity) = match problem.kind {
+            ProblemKind::InvalidPath => ("M005", Severity::Error),
+            ProblemKind::UnknownType => ("M104", Severity::Warning),
+            ProblemKind::Malformed | ProblemKind::DuplicateType => ("M106", Severity::Warning),
+        };
+        sink.emit(
+            path,
+            None,
+            rule,
+            severity,
+            format!("`## Provisioning`: {}", problem.reason),
+            None,
+        );
+    }
+
+    // Only in-root decls are disk-checked. An out-of-root decl (`../skills`) is
+    // deliberately not checked here: for a team domain the local working tree
+    // legitimately lacks it, since a state-dir mirror provides the folder, so a
+    // disk check would warn spuriously. `in_root_artifact_dirs` is the single
+    // source that decides in-root membership, shared with the scan exclusion.
+    for dir in in_root_artifact_dirs(root) {
+        if !dir.exists() {
+            let shown = dir.strip_prefix(root).unwrap_or(&dir).display();
+            sink.emit(
+                path,
+                None,
+                "M105",
+                Severity::Warning,
+                format!("`## Provisioning`: declared folder `{shown}` does not exist"),
+                None,
+            );
+        }
+    }
 }
 
 fn check_required_file(domain: &Domain, rf: &crate::config::RequiredFile, sink: &mut Sink) {
