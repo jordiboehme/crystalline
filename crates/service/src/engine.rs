@@ -3964,7 +3964,10 @@ impl Engine {
     /// flow must never overwrite that with a stale report. Refuses up front,
     /// before validating anything against GitHub, when
     /// `CRYSTALLINE_GITHUB_TOKEN` is set: this machine's identity is already
-    /// fixed by the environment.
+    /// fixed by the environment. The response's `github_enabled` and `note`
+    /// state enablement explicitly, straight from the live effective config,
+    /// so an agent narrates it from data rather than inferring it from tool
+    /// wording (connecting and enabling are independent of each other).
     pub async fn connect_with_token(&self, token: &str, host: Option<&str>) -> Result<Value> {
         if self.overlay.github_token().is_some() {
             return Err(EngineError::EnvTokenConnect);
@@ -3989,6 +3992,9 @@ impl Engine {
 
         let mut github = self.origin_connection_json().await?;
         github["pending_connect"] = Value::Null;
+        let enabled = self.config.read().unwrap().github_enabled();
+        github["github_enabled"] = json!(enabled);
+        github["note"] = json!(connect_enablement_note(enabled, false));
         self.configure_snapshot_with(github)
     }
 
@@ -4062,12 +4068,38 @@ impl Engine {
             *outcome_slot.lock().unwrap() = Some(result);
         });
 
+        let enabled = self.config.read().unwrap().github_enabled();
         self.configure_snapshot_with(json!({
             "connected": false,
             "user": Value::Null,
             "token_store": Value::Null,
             "pending_connect": view,
+            "github_enabled": enabled,
+            "note": connect_enablement_note(enabled, true),
         }))
+    }
+}
+
+/// The one-line status paired with `github_enabled` in a fresh connect
+/// response (see [`Engine::connect_with_token`] and
+/// [`Engine::start_device_connect`]), so an agent narrates enablement from
+/// the response data instead of inferring it from tool wording; connecting
+/// and enabling `github.enabled` are independent of each other and either
+/// order works. `pending` distinguishes a device flow that just started and
+/// is still waiting on the user to confirm the code from a personal access
+/// token connect that already landed.
+fn connect_enablement_note(enabled: bool, pending: bool) -> &'static str {
+    match (enabled, pending) {
+        (true, true) => {
+            "GitHub collaboration is enabled; once the code is confirmed team domains are ready to add."
+        }
+        (true, false) => "GitHub collaboration is enabled; team domains are ready to add.",
+        (false, true) => {
+            "Connecting works with github.enabled off; set it to true with configure when you want team domains."
+        }
+        (false, false) => {
+            "Connected with github.enabled off; set it to true with configure when you want team domains."
+        }
     }
 }
 

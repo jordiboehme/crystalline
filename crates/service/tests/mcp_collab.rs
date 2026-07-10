@@ -537,10 +537,22 @@ impl ConnectAuth for FakeConnectAuth {
 }
 
 async fn engine_for_connect(auth: Arc<FakeConnectAuth>, dir: &std::path::Path) -> Engine {
+    engine_for_connect_with(false, auth, dir).await
+}
+
+/// Same wiring as [`engine_for_connect`], with `github_enabled` set on the
+/// engine's config instead of always off - so a test can prove a connect
+/// response's `github_enabled`/`note` reflect the live config in both
+/// states, not just the disabled default the other connect fixtures use.
+async fn engine_for_connect_with(
+    github_enabled: bool,
+    auth: Arc<FakeConnectAuth>,
+    dir: &std::path::Path,
+) -> Engine {
     let store = TursoStore::open_in_memory().await.unwrap();
     Engine::new(
         Arc::new(Mutex::new(store)),
-        config(false),
+        config(github_enabled),
         None,
         Some(dir.join("config.yaml").to_path_buf()),
     )
@@ -586,6 +598,47 @@ async fn token_connect_validates_saves_and_reports_connected() {
     let snap = eng.configure_snapshot().await.unwrap();
     assert_eq!(snap["github"]["connected"], json!(true));
     assert_eq!(snap["github"]["user"], json!("octocat"));
+}
+
+#[tokio::test]
+async fn token_connect_reports_github_enabled_and_a_note_when_disabled() {
+    let tmp = tempfile::tempdir().unwrap();
+    let auth = fake_auth(
+        Err(RemoteError::NotConnected),
+        Err(RemoteError::NotConnected),
+        Ok("octocat".to_string()),
+    );
+    // github.enabled is off on this engine (the default fixture): the
+    // response states that explicitly rather than leaving an agent to infer
+    // it from tool wording.
+    let eng = engine_for_connect(auth, tmp.path()).await;
+
+    let result = eng.connect_with_token("pat-123", None).await.unwrap();
+    assert_eq!(result["github"]["github_enabled"], json!(false));
+    assert_eq!(
+        result["github"]["note"],
+        json!(
+            "Connected with github.enabled off; set it to true with configure when you want team domains."
+        )
+    );
+}
+
+#[tokio::test]
+async fn token_connect_reports_github_enabled_and_a_note_when_enabled() {
+    let tmp = tempfile::tempdir().unwrap();
+    let auth = fake_auth(
+        Err(RemoteError::NotConnected),
+        Err(RemoteError::NotConnected),
+        Ok("octocat".to_string()),
+    );
+    let eng = engine_for_connect_with(true, auth, tmp.path()).await;
+
+    let result = eng.connect_with_token("pat-123", None).await.unwrap();
+    assert_eq!(result["github"]["github_enabled"], json!(true));
+    assert_eq!(
+        result["github"]["note"],
+        json!("GitHub collaboration is enabled; team domains are ready to add.")
+    );
 }
 
 #[tokio::test]
@@ -714,6 +767,49 @@ async fn device_flow_second_connect_reports_the_same_pending_code_then_lands_con
     let after = eng.configure_snapshot().await.unwrap();
     assert_eq!(after["github"]["connected"], json!(true));
     assert!(after["github"]["pending_connect"].is_null());
+}
+
+#[tokio::test]
+async fn device_flow_start_reports_github_enabled_and_a_note_when_disabled() {
+    let tmp = tempfile::tempdir().unwrap();
+    let auth = fake_auth(
+        Ok(device_flow_start()),
+        Ok("device-token".to_string()),
+        Ok("octocat".to_string()),
+    );
+    // github.enabled is off on this engine (the default fixture): starting a
+    // device flow works anyway, and the response states enablement
+    // explicitly rather than leaving an agent to infer it from tool wording.
+    let eng = engine_for_connect(auth, tmp.path()).await;
+
+    let result = eng.start_device_connect(None).await.unwrap();
+    assert_eq!(result["github"]["github_enabled"], json!(false));
+    assert_eq!(
+        result["github"]["note"],
+        json!(
+            "Connecting works with github.enabled off; set it to true with configure when you want team domains."
+        )
+    );
+}
+
+#[tokio::test]
+async fn device_flow_start_reports_github_enabled_and_a_note_when_enabled() {
+    let tmp = tempfile::tempdir().unwrap();
+    let auth = fake_auth(
+        Ok(device_flow_start()),
+        Ok("device-token".to_string()),
+        Ok("octocat".to_string()),
+    );
+    let eng = engine_for_connect_with(true, auth, tmp.path()).await;
+
+    let result = eng.start_device_connect(None).await.unwrap();
+    assert_eq!(result["github"]["github_enabled"], json!(true));
+    assert_eq!(
+        result["github"]["note"],
+        json!(
+            "GitHub collaboration is enabled; once the code is confirmed team domains are ready to add."
+        )
+    );
 }
 
 #[tokio::test]

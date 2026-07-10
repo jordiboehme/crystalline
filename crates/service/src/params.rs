@@ -275,7 +275,8 @@ pub struct ConfigureParams {
     pub unset: Vec<String>,
     /// Pass "github" to link a GitHub account: starts a short code to
     /// confirm at github.com/login/device, or reports an already-pending
-    /// one. Omit when `token` is supplied.
+    /// one. Omit when `token` is supplied. Works whether or not
+    /// github.enabled is on yet; enabling is only needed for team domains.
     #[serde(default)]
     pub connect: Option<String>,
     /// A GitHub personal access token, connecting immediately instead of the

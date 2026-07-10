@@ -49,4 +49,4 @@ Some deployments are read-only and say so up front: the instructions state the k
 
 When origin tools like `share_changes` and `origin_status` are visible, some domains are shared with a team. Call `origin_status` before deep work, and `update_domain` first if behind. Share a coherent unit of knowledge with `share_changes` and always relay the returned review URL - a person merges the proposal, never the agent. Settle a disagreement with `resolve_conflict`: `mine`, `theirs` or a supplied `merged` version.
 
-Team collaboration is set up through `configure` alone, no terminal needed: setting `github.enabled` reveals the tools above, and `connect: "github"` returns a code and a URL for a browser already signed in to GitHub. Git and clones are never part of this flow.
+Team collaboration is set up through `configure` alone, no terminal needed: setting `github.enabled` reveals the tools above, and `connect: "github"` returns a code and a URL for a browser already signed in to GitHub - in either order, since connecting works before enabling too. Git and clones are never part of this flow.
