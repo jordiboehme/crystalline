@@ -53,6 +53,16 @@ Create a new engram only when no existing one owns the topic, or the existing ow
 
 The test for edit versus supersede: does the new information make a fact in the owner engram false going forward ("changed", "replaced", "no longer", "instead of")? Then it is a supersession however small the diff looks, even a one-word value swap - follow the recipe below instead of rewriting the old engram's content in place. A pure addition or clarification that contradicts nothing is a normal edit.
 
+## Reconcile in place, not as an append log
+
+An engram is what is true now, including what is now known to be outdated - it is never a change log. When re-ingesting a source or updating a topic, edit the body until it reads as a current-state description again: replace changed facts where they stand, insert new facts into the sections they belong in and delete what the source no longer supports. Never add a dated update section - `## Update - <date>`, `## Re-verification - <date>`, `## Refresh`, `## Change History`, `## Delta since <date>` or any sibling of these - and never append `- [fact] As of <date> X is Y` when the body already states X is Y: either the body needs updating or the observation is redundant. The version layer (git, a team domain's origin history) carries how knowledge changed; a body that reads as running commentary is wrong even when every entry was true as written.
+
+"Checked the source, nothing changed" is one frontmatter field, not a heading: keep a `last_verified: <date>` line current with `find_replace` (the same frontmatter mechanism the supersede recipe uses), adding it on the first verification, plus `source_date: <source last-modified>` when the source is versioned. Neither touches `valid_from`/`valid_to` - verification does not bound validity.
+
+Outdated knowledge earns its place only when the outdatedness is the point: a deprecated approach kept so it is not recommended again, a rejected alternative kept so it is not re-litigated, a documented anti-pattern. Mark it so it cannot read as current - `status: deprecated` or `superseded` on a whole engram, a `[lesson]` or `[gotcha]` bullet naming why something was retired inside a live one.
+
+Engrams whose topic is inherently historical carry history as structured current content, still not as an append log: a registry row holds its current status and one last-checked value, not a per-check trail; a decision engram tracks its current lifecycle status and is superseded when replaced; a meeting note records one meeting on one date - a new meeting gets a new engram, not an update block on the old one.
+
 ## Writing a new engram
 
 ```json
@@ -79,7 +89,7 @@ An engram needs at least 3 non-blank content lines to pass verification - a lone
 Pick the most precise bullet category for `- [category] content #tag`:
 
 - `[decision]` - a choice that was made
-- `[fact]` - verified current state
+- `[fact]` - verified current state; date it only when the date is part of the fact ("accepted 2026-07-02"), never as as-of hedging
 - `[pattern]` - a repeatable approach
 - `[gotcha]` - a non-obvious pitfall
 - `[convention]` - a team agreement
