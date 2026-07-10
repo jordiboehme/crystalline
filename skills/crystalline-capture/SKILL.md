@@ -102,7 +102,7 @@ Relations connect engrams to each other: `- depends_on [[Other Engram]]`, or a q
 
 ## Temporal fields
 
-`valid_from`/`valid_to` are optional. Absence is the normal case and it means unbounded: no `valid_from` means the engram has always been valid, no `valid_to` means it is valid forever. Set them only when validity is genuinely bounded - a policy that changes on a known date, a temporary workaround with a known expiry. Never write a sentinel far-future date to mean "forever"; just omit the field.
+`valid_from`/`valid_to` are optional. Absence is the normal case and it means unbounded: no `valid_from` means the engram has always been valid, no `valid_to` means it is valid forever. Set them only when validity is genuinely bounded - a policy that changes on a known date, a temporary workaround with a known expiry or a superseded fact whose end date is known (the supersede recipe below closes that window). Never write a sentinel far-future date to mean "forever"; just omit the field.
 
 Set them through the `metadata` argument as an object; a bound stated only in the content prose does not bound anything for search or supersede logic:
 
@@ -130,6 +130,10 @@ Do not let an engram hold both current and outdated guidance at once. When new k
 3. Add a `- superseded_by [[New Engram]]` relation on the old engram (and, optionally, `- supersedes [[Old Engram]]` on the new one).
 
 Read the old engram back afterwards and confirm its status actually changed before reporting the supersession done.
+
+When the date the old fact stopped holding is known, close its validity window in the same edit: extend the status find_replace to also add a `valid_to: <date>` line. Use the real-world transition date, not the date you happened to notice - and when that date is unknown, leave the window open and let `status` alone mark the retirement. A closed window is what makes the past addressable later: a search with `metadata_filters` on `valid_from`/`valid_to` can then answer "what applied last June" with the engram that was true then, the way a person recalls how things worked at a past job without mistaking it for the present.
+
+Retiring knowledge is also the moment to learn from it. The superseded engram keeps the full experience; any insight that outlives it - why the old approach failed, what to watch for next time - is unbounded knowledge that belongs as a `[lesson]` or `[pattern]` bullet on the new engram or its own engram, linked back to the retired one. The experience stays time-scoped; what it taught carries forward without bounds.
 
 ## Confirm before destroying
 
