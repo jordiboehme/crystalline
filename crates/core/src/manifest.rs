@@ -302,20 +302,37 @@ pub fn in_root_artifact_dirs(root: &Path) -> Vec<PathBuf> {
 /// the root, and an empty result lands on the root itself. Both cases return
 /// `None`, since neither is an in-root folder to exclude.
 fn normalize_in_root(path: &str) -> Option<PathBuf> {
+    let (kept, climbs) = normalize_relative(path);
+    if climbs > 0 || kept.is_empty() {
+        return None;
+    }
+    Some(kept.iter().collect())
+}
+
+/// The textual `.`/`..` normalization shared by [`normalize_in_root`] and the
+/// `provision` module's source-root resolution: split `path` on `/`, drop `.`
+/// and empty components, and let `..` pop the last kept component. Returns the
+/// components still kept once popping settles, plus how many `..` climbed past
+/// an already-empty stack. Zero climbs means the result stays at or inside
+/// whatever root the caller joins `kept` onto; more than zero means the path
+/// climbs above that root, which `normalize_in_root` treats as leaving no
+/// in-root folder to exclude, and `provision::resolve_source_roots` treats as
+/// a decl that resolves from somewhere else entirely.
+pub(crate) fn normalize_relative(path: &str) -> (Vec<&str>, usize) {
     let mut kept: Vec<&str> = Vec::new();
+    let mut climbs: usize = 0;
     for component in path.split('/') {
         match component {
             "" | "." => continue,
             ".." => {
-                kept.pop()?;
+                if kept.pop().is_none() {
+                    climbs += 1;
+                }
             }
             other => kept.push(other),
         }
     }
-    if kept.is_empty() {
-        return None;
-    }
-    Some(kept.iter().collect())
+    (kept, climbs)
 }
 
 fn section_key(title: &str) -> String {

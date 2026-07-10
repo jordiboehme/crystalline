@@ -22,6 +22,8 @@ etcetera = { workspace = true }
 walkdir = { workspace = true }
 globset = { workspace = true }
 uuid = { workspace = true }
+sha2 = { workspace = true }
+anyhow = { workspace = true }
 
 [dev-dependencies]
 insta = { workspace = true }

@@ -22,6 +22,7 @@ pub mod import;
 pub mod manifest;
 pub mod parse;
 pub mod prompt;
+pub mod provision;
 pub mod schema;
 pub mod verify;
 pub mod yaml;
@@ -41,6 +42,11 @@ pub use parse::{LosslessEngram, ParseError, parse_engram, parse_engram_lossless}
 pub use prompt::{
     PromptDomain, PromptOutput, generate_prompt, generate_prompt_unscoped, render_instructions,
     render_json, render_text,
+};
+pub use provision::{
+    ArtifactFile, DesiredFile, DesiredMcp, DesiredSet, DomainArtifacts, DomainSources,
+    HarnessState, InstalledFile, InstalledMcp, McpArtifact, ProvisionReceipt, SourceStamp,
+    desired_set, harness_supports, is_plain_component, resolve_source_roots, scan_domain,
 };
 pub use schema::{
     FieldDecl, FieldType, ScalarType, Schema, SchemaDrift, SchemaIssue, ValidationMode,
