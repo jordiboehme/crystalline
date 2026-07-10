@@ -40,6 +40,14 @@ pub enum McpOutcome {
     AlreadyExists,
     /// This harness has no MCP runner arm yet (a later milestone fills it in).
     Unsupported,
+    /// The change was recognized but deliberately not carried out now. The
+    /// session-start path installs a runner that answers this for every add
+    /// and remove, so file artifacts reconcile in the hook while MCP changes -
+    /// which would mean spawning a harness CLI - wait for an explicit
+    /// `crystalline provision` run. A reconcile treats it exactly like
+    /// [`McpOutcome::Failed`] for state (nothing recorded, nothing forgotten)
+    /// but raises no notice: the caller aggregates one line for the whole run.
+    Deferred,
     /// The command could not be run or failed. `manual` carries the exact
     /// command a user can run by hand, so a notice can pass it straight
     /// through.
@@ -47,6 +55,24 @@ pub enum McpOutcome {
         /// The command to run by hand.
         manual: String,
     },
+}
+
+/// An [`McpRunner`] that carries out no MCP change at all: every add and
+/// remove answers [`McpOutcome::Deferred`]. The session-start path installs it
+/// so a hook can reconcile a domain's file artifacts immediately while every
+/// MCP change - the one part that would shell out to a harness CLI - is left
+/// for an explicit `crystalline provision` run. Spawning a child from a
+/// session-start hook is exactly what this crate refuses to do, and this
+/// runner is how the reconcile engine keeps that promise on the hook path.
+pub struct DeferringMcpRunner;
+
+impl McpRunner for DeferringMcpRunner {
+    fn add(&mut self, _harness: HarnessKind, _name: &str, _server_json: &str) -> McpOutcome {
+        McpOutcome::Deferred
+    }
+    fn remove(&mut self, _harness: HarnessKind, _name: &str) -> McpOutcome {
+        McpOutcome::Deferred
+    }
 }
 
 /// How a reconcile run registers and deregisters MCP servers. The one seam
@@ -101,6 +127,10 @@ pub enum ActionStatus {
     McpSkipped,
     /// An MCP add, update or remove could not be carried out.
     McpFailed,
+    /// An MCP add, update or remove was deferred to an explicit provision run
+    /// rather than carried out now - the session-start path never spawns a
+    /// harness CLI. The receipt entry is left exactly as it was.
+    McpDeferred,
 }
 
 /// Reconcile one harness's installed artifacts against `desired`, mutating
@@ -349,6 +379,11 @@ fn reconcile_mcps(
                     notices.push(mcp_unsupported_notice(harness, name));
                     actions.push(mcp_action(name, ActionStatus::McpSkipped));
                 }
+                // Deferred: like a failed add for state (nothing recorded),
+                // but silent - the caller raises one line for the whole run.
+                McpOutcome::Deferred => {
+                    actions.push(mcp_action(name, ActionStatus::McpDeferred));
+                }
             },
             // Ours and unchanged: nothing to do, keep the record.
             Some(installed) if installed.sha256 == want.sha256 => {}
@@ -356,6 +391,13 @@ fn reconcile_mcps(
             // the old record so the server stays exactly as it was.
             Some(_) => {
                 let removed = mcp.remove(harness, name);
+                // Deferred remove: leave the old entry exactly as it was and
+                // raise no notice, the same silent, state-preserving deferral
+                // the add path takes.
+                if removed == McpOutcome::Deferred {
+                    actions.push(mcp_action(name, ActionStatus::McpDeferred));
+                    continue;
+                }
                 if removed != McpOutcome::Applied {
                     notices.push(mcp_update_failed_notice(
                         harness,
@@ -369,6 +411,9 @@ fn reconcile_mcps(
                     McpOutcome::Applied => {
                         record_mcp(state, name, &want.domain, &want.sha256);
                         actions.push(mcp_action(name, ActionStatus::McpUpdated));
+                    }
+                    McpOutcome::Deferred => {
+                        actions.push(mcp_action(name, ActionStatus::McpDeferred));
                     }
                     other => {
                         notices.push(mcp_update_failed_notice(
@@ -394,6 +439,11 @@ fn reconcile_mcps(
             McpOutcome::Applied => {
                 state.mcps.remove(&name);
                 actions.push(mcp_action(&name, ActionStatus::McpRemoved));
+            }
+            // Deferred: keep the record until an explicit provision run
+            // deregisters it, and stay silent - one aggregated line covers it.
+            McpOutcome::Deferred => {
+                actions.push(mcp_action(&name, ActionStatus::McpDeferred));
             }
             McpOutcome::Failed { manual } => {
                 notices.push(mcp_remove_failed_notice(harness, &name, &manual));
@@ -1249,5 +1299,100 @@ mod tests {
             state.mcps.contains_key("lighthouse"),
             "record kept on failure"
         );
+    }
+
+    // --- MCP deferral (session-start path) -----------------------------------
+
+    #[test]
+    fn mcp_add_deferred_records_nothing_and_stays_silent() {
+        let root = tempfile::tempdir().unwrap();
+        let desired = desired_mcp("lighthouse", "v1");
+        let mut state = HarnessState::default();
+
+        let (actions, notices) = run(
+            &bases(root.path()),
+            &desired,
+            &mut state,
+            &mut DeferringMcpRunner,
+        );
+
+        assert_eq!(statuses(&actions), vec![ActionStatus::McpDeferred]);
+        assert!(notices.is_empty(), "deferral is silent: {notices:?}");
+        assert!(
+            !state.mcps.contains_key("lighthouse"),
+            "an add not performed is not recorded"
+        );
+    }
+
+    #[test]
+    fn mcp_update_deferred_keeps_the_old_entry_and_stays_silent() {
+        let root = tempfile::tempdir().unwrap();
+        let desired = desired_mcp("lighthouse", "v2");
+        let mut state = HarnessState::default();
+        state
+            .mcps
+            .insert("lighthouse".to_string(), installed_mcp("v1"));
+
+        let (actions, notices) = run(
+            &bases(root.path()),
+            &desired,
+            &mut state,
+            &mut DeferringMcpRunner,
+        );
+
+        assert_eq!(statuses(&actions), vec![ActionStatus::McpDeferred]);
+        assert!(notices.is_empty(), "deferral is silent: {notices:?}");
+        // The old sha survives untouched, exactly as a failed update leaves it.
+        assert_eq!(state.mcps["lighthouse"].sha256, sha256_hex(b"v1"));
+    }
+
+    #[test]
+    fn mcp_remove_deferred_keeps_the_record_and_stays_silent() {
+        let root = tempfile::tempdir().unwrap();
+        let desired = DesiredSet::default(); // lighthouse no longer desired
+        let mut state = HarnessState::default();
+        state
+            .mcps
+            .insert("lighthouse".to_string(), installed_mcp("v1"));
+
+        let (actions, notices) = run(
+            &bases(root.path()),
+            &desired,
+            &mut state,
+            &mut DeferringMcpRunner,
+        );
+
+        assert_eq!(statuses(&actions), vec![ActionStatus::McpDeferred]);
+        assert!(notices.is_empty(), "deferral is silent: {notices:?}");
+        assert!(
+            state.mcps.contains_key("lighthouse"),
+            "a remove not performed keeps its record"
+        );
+    }
+
+    #[test]
+    fn mcp_unchanged_defers_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let desired = desired_mcp("lighthouse", "v1");
+        let mut state = HarnessState::default();
+        state
+            .mcps
+            .insert("lighthouse".to_string(), installed_mcp("v1"));
+
+        let (actions, notices) = run(
+            &bases(root.path()),
+            &desired,
+            &mut state,
+            &mut DeferringMcpRunner,
+        );
+
+        // An unchanged MCP is a no-op even on the deferring path: no runner
+        // call, so no deferred action and nothing for the caller to report.
+        assert!(
+            actions.is_empty(),
+            "no action for an unchanged MCP: {actions:?}"
+        );
+        assert!(notices.is_empty(), "{notices:?}");
+        assert_eq!(state.mcps["lighthouse"].sha256, sha256_hex(b"v1"));
     }
 }

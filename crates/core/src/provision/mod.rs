@@ -31,7 +31,9 @@ pub use receipt::{
     DomainSources, HarnessState, InstalledFile, InstalledMcp, ProvisionReceipt, SourceStamp, load,
     plain_rel_key, receipt_path, save, sha256_hex,
 };
-pub use reconcile::{ActionStatus, ArtifactAction, McpOutcome, McpRunner, reconcile_harness};
+pub use reconcile::{
+    ActionStatus, ArtifactAction, DeferringMcpRunner, McpOutcome, McpRunner, reconcile_harness,
+};
 
 // --- orchestration -------------------------------------------------------
 //
@@ -601,6 +603,540 @@ pub fn status(
     })
 }
 
+// --- session-start notices --------------------------------------------------
+
+/// The provisioning notices for one session start, appended after the routing
+/// prompt body and never altering it.
+///
+/// This runs inside the `crystalline prompt system` hook path, so it lives
+/// under the same contracts [`crate::prompt`] documents: it must stay fast
+/// (the prompt's under-50ms budget for 30 domains, see `prompt.rs`'s latency
+/// notes) and never let a stumble reach the routing prompt. Every internal
+/// failure - an unreadable receipt, an apply that cannot save - degrades to at
+/// most one advisory line; nothing here returns an error or panics.
+///
+/// It does two jobs, in this order in the returned list:
+/// 1. Reconcile opted-in domains' FILE artifacts against whatever changed at
+///    their sources, and note MCP changes without touching them. Registering
+///    an MCP server shells out to a harness CLI, which a hook must never do, so
+///    the reconcile runs with a [`DeferringMcpRunner`]: file rows install now
+///    while MCP rows defer to an explicit `crystalline provision` run and
+///    surface as a single line.
+/// 2. Name every undecided domain that ships artifacts, so the agent can raise
+///    the decision with the user and apply it with the `provision` tool.
+///
+/// Determinism: domains are visited in the config's own registered order and
+/// every line is built from stable inputs, so an unchanged workspace renders
+/// the same lines run to run - the discipline `prompt.rs` documents for the
+/// body, extended to the notices that trail it.
+///
+/// Latency: the fast path (nothing changed) reads the receipt once and stats
+/// each opted-in domain's source files without hashing them, comparing mtime
+/// and size against the receipt's stamps. Hashing only happens once a change
+/// is already suspected, inside `apply`. A domain's MCP configs - always few
+/// and small - are the one exception: they carry no source stamp, so they are
+/// rescanned each run to tell a real MCP change from a steady one.
+pub fn session_notices(
+    global: &GlobalConfig,
+    receipt_path: &Path,
+    harnesses: &[HarnessKind],
+) -> Vec<String> {
+    // The pending block needs neither the receipt nor any hashing (read_dir
+    // counts only), so it is built first and always appended last.
+    let pending_lines = render_pending(&session_pending(global));
+
+    // Opted-in file domains, in config order. A virtual domain can never ship
+    // artifacts, so it is never part of the reconcile set - apply skips it too.
+    let opted: Vec<(&String, &DomainEntry)> = global
+        .domains
+        .iter()
+        .filter(|(_, e)| e.provision == Some(true) && !e.is_virtual())
+        .collect();
+    if opted.is_empty() {
+        return pending_lines; // nothing opted in: only the pending block, if any
+    }
+
+    // A receipt that will not load is never regenerated from a hook - that is
+    // an explicit apply's job. One advisory, then only the pending block.
+    let receipt = match load(receipt_path) {
+        Ok(receipt) => receipt,
+        Err(_) => {
+            let mut out = vec![corrupt_receipt_notice()];
+            out.extend(pending_lines);
+            return out;
+        }
+    };
+
+    // Stat-only walk of each domain's file sources (no hashing) plus a light
+    // scan of its MCP configs (few, small) for the drift check below.
+    let mut walked: BTreeMap<String, BTreeMap<String, FileStat>> = BTreeMap::new();
+    let mut mcp_artifacts: Vec<DomainArtifacts> = Vec::new();
+    for (name, entry) in &opted {
+        let roots = resolve_source_roots(name, entry);
+        let (mcp_roots, file_roots): (Vec<_>, Vec<_>) = roots
+            .into_iter()
+            .partition(|(kind, _)| *kind == ArtifactType::Mcps);
+        walked.insert((*name).clone(), stat_file_sources(&file_roots));
+        let (arts, _scan_notices) = scan_domain(name, &mcp_roots);
+        mcp_artifacts.push(arts);
+    }
+
+    let work = matches!(
+        prefilter(Some(&receipt), &walked, harnesses),
+        SessionWork::Work
+    ) || mcp_drift(&mcp_artifacts, &receipt, harnesses);
+    if !work {
+        return pending_lines; // everything already current: skip apply entirely
+    }
+
+    // Something drifted: reconcile file artifacts now and defer MCP changes.
+    let mut out = Vec::new();
+    match apply(global, receipt_path, harnesses, &mut DeferringMcpRunner) {
+        Ok(report) => {
+            let file_changes = report
+                .harnesses
+                .iter()
+                .flat_map(|(_, actions)| actions)
+                .filter(|a| is_file_change(a.status))
+                .count();
+            if file_changes > 0 {
+                out.push(reconcile_summary_notice(file_changes));
+            }
+            out.extend(report.notices);
+            let deferred = report
+                .harnesses
+                .iter()
+                .flat_map(|(_, actions)| actions)
+                .any(|a| a.status == ActionStatus::McpDeferred);
+            if deferred {
+                out.push(mcp_deferred_notice());
+            }
+        }
+        Err(_) => out.push(save_failed_notice()),
+    }
+    out.extend(pending_lines);
+    out
+}
+
+/// The mtime (Unix seconds) and size of one source file, the stat-only
+/// fingerprint the session prefilter compares against a receipt stamp without
+/// ever hashing the file's bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileStat {
+    /// Modification time, Unix seconds, truncated exactly like [`stamp_source`].
+    mtime: i64,
+    /// File size in bytes.
+    size: u64,
+}
+
+/// Whether the session prefilter found anything worth reconciling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionWork {
+    /// Every opted-in domain's file sources match the receipt, every requested
+    /// harness is already recorded and the decision set is unchanged: skip apply.
+    NoWork,
+    /// Something drifted: run apply to reconcile it.
+    Work,
+    /// The receipt could not be read: surface one advisory, attempt nothing.
+    Advisory,
+}
+
+/// Decide, without hashing a single file, whether the session needs to run
+/// apply. Pure over its inputs so the whole decision table is unit-testable:
+/// `receipt` is `None` for a receipt that would not load (giving
+/// [`SessionWork::Advisory`]), `walked` maps each opted-in file domain to the
+/// mtime-and-size stat of every source file, and `harnesses` is the set that
+/// must each already be recorded.
+///
+/// [`SessionWork::Work`] on any of: a stamp whose mtime or size moved, a source
+/// file added or removed, an opted-in domain the receipt never stamped (a fresh
+/// opt-in), a stamped domain no longer opted in (a fresh opt-out) or a harness
+/// with no receipt entry yet (freshly installed - stamps alone never prove a
+/// harness current, the same reason `apply`'s doc comment gives). MCP drift is
+/// judged separately by [`mcp_drift`], since MCP configs carry no source stamp.
+fn prefilter(
+    receipt: Option<&ProvisionReceipt>,
+    walked: &BTreeMap<String, BTreeMap<String, FileStat>>,
+    harnesses: &[HarnessKind],
+) -> SessionWork {
+    let Some(receipt) = receipt else {
+        return SessionWork::Advisory;
+    };
+
+    // The decision set (opted-in file domains = the keys of `walked`) must be
+    // exactly the domains the receipt last stamped, both ways.
+    if walked.len() != receipt.sources.len()
+        || !walked.keys().all(|d| receipt.sources.contains_key(d))
+    {
+        return SessionWork::Work;
+    }
+
+    // Every stamped file must still be on disk at the same mtime and size, and
+    // no new file may have appeared under a root.
+    for (domain, files) in walked {
+        let Some(stamped) = receipt.sources.get(domain) else {
+            return SessionWork::Work; // unreachable: set equality checked above
+        };
+        if files.len() != stamped.files.len() {
+            return SessionWork::Work;
+        }
+        for (key, stat) in files {
+            match stamped.files.get(key) {
+                Some(stamp) if stamp.mtime == stat.mtime && stamp.size == stat.size => {}
+                _ => return SessionWork::Work,
+            }
+        }
+    }
+
+    // A requested harness recorded nowhere yet (freshly installed) needs a
+    // first pass even when every source file is untouched.
+    if harnesses
+        .iter()
+        .any(|h| !receipt.harnesses.contains_key(h.id()))
+    {
+        return SessionWork::Work;
+    }
+
+    SessionWork::NoWork
+}
+
+/// Whether any requested harness's recorded MCP servers differ from what the
+/// opted-in domains would provision right now. MCP configs carry no source
+/// stamp - the receipt's `sources` tracks file artifacts only - so this is the
+/// one place the session path rescans, which stays cheap because MCP configs
+/// are always few and small. `mcp_artifacts` holds each opted-in domain's
+/// freshly scanned MCP set (its files left empty); the comparison mirrors what
+/// `apply` would act on for each harness, so a match here means apply would
+/// raise no MCP action at all.
+fn mcp_drift(
+    mcp_artifacts: &[DomainArtifacts],
+    receipt: &ProvisionReceipt,
+    harnesses: &[HarnessKind],
+) -> bool {
+    for &harness in harnesses {
+        let (desired, _notices) = desired_set(harness, mcp_artifacts);
+        let desired_shas: BTreeMap<&str, &str> = desired
+            .mcps
+            .iter()
+            .map(|(name, mcp)| (name.as_str(), mcp.sha256.as_str()))
+            .collect();
+        let recorded_shas: BTreeMap<&str, &str> = receipt
+            .harnesses
+            .get(harness.id())
+            .map(|state| {
+                state
+                    .mcps
+                    .iter()
+                    .map(|(name, mcp)| (name.as_str(), mcp.sha256.as_str()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if desired_shas != recorded_shas {
+            return true;
+        }
+    }
+    false
+}
+
+// --- session-start stat walk (no hashing) -----------------------------------
+
+/// Stat-only walk of a domain's file source roots (skills, commands, agents;
+/// never MCP configs, which carry no stamp). Mirrors `model`'s scan selection
+/// exactly - a skill dir needs its `SKILL.md`, commands are `*.md` at any
+/// depth, agents are top-level `*.md` - so the keys line up with the stamps
+/// `apply` wrote, while reading only metadata, never a file's bytes. A hostile
+/// path component is skipped the same way the scan skips it, so a walked key
+/// can never diverge from a stamped one over an unsafe name.
+fn stat_file_sources(roots: &[(ArtifactType, PathBuf)]) -> BTreeMap<String, FileStat> {
+    let mut out = BTreeMap::new();
+    for (kind, root) in roots {
+        match kind {
+            ArtifactType::Skills => stat_skills(root, &mut out),
+            ArtifactType::Commands => stat_commands(root, &mut out),
+            ArtifactType::Agents => stat_agents(root, &mut out),
+            ArtifactType::Mcps => {} // never stamped: judged by mcp_drift instead
+        }
+    }
+    out
+}
+
+/// The mtime (Unix seconds) and size of `path`, or `None` when its metadata
+/// cannot be read - computed exactly like the stamp [`stamp_source`] writes, so
+/// the two are directly comparable.
+fn file_stat(path: &Path) -> Option<FileStat> {
+    // Metadata-readable is a looser bar than `hash_file`'s content read in
+    // `scan_domain`, and that asymmetry is intentional and safe: a file whose
+    // metadata reads here but whose bytes later fail to read only makes the
+    // stat walk over-report a key relative to a real scan, which triggers a
+    // harmless idempotent apply, never a missed change.
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    Some(FileStat {
+        mtime: mtime as i64,
+        size: meta.len(),
+    })
+}
+
+/// Recursively collect every visible file under `dir` as `(rel, FileStat)`
+/// pairs, `rel` joined with `/` from the walk root - the stat-only twin of
+/// `model`'s `walk_visible`. Hidden entries and symlinks are skipped the same
+/// way, so this walk sees exactly the files the scan would.
+fn walk_visible_stat(dir: &Path, rel: &mut Vec<String>, out: &mut Vec<(String, FileStat)>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut entries: Vec<_> = entries.filter_map(Result::ok).collect();
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue;
+        }
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let path = entry.path();
+        if file_type.is_dir() {
+            rel.push(name);
+            walk_visible_stat(&path, rel, out);
+            rel.pop();
+        } else if file_type.is_file()
+            && let Some(stat) = file_stat(&path)
+        {
+            rel.push(name);
+            out.push((rel.join("/"), stat));
+            rel.pop();
+        }
+    }
+}
+
+/// Stat every file of each `SKILL.md`-bearing skill directory under `root`,
+/// keyed `skills/<skill-dir>/<path-within-skill>` - the stat-only mirror of
+/// `model`'s `scan_skills`.
+fn stat_skills(root: &Path, out: &mut BTreeMap<String, FileStat>) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    let mut entries: Vec<_> = entries.filter_map(Result::ok).collect();
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') || !is_plain_component(&name) {
+            continue;
+        }
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let skill_dir = entry.path();
+        if !skill_dir.join("SKILL.md").is_file() {
+            continue;
+        }
+        let mut visible = Vec::new();
+        walk_visible_stat(&skill_dir, &mut Vec::new(), &mut visible);
+        for (rel_in_skill, stat) in visible {
+            if rel_in_skill.split('/').all(is_plain_component) {
+                out.insert(format!("skills/{name}/{rel_in_skill}"), stat);
+            }
+        }
+    }
+}
+
+/// Stat every `*.md` file under `root` at any depth, keyed `commands/<rel>` -
+/// the stat-only mirror of `model`'s `scan_commands`.
+fn stat_commands(root: &Path, out: &mut BTreeMap<String, FileStat>) {
+    let mut visible = Vec::new();
+    walk_visible_stat(root, &mut Vec::new(), &mut visible);
+    for (rel, stat) in visible {
+        if Path::new(&rel).extension().and_then(|e| e.to_str()) != Some("md") {
+            continue;
+        }
+        if rel.split('/').all(is_plain_component) {
+            out.insert(format!("commands/{rel}"), stat);
+        }
+    }
+}
+
+/// Stat every top-level `*.md` file directly inside `root` (no recursion),
+/// keyed `agents/<file>` - the stat-only mirror of `model`'s `scan_agents`.
+fn stat_agents(root: &Path, out: &mut BTreeMap<String, FileStat>) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    let mut entries: Vec<_> = entries.filter_map(Result::ok).collect();
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') || !is_plain_component(&name) {
+            continue;
+        }
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let path = entry.path();
+        if !file_type.is_file() || path.extension().and_then(|e| e.to_str()) != Some("md") {
+            continue;
+        }
+        if let Some(stat) = file_stat(&path) {
+            out.insert(format!("agents/{name}"), stat);
+        }
+    }
+}
+
+// --- session-start pending block (read_dir counts, no hashing) --------------
+
+/// Undecided declaring domains that ship at least one artifact, with per-type
+/// counts taken at read_dir level - never hashing, unlike [`collect_pending`]
+/// which the (non hook) apply and status paths can afford. This is what the
+/// session pending block names for the agent to raise with the user.
+fn session_pending(global: &GlobalConfig) -> Vec<PendingDomain> {
+    let mut pending = Vec::new();
+    for (name, entry) in &global.domains {
+        if entry.provision.is_some() {
+            continue;
+        }
+        let Some(manifest) = read_manifest(entry) else {
+            continue;
+        };
+        if manifest.provisioning().is_none() {
+            continue;
+        }
+        let roots = resolve_source_roots(name, entry);
+        let counts = count_source_roots(&roots);
+        if counts.values().copied().sum::<usize>() == 0 {
+            continue; // declares a section but ships nothing
+        }
+        pending.push(PendingDomain {
+            domain: name.clone(),
+            counts,
+        });
+    }
+    pending
+}
+
+/// Per-[`ArtifactType`] artifact counts for a domain's resolved source roots,
+/// at read_dir level and never hashing. File kinds reuse the scan-mirroring
+/// stat walk; MCP configs are counted as the `*.json` files their root holds,
+/// without parsing them, keeping the pending block's "count, do not hash"
+/// contract.
+fn count_source_roots(roots: &[(ArtifactType, PathBuf)]) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for (kind, root) in roots {
+        let n = match kind {
+            ArtifactType::Skills => {
+                let mut m = BTreeMap::new();
+                stat_skills(root, &mut m);
+                m.len()
+            }
+            ArtifactType::Commands => {
+                let mut m = BTreeMap::new();
+                stat_commands(root, &mut m);
+                m.len()
+            }
+            ArtifactType::Agents => {
+                let mut m = BTreeMap::new();
+                stat_agents(root, &mut m);
+                m.len()
+            }
+            ArtifactType::Mcps => count_json_files(root),
+        };
+        if n > 0 {
+            *counts.entry(kind.id().to_string()).or_insert(0) += n;
+        }
+    }
+    counts
+}
+
+/// The number of visible top-level `*.json` files in `root`, the read_dir-level
+/// count of MCP configs a domain ships.
+fn count_json_files(root: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            !name.starts_with('.')
+                && e.file_type().map(|t| t.is_file()).unwrap_or(false)
+                && Path::new(&name).extension().and_then(|x| x.to_str()) == Some("json")
+        })
+        .count()
+}
+
+// --- session-start notice text ----------------------------------------------
+
+/// Whether an [`ActionStatus`] is a file artifact that was actually written or
+/// removed, so the session summary counts only real file changes and skips the
+/// receipt-only adoption, the left-in-place foreign file and every MCP row.
+fn is_file_change(status: ActionStatus) -> bool {
+    matches!(
+        status,
+        ActionStatus::Installed
+            | ActionStatus::Updated
+            | ActionStatus::UpdatedBackup
+            | ActionStatus::Removed
+            | ActionStatus::RetiredBackup
+    )
+}
+
+/// One line per undecided domain that ships artifacts, naming its per-type
+/// counts and how to decide - raise it with the user, then apply the decision
+/// with the `provision` tool or the CLI. Empty when nothing is pending.
+fn render_pending(pending: &[PendingDomain]) -> Vec<String> {
+    pending
+        .iter()
+        .map(|p| {
+            format!(
+                "[crystalline] The `{}` domain ships artifacts to provision ({}) but has no decision yet - ask the user, then apply it with the `provision` tool or `crystalline provision allow {}`.",
+                p.domain,
+                render_counts(&p.counts),
+                p.domain
+            )
+        })
+        .collect()
+}
+
+/// A domain's artifact counts as `kind: n` pairs in a stable order, for a
+/// pending line - for example `skills: 2, commands: 1`.
+fn render_counts(counts: &BTreeMap<String, usize>) -> String {
+    counts
+        .iter()
+        .map(|(kind, n)| format!("{kind}: {n}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The summary line for a session that reconciled `changes` file artifacts.
+fn reconcile_summary_notice(changes: usize) -> String {
+    format!(
+        "[crystalline] Refreshed {changes} provisioned artifact(s) from your opted-in domains for this session."
+    )
+}
+
+/// The single line raised when the session deferred one or more MCP changes.
+fn mcp_deferred_notice() -> String {
+    "[crystalline] MCP server changes are waiting - apply them with the `provision` tool or `crystalline provision`.".to_string()
+}
+
+/// The advisory for a receipt that would not load: a hook never rebuilds it, so
+/// this points at the explicit run that will.
+fn corrupt_receipt_notice() -> String {
+    "[crystalline] Your provisioning memory could not be read - run `crystalline provision` to rebuild it and reconcile your domains.".to_string()
+}
+
+/// The advisory for an apply that reconciled but could not save its receipt.
+fn save_failed_notice() -> String {
+    "[crystalline] Could not save your provisioning memory this session - run `crystalline provision` to reconcile your domains.".to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -716,5 +1252,235 @@ mod tests {
             .insert("notes".to_string(), DomainEntry::virtual_domain());
 
         assert!(!any_domain_declares(&global));
+    }
+
+    // --- session prefilter ----------------------------------------------------
+
+    fn stamp(mtime: i64, size: u64) -> SourceStamp {
+        SourceStamp {
+            mtime,
+            size,
+            sha256: String::new(),
+        }
+    }
+
+    /// A receipt with one file domain `harbor` (two stamped files) provisioned
+    /// into claude-code - the steady state each trigger below perturbs.
+    fn steady_receipt() -> ProvisionReceipt {
+        let mut receipt = ProvisionReceipt::default();
+        receipt.sources.insert(
+            "harbor".to_string(),
+            DomainSources {
+                files: BTreeMap::from([
+                    ("skills/tide-tables/SKILL.md".to_string(), stamp(100, 10)),
+                    ("agents/quartermaster.md".to_string(), stamp(200, 20)),
+                ]),
+            },
+        );
+        receipt
+            .harnesses
+            .insert("claude-code".to_string(), HarnessState::default());
+        receipt
+    }
+
+    fn steady_walk() -> BTreeMap<String, BTreeMap<String, FileStat>> {
+        BTreeMap::from([(
+            "harbor".to_string(),
+            BTreeMap::from([
+                (
+                    "skills/tide-tables/SKILL.md".to_string(),
+                    FileStat {
+                        mtime: 100,
+                        size: 10,
+                    },
+                ),
+                (
+                    "agents/quartermaster.md".to_string(),
+                    FileStat {
+                        mtime: 200,
+                        size: 20,
+                    },
+                ),
+            ]),
+        )])
+    }
+
+    #[test]
+    fn prefilter_no_work_when_stamps_harness_and_decisions_all_match() {
+        assert_eq!(
+            prefilter(
+                Some(&steady_receipt()),
+                &steady_walk(),
+                &[HarnessKind::ClaudeCode]
+            ),
+            SessionWork::NoWork
+        );
+    }
+
+    #[test]
+    fn prefilter_work_on_mtime_drift() {
+        let mut walk = steady_walk();
+        walk.get_mut("harbor")
+            .unwrap()
+            .get_mut("agents/quartermaster.md")
+            .unwrap()
+            .mtime = 201;
+        assert_eq!(
+            prefilter(Some(&steady_receipt()), &walk, &[HarnessKind::ClaudeCode]),
+            SessionWork::Work
+        );
+    }
+
+    #[test]
+    fn prefilter_work_on_size_drift() {
+        let mut walk = steady_walk();
+        walk.get_mut("harbor")
+            .unwrap()
+            .get_mut("skills/tide-tables/SKILL.md")
+            .unwrap()
+            .size = 11;
+        assert_eq!(
+            prefilter(Some(&steady_receipt()), &walk, &[HarnessKind::ClaudeCode]),
+            SessionWork::Work
+        );
+    }
+
+    #[test]
+    fn prefilter_work_on_new_opted_in_domain() {
+        let mut walk = steady_walk();
+        walk.insert("cove".to_string(), BTreeMap::new());
+        assert_eq!(
+            prefilter(Some(&steady_receipt()), &walk, &[HarnessKind::ClaudeCode]),
+            SessionWork::Work
+        );
+    }
+
+    #[test]
+    fn prefilter_work_on_dropped_opted_in_domain() {
+        let mut receipt = steady_receipt();
+        // cove was opted in and stamped last time, but is absent from this
+        // run's walk (opted out): a decision-set mismatch.
+        receipt
+            .sources
+            .insert("cove".to_string(), DomainSources::default());
+        assert_eq!(
+            prefilter(Some(&receipt), &steady_walk(), &[HarnessKind::ClaudeCode]),
+            SessionWork::Work
+        );
+    }
+
+    #[test]
+    fn prefilter_work_on_added_source_file() {
+        let mut walk = steady_walk();
+        walk.get_mut("harbor").unwrap().insert(
+            "commands/charts/plot-route.md".to_string(),
+            FileStat {
+                mtime: 300,
+                size: 30,
+            },
+        );
+        assert_eq!(
+            prefilter(Some(&steady_receipt()), &walk, &[HarnessKind::ClaudeCode]),
+            SessionWork::Work
+        );
+    }
+
+    #[test]
+    fn prefilter_work_when_a_harness_has_no_receipt_entry() {
+        // codex freshly installed: every stamp is clean, but it was never
+        // reconciled, so stamps alone cannot prove it current.
+        assert_eq!(
+            prefilter(
+                Some(&steady_receipt()),
+                &steady_walk(),
+                &[HarnessKind::ClaudeCode, HarnessKind::Codex]
+            ),
+            SessionWork::Work
+        );
+    }
+
+    #[test]
+    fn prefilter_advisory_when_the_receipt_would_not_load() {
+        assert_eq!(
+            prefilter(None, &steady_walk(), &[HarnessKind::ClaudeCode]),
+            SessionWork::Advisory
+        );
+    }
+
+    // --- stat_file_sources vs scan_domain selection parity ---------------------
+
+    /// Write `content` to `path`, creating its parent directories first - the
+    /// same create-then-write idiom `reconcile`'s own fixtures use.
+    fn fixture_file(path: &Path, content: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    }
+
+    /// A fixture tree that hits every edge rule `stat_file_sources` and
+    /// `scan_domain` must agree on: a skill with a nested `scripts/` file, a
+    /// skill directory missing `SKILL.md`, a hidden entry at the root of a
+    /// kind and hidden entry inside a skill, a non-`.md` file among the
+    /// commands, a nested command, a top-level and a nested agents file, and a
+    /// name unsafe per `is_plain_component`. Returns the roots ready for both
+    /// functions.
+    fn selection_parity_roots(root: &Path) -> Vec<(ArtifactType, PathBuf)> {
+        let skills = root.join("skills");
+        // A real skill: SKILL.md plus a nested scripts/ file underneath it.
+        fixture_file(&skills.join("good-skill/SKILL.md"), "# good skill");
+        fixture_file(&skills.join("good-skill/scripts/run.sh"), "echo hi");
+        // Hidden entry inside a skill directory: skipped at that depth.
+        fixture_file(&skills.join("good-skill/.hidden-inner"), "nope");
+        // A skill directory with no SKILL.md: selected by neither.
+        fixture_file(&skills.join("no-skill-md/README.md"), "not a skill");
+        // A hidden top-level directory under skills, SKILL.md and all: the
+        // hidden check runs before anything looks inside it.
+        fixture_file(&skills.join(".hidden-skill/SKILL.md"), "hidden");
+        // A skill directory name unsafe per is_plain_component: selected by
+        // neither, regardless of what is inside it.
+        fixture_file(&skills.join("bad:name/SKILL.md"), "unsafe name");
+
+        let commands = root.join("commands");
+        fixture_file(&commands.join("top.md"), "# top command");
+        // A nested command: commands select *.md at any depth.
+        fixture_file(&commands.join("sub/nested.md"), "# nested command");
+        // A non-.md file among the commands: selected by neither.
+        fixture_file(&commands.join("notes.txt"), "not markdown");
+
+        let agents = root.join("agents");
+        // Agents select only top-level *.md.
+        fixture_file(&agents.join("top.md"), "# top agent");
+        fixture_file(&agents.join("nested/inner.md"), "never selected");
+
+        vec![
+            (ArtifactType::Skills, skills),
+            (ArtifactType::Commands, commands),
+            (ArtifactType::Agents, agents),
+        ]
+    }
+
+    #[test]
+    fn stat_walk_selection_matches_scan_domain() {
+        let dir = tempfile::tempdir().unwrap();
+        let roots = selection_parity_roots(dir.path());
+
+        let stat_keys: HashSet<String> = stat_file_sources(&roots).into_keys().collect();
+        let (artifacts, _scan_notices) = scan_domain("harbor", &roots);
+        let scan_keys: HashSet<String> = artifacts
+            .files
+            .iter()
+            .map(|f| format!("{}/{}", f.kind.id(), f.rel))
+            .collect();
+
+        assert_eq!(stat_keys, scan_keys);
+
+        // A key-set diff alone would still pass on two empty sets, so pin down
+        // that the edge rules actually fired both ways rather than everything
+        // being silently dropped.
+        assert!(stat_keys.contains("skills/good-skill/SKILL.md"));
+        assert!(stat_keys.contains("skills/good-skill/scripts/run.sh"));
+        assert!(stat_keys.contains("commands/top.md"));
+        assert!(stat_keys.contains("commands/sub/nested.md"));
+        assert!(stat_keys.contains("agents/top.md"));
+        assert_eq!(stat_keys.len(), 5);
     }
 }

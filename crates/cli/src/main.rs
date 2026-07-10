@@ -2129,7 +2129,7 @@ fn run_prompt(
     // prompt goes out. Cheap when versions match (one small-file read) and
     // best-effort always; outcomes surface only as trailing notice lines on
     // the text output.
-    let reconcile_notices = install::auto_reconcile(
+    let mut reconcile_notices = install::auto_reconcile(
         env!("CARGO_PKG_VERSION"),
         &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
     );
@@ -2139,6 +2139,22 @@ fn run_prompt(
     // CRYSTALLINE_CONFIG, then the default) and applies the environment overlay,
     // so the routing prompt reflects env-configured settings.
     let global = crystalline_service::overlay::load(config_path.as_deref())?.effective;
+
+    // Session-start provisioning: reconcile opted-in domains' file artifacts
+    // and surface undecided domains, joining the same notice channel as the
+    // auto-update above. Spawn-free by construction (the deferring MCP runner)
+    // and best-effort - session_notices never errors and its lines only ever
+    // trail the routing body, so the prompt stays byte-deterministic. State
+    // that cannot be resolved (a stateless environment) simply adds nothing.
+    let session_notices = crystalline_core::provision::receipt_path()
+        .ok()
+        .zip(crystalline_core::provision::install_receipt_path().ok())
+        .map(|(receipt, install_receipt)| {
+            let harnesses = crystalline_core::provision::installed_harnesses(&install_receipt);
+            crystalline_core::provision::session_notices(&global, &receipt, &harnesses)
+        })
+        .unwrap_or_default();
+    reconcile_notices.extend(session_notices);
 
     // Virtual domains have no MANIFEST on disk; their routing bullets come from
     // the daemon (warm) or a direct store read. The all-file common case never

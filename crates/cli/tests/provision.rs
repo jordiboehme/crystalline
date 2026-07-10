@@ -583,3 +583,311 @@ fn unknown_and_virtual_domain_decisions_error() {
     assert!(stderr.contains("notes"), "{stderr}");
     assert!(stderr.contains("virtual"), "{stderr}");
 }
+
+// --- session-start provisioning (`crystalline prompt system`) ---------------
+
+/// Rewrite the install receipt at the current binary version so a `prompt
+/// system` run's own auto-update sees nothing to refresh and adds no notice of
+/// its own, leaving the session provisioning notices as the only ones on
+/// stdout. `setup` seeds an old-version receipt; call this after it.
+fn bump_install_receipt_current(home: &Path) {
+    let path = home.join("state").join("crystalline").join("installs.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&json!({
+            "format": 1,
+            "installs": [
+                {
+                    "harness": "claude-code",
+                    "scope": "user",
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "parts": { "mcp": true, "hooks": true, "skills": true },
+                    "skills": []
+                }
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+/// Run `crystalline prompt system` in the isolated env and return its stdout,
+/// asserting a clean exit - the session provisioning path must never break the
+/// routing prompt.
+fn prompt_stdout(home: &Path, bin_dir: &Path) -> String {
+    let out = provision_cmd(home, bin_dir)
+        .args(["prompt", "system"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "prompt system must succeed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// The parsed `provisions.json` receipt at the isolated home.
+fn read_receipt(home: &Path) -> Value {
+    let path = home.join("state/crystalline/provisions.json");
+    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap()
+}
+
+#[test]
+fn prompt_appends_pending_decision_block() {
+    let (work, home, bin_dir, harbor_dir) = setup("prompt-pending");
+    let log = work.path().join("claude.log");
+    write_shim(&bin_dir, "claude", &log);
+    register_harbor(&home, &bin_dir, &harbor_dir);
+    bump_install_receipt_current(&home);
+
+    // Undecided: the routing body plus a pending-decision block naming harbor
+    // with its per-type counts and how to decide.
+    let undecided = prompt_stdout(&home, &bin_dir);
+    assert!(
+        undecided.contains("provision allow harbor"),
+        "the pending block hints at the decision: {undecided}"
+    );
+    assert!(
+        undecided.contains("skills: 2")
+            && undecided.contains("commands: 1")
+            && undecided.contains("agents: 1")
+            && undecided.contains("mcps: 1"),
+        "the counts are correct: {undecided}"
+    );
+
+    // Once decided, nothing is pending and the block is gone.
+    provision_cmd(&home, &bin_dir)
+        .args(["provision", "deny", "harbor"])
+        .assert()
+        .success();
+    let denied = prompt_stdout(&home, &bin_dir);
+    assert!(
+        !denied.contains("provision allow harbor"),
+        "no block once the domain is decided: {denied}"
+    );
+
+    // The routing body is byte-identical; the undecided run only appended the
+    // pending block after it.
+    assert!(
+        undecided.starts_with(&denied),
+        "the routing body must be byte-identical, the block only appended\n--- undecided ---\n{undecided}\n--- denied ---\n{denied}"
+    );
+    let appended = &undecided[denied.len()..];
+    assert!(
+        appended.contains("provision allow harbor"),
+        "the appended tail is exactly the pending block: {appended:?}"
+    );
+}
+
+#[test]
+fn prompt_reconciles_after_source_change() {
+    let (work, home, bin_dir, harbor_dir) = setup("prompt-reconcile");
+    let log = work.path().join("claude.log");
+    write_shim(&bin_dir, "claude", &log);
+    register_and_allow(&home, &bin_dir, &harbor_dir);
+    bump_install_receipt_current(&home);
+
+    // Change one source file with new bytes of a different length, so the
+    // stat-only prefilter catches it regardless of mtime granularity.
+    let new_agent =
+        "# Quartermaster\n\nA thoroughly rewritten and noticeably longer stores manifest.\n";
+    write(&harbor_dir, "agents/quartermaster.md", new_agent);
+
+    let out = prompt_stdout(&home, &bin_dir);
+
+    let target = home.join(".claude/agents/quartermaster.md");
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        new_agent,
+        "the target is reconciled to the new source"
+    );
+    assert!(
+        out.contains("Refreshed") && out.contains("provisioned artifact"),
+        "a change notice is present: {out}"
+    );
+    assert!(
+        !out.contains("MCP server changes are waiting"),
+        "the unchanged mcp is not deferred: {out}"
+    );
+}
+
+#[test]
+fn prompt_skips_hashing_when_stamps_unchanged() {
+    let (work, home, bin_dir, harbor_dir) = setup("prompt-skip");
+    let log = work.path().join("claude.log");
+    write_shim(&bin_dir, "claude", &log);
+    register_and_allow(&home, &bin_dir, &harbor_dir);
+    bump_install_receipt_current(&home);
+
+    let receipt_path = home.join("state/crystalline/provisions.json");
+    let receipt_before = std::fs::read(&receipt_path).unwrap();
+    let target = home.join(".claude/skills/tide-tables/SKILL.md");
+    let mtime_before = std::fs::metadata(&target).unwrap().modified().unwrap();
+
+    // Two consecutive session runs against an entirely unchanged workspace.
+    let _ = prompt_stdout(&home, &bin_dir);
+    let _ = prompt_stdout(&home, &bin_dir);
+
+    assert_eq!(
+        std::fs::read(&receipt_path).unwrap(),
+        receipt_before,
+        "the receipt is never rewritten when nothing changed"
+    );
+    assert_eq!(
+        std::fs::metadata(&target).unwrap().modified().unwrap(),
+        mtime_before,
+        "no provisioned target is rewritten when nothing changed"
+    );
+}
+
+#[test]
+fn prompt_defers_mcp_changes_with_one_line() {
+    let (work, home, bin_dir, harbor_dir) = setup("prompt-mcp");
+    let log = work.path().join("claude.log");
+    write_shim(&bin_dir, "claude", &log);
+    register_and_allow(&home, &bin_dir, &harbor_dir);
+    bump_install_receipt_current(&home);
+
+    let mcp_sha_before =
+        read_receipt(&home)["harnesses"]["claude-code"]["mcps"]["lighthouse"]["sha256"]
+            .as_str()
+            .unwrap()
+            .to_string();
+    let target = home.join(".claude/skills/tide-tables/SKILL.md");
+    let target_mtime_before = std::fs::metadata(&target).unwrap().modified().unwrap();
+    let log_before = read_log(&log);
+
+    // Change only the mcp server config at source.
+    write(
+        &harbor_dir,
+        "mcps/lighthouse.json",
+        r#"{"name": "lighthouse", "server": {"type": "http", "url": "https://example.test/mcp/v2"}}"#,
+    );
+
+    let out = prompt_stdout(&home, &bin_dir);
+
+    // Exactly one deferred-MCP line, and the hook path never spawned the
+    // harness CLI (the shim log did not grow).
+    let deferred_lines = out
+        .lines()
+        .filter(|l| l.contains("MCP server changes are waiting"))
+        .count();
+    assert_eq!(deferred_lines, 1, "exactly one deferred-MCP line: {out}");
+    assert_eq!(
+        read_log(&log),
+        log_before,
+        "the session path never spawns the harness CLI"
+    );
+
+    // File artifacts are untouched and the recorded mcp entry is left as it was.
+    assert_eq!(
+        std::fs::metadata(&target).unwrap().modified().unwrap(),
+        target_mtime_before,
+        "file artifacts are untouched by an mcp-only change"
+    );
+    let mcp_sha_after =
+        read_receipt(&home)["harnesses"]["claude-code"]["mcps"]["lighthouse"]["sha256"]
+            .as_str()
+            .unwrap()
+            .to_string();
+    assert_eq!(
+        mcp_sha_after, mcp_sha_before,
+        "the recorded mcp entry is left as it was, exactly like a deferred change"
+    );
+
+    // An explicit provision applies it (the shim sees the add), then the next
+    // session is quiet.
+    provision_cmd(&home, &bin_dir)
+        .args(["provision"])
+        .assert()
+        .success();
+    assert!(
+        read_log(&log).contains("mcp add-json lighthouse"),
+        "the explicit provision registers the changed mcp: {}",
+        read_log(&log)
+    );
+
+    let quiet = prompt_stdout(&home, &bin_dir);
+    assert!(
+        !quiet.contains("MCP server changes are waiting"),
+        "the next session is quiet once the mcp is applied: {quiet}"
+    );
+}
+
+#[test]
+fn prompt_survives_corrupt_receipt_with_one_advisory() {
+    let (work, home, bin_dir, harbor_dir) = setup("prompt-corrupt");
+    let log = work.path().join("claude.log");
+    write_shim(&bin_dir, "claude", &log);
+    register_and_allow(&home, &bin_dir, &harbor_dir);
+    bump_install_receipt_current(&home);
+
+    let receipt_path = home.join("state/crystalline/provisions.json");
+    std::fs::write(&receipt_path, "{ not json").unwrap();
+
+    let out = prompt_stdout(&home, &bin_dir);
+
+    let advisory_lines = out
+        .lines()
+        .filter(|l| l.contains("provisioning memory could not be read"))
+        .count();
+    assert_eq!(advisory_lines, 1, "exactly one advisory line: {out}");
+    assert_eq!(
+        std::fs::read_to_string(&receipt_path).unwrap(),
+        "{ not json",
+        "a hook never regenerates the receipt - that is an explicit apply's job"
+    );
+}
+
+#[test]
+fn prompt_json_format_stays_notice_free() {
+    let (work, home, bin_dir, harbor_dir) = setup("prompt-json");
+    let log = work.path().join("claude.log");
+    write_shim(&bin_dir, "claude", &log);
+    register_and_allow(&home, &bin_dir, &harbor_dir);
+    bump_install_receipt_current(&home);
+
+    // A second undecided declaring domain (would raise a pending block in text)
+    // and a source change (would raise a reconcile notice in text): json must
+    // still carry neither.
+    let cove_dir = work.path().join("kb-cove");
+    write_harbor(&cove_dir);
+    provision_cmd(&home, &bin_dir)
+        .args(["domain", "add", "cove"])
+        .arg(&cove_dir)
+        .arg("--no-sync")
+        .assert()
+        .success();
+    write(
+        &harbor_dir,
+        "agents/quartermaster.md",
+        "# Quartermaster\n\nChanged for this session with a longer body than before.\n",
+    );
+
+    let out = provision_cmd(&home, &bin_dir)
+        .args(["prompt", "system", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let _: Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("the json prompt must parse: {e}\n{stdout}"));
+    assert!(
+        !stdout.contains("ships artifacts to provision"),
+        "no pending block leaks into json: {stdout}"
+    );
+    assert!(
+        !stdout.contains("MCP server changes are waiting"),
+        "no deferred-mcp line leaks into json: {stdout}"
+    );
+    assert!(
+        !stdout.contains("Refreshed"),
+        "no reconcile summary leaks into json: {stdout}"
+    );
+}

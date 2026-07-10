@@ -4386,6 +4386,7 @@ fn action_status_id(status: crystalline_core::provision::ActionStatus) -> &'stat
         McpRemoved => "mcp_removed",
         McpSkipped => "mcp_skipped",
         McpFailed => "mcp_failed",
+        McpDeferred => "mcp_deferred",
     }
 }
 

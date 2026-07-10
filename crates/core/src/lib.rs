@@ -44,10 +44,10 @@ pub use prompt::{
     render_json, render_text,
 };
 pub use provision::{
-    ActionStatus, ArtifactAction, ArtifactFile, DesiredFile, DesiredMcp, DesiredSet,
-    DomainArtifacts, DomainSources, HarnessState, InstalledFile, InstalledMcp, McpArtifact,
-    McpOutcome, McpRunner, ProvisionReceipt, SourceStamp, desired_set, harness_supports,
-    is_plain_component, reconcile_harness, resolve_source_roots, scan_domain,
+    ActionStatus, ArtifactAction, ArtifactFile, DeferringMcpRunner, DesiredFile, DesiredMcp,
+    DesiredSet, DomainArtifacts, DomainSources, HarnessState, InstalledFile, InstalledMcp,
+    McpArtifact, McpOutcome, McpRunner, ProvisionReceipt, SourceStamp, desired_set,
+    harness_supports, is_plain_component, reconcile_harness, resolve_source_roots, scan_domain,
 };
 pub use schema::{
     FieldDecl, FieldType, ScalarType, Schema, SchemaDrift, SchemaIssue, ValidationMode,
