@@ -12,6 +12,7 @@ use crate::parse::{body_lines, locate, parse_heading};
 
 const SCOPE: &str = "scope";
 const WHEN_TO_USE: &str = "when to use";
+const PROVISIONING: &str = "provisioning";
 
 /// The starter MANIFEST engram for a new domain: valid frontmatter and the two
 /// required routing sections (`Scope`, `When to Use`) plus a `Notes for Agents`
@@ -134,6 +135,114 @@ impl Manifest {
         }
         missing
     }
+
+    /// The `Provisioning` section, if present. `None` means the section is
+    /// absent from the MANIFEST; `Some` means it is present, even when empty
+    /// or made entirely of problem bullets. Parsing a bullet never fails: one
+    /// that cannot become a [`ProvisioningDecl`] is kept as a
+    /// [`ProvisioningProblem`] instead, so a caller can surface it without a
+    /// MANIFEST-wide parse error.
+    pub fn provisioning(&self) -> Option<ProvisioningSection> {
+        let bullets = self.sections.get(PROVISIONING)?;
+        let mut decls: Vec<ProvisioningDecl> = Vec::new();
+        let mut problems: Vec<ProvisioningProblem> = Vec::new();
+
+        for bullet in bullets {
+            match parse_provisioning_bullet(bullet) {
+                Ok(decl) => {
+                    if decls.iter().any(|d| d.kind == decl.kind) {
+                        problems.push(ProvisioningProblem {
+                            bullet: bullet.clone(),
+                            reason: format!(
+                                "duplicate `{}` declaration, the first one wins",
+                                decl.kind.id()
+                            ),
+                        });
+                    } else {
+                        decls.push(decl);
+                    }
+                }
+                Err(reason) => problems.push(ProvisioningProblem {
+                    bullet: bullet.clone(),
+                    reason,
+                }),
+            }
+        }
+
+        Some(ProvisioningSection { decls, problems })
+    }
+}
+
+/// A category of deployable artifact a domain can provision into an AI
+/// harness config directory: skills, commands, agents or MCP configs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactType {
+    /// Agent skills.
+    Skills,
+    /// Slash commands.
+    Commands,
+    /// Subagent definitions.
+    Agents,
+    /// MCP server configs.
+    Mcps,
+}
+
+impl ArtifactType {
+    /// The canonical lowercase identifier used in a `Provisioning` bullet's
+    /// type and echoed back in a duplicate-declaration problem.
+    pub fn id(&self) -> &'static str {
+        match self {
+            ArtifactType::Skills => "skills",
+            ArtifactType::Commands => "commands",
+            ArtifactType::Agents => "agents",
+            ArtifactType::Mcps => "mcps",
+        }
+    }
+
+    /// Parse from an already-lowercased type string, `None` when it names
+    /// none of the four known artifact types.
+    fn parse(lowercased: &str) -> Option<ArtifactType> {
+        match lowercased {
+            "skills" => Some(ArtifactType::Skills),
+            "commands" => Some(ArtifactType::Commands),
+            "agents" => Some(ArtifactType::Agents),
+            "mcps" => Some(ArtifactType::Mcps),
+            _ => None,
+        }
+    }
+}
+
+/// One `type: path` declaration parsed from a `Provisioning` bullet. `path`
+/// is relative to the MANIFEST and may still climb out of the domain root
+/// with `..` components; that is a core feature, checked at resolution time
+/// rather than here.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProvisioningDecl {
+    /// The artifact type this folder provisions.
+    pub kind: ArtifactType,
+    /// The declared path, relative to the MANIFEST, trailing slash trimmed.
+    pub path: String,
+}
+
+/// A `Provisioning` bullet that did not parse into a [`ProvisioningDecl`],
+/// kept verbatim alongside why it was rejected.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProvisioningProblem {
+    /// The original bullet text.
+    pub bullet: String,
+    /// Why the bullet was rejected.
+    pub reason: String,
+}
+
+/// The parsed `Provisioning` section: clean declarations in document order,
+/// plus any bullets that did not parse.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProvisioningSection {
+    /// Declarations that parsed cleanly, in document order. At most one per
+    /// [`ArtifactType`]: a later duplicate becomes a problem instead.
+    pub decls: Vec<ProvisioningDecl>,
+    /// Bullets that did not parse, or lost to an earlier duplicate.
+    pub problems: Vec<ProvisioningProblem>,
 }
 
 fn section_key(title: &str) -> String {
@@ -146,4 +255,64 @@ fn section_key(title: &str) -> String {
 
 fn zero_indent_bullet(line: &str) -> Option<&str> {
     line.strip_prefix("- ").map(str::trim)
+}
+
+/// Parse one `Provisioning` bullet into a declaration, or the reason it was
+/// rejected. The bullet arrives already `- `-stripped and trimmed.
+fn parse_provisioning_bullet(bullet: &str) -> Result<ProvisioningDecl, String> {
+    let Some(colon) = bullet.find(':') else {
+        return Err(format!(
+            "expected a `type: path` shape, no colon found in `{bullet}`"
+        ));
+    };
+    let kind_str = bullet[..colon].trim().to_lowercase();
+    let Some(kind) = ArtifactType::parse(&kind_str) else {
+        return Err(format!(
+            "unknown provisioning type `{kind_str}`, expected one of skills, commands, agents or mcps"
+        ));
+    };
+    let mut path = bullet[colon + 1..].trim();
+    if let Some(trimmed) = path.strip_suffix('/') {
+        path = trimmed;
+    }
+    if let Some(reason) = invalid_provisioning_path(path) {
+        return Err(reason);
+    }
+    Ok(ProvisioningDecl {
+        kind,
+        path: path.to_string(),
+    })
+}
+
+/// Why `path` cannot be provisioned from, or `None` when it is fine.
+/// Absolute and home-relative paths are rejected because provisioning paths
+/// are relative to the MANIFEST; `..` components are allowed, since climbing
+/// out of the domain root is a core feature checked later at resolution
+/// time. The `:` and `\` checks per component guard the same Windows
+/// drive-relative and UNC forms as `is_plain_skill_name` in the CLI's
+/// install path, applied to every path component rather than a single name.
+fn invalid_provisioning_path(path: &str) -> Option<String> {
+    if path.is_empty() {
+        return Some("path is empty".to_string());
+    }
+    if path.starts_with('/') || path.starts_with('\\') || path.starts_with('~') {
+        return Some(format!(
+            "path `{path}` is absolute or home-relative, provisioning paths are relative to the MANIFEST"
+        ));
+    }
+    if path == "." {
+        return Some("path `.` does not name a folder".to_string());
+    }
+    for component in path.split('/') {
+        if component.is_empty()
+            || component == "."
+            || component.contains(':')
+            || component.contains('\\')
+        {
+            return Some(format!(
+                "path `{path}` has an invalid component `{component}`"
+            ));
+        }
+    }
+    None
 }

@@ -31,7 +31,10 @@ pub use engram::{
     Engram, Frontmatter, Heading, LinkTarget, Observation, RECOMMENDED_STATUSES, RECOMMENDED_TYPES,
     Relation, SchemaDef, WikiLink,
 };
-pub use manifest::{Manifest, manifest_template};
+pub use manifest::{
+    ArtifactType, Manifest, ProvisioningDecl, ProvisioningProblem, ProvisioningSection,
+    manifest_template,
+};
 pub use parse::{LosslessEngram, ParseError, parse_engram, parse_engram_lossless};
 pub use prompt::{
     PromptDomain, PromptOutput, generate_prompt, generate_prompt_unscoped, render_instructions,
