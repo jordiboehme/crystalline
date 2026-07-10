@@ -10,6 +10,7 @@ use std::path::PathBuf;
 
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 
+use crystalline_core::HarnessKind;
 use crystalline_core::config;
 use crystalline_core::verify::{self, VerifyOptions};
 
@@ -82,7 +83,7 @@ enum Command {
     Install {
         /// Which harness to wire up.
         #[arg(value_enum)]
-        harness: install::HarnessKind,
+        harness: HarnessArg,
         /// Write into the current repository's harness config (.claude,
         /// .codex, .agents or .github under the working directory) instead
         /// of this user's global one. Codex and Copilot still register their
@@ -106,7 +107,7 @@ enum Command {
     Uninstall {
         /// Which harness to unwire.
         #[arg(value_enum)]
-        harness: install::HarnessKind,
+        harness: HarnessArg,
         /// Act on the current repository's harness config instead of this
         /// user's global one.
         #[arg(long)]
@@ -795,6 +796,34 @@ enum OutputFormat {
     Github,
 }
 
+/// Which harness `install`/`uninstall` targets, as a clap `ValueEnum`. Mirrors
+/// [`HarnessKind`] variant for variant, with identical spellings and doc
+/// comments, so the derived help text and invalid-value error read exactly
+/// as they did before the harness model moved to `crystalline-core`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum HarnessArg {
+    /// Anthropic's Claude Code CLI: hooks in `settings.json`, skills in a
+    /// `skills` folder under `.claude`.
+    ClaudeCode,
+    /// The Codex CLI: hooks in a dedicated `hooks.json`, skills under
+    /// `.agents/skills`.
+    Codex,
+    /// The GitHub Copilot CLI: hooks in a wholly Crystalline-owned
+    /// `crystalline.json` under Copilot's hooks folder, skills under
+    /// `.copilot/skills` (user) or `.github/skills` (project).
+    Copilot,
+}
+
+impl From<HarnessArg> for HarnessKind {
+    fn from(arg: HarnessArg) -> HarnessKind {
+        match arg {
+            HarnessArg::ClaudeCode => HarnessKind::ClaudeCode,
+            HarnessArg::Codex => HarnessKind::Codex,
+            HarnessArg::Copilot => HarnessKind::Copilot,
+        }
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     // No arguments at all falls through to this hidden default: print help
     // rather than doing nothing silently.
@@ -835,7 +864,7 @@ fn main() -> anyhow::Result<()> {
             skip_skills,
         }) => install::run_install(
             install::InstallOptions {
-                harness,
+                harness: harness.into(),
                 project,
                 skip_mcp,
                 skip_hooks,
@@ -847,7 +876,7 @@ fn main() -> anyhow::Result<()> {
             harness,
             project,
             force,
-        }) => install::run_uninstall(harness, project, force, cli.json),
+        }) => install::run_uninstall(harness.into(), project, force, cli.json),
         Some(Command::Origin { command }) => {
             on_runtime(move || run_origin(command, cli.db, cli.json))
         }

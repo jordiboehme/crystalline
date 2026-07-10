@@ -31,6 +31,7 @@ use std::path::Path;
 use anyhow::{Result, anyhow};
 use crystalline_core::config::{self, DomainEntry, GlobalConfig, OriginConfig};
 use crystalline_core::verify::{self, VerifyOptions};
+use crystalline_core::{HarnessKind, harness_paths};
 use crystalline_index::{Store, configured_model_id};
 use crystalline_remote::TokenStore;
 use crystalline_remote::github::auth::auth_base;
@@ -40,7 +41,7 @@ use crystalline_service::instance;
 use serde::Serialize;
 
 use crate::cmd;
-use crate::install::{self, HarnessKind};
+use crate::install;
 use crate::receipt;
 
 /// One domain's diagnostics.
@@ -692,7 +693,7 @@ fn check_one_harness(
     harness: HarnessKind,
     entry: Option<&receipt::InstallRecord>,
 ) -> HarnessDoctor {
-    let paths = install::harness_paths(harness, false);
+    let paths = harness_paths(harness, false);
     let settings_present = paths.settings.is_file();
 
     let (session_start_hook, stop_hook, settings_parse_error) =

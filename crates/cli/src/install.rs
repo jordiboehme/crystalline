@@ -44,13 +44,13 @@
 //! and deleted on uninstall (unless a person added their own entries into
 //! it, which survive like any foreign data).
 
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::path::Path;
 
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
-use crystalline_core::config;
+use crystalline_core::{HarnessKind, HarnessPaths, config, harness_paths};
+use crystalline_service::{CliRun, run_harness_cli};
 
 use crate::receipt;
 
@@ -131,22 +131,6 @@ pub(crate) enum ReconcileMode {
     Auto,
 }
 
-/// Which harness `install`/`uninstall` targets. The `clap::ValueEnum`
-/// spellings are `claude-code`, `codex` and `copilot`.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
-pub enum HarnessKind {
-    /// Anthropic's Claude Code CLI: hooks in `settings.json`, skills in a
-    /// `skills` folder under `.claude`.
-    ClaudeCode,
-    /// The Codex CLI: hooks in a dedicated `hooks.json`, skills under
-    /// `.agents/skills`.
-    Codex,
-    /// The GitHub Copilot CLI: hooks in a wholly Crystalline-owned
-    /// `crystalline.json` under Copilot's hooks folder, skills under
-    /// `.copilot/skills` (user) or `.github/skills` (project).
-    Copilot,
-}
-
 /// How a harness stores its hooks: merged into a shared settings file it
 /// does not own (the foreign-data-preserving group shape) or written into a
 /// dedicated file named for Crystalline (the flat Copilot entry shape).
@@ -156,57 +140,11 @@ pub(crate) enum HooksStyle {
     Owned,
 }
 
-impl HarnessKind {
-    /// The stable identifier used in machine-readable output, and reused by
-    /// `doctor` to label its harnesses section with the same spelling
-    /// `crystalline install <name>` takes.
-    pub(crate) fn id(self) -> &'static str {
-        match self {
-            HarnessKind::ClaudeCode => "claude-code",
-            HarnessKind::Codex => "codex",
-            HarnessKind::Copilot => "copilot",
-        }
-    }
-
-    /// The human-facing product name.
-    fn display_name(self) -> &'static str {
-        match self {
-            HarnessKind::ClaudeCode => "Claude Code",
-            HarnessKind::Codex => "Codex",
-            HarnessKind::Copilot => "GitHub Copilot CLI",
-        }
-    }
-
-    /// The CLI binary that owns this harness's MCP registration.
-    fn cli(self) -> &'static str {
-        match self {
-            HarnessKind::ClaudeCode => "claude",
-            HarnessKind::Codex => "codex",
-            HarnessKind::Copilot => "copilot",
-        }
-    }
-
-    /// Which of the two hook storage styles this harness uses.
-    pub(crate) fn hooks_style(self) -> HooksStyle {
-        match self {
-            HarnessKind::ClaudeCode | HarnessKind::Codex => HooksStyle::Merged,
-            HarnessKind::Copilot => HooksStyle::Owned,
-        }
-    }
-
-    /// Candidate argv forms for this harness's CLI, tried in order: each is
-    /// the program name followed by prefix args placed before the verb args.
-    /// The Copilot CLI is also reachable as `gh copilot` (the GitHub CLI
-    /// forwards args it does not recognize), so a machine with only `gh`
-    /// still registers; a `gh` whose first run wants to install Copilot
-    /// fails fast against the null stdin, which degrades to the printed
-    /// manual command like any other failure.
-    fn cli_invocations(self) -> &'static [&'static [&'static str]] {
-        match self {
-            HarnessKind::ClaudeCode => &[&["claude"]],
-            HarnessKind::Codex => &[&["codex"]],
-            HarnessKind::Copilot => &[&["copilot"], &["gh", "copilot", "--"]],
-        }
+/// Which of the two hook storage styles a harness uses.
+pub(crate) fn hooks_style(harness: HarnessKind) -> HooksStyle {
+    match harness {
+        HarnessKind::ClaudeCode | HarnessKind::Codex => HooksStyle::Merged,
+        HarnessKind::Copilot => HooksStyle::Owned,
     }
 }
 
@@ -224,60 +162,6 @@ pub struct InstallOptions {
     pub skip_hooks: bool,
     /// Skip copying the topical skills.
     pub skip_skills: bool,
-}
-
-/// The settings file and skills folder for a harness at a given scope. Reused
-/// by `doctor`, which reads these same two paths to report each harness's
-/// onboarding trace without ever writing to them.
-pub(crate) struct HarnessPaths {
-    /// The JSON file the hooks live in (`settings.json` for Claude Code, a
-    /// dedicated `hooks.json` for Codex).
-    pub(crate) settings: PathBuf,
-    /// The folder each skill's `<name>/SKILL.md` is copied under.
-    pub(crate) skills_dir: PathBuf,
-}
-
-/// Resolve the settings file and skills folder for a harness and scope. User
-/// scope expands `~` through [`config::expand_tilde`]; `--project` scope is
-/// relative to the current working directory, so it lands in the repository
-/// the command is run from.
-pub(crate) fn harness_paths(harness: HarnessKind, project: bool) -> HarnessPaths {
-    match (harness, project) {
-        (HarnessKind::ClaudeCode, false) => HarnessPaths {
-            settings: config::expand_tilde("~/.claude/settings.json"),
-            skills_dir: config::expand_tilde("~/.claude/skills"),
-        },
-        (HarnessKind::ClaudeCode, true) => HarnessPaths {
-            settings: PathBuf::from(".claude/settings.json"),
-            skills_dir: PathBuf::from(".claude/skills"),
-        },
-        (HarnessKind::Codex, false) => HarnessPaths {
-            settings: config::expand_tilde("~/.codex/hooks.json"),
-            skills_dir: config::expand_tilde("~/.agents/skills"),
-        },
-        (HarnessKind::Codex, true) => HarnessPaths {
-            settings: PathBuf::from(".codex/hooks.json"),
-            skills_dir: PathBuf::from(".agents/skills"),
-        },
-        (HarnessKind::Copilot, false) => HarnessPaths {
-            settings: copilot_home().join("hooks").join("crystalline.json"),
-            skills_dir: copilot_home().join("skills"),
-        },
-        (HarnessKind::Copilot, true) => HarnessPaths {
-            settings: PathBuf::from(".github/hooks/crystalline.json"),
-            skills_dir: PathBuf::from(".github/skills"),
-        },
-    }
-}
-
-/// Copilot's home folder: `$COPILOT_HOME` when it is set and non-empty,
-/// `~/.copilot` otherwise, matching how the Copilot CLI itself resolves its
-/// hooks and skills locations.
-fn copilot_home() -> PathBuf {
-    match std::env::var_os("COPILOT_HOME") {
-        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-        _ => config::expand_tilde("~/.copilot"),
-    }
 }
 
 // --- hook JSON entries -------------------------------------------------------
@@ -473,7 +357,7 @@ pub(crate) fn harness_hook_present(
     event: &str,
     command: &str,
 ) -> bool {
-    match harness.hooks_style() {
+    match hooks_style(harness) {
         HooksStyle::Merged => hook_present(root, event, command),
         HooksStyle::Owned => owned_hook_present(root, event, command),
     }
@@ -610,53 +494,6 @@ fn write_settings(path: &Path, root: &Map<String, Value>) -> anyhow::Result<()> 
 
 // --- MCP registration (shell-outs, never fatal) ------------------------------
 
-/// The outcome of running a harness CLI once.
-enum CliRun {
-    /// The command exited zero.
-    Ok,
-    /// The command ran but exited non-zero.
-    Failed,
-    /// The command could not be spawned because the binary is not on PATH.
-    NotFound,
-}
-
-/// Run a harness CLI, discarding its stdout and stderr so nothing leaks into
-/// this command's own output, and never surfacing an error: a spawn failure
-/// for a missing binary is reported as [`CliRun::NotFound`], any other spawn
-/// or wait failure as [`CliRun::Failed`].
-fn run_cli(program: &str, args: &[&str]) -> CliRun {
-    match Command::new(program)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-    {
-        Ok(status) if status.success() => CliRun::Ok,
-        Ok(_) => CliRun::Failed,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => CliRun::NotFound,
-        Err(_) => CliRun::Failed,
-    }
-}
-
-/// Run a harness CLI trying each of its candidate invocations in order: a
-/// missing binary moves on to the next candidate, any other outcome is
-/// final. Only when every candidate is missing does the whole run read as
-/// [`CliRun::NotFound`].
-fn run_harness_cli(harness: HarnessKind, args: &[&str]) -> CliRun {
-    for candidate in harness.cli_invocations() {
-        let (program, prefix) = candidate
-            .split_first()
-            .expect("a candidate invocation always names a program");
-        let full: Vec<&str> = prefix.iter().chain(args.iter()).copied().collect();
-        match run_cli(program, &full) {
-            CliRun::NotFound => continue,
-            outcome => return outcome,
-        }
-    }
-    CliRun::NotFound
-}
-
 /// The `mcp add` argument vector for a harness. Claude Code takes an explicit
 /// `--scope`; Codex and Copilot register MCP servers per user only, so
 /// `--project` still lands globally (called out in the printed notice).
@@ -756,7 +593,7 @@ fn uninstall_mcp(harness: HarnessKind) -> McpReport {
 /// Install the managed hooks for a harness, dispatching on its storage
 /// style.
 fn install_hooks(harness: HarnessKind, path: &Path) -> anyhow::Result<HooksReport> {
-    match harness.hooks_style() {
+    match hooks_style(harness) {
         HooksStyle::Merged => install_merged_hooks(path),
         HooksStyle::Owned => install_owned_hooks(path),
     }
@@ -764,7 +601,7 @@ fn install_hooks(harness: HarnessKind, path: &Path) -> anyhow::Result<HooksRepor
 
 /// Remove the managed hooks for a harness, dispatching on its storage style.
 fn uninstall_hooks(harness: HarnessKind, path: &Path) -> anyhow::Result<HooksReport> {
-    match harness.hooks_style() {
+    match hooks_style(harness) {
         HooksStyle::Merged => uninstall_merged_hooks(path),
         HooksStyle::Owned => uninstall_owned_hooks(path),
     }
@@ -1709,7 +1546,7 @@ pub(crate) fn auto_reconcile(current_version: &str, cwd: &Path) -> Vec<String> {
         if !applies {
             continue;
         }
-        let Some(harness) = harness_from_id(&entry.harness) else {
+        let Some(harness) = HarnessKind::from_id(&entry.harness) else {
             continue;
         };
         let paths = harness_paths(harness, entry.scope == "project");
@@ -1755,19 +1592,10 @@ fn reconcile_entry(
     Ok(())
 }
 
-/// The `HarnessKind` for a receipt-recorded id; `None` for an id a future
-/// binary wrote that this one does not know.
-fn harness_from_id(id: &str) -> Option<HarnessKind> {
-    match id {
-        "claude-code" => Some(HarnessKind::ClaudeCode),
-        "codex" => Some(HarnessKind::Codex),
-        "copilot" => Some(HarnessKind::Copilot),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
 
     /// Build a settings object from a JSON literal, panicking if it is not an

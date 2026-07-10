@@ -17,6 +17,7 @@ pub mod address;
 pub mod config;
 pub mod emit;
 pub mod engram;
+pub mod harness;
 pub mod import;
 pub mod manifest;
 pub mod parse;
@@ -31,6 +32,7 @@ pub use engram::{
     Engram, Frontmatter, Heading, LinkTarget, Observation, RECOMMENDED_STATUSES, RECOMMENDED_TYPES,
     Relation, SchemaDef, WikiLink,
 };
+pub use harness::{HarnessKind, HarnessPaths, harness_paths};
 pub use manifest::{
     ArtifactType, Manifest, ProblemKind, ProvisioningDecl, ProvisioningProblem,
     ProvisioningSection, in_root_artifact_dirs, manifest_template,
