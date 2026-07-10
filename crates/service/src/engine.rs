@@ -28,7 +28,7 @@ use crystalline_core::emit::{
 };
 use crystalline_core::schema::{self, Schema};
 use crystalline_core::{
-    CrystallineUrl, Engram, Frontmatter, Manifest, YamlValue, parse_engram, slugify,
+    CrystallineUrl, Engram, Frontmatter, HarnessKind, Manifest, YamlValue, parse_engram, slugify,
 };
 use crystalline_index::{
     ChunkParams, DomainHost, DomainId, DomainKind, EmbeddingProvider, EngramDescriptor, EngramId,
@@ -2664,6 +2664,92 @@ impl Engine {
         })
     }
 
+    // --- provision ---------------------------------------------------------
+
+    /// Apply, inspect or record a decision for domain-declared artifact
+    /// provisioning (the skills, commands, agents and MCP servers a domain's
+    /// `## Provisioning` section ships into a harness's own config
+    /// directory). [`ProvisionAction::Status`] reports every domain's
+    /// decision and every installed harness's counts, writing nothing -
+    /// always allowed, even on a read-only instance, mirroring
+    /// `configure`'s `Show`. [`ProvisionAction::Allow`] and
+    /// [`ProvisionAction::Deny`] record one domain's decision (the same
+    /// file-config write-lock-first discipline as `configure`'s `Set`, see
+    /// [`Engine::configure`]) and then reconcile; [`ProvisionAction::Apply`]
+    /// reconciles without changing any decision. All three refuse with
+    /// `EngineError::ReadOnly` on a read-only instance.
+    ///
+    /// The harnesses reconciled into always come from this machine's install
+    /// receipt (`crystalline install`'s own memory of which harnesses are
+    /// onboarded), never a caller-supplied list: provisioning targets every
+    /// harness this machine has actually wired up.
+    pub async fn provision(&self, action: &ProvisionAction) -> Result<Value> {
+        let install_receipt = crystalline_core::provision::install_receipt_path()
+            .map_err(|e| EngineError::Internal(e.to_string()))?;
+        let harnesses = crystalline_core::provision::installed_harnesses(&install_receipt);
+        let receipt_path = crystalline_core::provision::receipt_path()
+            .map_err(|e| EngineError::Internal(e.to_string()))?;
+
+        match action {
+            ProvisionAction::Status => {
+                let config = self.config.read().unwrap().clone();
+                let report =
+                    crystalline_core::provision::status(&config, &receipt_path, &harnesses)
+                        .map_err(|e| EngineError::Internal(e.to_string()))?;
+                Ok(status_report_json(&report))
+            }
+            ProvisionAction::Allow { domain } | ProvisionAction::Deny { domain } => {
+                if self.read_only {
+                    return Err(EngineError::ReadOnly);
+                }
+                // An env-defined domain's source of truth is its variable: the
+                // overlay re-inserts a fresh entry (provision unset) on every
+                // effective-config recompute, so a decision written to the
+                // file would be silently discarded. Checked before the
+                // registered-domain lookup so a shadowed and an env-only name
+                // both get the env message, mirroring `origin_add`.
+                if let Some(env) = self.overlay.env_domain(domain) {
+                    return Err(EngineError::Conflict(format!(
+                        "domain '{domain}' is defined by the environment variable {}; unset it to manage this domain in the config file",
+                        env.var
+                    )));
+                }
+                let allow = matches!(action, ProvisionAction::Allow { .. });
+                // Take the file-config write lock first, the same discipline
+                // `configure`'s Set uses: serialize against a concurrent
+                // decision, mutate a clone, persist, then swap both configs
+                // in. Lock order is always file_config then config.
+                {
+                    let mut file_guard = self.file_config.write().unwrap();
+                    let mut file = file_guard.clone();
+                    set_domain_provision_decision(&mut file, domain, allow)?;
+                    self.persist_config(&file)?;
+                    let effective = self.overlay.apply(&file);
+                    *file_guard = file;
+                    *self.config.write().unwrap() = effective;
+                }
+                self.run_provision_apply(&receipt_path, &harnesses)
+            }
+            ProvisionAction::Apply => {
+                if self.read_only {
+                    return Err(EngineError::ReadOnly);
+                }
+                self.run_provision_apply(&receipt_path, &harnesses)
+            }
+        }
+    }
+
+    /// Reconcile every opted-in domain's declared artifacts into `harnesses`
+    /// through the real system MCP runner - the shared tail of
+    /// `provision`'s `Allow`, `Deny` and `Apply` arms.
+    fn run_provision_apply(&self, receipt_path: &Path, harnesses: &[HarnessKind]) -> Result<Value> {
+        let config = self.config.read().unwrap().clone();
+        let mut mcp = crate::harness_cli::SystemMcpRunner;
+        let report = crystalline_core::provision::apply(&config, receipt_path, harnesses, &mut mcp)
+            .map_err(|e| EngineError::Internal(e.to_string()))?;
+        Ok(apply_report_json(&report))
+    }
+
     // --- domain add (local and virtual) ---------------------------------------
 
     /// Create or adopt a local file domain and bring it into the index, the
@@ -4176,6 +4262,153 @@ impl From<settings::SettingsError> for EngineError {
     fn from(e: settings::SettingsError) -> Self {
         EngineError::Invalid(e.to_string())
     }
+}
+
+/// The requested provisioning action for [`Engine::provision`], mirroring
+/// the ctl `provision` command's `action` field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProvisionAction {
+    /// Report every domain's decision and every installed harness's counts,
+    /// writing nothing.
+    Status,
+    /// Opt `domain` in (`provision: true`), then reconcile.
+    Allow {
+        /// The domain to opt in.
+        domain: String,
+    },
+    /// Opt `domain` out (`provision: false`), then reconcile - this removes
+    /// any artifacts it previously shipped.
+    Deny {
+        /// The domain to opt out.
+        domain: String,
+    },
+    /// Reconcile every already opted-in domain's artifacts, without
+    /// changing any decision.
+    Apply,
+}
+
+/// Record `name`'s provisioning decision (`provision: true` for `allow`,
+/// `provision: false` otherwise) directly on `file`. The one seam
+/// [`Engine::provision`]'s daemon path and `client::provision`'s static
+/// fallback both mutate a config through, so the two can never diverge on
+/// what counts as "unregistered" or "virtual". Errors with
+/// [`EngineError::UnknownDomain`] naming every domain `file` does carry when
+/// `name` is not one of them, and with [`EngineError::Invalid`] when `name`
+/// is a virtual domain - it has no filesystem root to ship artifacts from,
+/// so no decision is recorded.
+pub(crate) fn set_domain_provision_decision(
+    file: &mut GlobalConfig,
+    name: &str,
+    allow: bool,
+) -> Result<()> {
+    let Some(entry) = file.domains.get(name) else {
+        return Err(EngineError::UnknownDomain {
+            domain: name.to_string(),
+            registered: file.domains.keys().cloned().collect(),
+        });
+    };
+    if entry.is_virtual() {
+        return Err(EngineError::Invalid(format!(
+            "domain '{name}' is virtual; virtual domains have no files to provision, so no decision was recorded"
+        )));
+    }
+    file.domains.get_mut(name).unwrap().provision = Some(allow);
+    Ok(())
+}
+
+/// Serialize an [`crystalline_core::provision::ApplyReport`] into the JSON
+/// shape both `Engine::provision`'s daemon path and `client::provision`'s
+/// static fallback return, since neither the report nor its nested types
+/// derive `Serialize` (the format crate keeps that derive off types whose
+/// JSON shape a caller-facing envelope, not a Rust API, should own).
+pub(crate) fn apply_report_json(report: &crystalline_core::provision::ApplyReport) -> Value {
+    let harnesses: Vec<Value> = report
+        .harnesses
+        .iter()
+        .map(|(harness, actions)| {
+            json!({
+                "harness": harness.id(),
+                "actions": actions.iter().map(artifact_action_json).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    json!({
+        "harnesses": harnesses,
+        "notices": report.notices,
+        "pending": report.pending.iter().map(pending_domain_json).collect::<Vec<_>>(),
+    })
+}
+
+/// Serialize a [`crystalline_core::provision::StatusReport`] into JSON, the
+/// read-only sibling of [`apply_report_json`].
+pub(crate) fn status_report_json(report: &crystalline_core::provision::StatusReport) -> Value {
+    json!({
+        "domains": report.domains.iter().map(domain_status_json).collect::<Vec<_>>(),
+        "harnesses": report.harnesses.iter().map(harness_status_json).collect::<Vec<_>>(),
+        "pending": report.pending.iter().map(pending_domain_json).collect::<Vec<_>>(),
+        "virtual_with_decision": report.virtual_with_decision,
+    })
+}
+
+fn artifact_action_json(action: &crystalline_core::provision::ArtifactAction) -> Value {
+    json!({ "target": action.target, "status": action_status_id(action.status) })
+}
+
+/// A stable snake_case id for one [`crystalline_core::provision::ActionStatus`]
+/// variant, the wire and CLI-rendering spelling for what a reconcile did to
+/// one artifact.
+fn action_status_id(status: crystalline_core::provision::ActionStatus) -> &'static str {
+    use crystalline_core::provision::ActionStatus::*;
+    match status {
+        Installed => "installed",
+        Adopted => "adopted",
+        ForeignKept => "foreign_kept",
+        Updated => "updated",
+        UpdatedBackup => "updated_backup",
+        Removed => "removed",
+        RetiredBackup => "retired_backup",
+        McpAdded => "mcp_added",
+        McpUpdated => "mcp_updated",
+        McpRemoved => "mcp_removed",
+        McpSkipped => "mcp_skipped",
+        McpFailed => "mcp_failed",
+    }
+}
+
+fn pending_domain_json(pending: &crystalline_core::provision::PendingDomain) -> Value {
+    json!({ "domain": pending.domain, "counts": pending.counts })
+}
+
+fn domain_status_json(status: &crystalline_core::provision::DomainStatus) -> Value {
+    json!({
+        "domain": status.domain,
+        "is_virtual": status.is_virtual,
+        "decision": decision_id(status.decision),
+        "declares": status.declares,
+        "counts": status.counts,
+        "parse_problems": status.parse_problems,
+    })
+}
+
+/// A stable snake_case id for one [`crystalline_core::provision::Decision`]
+/// variant.
+fn decision_id(decision: crystalline_core::provision::Decision) -> &'static str {
+    use crystalline_core::provision::Decision::*;
+    match decision {
+        Allowed => "allowed",
+        Denied => "denied",
+        Undecided => "undecided",
+    }
+}
+
+fn harness_status_json(status: &crystalline_core::provision::HarnessStatus) -> Value {
+    json!({
+        "harness": status.harness.id(),
+        "installed_files": status.installed_files,
+        "installed_mcps": status.installed_mcps,
+        "edited": status.edited,
+        "missing": status.missing,
+    })
 }
 
 /// Build an engine that opens the store directly for a one-shot standalone CLI

@@ -128,6 +128,20 @@ enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// Reconcile every domain's declared provisioning decision into every
+    /// harness this machine has onboarded: skills, commands, agents and MCP
+    /// servers land under (or come out of) each harness's own config
+    /// directory. Bare `provision` reconciles the decisions already on
+    /// file; `status`, `allow` and `deny` are subcommands.
+    Provision {
+        #[command(subcommand)]
+        command: Option<ProvisionCommand>,
+        /// Load the global config from this file instead of the default
+        /// path. Only meaningful for the bare form; each subcommand carries
+        /// its own.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
     /// Sync one or all registered domains into the index.
     Sync {
         /// Sync only this domain instead of every registered domain.
@@ -789,6 +803,36 @@ enum ConfigCommand {
     },
 }
 
+#[derive(Subcommand, Debug)]
+enum ProvisionCommand {
+    /// Show every domain's provisioning decision, each installed harness's
+    /// installed, edited and missing counts and any domain still awaiting a
+    /// decision.
+    Status {
+        /// Load the global config from this file instead of the default path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Opt a domain in to provisioning its declared artifacts, then
+    /// reconcile.
+    Allow {
+        /// The domain to opt in.
+        domain: String,
+        /// Load the global config from this file instead of the default path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Opt a domain out of provisioning its declared artifacts, then
+    /// reconcile - this removes any artifacts it previously shipped.
+    Deny {
+        /// The domain to opt out.
+        domain: String,
+        /// Load the global config from this file instead of the default path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 enum OutputFormat {
     Human,
@@ -881,6 +925,9 @@ fn main() -> anyhow::Result<()> {
             on_runtime(move || run_origin(command, cli.db, cli.json))
         }
         Some(Command::Config { command }) => on_runtime(move || config_dispatch(command, cli.json)),
+        Some(Command::Provision { command, config }) => {
+            on_runtime(move || provision_dispatch(command, config, cli.json))
+        }
         Some(Command::Sync {
             domain,
             embed,
@@ -1206,6 +1253,28 @@ fn print_setting_result(data: &serde_json::Value, json: bool) {
     if let Some(note) = data["note"].as_str() {
         println!("  {note}");
     }
+}
+
+/// `provision`/`provision status`/`provision allow`/`provision deny`:
+/// socket-first with an in-process fallback, handled inside
+/// `crystalline_service::client::provision`. Bare `provision` applies the
+/// decisions already on file; the subcommands report status or record one
+/// domain's opt-in/opt-out decision before applying.
+async fn provision_dispatch(
+    command: Option<ProvisionCommand>,
+    config: Option<PathBuf>,
+    json: bool,
+) -> anyhow::Result<()> {
+    let (action, domain, config) = match command {
+        None => ("apply", None, config),
+        Some(ProvisionCommand::Status { config }) => ("status", None, config),
+        Some(ProvisionCommand::Allow { domain, config }) => ("allow", Some(domain), config),
+        Some(ProvisionCommand::Deny { domain, config }) => ("deny", Some(domain), config),
+    };
+    let data = crystalline_service::client::provision(action, domain.as_deref(), config.as_deref())
+        .await?;
+    cmd::print_provision(action, &data, json);
+    Ok(())
 }
 
 /// `connect github`: sign this machine in to GitHub, always in-process (no

@@ -4,9 +4,9 @@
 //! one line `{ "v": 1, "ok": true, "data": ... }` or
 //! `{ "v": 1, "ok": false, "error": ... }`. Commands: sync, status, reindex,
 //! sessions, configure, origin_add, origin_update, origin_status,
-//! origin_share, origin_discard, origin_resolve, forget_domain, shutdown.
-//! This is the operator channel; data operations go over the MCP handshake
-//! instead.
+//! origin_share, origin_discard, origin_resolve, provision, forget_domain,
+//! shutdown. This is the operator channel; data operations go over the MCP
+//! handshake instead.
 
 use std::sync::Arc;
 
@@ -282,6 +282,40 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                 Err(e) => (envelope_err(e.to_string()), false),
             }
         }
+        // Apply, inspect or record a decision for domain-declared artifact
+        // provisioning. `status` is always allowed; `allow`, `deny` and
+        // `apply` refuse on a read-only daemon (`Engine::provision` itself
+        // checks).
+        "provision" => {
+            let action_str = req
+                .get("action")
+                .and_then(Value::as_str)
+                .unwrap_or("status");
+            let domain = req
+                .get("domain")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let action = match action_str {
+                "status" => Ok(crate::engine::ProvisionAction::Status),
+                "allow" => domain
+                    .map(|domain| crate::engine::ProvisionAction::Allow { domain })
+                    .ok_or_else(|| "provision allow requires a domain".to_string()),
+                "deny" => domain
+                    .map(|domain| crate::engine::ProvisionAction::Deny { domain })
+                    .ok_or_else(|| "provision deny requires a domain".to_string()),
+                "apply" => Ok(crate::engine::ProvisionAction::Apply),
+                other => Err(format!(
+                    "unknown provision action '{other}'; expected status, allow, deny or apply"
+                )),
+            };
+            match action {
+                Ok(action) => match shared.engine.provision(&action).await {
+                    Ok(data) => (envelope_ok(data), false),
+                    Err(e) => (envelope_err(e.to_string()), false),
+                },
+                Err(msg) => (envelope_err(msg), false),
+            }
+        }
         "shutdown" => (envelope_ok(json!({ "stopping": true })), true),
         // Best-effort: `domain remove` calls this so a live daemon stops
         // watching the removed path right away instead of on its next
@@ -297,7 +331,7 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                 "unknown ctl command '{other}'; expected status, sessions, sync, reindex, \
                  routing_bullets, scaffold_manifest, domain_import, domain_export, configure, \
                  origin_add, origin_update, origin_status, origin_share, origin_discard, \
-                 origin_resolve, forget_domain or shutdown"
+                 origin_resolve, provision, forget_domain or shutdown"
             )),
             false,
         ),
