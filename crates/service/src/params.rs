@@ -372,6 +372,18 @@ pub struct ResolveConflictParams {
     pub content: Option<String>,
 }
 
+/// Parameters for `provision`.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ProvisionParams {
+    /// What to do: "status" reports decisions, shipped artifacts and installed
+    /// state; "allow" or "deny" records the user's decision for `domain` and
+    /// applies it; "apply" reconciles current decisions.
+    pub action: String,
+    /// The domain for allow or deny. Omit for status and apply.
+    #[serde(default)]
+    pub domain: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -31,12 +31,21 @@
 //! `resolve_conflict` additionally disappear read-only. See `COLLAB_TOOLS`,
 //! `COLLAB_WRITE_TOOLS` and `hidden_collab_tool`.
 //!
+//! A thirteenth tool, `provision`, is gated a third way: hidden whenever no
+//! registered domain's MANIFEST declares a `## Provisioning` section (see
+//! [`Engine::provisioning_declared`]) or the instance is read-only, so an
+//! install with nothing to provision never carries the tool's context cost.
+//! Its route stays registered like every other hidden tool, so a call by
+//! name still reaches the engine: `status` answers for real even with no
+//! declaring domain, and a mutating action still hits the read-only guard.
+//!
 //! rmcp 2.1 supports a server pushing `notifications/tools/list_changed` to
 //! a connected client (`Peer::notify_tool_list_changed`, gated behind
 //! `ServerCapabilities::enable_tool_list_changed`); `configure` sends one
-//! whenever a `set`/`unset` call flips `github.enabled`, so a client that
-//! honours the notification refreshes its tool list immediately rather than
-//! waiting for its own next poll.
+//! whenever a `set`/`unset` call flips `github.enabled`, and `add_domain`/
+//! `update_domain` send one whenever they flip whether any domain declares
+//! provisioning, so a client that honours the notification refreshes its
+//! tool list immediately rather than waiting for its own next poll.
 //!
 //! Every tool also advertises MCP tool annotations: a display `title` plus the
 //! readOnly/destructive/idempotent/openWorld hints, so a client can tune its
@@ -108,6 +117,16 @@ fn is_collab_tool(name: &str) -> bool {
     COLLAB_TOOLS.contains(&name)
 }
 
+/// Whether the `provision` tool is hidden given the engine's live read-only
+/// state and whether any registered domain currently declares a
+/// `## Provisioning` section. A fresh install with nothing to provision never
+/// carries the tool's context cost; the route stays registered regardless
+/// (see `list_tools` and `get_tool`), so a call by name still reaches the
+/// engine either way.
+fn hidden_provision_tool(read_only: bool, provisioning_declared: bool) -> bool {
+    read_only || !provisioning_declared
+}
+
 /// Whether collaboration tool `name` is hidden given the engine's live
 /// `github.enabled` and `read_only` state. Not meaningful for a non-collab
 /// tool name; callers check [`is_write_tool`] separately for those. The net
@@ -124,7 +143,7 @@ fn hidden_collab_tool(name: &str, github_enabled: bool, read_only: bool) -> bool
     false
 }
 
-use crate::engine::{ConfigureAction, Engine, EngineError};
+use crate::engine::{ConfigureAction, Engine, EngineError, ProvisionAction};
 use crate::params::*;
 
 /// The shared MCP server: one tool router over one engine. Cheap to clone; the
@@ -433,6 +452,7 @@ impl McpServer {
     async fn add_domain(
         &self,
         Parameters(p): Parameters<AddDomainParams>,
+        peer: Peer<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         if p.repo.is_some() && p.is_virtual {
             return Err(to_error(EngineError::Invalid(
@@ -440,9 +460,14 @@ impl McpServer {
                     .to_string(),
             )));
         }
-        if let Some(repo) = p.repo.as_deref() {
-            return self
-                .engine
+
+        // A newly added (or adopted) domain may already carry a MANIFEST that
+        // declares a `Provisioning` section, so `provisioning_declared` can
+        // flip on this call; notify the same way `configure` does for
+        // `github.enabled`.
+        let before = self.engine.provisioning_declared();
+        let result: Result<Value, EngineError> = if let Some(repo) = p.repo.as_deref() {
+            self.engine
                 .origin_add(
                     repo,
                     p.domain.as_deref(),
@@ -451,33 +476,33 @@ impl McpServer {
                     p.folder.as_deref(),
                 )
                 .await
-                .map_err(to_error)
-                .and_then(ok);
-        }
-        if p.is_virtual {
+        } else if p.is_virtual {
             if p.folder.is_some() {
-                return Err(to_error(EngineError::Invalid(
+                Err(EngineError::Invalid(
                     "add_domain: a virtual domain has no folder; omit folder or drop virtual"
                         .to_string(),
-                )));
+                ))
+            } else {
+                match p.domain.as_deref() {
+                    Some(domain) => self.engine.domain_add_virtual(domain).await,
+                    None => Err(EngineError::Invalid(
+                        "add_domain: a virtual domain requires a domain name".to_string(),
+                    )),
+                }
             }
-            let Some(domain) = p.domain.as_deref() else {
-                return Err(to_error(EngineError::Invalid(
-                    "add_domain: a virtual domain requires a domain name".to_string(),
-                )));
-            };
-            return self
-                .engine
-                .domain_add_virtual(domain)
+        } else {
+            self.engine
+                .domain_add_local(p.domain.as_deref(), p.folder.as_deref())
                 .await
-                .map_err(to_error)
-                .and_then(ok);
+        };
+        let after = self.engine.provisioning_declared();
+        if before != after
+            && let Err(e) = peer.notify_tool_list_changed().await
+        {
+            tracing::warn!("failed to send tools/list_changed after add_domain: {e}");
         }
-        self.engine
-            .domain_add_local(p.domain.as_deref(), p.folder.as_deref())
-            .await
-            .map_err(to_error)
-            .and_then(ok)
+
+        result.map_err(to_error).and_then(ok)
     }
 
     #[tool(
@@ -516,12 +541,20 @@ impl McpServer {
     async fn update_domain(
         &self,
         Parameters(p): Parameters<UpdateDomainParams>,
+        peer: Peer<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.engine
-            .origin_update(p.domain.as_deref())
-            .await
-            .map_err(to_error)
-            .and_then(ok)
+        // A pull can rewrite a domain's MANIFEST, so `provisioning_declared`
+        // can flip here too; notify the same way `add_domain` and `configure`
+        // do.
+        let before = self.engine.provisioning_declared();
+        let result = self.engine.origin_update(p.domain.as_deref()).await;
+        let after = self.engine.provisioning_declared();
+        if before != after
+            && let Err(e) = peer.notify_tool_list_changed().await
+        {
+            tracing::warn!("failed to send tools/list_changed after update_domain: {e}");
+        }
+        result.map_err(to_error).and_then(ok)
     }
 
     #[tool(
@@ -579,6 +612,51 @@ impl McpServer {
         };
         self.engine
             .origin_resolve(&p.domain, &p.path, keep, content)
+            .await
+            .map_err(to_error)
+            .and_then(ok)
+    }
+
+    #[tool(
+        name = "provision",
+        title = "Provision harness artifacts",
+        description = "Provision the skills, commands, agents and MCP servers a domain ships into the user's coding harnesses. A domain declares artifact folders in its MANIFEST; each domain needs a one-time allow or deny decision from the user before anything installs. status shows decisions and pending domains, allow or deny records a decision and applies it, apply reconciles updates and removals. Installed artifacts update when the domain's files change and disappear when the domain is denied or removed.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn provision(
+        &self,
+        Parameters(p): Parameters<ProvisionParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let action = match p.action.as_str() {
+            "status" => ProvisionAction::Status,
+            "apply" => ProvisionAction::Apply,
+            "allow" | "deny" => {
+                let Some(domain) = p.domain.clone() else {
+                    return Err(ErrorData::invalid_params(
+                        format!("provision {} requires domain", p.action),
+                        None,
+                    ));
+                };
+                if p.action == "allow" {
+                    ProvisionAction::Allow { domain }
+                } else {
+                    ProvisionAction::Deny { domain }
+                }
+            }
+            other => {
+                return Err(ErrorData::invalid_params(
+                    format!("provision action must be status, allow, deny or apply, got '{other}'"),
+                    None,
+                ));
+            }
+        };
+        self.engine
+            .provision(&action)
             .await
             .map_err(to_error)
             .and_then(ok)
@@ -673,12 +751,16 @@ impl ServerHandler for McpServer {
     ) -> Result<ListToolsResult, ErrorData> {
         let read_only = self.engine.read_only();
         let github_enabled = self.engine.config().github_enabled();
+        let provisioning_declared = self.engine.provisioning_declared();
         let mut tools = Self::tool_router().list_all();
         tools.retain(|t| {
             if is_write_tool(&t.name) && read_only {
                 return false;
             }
             if is_collab_tool(&t.name) && hidden_collab_tool(&t.name, github_enabled, read_only) {
+                return false;
+            }
+            if t.name == "provision" && hidden_provision_tool(read_only, provisioning_declared) {
                 return false;
             }
             true
@@ -703,6 +785,11 @@ impl ServerHandler for McpServer {
             if hidden_collab_tool(name, github_enabled, read_only) {
                 return None;
             }
+        }
+        if name == "provision"
+            && hidden_provision_tool(read_only, self.engine.provisioning_declared())
+        {
+            return None;
         }
         Self::tool_router().get(name).cloned()
     }

@@ -2666,6 +2666,20 @@ impl Engine {
 
     // --- provision ---------------------------------------------------------
 
+    /// Whether any registered domain currently declares a `## Provisioning`
+    /// section in its MANIFEST, the gate for the `provision` MCP tool's
+    /// visibility: a fresh install with no such domain never sees the tool at
+    /// all, zero context cost. Wraps
+    /// [`crystalline_core::provision::any_domain_declares`] against the live
+    /// effective config, read fresh off the config lock on every call rather
+    /// than cached - the same cost class as `routing_text`, since a domain's
+    /// MANIFEST can gain or lose a `Provisioning` section between calls (a
+    /// freshly added domain, or an `update_domain` pull) and the very next
+    /// `list_tools` must reflect that.
+    pub fn provisioning_declared(&self) -> bool {
+        crystalline_core::provision::any_domain_declares(&self.config())
+    }
+
     /// Apply, inspect or record a decision for domain-declared artifact
     /// provisioning (the skills, commands, agents and MCP servers a domain's
     /// `## Provisioning` section ships into a harness's own config
