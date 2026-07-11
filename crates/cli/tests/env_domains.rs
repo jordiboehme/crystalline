@@ -115,6 +115,79 @@ fn domain_add_refuses_an_env_domain_name_naming_the_variable() {
         .stderr(predicates::str::contains("CRYSTALLINE_DOMAIN_TEAM"));
 }
 
+/// A domain directory whose MANIFEST declares a `## Provisioning` section and
+/// which ships one skill, so it would surface in the session pending block if
+/// it were a regular undecided domain.
+fn declaring_domain_dir(parent: &Path, name: &str, scope: &str) -> std::path::PathBuf {
+    let dir = parent.join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("MANIFEST.md"),
+        format!(
+            "---\ntype: manifest\ntitle: {name}\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# {name}\n\n## Scope\n\n- {scope}\n\n## When to Use\n\n- {scope}\n\n## Provisioning\n\n- skills: skills\n"
+        ),
+    )
+    .unwrap();
+    let skill = dir.join("skills/tide-tables/SKILL.md");
+    std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+    std::fs::write(
+        skill,
+        "---\nname: tide-tables\n---\n\nReads the tide tables.\n",
+    )
+    .unwrap();
+    dir
+}
+
+/// An env-defined domain's provisioning decision can never be recorded (the
+/// overlay re-inserts a fresh entry on every read), so the session pending
+/// block must never nag about it - while a regular undecided declaring
+/// domain in the same run still produces its pending line, mirroring
+/// `prompt_appends_pending_decision_block` in `tests/provision.rs`.
+#[test]
+fn prompt_system_never_marks_an_env_domain_pending_while_a_regular_domain_still_is() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let workspace = work.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+
+    // Both domains declare provisioning and ship a skill; only `harbor` is a
+    // regular config-file domain, `team` comes from the environment.
+    let team = declaring_domain_dir(work.path(), "team", "shared team knowledge");
+    let harbor = declaring_domain_dir(work.path(), "harbor", "coastal navigation knowledge");
+    let config = work.path().join("config.yaml");
+    std::fs::write(
+        &config,
+        format!("domains:\n  harbor:\n    path: {}\n", harbor.display()),
+    )
+    .unwrap();
+
+    let mut cmd = bin();
+    isolate(&mut cmd, &home);
+    let out = cmd
+        .env("CRYSTALLINE_DOMAIN_TEAM", &team)
+        .args(["prompt", "system", "--workspace"])
+        .arg(&workspace)
+        .args(["--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{:?}", out);
+    let text = String::from_utf8(out.stdout).unwrap();
+
+    assert!(
+        text.contains("provision allow harbor"),
+        "the regular undecided declaring domain still produces its pending line: {text}"
+    );
+    assert!(
+        !text.contains("provision allow team"),
+        "the env-defined domain never surfaces as awaiting a decision: {text}"
+    );
+    assert!(
+        text.contains("team"),
+        "the env domain is still routed, just never nagged about: {text}"
+    );
+}
+
 #[test]
 fn prompt_system_routes_an_env_domain() {
     let work = tempfile::tempdir().unwrap();

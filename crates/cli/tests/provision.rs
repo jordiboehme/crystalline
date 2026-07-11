@@ -418,7 +418,7 @@ fn status_reports_pending_and_counts() {
         .iter()
         .find(|p| p["domain"] == "harbor")
         .unwrap_or_else(|| panic!("harbor pending: {data}"));
-    assert_eq!(harbor_pending["counts"]["skills"], 2, "{data}");
+    assert_eq!(harbor_pending["counts"]["skills"], 1, "{data}");
     assert_eq!(harbor_pending["counts"]["commands"], 1, "{data}");
     assert_eq!(harbor_pending["counts"]["agents"], 1, "{data}");
     assert_eq!(harbor_pending["counts"]["mcps"], 1, "{data}");
@@ -462,8 +462,25 @@ fn status_reports_pending_and_counts() {
         .unwrap_or_else(|| panic!("claude-code status: {data}"));
     assert_eq!(claude_status["installed_files"], 4, "{data}");
     assert_eq!(claude_status["installed_mcps"], 1, "{data}");
+    assert_eq!(claude_status["drift"], 0, "{data}");
     assert_eq!(claude_status["edited"], 0, "{data}");
+    assert_eq!(claude_status["orphaned"], 0, "{data}");
     assert_eq!(claude_status["missing"], 0, "{data}");
+
+    // The human rendering matches `crystalline doctor`'s provisioning line
+    // wording exactly, so the daemon and read-only surfaces never drift
+    // apart on what they report.
+    let out = provision_cmd(&home, &bin_dir)
+        .args(["provision", "status"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(
+            "claude-code: 4 file(s) installed, 1 mcp(s) installed, 0 drifted, 0 edited, 0 orphaned, 0 missing"
+        ),
+        "{stdout}"
+    );
 }
 
 #[test]
@@ -650,7 +667,7 @@ fn prompt_appends_pending_decision_block() {
         "the pending block hints at the decision: {undecided}"
     );
     assert!(
-        undecided.contains("skills: 2")
+        undecided.contains("skills: 1")
             && undecided.contains("commands: 1")
             && undecided.contains("agents: 1")
             && undecided.contains("mcps: 1"),

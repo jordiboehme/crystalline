@@ -1,7 +1,7 @@
 //! In-process rmcp duplex tests over the real tool router.
 //!
 //! A `tokio::io::duplex` pair connects an rmcp client to the `McpServer` in the
-//! same process, driving the 12 tools through the actual JSON-RPC path. The
+//! same process, driving the tools through the actual JSON-RPC path. The
 //! engine shares an in-memory store; domains are real temp directories because
 //! files are the source of truth.
 

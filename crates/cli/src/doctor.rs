@@ -488,7 +488,7 @@ pub async fn run(
 
     let harnesses = check_harnesses();
 
-    let provisioning = check_provisioning(cfg, &targets)?;
+    let provisioning = check_provisioning(cfg, &loaded.overlay, &targets)?;
 
     Ok(DoctorReport {
         domains,
@@ -901,6 +901,7 @@ fn check_one_harness(
 /// spawns a harness CLI, so this stays as read-only as the rest of doctor.
 fn check_provisioning(
     cfg: &GlobalConfig,
+    overlay: &EnvOverlay,
     targets: &[(String, DomainEntry)],
 ) -> Result<Option<ProvisioningDoctor>> {
     if !provision::any_domain_declares(cfg) {
@@ -912,7 +913,13 @@ fn check_provisioning(
     let install_receipt_path = provision::install_receipt_path()
         .map_err(|e| anyhow!("could not resolve the install receipt path: {e}"))?;
     let harnesses = provision::installed_harnesses(&install_receipt_path);
-    let report = provision::status(cfg, &receipt_path, &harnesses)
+    // Named so an env-defined domain never surfaces in `pending`: its
+    // decision can never be recorded, see `provision::apply`'s doc comment.
+    let env_domains: HashSet<&str> = overlay
+        .env_domains()
+        .map(|(name, _)| name.as_str())
+        .collect();
+    let report = provision::status(cfg, &receipt_path, &harnesses, &env_domains)
         .map_err(|e| anyhow!("could not read provisioning status: {e}"))?;
 
     let selected: HashSet<&str> = targets.iter().map(|(name, _)| name.as_str()).collect();

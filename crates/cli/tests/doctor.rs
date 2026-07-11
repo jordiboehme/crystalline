@@ -1266,7 +1266,7 @@ fn provisioning_section_reports_domain_counts_pending_line_and_harness_drift_edi
         .find(|d| d["name"] == "harbor")
         .unwrap_or_else(|| panic!("no harbor entry: {provisioning}"));
     assert_eq!(harbor["decision"], json!("allowed"));
-    assert_eq!(harbor["counts"]["skills"], json!(2));
+    assert_eq!(harbor["counts"]["skills"], json!(1));
     assert_eq!(harbor["mirror_present"], Value::Null);
 
     let cove = domains

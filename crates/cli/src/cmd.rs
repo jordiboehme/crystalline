@@ -519,8 +519,10 @@ pub(crate) fn print_provision_apply(data: &serde_json::Value, json: bool) {
 }
 
 /// Render `provision status`: each domain's decision and declared counts,
-/// each installed harness's installed, edited and missing counts, then
-/// domains still awaiting a decision.
+/// each installed harness's installed, drifted, edited, orphaned and missing
+/// counts, then domains still awaiting a decision. The harness line matches
+/// `crystalline doctor`'s provisioning section wording exactly, so the two
+/// surfaces never drift apart on what they report.
 pub(crate) fn print_provision_status(data: &serde_json::Value, json: bool) {
     if json {
         println!("{data}");
@@ -542,11 +544,13 @@ pub(crate) fn print_provision_status(data: &serde_json::Value, json: bool) {
     }
     for h in data["harnesses"].as_array().unwrap_or(&empty) {
         println!(
-            "{}: {} file(s) installed, {} mcp(s) installed, {} edited, {} missing",
+            "{}: {} file(s) installed, {} mcp(s) installed, {} drifted, {} edited, {} orphaned, {} missing",
             h["harness"].as_str().unwrap_or(""),
             h["installed_files"].as_u64().unwrap_or(0),
             h["installed_mcps"].as_u64().unwrap_or(0),
+            h["drift"].as_u64().unwrap_or(0),
             h["edited"].as_u64().unwrap_or(0),
+            h["orphaned"].as_u64().unwrap_or(0),
             h["missing"].as_u64().unwrap_or(0),
         );
     }

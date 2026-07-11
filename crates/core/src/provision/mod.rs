@@ -124,12 +124,25 @@ fn read_manifest(entry: &DomainEntry) -> Option<Manifest> {
 }
 
 /// Per-[`ArtifactType`] counts of a scanned domain's artifacts, keyed by
-/// [`ArtifactType::id`]. A kind with zero artifacts is simply absent from the
-/// map, rather than present at zero.
+/// [`ArtifactType::id`], so "how many artifacts of that kind" is true for
+/// every kind: a skill is counted once per skill directory (its distinct
+/// first `rel` path segment), never once per file underneath it, while
+/// commands, agents and mcps stay plain file counts. A kind with zero
+/// artifacts is simply absent from the map, rather than present at zero.
 fn count_artifacts(artifacts: &DomainArtifacts) -> BTreeMap<String, usize> {
     let mut counts = BTreeMap::new();
+    let mut skill_dirs: HashSet<&str> = HashSet::new();
     for file in &artifacts.files {
-        *counts.entry(file.kind.id().to_string()).or_insert(0) += 1;
+        if file.kind == ArtifactType::Skills {
+            if let Some(dir) = file.rel.split('/').next() {
+                skill_dirs.insert(dir);
+            }
+        } else {
+            *counts.entry(file.kind.id().to_string()).or_insert(0) += 1;
+        }
+    }
+    if !skill_dirs.is_empty() {
+        counts.insert(ArtifactType::Skills.id().to_string(), skill_dirs.len());
     }
     if !artifacts.mcps.is_empty() {
         counts.insert(ArtifactType::Mcps.id().to_string(), artifacts.mcps.len());
@@ -141,11 +154,16 @@ fn count_artifacts(artifacts: &DomainArtifacts) -> BTreeMap<String, usize> {
 /// section and ship at least one artifact - the domains a caller should
 /// surface as awaiting a decision. A virtual domain never appears here: it
 /// has no filesystem root to scan, and a decided domain (allowed or denied)
-/// is no longer pending anything.
-fn collect_pending(global: &GlobalConfig) -> Vec<PendingDomain> {
+/// is no longer pending anything. Neither does a domain named in
+/// `env_domains`: an env-defined domain's `provision` field is reset to
+/// `None` on every config read (its decision lives nowhere writable - see
+/// [`apply`]'s and [`status`]'s doc comments), so without this exclusion it
+/// would surface as awaiting a decision forever even though allow/deny both
+/// refuse it outright.
+fn collect_pending(global: &GlobalConfig, env_domains: &HashSet<&str>) -> Vec<PendingDomain> {
     let mut pending = Vec::new();
     for (name, entry) in &global.domains {
-        if entry.provision.is_some() {
+        if entry.provision.is_some() || env_domains.contains(name.as_str()) {
             continue;
         }
         let Some(manifest) = read_manifest(entry) else {
@@ -365,11 +383,21 @@ pub struct ApplyReport {
 /// same philosophy as the search index. A single harness's own reconcile
 /// erroring degrades to a notice and the run continues with the rest; the
 /// only error this function returns is a failure to save the receipt itself.
+///
+/// `env_domains` names every env-defined domain (an `EnvOverlay`'s own
+/// domain names, in the `crystalline-service` crate this module cannot
+/// depend on) so `ApplyReport::pending` never lists one: its `provision`
+/// field always reads back `None` no matter what was decided, since the
+/// overlay re-inserts a fresh entry on every effective-config recompute, so
+/// without the exclusion it would nag forever about a decision that can
+/// never be recorded. Pass an empty set from a caller with no overlay to
+/// apply.
 pub fn apply(
     global: &GlobalConfig,
     receipt_path: &Path,
     harnesses: &[HarnessKind],
     mcp: &mut dyn McpRunner,
+    env_domains: &HashSet<&str>,
 ) -> anyhow::Result<ApplyReport> {
     let mut notices = Vec::new();
     let mut seen = HashSet::new();
@@ -414,7 +442,7 @@ pub fn apply(
         domain_artifacts.push(artifacts);
     }
 
-    let pending = collect_pending(global);
+    let pending = collect_pending(global, env_domains);
 
     if harnesses.is_empty() {
         if any_opted_in {
@@ -582,10 +610,16 @@ pub struct StatusReport {
 /// missing counts read from the receipt. Scans the filesystem to compare
 /// against the receipt but never writes anything - not the receipt, not a
 /// harness's config directory.
+///
+/// `env_domains` carries the same exclusion [`apply`]'s doc comment
+/// documents: every env-defined domain name, so none of them ever appears in
+/// `StatusReport::pending`. Pass an empty set from a caller with no overlay
+/// to apply.
 pub fn status(
     global: &GlobalConfig,
     receipt_path: &Path,
     harnesses: &[HarnessKind],
+    env_domains: &HashSet<&str>,
 ) -> anyhow::Result<StatusReport> {
     let receipt = load(receipt_path).unwrap_or_default();
 
@@ -651,7 +685,7 @@ pub fn status(
         });
     }
 
-    let pending = collect_pending(global);
+    let pending = collect_pending(global, env_domains);
 
     Ok(StatusReport {
         domains,
@@ -694,14 +728,20 @@ pub fn status(
 /// is already suspected, inside `apply`. A domain's MCP configs - always few
 /// and small - are the one exception: they carry no source stamp, so they are
 /// rescanned each run to tell a real MCP change from a steady one.
+///
+/// `env_domains` carries the same exclusion [`apply`]'s doc comment
+/// documents: every env-defined domain name, so none of them ever nags the
+/// pending block for a decision it can never record. Pass an empty set from
+/// a caller with no overlay to apply.
 pub fn session_notices(
     global: &GlobalConfig,
     receipt_path: &Path,
     harnesses: &[HarnessKind],
+    env_domains: &HashSet<&str>,
 ) -> Vec<String> {
     // The pending block needs neither the receipt nor any hashing (read_dir
     // counts only), so it is built first and always appended last.
-    let pending_lines = render_pending(&session_pending(global));
+    let pending_lines = render_pending(&session_pending(global, env_domains));
 
     // Opted-in file domains, in config order. A virtual domain can never ship
     // artifacts, so it is never part of the reconcile set - apply skips it too.
@@ -749,7 +789,13 @@ pub fn session_notices(
 
     // Something drifted: reconcile file artifacts now and defer MCP changes.
     let mut out = Vec::new();
-    match apply(global, receipt_path, harnesses, &mut DeferringMcpRunner) {
+    match apply(
+        global,
+        receipt_path,
+        harnesses,
+        &mut DeferringMcpRunner,
+        env_domains,
+    ) {
         Ok(report) => {
             let file_changes = report
                 .harnesses
@@ -1057,10 +1103,13 @@ fn stat_agents(root: &Path, out: &mut BTreeMap<String, FileStat>) {
 /// counts taken at read_dir level - never hashing, unlike [`collect_pending`]
 /// which the (non hook) apply and status paths can afford. This is what the
 /// session pending block names for the agent to raise with the user.
-fn session_pending(global: &GlobalConfig) -> Vec<PendingDomain> {
+/// `env_domains` is the same exclusion `collect_pending` documents: an
+/// env-defined domain is never included, since its `provision` decision can
+/// never be recorded.
+fn session_pending(global: &GlobalConfig, env_domains: &HashSet<&str>) -> Vec<PendingDomain> {
     let mut pending = Vec::new();
     for (name, entry) in &global.domains {
-        if entry.provision.is_some() {
+        if entry.provision.is_some() || env_domains.contains(name.as_str()) {
             continue;
         }
         let Some(manifest) = read_manifest(entry) else {
@@ -1084,9 +1133,11 @@ fn session_pending(global: &GlobalConfig) -> Vec<PendingDomain> {
 
 /// Per-[`ArtifactType`] artifact counts for a domain's resolved source roots,
 /// at read_dir level and never hashing. File kinds reuse the scan-mirroring
-/// stat walk; MCP configs are counted as the `*.json` files their root holds,
-/// without parsing them, keeping the pending block's "count, do not hash"
-/// contract.
+/// stat walk; a skill is counted once per skill directory (mirroring
+/// [`count_artifacts`]'s skill-granularity contract), never once per file
+/// underneath it. MCP configs are counted as the `*.json` files their root
+/// holds, without parsing them, keeping the pending block's "count, do not
+/// hash" contract.
 fn count_source_roots(roots: &[(ArtifactType, PathBuf)]) -> BTreeMap<String, usize> {
     let mut counts = BTreeMap::new();
     for (kind, root) in roots {
@@ -1094,7 +1145,11 @@ fn count_source_roots(roots: &[(ArtifactType, PathBuf)]) -> BTreeMap<String, usi
             ArtifactType::Skills => {
                 let mut m = BTreeMap::new();
                 stat_skills(root, &mut m);
-                m.len()
+                m.keys()
+                    .filter_map(|key| key.strip_prefix("skills/"))
+                    .filter_map(|rel| rel.split('/').next())
+                    .collect::<HashSet<_>>()
+                    .len()
             }
             ArtifactType::Commands => {
                 let mut m = BTreeMap::new();

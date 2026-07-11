@@ -1,6 +1,6 @@
 //! The shared service engine.
 //!
-//! Every data operation (the 12 MCP tools, the CLI data commands and the ctl
+//! Every data operation (the MCP tools, the CLI data commands and the ctl
 //! sync and reindex) runs through one [`Engine`]. It owns a single boxed
 //! [`Store`] (`dyn Store`) behind a [`tokio::sync::Mutex`] so the backend's
 //! single-connection model is honoured across the daemon's many tasks, the
@@ -2704,12 +2704,22 @@ impl Engine {
         let receipt_path = crystalline_core::provision::receipt_path()
             .map_err(|e| EngineError::Internal(e.to_string()))?;
 
+        let env_domains: HashSet<&str> = self
+            .overlay
+            .env_domains()
+            .map(|(name, _)| name.as_str())
+            .collect();
+
         match action {
             ProvisionAction::Status => {
                 let config = self.config.read().unwrap().clone();
-                let report =
-                    crystalline_core::provision::status(&config, &receipt_path, &harnesses)
-                        .map_err(|e| EngineError::Internal(e.to_string()))?;
+                let report = crystalline_core::provision::status(
+                    &config,
+                    &receipt_path,
+                    &harnesses,
+                    &env_domains,
+                )
+                .map_err(|e| EngineError::Internal(e.to_string()))?;
                 Ok(status_report_json(&report))
             }
             ProvisionAction::Allow { domain } | ProvisionAction::Deny { domain } => {
@@ -2759,8 +2769,19 @@ impl Engine {
     fn run_provision_apply(&self, receipt_path: &Path, harnesses: &[HarnessKind]) -> Result<Value> {
         let config = self.config.read().unwrap().clone();
         let mut mcp = crate::harness_cli::SystemMcpRunner;
-        let report = crystalline_core::provision::apply(&config, receipt_path, harnesses, &mut mcp)
-            .map_err(|e| EngineError::Internal(e.to_string()))?;
+        let env_domains: HashSet<&str> = self
+            .overlay
+            .env_domains()
+            .map(|(name, _)| name.as_str())
+            .collect();
+        let report = crystalline_core::provision::apply(
+            &config,
+            receipt_path,
+            harnesses,
+            &mut mcp,
+            &env_domains,
+        )
+        .map_err(|e| EngineError::Internal(e.to_string()))?;
         Ok(apply_report_json(&report))
     }
 
@@ -4421,7 +4442,9 @@ fn harness_status_json(status: &crystalline_core::provision::HarnessStatus) -> V
         "harness": status.harness.id(),
         "installed_files": status.installed_files,
         "installed_mcps": status.installed_mcps,
+        "drift": status.drift,
         "edited": status.edited,
+        "orphaned": status.orphaned,
         "missing": status.missing,
     })
 }

@@ -2138,7 +2138,15 @@ fn run_prompt(
     // The single load chokepoint resolves the config path (flag, then
     // CRYSTALLINE_CONFIG, then the default) and applies the environment overlay,
     // so the routing prompt reflects env-configured settings.
-    let global = crystalline_service::overlay::load(config_path.as_deref())?.effective;
+    let loaded_config = crystalline_service::overlay::load(config_path.as_deref())?;
+    let global = loaded_config.effective;
+    // Named so an env-defined domain never nags the pending block for a
+    // decision it can never record - see `session_notices`'s doc comment.
+    let env_domains: std::collections::HashSet<&str> = loaded_config
+        .overlay
+        .env_domains()
+        .map(|(name, _)| name.as_str())
+        .collect();
 
     // Session-start provisioning: reconcile opted-in domains' file artifacts
     // and surface undecided domains, joining the same notice channel as the
@@ -2151,7 +2159,12 @@ fn run_prompt(
         .zip(crystalline_core::provision::install_receipt_path().ok())
         .map(|(receipt, install_receipt)| {
             let harnesses = crystalline_core::provision::installed_harnesses(&install_receipt);
-            crystalline_core::provision::session_notices(&global, &receipt, &harnesses)
+            crystalline_core::provision::session_notices(
+                &global,
+                &receipt,
+                &harnesses,
+                &env_domains,
+            )
         })
         .unwrap_or_default();
     reconcile_notices.extend(session_notices);

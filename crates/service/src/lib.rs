@@ -5,7 +5,7 @@
 //!
 //! The CLI is a thin dispatcher over this crate. Data operations run through one
 //! shared [`engine::Engine`], reached either over the socket (when a daemon owns
-//! the index) or in-process (a brief standalone open). The 12 MCP tools, the ctl
+//! the index) or in-process (a brief standalone open). The MCP tools, the ctl
 //! commands and the CLI data commands all funnel through that one engine.
 
 pub mod client;

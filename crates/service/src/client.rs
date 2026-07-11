@@ -2,6 +2,7 @@
 //! commands (over the socket when a daemon runs, else in-process) and the ctl
 //! client used by the CLI operator commands.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -945,11 +946,23 @@ pub async fn provision(
     let harnesses = crystalline_core::provision::installed_harnesses(&install_receipt);
     let receipt_path = crystalline_core::provision::receipt_path()
         .map_err(|e| anyhow::anyhow!("could not resolve the provisioning receipt path: {e}"))?;
+    // Named so the pending block never nags about a domain whose decision can
+    // never be recorded - see `crystalline_core::provision::apply`'s doc
+    // comment.
+    let env_domains: HashSet<&str> = loaded
+        .overlay
+        .env_domains()
+        .map(|(name, _)| name.as_str())
+        .collect();
 
     match action {
         "status" => {
-            let report =
-                crystalline_core::provision::status(&loaded.effective, &receipt_path, &harnesses)?;
+            let report = crystalline_core::provision::status(
+                &loaded.effective,
+                &receipt_path,
+                &harnesses,
+                &env_domains,
+            )?;
             Ok(crate::engine::status_report_json(&report))
         }
         "allow" | "deny" => {
@@ -979,6 +992,7 @@ pub async fn provision(
                 &receipt_path,
                 &harnesses,
                 &mut mcp,
+                &env_domains,
             )?;
             Ok(crate::engine::apply_report_json(&report))
         }
@@ -992,6 +1006,7 @@ pub async fn provision(
                 &receipt_path,
                 &harnesses,
                 &mut mcp,
+                &env_domains,
             )?;
             Ok(crate::engine::apply_report_json(&report))
         }

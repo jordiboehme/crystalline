@@ -12,7 +12,7 @@
 //! keep the shared lock's ordering obvious.
 #![cfg(unix)]
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -20,6 +20,13 @@ use crystalline_core::HarnessKind;
 use crystalline_core::config::{DomainEntry, GlobalConfig};
 use crystalline_core::provision::reconcile::{ActionStatus, McpOutcome, McpRunner};
 use crystalline_core::provision::{self, Decision};
+
+/// No env-defined domains: the exclusion set every `apply`/`status` call in
+/// this file passes, since none of these fixtures use an environment
+/// overlay.
+fn no_env() -> HashSet<&'static str> {
+    HashSet::new()
+}
 
 /// Serializes every `HOME`-mutating test in this binary.
 static HOME_LOCK: Mutex<()> = Mutex::new(());
@@ -182,6 +189,7 @@ fn apply_opts_in_domain_installs_files_and_stamps_sources() {
         &receipt_path,
         &[HarnessKind::ClaudeCode],
         &mut runner,
+        &no_env(),
     );
     restore_home(previous);
     let report = report.unwrap();
@@ -252,6 +260,7 @@ fn apply_opt_out_removes_files_and_drops_source_stamps() {
         &receipt_path,
         &[HarnessKind::ClaudeCode],
         &mut runner,
+        &no_env(),
     )
     .unwrap();
     assert!(
@@ -267,6 +276,7 @@ fn apply_opt_out_removes_files_and_drops_source_stamps() {
         &receipt_path,
         &[HarnessKind::ClaudeCode],
         &mut runner,
+        &no_env(),
     )
     .unwrap();
 
@@ -311,6 +321,7 @@ fn apply_rename_at_source_removes_old_target_and_installs_new() {
         &receipt_path,
         &[HarnessKind::ClaudeCode],
         &mut NoMcp,
+        &no_env(),
     )
     .unwrap();
     assert!(
@@ -330,6 +341,7 @@ fn apply_rename_at_source_removes_old_target_and_installs_new() {
         &receipt_path,
         &[HarnessKind::ClaudeCode],
         &mut NoMcp,
+        &no_env(),
     )
     .unwrap();
     restore_home(previous);
@@ -358,7 +370,7 @@ fn apply_with_no_installed_harnesses_writes_nothing_and_suggests_install() {
     let receipt_dir = tempfile::tempdir().unwrap();
     let receipt_path = receipt_dir.path().join("provisions.json");
 
-    let report = provision::apply(&global, &receipt_path, &[], &mut NoMcp).unwrap();
+    let report = provision::apply(&global, &receipt_path, &[], &mut NoMcp, &no_env()).unwrap();
 
     assert!(report.harnesses.is_empty());
     assert!(
@@ -391,6 +403,7 @@ fn apply_undecided_declaring_domain_is_pending_and_not_installed() {
         &receipt_path,
         &[HarnessKind::ClaudeCode],
         &mut NoMcp,
+        &no_env(),
     )
     .unwrap();
     restore_home(previous);
@@ -404,7 +417,7 @@ fn apply_undecided_declaring_domain_is_pending_and_not_installed() {
     assert_eq!(report.pending.len(), 1);
     let pending = &report.pending[0];
     assert_eq!(pending.domain, "harbor");
-    assert_eq!(pending.counts.get("skills").copied(), Some(2));
+    assert_eq!(pending.counts.get("skills").copied(), Some(1));
     assert_eq!(pending.counts.get("commands").copied(), Some(1));
     assert_eq!(pending.counts.get("agents").copied(), Some(1));
     assert_eq!(pending.counts.get("mcps").copied(), Some(1));
@@ -427,6 +440,7 @@ fn apply_virtual_domain_opted_in_produces_a_notice_and_nothing_else() {
         &receipt_path,
         &[HarnessKind::ClaudeCode],
         &mut NoMcp,
+        &no_env(),
     )
     .unwrap();
     restore_home(previous);
@@ -465,6 +479,7 @@ fn apply_corrupt_receipt_is_regenerated_with_a_notice() {
         &receipt_path,
         &[HarnessKind::ClaudeCode],
         &mut NoMcp,
+        &no_env(),
     );
     restore_home(previous);
     let report = report.unwrap();
@@ -509,6 +524,7 @@ fn status_reflects_decisions_counts_and_edits_without_writing() {
         &receipt_path,
         &[HarnessKind::ClaudeCode],
         &mut runner,
+        &no_env(),
     )
     .unwrap();
 
@@ -525,7 +541,13 @@ fn status_reflects_decisions_counts_and_edits_without_writing() {
     )
     .unwrap();
 
-    let report = provision::status(&global, &receipt_path, &[HarnessKind::ClaudeCode]).unwrap();
+    let report = provision::status(
+        &global,
+        &receipt_path,
+        &[HarnessKind::ClaudeCode],
+        &no_env(),
+    )
+    .unwrap();
     restore_home(previous);
 
     let domain_status = report
@@ -537,7 +559,7 @@ fn status_reflects_decisions_counts_and_edits_without_writing() {
     assert!(domain_status.declares);
     assert!(!domain_status.is_virtual);
     assert_eq!(domain_status.parse_problems, 0);
-    assert_eq!(domain_status.counts.get("skills").copied(), Some(2));
+    assert_eq!(domain_status.counts.get("skills").copied(), Some(1));
     assert_eq!(domain_status.counts.get("commands").copied(), Some(1));
     assert_eq!(domain_status.counts.get("agents").copied(), Some(1));
     assert_eq!(domain_status.counts.get("mcps").copied(), Some(1));
@@ -586,13 +608,20 @@ fn status_reports_missing_files_and_virtual_decisions() {
         &receipt_path,
         &[HarnessKind::ClaudeCode],
         &mut NoMcp,
+        &no_env(),
     )
     .unwrap();
 
     // Delete the installed file locally.
     std::fs::remove_file(home.path().join(".claude/skills/tide-tables/SKILL.md")).unwrap();
 
-    let report = provision::status(&global, &receipt_path, &[HarnessKind::ClaudeCode]).unwrap();
+    let report = provision::status(
+        &global,
+        &receipt_path,
+        &[HarnessKind::ClaudeCode],
+        &no_env(),
+    )
+    .unwrap();
     restore_home(previous);
 
     let harness_status = &report.harnesses[0];
@@ -604,6 +633,53 @@ fn status_reports_missing_files_and_virtual_decisions() {
     assert_eq!(notes_status.decision, Decision::Denied);
     assert!(notes_status.counts.is_empty());
     assert_eq!(report.virtual_with_decision, vec!["notes".to_string()]);
+}
+
+// --- pending: env-defined domains never nag ---------------------------------
+
+/// An env-defined domain's `provision` field always reads back `None` (the
+/// overlay re-inserts a fresh entry on every effective-config recompute), so
+/// without the `env_domains` exclusion it would surface as pending forever
+/// even though `allow`/`deny` both refuse it. Two undecided declaring
+/// domains, one named in `env_domains`: only the other one is pending, in
+/// both `status` and `apply`.
+#[test]
+fn env_defined_domain_never_appears_pending_while_a_plain_undecided_domain_still_does() {
+    let env_dir = tempfile::tempdir().unwrap();
+    write_manifest(env_dir.path(), "- skills: skills\n");
+    write(env_dir.path(), "skills/tide-tables/SKILL.md", "tides\n");
+
+    let plain_dir = tempfile::tempdir().unwrap();
+    write_manifest(plain_dir.path(), "- skills: skills\n");
+    write(plain_dir.path(), "skills/lookout/SKILL.md", "watch\n");
+
+    let mut global = GlobalConfig::default();
+    global
+        .domains
+        .insert("harbor-env".to_string(), DomainEntry::file(env_dir.path()));
+    global
+        .domains
+        .insert("cove".to_string(), DomainEntry::file(plain_dir.path()));
+
+    let receipt_dir = tempfile::tempdir().unwrap();
+    let receipt_path = receipt_dir.path().join("provisions.json");
+    let env_domains: HashSet<&str> = HashSet::from(["harbor-env"]);
+
+    let status = provision::status(&global, &receipt_path, &[], &env_domains).unwrap();
+    assert_eq!(
+        status.pending.iter().map(|p| &p.domain).collect::<Vec<_>>(),
+        vec!["cove"],
+        "{:?}",
+        status.pending
+    );
+
+    let report = provision::apply(&global, &receipt_path, &[], &mut NoMcp, &env_domains).unwrap();
+    assert_eq!(
+        report.pending.iter().map(|p| &p.domain).collect::<Vec<_>>(),
+        vec!["cove"],
+        "{:?}",
+        report.pending
+    );
 }
 
 // --- any_domain_declares (end-to-end alongside apply/status) ----------------

@@ -1,5 +1,5 @@
-//! The rmcp tool router: the 12 core tools of the v1 MCP surface plus six
-//! GitHub collaboration tools whose visibility is gated at runtime.
+//! The rmcp tool router: the core tools of the v1 MCP surface plus the gated
+//! collaboration tools, visible only when the engine's live settings allow.
 //!
 //! Each tool is a thin wrapper over [`crate::engine::Engine`], which does the
 //! real work and is shared with the CLI data commands. Tool descriptions are
@@ -22,7 +22,7 @@
 //! eight read tools; the routes stay registered so a client that calls a hidden
 //! tool by name reaches the engine's read-only guard and gets a clean error.
 //!
-//! The six collaboration tools (`configure`, `add_domain`, `share_changes`,
+//! The collaboration tools (`configure`, `add_domain`, `share_changes`,
 //! `update_domain`, `origin_status`, `resolve_conflict`) are gated the same
 //! way, on the engine's live `github.enabled` setting and `read_only` flag
 //! rather than a startup snapshot, since `configure` can flip
@@ -31,7 +31,7 @@
 //! `resolve_conflict` additionally disappear read-only. See `COLLAB_TOOLS`,
 //! `COLLAB_WRITE_TOOLS` and `hidden_collab_tool`.
 //!
-//! A thirteenth tool, `provision`, is gated a third way: hidden whenever no
+//! One more tool, `provision`, is gated a third way: hidden whenever no
 //! registered domain's MANIFEST declares a `## Provisioning` section (see
 //! [`Engine::provisioning_declared`]) or the instance is read-only, so an
 //! install with nothing to provision never carries the tool's context cost.
