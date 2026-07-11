@@ -60,7 +60,9 @@ runs:
           Linux-X64) platform="linux-amd64"; ext="tar.gz" ;;
           Linux-ARM64) platform="linux-arm64"; ext="tar.gz" ;;
           macOS-ARM64) platform="macos-arm64"; ext="tar.gz" ;;
+          macOS-X64) platform="macos-amd64"; ext="tar.gz" ;;
           Windows-X64) platform="windows-amd64"; ext="zip" ;;
+          Windows-ARM64) platform="windows-arm64"; ext="zip" ;;
           *)
             echo "::error::unsupported runner os/arch combination: ${{ runner.os }}-${{ runner.arch }}"
             exit 1
