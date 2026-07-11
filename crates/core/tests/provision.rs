@@ -165,6 +165,9 @@ fn hidden_files_are_skipped_silently() {
     );
 }
 
+// Unix only: the colon fixtures below are not creatable on a Windows file
+// system, which closes this hostile-name class off at the OS level there.
+#[cfg(unix)]
 #[test]
 fn hostile_names_are_skipped_with_a_notice() {
     let dir = tempfile::tempdir().unwrap();
