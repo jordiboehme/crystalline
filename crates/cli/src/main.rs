@@ -1397,7 +1397,7 @@ fn print_origin_update(data: &serde_json::Value, json: bool) {
         let name = d["domain"].as_str().unwrap_or("");
         if d["provisioned"].as_bool().unwrap_or(false) {
             println!(
-                "{name}: provisioned {} engram(s) at {}",
+                "{name}: scaffolded {} engram(s) at {}",
                 d["engrams"].as_u64().unwrap_or(0),
                 d["base_commit"].as_str().unwrap_or("")
             );

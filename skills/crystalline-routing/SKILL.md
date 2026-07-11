@@ -13,6 +13,8 @@ At session start you are handed a routing block - injected as a session prompt i
 
 Either way, `list_domains` with `include_routing: true` re-fetches the same index mid-session.
 
+A line naming a domain that "ships artifacts to provision" with no decision yet is a pending provisioning decision, not routine routing information: summarize in one sentence what the domain would ship, ask the user whether to allow it and only then apply their answer with the `provision` tool or `crystalline provision allow <domain>` / `deny <domain>` - never decide on the user's behalf.
+
 ## Decide scope first
 
 1. **Narrow** - the task clearly belongs to one product, service or team, and a domain obviously owns it. Search that domain directly. A topic match without a named domain is still narrow: if the question's own words match what a routing line describes, scope to that domain rather than sweeping.
@@ -106,6 +108,10 @@ Structure questions ("what does domain X cover", "what is domain X for", "which 
 Address the MANIFEST by its permalink, usually `manifest` - `{"identifier": "manifest", "domain": "x"}` or the `crystalline://x/manifest` URL. The filename `MANIFEST.md` is not an identifier; when unsure, `browse_domain` lists the real permalink.
 
 Otherwise, search first. Reading every MANIFEST up front burns context for no benefit once the routing block already exists.
+
+## A domain can ship its own tools
+
+A MANIFEST can carry an optional `## Provisioning` section: bullets shaped `type: path`, one of four kinds - `skills`, `commands`, `agents` and `mcps` - naming a folder relative to the MANIFEST itself (a `../` path is allowed, pointing at a folder that lives beside the domain root). This is how a domain ships the working tools its knowledge depends on, not just the knowledge itself - authored once and provisioned into every harness whose format allows it. The scaffolded starter MANIFEST never includes this section; it is added by hand once a domain has something to ship. Nothing ships until a person decides to - see the note above on the routing block for what to do when a domain is still awaiting that decision.
 
 ## Knowledge questions are not codebase questions
 

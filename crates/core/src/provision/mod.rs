@@ -265,6 +265,35 @@ fn count_edited_and_missing(
     Ok((edited, missing))
 }
 
+/// How many of `state`'s recorded rows (files and mcps together) have
+/// drifted from `desired` - a row still part of the desired set but whose
+/// recorded hash no longer matches what a domain would now provision,
+/// meaning its source changed upstream since the last `apply` - and how many
+/// are orphaned: recorded but no longer part of `desired` at all, whether
+/// because their domain opted out, was removed from the config entirely or
+/// its manifest stopped declaring the artifact. Pure over its inputs and
+/// read-only in spirit: it never reads the filesystem or a harness's config
+/// directory, only compares two already-loaded maps.
+fn count_drift_and_orphaned(state: &HarnessState, desired: &DesiredSet) -> (usize, usize) {
+    let mut drift = 0;
+    let mut orphaned = 0;
+    for (key, installed) in &state.files {
+        match desired.files.get(key) {
+            Some(file) if file.sha256 == installed.sha256 => {}
+            Some(_) => drift += 1,
+            None => orphaned += 1,
+        }
+    }
+    for (name, installed) in &state.mcps {
+        match desired.mcps.get(name) {
+            Some(mcp) if mcp.sha256 == installed.sha256 => {}
+            Some(_) => drift += 1,
+            None => orphaned += 1,
+        }
+    }
+    (drift, orphaned)
+}
+
 // --- any_domain_declares ---------------------------------------------------
 
 /// Whether any registered file domain's MANIFEST declares a `Provisioning`
@@ -516,6 +545,19 @@ pub struct HarnessStatus {
     /// How many installed files the receipt records but that are no longer
     /// on disk.
     pub missing: usize,
+    /// How many recorded rows (files and mcps together) have drifted: their
+    /// domain now ships different bytes than what the receipt last
+    /// recorded, so the next `apply` would update them. Compared against
+    /// the harness's current desired set - projected fresh from every
+    /// opted-in domain's live scan - never against the filesystem, so this
+    /// never touches a harness's config directory.
+    pub drift: usize,
+    /// How many recorded rows (files and mcps together) are orphaned:
+    /// recorded but no longer part of the harness's current desired set,
+    /// whether their domain opted out, was removed from the config entirely
+    /// or its manifest stopped declaring the artifact. The next `apply`
+    /// retires them.
+    pub orphaned: usize,
 }
 
 /// A read-only snapshot of every domain's provisioning decision and every
@@ -549,6 +591,12 @@ pub fn status(
 
     let mut domains = Vec::new();
     let mut virtual_with_decision = Vec::new();
+    // Every opted-in file domain's fresh scan, collected alongside `domains`
+    // so the harness loop below can project each harness's current desired
+    // set without a second pass over the config - the same `global.domains`
+    // declaration order `apply`'s own collision-precedence contract relies
+    // on.
+    let mut opted_artifacts: Vec<DomainArtifacts> = Vec::new();
     for (name, entry) in &global.domains {
         let decision = Decision::from_entry(entry);
         if entry.is_virtual() {
@@ -580,6 +628,9 @@ pub fn status(
             counts: count_artifacts(&artifacts),
             parse_problems,
         });
+        if decision == Decision::Allowed {
+            opted_artifacts.push(artifacts);
+        }
     }
 
     let mut harness_statuses = Vec::new();
@@ -587,12 +638,16 @@ pub fn status(
         let empty = HarnessState::default();
         let state = receipt.harnesses.get(harness.id()).unwrap_or(&empty);
         let (edited, missing) = count_edited_and_missing(harness, state)?;
+        let (desired, _notices) = desired_set(harness, &opted_artifacts);
+        let (drift, orphaned) = count_drift_and_orphaned(state, &desired);
         harness_statuses.push(HarnessStatus {
             harness,
             installed_files: state.files.len(),
             installed_mcps: state.mcps.len(),
             edited,
             missing,
+            drift,
+            orphaned,
         });
     }
 
