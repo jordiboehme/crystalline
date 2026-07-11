@@ -1379,10 +1379,11 @@ async fn run_origin(command: OriginCommand, db: Option<PathBuf>, json: bool) -> 
     }
 }
 
-/// Render `origin update`'s aggregate result: one line per team domain (up
-/// to date, or the applied/merged counts with conflicts and proposal
-/// transitions called out), then one line per domain that failed to update.
-/// Conflicts only name the path: resolution tooling arrives in a later task.
+/// Render `origin update`'s aggregate result: one line per team domain (a
+/// freshly bootstrapped env-defined domain, up to date or the
+/// applied/merged counts with conflicts and proposal transitions called
+/// out), then one line per domain that failed to update. Conflicts only name
+/// the path: resolution tooling arrives in a later task.
 fn print_origin_update(data: &serde_json::Value, json: bool) {
     if json {
         print_value(data, true);
@@ -1395,9 +1396,9 @@ fn print_origin_update(data: &serde_json::Value, json: bool) {
     }
     for d in domains {
         let name = d["domain"].as_str().unwrap_or("");
-        if d["provisioned"].as_bool().unwrap_or(false) {
+        if d["bootstrapped"].as_bool().unwrap_or(false) {
             println!(
-                "{name}: scaffolded {} engram(s) at {}",
+                "{name}: bootstrapped {} engram(s) at {}",
                 d["engrams"].as_u64().unwrap_or(0),
                 d["base_commit"].as_str().unwrap_or("")
             );

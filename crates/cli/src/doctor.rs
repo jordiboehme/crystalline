@@ -139,7 +139,7 @@ pub struct OriginDoctor {
     pub base_mismatches: Vec<String>,
     /// Whether this team domain is defined by an environment variable. An
     /// env-defined domain with no origin state yet is not a problem: it
-    /// provisions itself when the daemon connects, so `remaining_problems`
+    /// bootstraps itself when the daemon connects, so `remaining_problems`
     /// skips it where a config-file domain would count.
     pub env_defined: bool,
 }
@@ -404,7 +404,7 @@ impl DoctorReport {
         // corrupt origin state for an already-connected team domain is.
         if let Some(g) = &self.github {
             for o in &g.origins {
-                // An env-defined team domain with no origin state provisions
+                // An env-defined team domain with no origin state bootstraps
                 // itself when the daemon connects, so it is not a problem; a
                 // config-file domain with no state genuinely is.
                 if !o.state_present && !o.env_defined {
@@ -1252,7 +1252,7 @@ pub fn render_human(report: &DoctorReport) -> String {
             if !o.state_present && o.env_defined {
                 let _ = writeln!(
                     out,
-                    "  {} ({}): env-defined team domain, provisions itself when the daemon connects",
+                    "  {} ({}): env-defined team domain, bootstraps itself when the daemon connects",
                     o.name, o.repo
                 );
             } else if !o.state_present {
