@@ -174,7 +174,7 @@ pub async fn run_serve(
     // watcher computes its roots below: notify refuses to watch a missing
     // directory, so pre-creating the (possibly empty) root lets the watch arm
     // and preserves the watch-before-scan invariant with no watcher changes.
-    // An env-origin domain is then provisioned into this root by the startup
+    // An env-origin domain is then bootstrapped into this root by the startup
     // task, its writes caught by the already-armed watch.
     for (name, env_domain) in loaded.overlay.env_domains() {
         if let Some(root) = env_domain.entry.file_path()
@@ -278,12 +278,12 @@ pub async fn run_serve(
             if let Err(err) = e.sync_take_over(None, take_over).await {
                 tracing::warn!("initial sync failed: {err}");
             }
-            // Self-provision env-defined team domains that have no local state
+            // Bootstrap env-defined team domains that have no local state
             // yet: the zero-config read-only node's first contact with GitHub.
             // Runs before the embedding provider is built so it is not gated on
             // a model download; the embed pass just below covers the engrams it
             // writes. A missing connection is not fatal (the poller retries).
-            e.provision_env_origins().await;
+            e.bootstrap_env_origins().await;
             if let Some(provider) = crate::engine::build_provider(&cfg).await {
                 e.set_provider(provider);
                 match e.embed_pending().await {

@@ -171,6 +171,145 @@ parity!(
     full_sync_counts
 );
 
+/// A MANIFEST body with a `## Provisioning` section declaring `decl`, so the
+/// exclusion tests can point sync at a real domain root.
+fn provisioning_manifest(decl: &str) -> String {
+    engram(
+        "Manifest",
+        "manifest",
+        "manifest",
+        "",
+        &format!(
+            "## Scope\n\n- covers the harbor\n\n## When to Use\n\n- when routing\n\n## Provisioning\n\n{decl}\n"
+        ),
+    )
+}
+
+async fn in_root_artifact_folder_is_not_indexed(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "MANIFEST.md",
+        &provisioning_manifest("- skills: skills"),
+    );
+    // A well-formed engram under the declared folder: it would index cleanly if
+    // it were not excluded, so its absence proves the exclusion, not a failure.
+    write(
+        root,
+        "skills/tide-tables/SKILL.md",
+        &engram(
+            "Tide Tables",
+            "skills/tide-tables/skill",
+            "engram",
+            "",
+            "how to read the harbor tidetableterm\n",
+        ),
+    );
+    write(
+        root,
+        "notes/harbor-log.md",
+        &engram(
+            "Harbor Log",
+            "notes/harbor-log",
+            "engram",
+            "",
+            "the tide came in twice today harborlogterm\n",
+        ),
+    );
+    // A near-miss sibling whose name merely starts with `skills` is a normal
+    // folder: exclusion matches whole path components, not string prefixes.
+    write(
+        root,
+        "skills-tables/berth-notes.md",
+        &engram(
+            "Berth Notes",
+            "skills-tables/berth-notes",
+            "engram",
+            "",
+            "berth three is shallow at low tide nearmissterm\n",
+        ),
+    );
+
+    let report = sync_domain(store, "harbor", root).await.unwrap();
+    assert_eq!(
+        report.added, 3,
+        "manifest, harbor-log and berth-notes added, the skill excluded: {report:?}"
+    );
+
+    let stats = store.domain_stats().await.unwrap();
+    assert_eq!(stats[0].engrams, 3);
+
+    let skill = store
+        .search(&SearchQuery::text("tidetableterm"))
+        .await
+        .unwrap();
+    assert_eq!(skill.total, 0, "the artifact folder is not indexed");
+    let log = store
+        .search(&SearchQuery::text("harborlogterm"))
+        .await
+        .unwrap();
+    assert_eq!(log.total, 1, "the sibling engram is indexed");
+    let near = store
+        .search(&SearchQuery::text("nearmissterm"))
+        .await
+        .unwrap();
+    assert_eq!(near.total, 1, "the skills-prefixed sibling is indexed");
+}
+parity!(
+    in_root_artifact_folder_excluded_from_index,
+    in_root_artifact_folder_is_not_indexed
+);
+
+async fn out_of_root_decl_excludes_nothing(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // The decl climbs out of the root, so the in-root `skills/` folder is a
+    // normal folder and its engrams stay indexed.
+    write(
+        root,
+        "MANIFEST.md",
+        &provisioning_manifest("- skills: ../skills"),
+    );
+    write(
+        root,
+        "skills/tide-tables/SKILL.md",
+        &engram(
+            "Tide Tables",
+            "skills/tide-tables/skill",
+            "engram",
+            "",
+            "how to read the harbor tidetableterm\n",
+        ),
+    );
+    write(
+        root,
+        "notes/harbor-log.md",
+        &engram(
+            "Harbor Log",
+            "notes/harbor-log",
+            "engram",
+            "",
+            "the tide came in twice today harborlogterm\n",
+        ),
+    );
+
+    let report = sync_domain(store, "harbor", root).await.unwrap();
+    assert_eq!(
+        report.added, 3,
+        "an out-of-root decl excludes nothing in-root: {report:?}"
+    );
+    let skill = store
+        .search(&SearchQuery::text("tidetableterm"))
+        .await
+        .unwrap();
+    assert_eq!(skill.total, 1, "the in-root folder is still indexed");
+}
+parity!(
+    out_of_root_decl_excludes_nothing_in_root,
+    out_of_root_decl_excludes_nothing
+);
+
 async fn warm_sync_unchanged(store: &dyn Store) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();

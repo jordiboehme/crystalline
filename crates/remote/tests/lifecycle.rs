@@ -1912,3 +1912,401 @@ async fn scenario_26_pull_ignores_a_hidden_upstream_addition_via_tarball_fallbac
     assert!(!st.files.contains_key(".env"));
     assert_eq!(st.base_commit, c2);
 }
+
+// --- M10: team-domain out-of-subtree artifact mirror --------------------------
+//
+// A team domain materializes only its subtree into the working tree, so an
+// out-of-subtree provisioning decl (`skills: ../skills`) is served from a
+// mirror `subscribe` and `pull` maintain under `<state_dir>/artifacts/<kind>`,
+// exactly where `crystalline_core::provision::resolve_source_roots` points a
+// team domain's out-of-subtree decls. The mirror's decl set comes from the
+// MANIFEST bytes inside the fetched tarball, never the local working tree.
+
+/// A team origin whose domain lives at the `knowledge/` subpath, so a
+/// `../skills` decl points at a sibling folder at the repository root rather
+/// than climbing out of the repository.
+fn team_spec() -> OriginSpec {
+    OriginSpec {
+        repo: "team/knowledge".to_string(),
+        subpath: Some("knowledge".to_string()),
+        branch: "main".to_string(),
+    }
+}
+
+/// A valid MANIFEST engram carrying `provisioning` as its Provisioning bullets.
+fn manifest_md(provisioning: &str) -> Vec<u8> {
+    let mut source = crystalline_core::manifest_template("Team", "2026-07-10");
+    source.push_str("\n## Provisioning\n\n");
+    source.push_str(provisioning);
+    source.into_bytes()
+}
+
+/// A repo-relative path to owned-bytes commit map, for fixtures that mix the
+/// domain subtree with out-of-subtree artifact folders in one commit.
+fn commit_map(pairs: Vec<(&str, Vec<u8>)>) -> BTreeMap<String, Vec<u8>> {
+    pairs
+        .into_iter()
+        .map(|(path, content)| (path.to_string(), content))
+        .collect()
+}
+
+#[tokio::test]
+async fn subscribe_materializes_out_of_subtree_artifact_mirror() {
+    let mock = MockProvider::new();
+    let manifest = manifest_md("- skills: ../skills\n- mcps: ../mcps\n- agents: agents\n");
+    let c1 = mock.add_commit(
+        commit_map(vec![
+            ("knowledge/MANIFEST.md", manifest.clone()),
+            (
+                "knowledge/agents/local.md",
+                b"served from the working tree".to_vec(),
+            ),
+            ("skills/tide-tables/SKILL.md", b"# Tide Tables\n".to_vec()),
+            (
+                "skills/tide-tables/scripts/chart.sh",
+                b"echo chart\n".to_vec(),
+            ),
+            (
+                "mcps/lighthouse.json",
+                br#"{"server":{"command":"x"}}"#.to_vec(),
+            ),
+        ]),
+        None,
+    );
+    let spec = team_spec();
+    let sub = subscribe_named(&mock, &spec, &c1, "team-knowledge").await;
+
+    // The out-of-subtree folders land under artifacts/<kind>, keyed by kind.
+    let artifacts = sub.state_dir.join("artifacts");
+    assert_eq!(
+        read(&artifacts.join("skills/tide-tables/SKILL.md")),
+        b"# Tide Tables\n"
+    );
+    assert_eq!(
+        read(&artifacts.join("skills/tide-tables/scripts/chart.sh")),
+        b"echo chart\n"
+    );
+    assert_eq!(
+        read(&artifacts.join("mcps/lighthouse.json")),
+        br#"{"server":{"command":"x"}}"#
+    );
+
+    // An in-subtree decl creates no mirror dir; the working tree serves it.
+    assert!(!artifacts.join("agents").exists());
+    assert_eq!(
+        read(&sub.domain_root.join("agents/local.md")),
+        b"served from the working tree"
+    );
+    // The out-of-subtree folders never leak into the working tree.
+    assert!(!sub.domain_root.join("skills").exists());
+    assert!(!sub.domain_root.join("mcps").exists());
+}
+
+#[tokio::test]
+async fn pull_refreshes_mirror_when_artifact_files_change() {
+    let mock = MockProvider::new();
+    let manifest = manifest_md("- skills: ../skills\n");
+    let c1 = mock.add_commit(
+        commit_map(vec![
+            ("knowledge/MANIFEST.md", manifest.clone()),
+            ("skills/tide-tables/SKILL.md", b"# v1\n".to_vec()),
+        ]),
+        None,
+    );
+    let spec = team_spec();
+    let sub = subscribe_named(&mock, &spec, &c1, "team-knowledge").await;
+    let mirrored = sub.state_dir.join("artifacts/skills/tide-tables/SKILL.md");
+    assert_eq!(read(&mirrored), b"# v1\n");
+
+    // Upstream changes a mirrored file only; the MANIFEST is unchanged, so the
+    // refresh is driven by the changed path falling under the declared root
+    // (the compare path, since the change set is small).
+    let c2 = mock.add_commit(
+        commit_map(vec![
+            ("knowledge/MANIFEST.md", manifest.clone()),
+            ("skills/tide-tables/SKILL.md", b"# v2 upstream\n".to_vec()),
+        ]),
+        Some(&c1),
+    );
+    mock.set_branch("main", &c2);
+
+    let report = pull(&mock, &spec, &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+    assert!(!report.up_to_date);
+    assert_eq!(read(&mirrored), b"# v2 upstream\n");
+    assert_eq!(load_state(&sub.state_dir).base_commit, c2);
+}
+
+#[tokio::test]
+async fn pull_manifest_change_reshapes_mirror() {
+    let mock = MockProvider::new();
+    let m1 = manifest_md("- skills: ../skills\n");
+    let c1 = mock.add_commit(
+        commit_map(vec![
+            ("knowledge/MANIFEST.md", m1.clone()),
+            ("skills/tide-tables/SKILL.md", b"skill\n".to_vec()),
+            ("agents/pilot.md", b"pilot\n".to_vec()),
+        ]),
+        None,
+    );
+    let spec = team_spec();
+    let sub = subscribe_named(&mock, &spec, &c1, "team-knowledge").await;
+    assert!(
+        sub.state_dir
+            .join("artifacts/skills/tide-tables/SKILL.md")
+            .exists()
+    );
+    assert!(!sub.state_dir.join("artifacts/agents").exists());
+
+    // Upstream drops the skills decl and adds an agents decl. The MANIFEST
+    // changed, so the mirror is rebuilt from the new decl set.
+    let m2 = manifest_md("- agents: ../agents\n");
+    let c2 = mock.add_commit(
+        commit_map(vec![
+            ("knowledge/MANIFEST.md", m2.clone()),
+            ("skills/tide-tables/SKILL.md", b"skill\n".to_vec()),
+            ("agents/pilot.md", b"pilot\n".to_vec()),
+        ]),
+        Some(&c1),
+    );
+    mock.set_branch("main", &c2);
+
+    pull(&mock, &spec, &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+
+    // The dropped kind is pruned, the added kind is materialized.
+    assert!(!sub.state_dir.join("artifacts/skills").exists());
+    assert_eq!(
+        read(&sub.state_dir.join("artifacts/agents/pilot.md")),
+        b"pilot\n"
+    );
+}
+
+#[tokio::test]
+async fn escaping_decl_fails_subscribe_and_pull() {
+    let spec = team_spec();
+    let hostile = manifest_md("- skills: ../../evil\n");
+
+    // Subscribe: a decl normalizing outside the repository root fails outright
+    // with the target untouched.
+    let mock = MockProvider::new();
+    let bad = mock.add_commit(
+        commit_map(vec![
+            ("knowledge/MANIFEST.md", hostile.clone()),
+            ("evil/x.md", b"nope\n".to_vec()),
+        ]),
+        None,
+    );
+    mock.set_branch("main", &bad);
+    let work = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let domain_root = work.path().join("domain");
+    let state_dir = state.path().join("origin");
+    let err = subscribe(&mock, &spec, &domain_root, &state_dir)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, crystalline_remote::RemoteError::State(_)),
+        "{err:?}"
+    );
+    assert!(
+        !domain_root.exists(),
+        "subscribe must leave the target untouched"
+    );
+    assert!(OriginState::load(&state_dir).unwrap().is_none());
+
+    // Pull: a clean subscribe, then a later commit whose MANIFEST turns a decl
+    // hostile fails the pull and leaves the previous mirror and base intact.
+    let mock2 = MockProvider::new();
+    let good = manifest_md("- skills: ../skills\n");
+    let c1 = mock2.add_commit(
+        commit_map(vec![
+            ("knowledge/MANIFEST.md", good.clone()),
+            ("skills/tide-tables/SKILL.md", b"good\n".to_vec()),
+        ]),
+        None,
+    );
+    let sub = subscribe_named(&mock2, &spec, &c1, "team-knowledge").await;
+    let mirrored = sub.state_dir.join("artifacts/skills/tide-tables/SKILL.md");
+    assert_eq!(read(&mirrored), b"good\n");
+
+    let c2 = mock2.add_commit(
+        commit_map(vec![
+            ("knowledge/MANIFEST.md", hostile.clone()),
+            ("skills/tide-tables/SKILL.md", b"good\n".to_vec()),
+            ("evil/x.md", b"nope\n".to_vec()),
+        ]),
+        Some(&c1),
+    );
+    mock2.set_branch("main", &c2);
+
+    let err = pull(&mock2, &spec, &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, crystalline_remote::RemoteError::State(_)),
+        "{err:?}"
+    );
+    assert_eq!(
+        read(&mirrored),
+        b"good\n",
+        "the previous mirror stays intact"
+    );
+    assert_eq!(
+        load_state(&sub.state_dir).base_commit,
+        c1,
+        "the base is not advanced when the mirror refresh fails"
+    );
+}
+
+// Domain removal (section 3): the mirror lives entirely inside the origin
+// state directory and never in the working tree. `crystalline` removes a
+// domain by dropping it from the config and leaving its files and index rows
+// untouched (see `crystalline_cli::cmd::domain_remove`); nothing deletes the
+// origin state directory today, so the mirror shares the exact fate of the
+// base snapshot and state.json - reclaimed whenever origin state is. This test
+// proves the containment that makes any origin-state reclamation sufficient.
+#[tokio::test]
+async fn domain_removal_drops_the_mirror() {
+    let mock = MockProvider::new();
+    let manifest = manifest_md("- skills: ../skills\n");
+    let c1 = mock.add_commit(
+        commit_map(vec![
+            ("knowledge/MANIFEST.md", manifest.clone()),
+            ("skills/tide-tables/SKILL.md", b"skill\n".to_vec()),
+        ]),
+        None,
+    );
+    let spec = team_spec();
+    let sub = subscribe_named(&mock, &spec, &c1, "team-knowledge").await;
+
+    let artifacts = sub.state_dir.join("artifacts");
+    assert!(artifacts.join("skills/tide-tables/SKILL.md").exists());
+    // The mirror is never in the working tree, so reclaiming origin state is
+    // enough to drop it: no stray artifact folder lingers beside the engrams.
+    assert!(!sub.domain_root.join("skills").exists());
+
+    std::fs::remove_dir_all(&sub.state_dir).unwrap();
+    assert!(!artifacts.exists());
+}
+
+/// Installs a scratch `HOME` and `XDG_STATE_HOME` for a test and restores the
+/// previous values on drop, even if an assertion panics. Env must stay
+/// installed across the whole test, since both
+/// `crystalline_core::config::origin_state_dir` and `resolve_source_roots`
+/// (which recomputes it) must resolve to the same scratch state directory.
+/// This is the only test in this binary that mutates process environment, so
+/// there is no other env-mutating test to serialize against.
+struct EnvGuard {
+    home: Option<std::ffi::OsString>,
+    xdg_state: Option<std::ffi::OsString>,
+}
+
+impl EnvGuard {
+    fn install(home: &Path) -> EnvGuard {
+        let guard = EnvGuard {
+            home: std::env::var_os("HOME"),
+            xdg_state: std::env::var_os("XDG_STATE_HOME"),
+        };
+        // SAFETY: no other test in this binary reads or writes HOME or
+        // XDG_STATE_HOME, and the guard restores both on drop.
+        unsafe {
+            std::env::set_var("HOME", home);
+            std::env::set_var("XDG_STATE_HOME", home.join("state"));
+        }
+        guard
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: see `install` - this binary has no concurrent env access.
+        unsafe {
+            match &self.home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match &self.xdg_state {
+                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+        }
+    }
+}
+
+// End-to-end at the core boundary: a subscribe-shaped mirror is visible to the
+// core provisioning chain. With `origin_state_dir` pointed at a scratch state
+// directory, `resolve_source_roots` resolves the `../skills` decl into the
+// mirror, `scan_domain` reads the mirrored skill and `desired_set` surfaces its
+// rel key sourced from the mirror.
+#[tokio::test]
+async fn mirror_flows_through_resolve_scan_and_desired_set() {
+    let home = tempfile::tempdir().unwrap();
+    let _env = EnvGuard::install(home.path());
+
+    let domain = "harbor-team";
+    let spec = team_spec();
+    let mock = MockProvider::new();
+    let manifest = manifest_md("- skills: ../skills\n");
+    let c1 = mock.add_commit(
+        commit_map(vec![
+            ("knowledge/MANIFEST.md", manifest.clone()),
+            ("skills/tide-tables/SKILL.md", b"# Tide Tables\n".to_vec()),
+            ("skills/tide-tables/scripts/chart.sh", b"echo\n".to_vec()),
+        ]),
+        None,
+    );
+    mock.set_branch("main", &c1);
+
+    let state_dir = crystalline_core::config::origin_state_dir(domain).unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let domain_root = work.path().join("harbor");
+    subscribe(&mock, &spec, &domain_root, &state_dir)
+        .await
+        .unwrap();
+
+    // A team-domain entry pointing at the materialized working tree and origin.
+    let mut entry = crystalline_core::config::DomainEntry::file(&domain_root);
+    entry.origin = Some(crystalline_core::config::OriginConfig {
+        repo: "team/knowledge".to_string(),
+        path: Some("knowledge".to_string()),
+        branch: None,
+        poll_secs: None,
+    });
+
+    let roots = crystalline_core::provision::resolve_source_roots(domain, &entry);
+    let mirror_skills = state_dir.join("artifacts").join("skills");
+    assert!(
+        roots.iter().any(
+            |(kind, path)| *kind == crystalline_core::ArtifactType::Skills
+                && *path == mirror_skills
+        ),
+        "resolve_source_roots should point the skills decl at the mirror: {roots:?}"
+    );
+
+    let (artifacts, _notices) = crystalline_core::provision::scan_domain(domain, &roots);
+    let (desired, _notices) = crystalline_core::provision::desired_set(
+        crystalline_core::HarnessKind::ClaudeCode,
+        std::slice::from_ref(&artifacts),
+    );
+
+    let key = "skills/tide-tables/SKILL.md";
+    assert!(
+        desired.files.contains_key(key),
+        "desired set should carry the mirrored skill: {:?}",
+        desired.files.keys().collect::<Vec<_>>()
+    );
+    let source = desired.files[key]
+        .source_path()
+        .expect("a passthrough skill keeps its source path");
+    assert!(
+        source.starts_with(&mirror_skills),
+        "the winning source should be the mirror: {source:?}"
+    );
+
+    // Keep the scratch directories alive until every assertion has run.
+    drop(home);
+    drop(work);
+}

@@ -70,7 +70,7 @@ async fn engine_with(
 
 /// The same wiring as [`engine_with`], but the domains come from an
 /// environment overlay rather than a prior `origin_add`, so a poll tick can be
-/// proven to provision a never-connected env-origin domain end to end.
+/// proven to bootstrap a never-connected env-origin domain end to end.
 async fn engine_with_env(
     config_path: &Path,
     origins_dir: &Path,
@@ -194,7 +194,7 @@ async fn poller_applies_an_upstream_edit_without_a_user_call() {
 }
 
 #[tokio::test]
-async fn a_poll_tick_provisions_a_due_env_origin_domain() {
+async fn a_poll_tick_bootstraps_a_due_env_origin_domain() {
     let tmp = tempfile::tempdir().unwrap();
     let mock = Arc::new(MockProvider::new());
     let c1 = mock.add_commit(commit_files(&[
@@ -224,16 +224,16 @@ async fn a_poll_tick_provisions_a_due_env_origin_domain() {
     // first tick; no `origin_add` and no `origin_update` were ever called.
     eng.origin_poll_tick(Instant::now(), Utc::now()).await;
 
-    // Provisioned end to end: files on disk and origin state written.
+    // Bootstrapped end to end: files on disk and origin state written.
     assert!(root.join("notes/alpha.md").exists());
     assert!(
         OriginState::load(&origins_dir.join("team"))
             .unwrap()
             .is_some(),
-        "the poll tick provisioned the env domain"
+        "the poll tick bootstrapped the env domain"
     );
 
-    // The poller recorded the provisioning as an applied outcome.
+    // The poller recorded the bootstrap as an applied outcome.
     let status = eng.status_report().await.unwrap();
     let domains = status["origins"]["domains"].as_array().unwrap();
     assert_eq!(domains.len(), 1);
@@ -274,7 +274,7 @@ async fn a_poll_tick_proceeds_with_an_env_token_and_no_saved_token_file() {
 
     assert!(
         root.join("notes/alpha.md").exists(),
-        "the tick provisioned the domain, proving it did not skip for lack of a connection"
+        "the tick bootstrapped the domain, proving it did not skip for lack of a connection"
     );
 
     let status = eng.status_report().await.unwrap();

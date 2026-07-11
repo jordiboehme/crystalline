@@ -233,6 +233,31 @@ Claude Desktop: download `crystalline-claude-desktop-skill-v<version>.zip` from 
 
 Other harnesses that support a similar skill or instruction-file convention can point at the same folders directly; the content only assumes the MCP tools documented in [Teach and learn](#teach-and-learn), never a specific harness.
 
+## Ship tools with a domain
+
+Teaching an agent what a domain knows is half the story - the other half is the working tools that knowledge depends on to act on it: skills, slash commands, subagent definitions and MCP server configs. A domain's `MANIFEST.md` can declare a `## Provisioning` section naming the folders it ships, one bullet per kind:
+
+```
+## Provisioning
+
+- skills: skills
+- commands: commands
+- agents: agents
+- mcps: mcps
+```
+
+Each bullet is `type: path`, one of `skills`, `commands`, `agents` or `mcps` (a folder of JSON configs for `mcps`); `path` is relative to the MANIFEST itself and may climb out of the domain root with `../` to point at a folder that lives beside it. The starter MANIFEST `crystalline domain init` scaffolds does not include this section - add it by hand once a domain actually ships something. Every artifact is authored once and translated into whichever harnesses' formats allow it, a markdown agent becoming Codex's TOML dialect and back again.
+
+Nothing ships until a person decides to: an undecided domain surfaces at session start so the agent can raise it with the person at the keyboard, then applies the answer with the `provision` MCP tool or from the terminal:
+
+```sh
+crystalline provision allow engineering   # opt in, then reconcile
+crystalline provision deny engineering    # opt out, removing anything already shipped
+crystalline provision status              # every domain's decision, every harness's installed state
+```
+
+Bare `crystalline provision` reconciles every opted-in domain into every harness this machine has onboarded. It is idempotent and safe to rerun - installing what is missing, updating what changed and retiring what a domain no longer ships. A provisioned file you edited by hand is still brought current on the next reconcile, with your edited version kept beside it as a `.bak` copy rather than lost; a foreign file Crystalline never wrote is adopted when it already matches byte for byte and otherwise left untouched, never overwritten.
+
 ## Share knowledge with a team
 
 A team domain is an ordinary domain whose files also live in a GitHub repository: local markdown stays the source of truth on this machine, and an origin records which repository, subfolder and branch it tracks.
@@ -299,7 +324,7 @@ The action ref (`@v0.6.0`) pins the action's own code; `version` pins the crysta
 Two more commands keep a knowledge base trustworthy:
 
 - **`crystalline import <src> --domain <name>`** brings an existing markdown-plus-frontmatter knowledge base under Crystalline: normalizes legacy `type` values, backfills `status` and temporal metadata, drops sentinel far-future dates in favor of leaving the field open-ended, and adds a missing `timestamp` - all as a pure file transformation, with `--dry-run` to preview first.
-- **`crystalline doctor`** diagnoses the index, registered domains and service state (orphan index rows, encoding issues, stale service locks) and repairs what it safely can with `--fix`. Once team domains are turned on it also reports whether this machine is connected to GitHub and whether each team domain's local origin state is intact; that part is always report-only, `--fix` never touches origin state.
+- **`crystalline doctor`** diagnoses the index, registered domains and service state (orphan index rows, encoding issues, stale service locks) and repairs what it safely can with `--fix`. Once team domains are turned on it also reports whether this machine is connected to GitHub and whether each team domain's local origin state is intact. When a domain ships provisioned artifacts, it reports every declaring domain's decision and shipped counts and every installed harness's drift, locally edited and orphaned counts against what was last reconciled - that part, like the GitHub checks, is always report-only, `--fix` never reconciles a harness.
 
 ## Deployment
 

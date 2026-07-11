@@ -1,7 +1,7 @@
 //! In-process rmcp duplex tests over the real tool router.
 //!
 //! A `tokio::io::duplex` pair connects an rmcp client to the `McpServer` in the
-//! same process, driving the 12 tools through the actual JSON-RPC path. The
+//! same process, driving the tools through the actual JSON-RPC path. The
 //! engine shares an in-memory store; domains are real temp directories because
 //! files are the source of truth.
 
@@ -16,6 +16,11 @@ use rmcp::model::CallToolRequestParams;
 use rmcp::service::{Peer, RunningService};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
+
+#[cfg(unix)]
+use std::ffi::OsString;
+#[cfg(unix)]
+use std::path::Path;
 
 struct Harness {
     _tmp: tempfile::TempDir,
@@ -1061,4 +1066,419 @@ async fn annotation_hints_line_up_with_the_gating() {
             "{name} is visible read-only but is neither a read tool nor update_domain"
         );
     }
+}
+
+// --- provision: declaration gating -------------------------------------------
+
+/// Overwrites `domain`'s MANIFEST.md under `root` (a `Harness`'s domain root)
+/// so it declares a `## Provisioning` section - `Harness::build`'s own
+/// template never does, so the gating tests below need this to flip a domain
+/// from undeclared to declared.
+fn declare_provisioning(root: &std::path::Path, domain: &str) {
+    std::fs::write(
+        root.join(domain).join("MANIFEST.md"),
+        format!(
+            "---\ntype: manifest\ntitle: {domain}\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n\
+             # {domain}\n\n\
+             ## Scope\n\n- Everything about {domain}\n\n\
+             ## When to Use\n\n- Route here for {domain} questions\n\n\
+             ## Provisioning\n\n- skills: skills\n"
+        ),
+    )
+    .unwrap();
+}
+
+/// A domain with no `Provisioning` section never surfaces the tool.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provision_tool_hidden_when_no_domain_declares() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let tools = client.peer().list_tools(Default::default()).await.unwrap();
+    assert!(
+        !tools.tools.iter().any(|t| t.name == "provision"),
+        "provision must be hidden when no domain declares a Provisioning section: {:?}",
+        tools.tools.iter().map(|t| &t.name).collect::<Vec<_>>()
+    );
+}
+
+/// Once a domain's MANIFEST declares a `Provisioning` section, the tool shows
+/// up in both `list_tools` and `get_tool`, the two enforcement points.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provision_tool_visible_once_a_domain_declares() {
+    use rmcp::ServerHandler;
+
+    let h = Harness::new(&["harbor"]).await;
+    declare_provisioning(&h.root, "harbor");
+
+    let (client, _server) = h.connect().await;
+    let tools = client.peer().list_tools(Default::default()).await.unwrap();
+    assert!(
+        tools.tools.iter().any(|t| t.name == "provision"),
+        "provision must be visible once harbor declares: {:?}",
+        tools.tools.iter().map(|t| &t.name).collect::<Vec<_>>()
+    );
+
+    let server = McpServer::new(h.engine.clone());
+    let tool = server
+        .get_tool("provision")
+        .expect("get_tool must agree with list_tools");
+
+    // The annotation row `EXPECTED_ANNOTATIONS` cannot carry (its fixture has
+    // no declaring domain, so the tool is hidden there): destructive because
+    // deny removes installed artifacts, idempotent because re-running any
+    // action reconciles to the same state, closed-world because everything
+    // happens on this machine.
+    assert_eq!(tool.title.as_deref(), Some("Provision harness artifacts"));
+    let ann = tool.annotations.as_ref().expect("annotations present");
+    assert_eq!(ann.read_only_hint, Some(false));
+    assert_eq!(ann.destructive_hint, Some(true));
+    assert_eq!(ann.idempotent_hint, Some(true));
+    assert_eq!(ann.open_world_hint, Some(false));
+}
+
+/// A declared domain still hides `provision` on a read-only instance, at both
+/// enforcement points.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provision_tool_hidden_in_read_only() {
+    use rmcp::ServerHandler;
+
+    let h = Harness::new_read_only(&["harbor"]).await;
+    declare_provisioning(&h.root, "harbor");
+
+    let (client, _server) = h.connect().await;
+    let tools = client.peer().list_tools(Default::default()).await.unwrap();
+    assert!(
+        !tools.tools.iter().any(|t| t.name == "provision"),
+        "provision must be hidden read-only even though harbor declares: {:?}",
+        tools.tools.iter().map(|t| &t.name).collect::<Vec<_>>()
+    );
+
+    let server = McpServer::new(h.engine.clone());
+    assert!(
+        server.get_tool("provision").is_none(),
+        "get_tool must agree with list_tools"
+    );
+}
+
+// --- provision: HOME/XDG_STATE_HOME redirection (unix only) -----------------
+//
+// `Engine::provision` always resolves `install_receipt_path`/`receipt_path`
+// (and a harness's artifact base) from `HOME`/`XDG_STATE_HOME`, even for a
+// bare `status` call - see `crates/service/tests/provision.rs`'s own note,
+// the engine-level sibling of the tests below. Every test that calls the
+// `provision` tool redirects them to a scratch directory first, restoring
+// the surrounding environment on drop.
+
+/// Serializes every HOME/XDG_STATE_HOME-mutating test in this binary. A
+/// tokio mutex, not `std::sync::Mutex`: the guard below is held across
+/// `.await` points in the async tests, which clippy's `await_holding_lock`
+/// flags for a std lock (the same reason `tests/provision.rs` uses one).
+#[cfg(unix)]
+static PROVISION_ENV_LOCK: Mutex<()> = Mutex::const_new(());
+
+/// Points `HOME`/`XDG_STATE_HOME` at scratch directories for the duration of
+/// one test, restoring whatever the surrounding environment had on drop.
+#[cfg(unix)]
+struct ProvisionScratchEnv {
+    previous: (Option<OsString>, Option<OsString>),
+    _guard: tokio::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(unix)]
+impl ProvisionScratchEnv {
+    async fn new(home: &Path, xdg_state_home: &Path) -> ProvisionScratchEnv {
+        let guard = PROVISION_ENV_LOCK.lock().await;
+        let previous = (std::env::var_os("HOME"), std::env::var_os("XDG_STATE_HOME"));
+        // SAFETY: guarded by PROVISION_ENV_LOCK, restored on drop.
+        unsafe {
+            std::env::set_var("HOME", home);
+            std::env::set_var("XDG_STATE_HOME", xdg_state_home);
+        }
+        ProvisionScratchEnv {
+            previous,
+            _guard: guard,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ProvisionScratchEnv {
+    fn drop(&mut self) {
+        match &self.previous.0 {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        match &self.previous.1 {
+            Some(v) => unsafe { std::env::set_var("XDG_STATE_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_STATE_HOME") },
+        }
+    }
+}
+
+/// A harbor-shaped MANIFEST declaring one skill (no mcps - this suite never
+/// wants a real harness CLI on `PATH`), mirroring `tests/provision.rs`'s own
+/// `write_harbor` fixture.
+#[cfg(unix)]
+fn write_provision_harbor(dir: &Path) {
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(
+        dir.join("MANIFEST.md"),
+        "---\ntype: manifest\ntitle: harbor\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n\
+         # harbor\n\n\
+         ## Scope\n\n- Coastal navigation knowledge\n\n\
+         ## When to Use\n\n- When docking\n\n\
+         ## Provisioning\n\n- skills: skills\n",
+    )
+    .unwrap();
+    let skill = dir.join("skills/tide-tables/SKILL.md");
+    std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+    std::fs::write(
+        skill,
+        "---\nname: tide-tables\n---\n\nReads the harbor's tide tables.\n",
+    )
+    .unwrap();
+}
+
+/// Marks claude-code onboarded in the install receipt this test's isolated
+/// `XDG_STATE_HOME` resolves to, so `Engine::provision` finds a harness to
+/// reconcile into.
+#[cfg(unix)]
+fn write_provision_install_receipt(xdg_state_home: &Path) {
+    let path = xdg_state_home.join("crystalline").join("installs.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&json!({
+            "format": 1,
+            "installs": [
+                {
+                    "harness": "claude-code",
+                    "scope": "user",
+                    "version": "0.0.0",
+                    "parts": { "mcp": true, "hooks": true, "skills": true },
+                    "skills": []
+                }
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+/// `allow` records the decision on the config file this engine owns and
+/// reconciles a skill into the isolated `HOME`, then `status` reports the
+/// decision back.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provision_allow_then_status_flow() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let xdg_state_home = work.path().join("state");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&xdg_state_home).unwrap();
+    let _env = ProvisionScratchEnv::new(&home, &xdg_state_home).await;
+
+    let harbor_dir = work.path().join("kb-harbor");
+    write_provision_harbor(&harbor_dir);
+    write_provision_install_receipt(&xdg_state_home);
+
+    let mut cfg = GlobalConfig::default();
+    cfg.domains
+        .insert("harbor".to_string(), DomainEntry::file(harbor_dir));
+    let config_path = work.path().join("config.yaml");
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let engine = Arc::new(Engine::new(
+        Arc::new(Mutex::new(store)),
+        cfg,
+        None,
+        Some(config_path.clone()),
+    ));
+    assert!(engine.provisioning_declared());
+
+    let (client_io, server_io) = tokio::io::duplex(1 << 16);
+    let server_engine = engine.clone();
+    let server_task =
+        tokio::spawn(
+            async move { rmcp::serve_server(McpServer::new(server_engine), server_io).await },
+        );
+    let client = rmcp::serve_client((), client_io).await.unwrap();
+    let server = server_task.await.unwrap().unwrap();
+    let peer = client.peer();
+
+    let allow = call(
+        peer,
+        "provision",
+        json!({"action": "allow", "domain": "harbor"}),
+    )
+    .await
+    .unwrap();
+    let harnesses = allow["harnesses"].as_array().unwrap();
+    assert_eq!(harnesses.len(), 1, "{allow}");
+    assert_eq!(harnesses[0]["harness"], "claude-code");
+    let actions = harnesses[0]["actions"].as_array().unwrap();
+    assert!(
+        actions.iter().any(|a| a["status"] == "installed"),
+        "{allow}"
+    );
+
+    // The decision landed on the config file this engine owns, not just in
+    // memory.
+    let saved: GlobalConfig = crystalline_core::config::load_yaml(&config_path).unwrap();
+    assert_eq!(saved.domains["harbor"].provision, Some(true));
+
+    // The files actually landed under the isolated HOME.
+    assert!(home.join(".claude/skills/tide-tables/SKILL.md").exists());
+
+    let status = call(peer, "provision", json!({"action": "status"}))
+        .await
+        .unwrap();
+    let domains = status["domains"].as_array().unwrap();
+    assert_eq!(domains.len(), 1, "{status}");
+    assert_eq!(domains[0]["domain"], "harbor");
+    assert_eq!(domains[0]["decision"], "allowed");
+    assert!(
+        status["pending"].as_array().unwrap().is_empty(),
+        "harbor is decided, not pending: {status}"
+    );
+
+    drop(client);
+    drop(server);
+}
+
+/// Calling `provision` by name while it is hidden still reaches the engine:
+/// `status` with no declaring domain answers for real (an empty report), not
+/// "tool not found", and `allow` on a read-only instance gets the read-only
+/// refusal rather than a bare not-found error.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provision_call_by_name_while_hidden_reaches_engine() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let xdg_state_home = work.path().join("state");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&xdg_state_home).unwrap();
+    let _env = ProvisionScratchEnv::new(&home, &xdg_state_home).await;
+
+    // No declaring domain at all: the tool is absent from list_tools, but a
+    // direct call by name still reaches the engine.
+    let h = Harness::new(&[]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    let tools = peer.list_tools(Default::default()).await.unwrap();
+    assert!(
+        !tools.tools.iter().any(|t| t.name == "provision"),
+        "provision must be hidden with no declaring domain"
+    );
+
+    let status = call(peer, "provision", json!({"action": "status"}))
+        .await
+        .unwrap();
+    assert!(status["domains"].as_array().unwrap().is_empty(), "{status}");
+    assert!(
+        status["harnesses"].as_array().unwrap().is_empty(),
+        "{status}"
+    );
+    assert!(status["pending"].as_array().unwrap().is_empty(), "{status}");
+
+    // Read-only + allow by name: the read-only refusal, not "tool not found".
+    let ro = Harness::new_read_only(&["eng"]).await;
+    let (ro_client, _ro_server) = ro.connect().await;
+    let ro_peer = ro_client.peer();
+    let err = call(
+        ro_peer,
+        "provision",
+        json!({"action": "allow", "domain": "eng"}),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("read-only"), "{err}");
+}
+
+// --- provision: tools/list_changed on a declaration flip ---------------------
+
+/// A client handler that records whether it ever received
+/// `notifications/tools/list_changed`, mirroring
+/// `tests/mcp_collab.rs`'s `NotifyClient` for the `configure` flip.
+#[derive(Clone, Default)]
+struct ProvisionNotifyClient {
+    got_list_changed: Arc<tokio::sync::Notify>,
+}
+
+impl rmcp::ClientHandler for ProvisionNotifyClient {
+    fn on_tool_list_changed(
+        &self,
+        _context: rmcp::service::NotificationContext<RoleClient>,
+    ) -> impl std::future::Future<Output = ()> + Send + '_ {
+        let notify = self.got_list_changed.clone();
+        async move {
+            notify.notify_one();
+        }
+    }
+}
+
+/// `add_domain` adopting a folder whose MANIFEST already declares a
+/// `Provisioning` section flips `provisioning_declared` from false to true,
+/// which must push a `tools/list_changed` notification the same way
+/// `configure` does for `github.enabled`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn add_domain_flip_notifies_tool_list_changed() {
+    let tmp = tempfile::tempdir().unwrap();
+    // A real tempdir config path, never the developer's actual global config:
+    // `add_domain` persists a freshly registered domain through it.
+    let config_path = tmp.path().join("config.yaml");
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let engine = Arc::new(Engine::new(
+        Arc::new(Mutex::new(store)),
+        GlobalConfig::default(),
+        None,
+        Some(config_path),
+    ));
+    assert!(!engine.provisioning_declared());
+
+    let (client_io, server_io) = tokio::io::duplex(1 << 16);
+    let server_engine = engine.clone();
+    let server_task =
+        tokio::spawn(
+            async move { rmcp::serve_server(McpServer::new(server_engine), server_io).await },
+        );
+    let handler = ProvisionNotifyClient::default();
+    let client = rmcp::serve_client(handler.clone(), client_io)
+        .await
+        .unwrap();
+    let _server = server_task.await.unwrap().unwrap();
+    let peer = client.peer();
+
+    // A folder whose MANIFEST already declares a Provisioning section: adding
+    // it as a domain adopts it in place and flips provisioning_declared.
+    let dir = tmp.path().join("harbor");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("MANIFEST.md"),
+        "---\ntype: manifest\ntitle: harbor\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n\
+         # harbor\n\n\
+         ## Scope\n\n- Coastal navigation knowledge\n\n\
+         ## When to Use\n\n- When docking\n\n\
+         ## Provisioning\n\n- skills: skills\n",
+    )
+    .unwrap();
+
+    call(
+        peer,
+        "add_domain",
+        json!({"domain": "harbor", "folder": dir.to_string_lossy()}),
+    )
+    .await
+    .unwrap();
+
+    assert!(engine.provisioning_declared());
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        handler.got_list_changed.notified(),
+    )
+    .await
+    .expect(
+        "expected a tools/list_changed notification after add_domain flipped provisioning_declared",
+    );
 }

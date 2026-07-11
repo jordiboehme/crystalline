@@ -100,13 +100,23 @@ pub async fn sync_domain_with<S: Store + ?Sized>(
         .await?;
     let existing = store.file_stamps(domain).await?;
 
+    // Folders the MANIFEST provisions from inside this root hold deployable
+    // artifacts, not engrams, so they are pruned from the walk. Empty whenever
+    // the MANIFEST is absent or unparseable, so nothing is excluded then.
+    let excluded = crystalline_core::in_root_artifact_dirs(root);
+
     // Walk the folder, skipping dot-directories, dot-files and non-markdown.
     let mut current: HashMap<String, Scanned> = HashMap::new();
     for entry in WalkDir::new(root)
         .into_iter()
         // Prune dot-directories and dot-files, but never the walk root itself
-        // (a temp or dotted root would otherwise prune the whole tree).
-        .filter_entry(|e| e.depth() == 0 || !is_hidden(e.file_name().to_string_lossy().as_ref()))
+        // (a temp or dotted root would otherwise prune the whole tree), and
+        // prune the provisioned artifact folders wholesale.
+        .filter_entry(|e| {
+            e.depth() == 0
+                || (!is_hidden(e.file_name().to_string_lossy().as_ref())
+                    && !is_excluded(e.path(), &excluded))
+        })
     {
         let entry = match entry {
             Ok(e) => e,
@@ -405,6 +415,11 @@ enum ParseOutcome {
 
 fn is_hidden(name: &str) -> bool {
     name.starts_with('.') && name != "." && name != ".."
+}
+
+/// Whether `path` is one of the excluded artifact folders or lives inside one.
+fn is_excluded(path: &Path, excluded: &[PathBuf]) -> bool {
+    excluded.iter().any(|dir| path.starts_with(dir))
 }
 
 fn rel_path(root: &Path, path: &Path) -> String {

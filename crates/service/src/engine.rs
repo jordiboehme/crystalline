@@ -1,6 +1,6 @@
 //! The shared service engine.
 //!
-//! Every data operation (the 12 MCP tools, the CLI data commands and the ctl
+//! Every data operation (the MCP tools, the CLI data commands and the ctl
 //! sync and reindex) runs through one [`Engine`]. It owns a single boxed
 //! [`Store`] (`dyn Store`) behind a [`tokio::sync::Mutex`] so the backend's
 //! single-connection model is honoured across the daemon's many tasks, the
@@ -28,7 +28,7 @@ use crystalline_core::emit::{
 };
 use crystalline_core::schema::{self, Schema};
 use crystalline_core::{
-    CrystallineUrl, Engram, Frontmatter, Manifest, YamlValue, parse_engram, slugify,
+    CrystallineUrl, Engram, Frontmatter, HarnessKind, Manifest, YamlValue, parse_engram, slugify,
 };
 use crystalline_index::{
     ChunkParams, DomainHost, DomainId, DomainKind, EmbeddingProvider, EngramDescriptor, EngramId,
@@ -2664,6 +2664,127 @@ impl Engine {
         })
     }
 
+    // --- provision ---------------------------------------------------------
+
+    /// Whether any registered domain currently declares a `## Provisioning`
+    /// section in its MANIFEST, the gate for the `provision` MCP tool's
+    /// visibility: a fresh install with no such domain never sees the tool at
+    /// all, zero context cost. Wraps
+    /// [`crystalline_core::provision::any_domain_declares`] against the live
+    /// effective config, read fresh off the config lock on every call rather
+    /// than cached - the same cost class as `routing_text`, since a domain's
+    /// MANIFEST can gain or lose a `Provisioning` section between calls (a
+    /// freshly added domain, or an `update_domain` pull) and the very next
+    /// `list_tools` must reflect that.
+    pub fn provisioning_declared(&self) -> bool {
+        crystalline_core::provision::any_domain_declares(&self.config())
+    }
+
+    /// Apply, inspect or record a decision for domain-declared artifact
+    /// provisioning (the skills, commands, agents and MCP servers a domain's
+    /// `## Provisioning` section ships into a harness's own config
+    /// directory). [`ProvisionAction::Status`] reports every domain's
+    /// decision and every installed harness's counts, writing nothing -
+    /// always allowed, even on a read-only instance, mirroring
+    /// `configure`'s `Show`. [`ProvisionAction::Allow`] and
+    /// [`ProvisionAction::Deny`] record one domain's decision (the same
+    /// file-config write-lock-first discipline as `configure`'s `Set`, see
+    /// [`Engine::configure`]) and then reconcile; [`ProvisionAction::Apply`]
+    /// reconciles without changing any decision. All three refuse with
+    /// `EngineError::ReadOnly` on a read-only instance.
+    ///
+    /// The harnesses reconciled into always come from this machine's install
+    /// receipt (`crystalline install`'s own memory of which harnesses are
+    /// onboarded), never a caller-supplied list: provisioning targets every
+    /// harness this machine has actually wired up.
+    pub async fn provision(&self, action: &ProvisionAction) -> Result<Value> {
+        let install_receipt = crystalline_core::provision::install_receipt_path()
+            .map_err(|e| EngineError::Internal(e.to_string()))?;
+        let harnesses = crystalline_core::provision::installed_harnesses(&install_receipt);
+        let receipt_path = crystalline_core::provision::receipt_path()
+            .map_err(|e| EngineError::Internal(e.to_string()))?;
+
+        let env_domains: HashSet<&str> = self
+            .overlay
+            .env_domains()
+            .map(|(name, _)| name.as_str())
+            .collect();
+
+        match action {
+            ProvisionAction::Status => {
+                let config = self.config.read().unwrap().clone();
+                let report = crystalline_core::provision::status(
+                    &config,
+                    &receipt_path,
+                    &harnesses,
+                    &env_domains,
+                )
+                .map_err(|e| EngineError::Internal(e.to_string()))?;
+                Ok(status_report_json(&report))
+            }
+            ProvisionAction::Allow { domain } | ProvisionAction::Deny { domain } => {
+                if self.read_only {
+                    return Err(EngineError::ReadOnly);
+                }
+                // An env-defined domain's source of truth is its variable: the
+                // overlay re-inserts a fresh entry (provision unset) on every
+                // effective-config recompute, so a decision written to the
+                // file would be silently discarded. Checked before the
+                // registered-domain lookup so a shadowed and an env-only name
+                // both get the env message, mirroring `origin_add`.
+                if let Some(env) = self.overlay.env_domain(domain) {
+                    return Err(EngineError::Conflict(format!(
+                        "domain '{domain}' is defined by the environment variable {}; unset it to manage this domain in the config file",
+                        env.var
+                    )));
+                }
+                let allow = matches!(action, ProvisionAction::Allow { .. });
+                // Take the file-config write lock first, the same discipline
+                // `configure`'s Set uses: serialize against a concurrent
+                // decision, mutate a clone, persist, then swap both configs
+                // in. Lock order is always file_config then config.
+                {
+                    let mut file_guard = self.file_config.write().unwrap();
+                    let mut file = file_guard.clone();
+                    set_domain_provision_decision(&mut file, domain, allow)?;
+                    self.persist_config(&file)?;
+                    let effective = self.overlay.apply(&file);
+                    *file_guard = file;
+                    *self.config.write().unwrap() = effective;
+                }
+                self.run_provision_apply(&receipt_path, &harnesses)
+            }
+            ProvisionAction::Apply => {
+                if self.read_only {
+                    return Err(EngineError::ReadOnly);
+                }
+                self.run_provision_apply(&receipt_path, &harnesses)
+            }
+        }
+    }
+
+    /// Reconcile every opted-in domain's declared artifacts into `harnesses`
+    /// through the real system MCP runner - the shared tail of
+    /// `provision`'s `Allow`, `Deny` and `Apply` arms.
+    fn run_provision_apply(&self, receipt_path: &Path, harnesses: &[HarnessKind]) -> Result<Value> {
+        let config = self.config.read().unwrap().clone();
+        let mut mcp = crate::harness_cli::SystemMcpRunner;
+        let env_domains: HashSet<&str> = self
+            .overlay
+            .env_domains()
+            .map(|(name, _)| name.as_str())
+            .collect();
+        let report = crystalline_core::provision::apply(
+            &config,
+            receipt_path,
+            harnesses,
+            &mut mcp,
+            &env_domains,
+        )
+        .map_err(|e| EngineError::Internal(e.to_string()))?;
+        Ok(apply_report_json(&report))
+    }
+
     // --- domain add (local and virtual) ---------------------------------------
 
     /// Create or adopt a local file domain and bring it into the index, the
@@ -2975,6 +3096,7 @@ impl Engine {
                         branch: branch.map(str::to_string),
                         poll_secs: None,
                     }),
+                    provision: None,
                 },
             );
             self.persist_config(&file)?;
@@ -3041,11 +3163,11 @@ impl Engine {
 
         let (spec, root, state_dir) = self.origin_spec_for(name, entry)?;
 
-        // An env-defined team domain with no origin state yet provisions itself
+        // An env-defined team domain with no origin state yet bootstraps itself
         // on first contact: the zero-config read-only node's first pull is a
         // subscribe, not an update. This is gated on the domain being
         // env-defined so a non-env domain with missing state still fails exactly
-        // as before (it was never fully connected). Provisioning is a
+        // as before (it was never fully connected). Bootstrapping is a
         // derived-truth pull, so it is allowed on a read-only instance. The
         // env check comes first so ordinary domains skip the state read on
         // every poll tick.
@@ -3056,7 +3178,7 @@ impl Engine {
                 .is_none()
         {
             return self
-                .provision_env_origin(name, &spec, &root, &state_dir)
+                .bootstrap_env_origin(name, &spec, &root, &state_dir)
                 .await;
         }
 
@@ -3083,16 +3205,16 @@ impl Engine {
         Ok(origin::pull_report_json(name, &report, proposals))
     }
 
-    /// Provisions an env-defined team domain on its first contact with GitHub:
+    /// Bootstraps an env-defined team domain on its first contact with GitHub:
     /// creates the root, runs the same [`ops::subscribe`] `origin_add` uses
     /// (minus the config write, since an env domain is never persisted), then
     /// syncs and best-effort embeds. Called under the domain's origin lock by
     /// [`Engine::origin_update_one`]. The report is shaped like a normal update
     /// (`up_to_date`, `applied`, `merged`, `conflicts`, `proposals`) so
     /// `print_origin_update` and the poller's outcome handling keep working
-    /// unchanged, plus `provisioned: true` and the subscribe facts (`engrams`,
-    /// `base_commit`) a provisioned line reads from.
-    async fn provision_env_origin(
+    /// unchanged, plus `bootstrapped: true` and the subscribe facts (`engrams`,
+    /// `base_commit`) a bootstrapped line reads from.
+    async fn bootstrap_env_origin(
         &self,
         name: &str,
         spec: &OriginSpec,
@@ -3114,19 +3236,19 @@ impl Engine {
             .inspect_err(|e| self.drop_github_credential_on_auth(e))?;
 
         // Tell a running daemon's watcher to start watching the freshly
-        // provisioned root, the same signal `origin_add` sends.
+        // bootstrapped root, the same signal `origin_add` sends.
         if let Some(tx) = &self.watch_tx {
             let _ = tx.send(WatchEvent::Add(name.to_string(), root.to_path_buf()));
         }
 
         self.sync(Some(name)).await?;
         if let Err(e) = self.embed_pending().await {
-            tracing::warn!("embedding after provisioning '{name}' failed: {e}");
+            tracing::warn!("embedding after bootstrapping '{name}' failed: {e}");
         }
 
         Ok(json!({
             "domain": name,
-            "provisioned": true,
+            "bootstrapped": true,
             "up_to_date": false,
             "applied": [],
             "merged": [],
@@ -3139,16 +3261,16 @@ impl Engine {
         }))
     }
 
-    /// Self-provisions every env-defined team domain that carries an origin but
+    /// Bootstraps every env-defined team domain that carries an origin but
     /// has no local origin state yet, bringing each up through
-    /// [`Engine::origin_update_one`] so provisioning and a plain background
+    /// [`Engine::origin_update_one`] so bootstrapping and a plain background
     /// pull stay exactly one code path. Called once from the daemon's startup
     /// task. A missing GitHub connection is not a failure - the background
     /// poller retries the moment a connection lands - so `NotConnected` only
     /// logs an info line; any other per-domain error is logged and never
     /// aborts startup. When env-origin domains exist while collaboration is
     /// off, one warning tells the operator to turn it on.
-    pub async fn provision_env_origins(&self) {
+    pub async fn bootstrap_env_origins(&self) {
         let targets: Vec<(String, DomainEntry)> = self
             .overlay
             .env_domains()
@@ -3160,7 +3282,7 @@ impl Engine {
         }
         if !self.config.read().unwrap().github_enabled() {
             tracing::warn!(
-                "env-defined team domains are configured but GitHub collaboration is off; set CRYSTALLINE_GITHUB_ENABLED=true to let them provision"
+                "env-defined team domains are configured but GitHub collaboration is off; set CRYSTALLINE_GITHUB_ENABLED=true to let them bootstrap"
             );
             return;
         }
@@ -3169,7 +3291,7 @@ impl Engine {
             let Ok(state_dir) = self.origin_state_dir(&name) else {
                 continue;
             };
-            // Already provisioned in an earlier run: nothing to do here, the
+            // Already bootstrapped in an earlier run: nothing to do here, the
             // poller keeps it up to date from now on.
             let has_state = crystalline_remote::state::OriginState::load(&state_dir)
                 .ok()
@@ -3181,7 +3303,7 @@ impl Engine {
             match self.origin_update_one(&name, &entry).await {
                 Ok(v) => {
                     tracing::info!(
-                        "provisioned env-defined team domain '{name}' ({} engram(s) at {})",
+                        "bootstrapped env-defined team domain '{name}' ({} engram(s) at {})",
                         v["engrams"].as_u64().unwrap_or(0),
                         v["base_commit"].as_str().unwrap_or("")
                     );
@@ -3192,7 +3314,7 @@ impl Engine {
                     );
                 }
                 Err(e) => {
-                    tracing::warn!("could not provision env-defined team domain '{name}': {e}");
+                    tracing::warn!("could not bootstrap env-defined team domain '{name}': {e}");
                 }
             }
         }
@@ -3363,9 +3485,9 @@ impl Engine {
                             format!("#{number} {status}")
                         })
                         .collect();
-                    if v["provisioned"].as_bool().unwrap_or(false) {
+                    if v["bootstrapped"].as_bool().unwrap_or(false) {
                         tracing::info!(
-                            "origin poll: provisioned '{name}' ({} engram(s))",
+                            "origin poll: bootstrapped '{name}' ({} engram(s))",
                             v["engrams"].as_u64().unwrap_or(0)
                         );
                     } else if !conflict_paths.is_empty() {
@@ -4207,6 +4329,156 @@ impl From<settings::SettingsError> for EngineError {
     fn from(e: settings::SettingsError) -> Self {
         EngineError::Invalid(e.to_string())
     }
+}
+
+/// The requested provisioning action for [`Engine::provision`], mirroring
+/// the ctl `provision` command's `action` field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProvisionAction {
+    /// Report every domain's decision and every installed harness's counts,
+    /// writing nothing.
+    Status,
+    /// Opt `domain` in (`provision: true`), then reconcile.
+    Allow {
+        /// The domain to opt in.
+        domain: String,
+    },
+    /// Opt `domain` out (`provision: false`), then reconcile - this removes
+    /// any artifacts it previously shipped.
+    Deny {
+        /// The domain to opt out.
+        domain: String,
+    },
+    /// Reconcile every already opted-in domain's artifacts, without
+    /// changing any decision.
+    Apply,
+}
+
+/// Record `name`'s provisioning decision (`provision: true` for `allow`,
+/// `provision: false` otherwise) directly on `file`. The one seam
+/// [`Engine::provision`]'s daemon path and `client::provision`'s static
+/// fallback both mutate a config through, so the two can never diverge on
+/// what counts as "unregistered" or "virtual". Errors with
+/// [`EngineError::UnknownDomain`] naming every domain `file` does carry when
+/// `name` is not one of them, and with [`EngineError::Invalid`] when `name`
+/// is a virtual domain - it has no filesystem root to ship artifacts from,
+/// so no decision is recorded.
+pub(crate) fn set_domain_provision_decision(
+    file: &mut GlobalConfig,
+    name: &str,
+    allow: bool,
+) -> Result<()> {
+    let Some(entry) = file.domains.get(name) else {
+        return Err(EngineError::UnknownDomain {
+            domain: name.to_string(),
+            registered: file.domains.keys().cloned().collect(),
+        });
+    };
+    if entry.is_virtual() {
+        return Err(EngineError::Invalid(format!(
+            "domain '{name}' is virtual; virtual domains have no files to provision, so no decision was recorded"
+        )));
+    }
+    file.domains.get_mut(name).unwrap().provision = Some(allow);
+    Ok(())
+}
+
+/// Serialize an [`crystalline_core::provision::ApplyReport`] into the JSON
+/// shape both `Engine::provision`'s daemon path and `client::provision`'s
+/// static fallback return, since neither the report nor its nested types
+/// derive `Serialize` (the format crate keeps that derive off types whose
+/// JSON shape a caller-facing envelope, not a Rust API, should own).
+pub(crate) fn apply_report_json(report: &crystalline_core::provision::ApplyReport) -> Value {
+    let harnesses: Vec<Value> = report
+        .harnesses
+        .iter()
+        .map(|(harness, actions)| {
+            json!({
+                "harness": harness.id(),
+                "actions": actions.iter().map(artifact_action_json).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    json!({
+        "harnesses": harnesses,
+        "notices": report.notices,
+        "pending": report.pending.iter().map(pending_domain_json).collect::<Vec<_>>(),
+    })
+}
+
+/// Serialize a [`crystalline_core::provision::StatusReport`] into JSON, the
+/// read-only sibling of [`apply_report_json`].
+pub(crate) fn status_report_json(report: &crystalline_core::provision::StatusReport) -> Value {
+    json!({
+        "domains": report.domains.iter().map(domain_status_json).collect::<Vec<_>>(),
+        "harnesses": report.harnesses.iter().map(harness_status_json).collect::<Vec<_>>(),
+        "pending": report.pending.iter().map(pending_domain_json).collect::<Vec<_>>(),
+        "virtual_with_decision": report.virtual_with_decision,
+    })
+}
+
+fn artifact_action_json(action: &crystalline_core::provision::ArtifactAction) -> Value {
+    json!({ "target": action.target, "status": action_status_id(action.status) })
+}
+
+/// A stable snake_case id for one [`crystalline_core::provision::ActionStatus`]
+/// variant, the wire and CLI-rendering spelling for what a reconcile did to
+/// one artifact.
+fn action_status_id(status: crystalline_core::provision::ActionStatus) -> &'static str {
+    use crystalline_core::provision::ActionStatus::*;
+    match status {
+        Installed => "installed",
+        Adopted => "adopted",
+        ForeignKept => "foreign_kept",
+        Updated => "updated",
+        UpdatedBackup => "updated_backup",
+        Removed => "removed",
+        RetiredBackup => "retired_backup",
+        McpAdded => "mcp_added",
+        McpUpdated => "mcp_updated",
+        McpRemoved => "mcp_removed",
+        McpSkipped => "mcp_skipped",
+        McpFailed => "mcp_failed",
+        McpDeferred => "mcp_deferred",
+    }
+}
+
+fn pending_domain_json(pending: &crystalline_core::provision::PendingDomain) -> Value {
+    json!({ "domain": pending.domain, "counts": pending.counts })
+}
+
+fn domain_status_json(status: &crystalline_core::provision::DomainStatus) -> Value {
+    json!({
+        "domain": status.domain,
+        "is_virtual": status.is_virtual,
+        "decision": decision_id(status.decision),
+        "declares": status.declares,
+        "counts": status.counts,
+        "parse_problems": status.parse_problems,
+    })
+}
+
+/// A stable snake_case id for one [`crystalline_core::provision::Decision`]
+/// variant.
+fn decision_id(decision: crystalline_core::provision::Decision) -> &'static str {
+    use crystalline_core::provision::Decision::*;
+    match decision {
+        Allowed => "allowed",
+        Denied => "denied",
+        Undecided => "undecided",
+    }
+}
+
+fn harness_status_json(status: &crystalline_core::provision::HarnessStatus) -> Value {
+    json!({
+        "harness": status.harness.id(),
+        "installed_files": status.installed_files,
+        "installed_mcps": status.installed_mcps,
+        "drift": status.drift,
+        "edited": status.edited,
+        "orphaned": status.orphaned,
+        "missing": status.missing,
+    })
 }
 
 /// Build an engine that opens the store directly for a one-shot standalone CLI

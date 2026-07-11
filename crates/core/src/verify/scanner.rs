@@ -148,10 +148,14 @@ fn domain_name(root: &Path) -> String {
 }
 
 fn collect_markdown_files(root: &Path) -> Result<Vec<PathBuf>, ScanError> {
+    // Folders the MANIFEST provisions from inside this root hold deployable
+    // artifacts, not engrams to verify, so they are pruned from the walk
+    // wholesale. Empty whenever the MANIFEST is absent or unparseable.
+    let excluded = crate::manifest::in_root_artifact_dirs(root);
     let mut out = Vec::new();
-    let walker = WalkDir::new(root)
-        .into_iter()
-        .filter_entry(|e| e.depth() == 0 || !is_dotfile(e.file_name()));
+    let walker = WalkDir::new(root).into_iter().filter_entry(|e| {
+        e.depth() == 0 || (!is_dotfile(e.file_name()) && !is_excluded(e.path(), &excluded))
+    });
     for entry in walker {
         let entry = entry.map_err(|e| {
             let path = e
@@ -177,4 +181,9 @@ fn collect_markdown_files(root: &Path) -> Result<Vec<PathBuf>, ScanError> {
 
 fn is_dotfile(name: &OsStr) -> bool {
     name.to_str().map(|s| s.starts_with('.')).unwrap_or(false)
+}
+
+/// Whether `path` is one of the excluded artifact folders or lives inside one.
+fn is_excluded(path: &Path, excluded: &[PathBuf]) -> bool {
+    excluded.iter().any(|dir| path.starts_with(dir))
 }

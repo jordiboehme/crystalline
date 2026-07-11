@@ -823,7 +823,7 @@ fn http_smoke_initialize_list_and_search() {
         .pointer("/result/tools")
         .and_then(Value::as_array)
         .unwrap();
-    // The 12 core tools plus `configure` and `add_domain`: GitHub collaboration
+    // The core tools plus `configure` and `add_domain`: GitHub collaboration
     // is off by default, so the five collaboration tools stay hidden, but
     // `add_domain` is write-gated not collab-gated, so it is visible (see
     // crystalline-service's mcp_collab test suite for the full gating matrix).

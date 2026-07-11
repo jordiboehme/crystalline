@@ -17,10 +17,12 @@ pub mod address;
 pub mod config;
 pub mod emit;
 pub mod engram;
+pub mod harness;
 pub mod import;
 pub mod manifest;
 pub mod parse;
 pub mod prompt;
+pub mod provision;
 pub mod schema;
 pub mod verify;
 pub mod yaml;
@@ -31,11 +33,22 @@ pub use engram::{
     Engram, Frontmatter, Heading, LinkTarget, Observation, RECOMMENDED_STATUSES, RECOMMENDED_TYPES,
     Relation, SchemaDef, WikiLink,
 };
-pub use manifest::{Manifest, manifest_template};
+pub use harness::{HarnessKind, HarnessPaths, artifact_base, harness_paths};
+pub use manifest::{
+    ArtifactType, Manifest, ProblemKind, ProvisioningDecl, ProvisioningProblem,
+    ProvisioningSection, in_root_artifact_dirs, manifest_template,
+};
 pub use parse::{LosslessEngram, ParseError, parse_engram, parse_engram_lossless};
 pub use prompt::{
     PromptDomain, PromptOutput, generate_prompt, generate_prompt_unscoped, render_instructions,
     render_json, render_text,
+};
+pub use provision::{
+    ActionStatus, Agent, ArtifactAction, ArtifactFile, Command, DeferringMcpRunner, DesiredFile,
+    DesiredMcp, DesiredPayload, DesiredSet, DomainArtifacts, DomainSources, HarnessState,
+    InstalledFile, InstalledMcp, McpArtifact, McpOutcome, McpRunner, ProvisionReceipt, SourceStamp,
+    desired_set, harness_supports, is_plain_component, reconcile_harness, resolve_source_roots,
+    scan_domain,
 };
 pub use schema::{
     FieldDecl, FieldType, ScalarType, Schema, SchemaDrift, SchemaIssue, ValidationMode,

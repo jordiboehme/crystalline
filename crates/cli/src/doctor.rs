@@ -20,17 +20,27 @@
 //! install receipt when one exists) and whether a receipt version skew or
 //! retired leftovers await the next session-start refresh - filesystem
 //! only, with no shell-out to the harness's own CLI, so this check stays
-//! fast and works offline. `--fix` removes orphan rows and stale service
-//! artifacts; the rest, including the whole GitHub, environment and
-//! harnesses sections, are report-only, and every finding that has a fix
-//! points at the right next command.
+//! fast and works offline; (j) when at least one registered domain declares
+//! a `## Provisioning` section, every declaring domain's decision and
+//! shipped artifact counts (plus, for a team domain with an out-of-subtree
+//! declaration, whether its artifact mirror has been pulled down), every
+//! installed harness's drift, locally edited, orphaned and missing counts
+//! against the provisioning receipt, and every domain still awaiting a
+//! decision -
+//! entirely read-only, straight off `crystalline_core::provision::status`,
+//! never reconciling anything itself. `--fix` removes orphan rows and stale
+//! service artifacts; the rest, including the whole GitHub, environment,
+//! harnesses and provisioning sections, are report-only, and every finding
+//! that has a fix points at the right next command.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Result, anyhow};
 use crystalline_core::config::{self, DomainEntry, GlobalConfig, OriginConfig};
+use crystalline_core::provision;
 use crystalline_core::verify::{self, VerifyOptions};
+use crystalline_core::{HarnessKind, harness_paths};
 use crystalline_index::{Store, configured_model_id};
 use crystalline_remote::TokenStore;
 use crystalline_remote::github::auth::auth_base;
@@ -40,7 +50,7 @@ use crystalline_service::instance;
 use serde::Serialize;
 
 use crate::cmd;
-use crate::install::{self, HarnessKind};
+use crate::install;
 use crate::receipt;
 
 /// One domain's diagnostics.
@@ -129,7 +139,7 @@ pub struct OriginDoctor {
     pub base_mismatches: Vec<String>,
     /// Whether this team domain is defined by an environment variable. An
     /// env-defined domain with no origin state yet is not a problem: it
-    /// provisions itself when the daemon connects, so `remaining_problems`
+    /// bootstraps itself when the daemon connects, so `remaining_problems`
     /// skips it where a config-file domain would count.
     pub env_defined: bool,
 }
@@ -255,6 +265,94 @@ pub struct HarnessDoctor {
     pub retired_leftovers: Vec<String>,
 }
 
+/// One domain's provisioning diagnostics, straight off
+/// [`provision::status`]: its decision, how many artifacts of each kind it
+/// ships and, for a team domain with at least one out-of-subtree
+/// `Provisioning` declaration, whether its artifact mirror has been pulled
+/// down from the origin yet. Only domains that declare a `Provisioning`
+/// section at all appear here - a domain with nothing to ship has nothing to
+/// report.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProvisioningDomainDoctor {
+    /// The domain name.
+    pub name: String,
+    /// `"allowed"`, `"denied"` or `"undecided"`.
+    pub decision: String,
+    /// [`crystalline_core::manifest::ArtifactType::id`] to how many
+    /// artifacts of that kind the domain ships.
+    pub counts: BTreeMap<String, usize>,
+    /// Whether the artifact mirror is present at this team domain's origin
+    /// state directory. `None` unless this is a team domain with at least
+    /// one out-of-subtree declaration (a `../`-climbing path) - the only
+    /// case a mirror is ever expected. The mirror itself is populated by the
+    /// same poller that keeps the domain's engrams current, never by doctor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mirror_present: Option<bool>,
+}
+
+/// One installed harness's provisioning diagnostics: installed counts read
+/// straight from the receipt, drift and orphaned counts compared against
+/// the harness's current desired set, and locally edited and missing counts
+/// compared against the installed files themselves. Gated to installed
+/// harnesses only, the same [`provision::installed_harnesses`] gate `apply`
+/// and `status` use - a harness that was never onboarded has nothing to
+/// compare against.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProvisioningHarnessDoctor {
+    /// The harness's stable identifier.
+    pub harness: String,
+    /// How many files the receipt records as installed for this harness.
+    pub installed_files: usize,
+    /// How many MCP servers the receipt records as installed for this
+    /// harness.
+    pub installed_mcps: usize,
+    /// How many recorded rows (files and mcps together) have drifted: their
+    /// domain now ships different bytes than the receipt last recorded, so
+    /// the next reconcile would update them. Counted only, never
+    /// reconciled here.
+    pub drift: usize,
+    /// How many installed files differ locally from the receipt's hash - a
+    /// user's own edit since the last reconcile, left alone by design.
+    pub edited: usize,
+    /// How many recorded rows (files and mcps together) are orphaned:
+    /// recorded but no longer part of what any opted-in domain would ship,
+    /// whether that domain opted out, was removed from the config entirely
+    /// or its manifest stopped declaring the artifact. The next reconcile
+    /// retires them.
+    pub orphaned: usize,
+    /// How many installed files the receipt records but that are no longer
+    /// on disk at the harness - deleted by hand since the last reconcile,
+    /// which reinstalls them.
+    pub missing: usize,
+}
+
+/// One domain still awaiting a provisioning decision, named with the counts
+/// it would ship.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProvisioningPendingDoctor {
+    /// The domain name.
+    pub domain: String,
+    /// [`crystalline_core::manifest::ArtifactType::id`] to how many
+    /// artifacts of that kind the domain would ship.
+    pub counts: BTreeMap<String, usize>,
+}
+
+/// Provisioning diagnostics: every declaring domain's decision and shipped
+/// counts, every installed harness's drift/edited/orphaned/missing counts
+/// against the provisioning receipt, and every domain still awaiting a
+/// decision. Read-only throughout, straight off [`provision::status`]:
+/// never writes the receipt, never touches a harness's own config directory
+/// and never spawns a harness CLI.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ProvisioningDoctor {
+    /// Every domain that declares a `Provisioning` section.
+    pub domains: Vec<ProvisioningDomainDoctor>,
+    /// Every installed harness's diagnostics.
+    pub harnesses: Vec<ProvisioningHarnessDoctor>,
+    /// Domains still awaiting a decision.
+    pub pending: Vec<ProvisioningPendingDoctor>,
+}
+
 /// The full `doctor` report.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct DoctorReport {
@@ -275,6 +373,9 @@ pub struct DoctorReport {
     /// any trace on disk at all: no settings/hooks file and no managed
     /// skill installed.
     pub harnesses: Option<Vec<HarnessDoctor>>,
+    /// Provisioning diagnostics. `None` when no registered domain declares a
+    /// `Provisioning` section at all.
+    pub provisioning: Option<ProvisioningDoctor>,
     /// Whether this report was produced with `--fix`.
     pub fix: bool,
 }
@@ -303,7 +404,7 @@ impl DoctorReport {
         // corrupt origin state for an already-connected team domain is.
         if let Some(g) = &self.github {
             for o in &g.origins {
-                // An env-defined team domain with no origin state provisions
+                // An env-defined team domain with no origin state bootstraps
                 // itself when the daemon connects, so it is not a problem; a
                 // config-file domain with no state genuinely is.
                 if !o.state_present && !o.env_defined {
@@ -324,6 +425,11 @@ impl DoctorReport {
                 .filter(|h| h.settings_parse_error.is_some())
                 .count();
         }
+        // Provisioning never contributes here, the same stance environment
+        // takes: an undecided domain is a normal state awaiting a person's
+        // answer, and drift, edited and orphaned rows all self-heal at the
+        // next `crystalline provision` (edited rows are left alone by
+        // design, never "fixed").
         n
     }
 }
@@ -382,6 +488,8 @@ pub async fn run(
 
     let harnesses = check_harnesses();
 
+    let provisioning = check_provisioning(cfg, &loaded.overlay, &targets)?;
+
     Ok(DoctorReport {
         domains,
         service,
@@ -389,6 +497,7 @@ pub async fn run(
         github,
         embeddings,
         harnesses,
+        provisioning,
         fix,
     })
 }
@@ -692,7 +801,7 @@ fn check_one_harness(
     harness: HarnessKind,
     entry: Option<&receipt::InstallRecord>,
 ) -> HarnessDoctor {
-    let paths = install::harness_paths(harness, false);
+    let paths = harness_paths(harness, false);
     let settings_present = paths.settings.is_file();
 
     let (session_start_hook, stop_hook, settings_parse_error) =
@@ -775,6 +884,117 @@ fn check_one_harness(
         receipt_version: entry.map(|e| e.version.clone()),
         retired_leftovers,
     }
+}
+
+/// Provisioning diagnostics: every declaring domain's decision and counts,
+/// every installed harness's drift/edited/orphaned/missing counts and every
+/// domain still awaiting a decision. `None` when no domain declares a
+/// `Provisioning` section at all, the same "omit rather than show empty"
+/// rule [`check_environment`], [`check_github`] and [`check_harnesses`]
+/// follow. The domain-keyed lists (`domains`, `pending`) are filtered by
+/// `--domain` through `targets`, matching how the per-domain and github
+/// sections behave; the harness rollup stays whole-machine on purpose, since
+/// the provisioning receipt is shared across every domain, the same way
+/// `apply` reconciles them. Calls straight into [`provision::status`], which
+/// only scans the filesystem and reads the provisioning receipt - it never
+/// writes the receipt, never touches a harness's config directory and never
+/// spawns a harness CLI, so this stays as read-only as the rest of doctor.
+fn check_provisioning(
+    cfg: &GlobalConfig,
+    overlay: &EnvOverlay,
+    targets: &[(String, DomainEntry)],
+) -> Result<Option<ProvisioningDoctor>> {
+    if !provision::any_domain_declares(cfg) {
+        return Ok(None);
+    }
+
+    let receipt_path = provision::receipt_path()
+        .map_err(|e| anyhow!("could not resolve the provisioning receipt path: {e}"))?;
+    let install_receipt_path = provision::install_receipt_path()
+        .map_err(|e| anyhow!("could not resolve the install receipt path: {e}"))?;
+    let harnesses = provision::installed_harnesses(&install_receipt_path);
+    // Named so an env-defined domain never surfaces in `pending`: its
+    // decision can never be recorded, see `provision::apply`'s doc comment.
+    let env_domains: HashSet<&str> = overlay
+        .env_domains()
+        .map(|(name, _)| name.as_str())
+        .collect();
+    let report = provision::status(cfg, &receipt_path, &harnesses, &env_domains)
+        .map_err(|e| anyhow!("could not read provisioning status: {e}"))?;
+
+    let selected: HashSet<&str> = targets.iter().map(|(name, _)| name.as_str()).collect();
+
+    let domains = report
+        .domains
+        .iter()
+        .filter(|d| d.declares && selected.contains(d.domain.as_str()))
+        .map(|d| ProvisioningDomainDoctor {
+            name: d.domain.clone(),
+            decision: provisioning_decision_label(d.decision).to_string(),
+            counts: d.counts.clone(),
+            mirror_present: mirror_present(cfg, &d.domain),
+        })
+        .collect();
+
+    let harnesses = report
+        .harnesses
+        .iter()
+        .map(|h| ProvisioningHarnessDoctor {
+            harness: h.harness.id().to_string(),
+            installed_files: h.installed_files,
+            installed_mcps: h.installed_mcps,
+            drift: h.drift,
+            edited: h.edited,
+            orphaned: h.orphaned,
+            missing: h.missing,
+        })
+        .collect();
+
+    let pending = report
+        .pending
+        .iter()
+        .filter(|p| selected.contains(p.domain.as_str()))
+        .map(|p| ProvisioningPendingDoctor {
+            domain: p.domain.clone(),
+            counts: p.counts.clone(),
+        })
+        .collect();
+
+    Ok(Some(ProvisioningDoctor {
+        domains,
+        harnesses,
+        pending,
+    }))
+}
+
+/// A stable human label for one [`provision::Decision`] variant, the same
+/// spelling `crystalline provision status` already uses.
+fn provisioning_decision_label(decision: provision::Decision) -> &'static str {
+    use provision::Decision::*;
+    match decision {
+        Allowed => "allowed",
+        Denied => "denied",
+        Undecided => "undecided",
+    }
+}
+
+/// Whether `name`'s artifact mirror is present at its origin state
+/// directory, for a team domain with at least one out-of-subtree
+/// `Provisioning` declaration. `None` when `name` is not a team domain, or is
+/// one but declares no out-of-subtree path - a mirror is never expected in
+/// either case. A resolved source root under `<origin_state_dir>/artifacts`
+/// is exactly how [`provision::resolve_source_roots`] documents an
+/// out-of-subtree decl resolving for a team domain, so its presence there is
+/// the gate.
+fn mirror_present(cfg: &GlobalConfig, name: &str) -> Option<bool> {
+    let entry = cfg.domains.get(name)?;
+    entry.origin.as_ref()?;
+    let roots = provision::resolve_source_roots(name, entry);
+    let mirror_root = config::origin_state_dir(name).ok()?.join("artifacts");
+    roots
+        .iter()
+        .any(|(_, root)| root.starts_with(&mirror_root))
+        .then(|| mirror_root.is_dir())
 }
 
 /// GitHub collaboration diagnostics: this machine's connection and, per team
@@ -1032,7 +1252,7 @@ pub fn render_human(report: &DoctorReport) -> String {
             if !o.state_present && o.env_defined {
                 let _ = writeln!(
                     out,
-                    "  {} ({}): env-defined team domain, provisions itself when the daemon connects",
+                    "  {} ({}): env-defined team domain, bootstraps itself when the daemon connects",
                     o.name, o.repo
                 );
             } else if !o.state_present {
@@ -1133,7 +1353,71 @@ pub fn render_human(report: &DoctorReport) -> String {
         }
     }
 
+    if let Some(p) = &report.provisioning {
+        let _ = writeln!(out, "provisioning:");
+        for d in &p.domains {
+            let _ = writeln!(
+                out,
+                "  {}: {}, {}",
+                d.name,
+                d.decision,
+                render_provision_counts(&d.counts)
+            );
+            if let Some(mirror) = d.mirror_present {
+                let _ = writeln!(
+                    out,
+                    "    artifact mirror: {}",
+                    if mirror {
+                        "present"
+                    } else {
+                        "not pulled down yet"
+                    }
+                );
+            }
+        }
+        for h in &p.harnesses {
+            let _ = writeln!(
+                out,
+                "  {}: {} file(s) installed, {} mcp(s) installed, {} drifted, {} edited, {} orphaned, {} missing",
+                h.harness,
+                h.installed_files,
+                h.installed_mcps,
+                h.drift,
+                h.edited,
+                h.orphaned,
+                h.missing
+            );
+        }
+        if !p.pending.is_empty() {
+            let _ = writeln!(out, "  awaiting a decision:");
+            for pd in &p.pending {
+                let _ = writeln!(
+                    out,
+                    "    {}: {} - run `crystalline provision allow {}`.",
+                    pd.domain,
+                    render_provision_counts(&pd.counts),
+                    pd.domain
+                );
+            }
+        }
+    }
+
     let remaining = report.remaining_problems();
     let _ = writeln!(out, "{remaining} problem(s) remaining");
     out
+}
+
+/// Render an artifact-kind-to-count map as `"2 skills, 1 mcps"`, or `"no
+/// artifacts"` when empty - the doctor-local twin of `cmd::format_counts`,
+/// operating on the typed map `provision::status` returns rather than a JSON
+/// value.
+fn render_provision_counts(counts: &BTreeMap<String, usize>) -> String {
+    if counts.is_empty() {
+        return "no artifacts".to_string();
+    }
+    counts
+        .iter()
+        .map(|(kind, n)| format!("{n} {kind}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }

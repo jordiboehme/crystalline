@@ -467,6 +467,153 @@ pub(crate) fn read_resolve_content(path: &Path) -> Result<Vec<u8>> {
     std::fs::read(path).with_context(|| format!("reading {}", path.display()))
 }
 
+// --- provision -----------------------------------------------------------
+
+/// Render a `provision` result: `status`'s report through
+/// [`print_provision_status`], every other action (bare `provision`,
+/// `allow`, `deny`) through [`print_provision_apply`].
+pub(crate) fn print_provision(action: &str, data: &serde_json::Value, json: bool) {
+    if action == "status" {
+        print_provision_status(data, json);
+    } else {
+        print_provision_apply(data, json);
+    }
+}
+
+/// Render an apply report (bare `provision`, `allow` or `deny`): one line per
+/// harness with what it did, or "up to date" when nothing changed, then any
+/// notices, then domains still awaiting a decision with a hint to opt them
+/// in.
+pub(crate) fn print_provision_apply(data: &serde_json::Value, json: bool) {
+    if json {
+        println!("{data}");
+        return;
+    }
+    // An empty harness list is not announced here: the core apply already
+    // raises its own no-harness notice (with the `crystalline install` hint)
+    // whenever a domain is opted in, and that notice prints below.
+    let empty = Vec::new();
+    let harnesses = data["harnesses"].as_array().unwrap_or(&empty);
+    for h in harnesses {
+        let name = h["harness"].as_str().unwrap_or("");
+        let actions = h["actions"].as_array().cloned().unwrap_or_default();
+        if actions.is_empty() {
+            println!("{name}: up to date");
+            continue;
+        }
+        println!("{name}:");
+        for a in &actions {
+            println!(
+                "  {} {}",
+                provision_action_label(a["status"].as_str().unwrap_or("")),
+                a["target"].as_str().unwrap_or("")
+            );
+        }
+    }
+    for notice in data["notices"].as_array().unwrap_or(&empty) {
+        if let Some(n) = notice.as_str() {
+            println!("note: {n}");
+        }
+    }
+    print_provision_pending(data);
+}
+
+/// Render `provision status`: each domain's decision and declared counts,
+/// each installed harness's installed, drifted, edited, orphaned and missing
+/// counts, then domains still awaiting a decision. The harness line matches
+/// `crystalline doctor`'s provisioning section wording exactly, so the two
+/// surfaces never drift apart on what they report.
+pub(crate) fn print_provision_status(data: &serde_json::Value, json: bool) {
+    if json {
+        println!("{data}");
+        return;
+    }
+    let empty = Vec::new();
+    for d in data["domains"].as_array().unwrap_or(&empty) {
+        let name = d["domain"].as_str().unwrap_or("");
+        if d["is_virtual"].as_bool().unwrap_or(false) {
+            println!("{name}: virtual, never provisions artifacts");
+            continue;
+        }
+        if !d["declares"].as_bool().unwrap_or(false) {
+            println!("{name}: declares no provisioning");
+            continue;
+        }
+        let decision = d["decision"].as_str().unwrap_or("undecided");
+        println!("{name}: {decision}, {}", format_counts(&d["counts"]));
+    }
+    for h in data["harnesses"].as_array().unwrap_or(&empty) {
+        println!(
+            "{}: {} file(s) installed, {} mcp(s) installed, {} drifted, {} edited, {} orphaned, {} missing",
+            h["harness"].as_str().unwrap_or(""),
+            h["installed_files"].as_u64().unwrap_or(0),
+            h["installed_mcps"].as_u64().unwrap_or(0),
+            h["drift"].as_u64().unwrap_or(0),
+            h["edited"].as_u64().unwrap_or(0),
+            h["orphaned"].as_u64().unwrap_or(0),
+            h["missing"].as_u64().unwrap_or(0),
+        );
+    }
+    print_provision_pending(data);
+}
+
+/// The "domains awaiting a decision" tail shared by an apply report and a
+/// status report.
+fn print_provision_pending(data: &serde_json::Value) {
+    let empty = Vec::new();
+    let pending = data["pending"].as_array().unwrap_or(&empty);
+    if pending.is_empty() {
+        return;
+    }
+    println!("Domains awaiting a decision:");
+    for p in pending {
+        let name = p["domain"].as_str().unwrap_or("");
+        println!(
+            "  {name}: {} - run `crystalline provision allow {name}` to opt in.",
+            format_counts(&p["counts"])
+        );
+    }
+}
+
+/// Render an [`ArtifactType`]-id-keyed counts object as `"2 skills, 1 mcps"`,
+/// or a plain "no artifacts" when it is empty.
+///
+/// [`ArtifactType`]: crystalline_core::manifest::ArtifactType
+fn format_counts(counts: &serde_json::Value) -> String {
+    let Some(map) = counts.as_object() else {
+        return "no artifacts".to_string();
+    };
+    if map.is_empty() {
+        return "no artifacts".to_string();
+    }
+    map.iter()
+        .map(|(kind, n)| format!("{} {kind}", n.as_u64().unwrap_or(0)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The human phrase for one [`ActionStatus`] wire id, matching
+/// `crystalline_service::engine::action_status_id`'s spellings.
+///
+/// [`ActionStatus`]: crystalline_core::ActionStatus
+fn provision_action_label(status: &str) -> &str {
+    match status {
+        "installed" => "installed",
+        "adopted" => "adopted",
+        "foreign_kept" => "kept (foreign)",
+        "updated" => "updated",
+        "updated_backup" => "updated (edit kept as .bak)",
+        "removed" => "removed",
+        "retired_backup" => "retired (edit kept as .bak)",
+        "mcp_added" => "mcp added",
+        "mcp_updated" => "mcp updated",
+        "mcp_removed" => "mcp removed",
+        "mcp_skipped" => "mcp skipped",
+        "mcp_failed" => "mcp failed",
+        other => other,
+    }
+}
+
 // --- domain remove -----------------------------------------------------------
 
 /// Remove a domain from the global config. Leaves its files and index rows

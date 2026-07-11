@@ -10,6 +10,7 @@ use std::path::PathBuf;
 
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 
+use crystalline_core::HarnessKind;
 use crystalline_core::config;
 use crystalline_core::verify::{self, VerifyOptions};
 
@@ -82,7 +83,7 @@ enum Command {
     Install {
         /// Which harness to wire up.
         #[arg(value_enum)]
-        harness: install::HarnessKind,
+        harness: HarnessArg,
         /// Write into the current repository's harness config (.claude,
         /// .codex, .agents or .github under the working directory) instead
         /// of this user's global one. Codex and Copilot still register their
@@ -106,7 +107,7 @@ enum Command {
     Uninstall {
         /// Which harness to unwire.
         #[arg(value_enum)]
-        harness: install::HarnessKind,
+        harness: HarnessArg,
         /// Act on the current repository's harness config instead of this
         /// user's global one.
         #[arg(long)]
@@ -126,6 +127,20 @@ enum Command {
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
+    },
+    /// Reconcile every domain's declared provisioning decision into every
+    /// harness this machine has onboarded: skills, commands, agents and MCP
+    /// servers land under (or come out of) each harness's own config
+    /// directory. Bare `provision` reconciles the decisions already on
+    /// file; `status`, `allow` and `deny` are subcommands.
+    Provision {
+        #[command(subcommand)]
+        command: Option<ProvisionCommand>,
+        /// Load the global config from this file instead of the default
+        /// path. Only meaningful for the bare form; each subcommand carries
+        /// its own.
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
     /// Sync one or all registered domains into the index.
     Sync {
@@ -788,11 +803,69 @@ enum ConfigCommand {
     },
 }
 
+#[derive(Subcommand, Debug)]
+enum ProvisionCommand {
+    /// Show every domain's provisioning decision, each installed harness's
+    /// installed, edited and missing counts and any domain still awaiting a
+    /// decision.
+    Status {
+        /// Load the global config from this file instead of the default path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Opt a domain in to provisioning its declared artifacts, then
+    /// reconcile.
+    Allow {
+        /// The domain to opt in.
+        domain: String,
+        /// Load the global config from this file instead of the default path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Opt a domain out of provisioning its declared artifacts, then
+    /// reconcile - this removes any artifacts it previously shipped.
+    Deny {
+        /// The domain to opt out.
+        domain: String,
+        /// Load the global config from this file instead of the default path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 enum OutputFormat {
     Human,
     Json,
     Github,
+}
+
+/// Which harness `install`/`uninstall` targets, as a clap `ValueEnum`. Mirrors
+/// [`HarnessKind`] variant for variant, with identical spellings and doc
+/// comments, so the derived help text and invalid-value error read exactly
+/// as they did before the harness model moved to `crystalline-core`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum HarnessArg {
+    /// Anthropic's Claude Code CLI: hooks in `settings.json`, skills in a
+    /// `skills` folder under `.claude`.
+    ClaudeCode,
+    /// The Codex CLI: hooks in a dedicated `hooks.json`, skills under
+    /// `.agents/skills`.
+    Codex,
+    /// The GitHub Copilot CLI: hooks in a wholly Crystalline-owned
+    /// `crystalline.json` under Copilot's hooks folder, skills under
+    /// `.copilot/skills` (user) or `.github/skills` (project).
+    Copilot,
+}
+
+impl From<HarnessArg> for HarnessKind {
+    fn from(arg: HarnessArg) -> HarnessKind {
+        match arg {
+            HarnessArg::ClaudeCode => HarnessKind::ClaudeCode,
+            HarnessArg::Codex => HarnessKind::Codex,
+            HarnessArg::Copilot => HarnessKind::Copilot,
+        }
+    }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -835,7 +908,7 @@ fn main() -> anyhow::Result<()> {
             skip_skills,
         }) => install::run_install(
             install::InstallOptions {
-                harness,
+                harness: harness.into(),
                 project,
                 skip_mcp,
                 skip_hooks,
@@ -847,11 +920,14 @@ fn main() -> anyhow::Result<()> {
             harness,
             project,
             force,
-        }) => install::run_uninstall(harness, project, force, cli.json),
+        }) => install::run_uninstall(harness.into(), project, force, cli.json),
         Some(Command::Origin { command }) => {
             on_runtime(move || run_origin(command, cli.db, cli.json))
         }
         Some(Command::Config { command }) => on_runtime(move || config_dispatch(command, cli.json)),
+        Some(Command::Provision { command, config }) => {
+            on_runtime(move || provision_dispatch(command, config, cli.json))
+        }
         Some(Command::Sync {
             domain,
             embed,
@@ -1179,6 +1255,28 @@ fn print_setting_result(data: &serde_json::Value, json: bool) {
     }
 }
 
+/// `provision`/`provision status`/`provision allow`/`provision deny`:
+/// socket-first with an in-process fallback, handled inside
+/// `crystalline_service::client::provision`. Bare `provision` applies the
+/// decisions already on file; the subcommands report status or record one
+/// domain's opt-in/opt-out decision before applying.
+async fn provision_dispatch(
+    command: Option<ProvisionCommand>,
+    config: Option<PathBuf>,
+    json: bool,
+) -> anyhow::Result<()> {
+    let (action, domain, config) = match command {
+        None => ("apply", None, config),
+        Some(ProvisionCommand::Status { config }) => ("status", None, config),
+        Some(ProvisionCommand::Allow { domain, config }) => ("allow", Some(domain), config),
+        Some(ProvisionCommand::Deny { domain, config }) => ("deny", Some(domain), config),
+    };
+    let data = crystalline_service::client::provision(action, domain.as_deref(), config.as_deref())
+        .await?;
+    cmd::print_provision(action, &data, json);
+    Ok(())
+}
+
 /// `connect github`: sign this machine in to GitHub, always in-process (no
 /// daemon involved - signing in is this machine's identity, not content).
 async fn run_connect(command: ConnectCommand, json: bool) -> anyhow::Result<()> {
@@ -1281,10 +1379,11 @@ async fn run_origin(command: OriginCommand, db: Option<PathBuf>, json: bool) -> 
     }
 }
 
-/// Render `origin update`'s aggregate result: one line per team domain (up
-/// to date, or the applied/merged counts with conflicts and proposal
-/// transitions called out), then one line per domain that failed to update.
-/// Conflicts only name the path: resolution tooling arrives in a later task.
+/// Render `origin update`'s aggregate result: one line per team domain (a
+/// freshly bootstrapped env-defined domain, up to date or the
+/// applied/merged counts with conflicts and proposal transitions called
+/// out), then one line per domain that failed to update. Conflicts only name
+/// the path: resolution tooling arrives in a later task.
 fn print_origin_update(data: &serde_json::Value, json: bool) {
     if json {
         print_value(data, true);
@@ -1297,9 +1396,9 @@ fn print_origin_update(data: &serde_json::Value, json: bool) {
     }
     for d in domains {
         let name = d["domain"].as_str().unwrap_or("");
-        if d["provisioned"].as_bool().unwrap_or(false) {
+        if d["bootstrapped"].as_bool().unwrap_or(false) {
             println!(
-                "{name}: provisioned {} engram(s) at {}",
+                "{name}: bootstrapped {} engram(s) at {}",
                 d["engrams"].as_u64().unwrap_or(0),
                 d["base_commit"].as_str().unwrap_or("")
             );
@@ -2031,7 +2130,7 @@ fn run_prompt(
     // prompt goes out. Cheap when versions match (one small-file read) and
     // best-effort always; outcomes surface only as trailing notice lines on
     // the text output.
-    let reconcile_notices = install::auto_reconcile(
+    let mut reconcile_notices = install::auto_reconcile(
         env!("CARGO_PKG_VERSION"),
         &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
     );
@@ -2040,7 +2139,36 @@ fn run_prompt(
     // The single load chokepoint resolves the config path (flag, then
     // CRYSTALLINE_CONFIG, then the default) and applies the environment overlay,
     // so the routing prompt reflects env-configured settings.
-    let global = crystalline_service::overlay::load(config_path.as_deref())?.effective;
+    let loaded_config = crystalline_service::overlay::load(config_path.as_deref())?;
+    let global = loaded_config.effective;
+    // Named so an env-defined domain never nags the pending block for a
+    // decision it can never record - see `session_notices`'s doc comment.
+    let env_domains: std::collections::HashSet<&str> = loaded_config
+        .overlay
+        .env_domains()
+        .map(|(name, _)| name.as_str())
+        .collect();
+
+    // Session-start provisioning: reconcile opted-in domains' file artifacts
+    // and surface undecided domains, joining the same notice channel as the
+    // auto-update above. Spawn-free by construction (the deferring MCP runner)
+    // and best-effort - session_notices never errors and its lines only ever
+    // trail the routing body, so the prompt stays byte-deterministic. State
+    // that cannot be resolved (a stateless environment) simply adds nothing.
+    let session_notices = crystalline_core::provision::receipt_path()
+        .ok()
+        .zip(crystalline_core::provision::install_receipt_path().ok())
+        .map(|(receipt, install_receipt)| {
+            let harnesses = crystalline_core::provision::installed_harnesses(&install_receipt);
+            crystalline_core::provision::session_notices(
+                &global,
+                &receipt,
+                &harnesses,
+                &env_domains,
+            )
+        })
+        .unwrap_or_default();
+    reconcile_notices.extend(session_notices);
 
     // Virtual domains have no MANIFEST on disk; their routing bullets come from
     // the daemon (warm) or a direct store read. The all-file common case never

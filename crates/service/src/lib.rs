@@ -5,13 +5,14 @@
 //!
 //! The CLI is a thin dispatcher over this crate. Data operations run through one
 //! shared [`engine::Engine`], reached either over the socket (when a daemon owns
-//! the index) or in-process (a brief standalone open). The 12 MCP tools, the ctl
+//! the index) or in-process (a brief standalone open). The MCP tools, the ctl
 //! commands and the CLI data commands all funnel through that one engine.
 
 pub mod client;
 pub mod control;
 pub mod daemon;
 pub mod engine;
+pub mod harness_cli;
 pub mod instance;
 pub mod mcp;
 mod origin;
@@ -27,6 +28,7 @@ pub use client::{
 };
 pub use daemon::run_serve;
 pub use engine::{Engine, EngineError};
+pub use harness_cli::{CliRun, SystemMcpRunner, run_harness_cli};
 pub use mcp::McpServer;
 pub use origin::parse_origin_spec;
 pub use overlay::{EnvDomain, EnvOverlay, LoadedConfig};

@@ -9,7 +9,8 @@
 use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
-use serde_json::Value;
+use crystalline_core::provision::sha256_hex;
+use serde_json::{Value, json};
 
 fn bin() -> Command {
     Command::cargo_bin("crystalline").unwrap()
@@ -1090,6 +1091,339 @@ fn doctor_reports_a_version_skewed_install_and_retired_leftovers() {
     let human = String::from_utf8(human).unwrap();
     assert!(human.contains("installed by 0.0.1"), "{human}");
     assert!(human.contains("crystalline-legacy"), "{human}");
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+// --- provisioning section ---------------------------------------------------
+//
+// `doctor`'s provisioning section reads straight off
+// `crystalline_core::provision::status` and the on-disk provisioning receipt
+// at `<state_dir>/provisions.json`, reachable only through `HOME`/`XDG_*`
+// like the harnesses section above, so these scenarios isolate a fresh
+// `HOME` the same way.
+
+/// Write a minimal valid MANIFEST at `dir` declaring a `## Provisioning`
+/// section from `bullets` (already `- `-prefixed lines, one per artifact
+/// type) - the same shape `crystalline_core::provision`'s own tests use.
+#[cfg(unix)]
+fn write_provisioning_manifest(dir: &Path, title: &str, bullets: &str) {
+    std::fs::create_dir_all(dir).unwrap();
+    let source = format!(
+        "---\ntype: manifest\ntitle: {title}\npermalink: manifest\n---\n\n\
+         # {title}\n\n\
+         ## Scope\n\n- {title} knowledge\n\n\
+         ## When to Use\n\n- When working on {title}\n\n\
+         ## Provisioning\n\n{bullets}"
+    );
+    std::fs::write(dir.join("MANIFEST.md"), source).unwrap();
+}
+
+/// The provisioning receipt path under an isolated home: `state_dir` honors
+/// `XDG_STATE_HOME`, which `apply_home` points at `<home>/state`.
+#[cfg(unix)]
+fn provision_receipt_file(home: &Path) -> PathBuf {
+    home.join("state")
+        .join("crystalline")
+        .join("provisions.json")
+}
+
+/// Write a claude-code install receipt at the isolated home's state
+/// directory, marking it onboarded at user scope - the same shape
+/// `tests/provision.rs`'s `write_install_receipt` writes. Doctor's
+/// provisioning section is gated to installed harnesses only, the same gate
+/// `apply` and `provision status` use.
+#[cfg(unix)]
+fn write_claude_code_install_receipt(home: &Path) {
+    std::fs::write(
+        receipt_file(home),
+        serde_json::to_string_pretty(&json!({
+            "format": 1,
+            "installs": [
+                {
+                    "harness": "claude-code",
+                    "scope": "user",
+                    "version": "0.0.0",
+                    "parts": { "mcp": true, "hooks": true, "skills": true },
+                    "skills": []
+                }
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+/// One fixture exercising every new count at once: `harbor` is opted in and
+/// was reconciled once already, `cove` still awaits a decision. The
+/// hand-crafted provisioning receipt gives claude-code three recorded rows:
+/// `SKILL.md` records exactly what harbor ships now, but the installed copy
+/// on disk was hand-edited since (edited, not drift); `chart.sh`'s recorded
+/// hash is stale against what harbor ships now, with the installed copy left
+/// matching that stale record (drift, not edited); `commands/retired.md`
+/// names an artifact harbor no longer declares at all (orphaned).
+#[test]
+#[cfg(unix)]
+fn provisioning_section_reports_domain_counts_pending_line_and_harness_drift_edited_orphaned() {
+    let (home, _state_dir) = isolated_home("provisioning");
+    let work = tempfile::tempdir().unwrap();
+
+    let harbor_dir = work.path().join("kb-harbor");
+    write_provisioning_manifest(&harbor_dir, "harbor", "- skills: skills\n");
+    let current_skill = "---\nname: tide-tables\n---\n\nReads the harbor's tide tables.\n";
+    write(&harbor_dir, "skills/tide-tables/SKILL.md", current_skill);
+    let current_chart = "#!/bin/sh\necho new-chart\n";
+    write(
+        &harbor_dir,
+        "skills/tide-tables/scripts/chart.sh",
+        current_chart,
+    );
+
+    let cove_dir = work.path().join("kb-cove");
+    write_provisioning_manifest(&cove_dir, "cove", "- skills: skills\n");
+    write(
+        &cove_dir,
+        "skills/lookout/SKILL.md",
+        "---\nname: lookout\n---\n\nWatches for approaching ships.\n",
+    );
+
+    let config = work.path().join("config.yaml");
+    std::fs::write(
+        &config,
+        format!(
+            "domains:\n  harbor:\n    path: {}\n    provision: true\n  cove:\n    path: {}\n",
+            harbor_dir.display(),
+            cove_dir.display()
+        ),
+    )
+    .unwrap();
+
+    write_claude_code_install_receipt(&home);
+
+    let stale_chart = "#!/bin/sh\necho old-chart\n";
+    std::fs::write(
+        provision_receipt_file(&home),
+        serde_json::to_string_pretty(&json!({
+            "format": 1,
+            "sources": {},
+            "harnesses": {
+                "claude-code": {
+                    "files": {
+                        "skills/tide-tables/SKILL.md": {
+                            "domain": "harbor",
+                            "sha256": sha256_hex(current_skill.as_bytes()),
+                        },
+                        "skills/tide-tables/scripts/chart.sh": {
+                            "domain": "harbor",
+                            "sha256": sha256_hex(stale_chart.as_bytes()),
+                        },
+                        "commands/retired.md": {
+                            "domain": "harbor",
+                            "sha256": sha256_hex(b"anything"),
+                        }
+                    },
+                    "mcps": {}
+                }
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    // The installed copy on disk: `SKILL.md` was hand-edited since the last
+    // reconcile, `chart.sh` still matches the stale record exactly, and
+    // `retired.md` was never installed at all (missing, incidental to this
+    // scenario).
+    write(
+        &home,
+        ".claude/skills/tide-tables/SKILL.md",
+        "---\nname: tide-tables\n---\n\nHand edited locally.\n",
+    );
+    write(
+        &home,
+        ".claude/skills/tide-tables/scripts/chart.sh",
+        stale_chart,
+    );
+
+    let mut cmd = bin();
+    apply_home(&mut cmd, &home);
+    let out = cmd
+        .args(["--json", "doctor", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(work.path().join("index.db"))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&out).unwrap();
+    let provisioning = &report["provisioning"];
+
+    let domains = provisioning["domains"].as_array().unwrap();
+    let harbor = domains
+        .iter()
+        .find(|d| d["name"] == "harbor")
+        .unwrap_or_else(|| panic!("no harbor entry: {provisioning}"));
+    assert_eq!(harbor["decision"], json!("allowed"));
+    assert_eq!(harbor["counts"]["skills"], json!(1));
+    assert_eq!(harbor["mirror_present"], Value::Null);
+
+    let cove = domains
+        .iter()
+        .find(|d| d["name"] == "cove")
+        .unwrap_or_else(|| panic!("no cove entry: {provisioning}"));
+    assert_eq!(cove["decision"], json!("undecided"));
+
+    let claude = provisioning["harnesses"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["harness"] == "claude-code")
+        .unwrap_or_else(|| panic!("no claude-code entry: {provisioning}"));
+    assert_eq!(claude["installed_files"], json!(3));
+    assert_eq!(claude["installed_mcps"], json!(0));
+    assert_eq!(claude["drift"], json!(1), "{provisioning}");
+    assert_eq!(claude["edited"], json!(1), "{provisioning}");
+    assert_eq!(claude["orphaned"], json!(1), "{provisioning}");
+    // The orphaned `retired.md` row was never installed on disk either, so
+    // it doubles as the missing count's fixture.
+    assert_eq!(claude["missing"], json!(1), "{provisioning}");
+
+    let pending = provisioning["pending"].as_array().unwrap();
+    assert_eq!(pending.len(), 1, "{provisioning}");
+    assert_eq!(pending[0]["domain"], json!("cove"));
+
+    let human = {
+        let mut cmd = bin();
+        apply_home(&mut cmd, &home);
+        cmd.args(["doctor", "--config"])
+            .arg(&config)
+            .args(["--db"])
+            .arg(work.path().join("index.db"))
+            .output()
+            .unwrap()
+            .stdout
+    };
+    let human = String::from_utf8(human).unwrap();
+    assert!(human.contains("provisioning:"), "{human}");
+    assert!(human.contains("harbor: allowed"), "{human}");
+    assert!(human.contains("cove: undecided"), "{human}");
+    assert!(
+        human.contains(
+            "claude-code: 3 file(s) installed, 0 mcp(s) installed, 1 drifted, 1 edited, 1 orphaned, 1 missing"
+        ),
+        "{human}"
+    );
+    assert!(
+        human.contains("crystalline provision allow cove"),
+        "{human}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// No registered domain declares a `Provisioning` section at all: the
+/// section stays out of the report entirely, the same "omit rather than
+/// show empty" rule the environment and harnesses sections follow.
+#[test]
+#[cfg(unix)]
+fn provisioning_section_is_absent_when_no_domain_declares() {
+    let (home, _state_dir) = isolated_home("provisioning-none");
+    let work = tempfile::tempdir().unwrap();
+    let (config, db) = empty_config(work.path());
+
+    let mut cmd = bin();
+    apply_home(&mut cmd, &home);
+    let out = cmd
+        .args(["--json", "doctor", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(report["provisioning"], Value::Null);
+
+    let human = {
+        let mut cmd = bin();
+        apply_home(&mut cmd, &home);
+        cmd.args(["doctor", "--config"])
+            .arg(&config)
+            .args(["--db"])
+            .arg(&db)
+            .output()
+            .unwrap()
+            .stdout
+    };
+    let human = String::from_utf8(human).unwrap();
+    assert!(!human.contains("provisioning:"), "{human}");
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// `--domain` restricts the provisioning section's domain-keyed lists
+/// (`domains` and `pending`) to the selected domain, the same way it
+/// restricts the per-domain and github sections. Two declaring, undecided
+/// domains; filtering to one must leave the other out of both lists.
+#[test]
+#[cfg(unix)]
+fn provisioning_section_honors_the_domain_filter() {
+    let (home, _state_dir) = isolated_home("provisioning-filter");
+    let work = tempfile::tempdir().unwrap();
+
+    let harbor_dir = work.path().join("kb-harbor");
+    write_provisioning_manifest(&harbor_dir, "harbor", "- skills: skills\n");
+    write(
+        &harbor_dir,
+        "skills/tide-tables/SKILL.md",
+        "---\nname: tide-tables\n---\n\nReads the harbor's tide tables.\n",
+    );
+
+    let cove_dir = work.path().join("kb-cove");
+    write_provisioning_manifest(&cove_dir, "cove", "- skills: skills\n");
+    write(
+        &cove_dir,
+        "skills/lookout/SKILL.md",
+        "---\nname: lookout\n---\n\nWatches for approaching ships.\n",
+    );
+
+    let config = work.path().join("config.yaml");
+    std::fs::write(
+        &config,
+        format!(
+            "domains:\n  harbor:\n    path: {}\n  cove:\n    path: {}\n",
+            harbor_dir.display(),
+            cove_dir.display()
+        ),
+    )
+    .unwrap();
+
+    let mut cmd = bin();
+    apply_home(&mut cmd, &home);
+    let out = cmd
+        .args(["--json", "doctor", "--domain", "harbor", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(work.path().join("index.db"))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&out).unwrap();
+    let provisioning = &report["provisioning"];
+
+    let domains = provisioning["domains"].as_array().unwrap();
+    assert_eq!(domains.len(), 1, "{provisioning}");
+    assert_eq!(domains[0]["name"], json!("harbor"));
+
+    let pending = provisioning["pending"].as_array().unwrap();
+    assert_eq!(pending.len(), 1, "{provisioning}");
+    assert_eq!(pending[0]["domain"], json!("harbor"));
 
     let _ = std::fs::remove_dir_all(&home);
 }

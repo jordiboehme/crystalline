@@ -356,6 +356,7 @@ async fn origin_add_connects_a_registered_domain_in_place() {
             kind: crystalline_core::config::DomainKind::File,
             path: Some(root.clone()),
             origin: None,
+            provision: None,
         },
     );
     let eng = Engine::new(
@@ -410,6 +411,7 @@ async fn origin_add_on_a_registered_domain_refuses_a_different_folder() {
             kind: crystalline_core::config::DomainKind::File,
             path: Some(root.clone()),
             origin: None,
+            provision: None,
         },
     );
     let eng = Engine::new(
@@ -552,7 +554,7 @@ async fn origin_update_named_domain_with_no_origin_errors() {
 // --- env-defined domains -----------------------------------------------------
 
 #[tokio::test]
-async fn origin_update_provisions_an_env_domain_then_plain_pulls() {
+async fn origin_update_bootstraps_an_env_domain_then_plain_pulls() {
     let tmp = tempfile::tempdir().unwrap();
     let mock = Arc::new(MockProvider::new());
     let c1 = mock.add_commit(commit_files(&[
@@ -578,12 +580,12 @@ async fn origin_update_provisions_an_env_domain_then_plain_pulls() {
     )
     .await;
 
-    // First update provisions: the missing-state env domain subscribes.
+    // First update bootstraps: the missing-state env domain subscribes.
     let result = eng.origin_update(Some("team")).await.unwrap();
     let domains = result["domains"].as_array().unwrap();
     assert_eq!(domains.len(), 1);
     assert_eq!(domains[0]["domain"], "team");
-    assert_eq!(domains[0]["provisioned"], true);
+    assert_eq!(domains[0]["bootstrapped"], true);
     assert_eq!(domains[0]["engrams"], 2);
     assert_eq!(domains[0]["base_commit"], c1);
     assert_eq!(result["errors"].as_array().unwrap().len(), 0);
@@ -595,7 +597,7 @@ async fn origin_update_provisions_an_env_domain_then_plain_pulls() {
         OriginState::load(&origins_dir.join("team"))
             .unwrap()
             .is_some(),
-        "origin state written on provisioning"
+        "origin state written on bootstrap"
     );
 
     // Indexed and searchable through the engine's own read path.
@@ -609,13 +611,13 @@ async fn origin_update_provisions_an_env_domain_then_plain_pulls() {
     assert_eq!(hits["total"], 1);
 
     // Second update is a plain pull now that state is present: nothing new
-    // upstream, so it is up to date and no longer marked provisioned.
+    // upstream, so it is up to date and no longer marked bootstrapped.
     let result = eng.origin_update(Some("team")).await.unwrap();
     let domains = result["domains"].as_array().unwrap();
     assert_eq!(domains.len(), 1);
     assert!(
-        domains[0]["provisioned"].is_null(),
-        "the second pull does not provision"
+        domains[0]["bootstrapped"].is_null(),
+        "the second pull does not bootstrap"
     );
     assert_eq!(domains[0]["up_to_date"], true);
 }

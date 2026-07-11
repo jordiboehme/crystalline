@@ -42,9 +42,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
+use crystalline_core::manifest::Manifest;
 use crystalline_core::parse_engram;
 
-use crate::archive::extract_tarball;
+use crate::archive::{extract_repo_subtree, extract_tarball};
 use crate::changes::{LocalChange, MAX_SHARED_FILE_BYTES, detect_local_changes};
 use crate::error::RemoteError;
 use crate::merge::{FileMerge, merge_file};
@@ -262,6 +263,16 @@ pub async fn subscribe(
         });
     }
 
+    // Materialize the out-of-subtree artifact mirror from the same tarball,
+    // driven by the MANIFEST's own provisioning decls at the fetched commit.
+    // Done before a working-tree byte is written so a decl escaping the
+    // repository root fails the whole subscribe with the disk untouched, the
+    // same fail-before-write stance the MANIFEST check above takes.
+    let manifest_source = extracted
+        .get("MANIFEST.md")
+        .and_then(|bytes| std::str::from_utf8(bytes).ok());
+    write_artifact_mirror(state_dir, spec.subpath.as_deref(), manifest_source, &bytes)?;
+
     let adopted = domain_root.exists() && std::fs::read_dir(domain_root)?.next().is_some();
 
     // One pass writes the base snapshot and stamps the manifest from the same
@@ -356,7 +367,32 @@ pub async fn pull(
     // Compute the domain-relative upstream change set, or re-baseline when the
     // base commit is no longer reachable upstream.
     let (edits, skipped_large) = match provider.compare(spec, &state.base_commit, &head).await {
-        Ok(cmp) => upstream_edits(provider, spec, &state, &head, cmp).await?,
+        Ok(cmp) => {
+            // Decide from the compare (before subpath filtering) whether the
+            // artifact mirror could have moved: a change under a declared
+            // out-of-subtree root, or a change to the subtree MANIFEST whose
+            // decls may themselves have shifted.
+            let refresh_needed = mirror_refresh_needed(&cmp, state_dir, spec.subpath.as_deref())?;
+            let (edits, skipped_large, fallback_tarball) =
+                upstream_edits(provider, spec, &state, &head, cmp).await?;
+            // The mirror rebuild runs before the merge loop and the base
+            // advance below, so a later commit that turned a decl hostile
+            // fails the whole pull with the previous mirror and base left
+            // intact. The tarball fallback already fetched the bytes, so it
+            // refreshes from those unconditionally; a clean compare fetches a
+            // tarball of its own only when the decision above asked for it.
+            match fallback_tarball {
+                Some(bytes) => {
+                    refresh_artifact_mirror(state_dir, spec.subpath.as_deref(), &bytes)?;
+                }
+                None if refresh_needed => {
+                    let bytes = provider.tarball(spec, &head).await?;
+                    refresh_artifact_mirror(state_dir, spec.subpath.as_deref(), &bytes)?;
+                }
+                None => {}
+            }
+            (edits, skipped_large)
+        }
         Err(RemoteError::RepoNotFound { .. }) | Err(RemoteError::Api { status: 404, .. }) => {
             return rebaseline(
                 provider,
@@ -916,6 +952,11 @@ async fn rebaseline(
     let bytes = provider.tarball(spec, &head).await?;
     let (extracted, skipped_large) = extract_tarball(&bytes, spec.subpath.as_deref())?;
 
+    // Rebuild the artifact mirror from the same fetched tree, before the base
+    // is replaced, so a head that turned a decl hostile fails the re-baseline
+    // with the previous mirror intact.
+    refresh_artifact_mirror(state_dir, spec.subpath.as_deref(), &bytes)?;
+
     let mut applied = Vec::new();
     for (rel, content) in &extracted {
         let wt_path = checked_working_path(state_dir, domain_root, rel)?;
@@ -975,13 +1016,18 @@ async fn refresh_proposals(
 /// filtering to the domain subtree and enforcing the shared-file size cap on
 /// upstream content. Falls back to a whole-tree tarball diff when the compare
 /// is truncated or lists more than [`MAX_COMPARE_FILES`] files.
+///
+/// The third element of the return is the tarball bytes the fallback path
+/// fetched, `Some` when the whole-tree diff ran and `None` for a plain
+/// compare, so the caller can refresh the artifact mirror from the very same
+/// bytes rather than fetching a second tarball.
 async fn upstream_edits(
     provider: &dyn Provider,
     spec: &OriginSpec,
     state: &OriginState,
     head: &str,
     cmp: CompareResult,
-) -> Result<(Vec<UpstreamEdit>, Vec<(String, u64)>), RemoteError> {
+) -> Result<(Vec<UpstreamEdit>, Vec<(String, u64)>, Option<Vec<u8>>), RemoteError> {
     let sub = spec.subpath.as_deref();
 
     let filtered: Vec<&UpstreamChange> = cmp
@@ -997,7 +1043,9 @@ async fn upstream_edits(
         .collect();
 
     if cmp.truncated || filtered.len() > MAX_COMPARE_FILES {
-        return upstream_edits_from_tarball(provider, spec, state, head).await;
+        let (edits, skipped, bytes) =
+            upstream_edits_from_tarball(provider, spec, state, head).await?;
+        return Ok((edits, skipped, Some(bytes)));
     }
 
     let mut edits = Vec::new();
@@ -1048,7 +1096,7 @@ async fn upstream_edits(
             }
         }
     }
-    Ok((edits, skipped_large))
+    Ok((edits, skipped_large, None))
 }
 
 /// Fetches a changed file's content by blob sha and records it as an edit,
@@ -1082,12 +1130,15 @@ async fn push_blob_edit(
 /// against the base manifest, the fallback when a compare is truncated or too
 /// large to page. Oversized entries the extractor skipped are excluded from
 /// the removal set so they are not mistaken for deletions.
+///
+/// Returns the fetched tarball bytes alongside the change set so the caller
+/// can refresh the artifact mirror from the same download.
 async fn upstream_edits_from_tarball(
     provider: &dyn Provider,
     spec: &OriginSpec,
     state: &OriginState,
     head: &str,
-) -> Result<(Vec<UpstreamEdit>, Vec<(String, u64)>), RemoteError> {
+) -> Result<(Vec<UpstreamEdit>, Vec<(String, u64)>, Vec<u8>), RemoteError> {
     let bytes = provider.tarball(spec, head).await?;
     let (extracted, skipped_large) = extract_tarball(&bytes, spec.subpath.as_deref())?;
     let skipped: BTreeSet<&str> = skipped_large.iter().map(|(p, _)| p.as_str()).collect();
@@ -1117,7 +1168,7 @@ async fn upstream_edits_from_tarball(
             });
         }
     }
-    Ok((edits, skipped_large))
+    Ok((edits, skipped_large, bytes))
 }
 
 /// True when `rel` (a domain-relative path) belongs to a proposal that just
@@ -1185,6 +1236,152 @@ fn to_repo_relative(domain_rel: &str, subpath: Option<&str>) -> String {
         None => domain_rel.to_string(),
         Some(sub) => format!("{}/{domain_rel}", sub.trim_matches('/')),
     }
+}
+
+/// The out-of-subtree provisioning roots a MANIFEST declares, each as
+/// `(kind id, repo-relative root)`, with the repository-root escape check
+/// already applied.
+///
+/// The decl set is read from the fetched MANIFEST's own bytes, never the
+/// local working tree: the mirror is canonical upstream content arriving
+/// through the same trusted pull channel as engrams, so a local-only decl a
+/// user has not shared yet simply resolves to an empty mirror dir until it is
+/// shared. A decl that stays inside the subtree (no `..` climb) is omitted: the
+/// working tree already serves it. A decl that climbs out of the subtree has
+/// its `subpath + decl.path` normalized against the repository root; one that
+/// climbs past the repository root is a hard [`RemoteError::State`] naming the
+/// decl, since a repo-bounded mirror is a security invariant. An unreadable or
+/// unparseable MANIFEST, or one with no Provisioning section, declares no
+/// roots.
+fn mirror_roots(
+    manifest_source: Option<&str>,
+    subpath: Option<&str>,
+) -> Result<Vec<(&'static str, String)>, RemoteError> {
+    let Some(source) = manifest_source else {
+        return Ok(Vec::new());
+    };
+    let Ok(engram) = parse_engram(source) else {
+        return Ok(Vec::new());
+    };
+    let manifest = Manifest::from_engram(&engram, source);
+    let Some(section) = manifest.provisioning() else {
+        return Ok(Vec::new());
+    };
+
+    let mut roots = Vec::new();
+    for decl in &section.decls {
+        let (_, climbs) = crystalline_core::manifest::normalize_relative(&decl.path);
+        if climbs == 0 {
+            // In-subtree (or root-landing): the working tree serves it, exactly
+            // as `resolve_source_roots` resolves it against the domain root.
+            continue;
+        }
+        // Combine with the subtree's own repo-relative location and normalize
+        // against the repository root.
+        let combined = match subpath {
+            Some(sub) => format!("{}/{}", sub.trim_matches('/'), decl.path),
+            None => decl.path.clone(),
+        };
+        let (kept, climbs) = crystalline_core::manifest::normalize_relative(&combined);
+        if climbs > 0 {
+            return Err(RemoteError::State(format!(
+                "provisioning decl `{}: {}` escapes the repository root and cannot be mirrored",
+                decl.kind.id(),
+                decl.path
+            )));
+        }
+        roots.push((decl.kind.id(), kept.join("/")));
+    }
+    Ok(roots)
+}
+
+/// Writes the team-domain artifact mirror under `state_dir/artifacts` from a
+/// tarball's bytes, driven by `manifest_source`'s out-of-subtree decls.
+///
+/// Each declared out-of-subtree folder is sliced out of the same tarball and
+/// clear-then-written into `artifacts/<kind>`; every kind no longer declared
+/// is pruned, and the whole `artifacts` directory falls away once nothing is
+/// declared (a MANIFEST that dropped its Provisioning section). The escape
+/// check in [`mirror_roots`] runs before any directory is touched, so a
+/// hostile decl fails the whole operation with the previous mirror intact.
+fn write_artifact_mirror(
+    state_dir: &Path,
+    subpath: Option<&str>,
+    manifest_source: Option<&str>,
+    tarball_bytes: &[u8],
+) -> Result<(), RemoteError> {
+    let roots = mirror_roots(manifest_source, subpath)?;
+    let desired: BTreeSet<&str> = roots.iter().map(|(kind, _)| *kind).collect();
+    for (kind_id, repo_root) in &roots {
+        let (files, _skipped_large) = extract_repo_subtree(tarball_bytes, repo_root)?;
+        state::replace_artifact_kind(state_dir, kind_id, &files)?;
+    }
+    state::prune_artifact_kinds(state_dir, &desired)?;
+    Ok(())
+}
+
+/// Refreshes the artifact mirror from a fetched tarball whose MANIFEST is read
+/// back out of the same bytes. The pull-side entry point where only the
+/// tarball is in hand (the compare refresh, both tarball fallbacks); subscribe
+/// passes its already-extracted MANIFEST straight to [`write_artifact_mirror`].
+fn refresh_artifact_mirror(
+    state_dir: &Path,
+    subpath: Option<&str>,
+    tarball_bytes: &[u8],
+) -> Result<(), RemoteError> {
+    let (subtree, _skipped_large) = extract_tarball(tarball_bytes, subpath)?;
+    let manifest_source = subtree
+        .get("MANIFEST.md")
+        .and_then(|bytes| std::str::from_utf8(bytes).ok());
+    write_artifact_mirror(state_dir, subpath, manifest_source, tarball_bytes)
+}
+
+/// Whether a compare result could have moved the artifact mirror, decided
+/// against the base snapshot's MANIFEST decls (repo-relative, before subpath
+/// filtering): true when a changed path falls under a declared out-of-subtree
+/// root, or when the subtree MANIFEST itself changed (its decls may have
+/// shifted, adding or dropping a mirrored folder). A base MANIFEST that
+/// somehow no longer parses cleanly is treated as needing a refresh, which
+/// then re-validates the fetched MANIFEST.
+fn mirror_refresh_needed(
+    cmp: &CompareResult,
+    state_dir: &Path,
+    subpath: Option<&str>,
+) -> Result<bool, RemoteError> {
+    let base_manifest = state::read_base_file(state_dir, "MANIFEST.md")?;
+    let roots = match base_manifest
+        .as_deref()
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+    {
+        Some(source) => match mirror_roots(Some(source), subpath) {
+            Ok(roots) => roots,
+            Err(_) => return Ok(true),
+        },
+        None => Vec::new(),
+    };
+    let manifest_key = to_repo_relative("MANIFEST.md", subpath);
+    for change in &cmp.files {
+        let mut paths = vec![change.path.as_str()];
+        if let ChangeKind::Renamed { previous } = &change.kind {
+            paths.push(previous.as_str());
+        }
+        for path in paths {
+            if path == manifest_key {
+                return Ok(true);
+            }
+            if roots.iter().any(|(_, root)| path_under_root(path, root)) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Whether repo-relative `path` sits at or under repo-relative `root`. An
+/// empty `root` (a decl resolving onto the repository root itself) covers the
+/// whole tree.
+fn path_under_root(path: &str, root: &str) -> bool {
+    root.is_empty() || path == root || path.starts_with(&format!("{root}/"))
 }
 
 /// Reads a working-tree file, returning `None` when it does not exist.

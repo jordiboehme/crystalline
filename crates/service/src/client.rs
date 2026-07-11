@@ -2,6 +2,7 @@
 //! commands (over the socket when a daemon runs, else in-process) and the ctl
 //! client used by the CLI operator commands.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -904,6 +905,117 @@ fn setting_view(
             value
         })
         .unwrap_or(Value::Null)
+}
+
+/// Apply, inspect or record a decision for domain-declared artifact
+/// provisioning (the skills, commands, agents and MCP servers a domain's
+/// `## Provisioning` section ships into a coding harness's own config
+/// directory): over the daemon when one is running and no explicit
+/// `--config` override was given, else against the config file and the
+/// provisioning receipt directly, mirroring `configure`'s daemon-first
+/// discipline (provisioning never opens the index either, so there is no
+/// `--db` to gate on). `action` is one of `status`, `allow`, `deny` or
+/// `apply`; `domain` is required for `allow`/`deny` and ignored otherwise.
+/// `allow`, `deny` and `apply` refuse on a read-only effective config,
+/// matching `Engine::provision`'s own guard; `status` is always answered.
+///
+/// The harnesses reconciled into always come from this machine's install
+/// receipt (`crystalline install`'s own record of onboarded harnesses),
+/// never a caller-supplied list.
+pub async fn provision(
+    action: &str,
+    domain: Option<&str>,
+    config_path: Option<&Path>,
+) -> anyhow::Result<Value> {
+    use serde_json::json;
+    // An explicit --config override names the exact file to operate on, the
+    // same reasoning `configure` documents: a running daemon serves ITS OWN
+    // default config, which may be a different one entirely.
+    if config_path.is_none()
+        && let Some(data) = ctl_if_running(json!({
+            "v": 1, "cmd": "provision", "action": action, "domain": domain,
+        }))
+        .await?
+    {
+        return Ok(data);
+    }
+
+    let loaded = overlay::load(config_path)?;
+    let install_receipt = crystalline_core::provision::install_receipt_path()
+        .map_err(|e| anyhow::anyhow!("could not resolve the install receipt path: {e}"))?;
+    let harnesses = crystalline_core::provision::installed_harnesses(&install_receipt);
+    let receipt_path = crystalline_core::provision::receipt_path()
+        .map_err(|e| anyhow::anyhow!("could not resolve the provisioning receipt path: {e}"))?;
+    // Named so the pending block never nags about a domain whose decision can
+    // never be recorded - see `crystalline_core::provision::apply`'s doc
+    // comment.
+    let env_domains: HashSet<&str> = loaded
+        .overlay
+        .env_domains()
+        .map(|(name, _)| name.as_str())
+        .collect();
+
+    match action {
+        "status" => {
+            let report = crystalline_core::provision::status(
+                &loaded.effective,
+                &receipt_path,
+                &harnesses,
+                &env_domains,
+            )?;
+            Ok(crate::engine::status_report_json(&report))
+        }
+        "allow" | "deny" => {
+            if loaded.effective.read_only() {
+                anyhow::bail!("{}", crate::engine::EngineError::ReadOnly);
+            }
+            let name =
+                domain.ok_or_else(|| anyhow::anyhow!("provision {action} requires a domain"))?;
+            // An env-defined domain's source of truth is its variable: the
+            // overlay re-inserts a fresh entry (provision unset) on every
+            // read, so a decision written to the file would be silently
+            // discarded. Checked before the registered-domain lookup so a
+            // shadowed and an env-only name both get the env message.
+            if let Some(env) = loaded.overlay.env_domain(name) {
+                anyhow::bail!(
+                    "domain '{name}' is defined by the environment variable {}; unset it to manage this domain in the config file",
+                    env.var
+                );
+            }
+            let mut file = loaded.file.clone();
+            crate::engine::set_domain_provision_decision(&mut file, name, action == "allow")?;
+            save_file(&loaded.path, &file)?;
+            let effective = loaded.overlay.apply(&file);
+            let mut mcp = crate::harness_cli::SystemMcpRunner;
+            let report = crystalline_core::provision::apply(
+                &effective,
+                &receipt_path,
+                &harnesses,
+                &mut mcp,
+                &env_domains,
+            )?;
+            Ok(crate::engine::apply_report_json(&report))
+        }
+        "apply" => {
+            if loaded.effective.read_only() {
+                anyhow::bail!("{}", crate::engine::EngineError::ReadOnly);
+            }
+            let mut mcp = crate::harness_cli::SystemMcpRunner;
+            let report = crystalline_core::provision::apply(
+                &loaded.effective,
+                &receipt_path,
+                &harnesses,
+                &mut mcp,
+                &env_domains,
+            )?;
+            Ok(crate::engine::apply_report_json(&report))
+        }
+        other => {
+            anyhow::bail!(
+                "unknown provision action '{other}'; expected status, allow, deny or apply"
+            )
+        }
+    }
 }
 
 /// Save a config to the path the load chokepoint already resolved.

@@ -23,7 +23,7 @@
 //! The overlay also carries env-defined domains: `CRYSTALLINE_DOMAIN_<NAME>`
 //! registers a file domain rooted at a path, and an optional
 //! `CRYSTALLINE_DOMAIN_<NAME>_ORIGIN=owner/repo[/subpath][@branch]` attaches a
-//! GitHub origin to it so a headless node provisions the team domain itself on
+//! GitHub origin to it so a headless node bootstraps the team domain itself on
 //! first contact. These domains are merged into the effective config last (env
 //! wins over a file entry of the same name) and are never written back to the
 //! file. Two grammar consequences follow from the `_ORIGIN` suffix rule and
