@@ -134,14 +134,16 @@ impl RecordingRunner {
 impl McpRunner for RecordingRunner {
     fn add(&mut self, _harness: HarnessKind, name: &str, _server_json: &str) -> McpOutcome {
         self.calls.push(format!("add:{name}"));
-        self.add_outcomes.pop_front().unwrap_or(McpOutcome::Applied)
+        self.add_outcomes
+            .pop_front()
+            .unwrap_or_else(McpOutcome::applied)
     }
 
     fn remove(&mut self, _harness: HarnessKind, name: &str) -> McpOutcome {
         self.calls.push(format!("remove:{name}"));
         self.remove_outcomes
             .pop_front()
-            .unwrap_or(McpOutcome::Applied)
+            .unwrap_or_else(McpOutcome::applied)
     }
 }
 
@@ -172,7 +174,7 @@ fn apply_opts_in_domain_installs_files_and_stamps_sources() {
 
     let receipt_dir = tempfile::tempdir().unwrap();
     let receipt_path = receipt_dir.path().join("provisions.json");
-    let mut runner = RecordingRunner::new().on_add(McpOutcome::Applied);
+    let mut runner = RecordingRunner::new().on_add(McpOutcome::applied());
 
     let previous = set_home(home.path());
     let report = provision::apply(
@@ -237,8 +239,8 @@ fn apply_opt_out_removes_files_and_drops_source_stamps() {
     let receipt_dir = tempfile::tempdir().unwrap();
     let receipt_path = receipt_dir.path().join("provisions.json");
     let mut runner = RecordingRunner::new()
-        .on_add(McpOutcome::Applied)
-        .on_remove(McpOutcome::Applied);
+        .on_add(McpOutcome::applied())
+        .on_remove(McpOutcome::applied());
 
     let previous = set_home(home.path());
 
@@ -499,7 +501,7 @@ fn status_reflects_decisions_counts_and_edits_without_writing() {
 
     let receipt_dir = tempfile::tempdir().unwrap();
     let receipt_path = receipt_dir.path().join("provisions.json");
-    let mut runner = RecordingRunner::new().on_add(McpOutcome::Applied);
+    let mut runner = RecordingRunner::new().on_add(McpOutcome::applied());
 
     let previous = set_home(home.path());
     provision::apply(

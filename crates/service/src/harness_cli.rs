@@ -107,26 +107,179 @@ fn run_harness_cli_output(harness: HarnessKind, args: &[&str]) -> CliOutput {
     CliOutput::NotFound
 }
 
+/// The transport shape a harness CLI needs, distilled from the artifact json's
+/// `server` object. Claude Code takes the raw json; Codex and Copilot take
+/// positional command line arguments, so the object is reduced to one of these.
+enum ServerShape {
+    /// A stdio server: a command, its args and its environment.
+    Stdio {
+        /// The executable to launch.
+        command: String,
+        /// The arguments passed to it.
+        args: Vec<String>,
+        /// `KEY`/`VALUE` environment pairs, in sorted key order.
+        env: Vec<(String, String)>,
+    },
+    /// An HTTP server: its URL and any request headers.
+    Http {
+        /// The server URL.
+        url: String,
+        /// `NAME`/`VALUE` header pairs, in sorted key order.
+        headers: Vec<(String, String)>,
+    },
+}
+
+/// Reduce a `server` json object to the [`ServerShape`] a positional CLI needs,
+/// or `None` when it names neither a `command` nor a `url`. A `type` of `http`,
+/// `streamable-http` or `sse`, or a bare `url` with no `command`, reads as HTTP;
+/// anything with a `command` reads as stdio (an entry with no `type` is stdio,
+/// the same default the harness CLIs take).
+fn parse_server_shape(server_json: &str) -> Option<ServerShape> {
+    let value: serde_json::Value = serde_json::from_str(server_json).ok()?;
+    let obj = value.as_object()?;
+    let ty = obj.get("type").and_then(|t| t.as_str());
+    let http = matches!(ty, Some("http") | Some("streamable-http") | Some("sse"))
+        || (obj.contains_key("url") && !obj.contains_key("command"));
+    if http {
+        let url = obj.get("url")?.as_str()?.to_string();
+        Some(ServerShape::Http {
+            url,
+            headers: string_pairs(obj.get("headers")),
+        })
+    } else {
+        let command = obj.get("command")?.as_str()?.to_string();
+        let args = obj
+            .get("args")
+            .and_then(|a| a.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Some(ServerShape::Stdio {
+            command,
+            args,
+            env: string_pairs(obj.get("env")),
+        })
+    }
+}
+
+/// Read a json object of string values into `(key, value)` pairs. serde_json
+/// backs its map with a `BTreeMap`, so the pairs come out in sorted key order -
+/// the same stable order the scan's canonical `server` json already uses, so a
+/// built argv is deterministic.
+fn string_pairs(value: Option<&serde_json::Value>) -> Vec<(String, String)> {
+    value
+        .and_then(|v| v.as_object())
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// The argument vector (after the CLI program name) that registers `name` with
-/// `server_json` for `harness`, or `None` when this harness has no MCP runner
-/// arm yet. Claude Code takes a user-scope `mcp add-json`; Codex and Copilot
-/// gain their own arms in a later milestone. Kept pure so a test can assert the
-/// exact argv without spawning anything.
-fn mcp_add_argv(harness: HarnessKind, name: &str, server_json: &str) -> Option<Vec<String>> {
+/// `server_json` for `harness`, plus any notices for `server` fields this
+/// harness's CLI has no flag for (dropped with their names, never silently),
+/// or `None` when the server shape cannot be built into a command line for
+/// this harness at all. Claude Code takes a user-scope `mcp add-json` with the
+/// raw json; Codex and Copilot take positional `mcp add` forms translated from
+/// the server object. Kept pure so a test can assert the exact argv and
+/// notices without spawning anything.
+fn mcp_add_argv(
+    harness: HarnessKind,
+    name: &str,
+    server_json: &str,
+) -> Option<(Vec<String>, Vec<String>)> {
     match harness {
-        HarnessKind::ClaudeCode => Some(
+        HarnessKind::ClaudeCode => Some((
             ["mcp", "add-json", name, server_json, "--scope", "user"]
                 .into_iter()
                 .map(String::from)
                 .collect(),
-        ),
-        HarnessKind::Codex | HarnessKind::Copilot => None,
+            Vec::new(),
+        )),
+        HarnessKind::Codex => codex_add_argv(name, parse_server_shape(server_json)?),
+        HarnessKind::Copilot => copilot_add_argv(name, parse_server_shape(server_json)?),
     }
 }
 
+/// Codex `mcp add`: stdio as `mcp add <name> [--env K=V ...] -- <cmd> [args]`,
+/// HTTP as `mcp add <name> --url <url>`. Codex exposes no header flag on an
+/// HTTP add, so headers cannot be carried: the server still registers, and a
+/// notice names the dropped `headers` field and its keys so the drop is never
+/// silent.
+fn codex_add_argv(name: &str, shape: ServerShape) -> Option<(Vec<String>, Vec<String>)> {
+    let mut argv = vec!["mcp".to_string(), "add".to_string(), name.to_string()];
+    let mut notices = Vec::new();
+    match shape {
+        ServerShape::Stdio { command, args, env } => {
+            for (key, value) in env {
+                argv.push("--env".to_string());
+                argv.push(format!("{key}={value}"));
+            }
+            argv.push("--".to_string());
+            argv.push(command);
+            argv.extend(args);
+        }
+        ServerShape::Http { url, headers } => {
+            argv.push("--url".to_string());
+            argv.push(url);
+            if !headers.is_empty() {
+                let keys: Vec<&str> = headers.iter().map(|(k, _)| k.as_str()).collect();
+                notices.push(format!(
+                    "the `headers` field of the MCP server `{name}` ({}) has no Codex CLI flag - registering it without those headers.",
+                    keys.join(", ")
+                ));
+            }
+        }
+    }
+    Some((argv, notices))
+}
+
+/// Copilot `mcp add`: stdio as `mcp add <name> [--env K=V ...] -- <cmd> [args]`,
+/// HTTP as `mcp add --transport http <name> <url> [--header "K: V" ...]`. Unlike
+/// Codex, Copilot does take a `--header` flag, so HTTP headers are carried and
+/// nothing is dropped.
+fn copilot_add_argv(name: &str, shape: ServerShape) -> Option<(Vec<String>, Vec<String>)> {
+    let argv = match shape {
+        ServerShape::Stdio { command, args, env } => {
+            let mut argv = vec!["mcp".to_string(), "add".to_string(), name.to_string()];
+            for (key, value) in env {
+                argv.push("--env".to_string());
+                argv.push(format!("{key}={value}"));
+            }
+            argv.push("--".to_string());
+            argv.push(command);
+            argv.extend(args);
+            argv
+        }
+        ServerShape::Http { url, headers } => {
+            let mut argv = vec![
+                "mcp".to_string(),
+                "add".to_string(),
+                "--transport".to_string(),
+                "http".to_string(),
+                name.to_string(),
+                url,
+            ];
+            for (key, value) in headers {
+                argv.push("--header".to_string());
+                argv.push(format!("{key}: {value}"));
+            }
+            argv
+        }
+    };
+    Some((argv, Vec::new()))
+}
+
 /// The argument vector (after the CLI program name) that deregisters `name` for
-/// `harness`, or `None` when this harness has no MCP runner arm yet. The remove
-/// counterpart of [`mcp_add_argv`].
+/// `harness`. The remove counterpart of [`mcp_add_argv`]: Claude Code takes a
+/// user-scope `mcp remove`; Codex and Copilot take the symmetric `mcp remove
+/// <name>` (Codex documents the verb; Copilot's is the symmetric form of its
+/// documented `mcp add`).
 fn mcp_remove_argv(harness: HarnessKind, name: &str) -> Option<Vec<String>> {
     match harness {
         HarnessKind::ClaudeCode => Some(
@@ -135,7 +288,12 @@ fn mcp_remove_argv(harness: HarnessKind, name: &str) -> Option<Vec<String>> {
                 .map(String::from)
                 .collect(),
         ),
-        HarnessKind::Codex | HarnessKind::Copilot => None,
+        HarnessKind::Codex | HarnessKind::Copilot => Some(
+            ["mcp", "remove", name]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+        ),
     }
 }
 
@@ -147,23 +305,25 @@ fn manual_command(harness: HarnessKind, argv: &[String]) -> String {
 }
 
 /// The real [`McpRunner`]: it registers and deregisters domain-provisioned MCP
-/// servers by shelling out to a harness's own CLI. A harness with no runner arm
-/// yet answers [`McpOutcome::Unsupported`]; a Claude Code add refused because
-/// the name already belongs to someone else is read off the CLI's stderr as
-/// [`McpOutcome::AlreadyExists`], so a reconcile leaves that foreign
+/// servers by shelling out to a harness's own CLI. All three harnesses have an
+/// arm; a `server` object that names neither a command nor a url cannot be
+/// built into a command line and answers [`McpOutcome::Unsupported`]. An add
+/// refused because the name already belongs to someone else is read off the
+/// CLI's stderr as [`McpOutcome::AlreadyExists`] (matched on the "already
+/// exists" phrasing Claude Code prints), so a reconcile leaves that foreign
 /// registration untouched; a missing binary or any other non-zero exit becomes
 /// [`McpOutcome::Failed`] carrying the exact command to run by hand.
 pub struct SystemMcpRunner;
 
 impl McpRunner for SystemMcpRunner {
     fn add(&mut self, harness: HarnessKind, name: &str, server_json: &str) -> McpOutcome {
-        let Some(argv) = mcp_add_argv(harness, name, server_json) else {
+        let Some((argv, notices)) = mcp_add_argv(harness, name, server_json) else {
             return McpOutcome::Unsupported;
         };
         let manual = manual_command(harness, &argv);
         let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
         match run_harness_cli_output(harness, &refs) {
-            CliOutput::Ok => McpOutcome::Applied,
+            CliOutput::Ok => McpOutcome::Applied { notices },
             CliOutput::NotFound => McpOutcome::Failed { manual },
             CliOutput::Failed { stderr } => {
                 if stderr.to_lowercase().contains("already exists") {
@@ -182,7 +342,7 @@ impl McpRunner for SystemMcpRunner {
         let manual = manual_command(harness, &argv);
         let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
         match run_harness_cli_output(harness, &refs) {
-            CliOutput::Ok => McpOutcome::Applied,
+            CliOutput::Ok => McpOutcome::applied(),
             CliOutput::NotFound | CliOutput::Failed { .. } => McpOutcome::Failed { manual },
         }
     }
@@ -194,8 +354,9 @@ mod tests {
 
     #[test]
     fn claude_code_add_argv_is_user_scope_add_json() {
-        let argv =
+        let (argv, notices) =
             mcp_add_argv(HarnessKind::ClaudeCode, "lighthouse", "{\"type\":\"http\"}").unwrap();
+        assert!(notices.is_empty(), "{notices:?}");
         assert_eq!(
             argv,
             vec![
@@ -224,10 +385,108 @@ mod tests {
     }
 
     #[test]
-    fn codex_and_copilot_have_no_mcp_runner_arm_yet() {
+    fn codex_stdio_add_argv_passes_env_then_command_after_the_separator() {
+        let server =
+            r#"{"args":["--port","7"],"command":"buoy","env":{"TOKEN":"abc"},"type":"stdio"}"#;
+        let (argv, notices) = mcp_add_argv(HarnessKind::Codex, "buoy", server).unwrap();
+        assert!(notices.is_empty(), "stdio drops nothing: {notices:?}");
+        assert_eq!(
+            argv,
+            vec![
+                "mcp",
+                "add",
+                "buoy",
+                "--env",
+                "TOKEN=abc",
+                "--",
+                "buoy",
+                "--port",
+                "7"
+            ]
+        );
+        assert_eq!(
+            manual_command(HarnessKind::Codex, &argv),
+            "codex mcp add buoy --env TOKEN=abc -- buoy --port 7"
+        );
+    }
+
+    #[test]
+    fn codex_http_add_argv_uses_url_and_notices_dropped_headers() {
+        // Codex has no header flag on an http add, so the headers object is
+        // dropped rather than forged into an unsupported flag - but never
+        // silently: the add still goes ahead and a notice names the field,
+        // the header keys and the server.
+        let server = r#"{"headers":{"Authorization":"Bearer x"},"type":"http","url":"https://example.test/mcp"}"#;
+        let (argv, notices) = mcp_add_argv(HarnessKind::Codex, "lighthouse", server).unwrap();
+        assert_eq!(
+            argv,
+            vec![
+                "mcp",
+                "add",
+                "lighthouse",
+                "--url",
+                "https://example.test/mcp"
+            ]
+        );
+        assert!(
+            !argv.iter().any(|a| a.contains("Authorization")),
+            "headers never reach the argv"
+        );
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(
+            notices[0].contains("`headers`")
+                && notices[0].contains("Authorization")
+                && notices[0].contains("lighthouse"),
+            "the notice names the field, the keys and the server: {notices:?}"
+        );
+    }
+
+    #[test]
+    fn copilot_stdio_add_argv_matches_the_codex_stdio_shape() {
+        let server = r#"{"command":"buoy","env":{"TOKEN":"abc"},"type":"stdio"}"#;
+        let (argv, notices) = mcp_add_argv(HarnessKind::Copilot, "buoy", server).unwrap();
+        assert!(notices.is_empty(), "{notices:?}");
+        assert_eq!(
+            argv,
+            vec!["mcp", "add", "buoy", "--env", "TOKEN=abc", "--", "buoy"]
+        );
+    }
+
+    #[test]
+    fn copilot_http_add_argv_uses_transport_flag_and_carries_headers() {
+        let server = r#"{"headers":{"Authorization":"Bearer x"},"type":"http","url":"https://example.test/mcp"}"#;
+        let (argv, notices) = mcp_add_argv(HarnessKind::Copilot, "lighthouse", server).unwrap();
+        assert!(
+            notices.is_empty(),
+            "headers are carried, nothing drops: {notices:?}"
+        );
+        assert_eq!(
+            argv,
+            vec![
+                "mcp",
+                "add",
+                "--transport",
+                "http",
+                "lighthouse",
+                "https://example.test/mcp",
+                "--header",
+                "Authorization: Bearer x",
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_and_copilot_remove_argv_is_the_symmetric_form() {
         for harness in [HarnessKind::Codex, HarnessKind::Copilot] {
-            assert!(mcp_add_argv(harness, "lighthouse", "{}").is_none());
-            assert!(mcp_remove_argv(harness, "lighthouse").is_none());
+            let argv = mcp_remove_argv(harness, "lighthouse").unwrap();
+            assert_eq!(argv, vec!["mcp", "remove", "lighthouse"]);
         }
+    }
+
+    #[test]
+    fn an_unbuildable_server_shape_has_no_argv() {
+        // Neither a command nor a url: nothing to register, so no argv.
+        assert!(mcp_add_argv(HarnessKind::Codex, "x", r#"{"note":"empty"}"#).is_none());
+        assert!(mcp_add_argv(HarnessKind::Copilot, "x", r#"{"note":"empty"}"#).is_none());
     }
 }

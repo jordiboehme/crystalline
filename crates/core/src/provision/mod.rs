@@ -22,10 +22,12 @@
 pub mod model;
 pub mod receipt;
 pub mod reconcile;
+pub(crate) mod translate;
 
 pub use model::{
-    ArtifactFile, DesiredFile, DesiredMcp, DesiredSet, DomainArtifacts, McpArtifact, desired_set,
-    harness_supports, is_plain_component, resolve_source_roots, scan_domain,
+    ArtifactFile, DesiredFile, DesiredMcp, DesiredPayload, DesiredSet, DomainArtifacts,
+    McpArtifact, desired_set, harness_supports, is_plain_component, resolve_source_roots,
+    scan_domain,
 };
 pub use receipt::{
     DomainSources, HarnessState, InstalledFile, InstalledMcp, ProvisionReceipt, SourceStamp, load,
@@ -34,6 +36,7 @@ pub use receipt::{
 pub use reconcile::{
     ActionStatus, ArtifactAction, DeferringMcpRunner, McpOutcome, McpRunner, reconcile_harness,
 };
+pub use translate::{Agent, Command};
 
 // --- orchestration -------------------------------------------------------
 //
@@ -964,8 +967,10 @@ fn stat_commands(root: &Path, out: &mut BTreeMap<String, FileStat>) {
     }
 }
 
-/// Stat every top-level `*.md` file directly inside `root` (no recursion),
-/// keyed `agents/<file>` - the stat-only mirror of `model`'s `scan_agents`.
+/// Stat every top-level `*.md` or `*.toml` file directly inside `root` (no
+/// recursion), keyed `agents/<file>` - the stat-only mirror of `model`'s
+/// `scan_agents`, matching its `.md`-or-`.toml` selection so a walked key never
+/// diverges from a stamped one over a Codex-dialect agent.
 fn stat_agents(root: &Path, out: &mut BTreeMap<String, FileStat>) {
     let Ok(entries) = std::fs::read_dir(root) else {
         return;
@@ -981,7 +986,8 @@ fn stat_agents(root: &Path, out: &mut BTreeMap<String, FileStat>) {
             continue;
         };
         let path = entry.path();
-        if !file_type.is_file() || path.extension().and_then(|e| e.to_str()) != Some("md") {
+        let ext = path.extension().and_then(|e| e.to_str());
+        if !file_type.is_file() || !matches!(ext, Some("md") | Some("toml")) {
             continue;
         }
         if let Some(stat) = file_stat(&path) {
@@ -1420,9 +1426,10 @@ mod tests {
     /// `scan_domain` must agree on: a skill with a nested `scripts/` file, a
     /// skill directory missing `SKILL.md`, a hidden entry at the root of a
     /// kind and hidden entry inside a skill, a non-`.md` file among the
-    /// commands, a nested command, a top-level and a nested agents file, and a
-    /// name unsafe per `is_plain_component`. Returns the roots ready for both
-    /// functions.
+    /// commands, a nested command, a top-level markdown agent, a top-level
+    /// Codex-dialect `.toml` agent, a nested agents file and an agents file of
+    /// another extension (both never selected), and a name unsafe per
+    /// `is_plain_component`. Returns the roots ready for both functions.
     fn selection_parity_roots(root: &Path) -> Vec<(ArtifactType, PathBuf)> {
         let skills = root.join("skills");
         // A real skill: SKILL.md plus a nested scripts/ file underneath it.
@@ -1447,8 +1454,11 @@ mod tests {
         fixture_file(&commands.join("notes.txt"), "not markdown");
 
         let agents = root.join("agents");
-        // Agents select only top-level *.md.
+        // Agents select top-level *.md and *.toml (the Codex agent dialect),
+        // nothing nested and no other extension.
         fixture_file(&agents.join("top.md"), "# top agent");
+        fixture_file(&agents.join("codex-reviewer.toml"), "name = \"reviewer\"");
+        fixture_file(&agents.join("notes.json"), "never selected");
         fixture_file(&agents.join("nested/inner.md"), "never selected");
 
         vec![
@@ -1481,6 +1491,7 @@ mod tests {
         assert!(stat_keys.contains("commands/top.md"));
         assert!(stat_keys.contains("commands/sub/nested.md"));
         assert!(stat_keys.contains("agents/top.md"));
-        assert_eq!(stat_keys.len(), 5);
+        assert!(stat_keys.contains("agents/codex-reviewer.toml"));
+        assert_eq!(stat_keys.len(), 6);
     }
 }

@@ -23,22 +23,30 @@ use std::path::{Path, PathBuf};
 use crate::config;
 use crate::harness::{HarnessKind, artifact_base};
 use crate::manifest::ArtifactType;
-use crate::provision::model::{DesiredFile, DesiredSet};
+use crate::provision::model::{DesiredFile, DesiredPayload, DesiredSet};
 use crate::provision::receipt::{
     HarnessState, InstalledFile, InstalledMcp, plain_rel_key, sha256_hex,
 };
 
 /// The result of asking a harness's CLI to register or deregister one MCP
 /// server. Registration is process work behind [`McpRunner`], so a reconcile
-/// run learns the outcome only through these four cases.
+/// run learns the outcome only through these cases.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum McpOutcome {
-    /// The change took effect.
-    Applied,
+    /// The change took effect. `notices` carries any user-facing notes raised
+    /// while applying it - typically a `server` field the harness CLI has no
+    /// flag for, dropped with a notice naming it rather than silently - which
+    /// the reconcile surfaces alongside its own notices.
+    Applied {
+        /// Notices raised while applying the change.
+        notices: Vec<String>,
+    },
     /// The add was refused because the name is already registered by someone
     /// else - foreign data a reconcile never seizes.
     AlreadyExists,
-    /// This harness has no MCP runner arm yet (a later milestone fills it in).
+    /// The change could not be expressed as this harness's CLI invocation at
+    /// all - a `server` object naming neither a command nor a url - so
+    /// nothing was run.
     Unsupported,
     /// The change was recognized but deliberately not carried out now. The
     /// session-start path installs a runner that answers this for every add
@@ -55,6 +63,16 @@ pub enum McpOutcome {
         /// The command to run by hand.
         manual: String,
     },
+}
+
+impl McpOutcome {
+    /// A clean [`McpOutcome::Applied`] with no notices - the common case, and
+    /// the spelling tests and runners reach for when nothing was dropped.
+    pub fn applied() -> McpOutcome {
+        McpOutcome::Applied {
+            notices: Vec::new(),
+        }
+    }
 }
 
 /// An [`McpRunner`] that carries out no MCP change at all: every add and
@@ -243,7 +261,7 @@ fn apply_desired_file(
             // Absent locally, recorded or not: an explicit reconcile writes it.
             // A file missing on disk is not read as a deletion here; that
             // session-start nuance arrives in a later milestone.
-            match write_file(target, &want.source) {
+            match write_payload(target, &want.payload) {
                 Ok(sha) => {
                     record_file(state, key, want, sha);
                     actions.push(file_action(target, ActionStatus::Installed));
@@ -261,7 +279,7 @@ fn apply_desired_file(
                     if local_sha == want.sha256 {
                         record_file(state, key, want, want.sha256.clone());
                     } else {
-                        match write_file(target, &want.source) {
+                        match write_payload(target, &want.payload) {
                             Ok(sha) => {
                                 record_file(state, key, want, sha);
                                 actions.push(file_action(target, ActionStatus::Updated));
@@ -276,7 +294,7 @@ fn apply_desired_file(
                         notices.push(msg);
                         return;
                     }
-                    match write_file(target, &want.source) {
+                    match write_payload(target, &want.payload) {
                         Ok(sha) => {
                             record_file(state, key, want, sha);
                             actions.push(file_action(target, ActionStatus::UpdatedBackup));
@@ -363,7 +381,10 @@ fn reconcile_mcps(
         match state.mcps.get(name).cloned() {
             // Not ours yet: try to register it.
             None => match mcp.add(harness, name, &want.server_json) {
-                McpOutcome::Applied => {
+                McpOutcome::Applied {
+                    notices: add_notices,
+                } => {
+                    notices.extend(add_notices);
                     record_mcp(state, name, &want.domain, &want.sha256);
                     actions.push(mcp_action(name, ActionStatus::McpAdded));
                 }
@@ -398,7 +419,10 @@ fn reconcile_mcps(
                     actions.push(mcp_action(name, ActionStatus::McpDeferred));
                     continue;
                 }
-                if removed != McpOutcome::Applied {
+                let McpOutcome::Applied {
+                    notices: remove_notices,
+                } = removed
+                else {
                     notices.push(mcp_update_failed_notice(
                         harness,
                         name,
@@ -406,9 +430,13 @@ fn reconcile_mcps(
                     ));
                     actions.push(mcp_action(name, ActionStatus::McpFailed));
                     continue;
-                }
+                };
+                notices.extend(remove_notices);
                 match mcp.add(harness, name, &want.server_json) {
-                    McpOutcome::Applied => {
+                    McpOutcome::Applied {
+                        notices: add_notices,
+                    } => {
+                        notices.extend(add_notices);
                         record_mcp(state, name, &want.domain, &want.sha256);
                         actions.push(mcp_action(name, ActionStatus::McpUpdated));
                     }
@@ -436,7 +464,10 @@ fn reconcile_mcps(
         .collect();
     for name in undesired {
         match mcp.remove(harness, &name) {
-            McpOutcome::Applied => {
+            McpOutcome::Applied {
+                notices: remove_notices,
+            } => {
+                notices.extend(remove_notices);
                 state.mcps.remove(&name);
                 actions.push(mcp_action(&name, ActionStatus::McpRemoved));
             }
@@ -529,15 +560,27 @@ fn prune_empty_dirs(base: &Path, file_parent: &Path) {
 
 // --- filesystem primitives ---------------------------------------------------
 
-/// Copy `source`'s bytes to `target` atomically (creating parent dirs) and
-/// return their hash, or a notice string on any read or write error.
-fn write_file(target: &Path, source: &Path) -> Result<String, String> {
-    let bytes = std::fs::read(source).map_err(|e| {
-        format!(
-            "could not read the source for `{}` ({e}) - leaving it as it is.",
-            target.display()
-        )
-    })?;
+/// Resolve a [`DesiredPayload`] into the exact bytes to write: a passthrough
+/// source is read off disk, a rendered target already carries its bytes. This
+/// is the one arm the cross-dialect payload enum adds to reconcile; every row
+/// of the semantics table below is otherwise unchanged, since it only ever asks
+/// "what bytes does this desired file resolve to" and hashes what it wrote.
+fn payload_bytes(target: &Path, payload: &DesiredPayload) -> Result<Vec<u8>, String> {
+    match payload {
+        DesiredPayload::File(source) => std::fs::read(source).map_err(|e| {
+            format!(
+                "could not read the source for `{}` ({e}) - leaving it as it is.",
+                target.display()
+            )
+        }),
+        DesiredPayload::Rendered(bytes) => Ok(bytes.clone()),
+    }
+}
+
+/// Write a desired file's bytes to `target` atomically (creating parent dirs)
+/// and return their hash, or a notice string on any read or write error.
+fn write_payload(target: &Path, payload: &DesiredPayload) -> Result<String, String> {
+    let bytes = payload_bytes(target, payload)?;
     config::save_bytes(target, &bytes).map_err(|e| {
         format!(
             "could not write `{}` ({e}) - leaving it as it is.",
@@ -650,7 +693,7 @@ fn mcp_already_exists_notice(harness: HarnessKind, name: &str, domain: &str) -> 
 
 fn mcp_unsupported_notice(harness: HarnessKind, name: &str) -> String {
     format!(
-        "{} does not register MCP servers yet, so `{name}` was left alone.",
+        "The MCP server `{name}` could not be turned into a {} registration - check its config's `server` object - so it was left alone.",
         harness.display_name()
     )
 }
@@ -736,14 +779,16 @@ mod tests {
     impl McpRunner for RecordingRunner {
         fn add(&mut self, _harness: HarnessKind, name: &str, _server_json: &str) -> McpOutcome {
             self.calls.push(format!("add:{name}"));
-            self.add_outcomes.pop_front().unwrap_or(McpOutcome::Applied)
+            self.add_outcomes
+                .pop_front()
+                .unwrap_or_else(McpOutcome::applied)
         }
 
         fn remove(&mut self, _harness: HarnessKind, name: &str) -> McpOutcome {
             self.calls.push(format!("remove:{name}"));
             self.remove_outcomes
                 .pop_front()
-                .unwrap_or(McpOutcome::Applied)
+                .unwrap_or_else(McpOutcome::applied)
         }
     }
 
@@ -775,7 +820,18 @@ mod tests {
         std::fs::write(&src, content).unwrap();
         DesiredFile {
             domain: "harbor".to_string(),
-            source: src,
+            payload: DesiredPayload::File(src),
+            sha256: sha256_hex(content.as_bytes()),
+        }
+    }
+
+    /// A [`DesiredFile`] whose payload is already-translated bytes (a
+    /// cross-dialect render), from the `harbor` domain. No source file exists on
+    /// disk: the bytes are carried inline, exactly as a real render produces.
+    fn rendered_file(content: &str) -> DesiredFile {
+        DesiredFile {
+            domain: "harbor".to_string(),
+            payload: DesiredPayload::Rendered(content.as_bytes().to_vec()),
             sha256: sha256_hex(content.as_bytes()),
         }
     }
@@ -1044,6 +1100,62 @@ mod tests {
         assert!(!state.files.contains_key(KEY));
     }
 
+    // --- rendered (cross-dialect) targets ------------------------------------
+
+    // A Rendered target carries its bytes inline rather than pointing at a
+    // source file, but it must travel every row of the semantics table exactly
+    // as a File target does - the payload only changes where the bytes come
+    // from, never what reconcile decides. These two rows stand in for the rest.
+
+    #[test]
+    fn rendered_absent_locally_is_installed_from_inline_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let key = "agents/quartermaster.md";
+        let mut desired = DesiredSet::default();
+        desired
+            .files
+            .insert(key.to_string(), rendered_file("RENDERED\n"));
+        let mut state = HarnessState::default();
+
+        let (actions, notices) = run(&bases(root.path()), &desired, &mut state, &mut NoMcp);
+
+        assert_eq!(statuses(&actions), vec![ActionStatus::Installed]);
+        assert!(notices.is_empty(), "{notices:?}");
+        let target = root.path().join("agents/quartermaster.md");
+        // The inline rendered bytes landed verbatim, and the receipt records
+        // their hash - not any source file's.
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "RENDERED\n");
+        assert_eq!(state.files[key].sha256, sha256_hex(b"RENDERED\n"));
+    }
+
+    #[test]
+    fn rendered_owned_but_edited_is_updated_with_backup() {
+        let root = tempfile::tempdir().unwrap();
+        let key = "agents/quartermaster.md";
+        let target = root.path().join("agents/quartermaster.md");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "EDITED\n").unwrap();
+
+        let mut desired = DesiredSet::default();
+        desired
+            .files
+            .insert(key.to_string(), rendered_file("RENDERED-NEW\n"));
+        let mut state = HarnessState::default();
+        // Owned at an earlier hash, differing from the edited bytes on disk.
+        state
+            .files
+            .insert(key.to_string(), installed(&sha256_hex(b"RENDERED-OLD\n")));
+
+        let (actions, notices) = run(&bases(root.path()), &desired, &mut state, &mut NoMcp);
+
+        assert_eq!(statuses(&actions), vec![ActionStatus::UpdatedBackup]);
+        assert!(notices.is_empty(), "{notices:?}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "RENDERED-NEW\n");
+        let bak = target.with_file_name("quartermaster.md.bak");
+        assert_eq!(std::fs::read_to_string(&bak).unwrap(), "EDITED\n");
+        assert_eq!(state.files[key].sha256, sha256_hex(b"RENDERED-NEW\n"));
+    }
+
     // --- prune ---------------------------------------------------------------
 
     #[test]
@@ -1156,13 +1268,33 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let desired = desired_mcp("lighthouse", "v1");
         let mut state = HarnessState::default();
-        let mut runner = RecordingRunner::new().on_add(McpOutcome::Applied);
+        let mut runner = RecordingRunner::new().on_add(McpOutcome::applied());
 
         let (actions, notices) = run(&bases(root.path()), &desired, &mut state, &mut runner);
 
         assert_eq!(statuses(&actions), vec![ActionStatus::McpAdded]);
         assert!(notices.is_empty(), "{notices:?}");
         assert_eq!(runner.calls, vec!["add:lighthouse"]);
+        assert_eq!(state.mcps["lighthouse"].sha256, sha256_hex(b"v1"));
+    }
+
+    #[test]
+    fn mcp_add_applied_with_notices_registers_and_surfaces_them() {
+        // A runner can apply a change while dropping a field its CLI has no
+        // flag for (Codex http headers): the server still registers and owns
+        // its receipt row, and the dropped-field notice reaches the caller.
+        let root = tempfile::tempdir().unwrap();
+        let desired = desired_mcp("lighthouse", "v1");
+        let mut state = HarnessState::default();
+        let dropped = "the `headers` field of the MCP server `lighthouse` has no Codex CLI flag - registering it without those headers.";
+        let mut runner = RecordingRunner::new().on_add(McpOutcome::Applied {
+            notices: vec![dropped.to_string()],
+        });
+
+        let (actions, notices) = run(&bases(root.path()), &desired, &mut state, &mut runner);
+
+        assert_eq!(statuses(&actions), vec![ActionStatus::McpAdded]);
+        assert_eq!(notices, vec![dropped.to_string()]);
         assert_eq!(state.mcps["lighthouse"].sha256, sha256_hex(b"v1"));
     }
 
@@ -1175,8 +1307,8 @@ mod tests {
             .mcps
             .insert("lighthouse".to_string(), installed_mcp("v1"));
         let mut runner = RecordingRunner::new()
-            .on_remove(McpOutcome::Applied)
-            .on_add(McpOutcome::Applied);
+            .on_remove(McpOutcome::applied())
+            .on_add(McpOutcome::applied());
 
         let (actions, notices) = run(&bases(root.path()), &desired, &mut state, &mut runner);
 
@@ -1195,7 +1327,7 @@ mod tests {
         state
             .mcps
             .insert("lighthouse".to_string(), installed_mcp("v1"));
-        let mut runner = RecordingRunner::new().on_remove(McpOutcome::Applied);
+        let mut runner = RecordingRunner::new().on_remove(McpOutcome::applied());
 
         let (actions, notices) = run(&bases(root.path()), &desired, &mut state, &mut runner);
 
@@ -1256,7 +1388,7 @@ mod tests {
             .insert("lighthouse".to_string(), installed_mcp("v1"));
         // Remove succeeds, the re-add fails: the old entry must survive.
         let mut runner = RecordingRunner::new()
-            .on_remove(McpOutcome::Applied)
+            .on_remove(McpOutcome::applied())
             .on_add(McpOutcome::Failed {
                 manual: "claude mcp add-json lighthouse {...} --scope user".to_string(),
             });

@@ -12,6 +12,7 @@ use crate::harness::HarnessKind;
 use crate::manifest::{self, ArtifactType, Manifest};
 use crate::parse::parse_engram;
 use crate::provision::receipt::sha256_hex;
+use crate::provision::translate::{self, Translated};
 
 /// Whether `component` is safe to use as a single path component when an
 /// artifact's location is joined onto a harness config directory, i.e.
@@ -230,10 +231,14 @@ fn scan_commands(
     }
 }
 
-/// Every `*.md` file directly inside `root`, no recursion; `rel` is the file
-/// name. A symlink is skipped silently rather than followed, the same
-/// no-follow stance [`walk_visible`] documents - following one would let a
-/// hostile entry stage the bytes of any file it can point at.
+/// Every `*.md` or `*.toml` file directly inside `root`, no recursion; `rel` is
+/// the file name. The extension is the agent's source dialect: a `.md` file is
+/// the markdown dialect Claude and GitHub Copilot read natively, a `.toml` file
+/// is the Codex dialect; the projection in [`crate::provision::translate`]
+/// decides which target gets a passthrough and which a conversion. A symlink is
+/// skipped silently rather than followed, the same no-follow stance
+/// [`walk_visible`] documents - following one would let a hostile entry stage
+/// the bytes of any file it can point at.
 fn scan_agents(
     kind: ArtifactType,
     root: &Path,
@@ -255,7 +260,8 @@ fn scan_agents(
             continue;
         };
         let path = entry.path();
-        if !file_type.is_file() || path.extension().and_then(|e| e.to_str()) != Some("md") {
+        let ext = path.extension().and_then(|e| e.to_str());
+        if !file_type.is_file() || !matches!(ext, Some("md") | Some("toml")) {
             continue;
         }
         if !is_plain_component(&name) {
@@ -472,16 +478,46 @@ fn logical_join(root: &Path, path: &str) -> PathBuf {
     result
 }
 
+/// The bytes a desired file resolves to when a reconcile finally writes it.
+///
+/// A [`DesiredPayload::File`] is a byte-identical passthrough: the target
+/// harness speaks the same dialect the artifact was authored in, so the source
+/// file is copied verbatim and the desired hash is the source hash. A
+/// [`DesiredPayload::Rendered`] carries the exact bytes a cross-dialect
+/// translation produced (a markdown agent emitted as Codex TOML, a Codex prompt
+/// nested for Claude), hashed over those bytes rather than the source's - so
+/// hand-edit detection and `.bak` semantics stay relative to what was actually
+/// installed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DesiredPayload {
+    /// Copy this source file's bytes unchanged (same-dialect passthrough).
+    File(PathBuf),
+    /// Write these already-translated bytes (cross-dialect target).
+    Rendered(Vec<u8>),
+}
+
 /// One key in a [`DesiredSet`]: `"<kind.id()>/<rel>"`, harness-agnostic - a
 /// reconcile engine maps it to a real path via [`crate::harness::HarnessPaths`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DesiredFile {
     /// The domain that won this key.
     pub domain: String,
-    /// Where the file lives on disk.
-    pub source: PathBuf,
-    /// Lowercase hex sha256 of the file's bytes.
+    /// The bytes to write: a passthrough source path or rendered bytes.
+    pub payload: DesiredPayload,
+    /// Lowercase hex sha256 of the bytes actually written.
     pub sha256: String,
+}
+
+impl DesiredFile {
+    /// The passthrough source path when this file is a byte-identical copy of a
+    /// source file, or `None` for a cross-dialect rendered target that has no
+    /// single source path on disk.
+    pub fn source_path(&self) -> Option<&Path> {
+        match &self.payload {
+            DesiredPayload::File(path) => Some(path),
+            DesiredPayload::Rendered(_) => None,
+        }
+    }
 }
 
 /// One desired MCP server, keyed by its own name.
@@ -506,83 +542,105 @@ pub struct DesiredSet {
     pub mcps: BTreeMap<String, DesiredMcp>,
 }
 
-/// Whether `harness` provisions artifacts of `kind` at all. This milestone's
-/// support matrix: Claude Code takes all four kinds; Codex and Copilot take
-/// skills only. M11 extends this as those harnesses gain command, agent and
-/// MCP support of their own.
+/// Whether `harness` provisions artifacts of `kind` at all. The full matrix:
+/// artifacts are authored in a source dialect and translated to every harness
+/// whose format can carry them, so Claude Code and Codex take all four kinds
+/// (a command flattens for Codex, an agent converts to or from TOML, an MCP
+/// server registers through the harness CLI) and GitHub Copilot takes every
+/// kind but commands - the Copilot CLI declined a prompt-file surface, so a
+/// command has nowhere to land there and is skipped with a notice. How each
+/// supported pair actually maps (passthrough versus a cross-dialect render)
+/// lives in [`crate::provision::translate`]; this gate answers only the coarse
+/// "at all" question the MCP path and the skip notices need.
 pub fn harness_supports(harness: HarnessKind, kind: ArtifactType) -> bool {
-    matches!(
+    !matches!(
         (harness, kind),
-        (HarnessKind::ClaudeCode, _)
-            | (HarnessKind::Codex, ArtifactType::Skills)
-            | (HarnessKind::Copilot, ArtifactType::Skills)
+        (HarnessKind::Copilot, ArtifactType::Commands)
     )
 }
 
-/// Project every domain's scanned artifacts into one harness's desired set.
+/// Project every domain's scanned artifacts into one harness's desired set,
+/// translating each artifact into the harness's own dialect along the way.
 ///
 /// `all` must be in registry config order - the order domains are declared
 /// in `config.yaml` - since that order is this function's collision-breaking
 /// contract: the first domain to claim a key wins it outright, and every
 /// later domain claiming the same key (or, for an MCP, the same name) only
-/// produces a notice naming both domains and the key. A domain shipping an
-/// artifact kind this harness does not support yet produces one notice per
-/// `(domain, kind)` pair naming the harness, however many artifacts of that
-/// kind the domain ships.
+/// produces a notice naming both domains and the key. Two of one domain's own
+/// artifacts can now collide too - a nested command and a flat command that
+/// flatten to the same Codex key - and the same first-wins rule settles it,
+/// with a notice naming both source files. A harness that provisions a kind at
+/// all but cannot carry one artifact (a malformed cross-dialect source, an
+/// agent too thin to render) skips that one artifact with its own notice; a
+/// kind a harness has no surface for at all (a command for GitHub Copilot)
+/// produces one notice per `(domain, kind)` pair, however many it ships.
 pub fn desired_set(harness: HarnessKind, all: &[DomainArtifacts]) -> (DesiredSet, Vec<String>) {
     let mut files: BTreeMap<String, DesiredFile> = BTreeMap::new();
     let mut mcps: BTreeMap<String, DesiredMcp> = BTreeMap::new();
     let mut notices = Vec::new();
     let mut unsupported_noted: HashSet<(String, &'static str)> = HashSet::new();
+    // Which domain and source `rel` won each target key, so a collision can name
+    // both the winning and the losing source, whatever dialect renamed them.
+    let mut winners: BTreeMap<String, (String, String)> = BTreeMap::new();
 
     for domain_artifacts in all {
         for file in &domain_artifacts.files {
-            if !harness_supports(harness, file.kind) {
-                if unsupported_noted.insert((domain_artifacts.domain.clone(), file.kind.id())) {
-                    notices.push(format!(
-                        "domain `{}` ships {}, but {} does not provision them yet - skipping",
-                        domain_artifacts.domain,
-                        file.kind.id(),
-                        harness.display_name()
-                    ));
+            match translate::translate_file(harness, file) {
+                Translated::Unsupported => {
+                    if unsupported_noted.insert((domain_artifacts.domain.clone(), file.kind.id())) {
+                        notices.push(unsupported_kind_notice(
+                            harness,
+                            &domain_artifacts.domain,
+                            file.kind,
+                        ));
+                    }
                 }
-                continue;
-            }
-            let key = format!("{}/{}", file.kind.id(), file.rel);
-            match files.get(&key) {
-                Some(existing) => {
-                    notices.push(format!(
-                        "domain `{}` and domain `{}` both provision `{key}` - domain `{}` wins",
-                        existing.domain, domain_artifacts.domain, existing.domain
-                    ));
-                }
-                None => {
-                    files.insert(
-                        key,
-                        DesiredFile {
-                            domain: domain_artifacts.domain.clone(),
-                            source: file.source.clone(),
-                            sha256: file.sha256.clone(),
-                        },
-                    );
+                Translated::Skip { notice } => notices.push(notice),
+                Translated::Emit {
+                    rel,
+                    payload,
+                    sha256,
+                    notices: field_notices,
+                } => {
+                    let key = format!("{}/{}", file.kind.id(), rel);
+                    match winners.get(&key) {
+                        Some((win_domain, win_rel)) => {
+                            notices.push(if *win_domain == domain_artifacts.domain {
+                                same_domain_collision_notice(
+                                    &domain_artifacts.domain,
+                                    win_rel,
+                                    &file.rel,
+                                    &key,
+                                )
+                            } else {
+                                cross_domain_collision_notice(
+                                    win_domain,
+                                    &domain_artifacts.domain,
+                                    &key,
+                                )
+                            });
+                        }
+                        None => {
+                            files.insert(
+                                key.clone(),
+                                DesiredFile {
+                                    domain: domain_artifacts.domain.clone(),
+                                    payload,
+                                    sha256,
+                                },
+                            );
+                            winners
+                                .insert(key, (domain_artifacts.domain.clone(), file.rel.clone()));
+                            notices.extend(field_notices);
+                        }
+                    }
                 }
             }
         }
 
-        if domain_artifacts.mcps.is_empty() {
-            continue;
-        }
-        if !harness_supports(harness, ArtifactType::Mcps) {
-            if unsupported_noted.insert((domain_artifacts.domain.clone(), ArtifactType::Mcps.id()))
-            {
-                notices.push(format!(
-                    "domain `{}` ships mcps, but {} does not provision them yet - skipping",
-                    domain_artifacts.domain,
-                    harness.display_name()
-                ));
-            }
-            continue;
-        }
+        // Every harness registers MCP servers through its own CLI -
+        // [`harness_supports`] is always true for mcps - so the servers
+        // project unconditionally.
         for mcp in &domain_artifacts.mcps {
             match mcps.get(&mcp.name) {
                 Some(existing) => {
@@ -606,6 +664,38 @@ pub fn desired_set(harness: HarnessKind, all: &[DomainArtifacts]) -> (DesiredSet
     }
 
     (DesiredSet { files, mcps }, notices)
+}
+
+/// The notice for a kind a harness has no surface for at all - a command for
+/// GitHub Copilot, whose CLI declined a prompt-file surface in favor of skills.
+fn unsupported_kind_notice(harness: HarnessKind, domain: &str, kind: ArtifactType) -> String {
+    format!(
+        "domain `{domain}` ships {k}, but {h} provides no {k} surface - skipping them. Ship them as skills to reach {h} users.",
+        k = kind.id(),
+        h = harness.display_name()
+    )
+}
+
+/// The notice for two different domains claiming the same target key: the
+/// earlier domain in config order keeps it.
+fn cross_domain_collision_notice(winner: &str, loser: &str, key: &str) -> String {
+    format!(
+        "domain `{winner}` and domain `{loser}` both provision `{key}` - domain `{winner}` wins"
+    )
+}
+
+/// The notice for one domain's own two artifacts colliding on a target key - a
+/// nested command and a flat command that flatten to the same Codex key. The
+/// first source in scan order keeps the key; both source paths are named.
+fn same_domain_collision_notice(
+    domain: &str,
+    winner_rel: &str,
+    loser_rel: &str,
+    key: &str,
+) -> String {
+    format!(
+        "domain `{domain}` maps both `{winner_rel}` and `{loser_rel}` to `{key}` - keeping `{winner_rel}`"
+    )
 }
 
 #[cfg(test)]
@@ -673,13 +763,23 @@ mod tests {
     }
 
     #[test]
-    fn codex_and_copilot_support_only_skills() {
-        for harness in [HarnessKind::Codex, HarnessKind::Copilot] {
-            assert!(harness_supports(harness, ArtifactType::Skills));
-            assert!(!harness_supports(harness, ArtifactType::Commands));
-            assert!(!harness_supports(harness, ArtifactType::Agents));
-            assert!(!harness_supports(harness, ArtifactType::Mcps));
+    fn codex_supports_all_kinds_and_copilot_all_but_commands() {
+        for kind in [
+            ArtifactType::Skills,
+            ArtifactType::Commands,
+            ArtifactType::Agents,
+            ArtifactType::Mcps,
+        ] {
+            assert!(harness_supports(HarnessKind::Codex, kind));
         }
+        // GitHub Copilot has no command surface, but takes every other kind.
+        assert!(harness_supports(HarnessKind::Copilot, ArtifactType::Skills));
+        assert!(harness_supports(HarnessKind::Copilot, ArtifactType::Agents));
+        assert!(harness_supports(HarnessKind::Copilot, ArtifactType::Mcps));
+        assert!(!harness_supports(
+            HarnessKind::Copilot,
+            ArtifactType::Commands
+        ));
     }
 
     #[test]
@@ -705,7 +805,7 @@ mod tests {
     }
 
     #[test]
-    fn copilot_gets_skills_only_with_one_notice_per_unsupported_kind() {
+    fn copilot_takes_skills_agents_and_mcps_and_skips_commands_with_one_notice() {
         let harbor = DomainArtifacts {
             domain: "harbor".to_string(),
             files: vec![
@@ -717,12 +817,14 @@ mod tests {
             mcps: vec![mcp("lighthouse", "harbor")],
         };
         let (desired, notices) = desired_set(HarnessKind::Copilot, std::slice::from_ref(&harbor));
-        assert_eq!(desired.files.len(), 1);
+        // Skills pass through, the markdown agent passes through natively, and
+        // the MCP registers - only the two commands have no Copilot surface.
+        assert_eq!(desired.files.len(), 2);
         assert!(desired.files.contains_key("skills/tide-tables/SKILL.md"));
-        assert!(desired.mcps.is_empty());
-        // One notice for commands (despite two command files), one for
-        // agents, one for mcps - not one per artifact.
-        assert_eq!(notices.len(), 3);
+        assert!(desired.files.contains_key("agents/quartermaster.md"));
+        assert_eq!(desired.mcps.len(), 1);
+        // One notice for commands despite two command files - not one per file.
+        assert_eq!(notices.len(), 1);
         assert!(
             notices
                 .iter()

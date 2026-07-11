@@ -2298,10 +2298,12 @@ async fn mirror_flows_through_resolve_scan_and_desired_set() {
         "desired set should carry the mirrored skill: {:?}",
         desired.files.keys().collect::<Vec<_>>()
     );
+    let source = desired.files[key]
+        .source_path()
+        .expect("a passthrough skill keeps its source path");
     assert!(
-        desired.files[key].source.starts_with(&mirror_skills),
-        "the winning source should be the mirror: {:?}",
-        desired.files[key].source
+        source.starts_with(&mirror_skills),
+        "the winning source should be the mirror: {source:?}"
     );
 
     // Keep the scratch directories alive until every assertion has run.

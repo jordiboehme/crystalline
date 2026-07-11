@@ -150,16 +150,20 @@ fn user_skills_dir(harness: HarnessKind) -> PathBuf {
 /// The user-scope directory a harness stores artifacts of `kind` under, or
 /// `None` when this harness keeps that kind nowhere on disk: an MCP config is
 /// registered through the harness CLI rather than written as a file, and a
-/// harness that does not provision a kind yet has no folder for it. A
-/// reconcile engine maps a desired key `"<kind>/<rel>"` to a real path by
-/// joining `rel` onto this base.
+/// harness with no surface for a kind has no folder for it. A reconcile
+/// engine maps a desired key `"<kind>/<rel>"` to a real path by joining `rel`
+/// onto this base.
 ///
-/// User scope only, which is where a domain provisions today. This milestone's
-/// matrix: Claude Code stores skills, commands and agents under `~/.claude`
-/// (and registers MCP servers through its CLI, so `Mcps` is `None`); Codex and
-/// GitHub Copilot store skills only, each under its own skills folder shared
-/// with [`harness_paths`]. M11 extends this as Codex and Copilot gain command,
-/// agent and MCP support of their own.
+/// User scope only, which is where a domain provisions today. The full
+/// matrix: every harness keeps skills under its own skills folder shared with
+/// [`harness_paths`]; Claude Code stores commands and agents under
+/// `~/.claude`; Codex stores its custom prompts (the flat directory a nested
+/// command flattens into) under `~/.codex/prompts` and its TOML agents under
+/// `~/.codex/agents`; GitHub Copilot reads markdown agents from its home's
+/// `agents` folder but declined a command surface outright, so Copilot
+/// commands stay `None` and are skipped with a notice. Every harness
+/// registers MCP servers through its own CLI, never as a file, so `Mcps` is
+/// always `None`.
 pub fn artifact_base(harness: HarnessKind, kind: ArtifactType) -> anyhow::Result<Option<PathBuf>> {
     let base = match (harness, kind) {
         (_, ArtifactType::Skills) => Some(user_skills_dir(harness)),
@@ -169,11 +173,16 @@ pub fn artifact_base(harness: HarnessKind, kind: ArtifactType) -> anyhow::Result
         (HarnessKind::ClaudeCode, ArtifactType::Agents) => {
             Some(config::expand_tilde("~/.claude/agents"))
         }
-        // Claude Code registers MCP servers through its own CLI, never as a
-        // file on disk; Codex and Copilot provision nothing but skills yet.
-        (HarnessKind::ClaudeCode, ArtifactType::Mcps)
-        | (HarnessKind::Codex, _)
-        | (HarnessKind::Copilot, _) => None,
+        // Codex custom prompts are deprecated upstream but functional; this
+        // base goes when the translate module's Codex command arm goes.
+        (HarnessKind::Codex, ArtifactType::Commands) => {
+            Some(config::expand_tilde("~/.codex/prompts"))
+        }
+        (HarnessKind::Codex, ArtifactType::Agents) => Some(config::expand_tilde("~/.codex/agents")),
+        (HarnessKind::Copilot, ArtifactType::Agents) => Some(copilot_home().join("agents")),
+        // The Copilot CLI declined a prompt-file surface (skills replace it),
+        // and every harness registers MCP servers through its own CLI.
+        (HarnessKind::Copilot, ArtifactType::Commands) | (_, ArtifactType::Mcps) => None,
     };
     Ok(base)
 }
@@ -273,21 +282,40 @@ mod tests {
     }
 
     #[test]
-    fn artifact_base_codex_and_copilot_provision_skills_only() {
-        for harness in [HarnessKind::Codex, HarnessKind::Copilot] {
-            assert!(
-                artifact_base(harness, ArtifactType::Skills)
-                    .unwrap()
-                    .is_some()
-            );
-            for kind in [
-                ArtifactType::Commands,
-                ArtifactType::Agents,
-                ArtifactType::Mcps,
-            ] {
-                assert_eq!(artifact_base(harness, kind).unwrap(), None);
-            }
-        }
+    fn artifact_base_codex_maps_prompts_and_agents_under_dot_codex() {
+        // A nested command flattens into Codex's flat prompts directory; a
+        // markdown agent renders into a TOML file under its agents directory.
+        assert_eq!(
+            artifact_base(HarnessKind::Codex, ArtifactType::Commands).unwrap(),
+            Some(config::expand_tilde("~/.codex/prompts"))
+        );
+        assert_eq!(
+            artifact_base(HarnessKind::Codex, ArtifactType::Agents).unwrap(),
+            Some(config::expand_tilde("~/.codex/agents"))
+        );
+        assert_eq!(
+            artifact_base(HarnessKind::Codex, ArtifactType::Mcps).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn artifact_base_copilot_maps_agents_under_its_home_and_commands_nowhere() {
+        // Copilot agents ride the same `COPILOT_HOME` helper as its skills and
+        // hooks; commands have no Copilot surface at all, so their base stays
+        // `None` and the desired-set projection skips them with a notice.
+        assert_eq!(
+            artifact_base(HarnessKind::Copilot, ArtifactType::Agents).unwrap(),
+            Some(copilot_home().join("agents"))
+        );
+        assert_eq!(
+            artifact_base(HarnessKind::Copilot, ArtifactType::Commands).unwrap(),
+            None
+        );
+        assert_eq!(
+            artifact_base(HarnessKind::Copilot, ArtifactType::Mcps).unwrap(),
+            None
+        );
     }
 
     #[test]
