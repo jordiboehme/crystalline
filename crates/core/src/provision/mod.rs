@@ -1553,7 +1553,10 @@ mod tests {
         // hidden check runs before anything looks inside it.
         fixture_file(&skills.join(".hidden-skill/SKILL.md"), "hidden");
         // A skill directory name unsafe per is_plain_component: selected by
-        // neither, regardless of what is inside it.
+        // neither, regardless of what is inside it. A colon is not a legal
+        // file name character on Windows, so this edge only exists on unix -
+        // which is also the only place such a name can reach the walkers.
+        #[cfg(unix)]
         fixture_file(&skills.join("bad:name/SKILL.md"), "unsafe name");
 
         let commands = root.join("commands");
