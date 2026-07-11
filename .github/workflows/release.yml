@@ -189,21 +189,28 @@ jobs:
           if-no-files-found: error
 
       # .msi package: only the two Windows legs produce one, built with the
-      # WiX v3 toolset preinstalled on the windows-latest image and driven by
-      # cargo-wix from crates/cli/wix/main.wxs. The MSI installs per machine
-      # into Program Files, puts the binary on the system PATH and upgrades in
-      # place thanks to the frozen UpgradeCode in the wxs, which stays shared
-      # across arches: on Windows on Arm the arm64 MSI major-upgrades an
-      # emulated-x64 install in place, which is the desired behavior.
+      # WiX v3 toolset and driven by cargo-wix from crates/cli/wix/main.wxs.
+      # windows-latest preinstalls WiX; the windows-11-arm image ships
+      # without it (verified 2026-07-11), so the guard step below installs it
+      # there. The MSI installs per machine into Program Files, puts the
+      # binary on the system PATH and upgrades in place thanks to the frozen
+      # UpgradeCode in the wxs, which stays shared across arches: on Windows
+      # on Arm the arm64 MSI major-upgrades an emulated-x64 install in
+      # place, which is the desired behavior.
       - name: Ensure WiX toolset is available
         if: matrix.msi
         shell: pwsh
         run: |
-          if (-not (Get-Command candle.exe -ErrorAction SilentlyContinue)) {
+          $candle = (Get-Command candle.exe -ErrorAction SilentlyContinue).Source
+          if (-not $candle) {
             choco install wixtoolset --no-progress -y
-            echo "${env:ProgramFiles(x86)}\WiX Toolset v3.14\bin" | Out-File -Append $env:GITHUB_PATH
+            # A GITHUB_PATH append only reaches later steps, and choco's PATH
+            # edit does not reach this shell either, so verify by full path.
+            $candle = "${env:ProgramFiles(x86)}\WiX Toolset v3.14\bin\candle.exe"
+            if (-not (Test-Path $candle)) { throw "candle.exe not found after WiX install" }
+            Split-Path $candle | Add-Content -Path $env:GITHUB_PATH
           }
-          candle.exe -? | Select-Object -First 1
+          "WiX candle $((Get-Item $candle).VersionInfo.FileVersion) at $candle"
 
       - name: Install cargo-wix
         if: matrix.msi
