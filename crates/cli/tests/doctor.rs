@@ -9,8 +9,13 @@
 use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
+// The provisioning doctor tests are unix-gated like the other harness-touching
+// suites, so their imports gate with them or Windows sees them as unused.
+#[cfg(unix)]
 use crystalline_core::provision::sha256_hex;
-use serde_json::{Value, json};
+use serde_json::Value;
+#[cfg(unix)]
+use serde_json::json;
 
 fn bin() -> Command {
     Command::cargo_bin("crystalline").unwrap()
