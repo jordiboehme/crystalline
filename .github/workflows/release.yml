@@ -24,6 +24,7 @@ jobs:
             platform: macos-arm64
             os: macos-latest
             archive_ext: tar.gz
+            codesign: true
           - target: x86_64-apple-darwin
             platform: macos-amd64
             # macos-15-intel is the last Intel macOS image GitHub ships;
@@ -32,6 +33,7 @@ jobs:
             # Rosetta 2, which those images include).
             os: macos-15-intel
             archive_ext: tar.gz
+            codesign: true
           - target: x86_64-unknown-linux-musl
             platform: linux-amd64
             os: ubuntu-latest
@@ -123,6 +125,140 @@ jobs:
           set -euo pipefail
           "${{ steps.bin.outputs.path }}" --version
           "${{ steps.bin.outputs.path }}" verify --help
+
+      # macOS code signing and notarization: sign the bare Mach-O with a
+      # Developer ID Application certificate under the hardened runtime,
+      # then notarize it with notarytool via an App Store Connect API key.
+      # A bare binary cannot carry a stapled ticket, so Gatekeeper resolves
+      # the notarization ticket online on first run; distribution stays a
+      # plain tar.gz. Signing runs BEFORE staging so the same signed binary
+      # flows into the archive, the Homebrew tap and the .mcpb bundles.
+      - name: Decide whether to sign and notarize
+        if: matrix.codesign
+        id: signing
+        shell: bash
+        env:
+          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          missing=()
+          for var in APPLE_CERTIFICATE_P12 APPLE_CERTIFICATE_PASSWORD APPLE_TEAM_ID \
+                     APPLE_API_KEY_P8 APPLE_API_KEY_ID APPLE_API_ISSUER_ID; do
+            [ -n "${!var:-}" ] || missing+=("$var")
+          done
+          if [ "${#missing[@]}" -eq 0 ]; then
+            echo "sign=true" >> "$GITHUB_OUTPUT"
+          elif [ "${#missing[@]}" -eq 6 ] && [ "${{ github.ref_type }}" != "tag" ]; then
+            echo "::notice::Apple signing secrets are not configured; this dry run produces an UNSIGNED macOS binary"
+            echo "sign=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Apple signing secrets missing (${missing[*]}); a tag build must sign and a partial secret set is always a misconfiguration"
+            exit 1
+          fi
+
+      - name: Set up signing keychain
+        if: matrix.codesign && steps.signing.outputs.sign == 'true'
+        shell: bash
+        env:
+          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          keychain_password="$(openssl rand -base64 32)"
+          cert="$RUNNER_TEMP/certificate.p12"
+          printf '%s' "$APPLE_CERTIFICATE_P12" | base64 --decode > "$cert"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$cert" -k "$keychain" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain" > /dev/null
+          security list-keychains -d user -s "$keychain" login.keychain-db
+          rm -f "$cert"
+
+      - name: Sign the binary
+        if: matrix.codesign && steps.signing.outputs.sign == 'true'
+        shell: bash
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          identity="$(security find-identity -v -p codesigning "$keychain" \
+            | awk -F'"' '/Developer ID Application/ { print $2; exit }')"
+          if [ -z "$identity" ]; then
+            echo "::error::no Developer ID Application identity found in the signing keychain"
+            exit 1
+          fi
+          codesign --force --timestamp --options runtime \
+            --identifier io.github.jordiboehme.crystalline \
+            --keychain "$keychain" \
+            --sign "$identity" \
+            "${{ steps.bin.outputs.path }}"
+          codesign --verify --strict --verbose=2 "${{ steps.bin.outputs.path }}"
+          info="$(codesign --display --verbose=2 "${{ steps.bin.outputs.path }}" 2>&1)"
+          echo "$info"
+          grep -q "Identifier=io.github.jordiboehme.crystalline" <<< "$info"
+          grep -q "TeamIdentifier=${APPLE_TEAM_ID}" <<< "$info"
+          grep -q "(runtime)" <<< "$info"
+
+      - name: Notarize the binary
+        if: matrix.codesign && steps.signing.outputs.sign == 'true'
+        shell: bash
+        env:
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          key="$RUNNER_TEMP/asc-key.p8"
+          printf '%s\n' "$APPLE_API_KEY_P8" > "$key"
+          zip="$RUNNER_TEMP/notarize.zip"
+          ditto -c -k "${{ steps.bin.outputs.path }}" "$zip"
+          result="$RUNNER_TEMP/notarize-result.json"
+          set +e
+          xcrun notarytool submit "$zip" \
+            --key "$key" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER_ID" \
+            --wait --timeout 30m --output-format json > "$result"
+          submit_rc=$?
+          set -e
+          cat "$result"
+          status="$(jq -r '.status // "unknown"' "$result")"
+          if [ "$submit_rc" -ne 0 ] || [ "$status" != "Accepted" ]; then
+            echo "::error::notarization failed (notarytool exit $submit_rc, status $status)"
+            submission_id="$(jq -r '.id // empty' "$result")"
+            if [ -n "$submission_id" ]; then
+              xcrun notarytool log "$submission_id" \
+                --key "$key" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER_ID" || true
+            fi
+            exit 1
+          fi
+          rm -f "$zip"
+
+      # Proves the hardened runtime does not break the binary (the embedded
+      # candle ML runtime is pure Rust with no JIT, so it should not).
+      - name: Smoke test the signed binary
+        if: matrix.codesign && steps.signing.outputs.sign == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          "${{ steps.bin.outputs.path }}" --version
+          "${{ steps.bin.outputs.path }}" verify --help
+
+      - name: Delete signing keychain
+        if: always() && matrix.codesign
+        shell: bash
+        run: |
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          if [ -f "$keychain" ]; then
+            security delete-keychain "$keychain"
+          fi
+          rm -f "$RUNNER_TEMP/certificate.p12" "$RUNNER_TEMP/asc-key.p8" "$RUNNER_TEMP/notarize.zip"
 
       - name: Stage archive contents
         id: stage

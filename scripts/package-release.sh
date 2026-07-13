@@ -3,7 +3,8 @@
 # mirroring what .github/workflows/release.yml builds per platform. Useful
 # for producing a one-off artifact by hand or sanity-checking packaging
 # before tagging a release. The workflow itself does not call this script;
-# it stays self-contained so CI never depends on a local dev tool.
+# it stays self-contained so CI never depends on a local dev tool. Archives
+# built here are unsigned; code signing and notarization happen only in CI.
 #
 # Usage: scripts/package-release.sh [target]
 # The target defaults to the current machine's host triple. The version is

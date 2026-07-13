@@ -67,9 +67,9 @@ crystalline --version
 
 The package also ships a systemd unit, installed disabled - see [Linux server with systemd](docs/deployment.md#linux-server-with-systemd) to run the daemon as a managed service.
 
-Windows, via MSI: download `crystalline-<version>-windows-amd64.msi` (or `crystalline-<version>-windows-arm64.msi` for Arm devices) from the [latest release](https://github.com/jordiboehme/crystalline/releases/latest) and double-click it, or install silently with `msiexec /i <file> /qn`. The installer adds Crystalline to the system PATH and upgrades in place. Releases are not code signed yet, so verify against `SHA256SUMS` and confirm any SmartScreen prompt (More info > Run anyway).
+Windows, via MSI: download `crystalline-<version>-windows-amd64.msi` (or `crystalline-<version>-windows-arm64.msi` for Arm devices) from the [latest release](https://github.com/jordiboehme/crystalline/releases/latest) and double-click it, or install silently with `msiexec /i <file> /qn`. The installer adds Crystalline to the system PATH and upgrades in place. Windows releases are not code signed yet, so verify against `SHA256SUMS` and confirm any SmartScreen prompt (More info > Run anyway).
 
-Every [release](https://github.com/jordiboehme/crystalline/releases/latest) also ships the standalone `crystalline` binary for macOS (Apple Silicon and Intel), Linux (x86_64 and arm64, statically linked) and Windows (x64 and Arm64), with a `SHA256SUMS` file for verification - or build from a clone with `cargo build --release`.
+Every [release](https://github.com/jordiboehme/crystalline/releases/latest) also ships the standalone `crystalline` binary for macOS (Apple Silicon and Intel), Linux (x86_64 and arm64, statically linked) and Windows (x64 and Arm64), with a `SHA256SUMS` file for verification - or build from a clone with `cargo build --release`. The macOS binaries are code signed and notarized with an Apple Developer ID, so Gatekeeper runs them without a prompt.
 
 ### Claude Code
 
