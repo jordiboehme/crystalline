@@ -5,7 +5,7 @@
 # `@anthropic-ai/mcpb` CLI.
 #
 # Usage: generate-manifest.sh <platform> <version> <outdir>
-#   platform  one of macos-arm64, macos-amd64, windows-amd64, windows-arm64,
+#   platform  one of macos-arm64, macos-intel, windows-amd64, windows-arm64,
 #             linux-amd64, linux-arm64
 #   version   release version without a leading v, e.g. 0.2.0
 #   outdir    directory manifest.json and icon.png are written into
@@ -14,7 +14,7 @@ set -euo pipefail
 
 usage() {
     echo "usage: $(basename "$0") <platform> <version> <outdir>" >&2
-    echo "  platform: macos-arm64 | macos-amd64 | windows-amd64 | windows-arm64 | linux-amd64 | linux-arm64" >&2
+    echo "  platform: macos-arm64 | macos-intel | windows-amd64 | windows-arm64 | linux-amd64 | linux-arm64" >&2
     exit 1
 }
 
@@ -37,7 +37,7 @@ command_path='${__dirname}/server/crystalline'
 os_platform=""
 
 case "$platform" in
-    macos-arm64 | macos-amd64)
+    macos-arm64 | macos-intel)
         os_platform="darwin"
         ;;
     windows-amd64 | windows-arm64)

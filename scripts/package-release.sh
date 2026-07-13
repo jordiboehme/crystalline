@@ -22,7 +22,7 @@ version="v$(awk -F'"' '/^version = /{ print $2; exit }' Cargo.toml)"
 # matrix.platform. The Rust target triple keeps driving the actual build below.
 case "$target" in
     aarch64-apple-darwin) platform="macos-arm64" ;;
-    x86_64-apple-darwin) platform="macos-amd64" ;;
+    x86_64-apple-darwin) platform="macos-intel" ;;
     x86_64-unknown-linux-musl) platform="linux-amd64" ;;
     aarch64-unknown-linux-musl) platform="linux-arm64" ;;
     x86_64-pc-windows-msvc) platform="windows-amd64" ;;
