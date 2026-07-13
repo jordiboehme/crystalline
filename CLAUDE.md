@@ -32,9 +32,9 @@ Dependency direction: core <- index <- service <- cli.
 
 ## Toolchain
 
-Rust is installed via Homebrew (`brew install rust`), which puts `cargo`, `rustc`, `clippy` and `rustfmt` directly on PATH at `/opt/homebrew/bin`. The commands above run as written, no wrapper needed.
+Rust is managed by rustup, installed via Homebrew (`brew install rustup`). Homebrew links only `rustup` itself into `/opt/homebrew/bin`; the proxies for `cargo`, `rustc`, `clippy` and `rustfmt` live in `/opt/homebrew/opt/rustup/bin`, which is not on the default PATH. If `cargo` is not found, prepend that directory (`export PATH="/opt/homebrew/opt/rustup/bin:$PATH"`) and the commands above run as written.
 
-There is no rustup, so the `rust-toolchain.toml` pin (channel 1.96.1) is not enforced: Homebrew supplies whatever version its `rust` formula carries, currently matching the pin at 1.96.1. If a `brew upgrade` moves `rust` past the pinned channel, either accept the drift or install rustup to honor `rust-toolchain.toml`.
+rustup enforces the `rust-toolchain.toml` pin: inside this repo every proxy resolves to channel 1.96.1 (including clippy and rustfmt) regardless of the default toolchain, and a missing pinned toolchain is downloaded on first use.
 
 ## Local folders (gitignored)
 
