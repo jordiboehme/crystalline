@@ -116,6 +116,11 @@ fn default_paths_are_namespaced() {
             .ends_with("crystalline/service.lock")
     );
     assert!(
+        config::service_info_path()
+            .unwrap()
+            .ends_with("crystalline/service.json")
+    );
+    assert!(
         config::models_dir()
             .unwrap()
             .ends_with("crystalline/models")

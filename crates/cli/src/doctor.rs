@@ -667,12 +667,18 @@ fn is_hidden(name: &str) -> bool {
 }
 
 fn check_service(fix: bool) -> Result<ServiceDoctor> {
-    let lock_path = config::service_lock_path()
+    // The record's primary home is `service.json`; a still-present pre-split
+    // daemon's record sitting in the lock file itself counts as present too
+    // (see `instance::read_lock_info`'s legacy fallback), so an upgraded
+    // doctor still flags and cleans up an old-format leftover.
+    let info_path = config::service_info_path()
+        .map_err(|e| anyhow!("could not resolve the service record path: {e}"))?;
+    let legacy_path = config::service_lock_path()
         .map_err(|e| anyhow!("could not resolve the service lock path: {e}"))?;
     let sock_path = config::service_sock_path()
         .map_err(|e| anyhow!("could not resolve the service socket path: {e}"))?;
 
-    let lock_present = lock_path.is_file();
+    let lock_present = info_path.is_file() || legacy_path.is_file();
     let info = instance::read_lock_info();
     let pid = info.as_ref().map(|i| i.pid);
     let alive = info
@@ -695,7 +701,9 @@ fn check_service(fix: bool) -> Result<ServiceDoctor> {
 
     if fix {
         if s.lock_stale {
-            s.lock_removed = std::fs::remove_file(&lock_path).is_ok();
+            let info_removed = std::fs::remove_file(&info_path).is_ok();
+            let legacy_removed = std::fs::remove_file(&legacy_path).is_ok();
+            s.lock_removed = info_removed || legacy_removed;
         }
         if s.socket_orphaned {
             s.socket_removed = std::fs::remove_file(&sock_path).is_ok();

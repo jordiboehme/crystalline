@@ -75,6 +75,7 @@ schemars = "1.2.1"
 futures = "0.3.32"
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Threading"] }
 
 # GitHub collaboration (crates/remote): plain-text three-way merge, the
 # GitHub-issued token in the OS keychain and repository tarball extraction.

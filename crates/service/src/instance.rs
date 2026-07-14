@@ -1,9 +1,13 @@
 //! Single-instance mechanics: the advisory lock and the local socket.
 //!
-//! Exactly one process owns the derived index. Ownership is an `fs4` advisory
-//! exclusive lock held on `service.lock` for the owner's lifetime; the socket
-//! (a Unix domain socket, or the named pipe `\\.\pipe\crystalline` on Windows)
-//! is how everyone else reaches it. See `research/single-instance-ipc.md`.
+//! Exactly one process owns the derived index. Ownership is an `fs4` exclusive
+//! lock held on `service.lock` for the owner's lifetime; the record describing
+//! the owner (pid, socket, version) lives in the separate `service.json`,
+//! because Windows region locks are mandatory - reads and writes through any
+//! other handle fail - so the locked file itself must never carry data. The
+//! socket (a Unix domain socket, or a per-state-directory named pipe on
+//! Windows) is how everyone else reaches the owner. See
+//! `research/single-instance-ipc.md`.
 //!
 //! Attaching is version aware: the lock record carries the owner's version,
 //! and a client built from a newer version displaces an older daemon with a
@@ -30,7 +34,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crystalline_core::config;
 
-/// The lock file record, written after the socket is bound.
+/// The owner record, written to service.json after the socket is bound.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LockInfo {
     /// The owning process id.
@@ -73,6 +77,7 @@ impl Connection {
 pub struct Ownership {
     lock_file: File,
     lock_path: PathBuf,
+    info_path: PathBuf,
     socket_path: PathBuf,
 }
 
@@ -88,7 +93,9 @@ impl Ownership {
         ListenerOptions::new().name(name).create_tokio()
     }
 
-    /// Publish the lock record now that the socket is bound.
+    /// Publish the owner record now that the socket is bound. Written beside
+    /// the lock file, never into it (mandatory locks on Windows), and renamed
+    /// into place so a reader never sees a partial record.
     pub fn publish(&self) -> io::Result<()> {
         let info = LockInfo {
             pid: std::process::id(),
@@ -97,7 +104,9 @@ impl Ownership {
             started_at: chrono::Utc::now().to_rfc3339(),
         };
         let json = serde_json::to_string(&info).unwrap_or_default();
-        std::fs::write(&self.lock_path, json.as_bytes())
+        let tmp = self.info_path.with_extension("json.tmp");
+        std::fs::write(&tmp, json.as_bytes())?;
+        std::fs::rename(&tmp, &self.info_path)
     }
 
     /// The socket path (unix) or pipe name (Windows) as a display string.
@@ -115,6 +124,7 @@ impl Ownership {
 
 impl Drop for Ownership {
     fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.info_path);
         let _ = FileExt::unlock(&self.lock_file);
         #[cfg(unix)]
         {
@@ -142,10 +152,19 @@ fn socket_name(sock_path: &Path) -> io::Result<Name<'_>> {
     }
 }
 
-/// Read the current lock record, if any is present and parseable.
+/// Read the current owner record, if any is present and parseable. Reads
+/// `service.json`; falls back to parsing a legacy record out of `service.lock`
+/// itself, which pre-record-split daemons wrote, so an upgraded client can
+/// still see (and displace) a daemon from before the split.
 pub fn read_lock_info() -> Option<LockInfo> {
-    let path = config::service_lock_path().ok()?;
-    let text = std::fs::read_to_string(path).ok()?;
+    if let Ok(path) = config::service_info_path()
+        && let Ok(text) = std::fs::read_to_string(path)
+        && let Ok(info) = serde_json::from_str(&text)
+    {
+        return Some(info);
+    }
+    let legacy = config::service_lock_path().ok()?;
+    let text = std::fs::read_to_string(legacy).ok()?;
     serde_json::from_str(&text).ok()
 }
 
@@ -380,6 +399,7 @@ pub fn acquire_ownership() -> anyhow::Result<Ownership> {
     let dir = config::state_dir()?;
     std::fs::create_dir_all(&dir)?;
     let lock_path = config::service_lock_path()?;
+    let info_path = config::service_info_path()?;
     let socket_path = config::service_sock_path()?;
 
     let file = OpenOptions::new()
@@ -406,9 +426,15 @@ pub fn acquire_ownership() -> anyhow::Result<Ownership> {
         );
     }
 
+    // The lock is held. Empty any legacy record bytes (pre-split daemons wrote
+    // the record into the lock file itself) through this same handle, the only
+    // handle that may touch a mandatorily locked file on Windows.
+    let _ = file.set_len(0);
+
     Ok(Ownership {
         lock_file: file,
         lock_path,
+        info_path,
         socket_path,
     })
 }
@@ -428,8 +454,8 @@ pub async fn read_mode_line(stream: &mut IpcStream) -> io::Result<String> {
     Ok(String::from_utf8_lossy(&buf).trim().to_string())
 }
 
-/// Best-effort process liveness. On unix a signal-0 probe; elsewhere the lock
-/// and socket reachability govern, so assume alive.
+/// Best-effort process liveness. On unix a signal-0 probe, on Windows an
+/// OpenProcess exit-code query; elsewhere assume alive.
 pub fn process_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
@@ -443,7 +469,28 @@ pub fn process_alive(pid: u32) -> bool {
         // EPERM means the process exists but is not ours to signal.
         io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, STILL_ACTIVE};
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        if pid == 0 {
+            return false;
+        }
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            // Access denied means the process exists but is not ours to query.
+            return std::io::Error::last_os_error().raw_os_error()
+                == Some(ERROR_ACCESS_DENIED as i32);
+        }
+        let mut code: u32 = 0;
+        let alive =
+            unsafe { GetExitCodeProcess(handle, &mut code) } != 0 && code == STILL_ACTIVE as u32;
+        unsafe { CloseHandle(handle) };
+        alive
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = pid;
         true
@@ -576,31 +623,27 @@ mod tests {
     // scratch socket instead, the same substitution `displace_*` above makes
     // for the daemon process itself.
 
-    /// Guards `HOME`/`XDG_*_HOME` for the two tests below: `try_attach_reporting`
-    /// resolves the real `crystalline_core::config::state_dir()` through
-    /// these, and cargo runs test functions from this file on multiple
-    /// threads, so both tests take this lock for their duration to avoid
-    /// observing each other's env var state. The same pattern
-    /// `crates/core/tests/config.rs` uses for `CRYSTALLINE_MODELS_DIR`.
-    /// `cfg(unix)` like the two tests that use it, so the Windows build does
-    /// not carry it as dead code.
-    #[cfg(unix)]
+    /// Guards `HOME`/`XDG_*_HOME` (and, on Windows, `USERPROFILE`/`APPDATA`/
+    /// `LOCALAPPDATA`) for the tests below: each resolves the real
+    /// `crystalline_core::config::state_dir()` through these, and cargo runs
+    /// test functions from this file on multiple threads, so every test takes
+    /// this lock for its duration to avoid observing another's env var state.
+    /// The same pattern `crates/core/tests/config.rs` uses for
+    /// `CRYSTALLINE_MODELS_DIR`.
     static STATE_DIR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// Points `HOME`/`XDG_*_HOME` at a fresh scratch directory for the
-    /// duration of one test, restoring whatever the surrounding environment
-    /// had on drop. A short `/tmp/cq-...` path rather than
+    /// Points `HOME`/`XDG_*_HOME` (and the Windows equivalents) at a fresh
+    /// scratch directory for the duration of one test, restoring whatever the
+    /// surrounding environment had on drop. A short base path rather than
     /// `tempfile::tempdir()`'s deeper one: the socket bound under it must stay
     /// within the ~104 byte unix socket path limit on macOS, the same reason
     /// the CLI integration tests' `Env` helper uses a short base.
-    #[cfg(unix)]
     struct ScratchHome {
         dir: PathBuf,
         previous: Vec<(&'static str, Option<String>)>,
         _guard: std::sync::MutexGuard<'static, ()>,
     }
 
-    #[cfg(unix)]
     impl ScratchHome {
         fn new(tag: &str) -> ScratchHome {
             let guard = STATE_DIR_ENV_LOCK.lock().unwrap();
@@ -608,7 +651,14 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
-            let dir = PathBuf::from("/tmp").join(format!("cq-{tag}-{nanos}"));
+            // `/tmp` keeps the unix socket path short; `temp_dir()` is the
+            // Windows equivalent (there is no unix socket path limit to
+            // respect there, but `/tmp` does not exist on Windows).
+            #[cfg(unix)]
+            let base = PathBuf::from("/tmp");
+            #[cfg(windows)]
+            let base = std::env::temp_dir();
+            let dir = base.join(format!("cq-{tag}-{nanos}"));
             std::fs::create_dir_all(dir.join("config")).unwrap();
             std::fs::create_dir_all(dir.join("state")).unwrap();
             std::fs::create_dir_all(dir.join("cache")).unwrap();
@@ -617,6 +667,9 @@ mod tests {
                 "XDG_CONFIG_HOME",
                 "XDG_STATE_HOME",
                 "XDG_CACHE_HOME",
+                "USERPROFILE",
+                "APPDATA",
+                "LOCALAPPDATA",
             ];
             let previous = vars.iter().map(|v| (*v, std::env::var(v).ok())).collect();
             unsafe {
@@ -624,6 +677,9 @@ mod tests {
                 std::env::set_var("XDG_CONFIG_HOME", dir.join("config"));
                 std::env::set_var("XDG_STATE_HOME", dir.join("state"));
                 std::env::set_var("XDG_CACHE_HOME", dir.join("cache"));
+                std::env::set_var("USERPROFILE", &dir);
+                std::env::set_var("APPDATA", dir.join("config"));
+                std::env::set_var("LOCALAPPDATA", dir.join("cache"));
             }
             // `state_dir()` itself never creates its directory (only
             // `acquire_ownership` does, which these tests bypass), so the
@@ -637,7 +693,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     impl Drop for ScratchHome {
         fn drop(&mut self) {
             for (var, value) in &self.previous {
@@ -672,14 +727,14 @@ mod tests {
             .unwrap();
         let pid = child.id();
 
-        let lock_path = config::service_lock_path().unwrap();
+        let info_path = config::service_info_path().unwrap();
         let info = LockInfo {
             pid,
             socket_path: sock.display().to_string(),
             version: "0.0.1".to_string(),
             started_at: chrono::Utc::now().to_rfc3339(),
         };
-        std::fs::write(&lock_path, serde_json::to_string(&info).unwrap()).unwrap();
+        std::fs::write(&info_path, serde_json::to_string(&info).unwrap()).unwrap();
 
         let server = tokio::spawn(async move {
             let mut stream = listener.accept().await.unwrap();
@@ -719,14 +774,14 @@ mod tests {
         let name = socket_name(&sock).unwrap();
         let listener = ListenerOptions::new().name(name).create_tokio().unwrap();
 
-        let lock_path = config::service_lock_path().unwrap();
+        let info_path = config::service_info_path().unwrap();
         let info = LockInfo {
             pid: std::process::id(),
             socket_path: sock.display().to_string(),
             version: crystalline_core::VERSION.to_string(),
             started_at: chrono::Utc::now().to_rfc3339(),
         };
-        std::fs::write(&lock_path, serde_json::to_string(&info).unwrap()).unwrap();
+        std::fs::write(&info_path, serde_json::to_string(&info).unwrap()).unwrap();
 
         let server = tokio::spawn(async move {
             let _ = listener.accept().await;
@@ -742,5 +797,77 @@ mod tests {
         drop(conn);
         server.await.unwrap();
         drop(home);
+    }
+
+    /// The record round trip that was impossible while the record lived inside
+    /// the locked file: publish writes and read_lock_info reads WHILE the
+    /// exclusive lock is held. Deliberately ungated - on Windows CI this is
+    /// the regression test for the mandatory-lock bug that broke daemon mode.
+    #[tokio::test]
+    async fn ownership_record_round_trips_while_the_lock_is_held() {
+        let home = ScratchHome::new("record-round-trip");
+        let ownership = acquire_ownership().unwrap();
+        ownership.publish().unwrap();
+        let info = read_lock_info().expect("the record is readable while the lock is held");
+        assert_eq!(info.pid, std::process::id());
+        assert_eq!(info.version, crystalline_core::VERSION);
+        assert_eq!(info.socket_path, ownership.socket_display());
+        drop(ownership);
+        assert!(read_lock_info().is_none(), "drop removes the record");
+        drop(home);
+    }
+
+    /// A pre-split daemon wrote its record into service.lock itself; with no
+    /// live owner the fallback still surfaces it so displacement works across
+    /// the upgrade.
+    #[tokio::test]
+    async fn read_lock_info_falls_back_to_a_legacy_record() {
+        let home = ScratchHome::new("legacy-record");
+        let legacy = LockInfo {
+            pid: std::process::id(),
+            socket_path: "legacy".to_string(),
+            version: "0.8.2".to_string(),
+            started_at: chrono::Utc::now().to_rfc3339(),
+        };
+        std::fs::write(
+            config::service_lock_path().unwrap(),
+            serde_json::to_string(&legacy).unwrap(),
+        )
+        .unwrap();
+        let info = read_lock_info().expect("the legacy record is readable");
+        assert_eq!(info.version, "0.8.2");
+        drop(home);
+    }
+
+    /// Acquiring ownership empties legacy bytes out of the lock file, so a
+    /// stale pre-split record can never shadow the live service.json.
+    #[tokio::test]
+    async fn acquire_ownership_empties_a_stale_legacy_record() {
+        let home = ScratchHome::new("legacy-emptied");
+        let stale = r#"{"pid":1,"socket_path":"gone","version":"0.0.1","started_at":""}"#;
+        std::fs::write(config::service_lock_path().unwrap(), stale).unwrap();
+        let ownership = acquire_ownership().unwrap();
+        assert!(
+            read_lock_info().is_none(),
+            "no service.json and the legacy bytes are gone"
+        );
+        drop(ownership);
+        drop(home);
+    }
+
+    /// process_alive tracks a real child on every platform.
+    #[test]
+    fn process_alive_tracks_a_real_child() {
+        assert!(process_alive(std::process::id()));
+        #[cfg(windows)]
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "exit 0"])
+            .spawn()
+            .unwrap();
+        #[cfg(unix)]
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        assert!(!process_alive(pid), "a reaped child is not alive");
     }
 }

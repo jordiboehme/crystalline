@@ -52,6 +52,9 @@ impl Env {
     fn lock_path(&self) -> PathBuf {
         self.state_dir().join("service.lock")
     }
+    fn info_path(&self) -> PathBuf {
+        self.state_dir().join("service.json")
+    }
     fn sock_path(&self) -> PathBuf {
         self.state_dir().join("service.sock")
     }
@@ -119,8 +122,11 @@ impl Env {
         }
     }
 
+    /// The pid from the owner record. Reads `service.json`, never the lock
+    /// file itself: the record moved there so a reader never has to touch a
+    /// handle another process holds an exclusive lock on.
     fn lock_pid(&self) -> Option<u64> {
-        let text = std::fs::read_to_string(self.lock_path()).ok()?;
+        let text = std::fs::read_to_string(self.info_path()).ok()?;
         let v: Value = serde_json::from_str(&text).ok()?;
         v.get("pid").and_then(Value::as_u64)
     }

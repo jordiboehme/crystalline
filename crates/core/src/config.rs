@@ -530,9 +530,21 @@ pub fn index_db_path() -> Result<PathBuf, ConfigError> {
     Ok(state_dir()?.join("index.db"))
 }
 
-/// The single-instance lock path, `<state_dir>/service.lock`.
+/// The single-instance lock path, `<state_dir>/service.lock`. Lock only: the
+/// owner holds an exclusive OS lock on this file for its lifetime and the
+/// contents are meaningless. The owner's record lives at [`service_info_path`],
+/// never in this file, because Windows region locks are mandatory: reading or
+/// writing a locked file through any other handle fails there.
 pub fn service_lock_path() -> Result<PathBuf, ConfigError> {
     Ok(state_dir()?.join("service.lock"))
+}
+
+/// The daemon record path, `<state_dir>/service.json`: the owner's pid, socket
+/// and version, written once the socket is bound and removed on shutdown. Kept
+/// apart from `service.lock` so reading the record never touches the locked
+/// file (see [`service_lock_path`]).
+pub fn service_info_path() -> Result<PathBuf, ConfigError> {
+    Ok(state_dir()?.join("service.json"))
 }
 
 /// The service socket path, `<state_dir>/service.sock`.
