@@ -358,13 +358,17 @@ pub async fn ensure_daemon(
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    anyhow::bail!("spawned a daemon but it did not become ready within 15s")
+    anyhow::bail!(
+        "spawned a daemon but it did not become ready within 15s (see daemon.log in the state directory)"
+    )
 }
 
 /// Open the daemon stderr log for appending, starting the file over once it
-/// outgrows 1 MiB so it never grows unbounded. `None` (and a null stderr)
-/// when the state dir or the file cannot be prepared: logging must never be
-/// the reason a daemon fails to spawn.
+/// outgrows 1 MiB. The cap is checked at spawn time and the reset is
+/// best-effort (a live holder can defeat the removal on Windows), so it bounds
+/// growth across spawns, not within one daemon's lifetime. `None` (and a null
+/// stderr) when the state dir or the file cannot be prepared: logging must
+/// never be the reason a daemon fails to spawn.
 fn daemon_log_sink() -> Option<std::process::Stdio> {
     let path = config::daemon_log_path().ok()?;
     if let Some(dir) = path.parent() {
