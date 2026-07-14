@@ -32,9 +32,10 @@ turso = "0.6.1"
 candle-core = "0.11.0"
 candle-nn = "0.11.0"
 candle-transformers = "0.11.0"
-# Blocking downloader over ureq, whose bundled rustls avoids any system OpenSSL
-# so the static release binaries stay self-contained. The local provider loads
-# and runs off the async runtime.
+# Blocking downloader over ureq. The base build bundles rustls so static Linux
+# binaries stay self-contained; crates/index adds the native-tls feature on
+# Windows and macOS targets so the download validates against the OS trust
+# store (corporate TLS-interception CAs live there, not in webpki roots).
 hf-hub = { version = "0.5.0", default-features = false, features = ["ureq"] }
 # Pure-Rust regex backend (fancy-regex) instead of the onig C library, and no
 # esaxx C++ trainer or progress bar; keeps musl static builds clean. Only the
