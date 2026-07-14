@@ -113,7 +113,7 @@ impl Ownership {
     pub fn socket_display(&self) -> String {
         #[cfg(windows)]
         {
-            PIPE_NAME.to_string()
+            format!(r"\\.\pipe\{}", pipe_name(&self.socket_path))
         }
         #[cfg(not(windows))]
         {
@@ -134,17 +134,29 @@ impl Drop for Ownership {
     }
 }
 
-/// The Windows named pipe name.
+/// The Windows pipe name for a given socket path: `crystalline-` plus the
+/// FNV-1a hash of the lowercased path. Hashing keeps the name short and free
+/// of separator characters; deriving it from the state-directory-scoped
+/// socket path isolates users and test homes from each other, where a fixed
+/// name would collide machine-wide. FNV-1a is fixed here (not DefaultHasher)
+/// so every release derives the same name and can attach across upgrades.
 #[cfg(windows)]
-const PIPE_NAME: &str = r"\\.\pipe\crystalline";
+fn pipe_name(sock_path: &Path) -> String {
+    let lowered = sock_path.to_string_lossy().to_lowercase();
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in lowered.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("crystalline-{hash:016x}")
+}
 
 /// Build the platform socket name: a filesystem path on unix, a namespaced pipe
 /// on Windows.
 fn socket_name(sock_path: &Path) -> io::Result<Name<'_>> {
     #[cfg(windows)]
     {
-        let _ = sock_path;
-        "crystalline".to_ns_name::<GenericNamespaced>()
+        pipe_name(sock_path).to_ns_name::<GenericNamespaced>()
     }
     #[cfg(not(windows))]
     {
@@ -349,6 +361,29 @@ pub async fn ensure_daemon(
     anyhow::bail!("spawned a daemon but it did not become ready within 15s")
 }
 
+/// Open the daemon stderr log for appending, starting the file over once it
+/// outgrows 1 MiB so it never grows unbounded. `None` (and a null stderr)
+/// when the state dir or the file cannot be prepared: logging must never be
+/// the reason a daemon fails to spawn.
+fn daemon_log_sink() -> Option<std::process::Stdio> {
+    let path = config::daemon_log_path().ok()?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).ok()?;
+    }
+    if std::fs::metadata(&path)
+        .map(|m| m.len() > 1024 * 1024)
+        .unwrap_or(false)
+    {
+        let _ = std::fs::remove_file(&path);
+    }
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .ok()?;
+    Some(file.into())
+}
+
 /// Spawn `current_exe serve --daemon` fully detached, forwarding `--read-only`
 /// when this instance was asked to serve read-only.
 fn spawn_daemon(
@@ -370,7 +405,7 @@ fn spawn_daemon(
     }
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stderr(daemon_log_sink().unwrap_or_else(std::process::Stdio::null));
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -388,8 +423,29 @@ fn spawn_daemon(
             });
         }
     }
-    cmd.spawn()?;
-    Ok(())
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::System::Threading::{
+            CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW,
+        };
+        // No console window for the detached daemon, its own process group,
+        // and a breakaway from the parent's job object so it outlives a
+        // harness that kills its job on exit. A job that forbids breakaway
+        // fails the spawn outright, so retry inside the job: starting at all
+        // beats outliving the parent.
+        cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB);
+        if cmd.spawn().is_err() {
+            cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+            cmd.spawn()?;
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        cmd.spawn()?;
+        Ok(())
+    }
 }
 
 /// Acquire ownership of the index by taking the advisory lock, with stale
@@ -500,6 +556,26 @@ pub fn process_alive(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn pipe_names_are_stable_and_scoped_to_the_socket_path() {
+        let a = pipe_name(Path::new(
+            r"C:\Users\a\AppData\Roaming\crystalline\service.sock",
+        ));
+        let b = pipe_name(Path::new(
+            r"C:\Users\b\AppData\Roaming\crystalline\service.sock",
+        ));
+        assert_ne!(a, b, "different homes get different pipes");
+        assert_eq!(
+            a,
+            pipe_name(Path::new(
+                r"c:\users\A\appdata\roaming\crystalline\service.sock"
+            )),
+            "windows paths are case-insensitive, the pipe name must be too"
+        );
+        assert!(a.starts_with("crystalline-") && a.len() == "crystalline-".len() + 16);
+    }
 
     #[test]
     fn attach_policy_displaces_only_a_strictly_older_daemon() {
@@ -817,6 +893,25 @@ mod tests {
         drop(home);
     }
 
+    /// An oversized daemon log starts over rather than growing unbounded.
+    /// Deliberately ungated - a detached daemon's stderr sink matters on every
+    /// platform, and `ScratchHome` keeps this sync-safe under the same env
+    /// lock the other tests here take.
+    #[tokio::test]
+    async fn daemon_log_sink_caps_the_file_size() {
+        let home = ScratchHome::new("daemon-log");
+        let path = config::daemon_log_path().unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, vec![b'x'; 2 * 1024 * 1024]).unwrap();
+        let sink = daemon_log_sink().expect("the sink opens");
+        drop(sink);
+        assert!(
+            std::fs::metadata(&path).unwrap().len() < 1024 * 1024,
+            "an oversized log starts over"
+        );
+        drop(home);
+    }
+
     /// A pre-split daemon wrote its record into service.lock itself; with no
     /// live owner the fallback still surfaces it so displacement works across
     /// the upgrade.
@@ -840,7 +935,9 @@ mod tests {
     }
 
     /// Acquiring ownership empties legacy bytes out of the lock file, so a
-    /// stale pre-split record can never shadow the live service.json.
+    /// stale pre-split record can never shadow the live service.json. On
+    /// Windows the mandatory lock alone already hides the legacy bytes from
+    /// any other handle, so this emptying assertion is meaningful on unix.
     #[tokio::test]
     async fn acquire_ownership_empties_a_stale_legacy_record() {
         let home = ScratchHome::new("legacy-emptied");

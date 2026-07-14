@@ -552,6 +552,14 @@ pub fn service_sock_path() -> Result<PathBuf, ConfigError> {
     Ok(state_dir()?.join("service.sock"))
 }
 
+/// The spawned daemon's stderr log, `<state_dir>/daemon.log`. A daemon spawned
+/// by the MCP bridge is fully detached, so without this file a startup failure
+/// is invisible; the log made the difference between a one-log field diagnosis
+/// and a blind one.
+pub fn daemon_log_path() -> Result<PathBuf, ConfigError> {
+    Ok(state_dir()?.join("daemon.log"))
+}
+
 /// The directory holding every origin's on-disk state, `<state_dir>/origins`.
 pub fn origins_state_dir() -> Result<PathBuf, ConfigError> {
     Ok(state_dir()?.join("origins"))

@@ -1201,6 +1201,9 @@ pub fn render_human(report: &DoctorReport) -> String {
     if !s.lock_stale && !s.socket_orphaned {
         let _ = writeln!(out, "  ok");
     }
+    if let Ok(log_path) = config::daemon_log_path() {
+        let _ = writeln!(out, "  daemon log: {}", log_path.display());
+    }
 
     if let Some(e) = &report.environment {
         let _ = writeln!(out, "environment:");
