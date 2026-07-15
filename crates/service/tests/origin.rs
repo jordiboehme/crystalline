@@ -647,6 +647,87 @@ async fn origin_add_retry_with_a_different_origin_still_conflicts() {
     assert!(matches!(err, EngineError::Conflict(_)), "{err}");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn origin_add_racing_retry_waits_under_the_lock_and_never_redownloads() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        (
+            "notes/alpha.md",
+            engram("Alpha", "alpha", "shared knowledge about turbines"),
+        ),
+    ]));
+    mock.set_branch("main", &commit);
+
+    // Park every tarball download on a gate: the first connect stalls
+    // mid-download, holding the origin lock, while an identical retry races
+    // in behind it.
+    let gate = mock.block_tarball();
+
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let root = tmp.path().join("brand-knowledge");
+    let eng = Arc::new(engine_with(&config_path, &origins_dir, mock.clone(), true, false).await);
+    let root_str = root.to_str().unwrap().to_string();
+
+    // Connect A: passes the pre-lock guard (no origin on file yet), takes the
+    // origin lock and blocks in tarball with the config not yet persisted.
+    let a = {
+        let eng = eng.clone();
+        let root_str = root_str.clone();
+        tokio::spawn(async move {
+            eng.origin_add("acme/brand-knowledge", None, None, None, Some(&root_str))
+                .await
+        })
+    };
+    // Give A a moment to reach the gate.
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    // Connect B: identical arguments. It also passes the pre-lock guard
+    // (still no origin persisted) and then queues on the origin lock A holds.
+    let b = {
+        let eng = eng.clone();
+        let root_str = root_str.clone();
+        tokio::spawn(async move {
+            eng.origin_add("acme/brand-knowledge", None, None, None, Some(&root_str))
+                .await
+        })
+    };
+    // Give B a moment to reach and block on the origin lock.
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    // Release the download; A finishes and persists its origin, then B wakes,
+    // re-reads the config under the lock and must answer idempotently.
+    gate.send(true).unwrap();
+
+    let a = a.await.unwrap().unwrap();
+    let b = b.await.unwrap().unwrap();
+
+    // A is the fresh connect.
+    assert!(
+        a.get("already_connected").is_none(),
+        "A is the fresh connect: {a}"
+    );
+    assert_eq!(a["domain"], "brand-knowledge");
+    assert_eq!(a["engrams"], 2);
+
+    // B saw A's just-persisted origin under the lock and answered
+    // already-connected instead of re-running the whole connect.
+    assert_eq!(b["already_connected"], serde_json::json!(true), "{b}");
+    assert_eq!(b["domain"], a["domain"]);
+    assert_eq!(b["base_commit"], a["base_commit"]);
+    assert_eq!(b["engrams"], a["engrams"]);
+
+    // The whole repo was downloaded exactly once: the racing retry never
+    // re-downloaded it.
+    assert_eq!(
+        mock.tarball_calls(),
+        1,
+        "the racing retry must not re-download the repo"
+    );
+}
+
 #[tokio::test]
 async fn origin_add_schedules_embedding_on_the_worker_channel() {
     let tmp = tempfile::tempdir().unwrap();

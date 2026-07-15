@@ -85,6 +85,17 @@ struct Inner {
     /// provider call at all (disabled, unauthenticated, or paused for a rate
     /// limit).
     branch_head_calls: usize,
+    /// How many times `tarball` has been called, for the connect-race test:
+    /// a first connect parks mid-download while an identical retry queues on
+    /// the origin lock, so a count of exactly one proves the retry answered
+    /// idempotently under the lock instead of re-downloading the whole repo.
+    tarball_calls: usize,
+    /// An optional gate every `tarball` download waits on until its sender
+    /// flips it open. Set through `MockProvider::block_tarball`; unset (the
+    /// default) means downloads never block. A `watch` channel is used so the
+    /// gate stays open once released - a second, racing download proceeds
+    /// too, rather than hanging.
+    tarball_gate: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
 /// An in-memory forge implementing [`Provider`] for the origin engine tests.
@@ -190,6 +201,23 @@ impl MockProvider {
     /// How many times `branch_head` has been called so far.
     pub fn branch_head_calls(&self) -> usize {
         self.inner.lock().unwrap().branch_head_calls
+    }
+
+    /// Arms a gate that blocks every `tarball` download until the returned
+    /// sender flips it open, and starts counting `tarball` calls. The
+    /// connect-race test uses it to park a first connect mid-download while
+    /// an identical retry races in behind it; `send(true)` on the sender
+    /// releases the download. The gate stays open once released, so a second
+    /// download never hangs.
+    pub fn block_tarball(&self) -> tokio::sync::watch::Sender<bool> {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        self.inner.lock().unwrap().tarball_gate = Some(rx);
+        tx
+    }
+
+    /// How many times `tarball` has been called so far.
+    pub fn tarball_calls(&self) -> usize {
+        self.inner.lock().unwrap().tarball_calls
     }
 
     /// Sets the lifecycle state `proposal_state` reports for `number`, so a
@@ -309,6 +337,21 @@ impl Provider for MockProvider {
     }
 
     async fn tarball(&self, origin: &OriginSpec, commit: &str) -> Result<Vec<u8>, RemoteError> {
+        // Count the download, then optionally park on the gate until its
+        // sender flips it open. The receiver is cloned out from under the std
+        // mutex so nothing is held across the await.
+        let gate = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.tarball_calls += 1;
+            inner.tarball_gate.clone()
+        };
+        if let Some(mut rx) = gate {
+            while !*rx.borrow() {
+                if rx.changed().await.is_err() {
+                    break;
+                }
+            }
+        }
         let inner = self.inner.lock().unwrap();
         let c = inner
             .commits

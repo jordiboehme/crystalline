@@ -3020,8 +3020,13 @@ impl Engine {
     /// Refuses with `github.enabled`'s message when collaboration is off,
     /// and with `EngineError::ReadOnly` on a read-only instance (this both
     /// writes content and mutates config, exactly the two things read-only
-    /// mode protects). Returns `{ domain, root, engrams, base_commit }` on
-    /// success.
+    /// mode protects). A fresh connect returns `{ domain, root, engrams,
+    /// base_commit, adopted, files_added, local_changes }`, so a caller knows
+    /// what landed and whether existing local knowledge was adopted. A retry
+    /// of the exact same connect - matching repo, subpath, branch and folder -
+    /// instead returns `{ domain, root, engrams, base_commit, already_connected:
+    /// true }`, so a client that timed out on the first attempt reads the
+    /// connected state rather than a conflict.
     pub async fn origin_add(
         &self,
         repo: &str,
@@ -3084,19 +3089,12 @@ impl Engine {
                     // A retry of the exact connect that already succeeded answers
                     // with the connected state instead of a conflict, so a client
                     // that timed out waiting for the first response never reads
-                    // success as failure. GitHub treats owner/name case
-                    // insensitively, so the repo compares that way; path compares
-                    // exactly and an absent branch means main on both sides.
-                    let same_repo = origin_cfg.repo.eq_ignore_ascii_case(repo);
-                    let same_path = origin_cfg.path.as_deref() == path;
-                    let same_branch =
-                        origin_cfg.branch.as_deref().unwrap_or("main") == branch.unwrap_or("main");
-                    let same_folder = match (folder, entry.file_path()) {
-                        (None, _) => true,
-                        (Some(f), Some(r)) => crystalline_core::config::expand_tilde(f) == r,
-                        (Some(_), None) => false,
-                    };
-                    if same_repo && same_path && same_branch && same_folder {
+                    // success as failure. This pre-lock guard keeps the common
+                    // retry-after-completion case instant and lock-free; a re-read
+                    // under the lock below catches a retry that raced an in-flight
+                    // connect (see `origin_add_with_progress`).
+                    if Self::origin_matches_request(&entry, origin_cfg, repo, path, branch, folder)
+                    {
                         return self.origin_already_connected(&domain_name, &entry).await;
                     }
                     return Err(EngineError::Conflict(format!(
@@ -3124,6 +3122,29 @@ impl Engine {
 
         let lock = self.origin_lock(&domain_name);
         let _guard = lock.lock().await;
+
+        // Re-read the config under the lock. A connect that raced ahead of us
+        // - a timed-out client's first attempt, still downloading when our
+        // retry slipped past the pre-lock guard with no origin on file yet -
+        // may have persisted its origin while we queued here. Answer a
+        // now-matching origin idempotently instead of downloading the whole
+        // repo again, and a now-conflicting one with the same conflict the
+        // pre-lock guard raises. The locked helper skips the lock we hold, and
+        // no progress stage fires: an idempotent return reports none, exactly
+        // like the pre-lock guard's.
+        if let Ok(entry) = self.domain_entry(&domain_name)
+            && let Some(origin_cfg) = &entry.origin
+        {
+            if Self::origin_matches_request(&entry, origin_cfg, repo, path, branch, folder) {
+                return self
+                    .origin_already_connected_locked(&domain_name, &entry)
+                    .await;
+            }
+            return Err(EngineError::Conflict(format!(
+                "domain '{domain_name}' is already connected to {}; pass a domain name to connect this origin under a different one",
+                origin_cfg.repo
+            )));
+        }
 
         let adopts_registered = existing_root.is_some();
         let root = match existing_root {
@@ -3219,12 +3240,52 @@ impl Engine {
         }))
     }
 
+    /// Whether a registered domain's origin matches this connect request
+    /// exactly, so a retry answers idempotently instead of re-connecting.
+    /// GitHub treats owner/name case insensitively, so the repo compares that
+    /// way; the subpath compares exactly and an absent branch means main on
+    /// both sides; an omitted folder always matches, a given one must resolve
+    /// to the registered root. Shared by the pre-lock guard and the re-read
+    /// under the lock so both sites judge a match identically.
+    fn origin_matches_request(
+        entry: &DomainEntry,
+        origin_cfg: &OriginConfig,
+        repo: &str,
+        path: Option<&str>,
+        branch: Option<&str>,
+        folder: Option<&str>,
+    ) -> bool {
+        let same_repo = origin_cfg.repo.eq_ignore_ascii_case(repo);
+        let same_path = origin_cfg.path.as_deref() == path;
+        let same_branch =
+            origin_cfg.branch.as_deref().unwrap_or("main") == branch.unwrap_or("main");
+        let same_folder = match (folder, entry.file_path()) {
+            (None, _) => true,
+            (Some(f), Some(r)) => crystalline_core::config::expand_tilde(f) == r,
+            (Some(_), None) => false,
+        };
+        same_repo && same_path && same_branch && same_folder
+    }
+
     /// The response for a connect retry that matches the existing
     /// connection: the same shape `origin_add` returns, marked
     /// `already_connected`, read under the domain's origin lock.
     async fn origin_already_connected(&self, name: &str, entry: &DomainEntry) -> Result<Value> {
         let lock = self.origin_lock(name);
         let _guard = lock.lock().await;
+        self.origin_already_connected_locked(name, entry).await
+    }
+
+    /// [`origin_already_connected`](Self::origin_already_connected)'s body,
+    /// assuming the caller already holds the domain's origin lock. The re-read
+    /// inside `origin_add_with_progress` calls this directly: the origin lock
+    /// is a non-reentrant tokio mutex, so re-acquiring it there would
+    /// deadlock.
+    async fn origin_already_connected_locked(
+        &self,
+        name: &str,
+        entry: &DomainEntry,
+    ) -> Result<Value> {
         let root = entry.file_path().unwrap_or_default();
         let state_dir = self.origin_state_dir(name)?;
         let base_commit = crystalline_remote::state::OriginState::load(&state_dir)?
