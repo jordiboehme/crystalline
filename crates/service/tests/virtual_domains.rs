@@ -277,6 +277,138 @@ async fn stale_edit_conflict(store: Arc<Mutex<dyn Store>>) {
 }
 both_backends!(stale_virtual_edit_conflicts, stale_edit_conflict);
 
+// --- temporal enforcement on the virtual edit path ---------------------------
+
+async fn virtual_edit_drop_is_cas_consistent(store: Arc<Mutex<dyn Store>>) {
+    let engine = virtual_engine(store);
+    engine
+        .write_engram(&write_params("Sentinel Note", "original body"))
+        .await
+        .unwrap();
+
+    engine
+        .edit_engram(&EditParams {
+            identifier: "sentinel-note".to_string(),
+            domain: "notes".to_string(),
+            operation: "find_replace".to_string(),
+            content: "status: current\nvalid_to: 9999-12-30\n".to_string(),
+            section: None,
+            find_text: Some("status: current\n".to_string()),
+            expected_replacements: None,
+            include_subsections: false,
+            expected_checksum: None,
+        })
+        .await
+        .unwrap();
+
+    let read = engine
+        .read_engram(&ReadParams {
+            identifier: "sentinel-note".to_string(),
+            domain: Some("notes".to_string()),
+        })
+        .await
+        .unwrap();
+    let content = read["content"].as_str().unwrap();
+    assert!(
+        !content.contains("valid_to"),
+        "the sentinel bound is dropped, not stored: {content}"
+    );
+    let checksum = read["checksum"].as_str().unwrap().to_string();
+
+    // A second, checksum-guarded edit against the checksum just read must
+    // succeed. If enforce_temporal ran after virtual_stamp/index_markdown
+    // instead of before, the stored stamp would hash the pre-drop bytes while
+    // the stored content column held the post-drop bytes, and this edit would
+    // spuriously conflict.
+    engine
+        .edit_engram(&EditParams {
+            identifier: "sentinel-note".to_string(),
+            domain: "notes".to_string(),
+            operation: "append".to_string(),
+            content: "a follow-up line".to_string(),
+            section: None,
+            find_text: None,
+            expected_replacements: None,
+            include_subsections: false,
+            expected_checksum: Some(checksum),
+        })
+        .await
+        .unwrap();
+}
+both_backends!(
+    virtual_edit_sentinel_drop_keeps_cas_consistent,
+    virtual_edit_drop_is_cas_consistent
+);
+
+async fn virtual_edit_rejects_malformed_temporal_date(store: Arc<Mutex<dyn Store>>) {
+    let engine = virtual_engine(store);
+    engine
+        .write_engram(&write_params("Timestamp Note", "original body"))
+        .await
+        .unwrap();
+
+    let before = engine
+        .read_engram(&ReadParams {
+            identifier: "timestamp-note".to_string(),
+            domain: Some("notes".to_string()),
+        })
+        .await
+        .unwrap();
+    let before_content = before["content"].as_str().unwrap().to_string();
+    let before_checksum = before["checksum"].as_str().unwrap().to_string();
+
+    let err = engine
+        .edit_engram(&EditParams {
+            identifier: "timestamp-note".to_string(),
+            domain: "notes".to_string(),
+            operation: "find_replace".to_string(),
+            content: "status: current\nvalid_to: 2026-07-15T10:30:00Z\n".to_string(),
+            section: None,
+            find_text: Some("status: current\n".to_string()),
+            expected_replacements: None,
+            include_subsections: false,
+            expected_checksum: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("must be a plain ISO date (YYYY-MM-DD)"),
+        "expected a day-granularity rejection, got {err}"
+    );
+
+    // The row is untouched by the rejected edit: a fresh read still returns
+    // the pre-edit content and checksum, which still guards a normal edit.
+    let after = engine
+        .read_engram(&ReadParams {
+            identifier: "timestamp-note".to_string(),
+            domain: Some("notes".to_string()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(after["content"].as_str().unwrap(), before_content);
+    assert_eq!(after["checksum"].as_str().unwrap(), before_checksum);
+
+    engine
+        .edit_engram(&EditParams {
+            identifier: "timestamp-note".to_string(),
+            domain: "notes".to_string(),
+            operation: "append".to_string(),
+            content: "a normal follow-up".to_string(),
+            section: None,
+            find_text: None,
+            expected_replacements: None,
+            include_subsections: false,
+            expected_checksum: Some(before_checksum),
+        })
+        .await
+        .unwrap();
+}
+both_backends!(
+    virtual_edit_rejects_a_malformed_temporal_date,
+    virtual_edit_rejects_malformed_temporal_date
+);
+
 // --- full reindex preserves virtual data -------------------------------------
 
 async fn full_reindex_preserves_virtual(store: Arc<Mutex<dyn Store>>) {
