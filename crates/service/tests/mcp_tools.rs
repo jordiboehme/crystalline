@@ -812,6 +812,209 @@ async fn write_engram_accepts_metadata_as_a_json_encoded_string() {
     assert!(err.contains("must be an object"), "unexpected error: {err}");
 }
 
+/// The write path enforces the temporal contract: a date field carrying a
+/// time-of-day component is rejected with the day-granular message and no file
+/// is created. write_engram and the CLI write share this engine call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_engram_rejects_a_timestamp_in_a_date_field() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    let err = call(
+        peer,
+        "write_engram",
+        json!({
+            "domain": "eng",
+            "title": "Timestamped bound",
+            "content": "A rule.",
+            "metadata": { "valid_to": "2026-07-15T10:30:00Z" },
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.contains("must be a plain ISO date (YYYY-MM-DD)"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        !h.root.join("eng/timestamped-bound.md").exists(),
+        "the engram file must not be created when the write is rejected"
+    );
+}
+
+/// A sentinel far-future `valid_to` is dropped on write: open-ended validity is
+/// expressed by absence, not by a distant date. The write succeeds and the
+/// field never lands in the file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_engram_drops_a_sentinel_valid_to() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    call(
+        peer,
+        "write_engram",
+        json!({
+            "domain": "eng",
+            "title": "Open ended",
+            "content": "Valid forever.",
+            "metadata": { "valid_to": "9999-12-30" },
+        }),
+    )
+    .await
+    .unwrap();
+    let text = std::fs::read_to_string(h.root.join("eng/open-ended.md")).unwrap();
+    assert!(
+        !text.contains("valid_to"),
+        "the sentinel valid_to must be dropped: {text}"
+    );
+}
+
+/// A plain ISO `valid_from` is promoted into the typed frontmatter field, so
+/// read_engram returns it as a date rather than an unparsed extra value.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_engram_promotes_a_plain_valid_from() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    call(
+        peer,
+        "write_engram",
+        json!({
+            "domain": "eng",
+            "title": "Bounded start",
+            "content": "Valid from a date.",
+            "metadata": { "valid_from": "2026-01-01" },
+        }),
+    )
+    .await
+    .unwrap();
+    let out = call(
+        peer,
+        "read_engram",
+        json!({ "identifier": "bounded-start", "domain": "eng" }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        out["frontmatter"]["valid_from"],
+        json!("2026-01-01"),
+        "valid_from must be a typed date: {out}"
+    );
+}
+
+/// The edit path enforces the same contract: a find_replace that injects a
+/// timestamped `valid_to` into the frontmatter is rejected and the file on disk
+/// is left byte-for-byte unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edit_engram_rejects_an_injected_timestamp_bound() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Editable", "content": "A rule." }),
+    )
+    .await
+    .unwrap();
+    let path = h.root.join("eng/editable.md");
+    let before = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        before.contains("status: current"),
+        "the edit anchor is missing: {before}"
+    );
+
+    let err = call(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng",
+            "identifier": "editable",
+            "operation": "find_replace",
+            "find_text": "status: current",
+            "content": "status: current\nvalid_to: 2026-07-15T10:30:00Z",
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.contains("must be a plain ISO date (YYYY-MM-DD)"),
+        "unexpected error: {err}"
+    );
+    let after = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(
+        before, after,
+        "the file must be unchanged after a rejected edit"
+    );
+}
+
+/// An edit that injects a sentinel far-future `valid_to` succeeds, but the
+/// bound is surgically dropped so absence keeps expressing open-ended validity.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edit_engram_drops_an_injected_sentinel_bound() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Sentinel edit", "content": "A rule." }),
+    )
+    .await
+    .unwrap();
+    call(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng",
+            "identifier": "sentinel-edit",
+            "operation": "find_replace",
+            "find_text": "status: current",
+            "content": "status: current\nvalid_to: 9999-12-30",
+        }),
+    )
+    .await
+    .unwrap();
+    let text = std::fs::read_to_string(h.root.join("eng/sentinel-edit.md")).unwrap();
+    assert!(
+        !text.contains("valid_to"),
+        "the sentinel valid_to must be dropped: {text}"
+    );
+    assert!(
+        !text.contains("9999-12-30"),
+        "the sentinel value must be gone: {text}"
+    );
+}
+
+/// validate_engrams runs the temporal checks: a date field written straight to
+/// disk with a time-of-day component is reported as a T003 issue.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn validate_engrams_flags_a_malformed_date_as_t003() {
+    let h = Harness::new(&["eng"]).await;
+    let md = "---\ntype: note\ntitle: Bad Date\npermalink: bad-date\ntags:\n  - eng\nstatus: current\nrecorded_at: 2026-01-01\nvalid_from: 2026-07-15T10:30:00Z\n---\n\n# Bad Date\n";
+    std::fs::write(h.root.join("eng/bad-date.md"), md).unwrap();
+    h.engine.sync(None).await.unwrap();
+
+    let (client, _server) = h.connect().await;
+    let out = call(
+        client.peer(),
+        "validate_engrams",
+        json!({ "domain": "eng" }),
+    )
+    .await
+    .unwrap();
+    let issues = out["issues"].as_array().unwrap();
+    assert!(
+        issues.iter().any(|i| i["kind"] == json!("T003")),
+        "a T003 issue must be present: {issues:?}"
+    );
+}
+
 /// The locked MCP tool annotation table: one row per tool, each a tuple of
 /// (name, title, read_only_hint, destructive_hint, idempotent_hint,
 /// open_world_hint). A hint of `None` means the attribute is deliberately

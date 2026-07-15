@@ -23,8 +23,8 @@ use crystalline_core::config::{
     DomainEntry, DomainKind as CoreDomainKind, GlobalConfig, OriginConfig,
 };
 use crystalline_core::emit::{
-    append_body, insert_after_section, insert_before_section, prepend_body, replace_section,
-    touch_timestamp,
+    append_body, insert_after_section, insert_before_section, prepend_body,
+    remove_frontmatter_field, replace_section, touch_timestamp,
 };
 use crystalline_core::schema::{self, Schema};
 use crystalline_core::{
@@ -1247,6 +1247,7 @@ impl Engine {
                 })?;
                 let edited = self.apply_edit(&current, p, &desc.permalink)?;
                 let edited = touch_timestamp(&edited, now_offset());
+                let edited = Self::enforce_temporal(edited)?;
                 write_file(&abs, &edited)?;
                 let store = self.store.lock().await;
                 self.reindex_file(&*store, desc.domain_id, root, &desc.path)
@@ -1275,6 +1276,7 @@ impl Engine {
                     .unwrap_or_else(|| sha256_hex(current.as_bytes()));
                 let edited = self.apply_edit(&current, p, &desc.permalink)?;
                 let edited = touch_timestamp(&edited, now_offset());
+                let edited = Self::enforce_temporal(edited)?;
                 let stamp = virtual_stamp(&edited);
                 let store = self.store.lock().await;
                 self.index_markdown(
@@ -1360,6 +1362,25 @@ impl Engine {
             .ok_or_else(|| {
                 EngineError::Invalid(format!("operation '{}' requires a section", p.operation))
             })
+    }
+
+    /// Enforce the temporal write contract on post-edit markdown: reject a date
+    /// field left malformed and surgically drop sentinel or null bounds,
+    /// matching write_engram and import. Post-edit rather than per-argument
+    /// because find_replace can rewrite frontmatter text directly. A parse
+    /// failure passes through unchanged; indexing reports it.
+    fn enforce_temporal(edited: String) -> Result<String> {
+        let Ok(engram) = parse_engram(&edited) else {
+            return Ok(edited);
+        };
+        let mut fm = engram.frontmatter;
+        let dropped = crystalline_core::temporal::normalize_temporal_fields(&mut fm)
+            .map_err(|e| EngineError::Invalid(e.to_string()))?;
+        let mut out = edited;
+        for field in dropped {
+            out = remove_frontmatter_field(&out, field);
+        }
+        Ok(out)
     }
 
     // --- move ----------------------------------------------------------------
@@ -2053,6 +2074,21 @@ impl Engine {
                         "line": issue.line,
                     }));
                 }
+            }
+            for issue in crystalline_core::verify::check_temporal(Path::new(&d.path), &engram) {
+                let message = match issue.fix {
+                    Some(fix) => format!("{} (fix: {fix})", issue.message),
+                    None => issue.message,
+                };
+                issues.push(json!({
+                    "permalink": d.permalink,
+                    "path": d.path,
+                    "severity": issue.severity,
+                    "kind": issue.rule,
+                    "field": Value::Null,
+                    "message": message,
+                    "line": issue.line,
+                }));
             }
         }
 
@@ -5024,7 +5060,9 @@ fn timeframe_cutoff(spec: &str) -> Option<String> {
 }
 
 /// Build engram markdown with auto-filled frontmatter via the core emitter.
-/// `valid_from` and `valid_to` are never written.
+/// Metadata date fields are validated against the temporal write contract: a
+/// valid ISO date lands in its typed frontmatter position, while a sentinel or
+/// null bound is dropped because open-ended validity is expressed by absence.
 #[allow(clippy::too_many_arguments)]
 fn build_markdown(
     engram_type: &str,
@@ -5070,6 +5108,9 @@ fn build_markdown(
     {
         return Err(EngineError::Invalid("metadata must be an object".into()));
     }
+
+    crystalline_core::temporal::normalize_temporal_fields(&mut fm)
+        .map_err(|e| EngineError::Invalid(e.to_string()))?;
 
     let engram = Engram {
         frontmatter: fm,
