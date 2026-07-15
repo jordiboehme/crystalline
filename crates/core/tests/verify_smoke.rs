@@ -4,7 +4,9 @@
 //! reporters against a couple of temp-dir domains.
 
 use std::fs;
+use std::path::Path;
 
+use crystalline_core::parse_engram;
 use crystalline_core::verify::{self, Format, Severity, VerifyOptions};
 use tempfile::tempdir;
 
@@ -81,6 +83,46 @@ fn required_field_and_encoding_and_temporal_and_quality_rules_fire() {
     assert!(rules.contains(&"E004"), "{rules:?}");
     assert!(rules.contains(&"T001"), "{rules:?}");
     assert!(rules.contains(&"Q001"), "{rules:?}");
+}
+
+#[test]
+fn a_timestamp_in_a_date_field_is_a_t003_error() {
+    let dir = tempdir().unwrap();
+    write(
+        dir.path(),
+        "MANIFEST.md",
+        "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n## Scope\n\n- Facts about time\n\n## When to Use\n\n- When asked about dates\n",
+    );
+    // A day-granular field carrying an RFC 3339 timestamp: the parser parks it
+    // in `extra`, so the temporal rule flags it as not a plain ISO date.
+    write(
+        dir.path(),
+        "timey.md",
+        "---\ntype: engram\ntitle: Timey\npermalink: timey\ntags:\n- t\nstatus: current\nrecorded_at: 2026-01-01\ntimestamp: 2026-01-01T00:00:00+00:00\nvalid_from: 2026-07-15T10:30:00Z\n---\n\n# Timey\n\nA date field must be a plain ISO date, never a full timestamp with a time.\n",
+    );
+
+    let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+    let t003 = report
+        .issues
+        .iter()
+        .find(|i| i.rule == "T003" && i.path.ends_with("timey.md"))
+        .expect("T003 present");
+    assert_eq!(t003.severity, Severity::Error);
+    assert_eq!(report.exit_code(), 1);
+}
+
+#[test]
+fn check_temporal_reports_timestamp_and_sentinel_together() {
+    // `valid_from` carries a timestamp (T003) and `valid_to` a sentinel
+    // far-future date (T008); the per-engram check surfaces both.
+    let engram = parse_engram(
+        "---\ntype: engram\ntitle: Timey\nstatus: current\nrecorded_at: 2026-01-01\ntimestamp: 2026-01-01T00:00:00+00:00\nvalid_from: 2026-07-15T10:30:00Z\nvalid_to: 9000-01-01\n---\n\nBody.\n",
+    )
+    .unwrap();
+    let issues = verify::check_temporal(Path::new("timey.md"), &engram);
+    let rules: Vec<&str> = issues.iter().map(|i| i.rule).collect();
+    assert!(rules.contains(&"T003"), "{rules:?}");
+    assert!(rules.contains(&"T008"), "{rules:?}");
 }
 
 #[test]

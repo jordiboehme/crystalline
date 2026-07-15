@@ -6,8 +6,8 @@ mod common;
 use chrono::{DateTime, FixedOffset};
 use common::{fixtures_dir, read};
 use crystalline_core::emit::{
-    append_body, insert_after_section, insert_before_section, prepend_body, replace_section,
-    set_frontmatter_field, touch_timestamp,
+    append_body, insert_after_section, insert_before_section, prepend_body,
+    remove_frontmatter_field, replace_section, set_frontmatter_field, touch_timestamp,
 };
 use crystalline_core::parse_engram;
 
@@ -120,6 +120,36 @@ fn touch_timestamp_sets_rfc3339() {
         e.frontmatter.timestamp.unwrap().to_rfc3339(),
         "2026-07-02T10:00:00+00:00"
     );
+}
+
+#[test]
+fn remove_frontmatter_field_removes_exactly_one_line() {
+    let source = read(&fixtures_dir().join("canonical/full-frontmatter.md"));
+    let out = remove_frontmatter_field(&source, "valid_to");
+    // Exactly the `valid_to:` line is gone; every other byte is preserved.
+    let expected = source.replace("valid_to: 2026-09-30\n", "");
+    assert_eq!(out, expected);
+    // The neighboring fields whose names share the `valid_` prefix survive.
+    let e = parse_engram(&out).unwrap();
+    assert_eq!(e.frontmatter.valid_to, None);
+    assert_eq!(
+        e.frontmatter.valid_from,
+        chrono::NaiveDate::from_ymd_opt(2026, 5, 1)
+    );
+}
+
+#[test]
+fn remove_frontmatter_field_missing_key_is_a_noop() {
+    let source = read(&fixtures_dir().join("canonical/full-frontmatter.md"));
+    let out = remove_frontmatter_field(&source, "nonexistent");
+    assert_eq!(out, source);
+}
+
+#[test]
+fn remove_frontmatter_field_without_a_block_is_a_noop() {
+    let source = "# Just a body\n\nNo frontmatter here at all.\n";
+    let out = remove_frontmatter_field(source, "valid_to");
+    assert_eq!(out, source);
 }
 
 #[test]

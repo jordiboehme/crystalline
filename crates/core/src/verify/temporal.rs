@@ -8,33 +8,28 @@
 //! rather than treated as valid input, since Crystalline expresses "valid
 //! forever" by omitting the field, never by writing a distant date.
 
+use std::path::Path;
+
 use chrono::Datelike;
 
-use crate::engram::RECOMMENDED_STATUSES;
-use crate::yaml::YamlValue;
+use crate::engram::{Engram, RECOMMENDED_STATUSES};
+use crate::import::SENTINEL_FUTURE_YEAR;
+use crate::temporal::{DATE_FIELDS, describe};
 
 use super::scanner::ScannedFile;
 use super::{Severity, Sink};
 
-/// Frontmatter keys holding a plain ISO date. When the raw value fails to
-/// parse, [`crate::parse`] preserves it in `frontmatter.extra` instead of
-/// the typed field (see the M1 parser note), which is what T003 reads.
-const DATE_FIELDS: &[&str] = &[
-    "recorded_at",
-    "valid_from",
-    "valid_to",
-    "source_date",
-    "last_verified",
-    "review_after",
-];
-
 pub(crate) fn check(file: &ScannedFile, sink: &mut Sink) {
     let Ok(engram) = &file.parsed else { return };
+    check_engram(&file.path, engram, sink);
+}
+
+pub(crate) fn check_engram(path: &Path, engram: &Engram, sink: &mut Sink) {
     let fm = &engram.frontmatter;
 
     if fm.status.as_deref().map(str::trim).unwrap_or("").is_empty() {
         sink.emit(
-            &file.path,
+            path,
             None,
             "T001",
             Severity::Error,
@@ -44,7 +39,7 @@ pub(crate) fn check(file: &ScannedFile, sink: &mut Sink) {
     }
     if fm.recorded_at.is_none() && !fm.extra.contains_key("recorded_at") {
         sink.emit(
-            &file.path,
+            path,
             None,
             "T001",
             Severity::Error,
@@ -58,7 +53,7 @@ pub(crate) fn check(file: &ScannedFile, sink: &mut Sink) {
         && !RECOMMENDED_STATUSES.contains(&status.as_str())
     {
         sink.emit(
-            &file.path,
+            path,
             None,
             "T002",
             Severity::Info,
@@ -70,7 +65,7 @@ pub(crate) fn check(file: &ScannedFile, sink: &mut Sink) {
     for field in DATE_FIELDS {
         if let Some(raw) = fm.extra.get(*field) {
             sink.emit(
-                &file.path,
+                path,
                 None,
                 "T003",
                 Severity::Error,
@@ -84,7 +79,7 @@ pub(crate) fn check(file: &ScannedFile, sink: &mut Sink) {
     }
     if let Some(raw) = fm.extra.get("timestamp") {
         sink.emit(
-            &file.path,
+            path,
             None,
             "T003",
             Severity::Error,
@@ -100,7 +95,7 @@ pub(crate) fn check(file: &ScannedFile, sink: &mut Sink) {
         && from > to
     {
         sink.emit(
-            &file.path,
+            path,
             None,
             "T004",
             Severity::Error,
@@ -120,7 +115,7 @@ pub(crate) fn check(file: &ScannedFile, sink: &mut Sink) {
             .any(|r| r.rel_type.eq_ignore_ascii_case("superseded_by"));
         if !has_relation {
             sink.emit(
-                &file.path,
+                path,
                 None,
                 "T005",
                 Severity::Warning,
@@ -132,7 +127,7 @@ pub(crate) fn check(file: &ScannedFile, sink: &mut Sink) {
 
     if fm.timestamp.is_none() && !fm.extra.contains_key("timestamp") {
         sink.emit(
-            &file.path,
+            path,
             None,
             "T006",
             Severity::Warning,
@@ -146,7 +141,7 @@ pub(crate) fn check(file: &ScannedFile, sink: &mut Sink) {
         && tc != "inferred"
     {
         sink.emit(
-            &file.path,
+            path,
             None,
             "T007",
             Severity::Warning,
@@ -156,10 +151,10 @@ pub(crate) fn check(file: &ScannedFile, sink: &mut Sink) {
     }
 
     if let Some(to) = fm.valid_to
-        && to.year() >= 9000
+        && to.year() >= SENTINEL_FUTURE_YEAR
     {
         sink.emit(
-            &file.path,
+            path,
             None,
             "T008",
             Severity::Warning,
@@ -167,10 +162,4 @@ pub(crate) fn check(file: &ScannedFile, sink: &mut Sink) {
             Some("remove the field; absence means valid forever".into()),
         );
     }
-}
-
-fn describe(v: &YamlValue) -> String {
-    v.as_str()
-        .map(str::to_string)
-        .unwrap_or_else(|| "non-scalar value".to_string())
 }

@@ -186,6 +186,42 @@ pub fn set_frontmatter_field(source: &str, key: &str, value: &str) -> String {
     )
 }
 
+/// Remove a single frontmatter field from the original source, leaving every
+/// other byte untouched. A no-op returning the source unchanged when the key
+/// or the frontmatter block is absent.
+///
+/// Only safe for a single-line scalar field. That is guaranteed for a date
+/// field that parsed into a `NaiveDate` and for an explicit null `key:` line;
+/// it must not be used on a key whose value spans several lines (a block
+/// sequence or a nested mapping), which would orphan the trailing lines.
+pub fn remove_frontmatter_field(source: &str, key: &str) -> String {
+    let (has_fm, fm_span, _body_start) = locate(source);
+    if !has_fm {
+        return source.to_string();
+    }
+
+    let raw = &source[fm_span.clone()];
+    let mut new_raw = String::with_capacity(raw.len());
+    let mut removed = false;
+    for line in raw.split_inclusive('\n') {
+        let content = line.strip_suffix('\n').unwrap_or(line);
+        if !removed && line_sets_key(content, key) {
+            removed = true;
+        } else {
+            new_raw.push_str(line);
+        }
+    }
+    if !removed {
+        return source.to_string();
+    }
+    format!(
+        "{}{}{}",
+        &source[..fm_span.start],
+        new_raw,
+        &source[fm_span.end..]
+    )
+}
+
 /// Set the `timestamp` field to `now` (RFC 3339) in the original source.
 pub fn touch_timestamp(source: &str, now: DateTime<FixedOffset>) -> String {
     set_frontmatter_field(source, "timestamp", &now.to_rfc3339())

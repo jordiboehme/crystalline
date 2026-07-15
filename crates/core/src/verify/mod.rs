@@ -29,6 +29,8 @@ use std::path::Path;
 
 use serde::Serialize;
 
+use crate::engram::Engram;
+
 pub use report::{Format, render, to_github, to_human, to_json};
 pub use scanner::ScanError;
 
@@ -128,6 +130,19 @@ where
 {
     let domains = scanner::scan(paths, options)?;
     Ok(run_rules(&domains, options))
+}
+
+/// Run the temporal (`T`-family) rules against a single already-parsed
+/// engram, returning its issues at their default severities. Backs the
+/// `validate_engrams` tool, which loads engram content through the engine
+/// rather than scanning a Domain root, so there is no `.crystalline.yaml`
+/// override and no `--strict` promotion in play here.
+pub fn check_temporal(path: &Path, engram: &Engram) -> Vec<Issue> {
+    let mut issues = Vec::new();
+    let mut summary = Summary::default();
+    let mut sink = Sink::new(&mut issues, &mut summary, None, false);
+    temporal::check_engram(path, engram, &mut sink);
+    issues
 }
 
 /// Report paths are part of the stable output schema and must be identical

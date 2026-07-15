@@ -24,6 +24,7 @@ pub mod parse;
 pub mod prompt;
 pub mod provision;
 pub mod schema;
+pub mod temporal;
 pub mod verify;
 pub mod yaml;
 
@@ -53,6 +54,7 @@ pub use provision::{
 pub use schema::{
     FieldDecl, FieldType, ScalarType, Schema, SchemaDrift, SchemaIssue, ValidationMode,
 };
+pub use temporal::{DATE_FIELDS, DateFieldError, normalize_temporal_fields};
 pub use verify::{Issue, Severity, VerifyOptions, VerifyReport, verify_paths};
 pub use yaml::YamlValue;
 
