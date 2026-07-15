@@ -476,6 +476,132 @@ async fn origin_add_refuses_a_domain_name_already_registered() {
 }
 
 #[tokio::test]
+async fn origin_add_retry_of_the_same_connect_is_idempotent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        (
+            "notes/alpha.md",
+            engram("Alpha", "alpha", "shared knowledge about turbines"),
+        ),
+    ]));
+    mock.set_branch("main", &commit);
+
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let root = tmp.path().join("brand-knowledge");
+    let eng = engine_with(&config_path, &origins_dir, mock, true, false).await;
+    let root_str = root.to_str().unwrap();
+
+    // connect once
+    let first = eng
+        .origin_add("acme/brand-knowledge", None, None, None, Some(root_str))
+        .await
+        .unwrap();
+    // retry with identical arguments
+    let second = eng
+        .origin_add("acme/brand-knowledge", None, None, None, Some(root_str))
+        .await
+        .unwrap();
+    assert_eq!(second["already_connected"], serde_json::json!(true));
+    assert_eq!(second["base_commit"], first["base_commit"]);
+    assert_eq!(second["domain"], first["domain"]);
+    assert_eq!(second["engrams"], first["engrams"]);
+}
+
+#[tokio::test]
+async fn origin_add_retry_treats_absent_branch_as_main() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[("MANIFEST.md", manifest())]));
+    mock.set_branch("main", &commit);
+
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let root = tmp.path().join("brand-knowledge");
+    let eng = engine_with(&config_path, &origins_dir, mock, true, false).await;
+    let root_str = root.to_str().unwrap();
+
+    // connect with branch None, retry with Some("main"): both mean main
+    eng.origin_add("acme/brand-knowledge", None, None, None, Some(root_str))
+        .await
+        .unwrap();
+    let second = eng
+        .origin_add(
+            "acme/brand-knowledge",
+            None,
+            None,
+            Some("main"),
+            Some(root_str),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second["already_connected"], serde_json::json!(true));
+}
+
+#[tokio::test]
+async fn origin_add_retry_with_a_different_origin_still_conflicts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[("MANIFEST.md", manifest())]));
+    mock.set_branch("main", &commit);
+
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let root = tmp.path().join("brand-knowledge");
+    let eng = engine_with(&config_path, &origins_dir, mock, true, false).await;
+    let root_str = root.to_str().unwrap();
+
+    eng.origin_add(
+        "acme/brand-knowledge",
+        Some("brand"),
+        None,
+        None,
+        Some(root_str),
+    )
+    .await
+    .unwrap();
+    // different repo under the same domain name
+    let err = eng
+        .origin_add(
+            "acme/other-knowledge",
+            Some("brand"),
+            None,
+            None,
+            Some(root_str),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EngineError::Conflict(_)), "{err}");
+    assert!(err.to_string().contains("already connected"), "{err}");
+    // same repo, different branch
+    let err = eng
+        .origin_add(
+            "acme/brand-knowledge",
+            Some("brand"),
+            None,
+            Some("dev"),
+            Some(root_str),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EngineError::Conflict(_)), "{err}");
+    // same repo, different subpath
+    let err = eng
+        .origin_add(
+            "acme/brand-knowledge",
+            Some("brand"),
+            Some("docs"),
+            None,
+            Some(root_str),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EngineError::Conflict(_)), "{err}");
+}
+
+#[tokio::test]
 async fn origin_add_schedules_embedding_on_the_worker_channel() {
     let tmp = tempfile::tempdir().unwrap();
     let mock = Arc::new(MockProvider::new());

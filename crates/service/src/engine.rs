@@ -3053,6 +3053,24 @@ impl Engine {
                     )));
                 }
                 if let Some(origin_cfg) = &entry.origin {
+                    // A retry of the exact connect that already succeeded answers
+                    // with the connected state instead of a conflict, so a client
+                    // that timed out waiting for the first response never reads
+                    // success as failure. GitHub treats owner/name case
+                    // insensitively, so the repo compares that way; path compares
+                    // exactly and an absent branch means main on both sides.
+                    let same_repo = origin_cfg.repo.eq_ignore_ascii_case(repo);
+                    let same_path = origin_cfg.path.as_deref() == path;
+                    let same_branch =
+                        origin_cfg.branch.as_deref().unwrap_or("main") == branch.unwrap_or("main");
+                    let same_folder = match (folder, entry.file_path()) {
+                        (None, _) => true,
+                        (Some(f), Some(r)) => crystalline_core::config::expand_tilde(f) == r,
+                        (Some(_), None) => false,
+                    };
+                    if same_repo && same_path && same_branch && same_folder {
+                        return self.origin_already_connected(&domain_name, &entry).await;
+                    }
                     return Err(EngineError::Conflict(format!(
                         "domain '{domain_name}' is already connected to {}; pass a domain name to connect this origin under a different one",
                         origin_cfg.repo
@@ -3160,6 +3178,37 @@ impl Engine {
             "adopted": report.adopted || adopts_registered,
             "files_added": report.files_written,
             "local_changes": report.local_changes,
+        }))
+    }
+
+    /// The response for a connect retry that matches the existing
+    /// connection: the same shape `origin_add` returns, marked
+    /// `already_connected`, read under the domain's origin lock.
+    async fn origin_already_connected(&self, name: &str, entry: &DomainEntry) -> Result<Value> {
+        let lock = self.origin_lock(name);
+        let _guard = lock.lock().await;
+        let root = entry.file_path().unwrap_or_default();
+        let state_dir = self.origin_state_dir(name)?;
+        let base_commit = crystalline_remote::state::OriginState::load(&state_dir)?
+            .map(|s| s.base_commit)
+            .unwrap_or_default();
+        let engrams = {
+            let store = self.store.lock().await;
+            store
+                .domain_stats()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .find(|d| d.name == name)
+                .map(|d| d.engrams)
+                .unwrap_or(0)
+        };
+        Ok(json!({
+            "domain": name,
+            "root": root.display().to_string(),
+            "engrams": engrams,
+            "base_commit": base_commit,
+            "already_connected": true,
         }))
     }
 

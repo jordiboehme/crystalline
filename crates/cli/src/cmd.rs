@@ -342,6 +342,17 @@ pub(crate) fn print_origin_add(repo: &str, data: &serde_json::Value, json: bool)
         println!("{data}");
         return;
     }
+    if data["already_connected"].as_bool().unwrap_or(false) {
+        let name = data["domain"].as_str().unwrap_or("");
+        println!("Domain '{name}' is already connected to {repo}");
+        println!("  root: {}", data["root"].as_str().unwrap_or(""));
+        println!(
+            "  {} engrams at {}",
+            data["engrams"].as_u64().unwrap_or(0),
+            data["base_commit"].as_str().unwrap_or("")
+        );
+        return;
+    }
     let name = data["domain"].as_str().unwrap_or("");
     println!("Connected team domain '{name}' to {repo}");
     println!("  root: {}", data["root"].as_str().unwrap_or(""));
