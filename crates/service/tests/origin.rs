@@ -319,6 +319,52 @@ async fn origin_add_creates_folder_registers_domain_and_indexes_engrams() {
 }
 
 #[tokio::test]
+async fn origin_add_reports_stage_progress() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        (
+            "notes/alpha.md",
+            engram("Alpha", "alpha", "shared knowledge about turbines"),
+        ),
+    ]));
+    mock.set_branch("main", &commit);
+
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let root = tmp.path().join("brand-knowledge");
+    let eng = engine_with(&config_path, &origins_dir, mock, true, false).await;
+
+    let seen: Arc<std::sync::Mutex<Vec<(u64, u64, String)>>> = Arc::default();
+    let cb: crystalline_service::engine::OriginProgress = {
+        let seen = seen.clone();
+        Arc::new(move |step, total, msg: &str| {
+            seen.lock().unwrap().push((step, total, msg.to_string()));
+        })
+    };
+    eng.origin_add_with_progress(
+        "acme/brand-knowledge",
+        None,
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+        Some(cb),
+    )
+    .await
+    .unwrap();
+    let seen = seen.lock().unwrap();
+    let steps: Vec<u64> = seen.iter().map(|(s, _, _)| *s).collect();
+    assert_eq!(
+        steps,
+        vec![1, 2, 3, 4],
+        "one strictly increasing step per stage"
+    );
+    assert!(seen.iter().all(|(_, total, _)| *total == 4));
+    assert!(seen[0].2.contains("acme/brand-knowledge"));
+}
+
+#[tokio::test]
 async fn origin_add_connects_a_registered_domain_in_place() {
     let tmp = tempfile::tempdir().unwrap();
     let mock = Arc::new(MockProvider::new());

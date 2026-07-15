@@ -156,6 +156,11 @@ impl From<crystalline_index::IndexError> for EngineError {
 /// The result type used across the engine.
 pub type Result<T> = std::result::Result<T, EngineError>;
 
+/// A stage-boundary progress callback for a long connect:
+/// (step, total steps, message). Sync and cheap by contract; the MCP
+/// layer bridges it onto async notifications through a channel.
+pub type OriginProgress = std::sync::Arc<dyn Fn(u64, u64, &str) + Send + Sync>;
+
 // --- connect auth (a testable seam over crystalline_remote::github::auth) ---
 
 /// The GitHub identity calls the `configure` tool's connect actions need:
@@ -3025,6 +3030,29 @@ impl Engine {
         branch: Option<&str>,
         folder: Option<&str>,
     ) -> Result<Value> {
+        self.origin_add_with_progress(repo, domain, path, branch, folder, None)
+            .await
+    }
+
+    /// [`origin_add`](Self::origin_add) with an optional stage-boundary
+    /// progress callback. A real connect reports four stages through it -
+    /// downloading, downloaded, indexing, connected - so a client can keep
+    /// its request timeout alive during a long download and index; an
+    /// already-connected retry is instant and reports none.
+    pub async fn origin_add_with_progress(
+        &self,
+        repo: &str,
+        domain: Option<&str>,
+        path: Option<&str>,
+        branch: Option<&str>,
+        folder: Option<&str>,
+        progress: Option<OriginProgress>,
+    ) -> Result<Value> {
+        let progress_at = |step: u64, msg: &str| {
+            if let Some(p) = &progress {
+                p(step, 4, msg);
+            }
+        };
         if !self.config.read().unwrap().github_enabled() {
             return Err(RemoteError::NotEnabled.into());
         }
@@ -3117,9 +3145,17 @@ impl Engine {
         let state_dir = self.origin_state_dir(&domain_name)?;
 
         let provider = self.resolve_origin_provider()?;
+        progress_at(1, &format!("downloading {repo}"));
         let report = ops::subscribe(provider.as_ref(), &spec, &root, &state_dir)
             .await
             .inspect_err(|e| self.drop_github_credential_on_auth(e))?;
+        progress_at(
+            2,
+            &format!(
+                "downloaded {} engrams, registering the domain",
+                report.engrams
+            ),
+        );
 
         // Register the domain and persist, mirroring `configure`'s file-then-
         // effective write-lock-first pattern so a concurrent read never observes
@@ -3158,6 +3194,7 @@ impl Engine {
             let _ = tx.send(WatchEvent::Add(domain_name.clone(), root.clone()));
         }
 
+        progress_at(3, "indexing for search");
         self.sync(Some(&domain_name)).await?;
         // Embedding a whole freshly connected repo can outlast any client
         // timeout, so a daemon or in-process MCP server runs it on the embed
@@ -3170,6 +3207,7 @@ impl Engine {
             tracing::warn!("embedding after connecting '{domain_name}' failed: {e}");
         }
 
+        progress_at(4, "connected");
         Ok(json!({
             "domain": domain_name,
             "root": root.display().to_string(),

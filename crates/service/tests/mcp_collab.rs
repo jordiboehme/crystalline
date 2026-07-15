@@ -26,7 +26,7 @@ use crystalline_service::Engine;
 use crystalline_service::EnvOverlay;
 use crystalline_service::engine::{ConnectAuth, EngineError};
 use crystalline_service::mcp::McpServer;
-use rmcp::model::CallToolRequestParams;
+use rmcp::model::{CallToolRequestParams, ProgressNotificationParam};
 use rmcp::service::{NotificationContext, Peer, RunningService};
 use rmcp::{ClientHandler, RoleClient, RoleServer};
 use serde_json::{Value, json};
@@ -85,10 +85,22 @@ async fn connect(
     RunningService<RoleClient, ()>,
     RunningService<RoleServer, McpServer>,
 ) {
+    connect_with(engine, ()).await
+}
+
+/// `connect` with a caller-supplied client handler, so a test can observe the
+/// server-to-client notifications (progress, tool list changes) it emits.
+async fn connect_with<H: ClientHandler>(
+    engine: Arc<Engine>,
+    handler: H,
+) -> (
+    RunningService<RoleClient, H>,
+    RunningService<RoleServer, McpServer>,
+) {
     let (client_io, server_io) = tokio::io::duplex(1 << 16);
     let server_task =
         tokio::spawn(async move { rmcp::serve_server(McpServer::new(engine), server_io).await });
-    let client = rmcp::serve_client((), client_io).await.unwrap();
+    let client = rmcp::serve_client(handler, client_io).await.unwrap();
     let server = server_task.await.unwrap().unwrap();
     (client, server)
 }
@@ -999,6 +1011,76 @@ async fn add_domain_tool_wires_through_to_origin_add() {
     assert_eq!(out["engrams"], json!(2));
     assert_eq!(out["base_commit"], json!(commit));
     assert!(root.join("MANIFEST.md").exists());
+}
+
+/// A client handler that records every progress notification it receives.
+#[derive(Clone, Default)]
+struct ProgressSink(Arc<std::sync::Mutex<Vec<ProgressNotificationParam>>>);
+
+impl ClientHandler for ProgressSink {
+    fn on_progress(
+        &self,
+        params: ProgressNotificationParam,
+        _context: NotificationContext<RoleClient>,
+    ) -> impl Future<Output = ()> + Send + '_ {
+        self.0.lock().unwrap().push(params);
+        std::future::ready(())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn add_domain_streams_progress_when_the_client_sends_a_token() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        ("notes/alpha.md", engram("Alpha", "alpha", "turbine notes")),
+    ]));
+    mock.set_branch("main", &commit);
+
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let root = tmp.path().join("brand-knowledge");
+    let eng = Arc::new(engine_with_provider(&config_path, &origins_dir, mock).await);
+
+    let sink = ProgressSink::default();
+    let (client, _server) = connect_with(eng, sink.clone()).await;
+    let peer = client.peer();
+
+    // rmcp's client attaches a fresh progress token to every request, so the
+    // server streams the connect's stage boundaries back over the same
+    // connection without the test having to set one by hand.
+    let args = json!({ "repo": "acme/brand-knowledge", "folder": root.to_str().unwrap() });
+    let params =
+        CallToolRequestParams::new("add_domain").with_arguments(args.as_object().unwrap().clone());
+    peer.call_tool(params).await.unwrap();
+
+    // Wait until all four stage notifications land. rmcp dispatches every
+    // incoming notification on its own task, so they can be recorded out of
+    // order even though the server emits them in sequence; assert on the
+    // delivered set, not the arrival order.
+    let seen = wait_until(|| {
+        let got = sink.0.lock().unwrap().clone();
+        async move { (got.len() >= 4).then_some(got) }
+    })
+    .await;
+
+    // Every stage notification echoes the one progress token the request
+    // carried, and reports the same total.
+    let token = seen[0].progress_token.clone();
+    assert!(
+        seen.iter().all(|p| p.progress_token == token),
+        "every notification carries the request's progress token: {:?}",
+        seen.iter().map(|p| &p.progress_token).collect::<Vec<_>>()
+    );
+    assert!(seen.iter().all(|p| p.total == Some(4.0)));
+    let mut progresses: Vec<f64> = seen.iter().map(|p| p.progress).collect();
+    progresses.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    assert_eq!(
+        progresses,
+        vec![1.0, 2.0, 3.0, 4.0],
+        "all four stages arrive, ending at the total"
+    );
 }
 
 // --- add_domain: local and virtual modes (no GitHub) ------------------------

@@ -63,7 +63,7 @@ use std::sync::Arc;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     CallToolResult, ContentBlock, ErrorData, ListToolsResult, PaginatedRequestParams,
-    ServerCapabilities, ServerInfo, Tool,
+    ProgressNotificationParam, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::{Peer, RoleServer, ServerHandler, tool, tool_handler, tool_router};
@@ -441,7 +441,7 @@ impl McpServer {
     #[tool(
         name = "add_domain",
         title = "Add domain",
-        description = "Create or connect a domain to store engrams in - the way to give the agent somewhere to capture knowledge, so it works even on an instance with no domains yet. Three modes follow the arguments: a local domain of markdown files on disk (pass folder, or just domain to use the default root at <domains_root>/<domain>) that is created with a starter MANIFEST when new and adopted in place when it already holds engrams; a virtual database-backed domain with no files (virtual: true with a domain name); or a GitHub team domain that downloads shared knowledge to learn from and share back (repo is owner/name, needs GitHub enabled via configure). repo and virtual are mutually exclusive. Available whenever the instance is writable; only the team mode needs GitHub turned on. Connecting a repository this domain is already connected to is safe and simply reports the connected state.",
+        description = "Create or connect a domain to store engrams in - the way to give the agent somewhere to capture knowledge, so it works even on an instance with no domains yet. Three modes follow the arguments: a local domain of markdown files on disk (pass folder, or just domain to use the default root at <domains_root>/<domain>) that is created with a starter MANIFEST when new and adopted in place when it already holds engrams; a virtual database-backed domain with no files (virtual: true with a domain name); or a GitHub team domain that downloads shared knowledge to learn from and share back (repo is owner/name, needs GitHub enabled via configure). repo and virtual are mutually exclusive. Available whenever the instance is writable; only the team mode needs GitHub turned on. Connecting a repository this domain is already connected to is safe and simply reports the connected state. Connecting a repository reports progress while it downloads and registers the knowledge, then keeps embedding it for search in the background after the call returns.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -452,7 +452,7 @@ impl McpServer {
     async fn add_domain(
         &self,
         Parameters(p): Parameters<AddDomainParams>,
-        peer: Peer<RoleServer>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         if p.repo.is_some() && p.is_virtual {
             return Err(to_error(EngineError::Invalid(
@@ -461,6 +461,28 @@ impl McpServer {
             )));
         }
 
+        // When the client sent a progress token, forward stage boundaries as
+        // MCP progress notifications so its request timeout stays alive during
+        // the download; a channel plus one forwarder task keeps them ordered.
+        let progress = ctx.meta.get_progress_token().map(|token| {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(u64, u64, String)>();
+            let peer = ctx.peer.clone();
+            tokio::spawn(async move {
+                while let Some((step, total, message)) = rx.recv().await {
+                    let _ = peer
+                        .notify_progress(
+                            ProgressNotificationParam::new(token.clone(), step as f64)
+                                .with_total(total as f64)
+                                .with_message(message),
+                        )
+                        .await;
+                }
+            });
+            std::sync::Arc::new(move |step: u64, total: u64, msg: &str| {
+                let _ = tx.send((step, total, msg.to_string()));
+            }) as crate::engine::OriginProgress
+        });
+
         // A newly added (or adopted) domain may already carry a MANIFEST that
         // declares a `Provisioning` section, so `provisioning_declared` can
         // flip on this call; notify the same way `configure` does for
@@ -468,12 +490,13 @@ impl McpServer {
         let before = self.engine.provisioning_declared();
         let result: Result<Value, EngineError> = if let Some(repo) = p.repo.as_deref() {
             self.engine
-                .origin_add(
+                .origin_add_with_progress(
                     repo,
                     p.domain.as_deref(),
                     p.path.as_deref(),
                     p.branch.as_deref(),
                     p.folder.as_deref(),
+                    progress,
                 )
                 .await
         } else if p.is_virtual {
@@ -497,7 +520,7 @@ impl McpServer {
         };
         let after = self.engine.provisioning_declared();
         if before != after
-            && let Err(e) = peer.notify_tool_list_changed().await
+            && let Err(e) = ctx.peer.notify_tool_list_changed().await
         {
             tracing::warn!("failed to send tools/list_changed after add_domain: {e}");
         }
