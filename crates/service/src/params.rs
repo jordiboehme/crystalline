@@ -52,7 +52,10 @@ pub struct WriteParams {
     /// legacy (guidance so an agent can tell an idea apart from current fact).
     #[serde(default)]
     pub status: Option<String>,
-    /// Extra frontmatter keys, preserved verbatim and filterable.
+    /// Extra frontmatter keys, preserved verbatim and filterable. Temporal
+    /// bounds go here: valid_from, valid_to, source_date, last_verified and
+    /// review_after must be plain ISO dates (YYYY-MM-DD); any other format
+    /// fails the write and an explicit null is dropped.
     #[serde(default)]
     pub metadata: Option<serde_json::Value>,
     /// Overwrite an existing engram with the same permalink instead of erroring.

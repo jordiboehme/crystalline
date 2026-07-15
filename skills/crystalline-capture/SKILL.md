@@ -119,7 +119,7 @@ Set them through the `metadata` argument as an object; a bound stated only in th
 }
 ```
 
-They are not top-level write arguments - an unknown argument is silently dropped, so a bound passed that way vanishes without an error. After a bounded write, read the engram back and confirm the fields landed before reporting the window as set.
+Bounds are not top-level write arguments and go inside metadata; the write enforces the format - a value that is not a plain ISO date (YYYY-MM-DD) fails with an error naming the field, and a sentinel far-future valid_to or an explicit null is dropped since absence already means valid forever, so a successful bounded write needs no read-back confirmation.
 
 ## Superseding instead of contradicting
 
