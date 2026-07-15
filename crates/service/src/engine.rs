@@ -284,6 +284,11 @@ pub struct Engine {
     // Told about domains discovered this way so the daemon's watcher can pick
     // them up without a restart. `None` outside the daemon.
     watch_tx: Option<tokio::sync::mpsc::UnboundedSender<WatchEvent>>,
+    // The channel a background embed worker listens on, so long-running verbs
+    // schedule an embed pass there instead of running it inline and blocking
+    // the caller on the model. `None` when no worker is wired (standalone
+    // one-shot commands and most tests), which keeps the inline pass.
+    embed_tx: Option<tokio::sync::mpsc::UnboundedSender<()>>,
     // Swappable so the daemon can build the (possibly downloading) provider in the
     // background without blocking readiness or text search.
     provider: std::sync::RwLock<Option<Arc<dyn EmbeddingProvider>>>,
@@ -499,6 +504,7 @@ impl Engine {
             config_path,
             discovered_domains: std::sync::RwLock::new(HashMap::new()),
             watch_tx: None,
+            embed_tx: None,
             provider: std::sync::RwLock::new(provider),
             model_id,
             chunk_params,
@@ -541,6 +547,14 @@ impl Engine {
         tx: tokio::sync::mpsc::UnboundedSender<WatchEvent>,
     ) -> Engine {
         self.watch_tx = Some(tx);
+        self
+    }
+
+    /// Wires the channel a background embed worker listens on. When present,
+    /// long-running verbs schedule embedding there instead of embedding
+    /// inline, so a connect request returns without waiting on the model.
+    pub fn with_embed_channel(mut self, tx: tokio::sync::mpsc::UnboundedSender<()>) -> Engine {
+        self.embed_tx = Some(tx);
         self
     }
 
@@ -2566,6 +2580,16 @@ impl Engine {
         Ok(embedded)
     }
 
+    /// Schedules a background embedding pass when a worker is wired,
+    /// returning whether it was scheduled; callers run an inline pass when
+    /// it was not.
+    pub fn request_embed(&self) -> bool {
+        match &self.embed_tx {
+            Some(tx) => tx.send(()).is_ok(),
+            None => false,
+        }
+    }
+
     // --- configure -------------------------------------------------------------
 
     /// Show, set or reset an agent-adjustable setting from the
@@ -3117,7 +3141,14 @@ impl Engine {
         }
 
         self.sync(Some(&domain_name)).await?;
-        if let Err(e) = self.embed_pending().await {
+        // Embedding a whole freshly connected repo can outlast any client
+        // timeout, so a daemon or in-process MCP server runs it on the embed
+        // worker; without a worker (standalone one-shot commands, tests) the
+        // inline pass keeps the old behavior, and is a no-op anyway whenever
+        // no provider is loaded.
+        if !self.request_embed()
+            && let Err(e) = self.embed_pending().await
+        {
             tracing::warn!("embedding after connecting '{domain_name}' failed: {e}");
         }
 
@@ -4549,6 +4580,22 @@ pub async fn build_provider(config: &GlobalConfig) -> Option<Arc<dyn EmbeddingPr
         Err(e) => {
             tracing::warn!("embedding provider unavailable, continuing text-only: {e}");
             None
+        }
+    }
+}
+
+/// Runs embedding passes on demand: one pass per burst of requests, the
+/// burst coalesced so queued signals never stack redundant passes. Ends
+/// when every sender is gone, which only happens alongside the engine
+/// itself going away.
+pub async fn run_embed_worker(
+    engine: Arc<Engine>,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<()>,
+) {
+    while rx.recv().await.is_some() {
+        while rx.try_recv().is_ok() {}
+        if let Err(e) = engine.embed_pending().await {
+            tracing::warn!("background embed failed: {e}");
         }
     }
 }

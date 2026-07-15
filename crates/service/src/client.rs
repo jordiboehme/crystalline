@@ -530,6 +530,10 @@ where
     let read_only = read_only || loaded.effective.read_only();
     let db_path = resolve_db(db)?;
     let store = open_store(&loaded.effective, Some(&db_path)).await?;
+    // A channel the embed worker (spawned below) listens on: connecting an
+    // origin mid-session schedules its embedding pass here instead of running
+    // it inline, so the connect request returns without waiting on the model.
+    let (embed_tx, embed_rx) = tokio::sync::mpsc::unbounded_channel();
     // The provider is built in the background so the stdio session is ready and
     // text search works before any model download completes. There is no
     // watcher task in this mode, so the resolved config path only helps a domain
@@ -538,9 +542,11 @@ where
     // its effective config drives reads while persistence stays env-free.
     let engine = Arc::new(
         Engine::new(store, loaded.file.clone(), None, Some(loaded.path.clone()))
+            .with_embed_channel(embed_tx)
             .with_read_only(read_only)
             .with_env_overlay(loaded.overlay.clone()),
     );
+    tokio::spawn(crate::engine::run_embed_worker(engine.clone(), embed_rx));
 
     let bg = engine.clone();
     let bg_config = loaded.effective.clone();

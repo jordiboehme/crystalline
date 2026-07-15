@@ -24,7 +24,7 @@ use crystalline_remote::state::{
 use crystalline_service::engine::EngineError;
 use crystalline_service::params::{ReadParams, SearchParams};
 use crystalline_service::{Engine, EnvOverlay};
-use support::{MockProvider, sha256_hex};
+use support::{CountingEmbedder, MockProvider, sha256_hex};
 use tokio::sync::Mutex;
 
 fn config(github_enabled: bool) -> GlobalConfig {
@@ -473,6 +473,89 @@ async fn origin_add_refuses_a_domain_name_already_registered() {
         .unwrap_err();
     assert!(matches!(err, EngineError::Conflict(_)), "{err}");
     assert!(!other_root.exists(), "a refused add must not touch disk");
+}
+
+#[tokio::test]
+async fn origin_add_schedules_embedding_on_the_worker_channel() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        ("notes/alpha.md", engram("Alpha", "alpha", "alpha body")),
+    ]));
+    mock.set_branch("main", &commit);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let eng = engine_with(
+        &tmp.path().join("config.yaml"),
+        &tmp.path().join("origins"),
+        mock,
+        true,
+        false,
+    )
+    .await
+    .with_embed_channel(tx);
+    let root = tmp.path().join("brand-knowledge");
+    eng.origin_add(
+        "acme/brand-knowledge",
+        None,
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+    )
+    .await
+    .unwrap();
+    assert!(
+        rx.try_recv().is_ok(),
+        "origin_add must schedule a background embed instead of embedding inline"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn embed_worker_runs_the_scheduled_pass() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        ("notes/alpha.md", engram("Alpha", "alpha", "alpha body")),
+    ]));
+    mock.set_branch("main", &commit);
+    let root = tmp.path().join("brand-knowledge");
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let eng = Arc::new(
+        engine_with(
+            &tmp.path().join("config.yaml"),
+            &tmp.path().join("origins"),
+            mock,
+            true,
+            false,
+        )
+        .await
+        .with_embed_channel(tx),
+    );
+    let embedder = Arc::new(CountingEmbedder::new());
+    eng.set_provider(embedder.clone());
+    tokio::spawn(crystalline_service::engine::run_embed_worker(
+        eng.clone(),
+        rx,
+    ));
+    eng.origin_add(
+        "acme/brand-knowledge",
+        None,
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+    )
+    .await
+    .unwrap();
+    // Poll up to 2 s for the worker to run the pass.
+    for _ in 0..200 {
+        if embedder.calls.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("the embed worker never ran the scheduled pass");
 }
 
 // --- origin_update ---------------------------------------------------------

@@ -200,6 +200,10 @@ pub async fn run_serve(
     // domain registered after this daemon started, so it starts watching that
     // root without a restart. See `Engine::domain_root`'s fresh-config fallback.
     let (watch_tx, watch_rx) = tokio::sync::mpsc::unbounded_channel::<WatchEvent>();
+    // A channel the embed worker (spawned below) listens on: connecting an
+    // origin schedules its embedding pass here instead of running it inline,
+    // so the connect request returns without waiting on the model.
+    let (embed_tx, embed_rx) = tokio::sync::mpsc::unbounded_channel();
     // The provider is built in the background (see below); text search and the
     // socket never wait on the model download. The engine holds the file config
     // and the overlay separately (persist and refresh hit the resolved file even
@@ -207,10 +211,12 @@ pub async fn run_serve(
     let engine = Arc::new(
         Engine::new(store, loaded.file.clone(), None, Some(loaded.path.clone()))
             .with_watch_channel(watch_tx)
+            .with_embed_channel(embed_tx)
             .with_read_only(read_only)
             .with_instance_id(instance_id)
             .with_env_overlay(loaded.overlay.clone()),
     );
+    tokio::spawn(crate::engine::run_embed_worker(engine.clone(), embed_rx));
 
     // Prime the routing cache once as the HTTP baseline: every HTTP session
     // shares this engine and reads its cache at initialize, and each socket

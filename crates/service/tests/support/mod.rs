@@ -16,6 +16,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
 use std::sync::Mutex;
 
+use crystalline_index::EmbeddingProvider;
 use crystalline_remote::RemoteError;
 use crystalline_remote::provider::{
     ChangeKind, CompareResult, HeadProbe, OriginSpec, ProposalHandle, ProposalRequest,
@@ -455,5 +456,45 @@ impl Provider for MockProvider {
 
     async fn current_user(&self) -> Result<String, RemoteError> {
         Ok(self.inner.lock().unwrap().current_user.clone())
+    }
+}
+
+/// An embedding provider that returns fixed small vectors and counts calls,
+/// for the background embed worker tests in `tests/origin.rs`.
+pub struct CountingEmbedder {
+    pub calls: std::sync::atomic::AtomicUsize,
+}
+
+impl CountingEmbedder {
+    pub fn new() -> Self {
+        Self {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+impl Default for CountingEmbedder {
+    fn default() -> Self {
+        CountingEmbedder::new()
+    }
+}
+
+#[async_trait::async_trait]
+impl EmbeddingProvider for CountingEmbedder {
+    async fn embed(&self, texts: &[String]) -> crystalline_index::Result<Vec<Vec<f32>>> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(vec![vec![0.1_f32; 4]; texts.len()])
+    }
+
+    fn model_id(&self) -> &str {
+        "test-model"
+    }
+
+    fn dims(&self) -> usize {
+        4
+    }
+
+    fn max_input_tokens(&self) -> usize {
+        512
     }
 }
