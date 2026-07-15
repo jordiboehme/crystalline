@@ -1,7 +1,9 @@
 //! Engine-level tests for GitHub origin collaboration: `origin_add`,
 //! `origin_update`, `origin_status`, `origin_share`, `origin_discard` and
 //! `origin_resolve`, plus the gating matrix (the `github.enabled` refusal
-//! and the read-only mode's asymmetric refusal).
+//! and the read-only mode's asymmetric refusal). The embed-worker
+//! scheduling checks also live here, beside the harness they share; they
+//! include the non-origin `domain_add_local` one.
 //!
 //! Every test injects `support::MockProvider` via `Engine::with_origin_provider`
 //! and points origin state at a tempdir via `Engine::with_origins_dir`, so
@@ -870,6 +872,52 @@ async fn origin_update_applies_an_upstream_edit_and_the_index_reflects_it() {
 }
 
 #[tokio::test]
+async fn origin_update_schedules_embedding_on_the_worker_channel() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let c1 = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        ("notes/alpha.md", engram("Alpha", "alpha", "version one")),
+    ]));
+    mock.set_branch("main", &c1);
+
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let root = tmp.path().join("brand-knowledge");
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let eng = engine_with(&config_path, &origins_dir, mock.clone(), true, false)
+        .await
+        .with_embed_channel(tx);
+    eng.origin_add(
+        "acme/brand-knowledge",
+        Some("brand"),
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+    )
+    .await
+    .unwrap();
+    // Drain the connect's own scheduled embed so the assertion below sees
+    // only the update's pass.
+    while rx.try_recv().is_ok() {}
+
+    let c2 = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        (
+            "notes/alpha.md",
+            engram("Alpha", "alpha", "version two, revised upstream"),
+        ),
+    ]));
+    mock.set_branch("main", &c2);
+
+    eng.origin_update(Some("brand")).await.unwrap();
+    assert!(
+        rx.try_recv().is_ok(),
+        "origin_update must schedule a background embed instead of embedding inline"
+    );
+}
+
+#[tokio::test]
 async fn origin_update_named_domain_with_no_origin_errors() {
     let tmp = tempfile::tempdir().unwrap();
     let mock = Arc::new(MockProvider::new());
@@ -1544,6 +1592,64 @@ async fn origin_discard_restores_files_and_syncs_the_index() {
     assert_eq!(hits["total"], 1, "{hits}");
 }
 
+#[tokio::test]
+async fn origin_discard_schedules_embedding_on_the_worker_channel() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        ("notes/keep.md", engram("Keep", "keep", "base content")),
+    ]));
+    mock.set_branch("main", &commit);
+
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let root = tmp.path().join("brand-knowledge");
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let eng = engine_with(&config_path, &origins_dir, mock.clone(), true, false)
+        .await
+        .with_embed_channel(tx);
+    eng.origin_add(
+        "acme/brand-knowledge",
+        Some("brand"),
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+    )
+    .await
+    .unwrap();
+    // Drain the connect's own scheduled embed so the assertion below sees
+    // only the discard's pass.
+    while rx.try_recv().is_ok() {}
+
+    // A previously opened, now declined proposal touching keep.md, without
+    // going through a real `origin_share` call.
+    let proposed = engram("Keep", "keep", "shared v2 content");
+    std::fs::write(root.join("notes/keep.md"), &proposed).unwrap();
+    let state_dir = origins_dir.join("brand");
+    let mut state = OriginState::load(&state_dir).unwrap().unwrap();
+    state.proposals.push(Proposal {
+        number: 5,
+        url: "https://github.test/pulls/5".to_string(),
+        branch: "crystalline/share-brand-000101000000".to_string(),
+        title: "Refine 1 engram in brand".to_string(),
+        created_at: chrono::Utc::now(),
+        status: ProposalStatus::Declined,
+        files: vec![ProposedFile {
+            path: "notes/keep.md".to_string(),
+            change: ProposedChange::Modified,
+            sha256: Some(sha256_hex(&proposed)),
+        }],
+    });
+    state.save(&state_dir).unwrap();
+
+    eng.origin_discard("brand", 5).await.unwrap();
+    assert!(
+        rx.try_recv().is_ok(),
+        "origin_discard must schedule a background embed instead of embedding inline"
+    );
+}
+
 // --- origin_resolve --------------------------------------------------------------
 
 #[tokio::test]
@@ -1648,5 +1754,40 @@ async fn origin_resolve_unknown_path_errors_without_writing() {
             EngineError::Remote(RemoteError::ConflictNotFound { .. })
         ),
         "{err}"
+    );
+}
+
+// --- domain_add_local --------------------------------------------------------
+
+#[tokio::test]
+async fn domain_add_local_schedules_embedding_on_the_worker_channel() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let eng = engine_with(
+        &tmp.path().join("config.yaml"),
+        &tmp.path().join("origins"),
+        mock,
+        false,
+        false,
+    )
+    .await
+    .with_embed_channel(tx);
+
+    let folder = tmp.path().join("local-notes");
+    std::fs::create_dir_all(folder.join("notes")).unwrap();
+    std::fs::write(folder.join("MANIFEST.md"), manifest()).unwrap();
+    std::fs::write(
+        folder.join("notes/alpha.md"),
+        engram("Alpha", "alpha", "alpha body"),
+    )
+    .unwrap();
+
+    eng.domain_add_local(Some("local-notes"), Some(folder.to_str().unwrap()))
+        .await
+        .unwrap();
+    assert!(
+        rx.try_recv().is_ok(),
+        "domain_add_local must schedule a background embed instead of embedding inline"
     );
 }

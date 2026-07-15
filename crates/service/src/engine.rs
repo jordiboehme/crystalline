@@ -2932,7 +2932,9 @@ impl Engine {
         }
 
         let sync = self.sync(Some(&domain_name)).await?;
-        if let Err(e) = self.embed_pending().await {
+        if !self.request_embed()
+            && let Err(e) = self.embed_pending().await
+        {
             tracing::warn!("embedding after creating '{domain_name}' failed: {e}");
         }
 
@@ -3367,7 +3369,9 @@ impl Engine {
             .inspect_err(|e| self.drop_github_credential_on_auth(e))?;
 
         self.sync(Some(name)).await?;
-        if let Err(e) = self.embed_pending().await {
+        if !self.request_embed()
+            && let Err(e) = self.embed_pending().await
+        {
             tracing::warn!("embedding after updating '{name}' failed: {e}");
         }
 
@@ -3421,7 +3425,9 @@ impl Engine {
         }
 
         self.sync(Some(name)).await?;
-        if let Err(e) = self.embed_pending().await {
+        if !self.request_embed()
+            && let Err(e) = self.embed_pending().await
+        {
             tracing::warn!("embedding after bootstrapping '{name}' failed: {e}");
         }
 
@@ -3855,7 +3861,9 @@ impl Engine {
         let report = ops::discard(&root, &state_dir, proposal_number)?;
 
         self.sync(Some(domain)).await?;
-        if let Err(e) = self.embed_pending().await {
+        if !self.request_embed()
+            && let Err(e) = self.embed_pending().await
+        {
             tracing::warn!(
                 "embedding after discarding proposal #{proposal_number} for '{domain}' failed: {e}"
             );
@@ -3896,7 +3904,9 @@ impl Engine {
         let report = ops::resolve(&root, &state_dir, path, resolution)?;
 
         self.sync(Some(domain)).await?;
-        if let Err(e) = self.embed_pending().await {
+        if !self.request_embed()
+            && let Err(e) = self.embed_pending().await
+        {
             tracing::warn!("embedding after resolving a conflict for '{domain}' failed: {e}");
         }
 

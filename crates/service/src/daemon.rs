@@ -200,9 +200,10 @@ pub async fn run_serve(
     // domain registered after this daemon started, so it starts watching that
     // root without a restart. See `Engine::domain_root`'s fresh-config fallback.
     let (watch_tx, watch_rx) = tokio::sync::mpsc::unbounded_channel::<WatchEvent>();
-    // A channel the embed worker (spawned below) listens on: connecting an
-    // origin schedules its embedding pass here instead of running it inline,
-    // so the connect request returns without waiting on the model.
+    // A channel the embed worker (spawned below) listens on: every engine
+    // operation that touches embeddings schedules its pass here instead of
+    // running it inline, so the triggering request returns without waiting
+    // on the model.
     let (embed_tx, embed_rx) = tokio::sync::mpsc::unbounded_channel();
     // The provider is built in the background (see below); text search and the
     // socket never wait on the model download. The engine holds the file config
@@ -432,8 +433,12 @@ async fn handle_conn(mut stream: IpcStream, shared: Arc<Shared>) {
 }
 
 /// Watch every domain root, debounce bursts by ~300ms and sync the touched
-/// domains, then embed. The store's on-disk stamp already matches any file a
-/// mutating tool just wrote, so those files are classified unchanged here.
+/// domains, then schedule an embedding pass on the worker (falling back to an
+/// inline pass only if the worker channel is unwired or its receiver already
+/// dropped, which in practice only a shutdown race produces). The store's
+/// on-disk stamp already matches
+/// any file a mutating tool just wrote, so those files are classified
+/// unchanged here.
 ///
 /// `new_roots` carries domains discovered after startup (see
 /// `Engine::domain_root`'s fresh-config fallback): a `domain add` while this
@@ -531,7 +536,9 @@ async fn run_watcher(
                                         if let Err(err) = engine.sync(Some(name.as_str())).await {
                                             tracing::warn!("catch-up sync of new domain '{name}' failed: {err}");
                                         }
-                                        if let Err(err) = engine.embed_pending().await {
+                                        if !engine.request_embed()
+                                            && let Err(err) = engine.embed_pending().await
+                                        {
                                             tracing::warn!("catch-up embed of new domain '{name}' failed: {err}");
                                         }
                                     }
@@ -574,6 +581,7 @@ async fn run_watcher(
                     }
                 }
                 if !dirty.is_empty()
+                    && !engine.request_embed()
                     && let Err(err) = engine.embed_pending().await
                 {
                     tracing::warn!("watch embed failed: {err}");
