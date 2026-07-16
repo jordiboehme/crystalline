@@ -10,9 +10,10 @@
 //!
 //! [`normalize_temporal_fields`] enforces that contract on the way in. It
 //! rejects a value that is not a plain ISO date with a helpful
-//! [`DateFieldError`], drops an explicit null bound and a sentinel bound
-//! written by a foreign source, and promotes a valid date the parser parked
-//! in `extra` into its typed field.
+//! [`DateFieldError`], drops an explicit null bound - other than on the
+//! required `recorded_at` - and a sentinel bound written by a foreign source,
+//! and promotes a valid date the parser parked in `extra` into its typed
+//! field.
 
 use chrono::{Datelike, NaiveDate};
 
@@ -53,8 +54,10 @@ pub struct DateFieldError {
 /// 1. For each date field the parser parked in `extra`: a string that parses
 ///    as `YYYY-MM-DD` is promoted into its typed field and removed from
 ///    `extra`; an explicit null is removed and reported as a dropped bound
-///    (a null bound means "no bound"); anything else - a timestamp string,
-///    an int, a bool, a list or a map - is a [`DateFieldError`].
+///    (a null bound means "no bound"), except on the required `recorded_at`,
+///    whose null falls through to the error case instead; anything else - a
+///    timestamp string, an int, a bool, a list or a map - is a
+///    [`DateFieldError`].
 /// 2. Sentinel bounds on the typed fields are dropped, since absence is how
 ///    open-ended validity is expressed: a `valid_to` at or above the sentinel
 ///    future year and a `valid_from` at or below the sentinel past year are
@@ -72,8 +75,10 @@ pub fn normalize_temporal_fields(
             continue;
         };
         let parsed = match value {
-            // An explicit null bound means "no bound": drop it.
-            YamlValue::Null => None,
+            // An explicit null bound means "no bound": drop it. recorded_at is
+            // required (T001), so a null there cannot unset it and falls
+            // through to the error arm below instead.
+            YamlValue::Null if field != "recorded_at" => None,
             YamlValue::String(s) => Some(NaiveDate::parse_from_str(s, "%Y-%m-%d").map_err(
                 |_| DateFieldError {
                     field,
@@ -244,6 +249,19 @@ mod tests {
         assert_eq!(
             fm.extra.get("author"),
             Some(&YamlValue::String("Ada".to_string()))
+        );
+    }
+
+    #[test]
+    fn null_recorded_at_is_rejected_not_dropped() {
+        // recorded_at is required (T001): a null cannot unset it, so it must
+        // error instead of being silently dropped like the other bounds.
+        let mut fm = fm_with_extra("recorded_at", YamlValue::Null);
+        let err = normalize_temporal_fields(&mut fm).unwrap_err();
+        assert_eq!(err.field, "recorded_at");
+        assert_eq!(
+            err.to_string(),
+            "recorded_at must be a plain ISO date (YYYY-MM-DD), got null; temporal fields are day-granular"
         );
     }
 }

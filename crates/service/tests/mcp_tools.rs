@@ -991,6 +991,53 @@ async fn edit_engram_drops_an_injected_sentinel_bound() {
     );
 }
 
+/// recorded_at is the one temporal field a null cannot drop: it is required
+/// (T001), so an edit that blanks it is rejected and the file on disk is left
+/// byte-for-byte unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edit_engram_rejects_a_nulled_recorded_at() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Recorded", "content": "A rule." }),
+    )
+    .await
+    .unwrap();
+    let path = h.root.join("eng/recorded.md");
+    let before = std::fs::read_to_string(&path).unwrap();
+    let recorded_line = before
+        .lines()
+        .find(|l| l.starts_with("recorded_at: "))
+        .unwrap_or_else(|| panic!("no recorded_at line: {before}"));
+
+    let err = call(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng",
+            "identifier": "recorded",
+            "operation": "find_replace",
+            "find_text": recorded_line,
+            "content": "recorded_at:",
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.contains("recorded_at must be a plain ISO date"),
+        "unexpected error: {err}"
+    );
+    let after = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(
+        before, after,
+        "the file must be unchanged after a rejected edit"
+    );
+}
+
 /// validate_engrams runs the temporal checks: a date field written straight to
 /// disk with a time-of-day component is reported as a T003 issue.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
