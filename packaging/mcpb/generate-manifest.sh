@@ -110,7 +110,9 @@ cat >"$manifest_path" <<JSON
     "mcp_config": {
       "command": "$command_path",
       "args": ["mcp"],
-      "env": {}
+      "env": {
+        "CRYSTALLINE_CHANNEL": "mcpb"
+      }
     }
   },
   "compatibility": {

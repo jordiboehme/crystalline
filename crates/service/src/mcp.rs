@@ -62,8 +62,8 @@ use std::sync::Arc;
 
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, ContentBlock, ErrorData, ListToolsResult, PaginatedRequestParams,
-    ProgressNotificationParam, ServerCapabilities, ServerInfo, Tool,
+    CallToolResult, ContentBlock, ErrorData, Implementation, ListToolsResult,
+    PaginatedRequestParams, ProgressNotificationParam, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::{Peer, RoleServer, ServerHandler, tool, tool_handler, tool_router};
@@ -748,9 +748,13 @@ impl ServerHandler for McpServer {
     /// and follows the engine's read-only mode, read-write and read-only intros
     /// alike. The daemon and the embedded stdio stack refresh the
     /// virtual-domain routing cache just before this runs, so the sync render
-    /// reads a current cache and never blocks on the store.
+    /// reads a current cache and never blocks on the store. `server_info` is
+    /// also set explicitly: `ServerInfo::default()` leaves
+    /// `Implementation::from_build_env()`, which would report the rmcp crate's
+    /// own name and version to harness logs rather than crystalline's.
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::default();
+        info.server_info = Implementation::new("crystalline", crystalline_core::VERSION);
         info.instructions = Some(self.engine.routing_text());
         info.capabilities = ServerCapabilities::builder()
             .enable_tools()

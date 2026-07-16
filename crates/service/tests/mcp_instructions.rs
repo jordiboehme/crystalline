@@ -135,6 +135,10 @@ async fn instructions_carry_a_routing_line_per_file_domain() {
     let (client, _server) = h.connect().await;
     let text = instructions(&client);
 
+    let peer_info = client.peer().peer_info().unwrap();
+    assert_eq!(peer_info.server_info.name, "crystalline");
+    assert_eq!(peer_info.server_info.version, crystalline_core::VERSION);
+
     assert!(
         text.starts_with("CRYSTALLINE KNOWLEDGE ROUTING"),
         "header first:\n{text}"
