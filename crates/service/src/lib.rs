@@ -20,6 +20,7 @@ pub mod overlay;
 pub mod params;
 mod poller;
 pub mod settings;
+pub mod stub;
 
 pub use client::{
     configure, ctl_if_running, ctl_required, domain_export, domain_import, origin_add,
@@ -32,3 +33,4 @@ pub use harness_cli::{CliRun, SystemMcpRunner, run_harness_cli};
 pub use mcp::McpServer;
 pub use origin::parse_origin_spec;
 pub use overlay::{EnvDomain, EnvOverlay, LoadedConfig};
+pub use stub::{DegradedServer, StubStatus};

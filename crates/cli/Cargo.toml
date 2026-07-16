@@ -80,3 +80,7 @@ serde_json = { workspace = true }
 insta = { workspace = true }
 reqwest = { workspace = true, features = ["blocking"] }
 sha2 = { workspace = true }
+# The degraded-stub binary test holds an exclusive index lock in the test
+# process (the fs4 lock a rival daemon would hold) so the spawned `mcp` child
+# fails to acquire it and serves the stub.
+fs4 = { workspace = true }

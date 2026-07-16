@@ -83,6 +83,12 @@ const RESERVED_VARS: &[&str] = &[
     "CRYSTALLINE_HEARTBEAT_SECS",
     "CRYSTALLINE_STALE_SECS",
     "CRYSTALLINE_TEST_POSTGRES_URL",
+    // The install-channel marker (see [`crate::stub::CHANNEL_ENV`]): the mcpb
+    // manifest sets it so the degraded status server can tell the Desktop
+    // extension apart from a plain install. It is read straight from the
+    // environment in `crate::stub`, never through the settings registry, so
+    // reserve it here or every mcpb session logs a spurious warning.
+    crate::stub::CHANNEL_ENV,
 ];
 
 /// An error parsing the environment overlay. The message names the offending
@@ -686,6 +692,7 @@ mod tests {
             ("CRYSTALLINE_HEARTBEAT_SECS", "5"),
             ("CRYSTALLINE_STALE_SECS", "15"),
             ("CRYSTALLINE_TEST_POSTGRES_URL", "postgres://db/test"),
+            (crate::stub::CHANNEL_ENV, "mcpb"),
         ])
         .unwrap();
         assert!(

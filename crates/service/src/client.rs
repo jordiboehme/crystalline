@@ -220,19 +220,34 @@ pub async fn run_mcp(
 
     // Embedded path: the explicit flag, or a daemon that could not be reached.
     // A terminal startup failure (lock held, config or store error) happens
-    // before rmcp answers anything, so reply to the held `initialize` with a
-    // JSON-RPC error rather than closing stdio, which the negotiation window
-    // reads as an unrecoverable network error. The process still exits non-zero
-    // (stderr carries the chain for the Desktop log).
-    match run_embedded_stdio(primed, db, config_path, read_only).await {
-        Ok(()) => Ok(()),
+    // before rmcp answers anything. Rather than closing stdio - which the
+    // negotiation window reads as an unrecoverable network error - serve a
+    // degraded status server: `initialize` succeeds with per-case instructions
+    // and a `status` tool explaining the failure and its fix, so the model can
+    // relay it instead of the session going dark. Every fallible step lives in
+    // `build_embedded`, ahead of the primed reader, so on failure the reader is
+    // still intact for the stub. Only if the stub itself fails to serve do we
+    // fall back to the old `-32000` reply and a non-zero exit (stderr carries
+    // the chain for the Desktop log).
+    match build_embedded(db, config_path, read_only).await {
+        Ok(stack) => run_embedded_stdio(stack, primed).await,
         Err(e) => {
-            if let Some(reply) = initialize_error_reply(&init_line, &format!("{e:#}")) {
-                let _ = stdout.write_all(reply.as_bytes()).await;
-                let _ = stdout.write_all(b"\n").await;
-                let _ = stdout.flush().await;
+            tracing::error!(
+                "crystalline mcp cannot start ({e:#}); serving a degraded status server"
+            );
+            let status = crate::stub::StubStatus::gather(format!("{e:#}"));
+            match serve_degraded_stub(status, primed).await {
+                Ok(()) => Ok(()),
+                Err(stub_err) => {
+                    tracing::warn!("degraded status server failed ({stub_err:#})");
+                    if let Some(reply) = initialize_error_reply(&init_line, &format!("{e:#}")) {
+                        let _ = stdout.write_all(reply.as_bytes()).await;
+                        let _ = stdout.write_all(b"\n").await;
+                        let _ = stdout.flush().await;
+                    }
+                    Err(e)
+                }
             }
-            Err(e)
         }
     }
 }
@@ -508,22 +523,27 @@ where
     }
 }
 
-/// The full in-process stack over stdio. Takes the lock; refuses if held. The
-/// effective mode is the explicit flag or `service.read_only`. `reader` is the
-/// primed stdin [`run_mcp`] already fronted with the drained `initialize`, so
-/// this path never touches the pre-init probe itself; it hands the reader
-/// straight to `rmcp::serve_server`. A startup error returned here reaches
-/// `run_mcp` before rmcp ever answers, which is where the terminal-failure
-/// `initialize` reply is written.
-async fn run_embedded_stdio<R>(
-    reader: R,
+/// The built-and-ready in-process stack: the tool server plus the index
+/// ownership it holds for the session. Every fallible startup step already ran
+/// in [`build_embedded`], so [`run_embedded_stdio`] only has to serve and can
+/// take the primed reader with no risk of failing after it is consumed.
+struct EmbeddedStack {
+    server: McpServer,
+    ownership: crate::instance::Ownership,
+}
+
+/// Build the full in-process stack: take the index lock (refused if held),
+/// load the config and overlay, open the store, construct the engine, launch
+/// the background sync and embed workers and prime the routing cache. Every
+/// step that can fail lives here, ahead of the reader ever being touched, so a
+/// terminal failure leaves [`run_mcp`]'s primed `initialize` reader intact for
+/// the degraded stub to serve. The effective read-only mode is the explicit
+/// flag or `service.read_only`.
+async fn build_embedded(
     db: Option<&Path>,
     config_path: Option<&Path>,
     read_only: bool,
-) -> anyhow::Result<()>
-where
-    R: AsyncRead + Unpin + Send + 'static,
-{
+) -> anyhow::Result<EmbeddedStack> {
     let ownership = acquire_ownership()
         .map_err(|e| anyhow::anyhow!("cannot run an embedded MCP server: {e}"))?;
     let loaded = overlay::load(config_path)?;
@@ -562,11 +582,44 @@ where
     // renders complete instructions, never racing the background sync above.
     engine.refresh_routing_cache().await;
 
-    let server = McpServer::new(engine);
+    Ok(EmbeddedStack {
+        server: McpServer::new(engine),
+        ownership,
+    })
+}
+
+/// Serve the built stack over stdio until the client closes stdin. `reader` is
+/// the primed stdin [`run_mcp`] already fronted with the drained `initialize`,
+/// so this path never touches the pre-init probe itself; it hands the reader
+/// straight to `rmcp::serve_server`. This runs only after [`build_embedded`]
+/// succeeded, so nothing here consumes the reader on a startup failure.
+async fn run_embedded_stdio<R>(stack: EmbeddedStack, reader: R) -> anyhow::Result<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
     let stdout = tokio::io::stdout();
-    let running = rmcp::serve_server(server, (reader, stdout)).await?;
+    let running = rmcp::serve_server(stack.server, (reader, stdout)).await?;
     let _ = running.waiting().await;
-    drop(ownership);
+    drop(stack.ownership);
+    Ok(())
+}
+
+/// Serve the degraded status server over stdio: a stand-in that answers
+/// `initialize` with explanatory instructions and a single `status` tool when
+/// the embedded stack could not start (see [`crate::stub`]). It holds no lock
+/// and opens no store, so serving it cannot itself fail for the reasons that
+/// forced the degradation; it ends when the client closes stdin, exactly like
+/// [`run_embedded_stdio`].
+async fn serve_degraded_stub<R>(status: crate::stub::StubStatus, reader: R) -> anyhow::Result<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    let running = rmcp::serve_server(
+        crate::stub::DegradedServer::new(status),
+        (reader, tokio::io::stdout()),
+    )
+    .await?;
+    let _ = running.waiting().await;
     Ok(())
 }
 

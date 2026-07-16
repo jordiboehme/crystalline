@@ -263,6 +263,17 @@ pub fn attach_policy(daemon_version: &str, own_version: &str) -> AttachPolicy {
     }
 }
 
+/// Whether `candidate` is a strictly newer release than `baseline`. Same
+/// triple parsing as [`attach_policy`]; an unparseable version on either side
+/// is never newer, so an odd record can only ever read as a conflict, never as
+/// an upgrade skew.
+pub(crate) fn strictly_newer(candidate: &str, baseline: &str) -> bool {
+    match (version_triple(candidate), version_triple(baseline)) {
+        (Some(candidate), Some(baseline)) => candidate > baseline,
+        _ => false,
+    }
+}
+
 /// Parse a version string's numeric `major.minor.patch` triple, ignoring any
 /// pre-release or build suffix.
 fn version_triple(version: &str) -> Option<(u64, u64, u64)> {
@@ -598,6 +609,21 @@ mod tests {
         assert_eq!(attach_policy("", "0.5.2"), AttachPolicy::Attach);
         assert_eq!(attach_policy("dev", "0.5.2"), AttachPolicy::Attach);
         assert_eq!(attach_policy("0.5.1", "junk"), AttachPolicy::Attach);
+    }
+
+    #[test]
+    fn strictly_newer_is_true_only_for_a_higher_triple() {
+        assert!(strictly_newer("0.9.0", "0.8.2"), "a higher triple is newer");
+        assert!(!strictly_newer("0.8.2", "0.8.2"), "equal is not newer");
+        assert!(!strictly_newer("0.8.1", "0.8.2"), "older is not newer");
+        assert!(
+            !strictly_newer("garbage", "0.8.2"),
+            "an unparseable candidate is never newer"
+        );
+        assert!(
+            !strictly_newer("0.9.0", "junk"),
+            "an unparseable baseline is never newer"
+        );
     }
 
     #[test]
