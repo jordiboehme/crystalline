@@ -26,7 +26,8 @@ Dependency direction: core <- index <- service <- cli.
 ## Commands
 
 - Build: `cargo build --release`
-- Test: `cargo test --workspace`
+- Test (fast path): `cargo nextest run --workspace` (install: `brew install cargo-nextest`), plus doctests via `cargo test --workspace --doc`
+- Test (canonical fallback): `cargo test --workspace`
 - Lint: `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check`
 - Style check: `bash scripts/style-lint.sh`
 
