@@ -900,6 +900,16 @@ pub trait Store: Send + Sync {
     /// full-reindex path.
     async fn wipe(&self) -> Result<()>;
 
+    /// Best-effort WAL checkpoint in TRUNCATE mode, shrinking a local WAL file
+    /// back down after a bulk rewrite (a full reindex or a wipe). The default
+    /// is a no-op, which is correct for Postgres: it has no local WAL file to
+    /// truncate. Turso overrides this with a real `PRAGMA
+    /// wal_checkpoint(TRUNCATE)` (confirmed to work by a runtime probe; see
+    /// the doc comment on `TursoStore::build`).
+    async fn checkpoint_wal(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Record that a domain finished syncing at the given RFC 3339 instant.
     async fn record_sync(&self, domain: DomainId, when: &str) -> Result<()>;
 

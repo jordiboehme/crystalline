@@ -96,6 +96,33 @@ impl TursoStore {
             .await
             .map_err(IndexError::from)?;
         let conn = db.connect().map_err(IndexError::from)?;
+
+        // PRAGMA probe against turso 0.7.0, verified two ways: reading
+        // turso_core's translate/pragma.rs (the PRAGMA setter dispatch) and a
+        // throwaway runtime test exercising each PRAGMA against a real
+        // connection. Findings:
+        // - busy_timeout: honored. `PRAGMA busy_timeout=5000` round-trips
+        //   through `PRAGMA busy_timeout` and drives a real retrying busy
+        //   handler (`Connection::set_busy_timeout`). Set below.
+        // - wal_checkpoint(TRUNCATE): honored. In the probe it shrank a
+        //   populated WAL file from over 1 MiB to 0 bytes. Used in `wipe()`
+        //   and by the CLI's `reindex --full` path (see
+        //   `Store::checkpoint_wal`), covering the same need the downstream
+        //   Docker image build met by shelling out to `sqlite3`.
+        // - synchronous: honored (round-tripped OFF and FULL in the probe)
+        //   but deliberately left at whatever `migrations::apply` and turso's
+        //   own default leave it at - not changed here, per plan.
+        // - wal_autocheckpoint: NOT honored. `turso_parser`'s `PragmaName`
+        //   enum has no `WalAutocheckpoint` variant, and turso_core's
+        //   `translate_pragma` silently ignores any unrecognized PRAGMA name
+        //   (SQLite's documented behavior for unknown pragmas): setting it
+        //   neither errors nor takes effect. The probe confirmed this -
+        //   `PRAGMA wal_autocheckpoint = 1000` returned `Ok`, but a
+        //   subsequent `PRAGMA wal_autocheckpoint` query returned no rows.
+        //   Not set here; wal_checkpoint(TRUNCATE) above is the mitigation for
+        //   WAL growth instead.
+        conn.execute("PRAGMA busy_timeout = 5000", ()).await?;
+
         let schema_version = migrations::apply(&conn).await?;
         let fts_native = probe_fts(&conn).await;
         Ok(TursoStore {
@@ -176,6 +203,15 @@ impl TursoStore {
     pub async fn explain_query_plan(&self, sql: &str) -> Result<Vec<String>> {
         let rows = query_all(&self.conn, &format!("EXPLAIN QUERY PLAN {sql}"), vec![]).await?;
         Ok(rows.iter().filter_map(|r| cell_text(r, 3)).collect())
+    }
+
+    /// Run `PRAGMA wal_checkpoint(TRUNCATE)`, shrinking the on-disk WAL file
+    /// back to (ideally) zero bytes. Confirmed to work by the runtime probe
+    /// documented on `build()`. The pragma returns one row (`busy`, `log`,
+    /// `checkpointed`) so it goes through the query path, not `execute`.
+    async fn truncate_wal(&self) -> Result<()> {
+        query_all(&self.conn, "PRAGMA wal_checkpoint(TRUNCATE)", vec![]).await?;
+        Ok(())
     }
 
     /// Delete the child rows recreated on every upsert. Chunk rows are NOT
@@ -1122,7 +1158,15 @@ impl Store for TursoStore {
         }
         self.conn.execute("COMMIT", ()).await?;
         self.tag_cache.lock().unwrap().clear();
+        // A wipe deletes every row, which is the biggest single write a store
+        // sees; truncate the WAL back down rather than leaving it to grow
+        // until the next natural checkpoint.
+        self.truncate_wal().await?;
         Ok(())
+    }
+
+    async fn checkpoint_wal(&self) -> Result<()> {
+        self.truncate_wal().await
     }
 
     async fn record_sync(&self, domain: DomainId, when: &str) -> Result<()> {

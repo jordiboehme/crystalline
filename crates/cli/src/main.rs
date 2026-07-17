@@ -957,7 +957,7 @@ fn main() -> anyhow::Result<()> {
             config,
         }) => on_runtime(move || reindex_dispatch(full, embed, config, cli.db, cli.json)),
         Some(Command::Status { config }) => {
-            on_runtime(move || status_dispatch(config, cli.db, cli.json))
+            on_runtime_current_thread(move || status_dispatch(config, cli.db, cli.json))
         }
         Some(Command::Model { command }) => match command {
             ModelCommand::Download { config } => {
@@ -1014,14 +1014,14 @@ fn main() -> anyhow::Result<()> {
         }) => on_runtime(move || mcp_dispatch(embedded, read_only, config, cli.db)),
         Some(Command::Ctl { command }) => on_runtime(move || run_ctl(command, cli.json)),
         Some(
-            cmd @ (Command::Write { .. }
-            | Command::Read { .. }
-            | Command::Edit { .. }
-            | Command::Move { .. }
+            cmd @ (Command::Read { .. }
             | Command::Search { .. }
             | Command::Context { .. }
             | Command::Recent { .. }),
-        ) => on_runtime(move || run_data(cmd, cli.db, cli.json)),
+        ) => on_runtime_current_thread(move || run_data(cmd, cli.db, cli.json)),
+        Some(cmd @ (Command::Write { .. } | Command::Edit { .. } | Command::Move { .. })) => {
+            on_runtime(move || run_data(cmd, cli.db, cli.json))
+        }
         Some(Command::Delete {
             identifier,
             domain,
@@ -1826,6 +1826,54 @@ where
     }
 }
 
+/// Run an async command body on a fresh single-threaded Tokio runtime. For the
+/// read-only verbs (status, search, read, recent, context, domain list): they
+/// never need worker-pool concurrency, so `current_thread` skips spinning up a
+/// pool multi_thread always creates, even for a one-shot command that awaits
+/// one thing at a time. Kept off the four content-mutating data commands
+/// (write, edit, move, delete) and everything else that touches the daemon,
+/// sync, reindex, import or embed, which stay on [`on_runtime`].
+fn on_runtime_current_thread<F, Fut>(make: F) -> anyhow::Result<()>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
+    on_runtime_value_current_thread(make)?
+}
+
+/// Like [`on_runtime_current_thread`] but for a future that yields a plain
+/// value, the `current_thread` sibling of [`on_runtime_value`].
+///
+/// Still spawns the same dedicated 8 MiB worker thread `on_runtime_value`
+/// does, for the same reason: a `current_thread` runtime's `block_on` still
+/// executes the future on whatever thread calls it (a `current_thread`
+/// runtime has no worker threads of its own to hand the future to - that is
+/// exactly what makes it lighter than `multi_thread`), so the Windows
+/// 1 MiB-main-thread-stack risk `on_runtime_value`'s doc comment describes is
+/// unchanged by the choice of scheduler and the dedicated thread stays.
+fn on_runtime_value_current_thread<T, F, Fut>(make: F) -> anyhow::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = T>,
+{
+    let worker = std::thread::Builder::new()
+        .name("crystalline-cmd".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || {
+            anyhow::Ok(
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?
+                    .block_on(make()),
+            )
+        })?;
+    match worker.join() {
+        Ok(result) => result,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
 fn run_domain(command: DomainCommand, db: Option<PathBuf>, json: bool) -> anyhow::Result<()> {
     match command {
         DomainCommand::Init { path, name } => cmd::domain_init(&path, name.as_deref(), json),
@@ -1842,7 +1890,7 @@ fn run_domain(command: DomainCommand, db: Option<PathBuf>, json: bool) -> anyhow
                 name, path, is_virtual, origin, branch, config, db, no_sync, json,
             )
         }),
-        DomainCommand::List { config } => on_runtime(move || async move {
+        DomainCommand::List { config } => on_runtime_current_thread(move || async move {
             cmd::domain_list(config.as_deref(), db.as_deref(), json).await
         }),
         DomainCommand::Import {

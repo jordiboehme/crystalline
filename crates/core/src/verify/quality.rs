@@ -9,10 +9,9 @@
 use std::collections::HashMap;
 
 use crate::engram::{Engram, Heading};
-use crate::parse::body_lines;
+use crate::parse::BodyLine;
 
 use super::scanner::{Domain, ScannedFile};
-use super::util::body_line_start;
 use super::{Severity, Sink};
 
 const DEFAULT_TOKEN_BUDGET: usize = 2500;
@@ -20,23 +19,26 @@ const MIN_CONTENT_LINES: usize = 3;
 const SIMILARITY_THRESHOLD: f64 = 0.85;
 const SIMILARITY_MIN_CHARS: usize = 80;
 
-pub(crate) fn check(file: &ScannedFile, domain: &Domain, sink: &mut Sink) {
+/// `lines` is the engram body tokenized once by the verify entry point
+/// (`run_rules` in `mod.rs`) and shared across every rule in this module that
+/// needs it, instead of each one retokenizing the same body separately.
+pub(crate) fn check(file: &ScannedFile, domain: &Domain, lines: &[BodyLine], sink: &mut Sink) {
     let Ok(engram) = &file.parsed else { return };
 
-    check_content(file, engram, sink);
+    check_content(file, lines, sink);
     check_token_budget(file, engram, domain, sink);
     check_duplicate_headings(file, engram, sink);
-    check_similar_sections(file, engram, sink);
-    check_near_miss_bullets(file, engram, sink);
+    check_similar_sections(file, engram, lines, sink);
+    check_near_miss_bullets(file, lines, sink);
 }
 
 /// Q001: an Engram with no meaningful content beyond its frontmatter is
 /// unlikely to be worth routing to. Counts non-blank body lines outside
 /// fenced code, matching the "meaningful content" convention documented for
 /// this rule family.
-fn check_content(file: &ScannedFile, engram: &Engram, sink: &mut Sink) {
-    let meaningful = body_lines(&engram.body, 1)
-        .into_iter()
+fn check_content(file: &ScannedFile, lines: &[BodyLine], sink: &mut Sink) {
+    let meaningful = lines
+        .iter()
         .filter(|l| !l.in_fence && !l.text.trim().is_empty())
         .count();
     if meaningful < MIN_CONTENT_LINES {
@@ -120,8 +122,13 @@ fn normalize_heading(text: &str) -> String {
 
 /// Q004: two `## ` sections within the same file that are near-duplicates of
 /// each other, most often a copy-paste that was not later diverged.
-fn check_similar_sections(file: &ScannedFile, engram: &Engram, sink: &mut Sink) {
-    let sections = h2_section_texts(engram, &file.source);
+fn check_similar_sections(
+    file: &ScannedFile,
+    engram: &Engram,
+    lines: &[BodyLine],
+    sink: &mut Sink,
+) {
+    let sections = h2_section_texts(engram, lines);
     for i in 0..sections.len() {
         for j in (i + 1)..sections.len() {
             let (_, a_text, a_norm) = &sections[i];
@@ -152,9 +159,7 @@ fn check_similar_sections(file: &ScannedFile, engram: &Engram, sink: &mut Sink) 
 /// Extract every `## ` section's heading line, heading text and normalized
 /// content (lowercased, non-alphanumeric collapsed to spaces, fenced code
 /// excluded).
-fn h2_section_texts(engram: &Engram, source: &str) -> Vec<(usize, String, String)> {
-    let start = body_line_start(source);
-    let lines = body_lines(&engram.body, start);
+fn h2_section_texts(engram: &Engram, lines: &[BodyLine]) -> Vec<(usize, String, String)> {
     let headings: Vec<&Heading> = engram.headings.iter().collect();
 
     let mut result = Vec::new();
@@ -168,7 +173,7 @@ fn h2_section_texts(engram: &Engram, source: &str) -> Vec<(usize, String, String
             .map(|nh| nh.line)
             .unwrap_or(usize::MAX);
         let mut buf = String::new();
-        for l in &lines {
+        for l in lines {
             if l.line_no > h.line && l.line_no < end && !l.in_fence {
                 let t = l.text.trim();
                 if !t.is_empty() {
@@ -235,9 +240,8 @@ fn bigrams(s: &str) -> Vec<(char, char)> {
 /// observation or relation grammar - most often a typo (missing space,
 /// unclosed bracket) that would otherwise silently vanish from the body's
 /// structured data with no warning at all.
-fn check_near_miss_bullets(file: &ScannedFile, engram: &Engram, sink: &mut Sink) {
-    let start = body_line_start(&file.source);
-    for bl in body_lines(&engram.body, start) {
+fn check_near_miss_bullets(file: &ScannedFile, lines: &[BodyLine], sink: &mut Sink) {
+    for bl in lines {
         if bl.in_fence {
             continue;
         }

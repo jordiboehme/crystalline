@@ -925,6 +925,15 @@ pub async fn reindex(
     if embed {
         embed_pass(&*store, &cfg).await?;
     }
+
+    if full {
+        // A full reindex is the biggest single rewrite the database sees;
+        // shrink the WAL back down rather than leaving it to grow until the
+        // next natural checkpoint. A no-op on Postgres (no local WAL file);
+        // on Turso this replaces the downstream Docker image build's shell-out
+        // to `sqlite3` for the same purpose.
+        store.checkpoint_wal().await?;
+    }
     Ok(())
 }
 

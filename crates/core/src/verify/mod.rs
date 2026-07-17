@@ -30,6 +30,7 @@ use std::path::Path;
 use serde::Serialize;
 
 use crate::engram::Engram;
+use crate::parse::{BodyLine, body_lines};
 
 pub use report::{Format, render, to_github, to_human, to_json};
 pub use scanner::ScanError;
@@ -238,11 +239,25 @@ fn run_rules(domains: &[scanner::Domain], options: &VerifyOptions) -> VerifyRepo
         );
         manifest_rules::check(domain, &mut sink);
         schema_rules::check(domain, &mut sink);
-        links::check(domain, &domain_names, &lookup, &mut sink);
-        for file in &domain.files {
+
+        // Tokenize each file's body once here, aligned by index with
+        // `domain.files`, and share the slice with the L- and Q-family rules
+        // below rather than have each rule (four call sites total: one in
+        // links.rs, three in quality.rs) retokenize the same body on its own.
+        let file_lines: Vec<Vec<BodyLine>> = domain
+            .files
+            .iter()
+            .map(|f| match &f.parsed {
+                Ok(engram) => body_lines(&engram.body, util::body_line_start(&f.source)),
+                Err(_) => Vec::new(),
+            })
+            .collect();
+
+        links::check(domain, &domain_names, &lookup, &file_lines, &mut sink);
+        for (file, lines) in domain.files.iter().zip(&file_lines) {
             format::check(file, &domain.name, &mut sink);
             temporal::check(file, &mut sink);
-            quality::check(file, domain, &mut sink);
+            quality::check(file, domain, lines, &mut sink);
         }
     }
 

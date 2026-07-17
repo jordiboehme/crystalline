@@ -234,7 +234,10 @@ fn copy_verbatim(
         let same_file = dest.exists()
             && std::fs::canonicalize(&entry.abs).ok() == std::fs::canonicalize(&dest).ok();
         if !same_file {
-            std::fs::copy(&entry.abs, &dest).map_err(io_err(&entry.abs))?;
+            // Copy-then-rename (crate::config::copy_atomic), not a direct
+            // copy: a crash mid-copy can no longer leave a truncated file at
+            // `dest` for a reader (or a re-import) to trip over.
+            crate::config::copy_atomic(&entry.abs, &dest).map_err(io_err(&entry.abs))?;
         }
     }
     report.files_copied += 1;
@@ -304,7 +307,10 @@ fn convert_markdown(
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent).map_err(io_err(parent))?;
         }
-        std::fs::write(&dest, &output).map_err(io_err(&dest))?;
+        // Write-then-rename (crate::config::write_atomic), not a direct
+        // write: a crash mid-write can no longer leave a truncated engram
+        // file at `dest`.
+        crate::config::write_atomic(&dest, output.as_bytes()).map_err(io_err(&dest))?;
     }
 
     report.files_converted += 1;
