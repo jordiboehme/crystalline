@@ -32,9 +32,9 @@ use crystalline_core::{
 };
 use crystalline_index::{
     ChunkParams, DomainHost, DomainId, DomainKind, EmbeddingProvider, EngramDescriptor, EngramId,
-    EngramRecord, FileStamp, HostClaim, RecentFilter, SearchMode, SearchQuery, Store, chunk_engram,
-    configured_model_id, order_jobs_for_batching, parse_metadata_filters, provider_from_config,
-    sync_domain_with,
+    EngramRecord, FileStamp, HostClaim, RecentFilter, SearchMode, SearchQuery, Store, apply_scan,
+    chunk_engram, configured_model_id, order_jobs_for_batching, parse_metadata_filters,
+    provider_from_config, scan_domain,
 };
 use crystalline_remote::ops;
 use crystalline_remote::{
@@ -2393,35 +2393,53 @@ impl Engine {
         let collab = !self.instance_id.is_empty();
         let mut reports = Vec::new();
         let mut skipped = Vec::new();
-        // Acquire the store lock per domain so the guard drops between domains
-        // instead of spanning the whole run; a domain's claim and sync stay
-        // under one acquisition, keeping per-domain single-writer semantics.
+        // Two short store-lock windows per domain with the scan in between, so the
+        // walk-hash-parse pass of a large domain no longer blocks every concurrent
+        // read behind the mutex. The first window claims the host, resolves the
+        // domain id and snapshots its stamps; the second applies transactionally
+        // with the TOCTOU guards. The claim stays live across the lock-free scan:
+        // the heartbeat timer renews it on its own task (30 s cadence, 90 s stale
+        // threshold), and unlike the old single-lock sync that scan no longer holds
+        // the store lock the timer needs, so a long scan cannot starve the
+        // heartbeat into staleness. The apply window is bounded db work, so no
+        // extra renew before it is needed.
         for (name, root) in &targets {
-            let store = self.store.lock().await;
-            if collab {
-                match self.claim_file_host(&*store, name, root, take_over).await? {
-                    HostClaim::Acquired => {}
-                    HostClaim::HeldByOther(host) => {
-                        if only.is_some() {
-                            return Err(EngineError::Conflict(host_refusal(name, &host)));
+            let (domain, snapshot) = {
+                let store = self.store.lock().await;
+                if collab {
+                    match self.claim_file_host(&*store, name, root, take_over).await? {
+                        HostClaim::Acquired => {}
+                        HostClaim::HeldByOther(host) => {
+                            if only.is_some() {
+                                return Err(EngineError::Conflict(host_refusal(name, &host)));
+                            }
+                            tracing::info!(
+                                "domain '{name}' is hosted by instance {} (last heartbeat {}); serving it read-from-database only",
+                                host.instance_id,
+                                host.heartbeat_at
+                            );
+                            skipped.push(json!({
+                                "domain": name,
+                                "hosted_by": host.instance_id,
+                                "heartbeat_at": host.heartbeat_at,
+                            }));
+                            continue;
                         }
-                        tracing::info!(
-                            "domain '{name}' is hosted by instance {} (last heartbeat {}); serving it read-from-database only",
-                            host.instance_id,
-                            host.heartbeat_at
-                        );
-                        skipped.push(json!({
-                            "domain": name,
-                            "hosted_by": host.instance_id,
-                            "heartbeat_at": host.heartbeat_at,
-                        }));
-                        continue;
                     }
                 }
-            }
-            let report = sync_domain_with(&*store, name, root, &self.chunk_params)
-                .await
-                .map_err(|e| EngineError::Internal(format!("sync of '{name}' failed: {e}")))?;
+                let domain = store
+                    .upsert_domain(name, Some(&root.to_string_lossy()), DomainKind::File)
+                    .await?;
+                let snapshot = store.file_stamps(domain).await?;
+                (domain, snapshot)
+            };
+            let scan = scan_domain(name, root, snapshot, &self.chunk_params).await;
+            let report = {
+                let store = self.store.lock().await;
+                apply_scan(&*store, domain, scan)
+                    .await
+                    .map_err(|e| EngineError::Internal(format!("sync of '{name}' failed: {e}")))?
+            };
             reports.push(report);
         }
         Ok(json!({
@@ -2441,34 +2459,44 @@ impl Engine {
         let targets = self.sync_targets(None)?;
         let collab = !self.instance_id.is_empty();
         let mut reports = Vec::new();
-        // Acquire the store lock per domain so the guard drops between domains.
-        // Claim, clear-if-full and sync interleave per domain under one
-        // acquisition rather than claiming every domain up front; per-domain
-        // single-writer semantics are unchanged. In collaboration mode a domain
-        // hosted by another live instance is left untouched.
+        // Two short store-lock windows per domain with the scan in between, the
+        // same shape as `sync_take_over`, so a large domain's walk-hash-parse pass
+        // no longer holds the mutex. The first window claims the host, clears the
+        // domain when `full` and snapshots the stamps; the snapshot is taken AFTER
+        // the clear so the scan classifies every file as new against empty stamps -
+        // the correct full-rebuild semantics. In collaboration mode a domain hosted
+        // by another live instance is left untouched (neither cleared nor scanned).
         for (name, root) in targets {
-            let store = self.store.lock().await;
-            if collab {
-                match self.claim_file_host(&*store, &name, &root, false).await? {
-                    HostClaim::Acquired => {}
-                    HostClaim::HeldByOther(host) => {
-                        tracing::info!(
-                            "skipping reindex of '{name}' hosted by instance {}",
-                            host.instance_id
-                        );
-                        continue;
+            let (domain, snapshot) = {
+                let store = self.store.lock().await;
+                if collab {
+                    match self.claim_file_host(&*store, &name, &root, false).await? {
+                        HostClaim::Acquired => {}
+                        HostClaim::HeldByOther(host) => {
+                            tracing::info!(
+                                "skipping reindex of '{name}' hosted by instance {}",
+                                host.instance_id
+                            );
+                            continue;
+                        }
                     }
                 }
-            }
-            if full {
-                let domain_id = store
+                let domain = store
                     .upsert_domain(&name, Some(&root.to_string_lossy()), DomainKind::File)
                     .await?;
-                store.clear_domain(domain_id).await?;
-            }
-            let report = sync_domain_with(&*store, &name, &root, &self.chunk_params)
-                .await
-                .map_err(|e| EngineError::Internal(format!("reindex of '{name}' failed: {e}")))?;
+                if full {
+                    store.clear_domain(domain).await?;
+                }
+                let snapshot = store.file_stamps(domain).await?;
+                (domain, snapshot)
+            };
+            let scan = scan_domain(&name, &root, snapshot, &self.chunk_params).await;
+            let report = {
+                let store = self.store.lock().await;
+                apply_scan(&*store, domain, scan).await.map_err(|e| {
+                    EngineError::Internal(format!("reindex of '{name}' failed: {e}"))
+                })?
+            };
             reports.push(report);
         }
         Ok(json!({
