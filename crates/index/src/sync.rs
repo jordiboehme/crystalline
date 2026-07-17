@@ -169,7 +169,7 @@ pub async fn sync_domain_with<S: Store + ?Sized>(
     }
 
     // Hash (and read) the survivors off-thread with bounded concurrency.
-    let hashed = hash_files(to_hash).await;
+    let hashed = hash_files(to_hash, &mut report).await;
 
     // Deleted candidates: recorded files no longer present on disk.
     let deleted_paths: Vec<String> = existing
@@ -319,12 +319,17 @@ struct Parsed {
     previously_indexed: bool,
 }
 
-async fn hash_files(files: Vec<Scanned>) -> Vec<(Scanned, Hashed)> {
+async fn hash_files(files: Vec<Scanned>, report: &mut SyncReport) -> Vec<(Scanned, Hashed)> {
     let sem = Arc::new(Semaphore::new(CONCURRENCY));
     let mut set: JoinSet<(Scanned, std::io::Result<Hashed>)> = JoinSet::new();
+    // The file identity moves into its task, so a task that panics outright
+    // would otherwise vanish without a trace. Keep a task-id to relative-path
+    // map so a panicked task is still attributable in `failed`.
+    let mut ids: HashMap<tokio::task::Id, String> = HashMap::new();
     for scanned in files {
         let sem = sem.clone();
-        set.spawn(async move {
+        let rel = scanned.rel.clone();
+        let handle = set.spawn(async move {
             let _permit = sem.acquire_owned().await.expect("semaphore open");
             let abs = scanned.abs.clone();
             let res = tokio::task::spawn_blocking(move || read_and_hash(&abs))
@@ -332,21 +337,35 @@ async fn hash_files(files: Vec<Scanned>) -> Vec<(Scanned, Hashed)> {
                 .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())));
             (scanned, res)
         });
+        ids.insert(handle.id(), rel);
     }
     let mut out = Vec::new();
-    while let Some(joined) = set.join_next().await {
-        if let Ok((scanned, Ok(hashed))) = joined {
-            out.push((scanned, hashed));
-        } else if let Ok((scanned, Err(_))) = joined {
-            // Unreadable file: surface it as a change with no content so the
-            // parse phase reports the failure.
-            out.push((
-                scanned,
-                Hashed {
-                    sha256: String::new(),
-                    content: None,
-                },
-            ));
+    while let Some(joined) = set.join_next_with_id().await {
+        match joined {
+            Ok((id, (scanned, Ok(hashed)))) => {
+                ids.remove(&id);
+                out.push((scanned, hashed));
+            }
+            Ok((id, (scanned, Err(_)))) => {
+                ids.remove(&id);
+                // Unreadable file: surface it as a change with no content so the
+                // parse phase reports the failure.
+                out.push((
+                    scanned,
+                    Hashed {
+                        sha256: String::new(),
+                        content: None,
+                    },
+                ));
+            }
+            Err(join_err) => {
+                let rel = ids
+                    .remove(&join_err.id())
+                    .unwrap_or_else(|| "unknown".to_string());
+                report
+                    .failed
+                    .push((rel, format!("task panicked: {join_err}")));
+            }
         }
     }
     out
@@ -356,7 +375,7 @@ fn read_and_hash(path: &Path) -> std::io::Result<Hashed> {
     let bytes = std::fs::read(path)?;
     let mut hasher = Sha256::new();
     hasher.update(&bytes);
-    let sha256 = hex(&hasher.finalize());
+    let sha256 = crate::hex_lower(&hasher.finalize());
     let content = String::from_utf8(bytes).ok();
     Ok(Hashed { sha256, content })
 }
@@ -367,9 +386,14 @@ async fn parse_files(
 ) -> Vec<Parsed> {
     let sem = Arc::new(Semaphore::new(CONCURRENCY));
     let mut set: JoinSet<ParseOutcome> = JoinSet::new();
+    // The relative path moves into its task (it lands in the `ParseOutcome`), so
+    // a task that panics outright would lose it. Keep a task-id to path map so a
+    // panicked task is still attributable in `failed`.
+    let mut ids: HashMap<tokio::task::Id, String> = HashMap::new();
     for (scanned, hashed, previously_indexed) in changed {
         let sem = sem.clone();
-        set.spawn(async move {
+        let rel = scanned.rel.clone();
+        let handle = set.spawn(async move {
             let _permit = sem.acquire_owned().await.expect("semaphore open");
             let Some(content) = hashed.content else {
                 return ParseOutcome::Failed(scanned.rel, "file is not valid UTF-8".to_string());
@@ -392,17 +416,31 @@ async fn parse_files(
                 Err(e) => ParseOutcome::Failed(scanned.rel, e.to_string()),
             }
         });
+        ids.insert(handle.id(), rel);
     }
 
     let mut out = Vec::new();
-    while let Some(joined) = set.join_next().await {
+    while let Some(joined) = set.join_next_with_id().await {
         match joined {
-            Ok(ParseOutcome::Ok(record, previously_indexed)) => out.push(Parsed {
-                previously_indexed,
-                record: *record,
-            }),
-            Ok(ParseOutcome::Failed(path, err)) => report.failed.push((path, err)),
-            Err(_) => {}
+            Ok((id, ParseOutcome::Ok(record, previously_indexed))) => {
+                ids.remove(&id);
+                out.push(Parsed {
+                    previously_indexed,
+                    record: *record,
+                });
+            }
+            Ok((id, ParseOutcome::Failed(path, err))) => {
+                ids.remove(&id);
+                report.failed.push((path, err));
+            }
+            Err(join_err) => {
+                let rel = ids
+                    .remove(&join_err.id())
+                    .unwrap_or_else(|| "unknown".to_string());
+                report
+                    .failed
+                    .push((rel, format!("task panicked: {join_err}")));
+            }
         }
     }
     out
@@ -429,14 +467,6 @@ fn rel_path(root: &Path, path: &Path) -> String {
         .map(|c| c.as_os_str().to_string_lossy().into_owned())
         .collect::<Vec<_>>()
         .join("/")
-}
-
-fn hex(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
 }
 
 fn duration_ms(d: Duration) -> u64 {

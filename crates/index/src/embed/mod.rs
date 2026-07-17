@@ -147,7 +147,10 @@ pub struct EmbedReport {
 /// back against its own `chunk_id`. The sort is stable so equal-length jobs
 /// keep the order the store returned them in.
 pub fn order_jobs_for_batching(jobs: &mut [ChunkJob]) {
-    jobs.sort_by_key(|job| estimate_tokens(&job.text));
+    // Cache each job's token estimate so the counter runs once per job rather
+    // than once per comparison; the sort stays stable so equal-length jobs keep
+    // the store's order.
+    jobs.sort_by_cached_key(|job| estimate_tokens(&job.text));
 }
 
 /// Embed every chunk that needs it for the active provider's model, in batches,

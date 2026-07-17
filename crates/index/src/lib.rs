@@ -41,3 +41,29 @@ pub use turso::TursoStore;
 
 #[cfg(feature = "postgres")]
 pub use postgres::PostgresStore;
+
+/// Encode bytes as lowercase hexadecimal into a pre-sized string. The shared
+/// SHA-256 formatter for the whole crate: chunk fingerprints, file checksums and
+/// the service crate's content hashing all route through it so the digest text is
+/// identical everywhere.
+pub fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+#[cfg(test)]
+mod hex_tests {
+    use super::hex_lower;
+
+    #[test]
+    fn hex_lower_encodes_empty_and_multibyte() {
+        assert_eq!(hex_lower(&[]), "");
+        // Boundary byte values and a two-nibble value keep the fixed width.
+        assert_eq!(hex_lower(&[0x00, 0xff]), "00ff");
+        assert_eq!(hex_lower(&[0x0a, 0xb3, 0x01]), "0ab301");
+    }
+}

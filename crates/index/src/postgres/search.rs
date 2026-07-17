@@ -127,7 +127,8 @@ async fn scored_lexical(
 
     let mut scored: Vec<(f64, Candidate)> = Vec::with_capacity(rows.len());
     for r in &rows {
-        let c = Candidate::from_row(r);
+        let mut c = Candidate::from_row(r);
+        c.lower();
         let score = c.score(terms);
         scored.push((score, c));
     }
@@ -610,6 +611,9 @@ fn clone_params(params: &[Param]) -> Vec<Param> {
             Param::Text(s) => Param::Text(s.clone()),
             Param::Int(i) => Param::Int(*i),
             Param::Vector(v) => Param::Vector(v.clone()),
+            Param::TextOpt(s) => Param::TextOpt(s.clone()),
+            Param::IntOpt(i) => Param::IntOpt(*i),
+            Param::VectorOpt(v) => Param::VectorOpt(v.clone()),
         })
         .collect()
 }
@@ -624,6 +628,14 @@ struct Candidate {
     status: String,
     description: Option<String>,
     content: String,
+    // Lowercased title, description and content, computed once by `lower` on the
+    // lexical scoring path and reused by `score`, `into_hit` and `text_snippet`
+    // so those methods never re-lowercase per term. Left empty on the semantic
+    // and filter-only paths, which never term-score, so those paths pay nothing;
+    // the methods that read these run only on lexically constructed candidates.
+    title_lower: String,
+    desc_lower: String,
+    content_lower: String,
 }
 
 impl Candidate {
@@ -637,18 +649,31 @@ impl Candidate {
             status: cell_text(r, 5).unwrap_or_default(),
             description: cell_text(r, 6),
             content: cell_text(r, 7).unwrap_or_default(),
+            title_lower: String::new(),
+            desc_lower: String::new(),
+            content_lower: String::new(),
         }
     }
 
+    /// Lowercase title, description and content once for the lexical path.
+    /// `to_lowercase` (full Unicode case folding) is kept rather than an
+    /// ASCII-only comparison so a non-ASCII term still matches its own case.
+    fn lower(&mut self) {
+        self.title_lower = self.title.to_lowercase();
+        self.desc_lower = self
+            .description
+            .as_deref()
+            .unwrap_or_default()
+            .to_lowercase();
+        self.content_lower = self.content.to_lowercase();
+    }
+
     fn score(&self, terms: &[String]) -> f64 {
-        let title = self.title.to_lowercase();
-        let desc = self.description.clone().unwrap_or_default().to_lowercase();
-        let content = self.content.to_lowercase();
         let mut score = 0.0;
         for term in terms {
-            score += 3.0 * count_occ(&title, term) as f64;
-            score += 2.0 * count_occ(&desc, term) as f64;
-            score += count_occ(&content, term) as f64;
+            score += 3.0 * count_occ(&self.title_lower, term) as f64;
+            score += 2.0 * count_occ(&self.desc_lower, term) as f64;
+            score += count_occ(&self.content_lower, term) as f64;
         }
         score
     }
@@ -659,15 +684,9 @@ impl Candidate {
         terms: &[String],
         score: f64,
     ) -> Result<SearchHit> {
-        let in_title = terms
-            .iter()
-            .any(|t| count_occ(&self.title.to_lowercase(), t) > 0);
-        let in_desc = self
-            .description
-            .as_ref()
-            .map(|d| d.to_lowercase())
-            .map(|d| terms.iter().any(|t| count_occ(&d, t) > 0))
-            .unwrap_or(false);
+        let in_title = terms.iter().any(|t| count_occ(&self.title_lower, t) > 0);
+        let in_desc =
+            self.description.is_some() && terms.iter().any(|t| count_occ(&self.desc_lower, t) > 0);
 
         // When the match is not in the title or description, prefer an
         // observation-level hit so the caller gets the source line.
@@ -690,10 +709,7 @@ impl Candidate {
         }
 
         let snippet_src = if in_title || !in_desc {
-            if terms
-                .iter()
-                .any(|t| count_occ(&self.content.to_lowercase(), t) > 0)
-            {
+            if terms.iter().any(|t| count_occ(&self.content_lower, t) > 0) {
                 self.content.clone()
             } else if let Some(d) = self.description.clone().filter(|d| !d.is_empty()) {
                 d
@@ -728,10 +744,7 @@ impl Candidate {
     /// A snippet windowed around the first matching term, for the lexical half
     /// of a hybrid hit.
     fn text_snippet(&self, terms: &[String]) -> String {
-        let src = if terms
-            .iter()
-            .any(|t| count_occ(&self.content.to_lowercase(), t) > 0)
-        {
+        let src = if terms.iter().any(|t| count_occ(&self.content_lower, t) > 0) {
             &self.content
         } else if let Some(d) = self.description.as_ref().filter(|d| !d.is_empty()) {
             d
