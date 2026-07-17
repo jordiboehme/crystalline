@@ -20,6 +20,14 @@
 //! the two for callers that do not manage the lock. Splitting them keeps the
 //! store mutex off the long walk-hash-parse pass of a large domain.
 //!
+//! [`scan_paths`] is a second front on the same classification machinery for the
+//! file watcher: its candidates come from a given list of relative paths instead
+//! of a full walk, so a one-file edit in a large domain costs one stat and one
+//! hash rather than walking every entry. Both fronts feed the identical
+//! [`apply_scan`], so the targeted pass inherits every TOCTOU guard unchanged.
+//! The watcher's full fallback, the startup sync and manual sync all reconcile
+//! any gap, so the targeted front only has to be convergent, never perfect.
+//!
 //! # Convergence under a concurrent writer
 //!
 //! Between the snapshot and the apply another writer (an MCP edit or a second
@@ -36,7 +44,7 @@
 //! the prefilter keeps re-selecting a diverged path until an uncontended pass
 //! applies it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
@@ -223,6 +231,145 @@ pub async fn scan_domain(
         );
     }
 
+    // Deleted candidates: recorded files no longer present on disk. A full walk
+    // sees every recorded path, so deletion detection is domain-wide here.
+    let deleted_paths: Vec<String> = stamps
+        .keys()
+        .filter(|p| !current.contains_key(*p))
+        .cloned()
+        .collect();
+
+    classify_and_parse(
+        name,
+        root,
+        stamps,
+        current,
+        deleted_paths,
+        chunk_params,
+        started,
+    )
+    .await
+}
+
+/// Scan a specific list of relative paths against a stamp snapshot, the
+/// path-targeted counterpart of [`scan_domain`] for the file watcher.
+///
+/// The classification, hashing, move detection and parsing are the identical
+/// shared machinery [`scan_domain`] uses; only the candidate set differs. Each
+/// given path is classified in isolation: a path that exists and is a markdown
+/// file (and passes the same walk filters - not hidden, not inside a provisioned
+/// artifact folder) is a change candidate, still prefiltered against `stamps`; a
+/// path absent on disk but present in `stamps` is a delete candidate; a path that
+/// is neither on disk nor recorded is ignored. Deletion detection is scoped to
+/// `paths` - no directory is walked anywhere - so a one-file edit in a large
+/// domain costs one stat and one hash, not a full walk of every entry.
+///
+/// Move detection stays within this one batch, exactly as the full scan: a delete
+/// candidate whose stored checksum matches a new candidate's hash is a rename in
+/// place rather than a delete plus an add. A rename whose two ends land in
+/// different debounce windows cannot be paired here and degrades to a delete plus
+/// an add - index-correct, but the rename-in-place optimization is lost and,
+/// because `replace_chunks` carries an embedding over only within one engram, the
+/// new path's chunks re-embed. That degradation is acceptable: the watcher's full
+/// fallback, the startup sync and manual sync all reconcile, so the targeted
+/// front only has to be convergent, never perfect.
+///
+/// The result flows through [`apply_scan`] with the identical TOCTOU guards, so a
+/// concurrent writer landing between the snapshot and the apply is deferred and
+/// reconciled just as it is for a full scan.
+pub async fn scan_paths(
+    name: &str,
+    root: &Path,
+    stamps: HashMap<String, FileStamp>,
+    paths: Vec<String>,
+    chunk_params: &ChunkParams,
+) -> DomainScan {
+    let started = Instant::now();
+
+    // The same artifact folders the full walk prunes: a targeted scan must index
+    // exactly what a full scan would, never a file the walk would have skipped.
+    let excluded = crystalline_core::in_root_artifact_dirs(root);
+
+    let mut current: HashMap<String, Scanned> = HashMap::new();
+    let mut deleted_paths: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for rel in paths {
+        // The same path can arrive twice in one debounce batch; classify it once.
+        if !seen.insert(rel.clone()) {
+            continue;
+        }
+        let abs = root.join(&rel);
+        let hidden = rel.split('/').any(is_hidden);
+        let is_md = rel.to_lowercase().ends_with(".md");
+        match std::fs::metadata(&abs) {
+            // An existing markdown file, filtered exactly as the walk filters:
+            // a change candidate, prefiltered against the stamps downstream.
+            Ok(meta) if meta.is_file() && is_md && !hidden && !is_excluded(&abs, &excluded) => {
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                let size = meta.len();
+                current.insert(
+                    rel.clone(),
+                    Scanned {
+                        rel,
+                        abs,
+                        mtime,
+                        size,
+                    },
+                );
+            }
+            // Exists but is not an indexable markdown file (a directory, a
+            // non-markdown file, a hidden or artifact path): ignore it, matching
+            // the walk which never indexes it either.
+            Ok(_) => {}
+            // Absent on disk: a recorded path is a delete candidate (scoped to
+            // the given paths, no walk), an unrecorded one is a no-op.
+            Err(_) => {
+                if stamps.contains_key(&rel) {
+                    deleted_paths.push(rel);
+                }
+            }
+        }
+    }
+
+    classify_and_parse(
+        name,
+        root,
+        stamps,
+        current,
+        deleted_paths,
+        chunk_params,
+        started,
+    )
+    .await
+}
+
+/// The classification and parse core shared by [`scan_domain`] and [`scan_paths`].
+///
+/// Given the markdown files found on disk (`current`, keyed by relative path) and
+/// the recorded paths whose file is gone (`deleted_paths`), it prefilters against
+/// `stamps`, hashes the survivors, detects moves within this batch (a vanished
+/// path whose stored checksum matches a new file's hash is a rename, not a delete
+/// plus an add), parses the genuinely changed files off-thread and assembles the
+/// [`DomainScan`]. The walk front and the path-list front differ only in how they
+/// build `current` and `deleted_paths`; everything from here is identical, so the
+/// two stay in step by construction. `report.unchanged` counts only paths
+/// actually examined - the whole domain for a walk, only the given paths for a
+/// targeted scan - because it is only ever bumped for an entry in `current`.
+#[allow(clippy::too_many_arguments)]
+async fn classify_and_parse(
+    name: &str,
+    root: &Path,
+    stamps: HashMap<String, FileStamp>,
+    current: HashMap<String, Scanned>,
+    deleted_paths: Vec<String>,
+    chunk_params: &ChunkParams,
+    started: Instant,
+) -> DomainScan {
     // Prefilter: unchanged files (same mtime and size) are skipped entirely.
     let mut report = SyncReport {
         domain: name.to_string(),
@@ -246,12 +393,6 @@ pub async fn scan_domain(
     // Hash (and read) the survivors off-thread with bounded concurrency.
     let hashed = hash_files(to_hash, &mut report).await;
 
-    // Deleted candidates: recorded files no longer present on disk.
-    let deleted_paths: Vec<String> = stamps
-        .keys()
-        .filter(|p| !current.contains_key(*p))
-        .cloned()
-        .collect();
     // Index deleted files by checksum for move detection.
     let mut deleted_by_hash: HashMap<String, Vec<String>> = HashMap::new();
     for p in &deleted_paths {
@@ -262,8 +403,7 @@ pub async fn scan_domain(
                 .push(p.clone());
         }
     }
-    let mut deleted_remaining: std::collections::HashSet<String> =
-        deleted_paths.iter().cloned().collect();
+    let mut deleted_remaining: HashSet<String> = deleted_paths.iter().cloned().collect();
 
     // Classify each hashed file. The bool records whether the engram was
     // already indexed, so the apply phase can tell added from updated.

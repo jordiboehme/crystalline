@@ -32,9 +32,9 @@ use crystalline_core::{
 };
 use crystalline_index::{
     ChunkParams, DomainHost, DomainId, DomainKind, EmbeddingProvider, EngramDescriptor, EngramId,
-    EngramRecord, FileStamp, HostClaim, RecentFilter, SearchMode, SearchQuery, Store, apply_scan,
-    chunk_engram, configured_model_id, order_jobs_for_batching, parse_metadata_filters,
-    provider_from_config, scan_domain,
+    EngramRecord, FileStamp, HostClaim, RecentFilter, SearchMode, SearchQuery, Store, SyncReport,
+    apply_scan, chunk_engram, configured_model_id, order_jobs_for_batching, parse_metadata_filters,
+    provider_from_config, scan_domain, scan_paths,
 };
 use crystalline_remote::ops;
 use crystalline_remote::{
@@ -2446,6 +2446,64 @@ impl Engine {
             "reports": serde_json::to_value(&reports).unwrap_or(Value::Null),
             "skipped": skipped,
         }))
+    }
+
+    /// Sync only the given relative paths of one file domain: the targeted path
+    /// the daemon's watcher takes for a small debounced batch instead of a full
+    /// rescan, so a one-file edit in a large domain costs one stat and one hash,
+    /// not a walk of every entry.
+    ///
+    /// The two-lock-window shape mirrors [`Engine::sync_take_over`]'s per-domain
+    /// body - claim the host, snapshot the stamps and release the lock, run the
+    /// lock-free path scan, then re-lock to apply through the same [`apply_scan`]
+    /// with its TOCTOU guards - so a targeted pass never holds the store mutex
+    /// across the scan either. Only the watcher calls this; it is intentionally
+    /// not exposed over MCP or the control socket, where a full sync is always
+    /// wanted. A domain hosted by another live instance in collaboration mode is
+    /// skipped silently, exactly as the watcher's full-sync path skips it today,
+    /// so a non-host never writes the host's rows. A missed or mis-targeted event
+    /// is caught by the full fallback, the startup sync or a manual sync, so the
+    /// targeted pass only has to be convergent, never perfect.
+    pub async fn sync_paths(&self, name: &str, paths: Vec<String>) -> Result<SyncReport> {
+        let ContentSource::File { root } = self.content_source(name)? else {
+            // A virtual domain has no files on disk; there is nothing to scan.
+            return Ok(SyncReport {
+                domain: name.to_string(),
+                ..SyncReport::default()
+            });
+        };
+        let collab = !self.instance_id.is_empty();
+        let (domain, snapshot) = {
+            let store = self.store.lock().await;
+            if collab {
+                match self.claim_file_host(&*store, name, &root, false).await? {
+                    HostClaim::Acquired => {}
+                    HostClaim::HeldByOther(host) => {
+                        tracing::info!(
+                            "targeted sync skipped: domain '{name}' is hosted by instance {}",
+                            host.instance_id
+                        );
+                        return Ok(SyncReport {
+                            domain: name.to_string(),
+                            ..SyncReport::default()
+                        });
+                    }
+                }
+            }
+            let domain = store
+                .upsert_domain(name, Some(&root.to_string_lossy()), DomainKind::File)
+                .await?;
+            let snapshot = store.file_stamps(domain).await?;
+            (domain, snapshot)
+        };
+        let scan = scan_paths(name, &root, snapshot, paths, &self.chunk_params).await;
+        let report = {
+            let store = self.store.lock().await;
+            apply_scan(&*store, domain, scan).await.map_err(|e| {
+                EngineError::Internal(format!("targeted sync of '{name}' failed: {e}"))
+            })?
+        };
+        Ok(report)
     }
 
     /// Reindex all file domains. `full` clears each file domain's rows first
