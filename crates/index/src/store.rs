@@ -661,6 +661,12 @@ impl EmbeddingCoverage {
     pub fn has_active_embeddings(&self, model: &str) -> bool {
         self.embedded_for(model) > 0
     }
+
+    /// Chunks still awaiting embedding by the given model: the total minus what
+    /// that model has already embedded.
+    pub fn backlog_for(&self, model: &str) -> usize {
+        self.total_chunks.saturating_sub(self.embedded_for(model))
+    }
 }
 
 /// Which full-text path the store is using.
@@ -893,6 +899,16 @@ pub trait Store: Send + Sync {
     /// Delete all indexed data, keeping the schema. The corruption-recovery and
     /// full-reindex path.
     async fn wipe(&self) -> Result<()>;
+
+    /// Best-effort WAL checkpoint in TRUNCATE mode, shrinking a local WAL file
+    /// back down after a bulk rewrite (a full reindex or a wipe). The default
+    /// is a no-op, which is correct for Postgres: it has no local WAL file to
+    /// truncate. Turso overrides this with a real `PRAGMA
+    /// wal_checkpoint(TRUNCATE)` (confirmed to work by a runtime probe; see
+    /// the doc comment on `TursoStore::build`).
+    async fn checkpoint_wal(&self) -> Result<()> {
+        Ok(())
+    }
 
     /// Record that a domain finished syncing at the given RFC 3339 instant.
     async fn record_sync(&self, domain: DomainId, when: &str) -> Result<()>;

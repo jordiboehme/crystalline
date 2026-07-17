@@ -23,7 +23,7 @@ use walkdir::WalkDir;
 
 use crate::embed::{ChunkParams, chunk_engram};
 use crate::error::{IndexError, Result};
-use crate::store::{EngramRecord, FileStamp, Store};
+use crate::store::{EngramRecord, FileStamp, NewChunk, Store};
 
 /// Maximum concurrent hashing or parsing tasks.
 const CONCURRENCY: usize = 8;
@@ -221,24 +221,16 @@ pub async fn sync_domain_with<S: Store + ?Sized>(
         }
     }
 
-    // Parse the changed files off-thread. Read failures and parse failures are
-    // reported, not fatal.
-    let parsed = parse_files(changed, &mut report).await;
+    // Parse the changed files off-thread, computing each engram's chunks in the
+    // same off-thread task so the write transaction never runs the chunker. Read
+    // failures and parse failures are reported, not fatal.
+    let parsed = parse_files(changed, chunk_params, &mut report).await;
 
     // Apply everything in one transaction. Duplicate-permalink upserts are
     // collected in `failed` and do not abort the batch (they are pre-checked so
     // no failing statement runs). Other errors roll the batch back.
     store.begin().await?;
-    let apply = apply_changes(
-        store,
-        domain,
-        moves,
-        deleted_remaining,
-        parsed,
-        chunk_params,
-        &mut report,
-    )
-    .await;
+    let apply = apply_changes(store, domain, moves, deleted_remaining, parsed, &mut report).await;
     match apply {
         Ok(()) => {}
         Err(e) => {
@@ -273,7 +265,6 @@ async fn apply_changes<S: Store + ?Sized>(
     moves: Vec<(String, String)>,
     deleted: std::collections::HashSet<String>,
     parsed: Vec<Parsed>,
-    chunk_params: &ChunkParams,
     report: &mut SyncReport,
 ) -> Result<()> {
     for (from, to) in moves {
@@ -288,16 +279,13 @@ async fn apply_changes<S: Store + ?Sized>(
         let existed = p.previously_indexed;
         match store.upsert_engram(domain, &p.record).await {
             Ok(id) => {
-                // Recompute the engram's chunk rows. replace_chunks keeps the
+                // Apply the chunk rows computed off-thread in parse_files, right
+                // after the upsert returns the id. replace_chunks keeps the
                 // embedding of any chunk whose fingerprint is unchanged, so an
-                // edit only re-embeds the paragraphs that changed.
-                let chunks = chunk_engram(
-                    &p.record.title,
-                    p.record.description.as_deref(),
-                    &p.record.content,
-                    chunk_params,
-                );
-                store.replace_chunks(id, &chunks).await?;
+                // edit only re-embeds the paragraphs that changed; the fingerprint
+                // folds in only the model id and text, so computing the chunks
+                // before the transaction changes nothing about the carry-over.
+                store.replace_chunks(id, &p.chunks).await?;
                 if existed {
                     report.updated += 1;
                 } else {
@@ -313,9 +301,11 @@ async fn apply_changes<S: Store + ?Sized>(
     Ok(())
 }
 
-/// A parsed change ready to upsert.
+/// A parsed change ready to upsert, with its embedding chunks already computed
+/// off-thread so the write transaction never runs the chunker.
 struct Parsed {
     record: EngramRecord,
+    chunks: Vec<NewChunk>,
     previously_indexed: bool,
 }
 
@@ -382,6 +372,7 @@ fn read_and_hash(path: &Path) -> std::io::Result<Hashed> {
 
 async fn parse_files(
     changed: Vec<(Scanned, Hashed, bool)>,
+    chunk_params: &ChunkParams,
     report: &mut SyncReport,
 ) -> Vec<Parsed> {
     let sem = Arc::new(Semaphore::new(CONCURRENCY));
@@ -393,6 +384,9 @@ async fn parse_files(
     for (scanned, hashed, previously_indexed) in changed {
         let sem = sem.clone();
         let rel = scanned.rel.clone();
+        // Chunking is two small fields, cloned per task so it moves into the
+        // blocking closure alongside the parse.
+        let chunk_params = chunk_params.clone();
         let handle = set.spawn(async move {
             let _permit = sem.acquire_owned().await.expect("semaphore open");
             let Some(content) = hashed.content else {
@@ -404,14 +398,28 @@ async fn parse_files(
                 size: scanned.size,
                 sha256: hashed.sha256,
             };
+            // Parse and chunk in one blocking task: both are pure CPU work, and
+            // computing the chunks here keeps the chunker out of the write
+            // transaction the apply phase holds.
             let parsed = tokio::task::spawn_blocking(move || {
                 crystalline_core::parse_engram(&content)
-                    .map(|engram| EngramRecord::from_engram(&engram, &rel, stamp))
+                    .map(|engram| {
+                        let record = EngramRecord::from_engram(&engram, &rel, stamp);
+                        let chunks = chunk_engram(
+                            &record.title,
+                            record.description.as_deref(),
+                            &record.content,
+                            &chunk_params,
+                        );
+                        (record, chunks)
+                    })
                     .map_err(|e| e.to_string())
             })
             .await;
             match parsed {
-                Ok(Ok(record)) => ParseOutcome::Ok(Box::new(record), previously_indexed),
+                Ok(Ok((record, chunks))) => {
+                    ParseOutcome::Ok(Box::new(record), chunks, previously_indexed)
+                }
                 Ok(Err(e)) => ParseOutcome::Failed(scanned.rel, e),
                 Err(e) => ParseOutcome::Failed(scanned.rel, e.to_string()),
             }
@@ -422,11 +430,12 @@ async fn parse_files(
     let mut out = Vec::new();
     while let Some(joined) = set.join_next_with_id().await {
         match joined {
-            Ok((id, ParseOutcome::Ok(record, previously_indexed))) => {
+            Ok((id, ParseOutcome::Ok(record, chunks, previously_indexed))) => {
                 ids.remove(&id);
                 out.push(Parsed {
                     previously_indexed,
                     record: *record,
+                    chunks,
                 });
             }
             Ok((id, ParseOutcome::Failed(path, err))) => {
@@ -447,7 +456,7 @@ async fn parse_files(
 }
 
 enum ParseOutcome {
-    Ok(Box<EngramRecord>, bool),
+    Ok(Box<EngramRecord>, Vec<NewChunk>, bool),
     Failed(String, String),
 }
 

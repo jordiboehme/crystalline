@@ -1937,6 +1937,25 @@ impl Engine {
     /// default global config path. Staleness is bounded to one connection: the
     /// block is an initialize-time snapshot, and the virtual bullets are only as
     /// fresh as the last cache refresh.
+    ///
+    /// This re-read looks redundant with `self.config` (in-memory), and mostly
+    /// is: `configure`'s `Set`/`Unset` (Engine::configure), `domain_add`'s file
+    /// and virtual arms and `origin_add` all persist to disk and then write
+    /// `self.config` in the same call, under `file_config`-then-`config` lock
+    /// order, before returning - a concurrent reader sees the new value the
+    /// instant the write lock releases, no re-read needed. `domain remove`
+    /// (`cmd::domain_remove` in the CLI crate) is the one path that does not:
+    /// it is a free function with no `Engine` reference at all, so it mutates
+    /// the config file directly regardless of whether a daemon is live; the
+    /// only in-process signal a running daemon gets is the `forget_domain` ctl
+    /// call, and `Engine::forget_domain` only drops the name from
+    /// `discovered_domains` and tells the watcher to stop - it never touches
+    /// `self.config`. Serving from `self.config` alone would therefore keep a
+    /// removed domain in every connection's routing block until the daemon
+    /// restarts, not just for one racing connection - a real regression, not
+    /// the already-accepted bounded staleness this comment describes for the
+    /// `None` branch below. So the re-read stays for as long as `domain
+    /// remove` is the one mutation path that does not refresh `self.config`.
     pub fn routing_text(&self) -> String {
         // (1) The effective config, composed the same way a fresh load would
         // see it. With a config path this is a fresh file read plus the overlay;
@@ -2527,7 +2546,7 @@ impl Engine {
         if let Value::Object(map) = &mut activity {
             map.insert(
                 "embedding_backlog".to_string(),
-                json!(coverage.total_chunks.saturating_sub(active_embedded)),
+                json!(coverage.backlog_for(&self.model_id)),
             );
         }
         let mut result = json!({
@@ -2555,6 +2574,18 @@ impl Engine {
             map.insert("origins".to_string(), self.origins_status_block().await);
         }
         Ok(result)
+    }
+
+    /// Chunks awaiting embedding for the active model: the figure `status_report`
+    /// exposes as `embedding_backlog`. Reads the cached coverage snapshot, so it
+    /// is cheap enough for the daemon's self-heal tick to poll; no per-chunk
+    /// scan.
+    pub async fn embedding_backlog(&self) -> Result<usize> {
+        let coverage = {
+            let store = self.store.lock().await;
+            store.embedding_coverage().await?
+        };
+        Ok(coverage.backlog_for(&self.model_id))
     }
 
     /// The domain-id set this instance should embed, or `None` for "all domains".

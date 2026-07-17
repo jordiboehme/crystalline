@@ -11,10 +11,9 @@ use std::collections::{BTreeSet, HashMap};
 
 use crate::address::{self, CrystallineUrl, LinkResolver, LookupTable, Resolution};
 use crate::engram::{Engram, LinkTarget};
-use crate::parse::{body_lines, mask_inline_code};
+use crate::parse::{BodyLine, mask_inline_code};
 
 use super::scanner::{Domain, ScannedFile};
-use super::util::body_line_start;
 use super::{Severity, Sink};
 
 /// Build the cross-domain permalink/title lookup used to resolve every
@@ -43,15 +42,19 @@ pub(crate) fn effective_permalink(file: &ScannedFile, engram: &Engram) -> String
         .unwrap_or_else(|| address::slugify(&file.rel_path.to_string_lossy()))
 }
 
+/// `file_lines` holds each file's engram body tokenized once by the verify
+/// entry point (`run_rules` in `mod.rs`), aligned by index with
+/// `domain.files`, and shared here rather than retokenized per file.
 pub(crate) fn check(
     domain: &Domain,
     domain_names: &BTreeSet<&str>,
     lookup: &LookupTable,
+    file_lines: &[Vec<BodyLine>],
     sink: &mut Sink,
 ) {
     check_duplicates(domain, sink);
 
-    for file in &domain.files {
+    for (file, lines) in domain.files.iter().zip(file_lines) {
         let Ok(engram) = &file.parsed else { continue };
         let own_permalink = effective_permalink(file, engram);
         let own_title = engram.frontmatter.title.trim().to_lowercase();
@@ -83,7 +86,7 @@ pub(crate) fn check(
             );
         }
 
-        check_crystalline_urls(file, engram, domain_names, lookup, sink);
+        check_crystalline_urls(file, lines, domain_names, lookup, sink);
     }
 }
 
@@ -226,13 +229,12 @@ fn check_target(
 /// naming a domain that is in the scan set but a permalink that is not.
 fn check_crystalline_urls(
     file: &ScannedFile,
-    engram: &Engram,
+    lines: &[BodyLine],
     domain_names: &BTreeSet<&str>,
     lookup: &LookupTable,
     sink: &mut Sink,
 ) {
-    let start = body_line_start(&file.source);
-    for bl in body_lines(&engram.body, start) {
+    for bl in lines {
         if bl.in_fence {
             continue;
         }

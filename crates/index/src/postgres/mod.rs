@@ -43,7 +43,7 @@ use crate::store::{
     ChunkJob, ChunkModelCount, DomainHost, DomainId, DomainKind, DomainStats, EdgeKind,
     EmbeddingCoverage, EmbeddingRow, EngramDescriptor, EngramId, EngramRecord, EngramSummary,
     FileStamp, FtsMode, GraphSlice, HostClaim, InboundRef, NewChunk, Page, RecentFilter, SearchHit,
-    SearchQuery, Store, StoreInfo, StoredEngram,
+    SearchMode, SearchQuery, Store, StoreInfo, StoredEngram,
 };
 
 /// A PostgreSQL-backed store. Open one with [`PostgresStore::open`].
@@ -68,6 +68,20 @@ pub struct PostgresStore {
     // until the first call; set by `ensure_embedding_width`, never by wipe
     // (wiping rows never changes the column type).
     embedding_width: Mutex<Option<i64>>,
+    // The last computed embedding coverage snapshot, shared by effective_mode,
+    // the search staleness gate and CLI status so they issue one aggregate scan,
+    // not three. `None` means recompute on the next read. Interior mutability with
+    // the same std::sync discipline as tag_cache: the guard is taken in a tight
+    // scope and never held across an await (clippy::await_holding_lock).
+    //
+    // Invalidated (set to `None`) by exactly the Store methods that can change a
+    // chunk's embedding state, derived from the trait: store_embeddings (writes
+    // embeddings), replace_chunks (deletes and reinserts an engram's chunks),
+    // delete_engram (deletes an engram's chunks), clear_domain (deletes a domain's
+    // chunks), wipe (deletes every chunk) and rollback (reverts any of the above
+    // that ran inside the transaction). upsert_engram, upsert_engram_checked and
+    // rename_engram never touch the chunk table, so they are not invalidators.
+    coverage_cache: Mutex<Option<EmbeddingCoverage>>,
 }
 
 /// A connection handle for one store method: either the pinned transaction
@@ -133,6 +147,52 @@ impl PostgresStore {
             schema,
             tag_cache: Mutex::new(HashMap::new()),
             embedding_width: Mutex::new(None),
+            coverage_cache: Mutex::new(None),
+        })
+    }
+
+    /// Drop the cached embedding coverage snapshot so the next read recomputes it.
+    /// Called by every mutator that can change a chunk's embedding state. Kept in a
+    /// tight scope with no await so the std::sync guard never crosses a suspension
+    /// point.
+    fn invalidate_coverage(&self) {
+        *self.coverage_cache.lock().unwrap() = None;
+    }
+
+    /// Recompute the embedding coverage snapshot from the chunk table. This is the
+    /// one aggregate scan the cached `embedding_coverage()` fills from on a miss.
+    async fn compute_coverage(&self) -> Result<EmbeddingCoverage> {
+        let mut conn = self.acquire().await?;
+        let c = conn.as_mut();
+        let total = scalar_i64(&mut *c, "SELECT count(*) FROM chunk", vec![])
+            .await?
+            .max(0) as usize;
+        let rows = query_all(
+            &mut *c,
+            "SELECT model, dims, count(*) FROM chunk WHERE embedding IS NOT NULL \
+             GROUP BY model, dims ORDER BY count(*) DESC",
+            vec![],
+        )
+        .await?;
+        let mut models = Vec::new();
+        let mut embedded = 0usize;
+        for r in &rows {
+            let count = cell_i64(r, 2).unwrap_or(0).max(0) as usize;
+            embedded += count;
+            let model = cell_text(r, 0).unwrap_or_default();
+            if model.is_empty() {
+                continue;
+            }
+            models.push(ChunkModelCount {
+                model,
+                dims: cell_i64(r, 1).unwrap_or(0).max(0) as usize,
+                count,
+            });
+        }
+        Ok(EmbeddingCoverage {
+            total_chunks: total,
+            embedded_chunks: embedded,
+            models,
         })
     }
 
@@ -740,6 +800,8 @@ impl Store for PostgresStore {
     }
 
     async fn clear_domain(&self, domain: DomainId) -> Result<()> {
+        // Deletes this domain's chunks, so the coverage snapshot is now stale.
+        self.invalidate_coverage();
         // Delete a single domain's engram and child rows, keeping the domain
         // row. Child rows first so the enforced foreign keys are satisfied.
         let mut conn = self.acquire().await?;
@@ -764,6 +826,8 @@ impl Store for PostgresStore {
     }
 
     async fn delete_engram(&self, domain: DomainId, path: &str) -> Result<()> {
+        // Deletes the engram's chunks, so the coverage snapshot is now stale.
+        self.invalidate_coverage();
         let mut conn = self.acquire().await?;
         let c = conn.as_mut();
         let id = sqlx::query("SELECT id FROM engram WHERE domain_id=$1 AND path=$2")
@@ -953,8 +1017,19 @@ impl Store for PostgresStore {
     }
 
     async fn search(&self, query: &SearchQuery) -> Result<Page<SearchHit>> {
+        // Compute the coverage snapshot for the semantic and hybrid modes (which
+        // gate on embedding staleness) BEFORE acquiring the search connection:
+        // embedding_coverage() acquires its own connection, and holding two
+        // acquisitions at once would relock the tx mutex on the pinned path. The
+        // cache makes this essentially free once effective_mode has warmed it, and
+        // folds the old second aggregate scan into the same shared snapshot. The
+        // lexical modes never touch embeddings, so they skip the snapshot.
+        let coverage = match query.mode {
+            SearchMode::Semantic | SearchMode::Hybrid => Some(self.embedding_coverage().await?),
+            _ => None,
+        };
         let mut conn = self.acquire().await?;
-        search::run_search(conn.as_mut(), query).await
+        search::run_search(conn.as_mut(), query, coverage.as_ref()).await
     }
 
     async fn neighbors(&self, ids: &[EngramId], depth: u8) -> Result<GraphSlice> {
@@ -1034,6 +1109,9 @@ impl Store for PostgresStore {
     }
 
     async fn replace_chunks(&self, engram_id: EngramId, chunks: &[NewChunk]) -> Result<()> {
+        // Deletes and reinserts this engram's chunks, so the coverage snapshot is
+        // now stale.
+        self.invalidate_coverage();
         let eid = engram_id.0;
         let mut conn = self.acquire().await?;
         let c = conn.as_mut();
@@ -1149,6 +1227,8 @@ impl Store for PostgresStore {
     }
 
     async fn store_embeddings(&self, batch: &[EmbeddingRow], model: &str) -> Result<()> {
+        // Writes embeddings, so the coverage snapshot is now stale.
+        self.invalidate_coverage();
         // Validate the whole batch before any write so a bad row never leaves
         // earlier rows committed.
         for row in batch {
@@ -1202,41 +1282,22 @@ impl Store for PostgresStore {
     }
 
     async fn embedding_coverage(&self) -> Result<EmbeddingCoverage> {
-        let mut conn = self.acquire().await?;
-        let c = conn.as_mut();
-        let total = scalar_i64(&mut *c, "SELECT count(*) FROM chunk", vec![])
-            .await?
-            .max(0) as usize;
-        let rows = query_all(
-            &mut *c,
-            "SELECT model, dims, count(*) FROM chunk WHERE embedding IS NOT NULL \
-             GROUP BY model, dims ORDER BY count(*) DESC",
-            vec![],
-        )
-        .await?;
-        let mut models = Vec::new();
-        let mut embedded = 0usize;
-        for r in &rows {
-            let count = cell_i64(r, 2).unwrap_or(0).max(0) as usize;
-            embedded += count;
-            let model = cell_text(r, 0).unwrap_or_default();
-            if model.is_empty() {
-                continue;
+        // Fast path in a tight scope so the std::sync guard is dropped before the
+        // recompute await below (clippy::await_holding_lock), tag_cache style.
+        {
+            let cached = self.coverage_cache.lock().unwrap();
+            if let Some(cov) = cached.as_ref() {
+                return Ok(cov.clone());
             }
-            models.push(ChunkModelCount {
-                model,
-                dims: cell_i64(r, 1).unwrap_or(0).max(0) as usize,
-                count,
-            });
         }
-        Ok(EmbeddingCoverage {
-            total_chunks: total,
-            embedded_chunks: embedded,
-            models,
-        })
+        let cov = self.compute_coverage().await?;
+        *self.coverage_cache.lock().unwrap() = Some(cov.clone());
+        Ok(cov)
     }
 
     async fn wipe(&self) -> Result<()> {
+        // Deletes every chunk, so the coverage snapshot is now stale.
+        self.invalidate_coverage();
         let mut conn = self.acquire().await?;
         let c = conn.as_mut();
         sqlx::query("BEGIN")
@@ -1450,6 +1511,9 @@ impl Store for PostgresStore {
         // A rolled-back tag insert leaves its cached id pointing at a row that no
         // longer exists, so drop the cache after a rollback.
         self.tag_cache.lock().unwrap().clear();
+        // A rollback also reverts any chunk mutation made in the transaction, so a
+        // snapshot recomputed mid-transaction must not survive it.
+        self.invalidate_coverage();
         Ok(())
     }
 }

@@ -16,8 +16,8 @@ use sqlx::PgConnection;
 
 use crate::error::{IndexError, Result};
 use crate::store::{
-    EdgeKind, EngramId, FilterOp, GraphEdge, GraphNode, GraphSlice, HitKind, MetadataFilter, Page,
-    SearchHit, SearchMode, SearchQuery,
+    EdgeKind, EmbeddingCoverage, EngramId, FilterOp, GraphEdge, GraphNode, GraphSlice, HitKind,
+    MetadataFilter, Page, SearchHit, SearchMode, SearchQuery,
 };
 
 use super::{Param, cell_i64, cell_real, cell_text, query_all, query_first, scalar_i64};
@@ -39,16 +39,28 @@ const HYBRID_SEMANTIC_WEIGHT: f64 = 0.6;
 /// above it (a both-signal hit can reach 1.0, a single-signal hit at most 0.85).
 const SINGLE_SOURCE_PENALTY: f64 = 0.85;
 
-/// Run a search and return one page of hits plus the total match count.
+/// Run a search and return one page of hits plus the total match count. The
+/// `coverage` snapshot is supplied by the store for the semantic and hybrid modes
+/// (which gate on embedding staleness) and is `None` for the lexical modes.
 pub(super) async fn run_search(
     conn: &mut PgConnection,
     query: &SearchQuery,
+    coverage: Option<&EmbeddingCoverage>,
 ) -> Result<Page<SearchHit>> {
     match query.mode {
-        SearchMode::Semantic => run_semantic(conn, query).await,
-        SearchMode::Hybrid => run_hybrid(conn, query).await,
+        SearchMode::Semantic => run_semantic(conn, query, require_coverage(coverage)?).await,
+        SearchMode::Hybrid => run_hybrid(conn, query, require_coverage(coverage)?).await,
         _ => run_lexical(conn, query).await,
     }
+}
+
+/// The staleness gate for semantic and hybrid search needs the coverage snapshot,
+/// which the store computes for exactly those two modes. A missing snapshot here
+/// is an internal wiring break, never a user input error.
+fn require_coverage(coverage: Option<&EmbeddingCoverage>) -> Result<&EmbeddingCoverage> {
+    coverage.ok_or_else(|| {
+        IndexError::Db("semantic search dispatched without an embedding coverage snapshot".into())
+    })
 }
 
 /// The lexical modes: Text, Title and Permalink. A LIKE-candidate prefilter in
@@ -195,7 +207,11 @@ async fn filter_only(
 
 /// Semantic search over chunk embeddings. Requires the caller to have embedded
 /// the query and set the active model on the [`SearchQuery`].
-async fn run_semantic(conn: &mut PgConnection, query: &SearchQuery) -> Result<Page<SearchHit>> {
+async fn run_semantic(
+    conn: &mut PgConnection,
+    query: &SearchQuery,
+    coverage: &EmbeddingCoverage,
+) -> Result<Page<SearchHit>> {
     let qvec = query
         .query_embedding
         .as_deref()
@@ -209,7 +225,7 @@ async fn run_semantic(conn: &mut PgConnection, query: &SearchQuery) -> Result<Pa
     let page = query.page.max(1);
     let min_sim = query.min_similarity.unwrap_or(DEFAULT_MIN_SIMILARITY) as f64;
 
-    check_staleness(conn, active, dims).await?;
+    check_staleness(coverage, active, dims)?;
 
     let mut hits = semantic_candidates(conn, query, qvec, active, dims).await?;
     hits.retain(|(sim, _)| *sim >= min_sim);
@@ -241,7 +257,11 @@ async fn run_semantic(conn: &mut PgConnection, query: &SearchQuery) -> Result<Pa
 /// Hybrid search: a lexical candidate scan and a semantic top-k, each normalized
 /// to `[0, 1]`, then blended. See [`crate::turso::search`] for the normalization
 /// and blend rationale; this port reproduces it exactly.
-async fn run_hybrid(conn: &mut PgConnection, query: &SearchQuery) -> Result<Page<SearchHit>> {
+async fn run_hybrid(
+    conn: &mut PgConnection,
+    query: &SearchQuery,
+    coverage: &EmbeddingCoverage,
+) -> Result<Page<SearchHit>> {
     let qvec = query
         .query_embedding
         .as_deref()
@@ -255,7 +275,7 @@ async fn run_hybrid(conn: &mut PgConnection, query: &SearchQuery) -> Result<Page
     let page = query.page.max(1);
     let min_sim = query.min_similarity.unwrap_or(DEFAULT_MIN_SIMILARITY) as f64;
 
-    check_staleness(conn, active, dims).await?;
+    check_staleness(coverage, active, dims)?;
 
     let terms: Vec<String> = query.text.as_deref().map(terms_of).unwrap_or_default();
     let text_scored = if terms.is_empty() {
@@ -390,53 +410,36 @@ async fn semantic_candidates(
 }
 
 /// Refuse semantic search when the stored embeddings cannot be compared against
-/// the active provider's vector space. Ported verbatim from the Turso backend.
-async fn check_staleness(conn: &mut PgConnection, active_model: &str, dims: usize) -> Result<()> {
-    let rows = query_all(
-        conn,
-        "SELECT model, dims, count(*) FROM chunk WHERE embedding IS NOT NULL GROUP BY model, dims",
-        vec![],
-    )
-    .await?;
+/// the active provider's vector space. Ported verbatim from the Turso backend;
+/// see [`crate::turso::search`] for the byte-identical-fields reasoning. Consumes
+/// the shared coverage snapshot rather than issuing its own aggregate scan.
+fn check_staleness(coverage: &EmbeddingCoverage, active_model: &str, dims: usize) -> Result<()> {
     let mut active_embedded = 0usize;
-    let mut total_embedded = 0usize;
     let mut foreign_dims = false;
-    let mut other: Option<(String, usize)> = None;
-    for r in &rows {
-        let m = cell_text(r, 0).unwrap_or_default();
-        let d = cell_i64(r, 1).unwrap_or(0).max(0) as usize;
-        let c = cell_i64(r, 2).unwrap_or(0).max(0) as usize;
-        total_embedded += c;
-        if m == active_model && d == dims {
-            active_embedded += c;
+    let mut other: Option<(&str, usize)> = None;
+    for m in &coverage.models {
+        if m.model == active_model && m.dims == dims {
+            active_embedded += m.count;
             continue;
         }
-        if d != dims {
+        if m.dims != dims {
             foreign_dims = true;
         }
-        if other.as_ref().map(|(_, oc)| c > *oc).unwrap_or(true) {
-            let label = if m.is_empty() {
-                "unknown".to_string()
-            } else {
-                m
-            };
-            other = Some((label, c));
+        if other.as_ref().map(|(_, oc)| m.count > *oc).unwrap_or(true) {
+            other = Some((m.model.as_str(), m.count));
         }
     }
 
-    let stale = total_embedded > 0 && (foreign_dims || active_embedded == 0);
+    let stale = coverage.embedded_chunks > 0 && (foreign_dims || active_embedded == 0);
     if stale {
-        let total_chunks = scalar_i64(conn, "SELECT count(*) FROM chunk", vec![])
-            .await?
-            .max(0) as usize;
         let stored_model = other
-            .map(|(m, _)| m)
+            .map(|(m, _)| m.to_string())
             .unwrap_or_else(|| active_model.to_string());
         return Err(IndexError::StaleEmbeddings {
             stored_model,
             active_model: active_model.to_string(),
             embedded: active_embedded,
-            total: total_chunks,
+            total: coverage.total_chunks,
         });
     }
     Ok(())

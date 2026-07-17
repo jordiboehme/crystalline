@@ -13,8 +13,8 @@ use turso::{Connection, Row, Value};
 
 use crate::error::{IndexError, Result};
 use crate::store::{
-    EdgeKind, EngramId, FilterOp, GraphEdge, GraphNode, GraphSlice, HitKind, MetadataFilter, Page,
-    SearchHit, SearchMode, SearchQuery,
+    EdgeKind, EmbeddingCoverage, EngramId, FilterOp, GraphEdge, GraphNode, GraphSlice, HitKind,
+    MetadataFilter, Page, SearchHit, SearchMode, SearchQuery,
 };
 
 use super::{cell_i64, cell_real, cell_text, query_all, query_first, scalar_i64};
@@ -34,13 +34,28 @@ const HYBRID_SEMANTIC_WEIGHT: f64 = 0.6;
 /// above it (a both-signal hit can reach 1.0, a single-signal hit at most 0.85).
 const SINGLE_SOURCE_PENALTY: f64 = 0.85;
 
-/// Run a search and return one page of hits plus the total match count.
-pub(super) async fn run_search(conn: &Connection, query: &SearchQuery) -> Result<Page<SearchHit>> {
+/// Run a search and return one page of hits plus the total match count. The
+/// `coverage` snapshot is supplied by the store for the semantic and hybrid modes
+/// (which gate on embedding staleness) and is `None` for the lexical modes.
+pub(super) async fn run_search(
+    conn: &Connection,
+    query: &SearchQuery,
+    coverage: Option<&EmbeddingCoverage>,
+) -> Result<Page<SearchHit>> {
     match query.mode {
-        SearchMode::Semantic => run_semantic(conn, query).await,
-        SearchMode::Hybrid => run_hybrid(conn, query).await,
+        SearchMode::Semantic => run_semantic(conn, query, require_coverage(coverage)?).await,
+        SearchMode::Hybrid => run_hybrid(conn, query, require_coverage(coverage)?).await,
         _ => run_lexical(conn, query).await,
     }
+}
+
+/// The staleness gate for semantic and hybrid search needs the coverage snapshot,
+/// which the store computes for exactly those two modes. A missing snapshot here
+/// is an internal wiring break, never a user input error.
+fn require_coverage(coverage: Option<&EmbeddingCoverage>) -> Result<&EmbeddingCoverage> {
+    coverage.ok_or_else(|| {
+        IndexError::Db("semantic search dispatched without an embedding coverage snapshot".into())
+    })
 }
 
 /// The lexical modes: Text, Title and Permalink. A LIKE-candidate prefilter in
@@ -198,7 +213,11 @@ fn pack_vector(v: &[f32]) -> Vec<u8> {
 
 /// Semantic search over chunk embeddings. Requires the caller to have embedded
 /// the query and set the active model on the [`SearchQuery`].
-async fn run_semantic(conn: &Connection, query: &SearchQuery) -> Result<Page<SearchHit>> {
+async fn run_semantic(
+    conn: &Connection,
+    query: &SearchQuery,
+    coverage: &EmbeddingCoverage,
+) -> Result<Page<SearchHit>> {
     let qvec = query
         .query_embedding
         .as_deref()
@@ -212,7 +231,7 @@ async fn run_semantic(conn: &Connection, query: &SearchQuery) -> Result<Page<Sea
     let page = query.page.max(1);
     let min_sim = query.min_similarity.unwrap_or(DEFAULT_MIN_SIMILARITY) as f64;
 
-    check_staleness(conn, active, dims).await?;
+    check_staleness(coverage, active, dims)?;
 
     let mut hits = semantic_candidates(conn, query, qvec, active, dims).await?;
     hits.retain(|(sim, _)| *sim >= min_sim);
@@ -256,7 +275,11 @@ async fn run_semantic(conn: &Connection, query: &SearchQuery) -> Result<Page<Sea
 /// (up to `1.0`) can outrank an equally strong single-signal hit (up to `0.85`).
 /// Hits are deduplicated per engram, keeping the best score, and every filter is
 /// pushed into the SQL of both halves rather than dropped afterwards.
-async fn run_hybrid(conn: &Connection, query: &SearchQuery) -> Result<Page<SearchHit>> {
+async fn run_hybrid(
+    conn: &Connection,
+    query: &SearchQuery,
+    coverage: &EmbeddingCoverage,
+) -> Result<Page<SearchHit>> {
     let qvec = query
         .query_embedding
         .as_deref()
@@ -270,7 +293,7 @@ async fn run_hybrid(conn: &Connection, query: &SearchQuery) -> Result<Page<Searc
     let page = query.page.max(1);
     let min_sim = query.min_similarity.unwrap_or(DEFAULT_MIN_SIMILARITY) as f64;
 
-    check_staleness(conn, active, dims).await?;
+    check_staleness(coverage, active, dims)?;
 
     let terms: Vec<String> = query.text.as_deref().map(terms_of).unwrap_or_default();
     let text_scored = if terms.is_empty() {
@@ -409,52 +432,43 @@ async fn semantic_candidates(
 /// Either case surfaces as [`IndexError::StaleEmbeddings`] so callers report
 /// "reindex in progress"; text search never calls this. When nothing is embedded
 /// yet, this is not an error: the semantic scan simply returns no hits.
-async fn check_staleness(conn: &Connection, active_model: &str, dims: usize) -> Result<()> {
-    let rows = query_all(
-        conn,
-        "SELECT model, dims, count(*) FROM chunk WHERE embedding IS NOT NULL GROUP BY model, dims",
-        vec![],
-    )
-    .await?;
+///
+/// This consumes the shared coverage snapshot (the same one `effective_mode`
+/// reads) rather than issuing its own aggregate scan, so a semantic or hybrid
+/// search costs one cached snapshot, not a second `GROUP BY`. The snapshot's
+/// `models` omits the empty-model group, but `store_embeddings` always writes a
+/// non-empty model id and nothing else ever writes an embedding, so no embedded
+/// chunk can lack a model: the omitted group is unreachable, and `embedded_chunks`
+/// plus `total_chunks` still account for every chunk. The produced
+/// [`IndexError::StaleEmbeddings`] fields are therefore byte-identical to the old
+/// direct scan for every reachable database state.
+fn check_staleness(coverage: &EmbeddingCoverage, active_model: &str, dims: usize) -> Result<()> {
     let mut active_embedded = 0usize;
-    let mut total_embedded = 0usize;
     let mut foreign_dims = false;
-    let mut other: Option<(String, usize)> = None;
-    for r in &rows {
-        let m = cell_text(r, 0).unwrap_or_default();
-        let d = cell_i64(r, 1).unwrap_or(0).max(0) as usize;
-        let c = cell_i64(r, 2).unwrap_or(0).max(0) as usize;
-        total_embedded += c;
-        if m == active_model && d == dims {
-            active_embedded += c;
+    let mut other: Option<(&str, usize)> = None;
+    for m in &coverage.models {
+        if m.model == active_model && m.dims == dims {
+            active_embedded += m.count;
             continue;
         }
-        if d != dims {
+        if m.dims != dims {
             foreign_dims = true;
         }
-        if other.as_ref().map(|(_, oc)| c > *oc).unwrap_or(true) {
-            let label = if m.is_empty() {
-                "unknown".to_string()
-            } else {
-                m
-            };
-            other = Some((label, c));
+        if other.as_ref().map(|(_, oc)| m.count > *oc).unwrap_or(true) {
+            other = Some((m.model.as_str(), m.count));
         }
     }
 
-    let stale = total_embedded > 0 && (foreign_dims || active_embedded == 0);
+    let stale = coverage.embedded_chunks > 0 && (foreign_dims || active_embedded == 0);
     if stale {
-        let total_chunks = scalar_i64(conn, "SELECT count(*) FROM chunk", vec![])
-            .await?
-            .max(0) as usize;
         let stored_model = other
-            .map(|(m, _)| m)
+            .map(|(m, _)| m.to_string())
             .unwrap_or_else(|| active_model.to_string());
         return Err(IndexError::StaleEmbeddings {
             stored_model,
             active_model: active_model.to_string(),
             embedded: active_embedded,
-            total: total_chunks,
+            total: coverage.total_chunks,
         });
     }
     Ok(())

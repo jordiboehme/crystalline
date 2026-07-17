@@ -1184,6 +1184,7 @@ name = "crystalline-index"
 version = "0.8.7"
 dependencies = [
  "async-trait",
+ "axum",
  "candle-core",
  "candle-nn",
  "candle-transformers",

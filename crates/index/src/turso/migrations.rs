@@ -42,6 +42,11 @@ pub const MIGRATIONS: &[Migration] = &[
         label: "domain host lock",
         sql: SCHEMA_V4,
     },
+    Migration {
+        version: 5,
+        label: "title-lower expression index",
+        sql: SCHEMA_V5,
+    },
 ];
 
 const SCHEMA_V1: &str = r#"
@@ -196,6 +201,19 @@ CREATE TABLE domain_lock (
     acquired_at TEXT NOT NULL,
     heartbeat_at TEXT NOT NULL
 );
+"#;
+
+// A case-insensitive title index for forward-reference resolution. Relations
+// resolve their target with `lower(e.title) = lower(...)` scoped to a domain,
+// and the find/inbound paths share the pattern; without an index each match is
+// a full engram scan, once per unresolved reference on every sync. Turso 0.7.0
+// accepts expression indexes and its planner seeks this one for the resolve
+// subquery shape (`SEARCH e USING INDEX idx_engram_title_lower`), so the
+// existing queries are left untouched and only gain the index. The `lower()`
+// folded into the index is byte-identical to the one the queries already call,
+// so resolution results are unchanged; the index just makes the match a seek.
+const SCHEMA_V5: &str = r#"
+CREATE INDEX idx_engram_title_lower ON engram(domain_id, lower(title));
 "#;
 
 /// The tables cleared by `wipe()`, child rows first. `domain_lock` references

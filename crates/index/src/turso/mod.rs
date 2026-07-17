@@ -26,7 +26,7 @@ use crate::store::{
     ChunkJob, ChunkModelCount, DomainHost, DomainId, DomainKind, DomainStats, EdgeKind,
     EmbeddingCoverage, EmbeddingRow, EngramDescriptor, EngramId, EngramRecord, EngramSummary,
     FileStamp, FtsMode, GraphSlice, HostClaim, InboundRef, NewChunk, Page, RecentFilter, SearchHit,
-    SearchQuery, Store, StoreInfo, StoredEngram,
+    SearchMode, SearchQuery, Store, StoreInfo, StoredEngram,
 };
 
 /// A Turso-backed store. Open one with [`TursoStore::open`].
@@ -39,6 +39,20 @@ pub struct TursoStore {
     fts_native: bool,
     // Tag name to id, to avoid re-interning tags during a sync.
     tag_cache: Mutex<HashMap<String, i64>>,
+    // The last computed embedding coverage snapshot, shared by effective_mode,
+    // the search staleness gate and CLI status so they issue one aggregate scan,
+    // not three. `None` means recompute on the next read. Interior mutability with
+    // the same std::sync discipline as tag_cache: the guard is taken in a tight
+    // scope and never held across an await (clippy::await_holding_lock).
+    //
+    // Invalidated (set to `None`) by exactly the Store methods that can change a
+    // chunk's embedding state, derived from the trait: store_embeddings (writes
+    // embeddings), replace_chunks (deletes and reinserts an engram's chunks),
+    // delete_engram (deletes an engram's chunks), clear_domain (deletes a domain's
+    // chunks), wipe (deletes every chunk) and rollback (reverts any of the above
+    // that ran inside the transaction). upsert_engram, upsert_engram_checked and
+    // rename_engram never touch the chunk table, so they are not invalidators.
+    coverage_cache: Mutex<Option<EmbeddingCoverage>>,
 }
 
 impl TursoStore {
@@ -82,6 +96,33 @@ impl TursoStore {
             .await
             .map_err(IndexError::from)?;
         let conn = db.connect().map_err(IndexError::from)?;
+
+        // PRAGMA probe against turso 0.7.0, verified two ways: reading
+        // turso_core's translate/pragma.rs (the PRAGMA setter dispatch) and a
+        // throwaway runtime test exercising each PRAGMA against a real
+        // connection. Findings:
+        // - busy_timeout: honored. `PRAGMA busy_timeout=5000` round-trips
+        //   through `PRAGMA busy_timeout` and drives a real retrying busy
+        //   handler (`Connection::set_busy_timeout`). Set below.
+        // - wal_checkpoint(TRUNCATE): honored. In the probe it shrank a
+        //   populated WAL file from over 1 MiB to 0 bytes. Used in `wipe()`
+        //   and by the CLI's `reindex --full` path (see
+        //   `Store::checkpoint_wal`), covering the same need the downstream
+        //   Docker image build met by shelling out to `sqlite3`.
+        // - synchronous: honored (round-tripped OFF and FULL in the probe)
+        //   but deliberately left at whatever `migrations::apply` and turso's
+        //   own default leave it at - not changed here, per plan.
+        // - wal_autocheckpoint: NOT honored. `turso_parser`'s `PragmaName`
+        //   enum has no `WalAutocheckpoint` variant, and turso_core's
+        //   `translate_pragma` silently ignores any unrecognized PRAGMA name
+        //   (SQLite's documented behavior for unknown pragmas): setting it
+        //   neither errors nor takes effect. The probe confirmed this -
+        //   `PRAGMA wal_autocheckpoint = 1000` returned `Ok`, but a
+        //   subsequent `PRAGMA wal_autocheckpoint` query returned no rows.
+        //   Not set here; wal_checkpoint(TRUNCATE) above is the mitigation for
+        //   WAL growth instead.
+        conn.execute("PRAGMA busy_timeout = 5000", ()).await?;
+
         let schema_version = migrations::apply(&conn).await?;
         let fts_native = probe_fts(&conn).await;
         Ok(TursoStore {
@@ -91,6 +132,50 @@ impl TursoStore {
             schema_version,
             fts_native,
             tag_cache: Mutex::new(HashMap::new()),
+            coverage_cache: Mutex::new(None),
+        })
+    }
+
+    /// Drop the cached embedding coverage snapshot so the next read recomputes it.
+    /// Called by every mutator that can change a chunk's embedding state. Kept in a
+    /// tight scope with no await so the std::sync guard never crosses a suspension
+    /// point.
+    fn invalidate_coverage(&self) {
+        *self.coverage_cache.lock().unwrap() = None;
+    }
+
+    /// Recompute the embedding coverage snapshot from the chunk table. This is the
+    /// one aggregate scan the cached `embedding_coverage()` fills from on a miss.
+    async fn compute_coverage(&self) -> Result<EmbeddingCoverage> {
+        let total = scalar_i64(&self.conn, "SELECT count(*) FROM chunk", vec![])
+            .await?
+            .max(0) as usize;
+        let rows = query_all(
+            &self.conn,
+            "SELECT model, dims, count(*) FROM chunk WHERE embedding IS NOT NULL \
+             GROUP BY model, dims ORDER BY count(*) DESC",
+            vec![],
+        )
+        .await?;
+        let mut models = Vec::new();
+        let mut embedded = 0usize;
+        for r in &rows {
+            let count = cell_i64(r, 2).unwrap_or(0).max(0) as usize;
+            embedded += count;
+            let model = cell_text(r, 0).unwrap_or_default();
+            if model.is_empty() {
+                continue;
+            }
+            models.push(ChunkModelCount {
+                model,
+                dims: cell_i64(r, 1).unwrap_or(0).max(0) as usize,
+                count,
+            });
+        }
+        Ok(EmbeddingCoverage {
+            total_chunks: total,
+            embedded_chunks: embedded,
+            models,
         })
     }
 
@@ -118,6 +203,15 @@ impl TursoStore {
     pub async fn explain_query_plan(&self, sql: &str) -> Result<Vec<String>> {
         let rows = query_all(&self.conn, &format!("EXPLAIN QUERY PLAN {sql}"), vec![]).await?;
         Ok(rows.iter().filter_map(|r| cell_text(r, 3)).collect())
+    }
+
+    /// Run `PRAGMA wal_checkpoint(TRUNCATE)`, shrinking the on-disk WAL file
+    /// back to (ideally) zero bytes. Confirmed to work by the runtime probe
+    /// documented on `build()`. The pragma returns one row (`busy`, `log`,
+    /// `checkpointed`) so it goes through the query path, not `execute`.
+    async fn truncate_wal(&self) -> Result<()> {
+        query_all(&self.conn, "PRAGMA wal_checkpoint(TRUNCATE)", vec![]).await?;
+        Ok(())
     }
 
     /// Delete the child rows recreated on every upsert. Chunk rows are NOT
@@ -584,6 +678,8 @@ impl Store for TursoStore {
     }
 
     async fn clear_domain(&self, domain: DomainId) -> Result<()> {
+        // Deletes this domain's chunks, so the coverage snapshot is now stale.
+        self.invalidate_coverage();
         // Delete a single domain's engram and child rows, keeping the domain
         // row. Child rows first, then chunks, then the engram rows themselves.
         let did = vec![Value::Integer(domain.0)];
@@ -603,6 +699,8 @@ impl Store for TursoStore {
     }
 
     async fn delete_engram(&self, domain: DomainId, path: &str) -> Result<()> {
+        // Deletes the engram's chunks, so the coverage snapshot is now stale.
+        self.invalidate_coverage();
         let id = query_first(
             &self.conn,
             "SELECT id FROM engram WHERE domain_id=?1 AND path=?2",
@@ -785,7 +883,16 @@ impl Store for TursoStore {
     }
 
     async fn search(&self, query: &SearchQuery) -> Result<Page<SearchHit>> {
-        search::run_search(&self.conn, query).await
+        // The semantic and hybrid modes gate on embedding staleness, which reads
+        // the coverage snapshot; the cache makes that essentially free once
+        // effective_mode has warmed it, and folds the old second aggregate scan
+        // into the same shared snapshot. The lexical modes never touch embeddings,
+        // so they skip the snapshot and pay nothing for it.
+        let coverage = match query.mode {
+            SearchMode::Semantic | SearchMode::Hybrid => Some(self.embedding_coverage().await?),
+            _ => None,
+        };
+        search::run_search(&self.conn, query, coverage.as_ref()).await
     }
 
     async fn neighbors(&self, ids: &[EngramId], depth: u8) -> Result<GraphSlice> {
@@ -863,6 +970,9 @@ impl Store for TursoStore {
     }
 
     async fn replace_chunks(&self, engram_id: EngramId, chunks: &[NewChunk]) -> Result<()> {
+        // Deletes and reinserts this engram's chunks, so the coverage snapshot is
+        // now stale.
+        self.invalidate_coverage();
         let eid = engram_id.0;
         // Carry over the embedding of any chunk whose fingerprint is unchanged so
         // an edit only re-embeds the paragraphs that actually changed. The
@@ -980,6 +1090,8 @@ impl Store for TursoStore {
     }
 
     async fn store_embeddings(&self, batch: &[EmbeddingRow], model: &str) -> Result<()> {
+        // Writes embeddings, so the coverage snapshot is now stale.
+        self.invalidate_coverage();
         // Validate the whole batch before opening the transaction so a bad row
         // never leaves earlier rows committed. The transaction then makes the
         // per-row updates all-or-nothing against a mid-batch database error,
@@ -1021,39 +1133,22 @@ impl Store for TursoStore {
     }
 
     async fn embedding_coverage(&self) -> Result<EmbeddingCoverage> {
-        let total = scalar_i64(&self.conn, "SELECT count(*) FROM chunk", vec![])
-            .await?
-            .max(0) as usize;
-        let rows = query_all(
-            &self.conn,
-            "SELECT model, dims, count(*) FROM chunk WHERE embedding IS NOT NULL \
-             GROUP BY model, dims ORDER BY count(*) DESC",
-            vec![],
-        )
-        .await?;
-        let mut models = Vec::new();
-        let mut embedded = 0usize;
-        for r in &rows {
-            let count = cell_i64(r, 2).unwrap_or(0).max(0) as usize;
-            embedded += count;
-            let model = cell_text(r, 0).unwrap_or_default();
-            if model.is_empty() {
-                continue;
+        // Fast path in a tight scope so the std::sync guard is dropped before the
+        // recompute await below (clippy::await_holding_lock), tag_cache style.
+        {
+            let cached = self.coverage_cache.lock().unwrap();
+            if let Some(cov) = cached.as_ref() {
+                return Ok(cov.clone());
             }
-            models.push(ChunkModelCount {
-                model,
-                dims: cell_i64(r, 1).unwrap_or(0).max(0) as usize,
-                count,
-            });
         }
-        Ok(EmbeddingCoverage {
-            total_chunks: total,
-            embedded_chunks: embedded,
-            models,
-        })
+        let cov = self.compute_coverage().await?;
+        *self.coverage_cache.lock().unwrap() = Some(cov.clone());
+        Ok(cov)
     }
 
     async fn wipe(&self) -> Result<()> {
+        // Deletes every chunk, so the coverage snapshot is now stale.
+        self.invalidate_coverage();
         self.conn.execute("BEGIN", ()).await?;
         for table in migrations::WIPE_TABLES {
             if let Err(e) = self.conn.execute(&format!("DELETE FROM {table}"), ()).await {
@@ -1063,7 +1158,15 @@ impl Store for TursoStore {
         }
         self.conn.execute("COMMIT", ()).await?;
         self.tag_cache.lock().unwrap().clear();
+        // A wipe deletes every row, which is the biggest single write a store
+        // sees; truncate the WAL back down rather than leaving it to grow
+        // until the next natural checkpoint.
+        self.truncate_wal().await?;
         Ok(())
+    }
+
+    async fn checkpoint_wal(&self) -> Result<()> {
+        self.truncate_wal().await
     }
 
     async fn record_sync(&self, domain: DomainId, when: &str) -> Result<()> {
@@ -1225,6 +1328,9 @@ impl Store for TursoStore {
     }
 
     async fn rollback(&self) -> Result<()> {
+        // A rollback reverts any chunk mutation made in the transaction, so a
+        // snapshot recomputed mid-transaction must not survive it.
+        self.invalidate_coverage();
         self.conn.execute("ROLLBACK", ()).await?;
         Ok(())
     }

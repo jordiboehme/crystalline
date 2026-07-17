@@ -70,3 +70,4 @@ hf-hub = { workspace = true, optional = true, features = ["native-tls"] }
 tempfile = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
+axum = { workspace = true }

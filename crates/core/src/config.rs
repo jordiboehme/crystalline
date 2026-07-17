@@ -462,15 +462,35 @@ pub fn save_bytes(path: &Path, bytes: &[u8]) -> Result<(), ConfigError> {
             source,
         })?;
     }
-    let tmp = temp_sibling(path);
-    std::fs::write(&tmp, bytes).map_err(|source| ConfigError::Io {
-        path: tmp.display().to_string(),
-        source,
-    })?;
-    std::fs::rename(&tmp, path).map_err(|source| ConfigError::Io {
+    write_atomic(path, bytes).map_err(|source| ConfigError::Io {
         path: path.display().to_string(),
         source,
-    })?;
+    })
+}
+
+/// Write `bytes` to `path` atomically: write a sibling temporary file, then
+/// rename it into place, so a crash or a concurrent read mid-write never
+/// observes a truncated file. `pub(crate)` since callers outside this module
+/// (the importer's markdown write path, `crate::import`) are all within this
+/// crate; each wraps the plain `io::Error` in its own error type, matching
+/// `save_bytes` above. Does not create the parent directory - callers that
+/// need one (like `save_bytes`) create it first.
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = temp_sibling(path);
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Copy `src` to `dest` atomically: copy into a sibling temporary file next to
+/// `dest`, then rename it into place. The copy half of the same crash-hygiene
+/// pattern as [`write_atomic`], for a caller (the importer's verbatim
+/// non-markdown copy path) that has a source file to duplicate rather than an
+/// already-encoded payload in memory. Does not create the parent directory.
+pub(crate) fn copy_atomic(src: &Path, dest: &Path) -> std::io::Result<()> {
+    let tmp = temp_sibling(dest);
+    std::fs::copy(src, &tmp)?;
+    std::fs::rename(&tmp, dest)?;
     Ok(())
 }
 

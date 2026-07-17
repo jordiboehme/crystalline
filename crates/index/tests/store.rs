@@ -12,8 +12,9 @@
 use std::path::Path;
 
 use crystalline_index::{
-    DomainKind, EmbeddingRow, EngramId, EngramRecord, FileStamp, FilterOp, HostClaim, IndexError,
-    MetadataFilter, RecentFilter, SearchMode, SearchQuery, Store, TursoStore, sync_domain,
+    DomainId, DomainKind, EmbeddingCoverage, EmbeddingRow, EngramId, EngramRecord, FileStamp,
+    FilterOp, HostClaim, IndexError, MetadataFilter, NewChunk, RecentFilter, SearchMode,
+    SearchQuery, Store, TursoStore, sync_domain,
 };
 
 fn write(dir: &Path, rel: &str, content: &str) {
@@ -430,6 +431,50 @@ async fn forward_reference_resolves(store: &dyn Store) {
 parity!(
     forward_reference_resolves_on_later_sync,
     forward_reference_resolves
+);
+
+/// The twin of `forward_reference_resolves` for the title-match path: the
+/// reference names its target by title, not permalink, and must resolve on the
+/// later sync when the target appears. This exercises the `lower(e.title)`
+/// branch of `resolve_pending_relations` (and the index behind it), which the
+/// permalink case never touches.
+async fn forward_reference_resolves_by_title(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // `[[Target Beta]]` matches neither a permalink nor anything present yet, so
+    // it stays unresolved until an engram whose title is "Target Beta" arrives.
+    write(
+        root,
+        "a.md",
+        &engram("A", "a", "engram", "", "- depends_on [[Target Beta]]\n"),
+    );
+    let first = sync_domain(store, "d", root).await.unwrap();
+    assert_eq!(first.relations_resolved, 0, "target absent, unresolved");
+    assert_eq!(
+        store.domain_stats().await.unwrap()[0].unresolved_relations,
+        1
+    );
+
+    // The target appears with a permalink that does NOT match the reference
+    // text, so only the title match can resolve it.
+    write(
+        root,
+        "b.md",
+        &engram("Target Beta", "beta-perma", "engram", "", "body b\n"),
+    );
+    let second = sync_domain(store, "d", root).await.unwrap();
+    assert_eq!(
+        second.relations_resolved, 1,
+        "resolved by title on the later sync"
+    );
+    assert_eq!(
+        store.domain_stats().await.unwrap()[0].unresolved_relations,
+        0
+    );
+}
+parity!(
+    forward_reference_resolves_by_title_on_later_sync,
+    forward_reference_resolves_by_title
 );
 
 async fn duplicate_permalink_fails(store: &dyn Store) {
@@ -1344,6 +1389,290 @@ async fn store_embeddings_mid_batch_mismatch_leaves_nothing(store: &dyn Store) {
 parity!(
     store_embeddings_is_atomic_on_mid_batch_dims_mismatch,
     store_embeddings_mid_batch_mismatch_leaves_nothing
+);
+
+// --- T1: embedding coverage cache invalidation -------------------------------
+//
+// The store caches the `EmbeddingCoverage` snapshot behind interior mutability
+// so `effective_mode` and the search staleness gate share one source of truth.
+// Every mutator that can change a chunk's embedding state must drop that
+// snapshot. The invalidation set derived from the `Store` trait is
+// `store_embeddings`, `replace_chunks`, `delete_engram`, `clear_domain`, `wipe`
+// and `rollback`. `upsert_engram`, `upsert_engram_checked` and `rename_engram`
+// never touch the chunk table, so they are deliberately not invalidators. Each
+// test warms the cache, mutates, then asserts the snapshot agrees with an
+// uncached recomputation, so a missing invalidation surfaces as a stale snapshot.
+
+/// The coverage facts recomputed WITHOUT the cache: `chunks_needing_embedding`
+/// never reads it. A model that embedded nothing needs every chunk, so its
+/// pending count is the total chunk count; the active model's pending count is
+/// the total minus the chunks it embedded, so total minus that pending count is
+/// the embedded count. Returns `(total_chunks, embedded_chunks)` as an
+/// independent ground truth for a store whose only embeddings use `model`.
+async fn recomputed_coverage(store: &dyn Store, model: &str) -> (usize, usize) {
+    let total = store
+        .chunks_needing_embedding("no-model-ever-embedded-this", None)
+        .await
+        .unwrap()
+        .len();
+    let pending = store
+        .chunks_needing_embedding(model, None)
+        .await
+        .unwrap()
+        .len();
+    (total, total - pending)
+}
+
+/// Assert the (possibly cached) coverage snapshot equals the uncached
+/// recomputation. Assumes every embedded chunk was embedded with `model`.
+async fn assert_snapshot_matches(store: &dyn Store, model: &str) {
+    let cov = store.embedding_coverage().await.unwrap();
+    let (total, embedded) = recomputed_coverage(store, model).await;
+    assert_eq!(
+        cov.total_chunks, total,
+        "total_chunks must match the uncached recount"
+    );
+    assert_eq!(
+        cov.embedded_chunks, embedded,
+        "embedded_chunks must match the uncached recount"
+    );
+}
+
+/// Seed a virtual domain with two engrams, one chunk each, nothing embedded.
+/// Returns the domain id for the mutators that address a domain directly.
+async fn seed_two_chunks(store: &dyn Store) -> DomainId {
+    let did = store
+        .upsert_domain("v", None, DomainKind::Virtual)
+        .await
+        .unwrap();
+    store
+        .upsert_engram(did, &record("a.md", "a", "alpha body", "sha-a"))
+        .await
+        .unwrap();
+    store
+        .upsert_engram(did, &record("b.md", "b", "beta body", "sha-b"))
+        .await
+        .unwrap();
+    let a = store.lookup_id("v", "a").await.unwrap().unwrap();
+    let b = store.lookup_id("v", "b").await.unwrap().unwrap();
+    store
+        .replace_chunks(
+            a,
+            &[NewChunk {
+                seq: 0,
+                text: "alpha body".into(),
+                text_hash: "hash-a".into(),
+            }],
+        )
+        .await
+        .unwrap();
+    store
+        .replace_chunks(
+            b,
+            &[NewChunk {
+                seq: 0,
+                text: "beta body".into(),
+                text_hash: "hash-b".into(),
+            }],
+        )
+        .await
+        .unwrap();
+    did
+}
+
+/// Embed every currently-pending chunk with `model` at width 8.
+async fn embed_all(store: &dyn Store, model: &str) {
+    let jobs = store.chunks_needing_embedding(model, None).await.unwrap();
+    let rows: Vec<EmbeddingRow> = jobs
+        .iter()
+        .map(|j| EmbeddingRow {
+            chunk_id: j.chunk_id,
+            embedding: vec![0.1f32; 8],
+            dims: 8,
+        })
+        .collect();
+    store.store_embeddings(&rows, model).await.unwrap();
+}
+
+async fn coverage_cache_invalidated_by_store_embeddings(store: &dyn Store) {
+    seed_two_chunks(store).await;
+    // Warm the snapshot while nothing is embedded.
+    let warm = store.embedding_coverage().await.unwrap();
+    assert_eq!(warm.total_chunks, 2);
+    assert_eq!(warm.embedded_chunks, 0, "nothing embedded yet");
+    // store_embeddings embeds every chunk; a surviving snapshot would still
+    // report zero embedded.
+    embed_all(store, "m8").await;
+    assert_snapshot_matches(store, "m8").await;
+    let cov = store.embedding_coverage().await.unwrap();
+    assert_eq!(
+        cov.embedded_chunks, 2,
+        "both chunks embedded after the mutator"
+    );
+}
+parity!(
+    coverage_cache_invalidates_on_store_embeddings,
+    coverage_cache_invalidated_by_store_embeddings
+);
+
+async fn coverage_cache_invalidated_by_replace_chunks(store: &dyn Store) {
+    seed_two_chunks(store).await;
+    embed_all(store, "m8").await;
+    let warm = store.embedding_coverage().await.unwrap();
+    assert_eq!(warm.embedded_chunks, 2);
+    // Replacing A's chunk with a differently fingerprinted one drops A's carried
+    // embedding, so one fewer chunk is embedded.
+    let a = store.lookup_id("v", "a").await.unwrap().unwrap();
+    store
+        .replace_chunks(
+            a,
+            &[NewChunk {
+                seq: 0,
+                text: "rewritten alpha".into(),
+                text_hash: "hash-a-v2".into(),
+            }],
+        )
+        .await
+        .unwrap();
+    assert_snapshot_matches(store, "m8").await;
+    let cov = store.embedding_coverage().await.unwrap();
+    assert_eq!(cov.embedded_chunks, 1, "A's embedding dropped, B's remains");
+    assert_eq!(cov.total_chunks, 2, "still two chunks total");
+}
+parity!(
+    coverage_cache_invalidates_on_replace_chunks,
+    coverage_cache_invalidated_by_replace_chunks
+);
+
+async fn coverage_cache_invalidated_by_delete_engram(store: &dyn Store) {
+    let did = seed_two_chunks(store).await;
+    embed_all(store, "m8").await;
+    let warm = store.embedding_coverage().await.unwrap();
+    assert_eq!(warm.total_chunks, 2);
+    assert_eq!(warm.embedded_chunks, 2);
+    store.delete_engram(did, "a.md").await.unwrap();
+    assert_snapshot_matches(store, "m8").await;
+    let cov = store.embedding_coverage().await.unwrap();
+    assert_eq!(cov.total_chunks, 1, "A's chunk removed");
+    assert_eq!(cov.embedded_chunks, 1);
+}
+parity!(
+    coverage_cache_invalidates_on_delete_engram,
+    coverage_cache_invalidated_by_delete_engram
+);
+
+async fn coverage_cache_invalidated_by_clear_domain(store: &dyn Store) {
+    let did = seed_two_chunks(store).await;
+    embed_all(store, "m8").await;
+    let warm = store.embedding_coverage().await.unwrap();
+    assert_eq!(warm.embedded_chunks, 2);
+    store.clear_domain(did).await.unwrap();
+    assert_snapshot_matches(store, "m8").await;
+    let cov = store.embedding_coverage().await.unwrap();
+    assert_eq!(
+        cov.total_chunks, 0,
+        "clearing the domain removed every chunk"
+    );
+    assert_eq!(cov.embedded_chunks, 0);
+    assert!(cov.models.is_empty());
+}
+parity!(
+    coverage_cache_invalidates_on_clear_domain,
+    coverage_cache_invalidated_by_clear_domain
+);
+
+async fn coverage_cache_invalidated_by_wipe(store: &dyn Store) {
+    seed_two_chunks(store).await;
+    embed_all(store, "m8").await;
+    let warm = store.embedding_coverage().await.unwrap();
+    assert_eq!(warm.embedded_chunks, 2);
+    store.wipe().await.unwrap();
+    assert_snapshot_matches(store, "m8").await;
+    let cov = store.embedding_coverage().await.unwrap();
+    assert_eq!(
+        cov,
+        EmbeddingCoverage::default(),
+        "wipe empties the snapshot"
+    );
+}
+parity!(
+    coverage_cache_invalidates_on_wipe,
+    coverage_cache_invalidated_by_wipe
+);
+
+async fn coverage_cache_invalidated_by_rollback(store: &dyn Store) {
+    let did = seed_two_chunks(store).await;
+    // Warm outside any transaction: two chunks, none embedded.
+    let base = store.embedding_coverage().await.unwrap();
+    assert_eq!(base.total_chunks, 2);
+    // Add a third chunk inside a transaction and observe it mid-transaction,
+    // which recomputes and re-caches the uncommitted count, then roll back.
+    store.begin().await.unwrap();
+    store
+        .upsert_engram(did, &record("c.md", "c", "gamma body", "sha-c"))
+        .await
+        .unwrap();
+    let c = store.lookup_id("v", "c").await.unwrap().unwrap();
+    store
+        .replace_chunks(
+            c,
+            &[NewChunk {
+                seq: 0,
+                text: "gamma body".into(),
+                text_hash: "hash-c".into(),
+            }],
+        )
+        .await
+        .unwrap();
+    let mid = store.embedding_coverage().await.unwrap();
+    assert_eq!(mid.total_chunks, 3, "sees its own uncommitted chunk");
+    store.rollback().await.unwrap();
+    // The uncommitted chunk is gone; the mid-transaction snapshot must not
+    // survive the rollback.
+    let after = store.embedding_coverage().await.unwrap();
+    assert_eq!(after.total_chunks, 2, "rollback dropped the stale snapshot");
+}
+parity!(
+    coverage_cache_invalidates_on_rollback,
+    coverage_cache_invalidated_by_rollback
+);
+
+/// The staleness label must stay byte-identical after the check consumes the
+/// cached coverage snapshot instead of its own aggregate scan: a same-width model
+/// swap names the stored model, reports zero embedded for the active model and
+/// counts every chunk. Mirrors `model_swap_returns_stale_embeddings_error` in
+/// `embed.rs` across both backends.
+async fn stale_embeddings_names_stored_model(store: &dyn Store) {
+    seed_two_chunks(store).await;
+    embed_all(store, "m8").await;
+    let query = SearchQuery {
+        text: Some("alpha".into()),
+        mode: SearchMode::Semantic,
+        query_embedding: Some(vec![0.1f32; 8]),
+        active_model: Some("other-model".into()),
+        limit: 10,
+        page: 1,
+        ..SearchQuery::default()
+    };
+    let err = store.search(&query).await.unwrap_err();
+    match err {
+        IndexError::StaleEmbeddings {
+            stored_model,
+            active_model,
+            embedded,
+            total,
+        } => {
+            assert_eq!(stored_model, "m8");
+            assert_eq!(active_model, "other-model");
+            assert_eq!(embedded, 0, "nothing embedded for the active model");
+            assert_eq!(total, 2, "every chunk counted");
+        }
+        other => panic!("expected StaleEmbeddings, got {other:?}"),
+    }
+}
+parity!(
+    stale_embeddings_reports_stored_model_on_swap,
+    stale_embeddings_names_stored_model
 );
 
 /// Models routinely double-encode nested tool arguments, sending the

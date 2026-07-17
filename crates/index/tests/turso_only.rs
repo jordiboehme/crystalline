@@ -30,8 +30,41 @@ async fn store_info_reports_turso_schema_version() {
     let store = open().await;
     let info = store.store_info().await.unwrap();
     assert_eq!(info.fts_mode, crystalline_index::FtsMode::CandidateScan);
-    // v1 initial, v2 vector chunk storage, v3 domain kind, v4 domain host lock.
-    assert_eq!(info.schema_version, 4);
+    // v1 initial, v2 vector chunk storage, v3 domain kind, v4 domain host lock,
+    // v5 title-lower expression index.
+    assert_eq!(info.schema_version, 5);
+}
+
+#[tokio::test]
+async fn title_match_resolution_seeks_the_promoted_index() {
+    let store = open().await;
+    // Seed a domain so the query is over a real table.
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "a.md",
+        &engram("Alpha", "a", "engram", "", "b\n"),
+    );
+    sync_domain(&store, "d", dir.path()).await.unwrap();
+
+    // The correlated title subquery shape `resolve_pending_relations` runs to
+    // match a relation target by lowercased title within a domain. Without the
+    // expression index this is a full engram scan per unresolved reference.
+    let plan = store
+        .explain_query_plan(
+            "SELECT e.id FROM engram e WHERE lower(e.title) = lower('Alpha') AND e.domain_id = 1 LIMIT 1",
+        )
+        .await
+        .unwrap();
+    let joined = plan.join(" | ");
+    assert!(
+        joined.contains("USING INDEX") && joined.contains("idx_engram_title_lower"),
+        "title match should seek the promoted index, plan was: {joined}"
+    );
+    assert!(
+        !joined.contains("SCAN engram") || joined.contains("USING INDEX"),
+        "title match should not be a bare full scan, plan was: {joined}"
+    );
 }
 
 #[tokio::test]
