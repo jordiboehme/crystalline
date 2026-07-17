@@ -5,7 +5,7 @@
 //! a socket or a network connection, and none starts a Tokio runtime. Every
 //! other subcommand lands in a later milestone.
 
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
@@ -19,6 +19,7 @@ mod doctor;
 mod hook;
 mod install;
 mod receipt;
+mod render;
 
 /// Local-first knowledge management for humans and AI agents.
 #[derive(Parser, Debug)]
@@ -1736,7 +1737,28 @@ async fn run_data(command: Command, db: Option<PathBuf>, json: bool) -> anyhow::
     };
 
     let value = crystalline_service::run_tool(tool, args, db.as_deref(), config.as_deref()).await?;
-    print_value(&value, json);
+    if json {
+        // `--json` keeps the exact byte-for-byte shape every tool has always
+        // emitted; nothing routes through the human renderers.
+        print_value(&value, true);
+        return Ok(());
+    }
+    // Human mode: give the read-heavy verbs a terminal-friendly view and leave
+    // every other data command on its pretty-JSON default. Each renderer
+    // degrades to that same pretty JSON when the value is not the shape it
+    // expects, so the fallback arm and the renderers print identically.
+    let mut out = std::io::stdout().lock();
+    match tool {
+        "read_engram" => render::render_read(&value, &mut out)?,
+        "search_engrams" => render::render_search(&value, &mut out)?,
+        "recent_activity" => render::render_recent(&value, &mut out)?,
+        "build_context" => render::render_context(&value, &mut out)?,
+        "write_engram" => render::render_write(&value, &mut out)?,
+        _ => {
+            let text = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
+            writeln!(out, "{text}")?;
+        }
+    }
     Ok(())
 }
 

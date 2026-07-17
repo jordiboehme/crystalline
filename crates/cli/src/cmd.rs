@@ -1366,6 +1366,15 @@ const HEALTHCHECK_DEADLINE: std::time::Duration = std::time::Duration::from_secs
 /// connection refused, a timeout, a non-200 status or a malformed response -
 /// comes back as a single-line `Err` naming the address it failed against,
 /// so the process exits nonzero through the normal error path.
+///
+/// B14 exemption: unlike the other data verbs, this default output is not given
+/// a human rendering and does not honor `--json`. The line printed here is the
+/// daemon's own `/health` HTTP body echoed verbatim, not a locally composed set
+/// of checks, and it is a machine-consumed contract: the container `HEALTHCHECK`
+/// captures it into `docker inspect`, and `tests/service.rs` asserts the default
+/// output contains `"status":"ok"`. Reshaping it would break those consumers for
+/// no gain (the body is already the canonical machine JSON), so the behavior is
+/// left as-is deliberately.
 pub(crate) fn healthcheck(addr: &str) -> Result<()> {
     use std::io::{Read, Write};
     use std::net::{TcpStream, ToSocketAddrs};
