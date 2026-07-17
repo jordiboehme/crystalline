@@ -1791,3 +1791,67 @@ async fn domain_add_local_schedules_embedding_on_the_worker_channel() {
         "domain_add_local must schedule a background embed instead of embedding inline"
     );
 }
+
+// --- hybrid search lock discipline (M2.1) ------------------------------------
+
+/// Pins the three-phase `search_engrams` contract that the A2+A12 lock
+/// restructure must preserve: with active embeddings and a stub provider a
+/// hybrid search reports `mode: hybrid`, still returns hits and embeds the
+/// query exactly once. It passes before and after the change (a regression pin,
+/// not a red-first test); the win is that no store guard is held across the
+/// provider embed call, which structural review guards, so this asserts
+/// behavior only and never times a lock.
+#[tokio::test]
+async fn hybrid_search_returns_hits_and_embeds_the_query_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let eng = engine_with(
+        &tmp.path().join("config.yaml"),
+        &tmp.path().join("origins"),
+        mock,
+        false,
+        false,
+    )
+    .await;
+    let embedder = Arc::new(CountingEmbedder::new());
+    eng.set_provider(embedder.clone());
+
+    // A local domain with one engram, synced and embedded inline: no embed
+    // channel is wired, so `domain_add_local` runs the embed pass itself and the
+    // store ends up with active embeddings for the engine's model.
+    let folder = tmp.path().join("local-notes");
+    std::fs::create_dir_all(folder.join("notes")).unwrap();
+    std::fs::write(folder.join("MANIFEST.md"), manifest()).unwrap();
+    std::fs::write(
+        folder.join("notes/alpha.md"),
+        engram("Alpha", "alpha", "alpha body"),
+    )
+    .unwrap();
+    eng.domain_add_local(Some("local-notes"), Some(folder.to_str().unwrap()))
+        .await
+        .unwrap();
+
+    let before = embedder.calls.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(before >= 1, "the inline embed pass ran during domain add");
+
+    let hits = eng
+        .search_engrams(&SearchParams {
+            query: Some("alpha".to_string()),
+            search_type: Some("hybrid".to_string()),
+            domains: vec!["local-notes".to_string()],
+            ..SearchParams::default()
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        hits["mode"], "hybrid",
+        "active embeddings keep the mode hybrid"
+    );
+    assert!(
+        hits["total"].as_u64().unwrap() >= 1,
+        "the hybrid search still returns hits"
+    );
+    let after = embedder.calls.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(after, before + 1, "the query was embedded exactly once");
+}

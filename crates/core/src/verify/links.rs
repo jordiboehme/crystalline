@@ -6,6 +6,7 @@
 //! whose named domain is outside the scan set cannot be judged broken or
 //! sound, so it is only ever informational (`L006`), never a warning.
 
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap};
 
 use crate::address::{self, CrystallineUrl, LinkResolver, LookupTable, Resolution};
@@ -235,7 +236,11 @@ fn check_crystalline_urls(
         if bl.in_fence {
             continue;
         }
-        let masked = mask_inline_code(bl.text);
+        let masked: Cow<'_, str> = if bl.text.contains('`') {
+            Cow::Owned(mask_inline_code(bl.text))
+        } else {
+            Cow::Borrowed(bl.text)
+        };
         for url in find_urls(&masked) {
             let Some(parsed) = CrystallineUrl::parse(&url) else {
                 continue;

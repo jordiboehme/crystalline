@@ -865,6 +865,57 @@ fn a_matching_crystalline_on_the_path_earns_no_version_notice() {
     );
 }
 
+#[test]
+fn install_into_an_empty_home_prints_the_no_domains_notice() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let bin_dir = work.path().join("bin");
+    let log = work.path().join("claude.log");
+    write_shim(&bin_dir, "claude", &log);
+
+    let out = install_cmd(&home, &bin_dir)
+        .args(["install", "claude-code"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains("No domains registered yet. Create one with: crystalline domain add"),
+        "a domain-less install points at domain add: {stdout}"
+    );
+}
+
+#[test]
+fn install_with_a_registered_domain_omits_the_no_domains_notice() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let bin_dir = work.path().join("bin");
+    let log = work.path().join("claude.log");
+    write_shim(&bin_dir, "claude", &log);
+
+    // The global config the isolated home resolves to (XDG_CONFIG_HOME is
+    // <home>/config), pre-seeded with one registered domain; install never
+    // touches the domain itself, so the path does not need to exist.
+    let config_path = home.join("config").join("crystalline").join("config.yaml");
+    std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &config_path,
+        "domains:\n  eng:\n    path: /tmp/does-not-need-to-exist\n",
+    )
+    .unwrap();
+
+    let out = install_cmd(&home, &bin_dir)
+        .args(["install", "claude-code"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        !stdout.contains("No domains registered"),
+        "an install with a registered domain omits the notice: {stdout}"
+    );
+}
+
 /// The receipt path under an isolated home: state_dir honors
 /// XDG_STATE_HOME, which install_cmd points at <home>/state.
 fn receipt_file(home: &Path) -> PathBuf {

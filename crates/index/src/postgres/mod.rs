@@ -254,6 +254,12 @@ pub(super) enum Param {
     Text(String),
     Int(i64),
     Vector(pgvector::Vector),
+    // Nullable variants for multi-row child inserts, where a NULL context,
+    // `to_domain`, or a carried-over chunk's model/dims/embedding binds as a
+    // typed NULL rather than a literal.
+    TextOpt(Option<String>),
+    IntOpt(Option<i64>),
+    VectorOpt(Option<pgvector::Vector>),
 }
 
 fn bind_all<'q>(
@@ -265,9 +271,60 @@ fn bind_all<'q>(
             Param::Text(s) => q.bind(s),
             Param::Int(i) => q.bind(i),
             Param::Vector(v) => q.bind(v),
+            Param::TextOpt(s) => q.bind(s),
+            Param::IntOpt(i) => q.bind(i),
+            Param::VectorOpt(v) => q.bind(v),
         };
     }
     q
+}
+
+/// Execute a statement with dynamically bound parameters, returning the affected
+/// row count. The multi-row child inserts route through this; the RETURNING
+/// observation insert uses [`query_all`] instead.
+pub(super) async fn exec(conn: &mut PgConnection, sql: &str, params: Vec<Param>) -> Result<u64> {
+    Ok(bind_all(sqlx::query(AssertSqlSafe(sql)), params)
+        .execute(&mut *conn)
+        .await
+        .map_err(IndexError::from)?
+        .rows_affected())
+}
+
+/// The maximum number of value tuples in one multi-row INSERT. Postgres caps a
+/// statement at 65535 bind parameters, far above this, so the chunk size stays in
+/// step with the Turso backend rather than tracking a different ceiling.
+const INSERT_CHUNK: usize = 100;
+
+/// Build the parenthesized value tuples for a multi-row INSERT: `count` tuples of
+/// `width` sequential `$n` placeholders each, plus an optional fixed trailing
+/// column (a literal `NULL` `to_id` for relations and links). `count` must be
+/// non-zero; callers iterate chunks of a possibly-empty slice and skip the
+/// statement entirely when there is nothing to insert.
+fn value_rows(width: usize, count: usize, trailing: Option<&str>) -> String {
+    let mut n = 1;
+    let mut rows = Vec::with_capacity(count);
+    for _ in 0..count {
+        let mut cells = Vec::with_capacity(width + usize::from(trailing.is_some()));
+        for _ in 0..width {
+            cells.push(format!("${n}"));
+            n += 1;
+        }
+        if let Some(t) = trailing {
+            cells.push(t.to_string());
+        }
+        rows.push(format!("({})", cells.join(",")));
+    }
+    rows.join(",")
+}
+
+/// The multi-row observation INSERT for `count` rows, returning each new row's id
+/// with its source line so observation tags map to the right observation without
+/// depending on `RETURNING` row order.
+fn observation_insert_sql(count: usize) -> String {
+    format!(
+        "INSERT INTO observation(engram_id, line, category, content, context) VALUES {} RETURNING id, line",
+        value_rows(5, count, None)
+    )
 }
 
 pub(super) async fn query_all(
@@ -518,70 +575,102 @@ impl Store for PostgresStore {
             delete_children(&mut *c, engram_id).await?;
         }
 
-        for obs in &record.observations {
-            let oid: (i64,) = sqlx::query_as(
-                "INSERT INTO observation(engram_id, line, category, content, context) VALUES($1,$2,$3,$4,$5) RETURNING id",
-            )
-            .bind(engram_id)
-            .bind(obs.line as i64)
-            .bind(&obs.category)
-            .bind(&obs.content)
-            .bind(obs.context.as_deref())
-            .fetch_one(&mut *c)
-            .await
-            .map_err(IndexError::from)?;
-            for tag in &obs.tags {
-                let tid = self.tag_id(&mut *c, tag).await?;
-                sqlx::query("INSERT INTO observation_tag(observation_id, tag_id) VALUES($1,$2) ON CONFLICT DO NOTHING")
-                    .bind(oid.0)
-                    .bind(tid)
-                    .execute(&mut *c)
-                    .await
-                    .map_err(IndexError::from)?;
+        // Observations: insert in chunks and read each new row's id back joined
+        // on its source line (unique within one engram), so observation tags map
+        // to the right observation without relying on RETURNING row order.
+        let mut obs_id_by_line: HashMap<i64, i64> = HashMap::new();
+        for batch in record.observations.chunks(INSERT_CHUNK) {
+            let mut params: Vec<Param> = Vec::with_capacity(batch.len() * 5);
+            for obs in batch {
+                params.push(Param::Int(engram_id));
+                params.push(Param::Int(obs.line as i64));
+                params.push(Param::Text(obs.category.clone()));
+                params.push(Param::Text(obs.content.clone()));
+                params.push(Param::TextOpt(obs.context.clone()));
+            }
+            let rows = query_all(&mut *c, &observation_insert_sql(batch.len()), params).await?;
+            for r in &rows {
+                if let (Some(id), Some(line)) = (cell_i64(r, 0), cell_i64(r, 1)) {
+                    obs_id_by_line.insert(line, id);
+                }
             }
         }
 
-        for rel in &record.relations {
-            sqlx::query(
-                "INSERT INTO relation(engram_id, domain_id, line, rel_type, to_target, to_domain, to_id) \
-                 VALUES($1,$2,$3,$4,$5,$6,NULL)",
-            )
-            .bind(engram_id)
-            .bind(domain.0)
-            .bind(rel.line as i64)
-            .bind(&rel.rel_type)
-            .bind(&rel.to_target)
-            .bind(rel.to_domain.as_deref())
-            .execute(&mut *c)
-            .await
-            .map_err(IndexError::from)?;
+        // Observation tags: intern each tag through the cache, then insert the
+        // (observation, tag) pairs in multi-row statements.
+        let mut obs_tag_pairs: Vec<(i64, i64)> = Vec::new();
+        for obs in &record.observations {
+            let Some(&oid) = obs_id_by_line.get(&(obs.line as i64)) else {
+                continue;
+            };
+            for tag in &obs.tags {
+                let tid = self.tag_id(&mut *c, tag).await?;
+                obs_tag_pairs.push((oid, tid));
+            }
+        }
+        for batch in obs_tag_pairs.chunks(INSERT_CHUNK) {
+            let mut params: Vec<Param> = Vec::with_capacity(batch.len() * 2);
+            for (oid, tid) in batch {
+                params.push(Param::Int(*oid));
+                params.push(Param::Int(*tid));
+            }
+            let sql = format!(
+                "INSERT INTO observation_tag(observation_id, tag_id) VALUES {} ON CONFLICT DO NOTHING",
+                value_rows(2, batch.len(), None)
+            );
+            exec(&mut *c, &sql, params).await?;
         }
 
-        for link in &record.links {
-            sqlx::query(
-                "INSERT INTO link(engram_id, domain_id, line, to_target, to_domain, to_id) \
-                 VALUES($1,$2,$3,$4,$5,NULL)",
-            )
-            .bind(engram_id)
-            .bind(domain.0)
-            .bind(link.line as i64)
-            .bind(&link.to_target)
-            .bind(link.to_domain.as_deref())
-            .execute(&mut *c)
-            .await
-            .map_err(IndexError::from)?;
+        for batch in record.relations.chunks(INSERT_CHUNK) {
+            let mut params: Vec<Param> = Vec::with_capacity(batch.len() * 6);
+            for rel in batch {
+                params.push(Param::Int(engram_id));
+                params.push(Param::Int(domain.0));
+                params.push(Param::Int(rel.line as i64));
+                params.push(Param::Text(rel.rel_type.clone()));
+                params.push(Param::Text(rel.to_target.clone()));
+                params.push(Param::TextOpt(rel.to_domain.clone()));
+            }
+            let sql = format!(
+                "INSERT INTO relation(engram_id, domain_id, line, rel_type, to_target, to_domain, to_id) VALUES {}",
+                value_rows(6, batch.len(), Some("NULL"))
+            );
+            exec(&mut *c, &sql, params).await?;
         }
 
+        for batch in record.links.chunks(INSERT_CHUNK) {
+            let mut params: Vec<Param> = Vec::with_capacity(batch.len() * 5);
+            for link in batch {
+                params.push(Param::Int(engram_id));
+                params.push(Param::Int(domain.0));
+                params.push(Param::Int(link.line as i64));
+                params.push(Param::Text(link.to_target.clone()));
+                params.push(Param::TextOpt(link.to_domain.clone()));
+            }
+            let sql = format!(
+                "INSERT INTO link(engram_id, domain_id, line, to_target, to_domain, to_id) VALUES {}",
+                value_rows(5, batch.len(), Some("NULL"))
+            );
+            exec(&mut *c, &sql, params).await?;
+        }
+
+        // Engram tags: intern each tag, then insert the pairs in multi-row
+        // statements.
+        let mut tag_ids: Vec<i64> = Vec::with_capacity(record.tags.len());
         for tag in &record.tags {
-            let tid = self.tag_id(&mut *c, tag).await?;
-            sqlx::query(
-                "INSERT INTO engram_tag(engram_id, tag_id) VALUES($1,$2) ON CONFLICT DO NOTHING",
-            )
-            .bind(engram_id)
-            .bind(tid)
-            .execute(&mut *c)
-            .await
-            .map_err(IndexError::from)?;
+            tag_ids.push(self.tag_id(&mut *c, tag).await?);
+        }
+        for batch in tag_ids.chunks(INSERT_CHUNK) {
+            let mut params: Vec<Param> = Vec::with_capacity(batch.len() * 2);
+            for tid in batch {
+                params.push(Param::Int(engram_id));
+                params.push(Param::Int(*tid));
+            }
+            let sql = format!(
+                "INSERT INTO engram_tag(engram_id, tag_id) VALUES {} ON CONFLICT DO NOTHING",
+                value_rows(2, batch.len(), None)
+            );
+            exec(&mut *c, &sql, params).await?;
         }
 
         Ok(EngramId(engram_id))
@@ -979,37 +1068,34 @@ impl Store for PostgresStore {
             .await
             .map_err(IndexError::from)?;
 
-        for chunk in chunks {
-            match carry.get(&chunk.text_hash) {
-                Some((model, dims, emb)) => {
-                    sqlx::query(
-                        "INSERT INTO chunk(engram_id, seq, text, text_hash, model, dims, embedding) \
-                         VALUES($1,$2,$3,$4,$5,$6,$7)",
-                    )
-                    .bind(eid)
-                    .bind(chunk.seq)
-                    .bind(&chunk.text)
-                    .bind(&chunk.text_hash)
-                    .bind(model.as_deref())
-                    .bind(*dims)
-                    .bind(emb.clone())
-                    .execute(&mut *c)
-                    .await
-                    .map_err(IndexError::from)?;
-                }
-                None => {
-                    sqlx::query(
-                        "INSERT INTO chunk(engram_id, seq, text, text_hash) VALUES($1,$2,$3,$4)",
-                    )
-                    .bind(eid)
-                    .bind(chunk.seq)
-                    .bind(&chunk.text)
-                    .bind(&chunk.text_hash)
-                    .execute(&mut *c)
-                    .await
-                    .map_err(IndexError::from)?;
+        // One 7-column multi-row insert for every chunk: a carry hit binds its
+        // preserved model, dims and embedding, a miss binds NULL for all three
+        // and leaves the chunk pending re-embedding.
+        for batch in chunks.chunks(INSERT_CHUNK) {
+            let mut params: Vec<Param> = Vec::with_capacity(batch.len() * 7);
+            for chunk in batch {
+                params.push(Param::Int(eid));
+                params.push(Param::Int(chunk.seq));
+                params.push(Param::Text(chunk.text.clone()));
+                params.push(Param::Text(chunk.text_hash.clone()));
+                match carry.get(&chunk.text_hash) {
+                    Some((model, dims, emb)) => {
+                        params.push(Param::TextOpt(model.clone()));
+                        params.push(Param::IntOpt(*dims));
+                        params.push(Param::VectorOpt(Some(emb.clone())));
+                    }
+                    None => {
+                        params.push(Param::TextOpt(None));
+                        params.push(Param::IntOpt(None));
+                        params.push(Param::VectorOpt(None));
+                    }
                 }
             }
+            let sql = format!(
+                "INSERT INTO chunk(engram_id, seq, text, text_hash, model, dims, embedding) VALUES {}",
+                value_rows(7, batch.len(), None)
+            );
+            exec(&mut *c, &sql, params).await?;
         }
         Ok(())
     }
@@ -1063,8 +1149,8 @@ impl Store for PostgresStore {
     }
 
     async fn store_embeddings(&self, batch: &[EmbeddingRow], model: &str) -> Result<()> {
-        let mut conn = self.acquire().await?;
-        let c = conn.as_mut();
+        // Validate the whole batch before any write so a bad row never leaves
+        // earlier rows committed.
         for row in batch {
             if row.embedding.len() != row.dims {
                 return Err(IndexError::Invalid(format!(
@@ -1073,17 +1159,45 @@ impl Store for PostgresStore {
                     row.dims
                 )));
             }
-            self.ensure_embedding_width(&mut *c, row.dims).await?;
-            let vector = pgvector::Vector::from(row.embedding.clone());
-            sqlx::query("UPDATE chunk SET embedding=$1, dims=$2, model=$3 WHERE id=$4")
-                .bind(vector)
-                .bind(row.dims as i64)
-                .bind(model)
-                .bind(row.chunk_id)
-                .execute(&mut *c)
-                .await
-                .map_err(IndexError::from)?;
         }
+        let mut conn = self.acquire().await?;
+        let c = conn.as_mut();
+        // `dims` is per row, and a width change may DDL (resize the column, drop
+        // and recreate the index), so make each distinct width current once and
+        // before the transaction opens rather than once per row inside it.
+        let mut widths: Vec<usize> = Vec::new();
+        for row in batch {
+            if !widths.contains(&row.dims) {
+                widths.push(row.dims);
+            }
+        }
+        for dims in widths {
+            self.ensure_embedding_width(&mut *c, dims).await?;
+        }
+        // The per-row updates then commit together, mirroring `wipe`.
+        sqlx::query("BEGIN")
+            .execute(&mut *c)
+            .await
+            .map_err(IndexError::from)?;
+        for row in batch {
+            let vector = pgvector::Vector::from(row.embedding.clone());
+            if let Err(e) =
+                sqlx::query("UPDATE chunk SET embedding=$1, dims=$2, model=$3 WHERE id=$4")
+                    .bind(vector)
+                    .bind(row.dims as i64)
+                    .bind(model)
+                    .bind(row.chunk_id)
+                    .execute(&mut *c)
+                    .await
+            {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *c).await;
+                return Err(e.into());
+            }
+        }
+        sqlx::query("COMMIT")
+            .execute(&mut *c)
+            .await
+            .map_err(IndexError::from)?;
         Ok(())
     }
 

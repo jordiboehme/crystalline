@@ -126,7 +126,7 @@ pub fn fingerprint(model_id: &str, text: &str) -> String {
     h.update(model_id.as_bytes());
     h.update(b":");
     h.update(text.as_bytes());
-    hex(&h.finalize())
+    crate::hex_lower(&h.finalize())
 }
 
 fn build_header(title: &str, description: Option<&str>) -> String {
@@ -220,12 +220,4 @@ fn split_paragraphs(body: &str) -> Vec<String> {
     }
     flush(&mut current, &mut paras);
     paras
-}
-
-fn hex(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
 }

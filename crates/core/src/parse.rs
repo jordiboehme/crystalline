@@ -9,6 +9,7 @@
 //! spans are masked before link and observation detection so knowledge inside
 //! code never leaks into the graph.
 
+use std::borrow::Cow;
 use std::ops::Range;
 
 use chrono::{DateTime, FixedOffset, NaiveDate};
@@ -442,25 +443,32 @@ fn scan_body(
         }
 
         // Wikilinks anywhere on the line, excluding a relation target and
-        // deduplicated per line.
-        let masked = mask_inline_code(line);
-        let mut seen: Vec<LinkTarget> = Vec::new();
-        let mut excluded = relation_target.is_none();
-        for inner in find_wikilinks(&masked) {
-            let target = LinkTarget::parse(&inner);
-            if !excluded
-                && let Some(rt) = &relation_target
-                && &target == rt
-            {
-                excluded = true;
-                continue;
-            }
-            if !seen.contains(&target) {
-                seen.push(target.clone());
-                links.push(WikiLink {
-                    line: line_no,
-                    target,
-                });
+        // deduplicated per line. Nothing to find on a line without "[[", and
+        // masking is only needed when a backtick could hide one.
+        if line.contains("[[") {
+            let masked: Cow<'_, str> = if line.contains('`') {
+                Cow::Owned(mask_inline_code(line))
+            } else {
+                Cow::Borrowed(line)
+            };
+            let mut seen: Vec<LinkTarget> = Vec::new();
+            let mut excluded = relation_target.is_none();
+            for inner in find_wikilinks(&masked) {
+                let target = LinkTarget::parse(&inner);
+                if !excluded
+                    && let Some(rt) = &relation_target
+                    && &target == rt
+                {
+                    excluded = true;
+                    continue;
+                }
+                if !seen.contains(&target) {
+                    seen.push(target.clone());
+                    links.push(WikiLink {
+                        line: line_no,
+                        target,
+                    });
+                }
             }
         }
     }
@@ -599,9 +607,13 @@ fn parse_relation(content: &str) -> Option<(String, LinkTarget)> {
 
 /// Replace inline code span contents (including the backticks) with spaces so
 /// wikilinks and observation markers inside code are ignored.
+///
+/// Masks in place in a single `Vec<char>`: every index the scan reads is
+/// fully read before any slot in that span is written, and once a span is
+/// blanked the scan pointer jumps past it, so a read never observes a
+/// write from an earlier iteration.
 pub(crate) fn mask_inline_code(line: &str) -> String {
-    let chars: Vec<char> = line.chars().collect();
-    let mut out = chars.clone();
+    let mut chars: Vec<char> = line.chars().collect();
     let n = chars.len();
     let mut i = 0;
     while i < n {
@@ -629,7 +641,7 @@ pub(crate) fn mask_inline_code(line: &str) -> String {
                 }
             }
             if let Some(end) = found {
-                for slot in out.iter_mut().take(end).skip(i) {
+                for slot in chars.iter_mut().take(end).skip(i) {
                     *slot = ' ';
                 }
                 i = end;
@@ -641,7 +653,7 @@ pub(crate) fn mask_inline_code(line: &str) -> String {
         }
         i += 1;
     }
-    out.into_iter().collect()
+    chars.into_iter().collect()
 }
 
 fn find_wikilinks(masked: &str) -> Vec<String> {
@@ -657,4 +669,79 @@ fn find_wikilinks(masked: &str) -> Vec<String> {
         }
     }
     res
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Pins the current mask_inline_code/scan_body behavior before the
+    // single-buffer and contains-guard refactor so the refactor cannot
+    // change observable output.
+
+    #[test]
+    fn mask_inline_code_leaves_unterminated_backtick_run_unmasked() {
+        let line = "text `unterminated [[Link]] end";
+        assert_eq!(mask_inline_code(line), line);
+    }
+
+    #[test]
+    fn mask_inline_code_masks_whole_span_with_unequal_nested_backtick_runs() {
+        let line = "before ``a`b`` after";
+        let masked = mask_inline_code(line);
+        assert_eq!(masked.chars().count(), line.chars().count());
+        assert!(masked.starts_with("before "));
+        assert!(masked.ends_with(" after"));
+        let middle = &masked["before ".len()..masked.len() - " after".len()];
+        assert!(
+            middle.chars().all(|c| c == ' '),
+            "expected the whole unequal nested run masked to spaces, got {middle:?}"
+        );
+    }
+
+    #[test]
+    fn mask_inline_code_is_identity_when_no_backticks_present() {
+        let line = "plain text with [[Wikilink]] and no backticks at all";
+        assert_eq!(mask_inline_code(line), line);
+    }
+
+    #[test]
+    fn mask_inline_code_blanks_multibyte_content_by_char_not_byte() {
+        let prefix = "日本";
+        let inner = "コード";
+        let suffix = "語";
+        let line = format!("{prefix}`{inner}`{suffix}");
+        let masked = mask_inline_code(&line);
+        assert_eq!(masked.chars().count(), line.chars().count());
+        assert!(masked.starts_with(prefix));
+        assert!(masked.ends_with(suffix));
+        assert!(!masked.contains(inner));
+        for ch in inner.chars() {
+            assert!(!masked.contains(ch));
+        }
+        assert!(!masked.contains('`'));
+    }
+
+    #[test]
+    fn mask_inline_code_hides_wikilink_inside_code_span() {
+        let line = "prefix `[[Inside]]` suffix";
+        let masked = mask_inline_code(line);
+        assert!(find_wikilinks(&masked).is_empty());
+    }
+
+    #[test]
+    fn scan_body_keeps_wikilink_outside_code_span_and_drops_one_inside() {
+        let body = "see `[[Inside]]` and [[Outside]] too";
+        let (_, _, links, _) = scan_body(body, 1);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].target.target, "Outside");
+        assert_eq!(links[0].line, 1);
+    }
+
+    #[test]
+    fn scan_body_returns_no_links_when_line_has_no_wikilink_markers() {
+        let body = "just `code` here, nothing to link";
+        let (_, _, links, _) = scan_body(body, 1);
+        assert!(links.is_empty());
+    }
 }

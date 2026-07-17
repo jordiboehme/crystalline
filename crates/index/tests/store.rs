@@ -1288,6 +1288,64 @@ parity!(
     embedding_width_follows_provider
 );
 
+/// `store_embeddings` writes the whole batch or nothing. A row whose embedding
+/// length contradicts its declared dims aborts the call, and because the batch is
+/// validated up front and written inside one transaction, no earlier row stays
+/// committed. Before the transactional write the first row's UPDATE committed
+/// before the bad row aborted, leaving a chunk embedded.
+async fn store_embeddings_mid_batch_mismatch_leaves_nothing(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "a.md",
+        &engram("A", "a", "engram", "", "alpha alpha alpha body one"),
+    );
+    write(
+        root,
+        "b.md",
+        &engram("B", "b", "engram", "", "beta beta beta body two"),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+
+    let jobs = store.chunks_needing_embedding("m8", None).await.unwrap();
+    assert!(
+        jobs.len() >= 2,
+        "need at least two chunks to exercise a mid-batch failure, got {}",
+        jobs.len()
+    );
+
+    // First row valid, a later row's embedding length contradicts its declared
+    // dims. The whole call must fail and leave nothing embedded.
+    let rows = vec![
+        EmbeddingRow {
+            chunk_id: jobs[0].chunk_id,
+            embedding: vec![0.1f32; 8],
+            dims: 8,
+        },
+        EmbeddingRow {
+            chunk_id: jobs[1].chunk_id,
+            embedding: vec![0.1f32; 7],
+            dims: 8,
+        },
+    ];
+    let result = store.store_embeddings(&rows, "m8").await;
+    assert!(
+        result.is_err(),
+        "a mid-batch dims mismatch must fail the call"
+    );
+
+    let coverage = store.embedding_coverage().await.unwrap();
+    assert_eq!(
+        coverage.embedded_chunks, 0,
+        "no chunk stays embedded after the batch fails"
+    );
+}
+parity!(
+    store_embeddings_is_atomic_on_mid_batch_dims_mismatch,
+    store_embeddings_mid_batch_mismatch_leaves_nothing
+);
+
 /// Models routinely double-encode nested tool arguments, sending the
 /// `metadata_filters` object as a JSON string. The wire parser accepts
 /// that form by parsing the string first; everything else non-object

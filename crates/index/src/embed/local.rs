@@ -10,14 +10,17 @@
 //! or corrupt cache self-heals: the model directory is wiped and fetched once
 //! more before giving up.
 
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config};
 use crystalline_core::config::{self, EmbeddingsConfig};
+use hf_hub::api::Progress;
 use hf_hub::api::sync::ApiBuilder;
 use hf_hub::{Cache, Repo, RepoType};
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
@@ -134,33 +137,116 @@ struct ModelFiles {
     weights: PathBuf,
 }
 
-/// Fetch `config.json`, `tokenizer.json` and `model.safetensors` into the cache,
-/// announcing a first-use download once to stderr.
+/// Adapts hf-hub's per-chunk [`Progress`] callbacks (one `update` call per
+/// ~8 KiB read, `std::io::copy`'s default buffer) into a single
+/// carriage-return byte-progress line on stderr, throttled to about ten
+/// renders a second so a fast local connection does not flood the terminal
+/// with one write per chunk. Only ever constructed when stderr is a live
+/// terminal (see [`ensure_files`]), so it never needs to check that itself.
+struct ByteProgress {
+    filename: String,
+    total: usize,
+    downloaded: usize,
+    last_render: Option<Instant>,
+}
+
+impl ByteProgress {
+    fn new() -> Self {
+        ByteProgress {
+            filename: String::new(),
+            total: 0,
+            downloaded: 0,
+            last_render: None,
+        }
+    }
+
+    fn render(&self) {
+        let mb = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
+        eprint!(
+            "\r  {}: {:.1} / {:.1} MB",
+            self.filename,
+            mb(self.downloaded),
+            mb(self.total)
+        );
+        let _ = std::io::stderr().flush();
+    }
+}
+
+impl Progress for ByteProgress {
+    fn init(&mut self, size: usize, filename: &str) {
+        self.total = size;
+        self.downloaded = 0;
+        self.filename = filename.to_string();
+        self.last_render = Some(Instant::now());
+        self.render();
+    }
+
+    fn update(&mut self, size: usize) {
+        self.downloaded += size;
+        let now = Instant::now();
+        let due = self
+            .last_render
+            .is_none_or(|t| now.duration_since(t) >= Duration::from_millis(100));
+        if due {
+            self.last_render = Some(now);
+            self.render();
+        }
+    }
+
+    fn finish(&mut self) {
+        // A final render so the line lands on the true total even when the
+        // last chunk landed inside the throttle window, then a newline so
+        // whatever prints next starts clean instead of overwriting this line.
+        self.render();
+        eprintln!();
+    }
+}
+
+/// Fetch `config.json`, `tokenizer.json` and `model.safetensors` into the
+/// cache, announcing a first-use download once to stderr. When the whole
+/// download is needed (nothing cached yet) and stderr is a live terminal, each
+/// file also gets a `\r`-updated byte-progress line via [`ByteProgress`];
+/// piped or redirected stderr (a log file, `--json`'s non-interactive
+/// callers, CI) keeps exactly the single notice line, never per-byte output.
+/// A file already present in the cache is resolved with no network call at
+/// all, so a fully warmed cache - the air-gapped and CI-prefetch paths -
+/// never dials out just to check.
 fn ensure_files(cache_dir: &Path) -> Result<ModelFiles> {
     std::fs::create_dir_all(cache_dir).map_err(|e| IndexError::Io {
         path: cache_dir.display().to_string(),
         source: e,
     })?;
 
-    let cached = Cache::new(cache_dir.to_path_buf())
-        .repo(Repo::new(HF_REPO.to_string(), RepoType::Model))
-        .get("model.safetensors")
-        .is_some();
+    let hub_cache =
+        Cache::new(cache_dir.to_path_buf()).repo(Repo::new(HF_REPO.to_string(), RepoType::Model));
+    let cached = hub_cache.get("model.safetensors").is_some();
     if !cached {
         eprintln!(
             "crystalline: downloading embedding model {HF_REPO} to {} (first use, about 130 MB)...",
             cache_dir.display()
         );
     }
+    let show_progress = !cached && std::io::stderr().is_terminal();
 
     let api = ApiBuilder::new()
         .with_cache_dir(cache_dir.to_path_buf())
+        // Ours only: a stable, testable byte counter instead of hf-hub's own
+        // default indicatif bar, so exactly one progress mechanism is ever
+        // active and it is the one this module controls and TTY-gates itself.
+        .with_progress(false)
         .build()
         .map_err(|e| IndexError::Embedding(format!("hub client: {e}")))?;
     let repo = api.model(HF_REPO.to_string());
     let fetch = |name: &str| -> Result<PathBuf> {
-        repo.get(name)
-            .map_err(|e| IndexError::Embedding(format!("downloading {name}: {e}")))
+        if let Some(path) = hub_cache.get(name) {
+            return Ok(path);
+        }
+        if show_progress {
+            repo.download_with_progress(name, ByteProgress::new())
+        } else {
+            repo.download(name)
+        }
+        .map_err(|e| IndexError::Embedding(format!("downloading {name}: {e}")))
     };
     Ok(ModelFiles {
         config: fetch("config.json")?,

@@ -312,16 +312,16 @@ github:
 `crystalline verify` statically checks one or more domains against the full rule catalog - malformed frontmatter, broken links, missing MANIFEST sections, schema drift - with no database, service or network connection involved. Its usual home is CI/CD on the GitHub repositories that hold a team's knowledge: every proposal is verified before the team merges it, so nothing malformed ever lands on the branch everyone pulls from. The bundled GitHub Action wires that up:
 
 ```yaml
-- uses: jordiboehme/crystalline/action@v0.8.6
+- uses: jordiboehme/crystalline/action@v0.8.7
   with:
     paths: knowledge/       # space-separated domain roots, default '.'
     strict: 'false'         # promote Warning rules to Error
-    version: v0.8.6         # crystalline binary tag to download, or 'latest'
+    version: v0.8.7         # crystalline binary tag to download, or 'latest'
 ```
 
-The action ref (`@v0.8.6`) pins the action's own code; `version` pins the crystalline binary it downloads, so pinning both gives a fully reproducible check. The binary is checksum-verified, then the action runs `crystalline verify`, annotates the run and, on a pull request, posts a single summary comment kept up to date in place.
+The action ref (`@v0.8.7`) pins the action's own code; `version` pins the crystalline binary it downloads, so pinning both gives a fully reproducible check. The binary is checksum-verified, then the action runs `crystalline verify`, annotates the run and, on a pull request, posts a single summary comment kept up to date in place.
 
-Two more commands keep a knowledge base trustworthy:
+Two more commands keep your knowledge trustworthy:
 
 - **`crystalline import <src> --domain <name>`** brings an existing markdown-plus-frontmatter knowledge base under Crystalline: normalizes legacy `type` values, backfills `status` and temporal metadata, drops sentinel far-future dates in favor of leaving the field open-ended, and adds a missing `timestamp` - all as a pure file transformation, with `--dry-run` to preview first.
 - **`crystalline doctor`** diagnoses the index, registered domains and service state (orphan index rows, encoding issues, stale service locks) and repairs what it safely can with `--fix`. Once team domains are turned on it also reports whether this machine is connected to GitHub and whether each team domain's local origin state is intact. When a domain ships provisioned artifacts, it reports every declaring domain's decision and shipped counts and every installed harness's drift, locally edited and orphaned counts against what was last reconciled - that part, like the GitHub checks, is always report-only, `--fix` never reconciles a harness.
@@ -336,7 +336,7 @@ Crystalline runs the same way in every scenario: a daemon in the middle keeps on
 | [Claude Desktop extension](docs/deployment.md#claude-desktop-extension) | One-click `.mcpb` install, no terminal involved; the agent creates domains at runtime |
 | [Team server](docs/deployment.md#team-server) | One container on the network, every agent connects over HTTP |
 | [Linux server with systemd](docs/deployment.md#linux-server-with-systemd) | The .deb ships a unit, disabled by default; enable it once and agents connect over HTTP |
-| [Published read-only knowledge base](docs/deployment.md#published-read-only-knowledge-base) | Knowledge curated in a git repository, served read-only to agents |
+| [Published read-only domains](docs/deployment.md#published-read-only-domains) | Knowledge curated in a git repository, served read-only to agents |
 | [Air-gapped or egress-restricted](docs/deployment.md#air-gapped-or-egress-restricted) | The `with-model` image or a pre-fetched model directory; nothing at runtime needs the network |
 | [Shared database collaboration](docs/deployment.md#shared-database-collaboration) | Several instances share one PostgreSQL index, so every capture is visible to all |
 | [Team knowledge on GitHub](docs/deployment.md#team-knowledge-on-github) | A domain tracks a GitHub repository; sharing goes through reviewed proposals |
@@ -347,10 +347,10 @@ Most domains are folders of files. A virtual domain is the other option: its eng
 
 ```sh
 # Register a database-backed domain and scaffold its MANIFEST into the index.
-crystalline domain add notes --virtual
+crystalline domain add decisions --virtual
 
 # It works with the same tools as any domain.
-crystalline write notes "First note" --content "captured straight into the database"
+crystalline write decisions "First decision" --content "captured straight into the database"
 crystalline search "captured"
 ```
 

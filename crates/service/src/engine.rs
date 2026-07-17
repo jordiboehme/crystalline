@@ -33,7 +33,8 @@ use crystalline_core::{
 use crystalline_index::{
     ChunkParams, DomainHost, DomainId, DomainKind, EmbeddingProvider, EngramDescriptor, EngramId,
     EngramRecord, FileStamp, HostClaim, RecentFilter, SearchMode, SearchQuery, Store, chunk_engram,
-    configured_model_id, parse_metadata_filters, provider_from_config, sync_domain_with,
+    configured_model_id, order_jobs_for_batching, parse_metadata_filters, provider_from_config,
+    sync_domain_with,
 };
 use crystalline_remote::ops;
 use crystalline_remote::{
@@ -647,6 +648,13 @@ impl Engine {
     /// `configure` set or unset applied since construction.
     pub fn config(&self) -> GlobalConfig {
         self.config.read().unwrap().clone()
+    }
+
+    /// Whether team collaboration is enabled, read fresh under the config guard
+    /// without cloning the whole config. `config()` stays for callers that need
+    /// a full snapshot.
+    pub fn github_enabled(&self) -> bool {
+        self.config.read().unwrap().github_enabled()
     }
 
     /// The active embedding model id.
@@ -1450,7 +1458,12 @@ impl Engine {
             }
             if let ContentSource::File { root } = &src_source {
                 let src_abs = join_rel(root, &src.path);
-                let _ = std::fs::remove_file(&src_abs);
+                if let Err(e) = std::fs::remove_file(&src_abs) {
+                    tracing::warn!(
+                        "could not remove moved source {}: {e}; leaving it in place",
+                        src_abs.display()
+                    );
+                }
             }
             let store = self.store.lock().await;
             store.delete_engram(src.domain_id, &src.path).await?;
@@ -1628,13 +1641,22 @@ impl Engine {
                 parse_metadata_filters(mf).map_err(|e| EngineError::Invalid(e.to_string()))?;
         }
 
-        let store = self.store.lock().await;
-        let effective = self
-            .effective_mode(&*store, requested, text.is_some())
-            .await?;
+        // Phase the store lock so it is never held across the provider embed
+        // call, the same discipline as `embed_pending`: fetch the provider once,
+        // hold the store lock only to resolve the effective mode (which reads
+        // embedding coverage), then drop it before embedding the query and
+        // relock for the search. The coverage snapshot can go stale between the
+        // mode decision and the search, an accepted race of the same class as
+        // already exists across two separate search calls.
+        let provider = self.provider();
+        let effective = {
+            let store = self.store.lock().await;
+            self.effective_mode(&*store, requested, text.is_some(), provider.is_some())
+                .await?
+        };
         query.mode = effective;
         if matches!(effective, SearchMode::Semantic | SearchMode::Hybrid)
-            && let Some(provider) = self.provider()
+            && let Some(provider) = &provider
         {
             let q = text.clone().unwrap_or_default();
             let vecs = provider
@@ -1645,6 +1667,7 @@ impl Engine {
             query.active_model = Some(self.model_id.clone());
         }
 
+        let store = self.store.lock().await;
         let page = store.search(&query).await?;
         Ok(json!({
             "mode": mode_str(effective),
@@ -1661,11 +1684,12 @@ impl Engine {
         store: &dyn Store,
         requested: SearchMode,
         has_text: bool,
+        has_provider: bool,
     ) -> Result<SearchMode> {
         if !matches!(requested, SearchMode::Semantic | SearchMode::Hybrid) {
             return Ok(requested);
         }
-        if !has_text || self.provider().is_none() {
+        if !has_text || !has_provider {
             return Ok(SearchMode::Text);
         }
         let coverage = store.embedding_coverage().await?;
@@ -2348,10 +2372,13 @@ impl Engine {
         let _activity = ActivityState::begin(&self.activity, "sync", only);
         let targets = self.sync_targets(only)?;
         let collab = !self.instance_id.is_empty();
-        let store = self.store.lock().await;
         let mut reports = Vec::new();
         let mut skipped = Vec::new();
+        // Acquire the store lock per domain so the guard drops between domains
+        // instead of spanning the whole run; a domain's claim and sync stay
+        // under one acquisition, keeping per-domain single-writer semantics.
         for (name, root) in &targets {
+            let store = self.store.lock().await;
             if collab {
                 match self.claim_file_host(&*store, name, root, take_over).await? {
                     HostClaim::Acquired => {}
@@ -2394,36 +2421,33 @@ impl Engine {
         let _activity = ActivityState::begin(&self.activity, "reindex", None);
         let targets = self.sync_targets(None)?;
         let collab = !self.instance_id.is_empty();
-        let store = self.store.lock().await;
-        // In collaboration mode reduce to the domains this instance may rebuild
-        // (the ones it hosts); outside it, every file domain is fair game.
-        let mut active: Vec<(String, PathBuf)> = Vec::new();
+        let mut reports = Vec::new();
+        // Acquire the store lock per domain so the guard drops between domains.
+        // Claim, clear-if-full and sync interleave per domain under one
+        // acquisition rather than claiming every domain up front; per-domain
+        // single-writer semantics are unchanged. In collaboration mode a domain
+        // hosted by another live instance is left untouched.
         for (name, root) in targets {
+            let store = self.store.lock().await;
             if collab {
                 match self.claim_file_host(&*store, &name, &root, false).await? {
-                    HostClaim::Acquired => active.push((name, root)),
+                    HostClaim::Acquired => {}
                     HostClaim::HeldByOther(host) => {
                         tracing::info!(
                             "skipping reindex of '{name}' hosted by instance {}",
                             host.instance_id
                         );
+                        continue;
                     }
                 }
-            } else {
-                active.push((name, root));
             }
-        }
-        if full {
-            for (name, root) in &active {
+            if full {
                 let domain_id = store
-                    .upsert_domain(name, Some(&root.to_string_lossy()), DomainKind::File)
+                    .upsert_domain(&name, Some(&root.to_string_lossy()), DomainKind::File)
                     .await?;
                 store.clear_domain(domain_id).await?;
             }
-        }
-        let mut reports = Vec::new();
-        for (name, root) in &active {
-            let report = sync_domain_with(&*store, name, root, &self.chunk_params)
+            let report = sync_domain_with(&*store, &name, &root, &self.chunk_params)
                 .await
                 .map_err(|e| EngineError::Internal(format!("reindex of '{name}' failed: {e}")))?;
             reports.push(report);
@@ -2582,7 +2606,7 @@ impl Engine {
         // collaboration mode the scan is scoped to the file domains this instance
         // hosts plus all virtual domains, so a non-host does not wastefully
         // re-embed a chunk another instance owns; standalone it embeds everything.
-        let jobs = {
+        let mut jobs = {
             let store = self.store.lock().await;
             let scope = self.embed_scope(&*store).await?;
             store
@@ -2592,6 +2616,10 @@ impl Engine {
         if jobs.is_empty() {
             return Ok(0);
         }
+        // Length-sort so batches pay for their longest member once instead of
+        // padding every short chunk out to whatever long one happened to land
+        // in the same batch.
+        order_jobs_for_batching(&mut jobs);
         let _activity = ActivityState::begin(&self.activity, "embed", None);
         let mut embedded = 0usize;
         for batch in jobs.chunks(EMBED_BATCH) {
@@ -2742,7 +2770,7 @@ impl Engine {
     /// freshly added domain, or an `update_domain` pull) and the very next
     /// `list_tools` must reflect that.
     pub fn provisioning_declared(&self) -> bool {
-        crystalline_core::provision::any_domain_declares(&self.config())
+        crystalline_core::provision::any_domain_declares(&self.config.read().unwrap())
     }
 
     /// Apply, inspect or record a decision for domain-declared artifact
@@ -5021,12 +5049,7 @@ fn virtual_stamp(content: &str) -> FileStamp {
 fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    let digest = hasher.finalize();
-    let mut s = String::with_capacity(digest.len() * 2);
-    for b in digest {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
+    crystalline_index::hex_lower(&hasher.finalize())
 }
 
 fn mtime_secs(meta: &std::fs::Metadata) -> i64 {

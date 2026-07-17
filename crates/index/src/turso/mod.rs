@@ -224,6 +224,43 @@ fn opt_text(o: &Option<String>) -> Value {
     }
 }
 
+/// The maximum number of value tuples in one multi-row INSERT. Chunking keeps the
+/// bind-parameter count under SQLite's 999-parameter ceiling for every child
+/// table (the widest is chunk at 7 params per row).
+const INSERT_CHUNK: usize = 100;
+
+/// Build the parenthesized value tuples for a multi-row INSERT: `count` tuples of
+/// `width` sequential `?n` placeholders each, plus an optional fixed trailing
+/// column (a literal `NULL` `to_id` for relations and links). `count` must be
+/// non-zero; an empty VALUES list is not valid SQL, so callers iterate chunks of
+/// a possibly-empty slice and skip the statement entirely when there is nothing.
+fn value_rows(width: usize, count: usize, trailing: Option<&str>) -> String {
+    let mut n = 1;
+    let mut rows = Vec::with_capacity(count);
+    for _ in 0..count {
+        let mut cells = Vec::with_capacity(width + usize::from(trailing.is_some()));
+        for _ in 0..width {
+            cells.push(format!("?{n}"));
+            n += 1;
+        }
+        if let Some(t) = trailing {
+            cells.push(t.to_string());
+        }
+        rows.push(format!("({})", cells.join(",")));
+    }
+    rows.join(",")
+}
+
+/// The multi-row observation INSERT for `count` rows, returning each new row's id
+/// with its source line so observation tags map to the right observation without
+/// depending on `RETURNING` row order.
+fn observation_insert_sql(count: usize) -> String {
+    format!(
+        "INSERT INTO observation(engram_id, line, category, content, context) VALUES {} RETURNING id, line",
+        value_rows(5, count, None)
+    )
+}
+
 /// The stored discriminator string for a domain kind.
 fn kind_str(kind: DomainKind) -> &'static str {
     match kind {
@@ -387,74 +424,102 @@ impl Store for TursoStore {
             None => self.conn.last_insert_rowid(),
         };
 
-        for obs in &record.observations {
-            self.conn
-                .execute(
-                    "INSERT INTO observation(engram_id, line, category, content, context) VALUES(?1,?2,?3,?4,?5)",
-                    vec![
-                        Value::Integer(engram_id),
-                        Value::Integer(obs.line as i64),
-                        Value::Text(obs.category.clone()),
-                        Value::Text(obs.content.clone()),
-                        opt_text(&obs.context),
-                    ],
-                )
-                .await?;
-            if !obs.tags.is_empty() {
-                let oid = self.conn.last_insert_rowid();
-                for tag in &obs.tags {
-                    let tid = self.tag_id(tag).await?;
-                    self.conn
-                        .execute(
-                            "INSERT OR IGNORE INTO observation_tag(observation_id, tag_id) VALUES(?1,?2)",
-                            vec![Value::Integer(oid), Value::Integer(tid)],
-                        )
-                        .await?;
+        // Observations: insert in chunks and read each new row's id back joined
+        // on its source line (unique within one engram), so observation tags map
+        // to the right observation without relying on RETURNING row order.
+        let mut obs_id_by_line: HashMap<i64, i64> = HashMap::new();
+        for batch in record.observations.chunks(INSERT_CHUNK) {
+            let mut params: Vec<Value> = Vec::with_capacity(batch.len() * 5);
+            for obs in batch {
+                params.push(Value::Integer(engram_id));
+                params.push(Value::Integer(obs.line as i64));
+                params.push(Value::Text(obs.category.clone()));
+                params.push(Value::Text(obs.content.clone()));
+                params.push(opt_text(&obs.context));
+            }
+            let rows = query_all(&self.conn, &observation_insert_sql(batch.len()), params).await?;
+            for r in &rows {
+                if let (Some(id), Some(line)) = (cell_i64(r, 0), cell_i64(r, 1)) {
+                    obs_id_by_line.insert(line, id);
                 }
             }
         }
 
-        for rel in &record.relations {
-            self.conn
-                .execute(
-                    "INSERT INTO relation(engram_id, domain_id, line, rel_type, to_target, to_domain, to_id) \
-                     VALUES(?1,?2,?3,?4,?5,?6,NULL)",
-                    vec![
-                        Value::Integer(engram_id),
-                        Value::Integer(domain.0),
-                        Value::Integer(rel.line as i64),
-                        Value::Text(rel.rel_type.clone()),
-                        Value::Text(rel.to_target.clone()),
-                        opt_text(&rel.to_domain),
-                    ],
-                )
-                .await?;
+        // Observation tags: intern each tag through the cache, then insert the
+        // (observation, tag) pairs in multi-row statements.
+        let mut obs_tag_pairs: Vec<(i64, i64)> = Vec::new();
+        for obs in &record.observations {
+            let Some(&oid) = obs_id_by_line.get(&(obs.line as i64)) else {
+                continue;
+            };
+            for tag in &obs.tags {
+                let tid = self.tag_id(tag).await?;
+                obs_tag_pairs.push((oid, tid));
+            }
+        }
+        for batch in obs_tag_pairs.chunks(INSERT_CHUNK) {
+            let mut params: Vec<Value> = Vec::with_capacity(batch.len() * 2);
+            for (oid, tid) in batch {
+                params.push(Value::Integer(*oid));
+                params.push(Value::Integer(*tid));
+            }
+            let sql = format!(
+                "INSERT OR IGNORE INTO observation_tag(observation_id, tag_id) VALUES {}",
+                value_rows(2, batch.len(), None)
+            );
+            self.conn.execute(&sql, params).await?;
         }
 
-        for link in &record.links {
-            self.conn
-                .execute(
-                    "INSERT INTO link(engram_id, domain_id, line, to_target, to_domain, to_id) \
-                     VALUES(?1,?2,?3,?4,?5,NULL)",
-                    vec![
-                        Value::Integer(engram_id),
-                        Value::Integer(domain.0),
-                        Value::Integer(link.line as i64),
-                        Value::Text(link.to_target.clone()),
-                        opt_text(&link.to_domain),
-                    ],
-                )
-                .await?;
+        for batch in record.relations.chunks(INSERT_CHUNK) {
+            let mut params: Vec<Value> = Vec::with_capacity(batch.len() * 6);
+            for rel in batch {
+                params.push(Value::Integer(engram_id));
+                params.push(Value::Integer(domain.0));
+                params.push(Value::Integer(rel.line as i64));
+                params.push(Value::Text(rel.rel_type.clone()));
+                params.push(Value::Text(rel.to_target.clone()));
+                params.push(opt_text(&rel.to_domain));
+            }
+            let sql = format!(
+                "INSERT INTO relation(engram_id, domain_id, line, rel_type, to_target, to_domain, to_id) VALUES {}",
+                value_rows(6, batch.len(), Some("NULL"))
+            );
+            self.conn.execute(&sql, params).await?;
         }
 
+        for batch in record.links.chunks(INSERT_CHUNK) {
+            let mut params: Vec<Value> = Vec::with_capacity(batch.len() * 5);
+            for link in batch {
+                params.push(Value::Integer(engram_id));
+                params.push(Value::Integer(domain.0));
+                params.push(Value::Integer(link.line as i64));
+                params.push(Value::Text(link.to_target.clone()));
+                params.push(opt_text(&link.to_domain));
+            }
+            let sql = format!(
+                "INSERT INTO link(engram_id, domain_id, line, to_target, to_domain, to_id) VALUES {}",
+                value_rows(5, batch.len(), Some("NULL"))
+            );
+            self.conn.execute(&sql, params).await?;
+        }
+
+        // Engram tags: intern each tag, then insert the pairs in multi-row
+        // statements.
+        let mut tag_ids: Vec<i64> = Vec::with_capacity(record.tags.len());
         for tag in &record.tags {
-            let tid = self.tag_id(tag).await?;
-            self.conn
-                .execute(
-                    "INSERT OR IGNORE INTO engram_tag(engram_id, tag_id) VALUES(?1,?2)",
-                    vec![Value::Integer(engram_id), Value::Integer(tid)],
-                )
-                .await?;
+            tag_ids.push(self.tag_id(tag).await?);
+        }
+        for batch in tag_ids.chunks(INSERT_CHUNK) {
+            let mut params: Vec<Value> = Vec::with_capacity(batch.len() * 2);
+            for tid in batch {
+                params.push(Value::Integer(engram_id));
+                params.push(Value::Integer(*tid));
+            }
+            let sql = format!(
+                "INSERT OR IGNORE INTO engram_tag(engram_id, tag_id) VALUES {}",
+                value_rows(2, batch.len(), None)
+            );
+            self.conn.execute(&sql, params).await?;
         }
 
         Ok(EngramId(engram_id))
@@ -835,39 +900,34 @@ impl Store for TursoStore {
             )
             .await?;
 
-        for c in chunks {
-            match carry.get(&c.text_hash) {
-                Some((model, dims, emb)) => {
-                    self.conn
-                        .execute(
-                            "INSERT INTO chunk(engram_id, seq, text, text_hash, model, dims, embedding) \
-                             VALUES(?1,?2,?3,?4,?5,?6,?7)",
-                            vec![
-                                Value::Integer(eid),
-                                Value::Integer(c.seq),
-                                Value::Text(c.text.clone()),
-                                Value::Text(c.text_hash.clone()),
-                                model.clone(),
-                                dims.clone(),
-                                Value::Blob(emb.clone()),
-                            ],
-                        )
-                        .await?;
-                }
-                None => {
-                    self.conn
-                        .execute(
-                            "INSERT INTO chunk(engram_id, seq, text, text_hash) VALUES(?1,?2,?3,?4)",
-                            vec![
-                                Value::Integer(eid),
-                                Value::Integer(c.seq),
-                                Value::Text(c.text.clone()),
-                                Value::Text(c.text_hash.clone()),
-                            ],
-                        )
-                        .await?;
+        // One 7-column multi-row insert for every chunk: a carry hit binds its
+        // preserved model, dims and embedding, a miss binds NULL for all three
+        // and leaves the chunk pending re-embedding.
+        for batch in chunks.chunks(INSERT_CHUNK) {
+            let mut params: Vec<Value> = Vec::with_capacity(batch.len() * 7);
+            for c in batch {
+                params.push(Value::Integer(eid));
+                params.push(Value::Integer(c.seq));
+                params.push(Value::Text(c.text.clone()));
+                params.push(Value::Text(c.text_hash.clone()));
+                match carry.get(&c.text_hash) {
+                    Some((model, dims, emb)) => {
+                        params.push(model.clone());
+                        params.push(dims.clone());
+                        params.push(Value::Blob(emb.clone()));
+                    }
+                    None => {
+                        params.push(Value::Null);
+                        params.push(Value::Null);
+                        params.push(Value::Null);
+                    }
                 }
             }
+            let sql = format!(
+                "INSERT INTO chunk(engram_id, seq, text, text_hash, model, dims, embedding) VALUES {}",
+                value_rows(7, batch.len(), None)
+            );
+            self.conn.execute(&sql, params).await?;
         }
         Ok(())
     }
@@ -920,6 +980,10 @@ impl Store for TursoStore {
     }
 
     async fn store_embeddings(&self, batch: &[EmbeddingRow], model: &str) -> Result<()> {
+        // Validate the whole batch before opening the transaction so a bad row
+        // never leaves earlier rows committed. The transaction then makes the
+        // per-row updates all-or-nothing against a mid-batch database error,
+        // mirroring `wipe`.
         for row in batch {
             if row.embedding.len() != row.dims {
                 return Err(IndexError::Invalid(format!(
@@ -928,11 +992,15 @@ impl Store for TursoStore {
                     row.dims
                 )));
             }
+        }
+        self.conn.execute("BEGIN", ()).await?;
+        for row in batch {
             let mut bytes = Vec::with_capacity(row.embedding.len() * 4);
             for f in &row.embedding {
                 bytes.extend_from_slice(&f.to_le_bytes());
             }
-            self.conn
+            if let Err(e) = self
+                .conn
                 .execute(
                     "UPDATE chunk SET embedding=?1, dims=?2, model=?3 WHERE id=?4",
                     vec![
@@ -942,8 +1010,13 @@ impl Store for TursoStore {
                         Value::Integer(row.chunk_id),
                     ],
                 )
-                .await?;
+                .await
+            {
+                let _ = self.conn.execute("ROLLBACK", ()).await;
+                return Err(e.into());
+            }
         }
+        self.conn.execute("COMMIT", ()).await?;
         Ok(())
     }
 
@@ -1154,5 +1227,129 @@ impl Store for TursoStore {
     async fn rollback(&self) -> Result<()> {
         self.conn.execute("ROLLBACK", ()).await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+    use crate::store::{FileStamp, ObservationRecord};
+
+    #[test]
+    fn observation_insert_is_one_statement_with_a_tuple_per_row() {
+        let sql = observation_insert_sql(3);
+        assert_eq!(sql.matches("INSERT").count(), 1, "one INSERT: {sql}");
+        // One `(?` opens each value tuple, so three tuples for three rows.
+        assert_eq!(sql.matches("(?").count(), 3, "three value tuples: {sql}");
+        assert!(
+            sql.contains("VALUES (?1,?2,?3,?4,?5),(?6,?7,?8,?9,?10),(?11,?12,?13,?14,?15)"),
+            "sequential placeholders across all rows: {sql}"
+        );
+        assert!(
+            sql.ends_with("RETURNING id, line"),
+            "returns id and line: {sql}"
+        );
+    }
+
+    fn obs(line: usize, content: &str, tags: &[&str]) -> ObservationRecord {
+        ObservationRecord {
+            line,
+            category: "fact".to_string(),
+            content: content.to_string(),
+            tags: tags.iter().map(|t| t.to_string()).collect(),
+            context: None,
+        }
+    }
+
+    fn record_with_observations(observations: Vec<ObservationRecord>) -> EngramRecord {
+        EngramRecord {
+            path: "a.md".to_string(),
+            permalink: "a".to_string(),
+            title: "A".to_string(),
+            engram_type: "engram".to_string(),
+            status: "current".to_string(),
+            recorded_at: Some("2026-01-01".to_string()),
+            valid_from: None,
+            valid_to: None,
+            timestamp: None,
+            description: None,
+            content: "body".to_string(),
+            metadata: serde_json::json!({}),
+            tags: Vec::new(),
+            observations,
+            relations: Vec::new(),
+            links: Vec::new(),
+            stamp: FileStamp {
+                mtime: 0,
+                size: 4,
+                sha256: "sha".to_string(),
+            },
+        }
+    }
+
+    /// Every observation's tag set read back keyed by source line, so a
+    /// mismapped tag surfaces against the wrong line.
+    async fn tags_by_line(store: &TursoStore, engram_id: i64) -> Vec<(i64, Vec<String>)> {
+        let rows = query_all(
+            &store.conn,
+            "SELECT o.line, t.name FROM observation o \
+             LEFT JOIN observation_tag ot ON ot.observation_id=o.id \
+             LEFT JOIN tag t ON t.id=ot.tag_id \
+             WHERE o.engram_id=?1 ORDER BY o.line, t.name",
+            vec![Value::Integer(engram_id)],
+        )
+        .await
+        .unwrap();
+        let mut map: BTreeMap<i64, Vec<String>> = BTreeMap::new();
+        for r in &rows {
+            let line = cell_i64(r, 0).unwrap();
+            let entry = map.entry(line).or_default();
+            if let Some(name) = cell_text(r, 1) {
+                entry.push(name);
+            }
+        }
+        map.into_iter().collect()
+    }
+
+    #[tokio::test]
+    async fn observation_tags_map_to_correct_observations() {
+        let store = TursoStore::open_in_memory().await.unwrap();
+        let domain = store
+            .upsert_domain("d", Some("/tmp/d"), DomainKind::File)
+            .await
+            .unwrap();
+        // Distinct lines, distinct tag sets, one observation deliberately
+        // untagged, and a tag shared by two observations.
+        let record = record_with_observations(vec![
+            obs(3, "first fact", &["alpha", "shared"]),
+            obs(7, "second fact", &["beta"]),
+            obs(11, "third fact", &[]),
+            obs(15, "fourth fact", &["shared", "gamma"]),
+        ]);
+        let id = store.upsert_engram(domain, &record).await.unwrap().0;
+
+        let expected = vec![
+            (3i64, vec!["alpha".to_string(), "shared".to_string()]),
+            (7, vec!["beta".to_string()]),
+            (11, Vec::new()),
+            (15, vec!["gamma".to_string(), "shared".to_string()]),
+        ];
+        assert_eq!(
+            tags_by_line(&store, id).await,
+            expected,
+            "each tag set maps to its own observation after the first upsert"
+        );
+
+        // A re-upsert clears and recreates the child rows; join-on-line keeps the
+        // mapping stable where a positional RETURNING map could scramble it.
+        let id2 = store.upsert_engram(domain, &record).await.unwrap().0;
+        assert_eq!(id2, id, "the same path keeps its engram id");
+        assert_eq!(
+            tags_by_line(&store, id).await,
+            expected,
+            "the mapping survives a re-upsert"
+        );
     }
 }

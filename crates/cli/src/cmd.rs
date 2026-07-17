@@ -111,6 +111,44 @@ pub(crate) fn resolve_domain_path(entry: &DomainEntry) -> Option<PathBuf> {
     entry.file_path().filter(|_| !entry.is_virtual())
 }
 
+// --- relative time -------------------------------------------------------------
+
+/// Bucket a duration in seconds into a compact human string: `42s`, `12m`,
+/// `3h` or `4d`. The single-unit sibling of `main.rs`'s `format_uptime`
+/// (which keeps its own `3h07m` minute precision for a live daemon's "up"
+/// line); this is the coarser granularity a "how long ago" reading wants.
+fn humanize_duration(secs: u64) -> String {
+    if secs >= 86_400 {
+        format!("{}d", secs / 86_400)
+    } else if secs >= 3_600 {
+        format!("{}h", secs / 3_600)
+    } else if secs >= 60 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{secs}s")
+    }
+}
+
+/// Render an ISO-8601 timestamp as `<duration> ago` for human output
+/// (`5m ago`, `2h ago`, `3d ago`). Used for `status`'s last-sync column, the
+/// domain list's host heartbeat and `origin status`'s last-checked line - every
+/// place a raw timestamp reads worse to a person than how long ago it was.
+/// Falls back to the value unchanged when it does not parse as a timestamp,
+/// or names a future instant (clock skew, a deliberately future value, where
+/// "ago" would mislead), so a caller can pass any string straight through
+/// without an `Option` dance. `--json` output always keeps the raw ISO
+/// string; this is for human rendering only.
+pub(crate) fn relative_time(value: &str) -> String {
+    let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(value) else {
+        return value.to_string();
+    };
+    let secs = (chrono::Utc::now() - parsed.with_timezone(&chrono::Utc)).num_seconds();
+    if secs < 0 {
+        return value.to_string();
+    }
+    format!("{} ago", humanize_duration(secs as u64))
+}
+
 // --- domain init -------------------------------------------------------------
 
 /// Scaffold a MANIFEST.md at a domain root if one is absent. Never touches the
@@ -166,9 +204,17 @@ pub fn domain_init(path: &Path, name: Option<&str>, json: bool) -> Result<()> {
 /// Returns the canonicalized domain root; indexing is a separate step (see
 /// [`sync_domain_direct`]) so the daemon-dispatch decision stays in `main.rs`,
 /// alongside `sync` and `reindex`'s own dispatch.
+///
+/// An absent `path` defaults to `<domains_root>/<name>` through
+/// [`crystalline_service::default_domain_folder`], the same placement rule
+/// the MCP `add_domain` tool's local-domain path uses (`Engine::domain_add_local`),
+/// so both entry points agree on where an unrooted domain ends up. The
+/// default path still needs a pre-scaffolded `MANIFEST.md`, exactly like an
+/// explicit path does - `domain add` never auto-creates one, `domain init`
+/// does.
 pub(crate) fn domain_add_register(
     name: &str,
-    path: &Path,
+    path: Option<&Path>,
     config_override: Option<&Path>,
 ) -> Result<PathBuf> {
     // Mutate the file truth and save it back to the resolved path; the
@@ -182,15 +228,20 @@ pub(crate) fn domain_add_register(
         );
     }
 
-    let manifest = path.join("MANIFEST.md");
+    let root = match path {
+        Some(p) => p.to_path_buf(),
+        None => crystalline_service::default_domain_folder(&loaded.effective.domains_root(), name),
+    };
+
+    let manifest = root.join("MANIFEST.md");
     if !manifest.exists() {
         bail!(
             "no MANIFEST.md at {}. Run: crystalline domain init {}",
-            path.display(),
-            path.display()
+            root.display(),
+            root.display()
         );
     }
-    let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let abs = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
 
     let mut cfg = loaded.file;
     cfg.domains
@@ -741,9 +792,17 @@ pub async fn domain_list(
         if loaded.overlay.env_domain(name).is_some() {
             location.push_str(" (env)");
         }
-        // In a shared database a file domain names the instance that hosts it.
+        // In a shared database a file domain names the instance that hosts
+        // it, along with how recently it last heartbeat.
         let host = host_for(name)
-            .map(|(id, _)| format!("\thosted by {id}"))
+            .map(|(id, hb)| {
+                let heartbeat = hb.as_deref().map(relative_time).unwrap_or_default();
+                if heartbeat.is_empty() {
+                    format!("\thosted by {id}")
+                } else {
+                    format!("\thosted by {id} (heartbeat {heartbeat})")
+                }
+            })
             .unwrap_or_default();
         match count_for(name) {
             Some(n) => println!("{name}\t{location}\t{n} engrams{host}"),
@@ -775,6 +834,12 @@ pub async fn sync(
         let Some(path) = resolve_domain_path(&entry) else {
             continue;
         };
+        // A large domain's walk-hash-parse pass can take a while with no
+        // other output in between; say which domain is in flight before it
+        // starts, the same way `embed_pass` announces each batch.
+        if !json {
+            eprintln!("syncing {name}...");
+        }
         let report = sync_domain_with(&*store, &name, &path, &params)
             .await
             .map_err(|e| anyhow!("sync of '{name}' failed: {e}"))?;
@@ -939,12 +1004,19 @@ pub fn render_status(data: &serde_json::Value, daemon_note: &str) {
         .unwrap_or_default();
 
     if !data.get("indexed").and_then(Value::as_bool).unwrap_or(true) {
-        println!(
-            "No index at {} yet. Run: crystalline sync",
-            data["db_path"].as_str().unwrap_or("(unknown)")
-        );
-        for name in registered {
-            println!("{name}\t(not indexed yet)");
+        if registered.is_empty() {
+            // Nothing registered at all: pointing at `sync` here would send a
+            // first-time user in a circle, since sync has nothing to sync
+            // yet either.
+            println!("No domains registered yet. Run: crystalline domain add <name> <path>");
+        } else {
+            println!(
+                "No index at {} yet. Run: crystalline sync",
+                data["db_path"].as_str().unwrap_or("(unknown)")
+            );
+            for name in registered {
+                println!("{name}\t(not indexed yet)");
+            }
         }
         return;
     }
@@ -1001,6 +1073,7 @@ pub fn render_status(data: &serde_json::Value, daemon_note: &str) {
     for d in &domains {
         let name = d["name"].as_str().unwrap_or("");
         indexed_names.insert(name.to_string());
+        let last_sync = d["last_sync"].as_str().map(relative_time);
         println!(
             "{}\t{} engrams, {} observations, {} relations ({} unresolved)\tlast sync {}",
             name,
@@ -1008,7 +1081,7 @@ pub fn render_status(data: &serde_json::Value, daemon_note: &str) {
             d["observations"].as_u64().unwrap_or(0),
             d["relations"].as_u64().unwrap_or(0),
             d["unresolved_relations"].as_u64().unwrap_or(0),
-            d["last_sync"].as_str().unwrap_or("never")
+            last_sync.as_deref().unwrap_or("never")
         );
     }
     // Registered domains the index holds no row for yet.
@@ -1157,32 +1230,41 @@ pub fn import(
 }
 
 fn print_import_report(r: &crystalline_core::import::ImportReport, dry_run: bool) {
+    use std::io::Write as _;
+
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
     if dry_run {
-        println!("Dry run: no files were written.");
+        writeln!(out, "Dry run: no files were written.").unwrap();
     }
-    println!(
+    writeln!(
+        out,
         "{} converted, {} copied, {} skipped",
         r.files_converted, r.files_copied, r.files_skipped
-    );
-    println!(
+    )
+    .unwrap();
+    writeln!(
+        out,
         "type mapped: {}, temporal backfilled: {}, sentinels dropped: {}, prefixes stripped: {}, collisions: {}",
         r.type_mapped,
         r.temporal_backfilled,
         r.sentinels_dropped,
         r.prefixes_stripped,
         r.collisions
-    );
+    )
+    .unwrap();
     for w in &r.warnings {
-        println!("  warning: {w}");
+        writeln!(out, "  warning: {w}").unwrap();
     }
     for f in &r.files {
         if !f.changes.is_empty() {
-            println!("  {}", f.path);
+            writeln!(out, "  {}", f.path).unwrap();
             for c in &f.changes {
-                println!("    {c}");
+                writeln!(out, "    {c}").unwrap();
             }
         }
     }
+    out.flush().unwrap();
 }
 
 // --- connect github ------------------------------------------------------------
@@ -1357,6 +1439,15 @@ const HEALTHCHECK_DEADLINE: std::time::Duration = std::time::Duration::from_secs
 /// connection refused, a timeout, a non-200 status or a malformed response -
 /// comes back as a single-line `Err` naming the address it failed against,
 /// so the process exits nonzero through the normal error path.
+///
+/// B14 exemption: unlike the other data verbs, this default output is not given
+/// a human rendering and does not honor `--json`. The line printed here is the
+/// daemon's own `/health` HTTP body echoed verbatim, not a locally composed set
+/// of checks, and it is a machine-consumed contract: the container `HEALTHCHECK`
+/// captures it into `docker inspect`, and `tests/service.rs` asserts the default
+/// output contains `"status":"ok"`. Reshaping it would break those consumers for
+/// no gain (the body is already the canonical machine JSON), so the behavior is
+/// left as-is deliberately.
 pub(crate) fn healthcheck(addr: &str) -> Result<()> {
     use std::io::{Read, Write};
     use std::net::{TcpStream, ToSocketAddrs};
@@ -1501,5 +1592,43 @@ fn print_report(r: &crystalline_index::SyncReport) {
     );
     for (path, err) in &r.failed {
         println!("  failed: {path}: {err}");
+    }
+}
+
+#[cfg(test)]
+mod relative_time_tests {
+    use super::{humanize_duration, relative_time};
+
+    #[test]
+    fn humanize_duration_buckets_at_each_unit_boundary() {
+        assert_eq!(humanize_duration(0), "0s");
+        assert_eq!(humanize_duration(59), "59s");
+        assert_eq!(humanize_duration(60), "1m");
+        assert_eq!(humanize_duration(3_599), "59m");
+        assert_eq!(humanize_duration(3_600), "1h");
+        assert_eq!(humanize_duration(86_399), "23h");
+        assert_eq!(humanize_duration(86_400), "1d");
+        assert_eq!(humanize_duration(172_800), "2d");
+    }
+
+    #[test]
+    fn relative_time_renders_past_instants_as_a_duration_ago() {
+        let five_minutes_ago = (chrono::Utc::now() - chrono::Duration::minutes(5)).to_rfc3339();
+        assert_eq!(relative_time(&five_minutes_ago), "5m ago");
+
+        let three_days_ago = (chrono::Utc::now() - chrono::Duration::days(3)).to_rfc3339();
+        assert_eq!(relative_time(&three_days_ago), "3d ago");
+    }
+
+    #[test]
+    fn relative_time_falls_back_to_the_original_value_when_unparsable_or_future() {
+        assert_eq!(relative_time("never"), "never");
+        assert_eq!(relative_time(""), "");
+
+        // A future instant (clock skew, a deliberately future value) must
+        // never be rendered as "ago" - that would actively mislead.
+        let five_minutes_from_now =
+            (chrono::Utc::now() + chrono::Duration::minutes(5)).to_rfc3339();
+        assert_eq!(relative_time(&five_minutes_from_now), five_minutes_from_now);
     }
 }

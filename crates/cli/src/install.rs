@@ -1244,6 +1244,20 @@ pub fn run_install(opts: InstallOptions, json: bool) -> anyhow::Result<()> {
     {
         notices.push(notice);
     }
+    // A fresh install with nothing registered yet leaves an agent with
+    // nowhere to capture what it learns; point at both ways to fix that
+    // (the CLI now that install is done, or the MCP tool itself at runtime).
+    // A config load failure here is not install's problem to report twice
+    // over - it is silently skipped rather than turning an otherwise
+    // successful install into a failure.
+    if let Ok(loaded) = crystalline_service::overlay::load(None)
+        && loaded.effective.domains.is_empty()
+    {
+        notices.push(
+            "No domains registered yet. Create one with: crystalline domain add <name> <path> - or let an agent create one at runtime with the add_domain tool."
+                .to_string(),
+        );
+    }
     if opts.harness == HarnessKind::Codex {
         if !opts.skip_mcp && opts.project {
             notices.push(
