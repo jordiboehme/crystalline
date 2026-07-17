@@ -1333,6 +1333,105 @@ parity!(
     embedding_width_follows_provider
 );
 
+/// A width flip (a `store_embeddings` call at a new `dims`) drives
+/// `ensure_embedding_width`'s `ALTER TABLE ... TYPE vector({dims})`, which
+/// changes the `chunk.embedding` column's typmod. `replace_chunks`' carry
+/// SELECT is the only statement in the Postgres module that returns that raw
+/// column, so it is the one statement exposed to the "cached plan must not
+/// change result type" hazard when a pooled connection's cached plan predates
+/// the DDL (see the module doc in `postgres/mod.rs`). This syncs once to seed
+/// chunks and warm the carry SELECT's plan, flips the width and re-syncs an
+/// edit (re-running the carry SELECT against the resized column), then flips
+/// the width a second time and re-syncs again, giving the hazard two
+/// independent chances to surface on whichever connection the pool hands
+/// back. Every step must succeed and coverage must stay internally
+/// consistent throughout; on Turso this is unchanged behavior; the point of
+/// running it here is that Postgres now survives it too.
+async fn width_flip_survives_replace_chunks(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "a.md",
+        &engram("A", "a", "engram", "", "alpha alpha alpha body one"),
+    );
+    write(
+        root,
+        "b.md",
+        &engram("B", "b", "engram", "", "beta beta beta body two"),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+
+    // First width: 8 dims. Embeds every chunk, driving ensure_embedding_width's
+    // ALTER for the first time.
+    let jobs = store.chunks_needing_embedding("m8", None).await.unwrap();
+    assert!(
+        !jobs.is_empty(),
+        "chunks await embedding after the first sync"
+    );
+    let rows: Vec<EmbeddingRow> = jobs
+        .iter()
+        .map(|j| EmbeddingRow {
+            chunk_id: j.chunk_id,
+            embedding: embed_one(&j.text, 8),
+            dims: 8,
+        })
+        .collect();
+    store.store_embeddings(&rows, "m8").await.unwrap();
+    let cov = store.embedding_coverage().await.unwrap();
+    assert_eq!(
+        cov.embedded_chunks, cov.total_chunks,
+        "everything embedded at 8 dims"
+    );
+
+    // Edit and re-sync: replace_chunks now runs its carry SELECT against the
+    // just-resized (8-dim) embedding column, on whatever connection the pool
+    // hands back for this transaction.
+    write(
+        root,
+        "a.md",
+        &engram("A", "a", "engram", "", "alpha alpha alpha body one edited"),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+    let cov = store.embedding_coverage().await.unwrap();
+    assert!(
+        cov.embedded_chunks <= cov.total_chunks,
+        "coverage stays consistent after the first width flip"
+    );
+
+    // Second width: 16 dims, driving a second ALTER, then re-sync once more so
+    // the carry SELECT runs again against a column that just changed shape a
+    // second time.
+    let jobs = store.chunks_needing_embedding("m16", None).await.unwrap();
+    let rows: Vec<EmbeddingRow> = jobs
+        .iter()
+        .map(|j| EmbeddingRow {
+            chunk_id: j.chunk_id,
+            embedding: embed_one(&j.text, 16),
+            dims: 16,
+        })
+        .collect();
+    store.store_embeddings(&rows, "m16").await.unwrap();
+
+    write(
+        root,
+        "b.md",
+        &engram("B", "b", "engram", "", "beta beta beta body two edited"),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+
+    let cov = store.embedding_coverage().await.unwrap();
+    assert!(cov.total_chunks > 0, "chunks remain after both width flips");
+    assert!(
+        cov.embedded_chunks <= cov.total_chunks,
+        "coverage stays consistent after the second width flip"
+    );
+}
+parity!(
+    width_flips_keep_replace_chunks_healthy,
+    width_flip_survives_replace_chunks
+);
+
 /// `store_embeddings` writes the whole batch or nothing. A row whose embedding
 /// length contradicts its declared dims aborts the call, and because the batch is
 /// validated up front and written inside one transaction, no earlier row stays
