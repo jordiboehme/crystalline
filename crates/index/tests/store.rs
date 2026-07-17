@@ -433,6 +433,50 @@ parity!(
     forward_reference_resolves
 );
 
+/// The twin of `forward_reference_resolves` for the title-match path: the
+/// reference names its target by title, not permalink, and must resolve on the
+/// later sync when the target appears. This exercises the `lower(e.title)`
+/// branch of `resolve_pending_relations` (and the index behind it), which the
+/// permalink case never touches.
+async fn forward_reference_resolves_by_title(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // `[[Target Beta]]` matches neither a permalink nor anything present yet, so
+    // it stays unresolved until an engram whose title is "Target Beta" arrives.
+    write(
+        root,
+        "a.md",
+        &engram("A", "a", "engram", "", "- depends_on [[Target Beta]]\n"),
+    );
+    let first = sync_domain(store, "d", root).await.unwrap();
+    assert_eq!(first.relations_resolved, 0, "target absent, unresolved");
+    assert_eq!(
+        store.domain_stats().await.unwrap()[0].unresolved_relations,
+        1
+    );
+
+    // The target appears with a permalink that does NOT match the reference
+    // text, so only the title match can resolve it.
+    write(
+        root,
+        "b.md",
+        &engram("Target Beta", "beta-perma", "engram", "", "body b\n"),
+    );
+    let second = sync_domain(store, "d", root).await.unwrap();
+    assert_eq!(
+        second.relations_resolved, 1,
+        "resolved by title on the later sync"
+    );
+    assert_eq!(
+        store.domain_stats().await.unwrap()[0].unresolved_relations,
+        0
+    );
+}
+parity!(
+    forward_reference_resolves_by_title_on_later_sync,
+    forward_reference_resolves_by_title
+);
+
 async fn duplicate_permalink_fails(store: &dyn Store) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();

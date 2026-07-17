@@ -41,6 +41,11 @@ pub const MIGRATIONS: &[Migration] = &[
         label: "domain host lock",
         sql: SCHEMA_V3,
     },
+    Migration {
+        version: 4,
+        label: "title-lower expression index",
+        sql: SCHEMA_V4,
+    },
 ];
 
 // The whole current schema in one step. The temporal columns stay TEXT ISO
@@ -182,6 +187,16 @@ CREATE TABLE domain_lock (
     acquired_at TEXT NOT NULL,
     heartbeat_at TEXT NOT NULL
 );
+"#;
+
+// The Postgres twin of Turso's v5: a case-insensitive title index for
+// forward-reference resolution. Relations resolve their target with
+// `lower(e.title) = lower(...)` scoped to a domain, and the find/inbound paths
+// share the pattern; without an index each match is a full engram scan. Postgres
+// supports functional indexes natively, so the existing queries are left
+// untouched and only gain the index.
+const SCHEMA_V4: &str = r#"
+CREATE INDEX idx_engram_title_lower ON engram(domain_id, lower(title));
 "#;
 
 /// The tables cleared by `wipe()`, child rows first so the enforced foreign
