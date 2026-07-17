@@ -36,7 +36,9 @@ pub use store::{
     MetadataFilter, NewChunk, Page, RecentFilter, SearchHit, SearchMode, SearchQuery, Store,
     StoreInfo, StoredEngram, parse_metadata_filters,
 };
-pub use sync::{SyncReport, sync_domain, sync_domain_with};
+pub use sync::{
+    DomainScan, SyncReport, apply_scan, scan_domain, scan_paths, sync_domain, sync_domain_with,
+};
 pub use turso::TursoStore;
 
 #[cfg(feature = "postgres")]

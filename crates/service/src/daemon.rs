@@ -449,6 +449,14 @@ async fn handle_conn(mut stream: IpcStream, shared: Arc<Shared>) {
     }
 }
 
+/// One item on the watcher's debounce channel: a concrete filesystem path from
+/// a notify event, or a rescan/overflow signal meaning events were dropped and
+/// every watched domain must fall back to a full rescan this flush.
+enum WatchTick {
+    Path(PathBuf),
+    Rescan,
+}
+
 /// Watch every domain root, debounce bursts by ~300ms and sync the touched
 /// domains, then schedule an embedding pass on the worker (falling back to an
 /// inline pass only if the worker channel is unwired or its receiver already
@@ -456,6 +464,16 @@ async fn handle_conn(mut stream: IpcStream, shared: Arc<Shared>) {
 /// on-disk stamp already matches
 /// any file a mutating tool just wrote, so those files are classified
 /// unchanged here.
+///
+/// A debounce flush accumulates dirty relative PATHS per domain (see
+/// [`DirtyPaths`]), not just dirty domain names: a small batch runs a
+/// path-targeted [`Engine::sync_paths`] over exactly those paths, so a one-file
+/// edit in a large domain no longer walks every entry. A batch that cannot be
+/// reduced to clean markdown paths - a rescan/overflow notice, a directory
+/// event, an ambiguous deletion or more than [`MAX_DIRTY_PATHS`] paths -
+/// escalates that domain to today's full [`Engine::sync`] rescan. That full
+/// fallback, plus the startup sync and manual `crystalline sync`, cover every
+/// watcher gap, so the targeted path only has to be convergent, never perfect.
 ///
 /// `new_roots` carries domains discovered after startup (see
 /// `Engine::domain_root`'s fresh-config fallback): a `domain add` while this
@@ -479,11 +497,17 @@ async fn run_watcher(
     mut new_roots: tokio::sync::mpsc::UnboundedReceiver<WatchEvent>,
     watches_ready: tokio::sync::oneshot::Sender<()>,
 ) -> anyhow::Result<()> {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<PathBuf>();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<WatchTick>();
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         if let Ok(event) = res {
+            // A rescan/overflow notice (an inotify IN_Q_OVERFLOW, an fsevents
+            // rescan) means events were dropped, so which paths changed is
+            // unknown: signal a full rescan rather than trust a partial stream.
+            if event.need_rescan() {
+                let _ = tx.send(WatchTick::Rescan);
+            }
             for path in event.paths {
-                let _ = tx.send(path);
+                let _ = tx.send(WatchTick::Path(path));
             }
         }
     })?;
@@ -585,19 +609,34 @@ async fn run_watcher(
             }
             first = rx.recv() => {
                 let Some(first) = first else { break };
-                let mut dirty: HashSet<String> =
-                    domains_for(&first, &domains).into_iter().collect();
-                while let Ok(Some(path)) =
+                // Accumulate dirty relative paths per domain over the debounce
+                // window, escalating a domain to a full rescan whenever a batch
+                // cannot be reduced to clean markdown paths (see DirtyPaths).
+                let mut dirty: HashMap<String, DirtyPaths> = HashMap::new();
+                accumulate_tick(&mut dirty, first, &domains);
+                while let Ok(Some(tick)) =
                     tokio::time::timeout(Duration::from_millis(300), rx.recv()).await
                 {
-                    dirty.extend(domains_for(&path, &domains));
+                    accumulate_tick(&mut dirty, tick, &domains);
                 }
-                for name in &dirty {
-                    if let Err(err) = engine.sync(Some(name)).await {
-                        tracing::warn!("watch sync of '{name}' failed: {err}");
+                let touched = !dirty.is_empty();
+                for (name, work) in dirty {
+                    // full: today's walk-based rescan; otherwise a targeted pass
+                    // over just the dirty paths. The full fallback plus the
+                    // startup and manual syncs cover any gap, so the targeted
+                    // pass only has to be convergent, never perfect.
+                    if work.full {
+                        if let Err(err) = engine.sync(Some(&name)).await {
+                            tracing::warn!("watch sync of '{name}' failed: {err}");
+                        }
+                    } else if !work.paths.is_empty() {
+                        let paths: Vec<String> = work.paths.into_iter().collect();
+                        if let Err(err) = engine.sync_paths(&name, paths).await {
+                            tracing::warn!("targeted watch sync of '{name}' failed: {err}");
+                        }
                     }
                 }
-                if !dirty.is_empty()
+                if touched
                     && !engine.request_embed()
                     && let Err(err) = engine.embed_pending().await
                 {
@@ -779,27 +818,181 @@ fn domain_roots(config: &GlobalConfig) -> Vec<(String, PathBuf)> {
         .collect()
 }
 
-/// The domain names whose root is a prefix of the event path.
+/// Cap on targeted dirty paths per domain per debounce flush before the batch
+/// escalates to a full rescan: past this many distinct paths a full walk is the
+/// cheaper way to reconcile, and the cap also bounds the memory one burst holds.
+const MAX_DIRTY_PATHS: usize = 256;
+
+/// One domain's pending watcher work for a single debounce flush: a set of dirty
+/// relative markdown paths, or `full` when the batch must fall back to a full
+/// rescan.
 ///
-/// `domains` roots are already canonical (see [`domain_roots`]), so a raw
-/// prefix match against the event path is tried first and needs no syscall.
-/// Only when that finds nothing is the event path itself canonicalized and
-/// retried, which still matches a root reached through a symlink.
-fn domains_for(path: &Path, domains: &[(String, PathBuf)]) -> Vec<String> {
-    let raw_hits: Vec<String> = domains
+/// `full` is the safety valve. The startup sync, a manual `crystalline sync` and
+/// this full fallback all cover any watcher gap, so targeted mode only has to be
+/// convergent, never perfect: anything the watcher cannot reduce to a clean
+/// markdown path escalates here rather than risk a missed or wrong targeted
+/// change. Once `full` is set the individual paths no longer matter, so they are
+/// dropped to keep the set bounded.
+#[derive(Debug, Default)]
+struct DirtyPaths {
+    paths: HashSet<String>,
+    full: bool,
+}
+
+impl DirtyPaths {
+    /// Escalate this domain to a full rescan for this flush.
+    fn mark_full(&mut self) {
+        self.full = true;
+        self.paths.clear();
+    }
+
+    /// Add one dirty relative path, escalating to a full rescan once the batch
+    /// grows past the cap.
+    fn add(&mut self, rel: String) {
+        if self.full {
+            return;
+        }
+        self.paths.insert(rel);
+        if self.paths.len() > MAX_DIRTY_PATHS {
+            self.mark_full();
+        }
+    }
+}
+
+/// How one watcher event maps onto a domain: a clean relative markdown path to
+/// target, a signal to escalate the whole domain to a full rescan, or nothing.
+enum DirtyKind {
+    /// A clean domain-relative markdown path to sync in the targeted pass.
+    Path(String),
+    /// Fall back to a full rescan of the domain (a directory event, an
+    /// unresolvable relative path or an ambiguous deletion).
+    Escalate,
+    /// Not index-relevant (a hidden path or a live non-markdown file); ignore.
+    Ignore,
+}
+
+/// Fold one debounce tick into the per-domain dirty map.
+fn accumulate_tick(
+    dirty: &mut HashMap<String, DirtyPaths>,
+    tick: WatchTick,
+    domains: &[(String, PathBuf)],
+) {
+    match tick {
+        // A dropped-event / overflow signal: which paths were lost is unknown,
+        // so reconcile every watched domain with a full rescan.
+        WatchTick::Rescan => {
+            for (name, _) in domains {
+                dirty.entry(name.clone()).or_default().mark_full();
+            }
+        }
+        WatchTick::Path(path) => {
+            for (name, kind) in classify_event(&path, domains) {
+                let entry = dirty.entry(name).or_default();
+                match kind {
+                    DirtyKind::Path(rel) => entry.add(rel),
+                    DirtyKind::Escalate => entry.mark_full(),
+                    DirtyKind::Ignore => {}
+                }
+            }
+        }
+    }
+}
+
+/// Classify one event path against the watched domains, then reduce the event to
+/// a [`DirtyKind`] per matched domain. A path under no root yields nothing.
+///
+/// `domains` roots are already canonical (see [`domain_roots`]), so a raw prefix
+/// match against the event path is tried first and needs no syscall. Only when
+/// that finds nothing is the event path itself canonicalized and retried, which
+/// still matches a root reached through a symlink.
+fn classify_event(path: &Path, domains: &[(String, PathBuf)]) -> Vec<(String, DirtyKind)> {
+    // Raw prefix match first (no syscall).
+    let raw: Vec<(String, PathBuf)> = domains
         .iter()
         .filter(|(_, root)| path.starts_with(root))
-        .map(|(name, _)| name.clone())
+        .map(|(name, root)| (name.clone(), root.clone()))
         .collect();
-    if !raw_hits.is_empty() {
-        return raw_hits;
-    }
-    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    domains
-        .iter()
-        .filter(|(_, root)| canonical.starts_with(root))
-        .map(|(name, _)| name.clone())
+    let canonical;
+    let (match_path, hits): (&Path, Vec<(String, PathBuf)>) = if !raw.is_empty() {
+        (path, raw)
+    } else {
+        // Only when the raw check finds nothing is the event path canonicalized
+        // and retried, which still matches a root reached through a symlink.
+        canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let hits = domains
+            .iter()
+            .filter(|(_, root)| canonical.starts_with(root))
+            .map(|(name, root)| (name.clone(), root.clone()))
+            .collect();
+        (canonical.as_path(), hits)
+    };
+    hits.into_iter()
+        .map(|(name, root)| (name, classify_in_root(match_path, &root)))
         .collect()
+}
+
+/// Reduce one event path, already known to sit under `root`, to a [`DirtyKind`].
+fn classify_in_root(path: &Path, root: &Path) -> DirtyKind {
+    // A directory event (a create, a rename, a bulk delete) can hide markdown
+    // children notify never reports individually, so fall back to a full rescan
+    // rather than guess at the children.
+    if path.is_dir() {
+        return DirtyKind::Escalate;
+    }
+    let Some(rel) = clean_rel(root, path) else {
+        // Not cleanly under this root (a `..` component or a non-UTF8 name once
+        // the prefix matched): the safe side is a full rescan.
+        return DirtyKind::Escalate;
+    };
+    // Hidden paths (dotfiles, anything under a dot-directory) are pruned by the
+    // scan walk, so they never map to an engram: ignore them, matching the walk.
+    if rel.split('/').any(is_hidden) {
+        return DirtyKind::Ignore;
+    }
+    let is_md = rel.to_lowercase().ends_with(".md");
+    if path.exists() {
+        // An existing non-markdown regular file is never indexed (directories
+        // were escalated above), so ignore it; a markdown file is a targeted
+        // candidate, resolved against the stamps by scan_paths.
+        if is_md {
+            DirtyKind::Path(rel)
+        } else {
+            DirtyKind::Ignore
+        }
+    } else if is_md {
+        // A vanished markdown file is a targeted delete candidate.
+        DirtyKind::Path(rel)
+    } else {
+        // A vanished non-markdown path is ambiguous - it may have been a
+        // directory whose markdown children notify never reported - so escalate
+        // to a full rescan, the convergent safe side.
+        DirtyKind::Escalate
+    }
+}
+
+/// The domain-relative path of `path` under `root`, joined with `/` to match the
+/// stamp keys, or `None` when the path is the root itself or holds any non-normal
+/// component (`..`, a prefix), which must escalate instead.
+fn clean_rel(root: &Path, path: &Path) -> Option<String> {
+    let rel = path.strip_prefix(root).ok()?;
+    let mut parts = Vec::new();
+    for comp in rel.components() {
+        match comp {
+            std::path::Component::Normal(s) => parts.push(s.to_string_lossy().into_owned()),
+            _ => return None,
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("/"))
+    }
+}
+
+/// Whether a single path component is hidden (a dotfile or dot-directory),
+/// mirroring the scan walk's own pruning.
+fn is_hidden(name: &str) -> bool {
+    name.starts_with('.') && name != "." && name != ".."
 }
 
 // --- config + path resolution -----------------------------------------------
@@ -1000,34 +1193,43 @@ mod tests {
         );
     }
 
-    // domains_for: the raw prefix match must short-circuit before any
-    // canonicalize syscall, and the canonicalize fallback must still resolve
-    // an event path reached through a symlinked root.
+    // classify_event: the raw prefix match must short-circuit before any
+    // canonicalize syscall and the canonicalize fallback must still resolve an
+    // event path reached through a symlinked root - the same matching the old
+    // domains_for had - and each matched event reduces to the right DirtyKind.
 
-    #[test]
-    fn domains_for_matches_via_raw_prefix_without_canonicalizing() {
-        // A path that does not exist on disk still matches through the raw
-        // check, proving the fallback canonicalize call is never reached.
-        let root = PathBuf::from("/some/canonical/root");
-        let domains = vec![("domain".to_string(), root.clone())];
-        let event_path = root.join("sub/does-not-exist.md");
-        assert_eq!(
-            domains_for(&event_path, &domains),
-            vec!["domain".to_string()]
-        );
+    fn as_path(kind: &DirtyKind) -> Option<&str> {
+        match kind {
+            DirtyKind::Path(p) => Some(p.as_str()),
+            _ => None,
+        }
     }
 
     #[test]
-    fn domains_for_returns_empty_when_no_root_matches() {
+    fn classify_event_matches_via_raw_prefix_without_canonicalizing() {
+        // A path that does not exist on disk still matches through the raw
+        // check, proving the fallback canonicalize call is never reached; a
+        // vanished markdown path is a targeted delete candidate.
+        let root = PathBuf::from("/some/canonical/root");
+        let domains = vec![("domain".to_string(), root.clone())];
+        let event_path = root.join("sub/does-not-exist.md");
+        let hits = classify_event(&event_path, &domains);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, "domain");
+        assert_eq!(as_path(&hits[0].1), Some("sub/does-not-exist.md"));
+    }
+
+    #[test]
+    fn classify_event_returns_empty_when_no_root_matches() {
         let root = PathBuf::from("/some/canonical/root");
         let domains = vec![("domain".to_string(), root)];
         let event_path = PathBuf::from("/completely/unrelated/path/file.md");
-        assert!(domains_for(&event_path, &domains).is_empty());
+        assert!(classify_event(&event_path, &domains).is_empty());
     }
 
     #[cfg(unix)]
     #[test]
-    fn domains_for_matches_a_symlinked_event_path_via_canonicalize_fallback() {
+    fn classify_event_matches_a_symlinked_event_path_via_canonicalize_fallback() {
         let base = tempfile::tempdir().unwrap();
         let real_root = base.path().join("real");
         std::fs::create_dir(&real_root).unwrap();
@@ -1040,14 +1242,120 @@ mod tests {
         std::os::unix::fs::symlink(&real_root, &link).unwrap();
 
         let domains = vec![("domain".to_string(), canonical_root)];
-        // The event path travels through the symlink, so it does not
-        // textually start with the canonical root: only the canonicalize
-        // fallback resolves it.
+        // The event path travels through the symlink, so it does not textually
+        // start with the canonical root: only the canonicalize fallback resolves
+        // it, and the resolved markdown file is a targeted path.
         let event_path = link.join("note.md");
 
-        assert_eq!(
-            domains_for(&event_path, &domains),
-            vec!["domain".to_string()]
+        let hits = classify_event(&event_path, &domains);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, "domain");
+        assert_eq!(as_path(&hits[0].1), Some("note.md"));
+    }
+
+    #[test]
+    fn classify_event_escalates_on_a_directory() {
+        // A directory event can hide markdown children notify never reports
+        // individually, so it must fall back to a full rescan.
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let subdir = root.join("sub");
+        std::fs::create_dir(&subdir).unwrap();
+        let domains = vec![("domain".to_string(), root)];
+        let hits = classify_event(&subdir, &domains);
+        assert_eq!(hits.len(), 1);
+        assert!(matches!(hits[0].1, DirtyKind::Escalate));
+    }
+
+    #[test]
+    fn classify_event_ignores_a_live_non_markdown_file_and_hidden_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::write(root.join("scratch.txt"), "x").unwrap();
+        std::fs::write(root.join(".hidden.md"), "x").unwrap();
+        let domains = vec![("domain".to_string(), root.clone())];
+
+        // A live non-markdown file is never indexed, so it is ignored.
+        let txt = classify_event(&root.join("scratch.txt"), &domains);
+        assert_eq!(txt.len(), 1);
+        assert!(matches!(txt[0].1, DirtyKind::Ignore));
+
+        // A hidden markdown file is pruned by the scan walk, so it is ignored.
+        let hidden = classify_event(&root.join(".hidden.md"), &domains);
+        assert_eq!(hidden.len(), 1);
+        assert!(matches!(hidden[0].1, DirtyKind::Ignore));
+    }
+
+    #[test]
+    fn classify_event_escalates_on_a_vanished_non_markdown_path() {
+        // A vanished non-markdown path is ambiguous - it may have been a
+        // directory whose markdown children notify never reported - so it
+        // escalates to a full rescan, the convergent safe side.
+        let root = PathBuf::from("/some/canonical/root");
+        let domains = vec![("domain".to_string(), root.clone())];
+        let hits = classify_event(&root.join("was-a-dir"), &domains);
+        assert_eq!(hits.len(), 1);
+        assert!(matches!(hits[0].1, DirtyKind::Escalate));
+    }
+
+    // DirtyPaths: distinct paths accumulate until the cap, an overflow escalates
+    // to a full rescan and full is sticky (a later path never un-escalates it).
+
+    #[test]
+    fn dirty_paths_accumulates_distinct_paths_under_the_cap() {
+        let mut d = DirtyPaths::default();
+        d.add("a.md".to_string());
+        d.add("b.md".to_string());
+        d.add("a.md".to_string()); // a duplicate does not double-count
+        assert!(!d.full);
+        assert_eq!(d.paths.len(), 2);
+    }
+
+    #[test]
+    fn dirty_paths_overflow_past_the_cap_escalates_to_full() {
+        let mut d = DirtyPaths::default();
+        for i in 0..=MAX_DIRTY_PATHS {
+            d.add(format!("f{i}.md"));
+        }
+        assert!(
+            d.full,
+            "past {MAX_DIRTY_PATHS} distinct paths the batch is full"
         );
+        assert!(d.paths.is_empty(), "the paths are dropped once full");
+    }
+
+    #[test]
+    fn dirty_paths_full_is_sticky() {
+        let mut d = DirtyPaths::default();
+        d.mark_full();
+        d.add("a.md".to_string());
+        assert!(d.full, "a later path never un-escalates a full batch");
+        assert!(d.paths.is_empty());
+    }
+
+    // accumulate_tick: a rescan/overflow signal marks every watched domain full;
+    // a single markdown event targets exactly that path.
+
+    #[test]
+    fn accumulate_tick_rescan_marks_every_watched_domain_full() {
+        let domains = vec![
+            ("a".to_string(), PathBuf::from("/roots/a")),
+            ("b".to_string(), PathBuf::from("/roots/b")),
+        ];
+        let mut dirty: HashMap<String, DirtyPaths> = HashMap::new();
+        accumulate_tick(&mut dirty, WatchTick::Rescan, &domains);
+        assert!(dirty["a"].full);
+        assert!(dirty["b"].full);
+    }
+
+    #[test]
+    fn accumulate_tick_a_single_markdown_event_targets_that_path() {
+        let root = PathBuf::from("/roots/a");
+        let domains = vec![("a".to_string(), root.clone())];
+        let mut dirty: HashMap<String, DirtyPaths> = HashMap::new();
+        // A vanished markdown path (delete candidate) is targeted, not full.
+        accumulate_tick(&mut dirty, WatchTick::Path(root.join("note.md")), &domains);
+        assert!(!dirty["a"].full);
+        assert!(dirty["a"].paths.contains("note.md"));
     }
 }

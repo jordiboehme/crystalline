@@ -13,8 +13,8 @@ use crystalline_core::config::{
     self, DatabaseBackend, DomainEntry, EmbeddingsConfig, GlobalConfig,
 };
 use crystalline_index::{
-    ChunkParams, DomainKind, Store, configured_model_id, download_local_model,
-    provider_from_config, run_embedding_pass, sync_domain_with,
+    ChunkParams, DomainKind, Store, apply_scan, configured_model_id, download_local_model,
+    provider_from_config, run_embedding_pass, scan_domain,
 };
 use tokio::sync::Mutex as TokioMutex;
 
@@ -314,9 +314,20 @@ pub(crate) async fn sync_domain_direct(
 ) -> Result<crystalline_index::SyncReport> {
     let cfg = load(config_override)?.effective;
     let store = open_backend(&cfg, db_override, false).await?;
-    let store = store.lock().await;
     let params = chunk_params(&cfg);
-    sync_domain_with(&*store, name, root, &params)
+    // First lock window: resolve the domain id and snapshot its stamps. The scan
+    // then runs with no lock held; the second window applies transactionally.
+    let (domain, snapshot) = {
+        let store = store.lock().await;
+        let domain = store
+            .upsert_domain(name, Some(&root.to_string_lossy()), DomainKind::File)
+            .await?;
+        let snapshot = store.file_stamps(domain).await?;
+        (domain, snapshot)
+    };
+    let scan = scan_domain(name, root, snapshot, &params).await;
+    let store = store.lock().await;
+    apply_scan(&*store, domain, scan)
         .await
         .map_err(|e| anyhow!("sync of '{name}' failed: {e}"))
 }
@@ -825,7 +836,6 @@ pub async fn sync(
     let cfg = load(config_override)?.effective;
     let targets = select_domains(&cfg, only)?;
     let store = open_backend(&cfg, db_override, false).await?;
-    let store = store.lock().await;
     let params = chunk_params(&cfg);
 
     let mut reports = Vec::new();
@@ -840,9 +850,24 @@ pub async fn sync(
         if !json {
             eprintln!("syncing {name}...");
         }
-        let report = sync_domain_with(&*store, &name, &path, &params)
-            .await
-            .map_err(|e| anyhow!("sync of '{name}' failed: {e}"))?;
+        // First lock window: snapshot the stamps; scan with no lock held so the
+        // walk-hash-parse pass does not block concurrent readers; second window:
+        // apply transactionally with the TOCTOU guards.
+        let (domain, snapshot) = {
+            let store = store.lock().await;
+            let domain = store
+                .upsert_domain(&name, Some(&path.to_string_lossy()), DomainKind::File)
+                .await?;
+            let snapshot = store.file_stamps(domain).await?;
+            (domain, snapshot)
+        };
+        let scan = scan_domain(&name, &path, snapshot, &params).await;
+        let report = {
+            let store = store.lock().await;
+            apply_scan(&*store, domain, scan)
+                .await
+                .map_err(|e| anyhow!("sync of '{name}' failed: {e}"))?
+        };
         reports.push(report);
     }
 
@@ -855,6 +880,7 @@ pub async fn sync(
     }
 
     if embed {
+        let store = store.lock().await;
         embed_pass(&*store, &cfg).await?;
     }
     Ok(())
@@ -880,13 +906,16 @@ pub async fn reindex(
     // domain's rows per-domain and resyncs, so virtual-domain rows, whose only
     // source of truth is the database, survive the reindex.
     let store = open_backend(&cfg, db_override, full).await?;
-    let store = store.lock().await;
     // Only the file domains have files to (re)index.
     let file_targets: Vec<(String, PathBuf)> = targets
         .into_iter()
         .filter_map(|(name, entry)| resolve_domain_path(&entry).map(|p| (name, p)))
         .collect();
+    // Clear every file domain up front, before any resync, so cross-domain
+    // forward references resolve in the same order as before the lock split (a
+    // source domain sees the cleared, not the stale, target while resolving).
     if full {
+        let store = store.lock().await;
         for (name, path) in &file_targets {
             let domain_id = store
                 .upsert_domain(name, Some(&path.to_string_lossy()), DomainKind::File)
@@ -901,9 +930,22 @@ pub async fn reindex(
 
     let mut reports = Vec::new();
     for (name, path) in &file_targets {
-        let report = sync_domain_with(&*store, name, path, &params)
-            .await
-            .map_err(|e| anyhow!("reindex of '{name}' failed: {e}"))?;
+        // First lock window: snapshot; scan with no lock held; second: apply.
+        let (domain, snapshot) = {
+            let store = store.lock().await;
+            let domain = store
+                .upsert_domain(name, Some(&path.to_string_lossy()), DomainKind::File)
+                .await?;
+            let snapshot = store.file_stamps(domain).await?;
+            (domain, snapshot)
+        };
+        let scan = scan_domain(name, path, snapshot, &params).await;
+        let report = {
+            let store = store.lock().await;
+            apply_scan(&*store, domain, scan)
+                .await
+                .map_err(|e| anyhow!("reindex of '{name}' failed: {e}"))?
+        };
         reports.push(report);
     }
 
@@ -923,6 +965,7 @@ pub async fn reindex(
     }
 
     if embed {
+        let store = store.lock().await;
         embed_pass(&*store, &cfg).await?;
     }
 
@@ -932,6 +975,7 @@ pub async fn reindex(
         // next natural checkpoint. A no-op on Postgres (no local WAL file);
         // on Turso this replaces the downstream Docker image build's shell-out
         // to `sqlite3` for the same purpose.
+        let store = store.lock().await;
         store.checkpoint_wal().await?;
     }
     Ok(())
@@ -1588,14 +1632,22 @@ fn select_domains(cfg: &GlobalConfig, only: Option<&str>) -> Result<Vec<(String,
 }
 
 fn print_report(r: &crystalline_index::SyncReport) {
+    // The deferred count only prints when non-zero, so a quiet uncontended sync
+    // reads the same as before and a busy one surfaces the skipped changes.
+    let deferred = if r.deferred > 0 {
+        format!(", {} deferred", r.deferred)
+    } else {
+        String::new()
+    };
     println!(
-        "{}: {} added, {} updated, {} deleted, {} moved, {} unchanged, {} resolved ({} ms)",
+        "{}: {} added, {} updated, {} deleted, {} moved, {} unchanged{}, {} resolved ({} ms)",
         r.domain,
         r.added,
         r.updated,
         r.deleted,
         r.moved,
         r.unchanged,
+        deferred,
         r.relations_resolved,
         r.duration_ms
     );

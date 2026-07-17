@@ -10,8 +10,41 @@
 //!
 //! Hashing and parsing run off-thread with bounded concurrency; all database
 //! writes stay on the calling task and commit together.
+//!
+//! # Two phases, so the store lock only covers database work
+//!
+//! A sync is two phases: [`scan_domain`] is pure filesystem and CPU (walk, hash,
+//! parse, chunk) and takes the stamp snapshot as input rather than reading the
+//! store, so a caller runs it with no store lock held; [`apply_scan`] is the
+//! transactional apply and touches the store only. [`sync_domain_with`] composes
+//! the two for callers that do not manage the lock. Splitting them keeps the
+//! store mutex off the long walk-hash-parse pass of a large domain.
+//!
+//! [`scan_paths`] is a second front on the same classification machinery for the
+//! file watcher: its candidates come from a given list of relative paths instead
+//! of a full walk, so a one-file edit in a large domain costs one stat and one
+//! hash rather than walking every entry. Both fronts feed the identical
+//! [`apply_scan`], so the targeted pass inherits every TOCTOU guard unchanged.
+//! The watcher's full fallback, the startup sync and manual sync all reconcile
+//! any gap, so the targeted front only has to be convergent, never perfect.
+//!
+//! # Convergence under a concurrent writer
+//!
+//! Between the snapshot and the apply another writer (an MCP edit or a second
+//! instance in collaboration mode) can change both the index and the files.
+//! [`apply_scan`] re-reads the live stamps inside its transaction and skips any
+//! classified change whose live db stamp no longer matches the snapshot it was
+//! classified against (a delete additionally skips when its file reappeared on
+//! disk), counting each skip in [`SyncReport::deferred`]. Every skip is safe
+//! because it leaves the system in a state a later pass reconciles: a skip on a
+//! changed db stamp leaves an index state newer than the scan, and a skip on a
+//! reappeared file leaves a watcher event already queued for that write. In both
+//! cases the next sync sees the divergence through the stamp prefilter. No skip
+//! can wedge permanently, because a stamp only changes when content changes, so
+//! the prefilter keeps re-selecting a diverged path until an uncontended pass
+//! applies it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
@@ -23,7 +56,7 @@ use walkdir::WalkDir;
 
 use crate::embed::{ChunkParams, chunk_engram};
 use crate::error::{IndexError, Result};
-use crate::store::{EngramRecord, FileStamp, NewChunk, Store};
+use crate::store::{DomainId, EngramRecord, FileStamp, NewChunk, Store};
 
 /// Maximum concurrent hashing or parsing tasks.
 const CONCURRENCY: usize = 8;
@@ -43,6 +76,11 @@ pub struct SyncReport {
     pub moved: usize,
     /// Files unchanged since the last sync.
     pub unchanged: usize,
+    /// Classified changes the apply skipped because a concurrent writer moved
+    /// the db stamp (or recreated the file) between the snapshot and the apply.
+    /// A later pass reconciles each one, so a non-zero count marks a busy system,
+    /// not a failure.
+    pub deferred: usize,
     /// Files that could not be read, parsed or upserted, with the reason.
     pub failed: Vec<(String, String)>,
     /// Forward references resolved at the end of this sync.
@@ -90,7 +128,6 @@ pub async fn sync_domain_with<S: Store + ?Sized>(
     root: &Path,
     chunk_params: &ChunkParams,
 ) -> Result<SyncReport> {
-    let started = Instant::now();
     let domain = store
         .upsert_domain(
             name,
@@ -98,7 +135,53 @@ pub async fn sync_domain_with<S: Store + ?Sized>(
             crate::store::DomainKind::File,
         )
         .await?;
-    let existing = store.file_stamps(domain).await?;
+    let stamps = store.file_stamps(domain).await?;
+    let scan = scan_domain(name, root, stamps, chunk_params).await;
+    apply_scan(store, domain, scan).await
+}
+
+/// The filesystem side of a sync, ready to apply against a store.
+///
+/// [`scan_domain`] produces this with no store access at all. It carries the
+/// classified moves, deletes and parsed-with-chunks changes, the stamp snapshot
+/// they were classified against (so the apply can detect a concurrent writer),
+/// the walk root (so a delete can re-stat its file) and the partial report
+/// (`unchanged` and `failed` counts). [`apply_scan`] consumes it inside one
+/// transaction and fills in the remaining report fields.
+pub struct DomainScan {
+    /// Renames: `(from, to)`, identical content moved to a new path in place.
+    moves: Vec<(String, String)>,
+    /// Recorded paths whose file vanished from disk, to delete from the index.
+    deletes: std::collections::HashSet<String>,
+    /// Parsed new and modified engrams with their chunks computed off-thread.
+    parsed: Vec<Parsed>,
+    /// The stamp snapshot the scan classified against, keyed by relative path.
+    /// The apply compares the live db stamps against these to spot a concurrent
+    /// write and defer the stale change.
+    snapshot: HashMap<String, FileStamp>,
+    /// The walk root, so the apply can re-stat a delete candidate on disk.
+    root: PathBuf,
+    /// `unchanged` and `failed` from the scan; the apply fills in the rest.
+    report: SyncReport,
+    /// When the scan began, so the apply can report the total duration.
+    started: Instant,
+}
+
+/// Scan one domain against a stamp snapshot: walk, prefilter, hash, classify and
+/// parse, with no store access at all.
+///
+/// `stamps` is the recorded [`FileStamp`] per relative path the caller read from
+/// the store before releasing its lock; the scan classifies every file against
+/// it and hands it back inside the [`DomainScan`] so the apply can re-check it.
+/// The walk, hash and parse phases run off-thread and never fail fatally: a file
+/// that cannot be read or parsed lands in `report.failed`, not an error.
+pub async fn scan_domain(
+    name: &str,
+    root: &Path,
+    stamps: HashMap<String, FileStamp>,
+    chunk_params: &ChunkParams,
+) -> DomainScan {
+    let started = Instant::now();
 
     // Folders the MANIFEST provisions from inside this root hold deployable
     // artifacts, not engrams, so they are pruned from the walk. Empty whenever
@@ -148,6 +231,145 @@ pub async fn sync_domain_with<S: Store + ?Sized>(
         );
     }
 
+    // Deleted candidates: recorded files no longer present on disk. A full walk
+    // sees every recorded path, so deletion detection is domain-wide here.
+    let deleted_paths: Vec<String> = stamps
+        .keys()
+        .filter(|p| !current.contains_key(*p))
+        .cloned()
+        .collect();
+
+    classify_and_parse(
+        name,
+        root,
+        stamps,
+        current,
+        deleted_paths,
+        chunk_params,
+        started,
+    )
+    .await
+}
+
+/// Scan a specific list of relative paths against a stamp snapshot, the
+/// path-targeted counterpart of [`scan_domain`] for the file watcher.
+///
+/// The classification, hashing, move detection and parsing are the identical
+/// shared machinery [`scan_domain`] uses; only the candidate set differs. Each
+/// given path is classified in isolation: a path that exists and is a markdown
+/// file (and passes the same walk filters - not hidden, not inside a provisioned
+/// artifact folder) is a change candidate, still prefiltered against `stamps`; a
+/// path absent on disk but present in `stamps` is a delete candidate; a path that
+/// is neither on disk nor recorded is ignored. Deletion detection is scoped to
+/// `paths` - no directory is walked anywhere - so a one-file edit in a large
+/// domain costs one stat and one hash, not a full walk of every entry.
+///
+/// Move detection stays within this one batch, exactly as the full scan: a delete
+/// candidate whose stored checksum matches a new candidate's hash is a rename in
+/// place rather than a delete plus an add. A rename whose two ends land in
+/// different debounce windows cannot be paired here and degrades to a delete plus
+/// an add - index-correct, but the rename-in-place optimization is lost and,
+/// because `replace_chunks` carries an embedding over only within one engram, the
+/// new path's chunks re-embed. That degradation is acceptable: the watcher's full
+/// fallback, the startup sync and manual sync all reconcile, so the targeted
+/// front only has to be convergent, never perfect.
+///
+/// The result flows through [`apply_scan`] with the identical TOCTOU guards, so a
+/// concurrent writer landing between the snapshot and the apply is deferred and
+/// reconciled just as it is for a full scan.
+pub async fn scan_paths(
+    name: &str,
+    root: &Path,
+    stamps: HashMap<String, FileStamp>,
+    paths: Vec<String>,
+    chunk_params: &ChunkParams,
+) -> DomainScan {
+    let started = Instant::now();
+
+    // The same artifact folders the full walk prunes: a targeted scan must index
+    // exactly what a full scan would, never a file the walk would have skipped.
+    let excluded = crystalline_core::in_root_artifact_dirs(root);
+
+    let mut current: HashMap<String, Scanned> = HashMap::new();
+    let mut deleted_paths: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for rel in paths {
+        // The same path can arrive twice in one debounce batch; classify it once.
+        if !seen.insert(rel.clone()) {
+            continue;
+        }
+        let abs = root.join(&rel);
+        let hidden = rel.split('/').any(is_hidden);
+        let is_md = rel.to_lowercase().ends_with(".md");
+        match std::fs::metadata(&abs) {
+            // An existing markdown file, filtered exactly as the walk filters:
+            // a change candidate, prefiltered against the stamps downstream.
+            Ok(meta) if meta.is_file() && is_md && !hidden && !is_excluded(&abs, &excluded) => {
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                let size = meta.len();
+                current.insert(
+                    rel.clone(),
+                    Scanned {
+                        rel,
+                        abs,
+                        mtime,
+                        size,
+                    },
+                );
+            }
+            // Exists but is not an indexable markdown file (a directory, a
+            // non-markdown file, a hidden or artifact path): ignore it, matching
+            // the walk which never indexes it either.
+            Ok(_) => {}
+            // Absent on disk: a recorded path is a delete candidate (scoped to
+            // the given paths, no walk), an unrecorded one is a no-op.
+            Err(_) => {
+                if stamps.contains_key(&rel) {
+                    deleted_paths.push(rel);
+                }
+            }
+        }
+    }
+
+    classify_and_parse(
+        name,
+        root,
+        stamps,
+        current,
+        deleted_paths,
+        chunk_params,
+        started,
+    )
+    .await
+}
+
+/// The classification and parse core shared by [`scan_domain`] and [`scan_paths`].
+///
+/// Given the markdown files found on disk (`current`, keyed by relative path) and
+/// the recorded paths whose file is gone (`deleted_paths`), it prefilters against
+/// `stamps`, hashes the survivors, detects moves within this batch (a vanished
+/// path whose stored checksum matches a new file's hash is a rename, not a delete
+/// plus an add), parses the genuinely changed files off-thread and assembles the
+/// [`DomainScan`]. The walk front and the path-list front differ only in how they
+/// build `current` and `deleted_paths`; everything from here is identical, so the
+/// two stay in step by construction. `report.unchanged` counts only paths
+/// actually examined - the whole domain for a walk, only the given paths for a
+/// targeted scan - because it is only ever bumped for an entry in `current`.
+#[allow(clippy::too_many_arguments)]
+async fn classify_and_parse(
+    name: &str,
+    root: &Path,
+    stamps: HashMap<String, FileStamp>,
+    current: HashMap<String, Scanned>,
+    deleted_paths: Vec<String>,
+    chunk_params: &ChunkParams,
+    started: Instant,
+) -> DomainScan {
     // Prefilter: unchanged files (same mtime and size) are skipped entirely.
     let mut report = SyncReport {
         domain: name.to_string(),
@@ -155,7 +377,7 @@ pub async fn sync_domain_with<S: Store + ?Sized>(
     };
     let mut to_hash: Vec<Scanned> = Vec::new();
     for (rel, scanned) in &current {
-        match existing.get(rel) {
+        match stamps.get(rel) {
             Some(stamp) if stamp.mtime == scanned.mtime && stamp.size == scanned.size => {
                 report.unchanged += 1;
             }
@@ -171,31 +393,24 @@ pub async fn sync_domain_with<S: Store + ?Sized>(
     // Hash (and read) the survivors off-thread with bounded concurrency.
     let hashed = hash_files(to_hash, &mut report).await;
 
-    // Deleted candidates: recorded files no longer present on disk.
-    let deleted_paths: Vec<String> = existing
-        .keys()
-        .filter(|p| !current.contains_key(*p))
-        .cloned()
-        .collect();
     // Index deleted files by checksum for move detection.
     let mut deleted_by_hash: HashMap<String, Vec<String>> = HashMap::new();
     for p in &deleted_paths {
-        if let Some(stamp) = existing.get(p) {
+        if let Some(stamp) = stamps.get(p) {
             deleted_by_hash
                 .entry(stamp.sha256.clone())
                 .or_default()
                 .push(p.clone());
         }
     }
-    let mut deleted_remaining: std::collections::HashSet<String> =
-        deleted_paths.iter().cloned().collect();
+    let mut deleted_remaining: HashSet<String> = deleted_paths.iter().cloned().collect();
 
     // Classify each hashed file. The bool records whether the engram was
     // already indexed, so the apply phase can tell added from updated.
     let mut moves: Vec<(String, String)> = Vec::new();
     let mut changed: Vec<(Scanned, Hashed, bool)> = Vec::new();
     for (scanned, hashed) in hashed {
-        let is_new = !existing.contains_key(&scanned.rel);
+        let is_new = !stamps.contains_key(&scanned.rel);
         if is_new {
             // A new file whose checksum matches a vanished file is a move.
             if let Some(candidates) = deleted_by_hash.get_mut(&hashed.sha256)
@@ -210,7 +425,7 @@ pub async fn sync_domain_with<S: Store + ?Sized>(
             }
             changed.push((scanned, hashed, false));
         } else {
-            let stamp = existing.get(&scanned.rel);
+            let stamp = stamps.get(&scanned.rel);
             let same = stamp.map(|s| s.sha256 == hashed.sha256).unwrap_or(false);
             if same {
                 // Touched but identical content: nothing to reindex.
@@ -226,17 +441,58 @@ pub async fn sync_domain_with<S: Store + ?Sized>(
     // failures and parse failures are reported, not fatal.
     let parsed = parse_files(changed, chunk_params, &mut report).await;
 
-    // Apply everything in one transaction. Duplicate-permalink upserts are
-    // collected in `failed` and do not abort the batch (they are pre-checked so
-    // no failing statement runs). Other errors roll the batch back.
+    DomainScan {
+        moves,
+        deletes: deleted_remaining,
+        parsed,
+        snapshot: stamps,
+        root: root.to_path_buf(),
+        report,
+        started,
+    }
+}
+
+/// Apply a [`DomainScan`] to the store in one transaction: moves, deletes,
+/// upserts with their chunks, forward-reference resolution and the sync stamp.
+///
+/// The whole batch commits together. Duplicate-permalink upserts are collected in
+/// `failed` and do not abort the batch (they are pre-checked so no failing
+/// statement runs); any other error rolls the batch back.
+///
+/// A concurrent writer can move the index between the scan's snapshot and this
+/// apply. The apply re-reads the live stamps once, inside the transaction, and
+/// defers any classified change whose live db stamp no longer matches the
+/// snapshot it was classified against - see the module-level convergence note.
+pub async fn apply_scan<S: Store + ?Sized>(
+    store: &S,
+    domain: DomainId,
+    scan: DomainScan,
+) -> Result<SyncReport> {
+    let DomainScan {
+        moves,
+        deletes,
+        parsed,
+        snapshot,
+        root,
+        mut report,
+        started,
+    } = scan;
+
     store.begin().await?;
-    let apply = apply_changes(store, domain, moves, deleted_remaining, parsed, &mut report).await;
-    match apply {
-        Ok(()) => {}
-        Err(e) => {
-            let _ = store.rollback().await;
-            return Err(e);
-        }
+    let apply = apply_changes(
+        store,
+        domain,
+        moves,
+        deletes,
+        parsed,
+        &snapshot,
+        &root,
+        &mut report,
+    )
+    .await;
+    if let Err(e) = apply {
+        let _ = store.rollback().await;
+        return Err(e);
     }
 
     let resolved = match store.resolve_pending_relations(domain).await {
@@ -259,23 +515,66 @@ pub async fn sync_domain_with<S: Store + ?Sized>(
     Ok(report)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn apply_changes<S: Store + ?Sized>(
     store: &S,
-    domain: crate::store::DomainId,
+    domain: DomainId,
     moves: Vec<(String, String)>,
-    deleted: std::collections::HashSet<String>,
+    deletes: std::collections::HashSet<String>,
     parsed: Vec<Parsed>,
+    snapshot: &HashMap<String, FileStamp>,
+    root: &Path,
     report: &mut SyncReport,
 ) -> Result<()> {
+    // The live stamps guard against a writer that moved the index between the
+    // scan's snapshot and now. Read them once, inside the transaction and only
+    // when there is something to apply, so the warm no-change pass adds no query.
+    let live = if moves.is_empty() && deletes.is_empty() && parsed.is_empty() {
+        HashMap::new()
+    } else {
+        store.file_stamps(domain).await?
+    };
+
     for (from, to) in moves {
+        // A move is a delete of `from` plus an add of `to`; if either end's db
+        // stamp moved since the snapshot the classification is stale, so leave
+        // both ends for the next pass rather than renaming over a fresh write.
+        if live.get(&from) != snapshot.get(&from) || live.get(&to) != snapshot.get(&to) {
+            report.deferred += 1;
+            tracing::debug!(from = %from, to = %to, "sync: deferring a move whose db stamp moved mid-scan");
+            continue;
+        }
         store.rename_engram(domain, &from, &to).await?;
         report.moved += 1;
     }
-    for path in deleted {
+    for path in deletes {
+        // The row was rewritten mid-scan: someone indexed newer state at this
+        // path, so dropping it would discard their write.
+        if live.get(&path) != snapshot.get(&path) {
+            report.deferred += 1;
+            tracing::debug!(path = %path, "sync: deferring a delete whose db stamp moved mid-scan");
+            continue;
+        }
+        // The file vanished during the scan but is back on disk now; the watcher
+        // event for that recreation is already queued, so leave the row for it.
+        if root.join(&path).exists() {
+            report.deferred += 1;
+            tracing::debug!(path = %path, "sync: deferring a delete whose file reappeared on disk");
+            continue;
+        }
         store.delete_engram(domain, &path).await?;
         report.deleted += 1;
     }
     for p in parsed {
+        // The db stamp for this path moved since the snapshot: a concurrent
+        // writer indexed newer state, so the parsed content is stale. Applying it
+        // would clobber the newer state, so defer and let the next pass reconcile.
+        let path = p.record.path.as_str();
+        if live.get(path) != snapshot.get(path) {
+            report.deferred += 1;
+            tracing::debug!(path = %path, "sync: deferring a change whose db stamp moved mid-scan");
+            continue;
+        }
         let existed = p.previously_indexed;
         match store.upsert_engram(domain, &p.record).await {
             Ok(id) => {
