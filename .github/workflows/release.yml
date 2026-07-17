@@ -628,6 +628,12 @@ jobs:
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ghcr.io/jordiboehme/crystalline
+          # latest=false everywhere: the default latest=auto appends a bare
+          # `latest` to every semver tag list, so the with-model push (which
+          # runs last) would silently steal `latest` from the runtime image.
+          # Only the explicit raw tag below moves `latest`, and only here.
+          flavor: |
+            latest=false
           tags: |
             type=semver,pattern={{version}}
             type=raw,value=latest
@@ -643,6 +649,10 @@ jobs:
           target: runtime
           platforms: linux/amd64,linux/arm64
           push: true
+          # No provenance attestations: they publish as extra unknown/unknown
+          # platform entries in the image index, which registry UIs list next
+          # to the real platforms, and nothing consumes them here.
+          provenance: false
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 
@@ -651,6 +661,10 @@ jobs:
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ghcr.io/jordiboehme/crystalline
+          # See the runtime metadata step: without latest=false this variant
+          # would also emit `latest` and overwrite the runtime image's tag.
+          flavor: |
+            latest=false
           tags: |
             type=semver,pattern={{version}},suffix=-with-model
             type=raw,value=with-model
@@ -694,6 +708,8 @@ jobs:
           target: runtime-with-model
           platforms: linux/amd64,linux/arm64
           push: true
+          # Same as the runtime push: no unknown/unknown attestation entries.
+          provenance: false
           tags: ${{ steps.meta_with_model.outputs.tags }}
           labels: ${{ steps.meta_with_model.outputs.labels }}
 
