@@ -653,6 +653,85 @@ fn delete_force_deletes_without_prompting() {
     );
 }
 
+/// The WAL sidecar path turso writes next to a local db file.
+fn wal_path(db: &Path) -> PathBuf {
+    let mut s = db.as_os_str().to_os_string();
+    s.push("-wal");
+    PathBuf::from(s)
+}
+
+/// True when the WAL sidecar is either absent or truncated to 0 bytes - the
+/// two shapes `PRAGMA wal_checkpoint(TRUNCATE)` can leave behind.
+fn wal_is_truncated(db: &Path) -> bool {
+    match std::fs::metadata(wal_path(db)) {
+        Ok(meta) => meta.len() == 0,
+        Err(_) => true,
+    }
+}
+
+#[test]
+fn incremental_reindex_truncates_the_wal() {
+    let work = tempfile::tempdir().unwrap();
+    let (config, db) = seed_two_engrams(work.path());
+
+    // seed_two_engrams already ran `domain add`, which syncs; the WAL sidecar
+    // should reflect that write. A plain `sync` afterward covers change 2:
+    // the direct sync path checkpoints too, even with nothing new to index.
+    bin()
+        .args(["sync", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .success();
+    assert!(
+        wal_is_truncated(&db),
+        "sync (direct, non-daemon path) truncates the WAL: {:?}",
+        std::fs::metadata(wal_path(&db)).map(|m| m.len())
+    );
+
+    // Add a third engram so the incremental reindex below has a real delta to
+    // merge, not a no-op scan.
+    write(
+        &work.path().join("kb"),
+        "gamma.md",
+        "---\ntype: engram\ntitle: Gamma\npermalink: gamma\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nGamma body mentions zephyrtoken too.\n",
+    );
+
+    // reindex with NO --full: the incremental path. Before the fix this never
+    // calls checkpoint_wal, so a snapshot pipeline shipping index.db alone
+    // (sidecars deleted) would ship a stale database missing this delta.
+    bin()
+        .args(["reindex", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .success();
+    assert!(
+        wal_is_truncated(&db),
+        "incremental reindex (no --full) truncates the WAL: {:?}",
+        std::fs::metadata(wal_path(&db)).map(|m| m.len())
+    );
+
+    // The delta the WAL held is not lost: it was merged into the db file, not
+    // discarded, before the truncate.
+    let out = bin()
+        .args(["--json", "search", "zephyrtoken", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let search: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        search["total"].as_u64().unwrap(),
+        3,
+        "the incremental delta survived the WAL truncate: {search}"
+    );
+}
+
 #[test]
 fn domain_add_without_a_path_registers_at_the_default_domains_root() {
     let work = tempfile::tempdir().unwrap();
