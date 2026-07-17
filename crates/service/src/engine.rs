@@ -2527,7 +2527,7 @@ impl Engine {
         if let Value::Object(map) = &mut activity {
             map.insert(
                 "embedding_backlog".to_string(),
-                json!(coverage.total_chunks.saturating_sub(active_embedded)),
+                json!(coverage.backlog_for(&self.model_id)),
             );
         }
         let mut result = json!({
@@ -2555,6 +2555,18 @@ impl Engine {
             map.insert("origins".to_string(), self.origins_status_block().await);
         }
         Ok(result)
+    }
+
+    /// Chunks awaiting embedding for the active model: the figure `status_report`
+    /// exposes as `embedding_backlog`. Reads the cached coverage snapshot, so it
+    /// is cheap enough for the daemon's self-heal tick to poll; no per-chunk
+    /// scan.
+    pub async fn embedding_backlog(&self) -> Result<usize> {
+        let coverage = {
+            let store = self.store.lock().await;
+            store.embedding_coverage().await?
+        };
+        Ok(coverage.backlog_for(&self.model_id))
     }
 
     /// The domain-id set this instance should embed, or `None` for "all domains".

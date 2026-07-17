@@ -661,6 +661,12 @@ impl EmbeddingCoverage {
     pub fn has_active_embeddings(&self, model: &str) -> bool {
         self.embedded_for(model) > 0
     }
+
+    /// Chunks still awaiting embedding by the given model: the total minus what
+    /// that model has already embedded.
+    pub fn backlog_for(&self, model: &str) -> usize {
+        self.total_chunks.saturating_sub(self.embedded_for(model))
+    }
 }
 
 /// Which full-text path the store is using.

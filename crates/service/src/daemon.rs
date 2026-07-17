@@ -348,6 +348,18 @@ pub async fn run_serve(
         });
     }
 
+    // The embed self-heal tick: re-fires the event-driven embed worker on a low
+    // cadence whenever a backlog is left outstanding, so a transient provider
+    // failure that consumed the worker's signal does not strand the backlog
+    // until the next write. Never embeds inline (see run_embed_tick).
+    {
+        let e = engine.clone();
+        let rx = shared.watch();
+        tokio::spawn(async move {
+            run_embed_tick(e, EMBED_TICK, rx).await;
+        });
+    }
+
     // The optional HTTP endpoint.
     if let Some(addr) = http_addr.clone() {
         let e = engine.clone();
@@ -676,6 +688,43 @@ async fn run_origin_poller(engine: Arc<Engine>, mut shutdown: watch::Receiver<bo
             _ = ticker.tick() => {
                 engine.origin_poll_tick(Instant::now(), chrono::Utc::now()).await;
             }
+        }
+    }
+}
+
+/// How often the embed self-heal tick wakes to re-fire the worker when a
+/// backlog remains. Low by design: the worker is event-driven and this only
+/// closes the gap a transient provider failure opens, so it never needs to run
+/// often.
+const EMBED_TICK: Duration = Duration::from_secs(300);
+
+/// Re-fire the event-driven embed worker whenever a backlog is left outstanding,
+/// until shutdown. The worker only runs when a write signals it; a transient
+/// provider failure consumes that signal and would strand the backlog until the
+/// next write. Every `cadence` this checks the engine's backlog probe and, only
+/// when it is non-empty, sends one more signal on the worker channel. It never
+/// falls back to an inline embed when no worker is wired (an inline pass on this
+/// timer would reintroduce the request-path stall the worker exists to
+/// prevent), so an unwired tick is a silent no-op. The cadence is a parameter so
+/// a test can drive it fast; production passes [`EMBED_TICK`]. The first tick is
+/// consumed so a self-heal never races the startup embed.
+pub async fn run_embed_tick(
+    engine: Arc<Engine>,
+    cadence: Duration,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let mut ticker = tokio::time::interval(cadence);
+    ticker.tick().await;
+    loop {
+        tokio::select! {
+            _ = wait_true(&mut shutdown) => break,
+            _ = ticker.tick() => match engine.embedding_backlog().await {
+                Ok(0) => {}
+                Ok(_) => {
+                    engine.request_embed();
+                }
+                Err(err) => tracing::warn!("embed self-heal backlog probe failed: {err}"),
+            },
         }
     }
 }
