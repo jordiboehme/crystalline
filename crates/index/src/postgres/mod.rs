@@ -24,18 +24,57 @@
 //!   provider works on either backend; a dims change already invalidates every
 //!   stored vector through the existing staleness machinery, so the resize rides
 //!   that invalidation instead of adding a new one.
+//! - `ensure_embedding_width`'s `ALTER TABLE ... TYPE vector({dims})` changes the
+//!   `chunk.embedding` column's typmod, which is encoded in the row description
+//!   of any sqlx-cached prepared statement whose result row includes that raw
+//!   column. The pool has multiple connections; the ALTER only clears the plan
+//!   cache of the one connection that ran it (`clear_cached_statements` in
+//!   `ensure_embedding_width`), so any other pooled connection with a stale plan
+//!   still cached raises Postgres's "cached plan must not change result type" on
+//!   its next use. `replace_chunks`' carry SELECT is the only statement in this
+//!   module (or in `search`) that returns that raw column - an expression over
+//!   it (the `<=>` distance operator, which yields `float8`) or a statement that
+//!   only binds a vector parameter is unaffected and stays cached - so it is the
+//!   one exposed to the hazard.
+//!
+//!   Two fixes were tried and rejected before landing on the one below.
+//!   `.persistent(false)` (never cache the statement) looked right but breaks on
+//!   sqlx 0.9: that flag routes the statement through Postgres's unnamed
+//!   prepared statement, which does not survive being interleaved with the raw
+//!   `BEGIN`/`COMMIT` this module sends as plain SQL (see `begin()`) - every
+//!   statement on that connection then fails with "unnamed prepared statement
+//!   does not exist", observed deterministically across the whole parity suite,
+//!   not just the carry SELECT. Retrying the failed statement once in place,
+//!   after `clear_cached_statements` on just that connection, does not work
+//!   either: the carry SELECT runs inside `sync`'s explicit transaction (the raw
+//!   `BEGIN` in `begin()`), and Postgres aborts a transaction block on any error
+//!   raised inside it, so the retry's first statement fails again immediately
+//!   with "current transaction is aborted, commands ignored until end of
+//!   transaction block" rather than a fresh attempt - also confirmed against a
+//!   live database.
+//!
+//!   The fix instead prevents the stale plan from ever being reused:
+//!   `embedding_generation`, an `AtomicU64` on `PostgresStore`, is bumped every
+//!   time `ensure_embedding_width` actually runs its ALTER. `replace_chunks`
+//!   folds the current generation into its carry SELECT's SQL text as a
+//!   trailing comment, so a width change gives the statement different SQL
+//!   text and therefore a different sqlx cache key; every connection, not just
+//!   the one that ran the DDL, prepares fresh the next time it runs the carry
+//!   SELECT after a resize, and the plan it had cached under the old
+//!   generation's text simply ages out of the LRU unused.
 
 mod migrations;
 mod search;
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use sqlx::pool::PoolConnection;
 use sqlx::postgres::{PgArguments, PgPoolOptions, PgRow};
 use sqlx::query::Query;
-use sqlx::{AssertSqlSafe, PgConnection, PgPool, Postgres, Row};
+use sqlx::{AssertSqlSafe, Connection, PgConnection, PgPool, Postgres, Row};
 use tokio::sync::{Mutex as TokioMutex, MutexGuard};
 
 use crate::error::{IndexError, Result};
@@ -68,6 +107,16 @@ pub struct PostgresStore {
     // until the first call; set by `ensure_embedding_width`, never by wipe
     // (wiping rows never changes the column type).
     embedding_width: Mutex<Option<i64>>,
+    // Bumped by `ensure_embedding_width` every time its `ALTER TABLE ... TYPE
+    // vector({dims})` actually runs (never on the already-matches fast path).
+    // `replace_chunks` folds the current value into its carry SELECT's SQL
+    // text, which changes sqlx's cache key and so guarantees a fresh prepare
+    // after every width change; see the module doc for why this exists.
+    // `AtomicU64` rather than the `Mutex<_>` used elsewhere because it is only
+    // ever read or bumped, never checked-and-set as part of a larger decision;
+    // `Ordering::Relaxed` is enough since the engine mutex already serializes
+    // all store access, so there is never a concurrent reader to order against.
+    embedding_generation: AtomicU64,
     // The last computed embedding coverage snapshot, shared by effective_mode,
     // the search staleness gate and CLI status so they issue one aggregate scan,
     // not three. `None` means recompute on the next read. Interior mutability with
@@ -147,6 +196,7 @@ impl PostgresStore {
             schema,
             tag_cache: Mutex::new(HashMap::new()),
             embedding_width: Mutex::new(None),
+            embedding_generation: AtomicU64::new(0),
             coverage_cache: Mutex::new(None),
         })
     }
@@ -262,6 +312,18 @@ impl PostgresStore {
     /// Idempotent and cheap once the width is known: a single cached
     /// comparison, or failing that one `pg_attribute` lookup, on every call
     /// that already matches.
+    ///
+    /// The `ALTER ... TYPE` below changes the `chunk.embedding` column's
+    /// typmod, which invalidates any sqlx-cached prepared statement whose
+    /// result row includes that raw column (Postgres error: "cached plan must
+    /// not change result type"). The `clear_cached_statements` at the end
+    /// sheds `conn`'s own stale plans but cannot reach the pool's other
+    /// connections, so on a successful resize this bumps
+    /// `embedding_generation`: `replace_chunks`' carry SELECT folds the new
+    /// value into its SQL text, which changes sqlx's cache key and forces a
+    /// fresh prepare everywhere, on this connection and every other one,
+    /// without needing to reach them. See the module doc for the full hazard
+    /// and why that statement cannot instead retry in place.
     async fn ensure_embedding_width(&self, conn: &mut PgConnection, dims: usize) -> Result<()> {
         let dims = dims as i64;
         if *self.embedding_width.lock().unwrap() == Some(dims) {
@@ -300,6 +362,19 @@ impl PostgresStore {
         .execute(&mut *conn)
         .await
         .map_err(IndexError::from)?;
+        // The DDL above just changed the `chunk.embedding` column's typmod, so
+        // any plan this connection had cached for a statement returning that
+        // column is now stale. `clear_cached_statements` sheds `conn`'s own
+        // stale plans directly; it only reaches this one connection, so it is
+        // a courtesy for whichever statements this connection still might run
+        // under the old SQL text (there are none, `replace_chunks` is the only
+        // one and it always carries the current generation), not what makes
+        // the pool's other connections safe. `embedding_generation` below is
+        // what does that, by changing the cache key everywhere at once.
+        Connection::clear_cached_statements(&mut *conn)
+            .await
+            .map_err(IndexError::from)?;
+        self.embedding_generation.fetch_add(1, Ordering::Relaxed);
         *self.embedding_width.lock().unwrap() = Some(dims);
         Ok(())
     }
@@ -1119,13 +1194,28 @@ impl Store for PostgresStore {
         // an edit only re-embeds the paragraphs that changed. The fingerprint
         // folds in the model id, so a chunk embedded by a different model does
         // not match and is left for re-embedding.
-        let existing = sqlx::query(
-            "SELECT text_hash, model, dims, embedding FROM chunk WHERE engram_id=$1 AND embedding IS NOT NULL",
-        )
-        .bind(eid)
-        .fetch_all(&mut *c)
-        .await
-        .map_err(IndexError::from)?;
+        //
+        // This selects the raw `embedding` column, whose type includes the
+        // column's typmod, so it is the one statement in this module exposed to
+        // `ensure_embedding_width`'s DDL-vs-cached-plan hazard (see the module
+        // doc). The trailing `/* w{generation} */` comment is inert to Postgres but not
+        // to sqlx's statement cache: it makes the SQL text - and so the cache
+        // key - change every time the column is resized, which forces a fresh
+        // prepare against the current column shape on whichever connection runs
+        // this next, without needing to reach every pooled connection directly.
+        // This runs inside `sync`'s explicit transaction (the raw `BEGIN` in
+        // `begin()`), where a failed statement would abort the whole
+        // transaction with no way to recover by retrying in place, which is why
+        // prevention rather than retry is the fix here.
+        let generation = self.embedding_generation.load(Ordering::Relaxed);
+        let carry_sql = format!(
+            "SELECT text_hash, model, dims, embedding FROM chunk WHERE engram_id=$1 AND embedding IS NOT NULL /* w{generation} */"
+        );
+        let existing = sqlx::query(AssertSqlSafe(carry_sql))
+            .bind(eid)
+            .fetch_all(&mut *c)
+            .await
+            .map_err(IndexError::from)?;
         let mut carry: HashMap<String, (Option<String>, Option<i64>, pgvector::Vector)> =
             HashMap::new();
         for r in &existing {
