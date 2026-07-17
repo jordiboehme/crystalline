@@ -41,9 +41,11 @@ pub(crate) fn default_domain_name(repo: &str) -> String {
 /// The domain folder a domain-creating call uses when the caller does not
 /// supply one: `<root>/<domain>`, where `root` is the configured domains root
 /// (`GlobalConfig::domains_root`, `~/Documents/Crystalline` by default). Kept a
-/// free function over the already-resolved root so both `origin_add` and the
-/// local-domain path share one placement rule.
-pub(crate) fn default_domain_folder(root: &Path, domain: &str) -> PathBuf {
+/// free function over the already-resolved root so both `origin_add`, the
+/// local-domain path and the standalone CLI's `domain add` (which has no
+/// engine to call into) share one placement rule. Public (re-exported from
+/// the crate root) for that last caller.
+pub fn default_domain_folder(root: &Path, domain: &str) -> PathBuf {
     root.join(domain)
 }
 

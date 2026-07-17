@@ -959,9 +959,9 @@ fn status_with_a_daemon_renders_text_with_the_daemon_line() {
     assert!(value["domains"].is_array(), "{value}");
 }
 
-/// Without a daemon, `status` says so in its first line and renders the same
-/// human shape from a direct index read; a registered domain that was never
-/// synced shows as not indexed yet rather than disappearing.
+/// Without a daemon and with nothing registered, `status` says so in its
+/// first line and points a first-time user at `domain add` rather than
+/// `sync` - there is nothing to sync yet either.
 #[test]
 fn status_without_a_daemon_says_not_running() {
     let env = Env::new("status-down");
@@ -972,7 +972,35 @@ fn status_without_a_daemon_says_not_running() {
         out.starts_with("Daemon: not running; reading the index directly"),
         "{out}"
     );
+    assert!(
+        out.contains("No domains registered yet. Run: crystalline domain add"),
+        "{out}"
+    );
+}
+
+/// Without a daemon, once a domain is registered but never synced, `status`
+/// still renders the same human shape from a direct index read and shows the
+/// domain as not indexed yet rather than disappearing - `sync` is now the
+/// right pointer, unlike the nothing-registered case above.
+#[test]
+fn status_without_a_daemon_and_no_index_reports_registered_domains_as_not_indexed_yet() {
+    let env = Env::new("status-down-registered");
+    std::fs::create_dir_all(env.config_path().parent().unwrap()).unwrap();
+    std::fs::write(
+        env.config_path(),
+        "domains:\n  eng:\n    path: /tmp/does-not-need-to-exist\n",
+    )
+    .unwrap();
+
+    let (ok, out) = env.run(&["status"]);
+    assert!(ok, "{out}");
+    assert!(
+        out.starts_with("Daemon: not running; reading the index directly"),
+        "{out}"
+    );
     assert!(out.contains("No index at "), "{out}");
+    assert!(out.contains("Run: crystalline sync"), "{out}");
+    assert!(out.contains("eng\t(not indexed yet)"), "{out}");
 }
 
 /// `--db`/`--config` overrides bypass the daemon on purpose; the first line

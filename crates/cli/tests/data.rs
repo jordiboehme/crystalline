@@ -564,3 +564,136 @@ fn domain_add_no_sync_registers_without_indexing() {
         "--no-sync leaves the domain unindexed: {search}"
     );
 }
+
+#[test]
+fn status_human_output_with_no_domains_points_at_domain_add() {
+    let work = tempfile::tempdir().unwrap();
+    let config = work.path().join("config.yaml");
+    let db = work.path().join("state/index.db");
+
+    // Neither the config nor the index exists yet: a first run against a
+    // clean machine before any domain has been registered.
+    let out = bin()
+        .args(["status", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("No domains registered yet. Run: crystalline domain add"),
+        "status with nothing registered points at domain add: {stdout}"
+    );
+    assert!(
+        !stdout.contains("Run: crystalline sync"),
+        "status with nothing registered must not send a first-time user to sync: {stdout}"
+    );
+}
+
+#[test]
+fn delete_without_force_still_deletes_when_stdin_is_not_a_terminal() {
+    let work = tempfile::tempdir().unwrap();
+    let (config, db) = seed_two_engrams(work.path());
+
+    // assert_cmd spawns the child with a closed (non-terminal) stdin, so the
+    // confirmation prompt `delete` would otherwise print is skipped entirely
+    // here - a script piping into `delete` must never block on it. This is
+    // the load-bearing case: without the terminal check, a naive prompt
+    // would read EOF and hang or misbehave under a real pipe.
+    bin()
+        .args(["delete", "alpha", "eng", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .success();
+
+    let out = bin()
+        .args(["--json", "search", "zephyrtoken", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    let search: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        search["total"].as_u64().unwrap(),
+        1,
+        "alpha was deleted with no hang and no confirmation block: {search}"
+    );
+}
+
+#[test]
+fn delete_force_deletes_without_prompting() {
+    let work = tempfile::tempdir().unwrap();
+    let (config, db) = seed_two_engrams(work.path());
+
+    bin()
+        .args(["delete", "beta", "eng", "--force", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .success();
+
+    let out = bin()
+        .args(["--json", "search", "zephyrtoken", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    let search: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        search["total"].as_u64().unwrap(),
+        1,
+        "beta was deleted with --force and no prompt: {search}"
+    );
+}
+
+#[test]
+fn domain_add_without_a_path_registers_at_the_default_domains_root() {
+    let work = tempfile::tempdir().unwrap();
+    let config = work.path().join("config.yaml");
+    let domains_root = work.path().join("root");
+    std::fs::write(
+        &config,
+        format!("domains_root: {}\n", domains_root.display()),
+    )
+    .unwrap();
+
+    // `domain add` never auto-scaffolds a MANIFEST.md, even at the default
+    // root: it needs the same pre-existing one an explicit path would, via
+    // `domain init`.
+    let default_path = domains_root.join("eng");
+    bin()
+        .args(["domain", "init"])
+        .arg(&default_path)
+        .args(["--name", "eng"])
+        .assert()
+        .success();
+
+    let db = work.path().join("state/index.db");
+    let out = bin()
+        .args(["domain", "add", "eng", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let canonical_default = std::fs::canonicalize(&default_path).unwrap();
+    assert!(
+        stdout.contains(&canonical_default.display().to_string()),
+        "domain add without a path prints the resolved default root: {stdout}"
+    );
+
+    let saved = std::fs::read_to_string(&config).unwrap();
+    assert!(
+        saved.contains(&canonical_default.display().to_string()),
+        "config persists the domain rooted at the default: {saved}"
+    );
+}

@@ -23,15 +23,26 @@ mod render;
 
 /// Local-first knowledge management for humans and AI agents.
 #[derive(Parser, Debug)]
-#[command(name = "crystalline", version, about, long_about = None)]
+#[command(
+    name = "crystalline",
+    version,
+    about,
+    long_about = None,
+    after_help = "Quickstart:
+  crystalline install claude-code
+  crystalline domain add engineering ~/knowledge/engineering
+  crystalline sync
+  crystalline write engineering \"Retry queue gotcha\" --content \"...\"
+  crystalline search \"retry queue\""
+)]
 struct Cli {
     /// Emit machine-readable JSON instead of human-readable text. Shorthand
     /// for `--format json` on subcommands that support it.
     #[arg(long, global = true)]
     json: bool,
 
-    /// Override the index database path. Defaults to the state-directory
-    /// `index.db`. Essential for tests and for pointing at a scratch index.
+    /// Override the index database path. Defaults to the state directory's
+    /// `index.db`. Useful for a scratch or alternate index.
     #[arg(long, global = true)]
     db: Option<PathBuf>,
 
@@ -389,6 +400,10 @@ enum Command {
         identifier: String,
         /// The engram's domain.
         domain: String,
+        /// Skip the confirmation prompt. Implied when stdin is not a live
+        /// terminal or `--json` is set, so a script never hangs on it.
+        #[arg(long)]
+        force: bool,
         /// Load the global config from this file instead of the default path.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -595,10 +610,11 @@ enum DomainCommand {
     Add {
         /// The domain name used everywhere it is referenced.
         name: String,
-        /// The domain root directory. Omitted for a virtual domain. With
-        /// `--origin`, this is where the team domain lives on this machine
-        /// (existing files are kept); defaults to
-        /// ~/Documents/Crystalline/<name> when omitted.
+        /// The domain root directory. Omitted for a virtual domain. For a
+        /// file domain, defaults to <domains_root>/<name>
+        /// (~/Documents/Crystalline/<name> unless configured) when omitted;
+        /// with `--origin` this is where the team domain lives on this
+        /// machine, and existing files there are kept.
         path: Option<PathBuf>,
         /// Register a virtual domain: engrams live in the database, not on disk.
         /// Incompatible with a path argument.
@@ -1002,11 +1018,18 @@ fn main() -> anyhow::Result<()> {
             | Command::Read { .. }
             | Command::Edit { .. }
             | Command::Move { .. }
-            | Command::Delete { .. }
             | Command::Search { .. }
             | Command::Context { .. }
             | Command::Recent { .. }),
         ) => on_runtime(move || run_data(cmd, cli.db, cli.json)),
+        Some(Command::Delete {
+            identifier,
+            domain,
+            force,
+            config,
+        }) => {
+            on_runtime(move || delete_dispatch(identifier, domain, force, config, cli.db, cli.json))
+        }
         Some(Command::Hook { event }) => match event {
             HookEvent::Stop => {
                 hook::run_stop();
@@ -1512,9 +1535,10 @@ fn print_origin_status(data: &serde_json::Value, json: bool) {
                 c["path"].as_str().unwrap_or("")
             );
         }
+        let last_checked = d["last_checked"].as_str().map(cmd::relative_time);
         println!(
             "  last checked: {}",
-            d["last_checked"].as_str().unwrap_or("never")
+            last_checked.as_deref().unwrap_or("never")
         );
     }
     for e in data["errors"].as_array().unwrap_or(&empty) {
@@ -1664,15 +1688,6 @@ async fn run_data(command: Command, db: Option<PathBuf>, json: bool) -> anyhow::
                 "destination_domain": destination_domain,
                 "update_links": !no_update_links,
             }),
-            config,
-        ),
-        Command::Delete {
-            identifier,
-            domain,
-            config,
-        } => (
-            "delete_engram",
-            json!({ "identifier": identifier, "domain": domain }),
             config,
         ),
         Command::Search {
@@ -1902,6 +1917,57 @@ async fn domain_export_dispatch(
     Ok(())
 }
 
+/// `delete`: remove an engram, resolved through the same `delete_engram` tool
+/// the MCP surface uses. Prompts for confirmation first when a person is
+/// plausibly at the keyboard - stdin is a live terminal, `--force` was not
+/// given and `--json` was not requested - by resolving the target's address
+/// through `read_engram` (the same resolution `delete_engram` itself does)
+/// and printing it before asking. Every other combination - piped stdin,
+/// `--force`, `--json` - deletes immediately with no prompt, exactly the
+/// behavior before this flag existed: a script piping into `delete` must
+/// never hang waiting on a question nobody can answer.
+async fn delete_dispatch(
+    identifier: String,
+    domain: String,
+    force: bool,
+    config: Option<PathBuf>,
+    db: Option<PathBuf>,
+    json: bool,
+) -> anyhow::Result<()> {
+    use serde_json::json as j;
+    if std::io::stdin().is_terminal() && !force && !json {
+        let resolved = crystalline_service::run_tool(
+            "read_engram",
+            j!({ "identifier": identifier, "domain": domain }),
+            db.as_deref(),
+            config.as_deref(),
+        )
+        .await?;
+        let url = resolved
+            .get("url")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("crystalline://{domain}/{identifier}"));
+        print!("delete {url}? [y/N] ");
+        std::io::stdout().flush()?;
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if !matches!(answer.trim(), "y" | "Y") {
+            println!("aborted");
+            return Ok(());
+        }
+    }
+    let value = crystalline_service::run_tool(
+        "delete_engram",
+        j!({ "identifier": identifier, "domain": domain }),
+        db.as_deref(),
+        config.as_deref(),
+    )
+    .await?;
+    print_value(&value, json);
+    Ok(())
+}
+
 /// `mcp`: attach to a running daemon (or start one), or run the stack
 /// in-process, and serve MCP over stdio. The server starts cleanly with no
 /// domains registered; domains are created at runtime through the `add_domain`
@@ -1968,9 +2034,11 @@ async fn domain_add_dispatch(
         return Ok(());
     }
 
-    let path =
-        path.ok_or_else(|| anyhow::anyhow!("`domain add` requires a path (or use --virtual)"))?;
-    let abs = cmd::domain_add_register(&name, &path, config.as_deref())?;
+    // An absent path defaults to `<domains_root>/<name>` inside
+    // `domain_add_register`, mirroring the MCP `add_domain` tool's default
+    // placement; the resolved directory still needs a pre-scaffolded
+    // MANIFEST.md either way.
+    let abs = cmd::domain_add_register(&name, path.as_deref(), config.as_deref())?;
     if no_sync {
         cmd::print_domain_add_no_sync(&name, &abs, json);
         return Ok(());
