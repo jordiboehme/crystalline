@@ -3,11 +3,13 @@
 //! path, the min-similarity cutoff and the unchanged-file zero-rework guarantee.
 
 use std::path::Path;
+use std::sync::Mutex;
 
 use async_trait::async_trait;
+use crystalline_index::embed::estimate_tokens;
 use crystalline_index::{
-    ChunkParams, EmbeddingProvider, IndexError, Result, SearchMode, SearchQuery, Store, TursoStore,
-    chunk_engram, run_embedding_pass, sync_domain_with,
+    ChunkJob, ChunkParams, EmbeddingProvider, IndexError, Result, SearchMode, SearchQuery, Store,
+    TursoStore, chunk_engram, order_jobs_for_batching, run_embedding_pass, sync_domain_with,
 };
 
 // --- chunking (no store) -----------------------------------------------------
@@ -93,6 +95,42 @@ fn fingerprints_are_stable_and_model_scoped() {
         ca1[0].text_hash, cb[0].text_hash,
         "the model id namespaces the fingerprint"
     );
+}
+
+// --- batch ordering (no store) ------------------------------------------------
+
+fn job(chunk_id: i64, text: &str) -> ChunkJob {
+    ChunkJob {
+        chunk_id,
+        engram_id: 1,
+        seq: 0,
+        text: text.to_string(),
+        text_hash: "h".to_string(),
+    }
+}
+
+#[test]
+fn order_jobs_for_batching_sorts_ascending_and_keeps_ties_stable() {
+    // Four jobs: two tie at the shortest length, one is medium, one is the
+    // longest. The two tied jobs start out separated by the longer ones so a
+    // non-stable sort could plausibly swap them.
+    let mut jobs = vec![
+        job(1, &"b".repeat(40)), // 10 tokens, longest
+        job(2, &"a".repeat(4)),  // 1 token, tie group, appears first
+        job(3, &"d".repeat(20)), // 5 tokens, medium
+        job(4, &"c".repeat(4)),  // 1 token, tie group, appears second
+    ];
+    order_jobs_for_batching(&mut jobs);
+    let ids: Vec<i64> = jobs.iter().map(|j| j.chunk_id).collect();
+    assert_eq!(
+        ids,
+        vec![2, 4, 3, 1],
+        "ascending by estimated tokens, ties (2 before 4) keep their original order"
+    );
+    let tokens: Vec<usize> = jobs.iter().map(|j| estimate_tokens(&j.text)).collect();
+    for w in tokens.windows(2) {
+        assert!(w[0] <= w[1], "non-decreasing token counts: {tokens:?}");
+    }
 }
 
 // --- fake provider -----------------------------------------------------------
@@ -516,4 +554,79 @@ async fn editing_one_paragraph_only_reembeds_that_chunk() {
         coverage.embedded_chunks,
         coverage.total_chunks
     );
+}
+
+// --- batch ordering (store) ---------------------------------------------------
+
+/// A [`FakeProvider`] that also records every `embed` call's input texts, so a
+/// test can inspect batch composition after the fact.
+struct RecordingProvider {
+    model: String,
+    calls: Mutex<Vec<Vec<String>>>,
+}
+
+impl RecordingProvider {
+    fn new(model: &str) -> RecordingProvider {
+        RecordingProvider {
+            model: model.to_string(),
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl EmbeddingProvider for RecordingProvider {
+    async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        self.calls.lock().unwrap().push(texts.to_vec());
+        Ok(texts.iter().map(|t| embed_one(t)).collect())
+    }
+    fn model_id(&self) -> &str {
+        &self.model
+    }
+    fn dims(&self) -> usize {
+        8
+    }
+    fn max_input_tokens(&self) -> usize {
+        512
+    }
+}
+
+#[tokio::test]
+async fn run_embedding_pass_batches_jobs_length_ordered() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // Forty single-paragraph engrams (well over one 16-chunk batch) with
+    // strictly increasing body lengths, so each becomes exactly one chunk with
+    // a distinct estimated token count. Filesystem walk order does not sort
+    // these by length, so a monotonic embed order can only come from
+    // `order_jobs_for_batching`.
+    for i in 0..40 {
+        let body = "word ".repeat(i + 1);
+        write(
+            root,
+            &format!("e{i}.md"),
+            &engram(&format!("E{i}"), &format!("e{i}"), "", &body),
+        );
+    }
+    let store = open().await;
+    let provider = RecordingProvider::new("fake-8");
+    let params = ChunkParams::for_model(provider.model_id());
+    sync_domain_with(&store, "d", root, &params).await.unwrap();
+    run_embedding_pass(&store, &provider, |_, _| {})
+        .await
+        .unwrap();
+
+    let calls = provider.calls.lock().unwrap();
+    assert!(
+        calls.len() > 1,
+        "the corpus spans more than one embed batch"
+    );
+    let flattened: Vec<usize> = calls.iter().flatten().map(|t| estimate_tokens(t)).collect();
+    assert!(flattened.len() >= 40, "one chunk per engram");
+    for w in flattened.windows(2) {
+        assert!(
+            w[0] <= w[1],
+            "batches are length-ordered across the whole pass: {flattened:?}"
+        );
+    }
 }

@@ -25,7 +25,7 @@ pub mod turso;
 
 pub use embed::{
     ChunkParams, EmbedReport, EmbeddingProvider, ModelDownload, chunk_engram, configured_model_id,
-    download_local_model, provider_from_config, run_embedding_pass,
+    download_local_model, order_jobs_for_batching, provider_from_config, run_embedding_pass,
 };
 pub use error::{IndexError, Result};
 pub use factory::open_store;

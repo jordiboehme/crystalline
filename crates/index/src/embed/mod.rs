@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use crystalline_core::config::EmbeddingsConfig;
 
 use crate::error::{IndexError, Result};
-use crate::store::{EmbeddingRow, Store};
+use crate::store::{ChunkJob, EmbeddingRow, Store};
 
 pub use chunk::{
     ChunkParams, DEFAULT_MAX_TOKENS, DEFAULT_MODEL_ID, chunk_engram, chunk_engram_with,
@@ -137,6 +137,19 @@ pub struct EmbedReport {
     pub batches: usize,
 }
 
+/// Order jobs ascending by estimated token count before batching.
+///
+/// The local tokenizer pads every batch to its longest member
+/// (`PaddingStrategy::BatchLongest`), so a batch that mixes one long chunk into
+/// fifteen short ones pays the long sequence's cost sixteen times over. Sorting
+/// first makes batches length-homogeneous and cuts that padding waste on full
+/// passes. Correctness never depends on batch order: each vector is written
+/// back against its own `chunk_id`. The sort is stable so equal-length jobs
+/// keep the order the store returned them in.
+pub fn order_jobs_for_batching(jobs: &mut [ChunkJob]) {
+    jobs.sort_by_key(|job| estimate_tokens(&job.text));
+}
+
 /// Embed every chunk that needs it for the active provider's model, in batches,
 /// writing the vectors back through the store. `progress` is called after each
 /// batch with `(done, total)`.
@@ -150,9 +163,10 @@ pub async fn run_embedding_pass(
 ) -> Result<EmbedReport> {
     // The standalone `sync --embed` / `reindex --embed` fill embeds every domain
     // (`None`); the daemon's background queue scopes its own pass instead.
-    let jobs = store
+    let mut jobs = store
         .chunks_needing_embedding(provider.model_id(), None)
         .await?;
+    order_jobs_for_batching(&mut jobs);
     let total = jobs.len();
     if total == 0 {
         return Ok(EmbedReport::default());

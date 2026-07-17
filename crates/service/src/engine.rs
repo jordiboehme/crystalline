@@ -33,7 +33,8 @@ use crystalline_core::{
 use crystalline_index::{
     ChunkParams, DomainHost, DomainId, DomainKind, EmbeddingProvider, EngramDescriptor, EngramId,
     EngramRecord, FileStamp, HostClaim, RecentFilter, SearchMode, SearchQuery, Store, chunk_engram,
-    configured_model_id, parse_metadata_filters, provider_from_config, sync_domain_with,
+    configured_model_id, order_jobs_for_batching, parse_metadata_filters, provider_from_config,
+    sync_domain_with,
 };
 use crystalline_remote::ops;
 use crystalline_remote::{
@@ -2582,7 +2583,7 @@ impl Engine {
         // collaboration mode the scan is scoped to the file domains this instance
         // hosts plus all virtual domains, so a non-host does not wastefully
         // re-embed a chunk another instance owns; standalone it embeds everything.
-        let jobs = {
+        let mut jobs = {
             let store = self.store.lock().await;
             let scope = self.embed_scope(&*store).await?;
             store
@@ -2592,6 +2593,10 @@ impl Engine {
         if jobs.is_empty() {
             return Ok(0);
         }
+        // Length-sort so batches pay for their longest member once instead of
+        // padding every short chunk out to whatever long one happened to land
+        // in the same batch.
+        order_jobs_for_batching(&mut jobs);
         let _activity = ActivityState::begin(&self.activity, "embed", None);
         let mut embedded = 0usize;
         for batch in jobs.chunks(EMBED_BATCH) {
