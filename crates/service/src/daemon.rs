@@ -386,6 +386,11 @@ pub async fn run_serve(
     // instance hosts nothing.
     engine.release_hosts().await;
 
+    // Best-effort WAL checkpoint so a stopped daemon's state dir holds a clean
+    // single-file db, backup and copy friendly. Never blocks or fails
+    // shutdown: checkpoint_wal logs and swallows any error itself.
+    engine.checkpoint_wal().await;
+
     // Dropping ownership releases the lock and removes the socket and lock files.
     drop(ownership);
     if !daemon_flag {

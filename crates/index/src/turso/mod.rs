@@ -119,8 +119,20 @@ impl TursoStore {
         //   neither errors nor takes effect. The probe confirmed this -
         //   `PRAGMA wal_autocheckpoint = 1000` returned `Ok`, but a
         //   subsequent `PRAGMA wal_autocheckpoint` query returned no rows.
-        //   Not set here; wal_checkpoint(TRUNCATE) above is the mitigation for
-        //   WAL growth instead.
+        //   Not set here, and not needed: a source read of vendored
+        //   turso_core 0.7.0 (storage/wal.rs, storage/pager.rs) confirms the
+        //   engine passive-checkpoints on every commit once un-backfilled
+        //   frames pass a hardcoded threshold of 1000, and separately
+        //   restarts the WAL file from the start once fully backfilled, both
+        //   default-on for the plain local-database path this store uses. So
+        //   the WAL never grows unbounded on its own; it is bounded near
+        //   whatever burst set its high-water mark. What the engine does not
+        //   do is zero the file: passive checkpoints backfill without
+        //   truncating, and its own last-connection shutdown truncate never
+        //   fires here because these bindings' `Connection` has no
+        //   Drop-close and this store never calls `close()`. wal_checkpoint
+        //   (TRUNCATE) above is reclamation of that high-water mark, not a
+        //   substitute for growth control the engine already provides.
         conn.execute("PRAGMA busy_timeout = 5000", ()).await?;
 
         let schema_version = migrations::apply(&conn).await?;

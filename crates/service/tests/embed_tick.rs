@@ -3,6 +3,9 @@
 //! the next write. This periodic tick re-fires the worker while a backlog
 //! remains and stays silent when there is none, and exits on shutdown.
 
+mod support;
+
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,6 +14,7 @@ use crystalline_index::{Store, TursoStore};
 use crystalline_service::daemon::run_embed_tick;
 use crystalline_service::engine::Engine;
 use crystalline_service::params::*;
+use support::CountingEmbedder;
 use tokio::sync::Mutex;
 
 /// An engine over a config with a single virtual domain named `notes`.
@@ -109,4 +113,104 @@ async fn tick_stays_silent_with_no_backlog() {
 
     shutdown_tx.send(true).unwrap();
     let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+}
+
+// --- WAL hygiene -------------------------------------------------------------
+
+/// The WAL sidecar path turso writes next to a local db file. Mirrors the CLI
+/// test helpers in crates/cli/tests/data.rs.
+fn wal_path(db: &Path) -> PathBuf {
+    let mut s = db.as_os_str().to_os_string();
+    s.push("-wal");
+    PathBuf::from(s)
+}
+
+/// True when the WAL sidecar is either absent or truncated to 0 bytes - the
+/// two shapes `PRAGMA wal_checkpoint(TRUNCATE)` can leave behind.
+fn wal_is_truncated(db: &Path) -> bool {
+    match std::fs::metadata(wal_path(db)) {
+        Ok(meta) => meta.len() == 0,
+        Err(_) => true,
+    }
+}
+
+#[tokio::test]
+async fn checkpoint_wal_truncates_the_sidecar() {
+    // A real file-backed db: the sidecar this test asserts on does not exist
+    // for an in-memory store.
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("index.db");
+    let store = TursoStore::open(&db).await.unwrap();
+    let store: Arc<Mutex<dyn Store>> = Arc::new(Mutex::new(store));
+    let engine = virtual_engine(store);
+
+    engine
+        .write_engram(&write_params(
+            "Note",
+            "a body long enough to leave a non-empty WAL sidecar before the checkpoint",
+        ))
+        .await
+        .unwrap();
+    assert!(
+        !wal_is_truncated(&db),
+        "the write left the WAL non-empty: {:?}",
+        std::fs::metadata(wal_path(&db)).map(|m| m.len())
+    );
+
+    engine.checkpoint_wal().await;
+    assert!(
+        wal_is_truncated(&db),
+        "checkpoint_wal truncates the sidecar: {:?}",
+        std::fs::metadata(wal_path(&db)).map(|m| m.len())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn embed_worker_checkpoints_the_wal_after_a_pass() {
+    // A real file-backed db, driven through the same run_embed_worker loop the
+    // daemon spawns, so this exercises the post-embed-pass checkpoint call
+    // site, not just Engine::checkpoint_wal in isolation.
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("index.db");
+    let store = TursoStore::open(&db).await.unwrap();
+    let store: Arc<Mutex<dyn Store>> = Arc::new(Mutex::new(store));
+    let (embed_tx, embed_rx) = tokio::sync::mpsc::unbounded_channel();
+    let engine = Arc::new(virtual_engine(store).with_embed_channel(embed_tx));
+    let embedder = Arc::new(CountingEmbedder::new());
+    engine.set_provider(embedder.clone());
+
+    tokio::spawn(crystalline_service::engine::run_embed_worker(
+        engine.clone(),
+        embed_rx,
+    ));
+
+    // write_engram indexes and chunks synchronously but, like the real MCP
+    // and watcher paths, does not itself request a background pass; that is
+    // the self-heal tick's job (daemon::run_embed_tick) or, here, an explicit
+    // request mirroring it. The spawned worker consumes the signal, embeds
+    // via the provider and, per the change under test, checkpoints the WAL
+    // once the pass embeds a non-zero count.
+    engine
+        .write_engram(&write_params(
+            "Note",
+            "the body of a note that produces a chunk for the worker to embed",
+        ))
+        .await
+        .unwrap();
+    assert!(
+        engine.request_embed(),
+        "the wired channel accepts the request"
+    );
+
+    for _ in 0..200 {
+        if embedder.calls.load(std::sync::atomic::Ordering::SeqCst) > 0 && wal_is_truncated(&db) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!(
+        "the embed worker never checkpointed the WAL after its pass: embed calls={}, wal={:?}",
+        embedder.calls.load(std::sync::atomic::Ordering::SeqCst),
+        std::fs::metadata(wal_path(&db)).map(|m| m.len())
+    );
 }
