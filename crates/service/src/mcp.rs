@@ -422,9 +422,9 @@ impl McpServer {
             return result.map_err(to_error).and_then(ok);
         }
 
-        let before = self.engine.config().github_enabled();
+        let before = self.engine.github_enabled();
         self.apply_settings(&p).await?;
-        let after = self.engine.config().github_enabled();
+        let after = self.engine.github_enabled();
         if before != after
             && let Err(e) = peer.notify_tool_list_changed().await
         {
@@ -777,7 +777,7 @@ impl ServerHandler for McpServer {
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
         let read_only = self.engine.read_only();
-        let github_enabled = self.engine.config().github_enabled();
+        let github_enabled = self.engine.github_enabled();
         let provisioning_declared = self.engine.provisioning_declared();
         let mut tools = Self::tool_router().list_all();
         tools.retain(|t| {
@@ -808,7 +808,7 @@ impl ServerHandler for McpServer {
             return None;
         }
         if is_collab_tool(name) {
-            let github_enabled = self.engine.config().github_enabled();
+            let github_enabled = self.engine.github_enabled();
             if hidden_collab_tool(name, github_enabled, read_only) {
                 return None;
             }
