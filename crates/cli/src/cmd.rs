@@ -883,6 +883,16 @@ pub async fn sync(
         let store = store.lock().await;
         embed_pass(&*store, &cfg).await?;
     }
+
+    // Any sync, not just a full reindex, is a snapshot-preparation verb: a
+    // downstream pipeline may ship index.db as a single file (sidecars
+    // deleted), so the delta this sync just wrote must not sit stranded in
+    // the WAL. Merge and shrink it now rather than waiting for a natural
+    // checkpoint. A no-op on Postgres (no local WAL file).
+    {
+        let store = store.lock().await;
+        store.checkpoint_wal().await?;
+    }
     Ok(())
 }
 
@@ -969,12 +979,15 @@ pub async fn reindex(
         embed_pass(&*store, &cfg).await?;
     }
 
-    if full {
-        // A full reindex is the biggest single rewrite the database sees;
-        // shrink the WAL back down rather than leaving it to grow until the
-        // next natural checkpoint. A no-op on Postgres (no local WAL file);
-        // on Turso this replaces the downstream Docker image build's shell-out
-        // to `sqlite3` for the same purpose.
+    // Any reindex, full or incremental, is a snapshot-preparation verb: a
+    // downstream pipeline may ship index.db as a single file (sidecars
+    // deleted), so whatever this reindex (and the optional embed pass above)
+    // just wrote must not sit stranded in the WAL. Merge and shrink it now
+    // rather than leaving it to grow until the next natural checkpoint. A
+    // no-op on Postgres (no local WAL file); on Turso this replaces the
+    // downstream Docker image build's shell-out to `sqlite3` for the same
+    // purpose.
+    {
         let store = store.lock().await;
         store.checkpoint_wal().await?;
     }

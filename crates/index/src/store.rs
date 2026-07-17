@@ -901,11 +901,13 @@ pub trait Store: Send + Sync {
     async fn wipe(&self) -> Result<()>;
 
     /// Best-effort WAL checkpoint in TRUNCATE mode, shrinking a local WAL file
-    /// back down after a bulk rewrite (a full reindex or a wipe). The default
-    /// is a no-op, which is correct for Postgres: it has no local WAL file to
-    /// truncate. Turso overrides this with a real `PRAGMA
-    /// wal_checkpoint(TRUNCATE)` (confirmed to work by a runtime probe; see
-    /// the doc comment on `TursoStore::build`).
+    /// back down after a sync or reindex, full or incremental, or a wipe. Any
+    /// of these may precede a caller shipping the database file as a
+    /// single-file snapshot (sidecars deleted), so the WAL must not be left
+    /// holding an un-merged delta. The default is a no-op, which is correct
+    /// for Postgres: it has no local WAL file to truncate. Turso overrides
+    /// this with a real `PRAGMA wal_checkpoint(TRUNCATE)` (confirmed to work
+    /// by a runtime probe; see the doc comment on `TursoStore::build`).
     async fn checkpoint_wal(&self) -> Result<()> {
         Ok(())
     }
