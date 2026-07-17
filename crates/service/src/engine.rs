@@ -2674,6 +2674,22 @@ impl Engine {
         Ok(coverage.backlog_for(&self.model_id))
     }
 
+    /// Best-effort WAL checkpoint: reclaims disk after a burst of writes (a
+    /// bulk embed pass, daemon shutdown) by merging the WAL back into the main
+    /// db file and truncating it. The engine already bounds WAL growth on its
+    /// own (a passive checkpoint fires past a hardcoded un-backfilled-frame
+    /// threshold, see the PRAGMA probe comment on `TursoStore::build`), so
+    /// this call is disk hygiene, never growth control - callers must not
+    /// depend on it for correctness. Errors are logged and swallowed: never
+    /// let a checkpoint block or fail the caller. A no-op on Postgres via the
+    /// `Store::checkpoint_wal` trait default.
+    pub async fn checkpoint_wal(&self) {
+        let store = self.store.lock().await;
+        if let Err(e) = store.checkpoint_wal().await {
+            tracing::warn!("WAL checkpoint failed: {e}");
+        }
+    }
+
     /// The domain-id set this instance should embed, or `None` for "all domains".
     /// Outside collaboration mode it is `None` (embed everything). In
     /// collaboration mode it is the file domains this instance hosts plus every
@@ -4933,8 +4949,15 @@ pub async fn run_embed_worker(
 ) {
     while rx.recv().await.is_some() {
         while rx.try_recv().is_ok() {}
-        if let Err(e) = engine.embed_pending().await {
-            tracing::warn!("background embed failed: {e}");
+        match engine.embed_pending().await {
+            Ok(0) => {}
+            Ok(_) => {
+                // The engine passive-checkpoints on its own past a hardcoded
+                // un-backfilled-frame threshold, so this is disk reclamation
+                // of the post-bulk-embed high-water mark, not growth control.
+                engine.checkpoint_wal().await;
+            }
+            Err(e) => tracing::warn!("background embed failed: {e}"),
         }
     }
 }
