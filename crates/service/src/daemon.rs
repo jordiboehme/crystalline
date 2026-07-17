@@ -259,6 +259,11 @@ pub async fn run_serve(
         if read_only {
             eprintln!("crystalline serving read-only: content-mutating tools are disabled");
         }
+        if loaded.effective.domains.is_empty() {
+            eprintln!(
+                "no domains registered yet - agents can create one with add_domain, or run: crystalline domain add <name> <path>"
+            );
+        }
     }
 
     // The watcher arms every startup domain's watch and only then fires this
@@ -726,11 +731,24 @@ fn domain_roots(config: &GlobalConfig) -> Vec<(String, PathBuf)> {
 }
 
 /// The domain names whose root is a prefix of the event path.
+///
+/// `domains` roots are already canonical (see [`domain_roots`]), so a raw
+/// prefix match against the event path is tried first and needs no syscall.
+/// Only when that finds nothing is the event path itself canonicalized and
+/// retried, which still matches a root reached through a symlink.
 fn domains_for(path: &Path, domains: &[(String, PathBuf)]) -> Vec<String> {
+    let raw_hits: Vec<String> = domains
+        .iter()
+        .filter(|(_, root)| path.starts_with(root))
+        .map(|(name, _)| name.clone())
+        .collect();
+    if !raw_hits.is_empty() {
+        return raw_hits;
+    }
     let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     domains
         .iter()
-        .filter(|(_, root)| canonical.starts_with(root) || path.starts_with(root))
+        .filter(|(_, root)| canonical.starts_with(root))
         .map(|(name, _)| name.clone())
         .collect()
 }
@@ -930,6 +948,57 @@ mod tests {
         assert_eq!(
             cfg.allowed_hosts,
             vec!["localhost", "127.0.0.1", "::1", "muthur.lan"]
+        );
+    }
+
+    // domains_for: the raw prefix match must short-circuit before any
+    // canonicalize syscall, and the canonicalize fallback must still resolve
+    // an event path reached through a symlinked root.
+
+    #[test]
+    fn domains_for_matches_via_raw_prefix_without_canonicalizing() {
+        // A path that does not exist on disk still matches through the raw
+        // check, proving the fallback canonicalize call is never reached.
+        let root = PathBuf::from("/some/canonical/root");
+        let domains = vec![("domain".to_string(), root.clone())];
+        let event_path = root.join("sub/does-not-exist.md");
+        assert_eq!(
+            domains_for(&event_path, &domains),
+            vec!["domain".to_string()]
+        );
+    }
+
+    #[test]
+    fn domains_for_returns_empty_when_no_root_matches() {
+        let root = PathBuf::from("/some/canonical/root");
+        let domains = vec![("domain".to_string(), root)];
+        let event_path = PathBuf::from("/completely/unrelated/path/file.md");
+        assert!(domains_for(&event_path, &domains).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn domains_for_matches_a_symlinked_event_path_via_canonicalize_fallback() {
+        let base = tempfile::tempdir().unwrap();
+        let real_root = base.path().join("real");
+        std::fs::create_dir(&real_root).unwrap();
+        std::fs::write(real_root.join("note.md"), "body").unwrap();
+        // domain_roots stores the already-canonicalized root, so mirror that
+        // here rather than the raw pre-canonicalize path.
+        let canonical_root = std::fs::canonicalize(&real_root).unwrap();
+
+        let link = base.path().join("link");
+        std::os::unix::fs::symlink(&real_root, &link).unwrap();
+
+        let domains = vec![("domain".to_string(), canonical_root)];
+        // The event path travels through the symlink, so it does not
+        // textually start with the canonical root: only the canonicalize
+        // fallback resolves it.
+        let event_path = link.join("note.md");
+
+        assert_eq!(
+            domains_for(&event_path, &domains),
+            vec!["domain".to_string()]
         );
     }
 }

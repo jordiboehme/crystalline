@@ -1157,32 +1157,41 @@ pub fn import(
 }
 
 fn print_import_report(r: &crystalline_core::import::ImportReport, dry_run: bool) {
+    use std::io::Write as _;
+
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
     if dry_run {
-        println!("Dry run: no files were written.");
+        writeln!(out, "Dry run: no files were written.").unwrap();
     }
-    println!(
+    writeln!(
+        out,
         "{} converted, {} copied, {} skipped",
         r.files_converted, r.files_copied, r.files_skipped
-    );
-    println!(
+    )
+    .unwrap();
+    writeln!(
+        out,
         "type mapped: {}, temporal backfilled: {}, sentinels dropped: {}, prefixes stripped: {}, collisions: {}",
         r.type_mapped,
         r.temporal_backfilled,
         r.sentinels_dropped,
         r.prefixes_stripped,
         r.collisions
-    );
+    )
+    .unwrap();
     for w in &r.warnings {
-        println!("  warning: {w}");
+        writeln!(out, "  warning: {w}").unwrap();
     }
     for f in &r.files {
         if !f.changes.is_empty() {
-            println!("  {}", f.path);
+            writeln!(out, "  {}", f.path).unwrap();
             for c in &f.changes {
-                println!("    {c}");
+                writeln!(out, "    {c}").unwrap();
             }
         }
     }
+    out.flush().unwrap();
 }
 
 // --- connect github ------------------------------------------------------------
