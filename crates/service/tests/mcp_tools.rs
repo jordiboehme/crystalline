@@ -129,6 +129,7 @@ async fn list_tools_exposes_the_core_tools_plus_configure_and_add_domain() {
         "browse_domain",
         "validate_engrams",
         "infer_schema",
+        "vocabulary",
         "configure",
         "add_domain",
     ] {
@@ -145,7 +146,7 @@ async fn list_tools_exposes_the_core_tools_plus_configure_and_add_domain() {
             "{hidden} must be hidden while github.enabled is off: {names:?}"
         );
     }
-    assert_eq!(names.len(), 14, "exactly 14 tools: {names:?}");
+    assert_eq!(names.len(), 15, "exactly 15 tools: {names:?}");
 }
 
 /// The `configure` tool's `set` and `unset` inputs must advertise the plain
@@ -200,7 +201,7 @@ async fn read_only_hides_the_write_gated_tools() {
             "{hidden} must be hidden in read-only mode: {names:?}"
         );
     }
-    // The eight read tools remain.
+    // The nine read tools remain.
     for expected in [
         "read_engram",
         "search_engrams",
@@ -210,6 +211,7 @@ async fn read_only_hides_the_write_gated_tools() {
         "browse_domain",
         "validate_engrams",
         "infer_schema",
+        "vocabulary",
     ] {
         assert!(names.contains(&expected.to_string()), "missing {expected}");
     }
@@ -228,7 +230,7 @@ async fn read_only_hides_the_write_gated_tools() {
             "{hidden} must be hidden read-only: {names:?}"
         );
     }
-    assert_eq!(names.len(), 8, "exactly 8 tools in read-only: {names:?}");
+    assert_eq!(names.len(), 9, "exactly 9 tools in read-only: {names:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1000,6 +1002,124 @@ async fn validate_and_infer_schema() {
     assert!(inferred["count"].as_u64().unwrap() >= 2);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn vocabulary_lists_tags_categories_and_relation_types() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    call(
+        peer,
+        "write_engram",
+        json!({
+            "domain": "eng",
+            "title": "Alpha",
+            // `legacy` is a frontmatter-only tag and `urgent` an observation-only
+            // tag, so their engram and observation counts are unequal and a
+            // swapped assignment in the backend would be caught below.
+            "tags": ["database", "api", "legacy"],
+            "content": "- [decision] chose postgres #database\n\n- [pattern] api uses rest #api #urgent\n\n- depends_on [[Beta]]",
+        }),
+    )
+    .await
+    .unwrap();
+    call(
+        peer,
+        "write_engram",
+        json!({
+            "domain": "eng",
+            "title": "Beta",
+            "tags": ["database"],
+            "content": "- [decision] indexed the table #database",
+        }),
+    )
+    .await
+    .unwrap();
+
+    // Scoped to the domain: the response echoes the domain and each tag carries
+    // both its engram and its observation usage count.
+    let vocab = call(peer, "vocabulary", json!({ "domain": "eng" }))
+        .await
+        .unwrap();
+    assert_eq!(vocab["domain"], json!("eng"));
+    let tags = vocab["tags"].as_array().unwrap();
+    // `database` tags two engrams and two observations, so it leads the list.
+    assert_eq!(
+        tags[0]["name"],
+        json!("database"),
+        "most-used tag first: {vocab}"
+    );
+    assert_eq!(
+        tags[0]["engrams"],
+        json!(2),
+        "database tags two engrams: {vocab}"
+    );
+    assert_eq!(
+        tags[0]["observations"],
+        json!(2),
+        "database tags two observations: {vocab}"
+    );
+    // Unequal-count tags guard the engram-vs-observation aggregation against a
+    // swap: `legacy` is frontmatter-only, `urgent` observation-only.
+    let legacy = tags
+        .iter()
+        .find(|t| t["name"] == json!("legacy"))
+        .expect("legacy tag present");
+    assert_eq!(
+        legacy["engrams"],
+        json!(1),
+        "legacy tags one engram: {vocab}"
+    );
+    assert_eq!(
+        legacy["observations"],
+        json!(0),
+        "legacy is frontmatter-only: {vocab}"
+    );
+    let urgent = tags
+        .iter()
+        .find(|t| t["name"] == json!("urgent"))
+        .expect("urgent tag present");
+    assert_eq!(
+        urgent["engrams"],
+        json!(0),
+        "urgent is observation-only: {vocab}"
+    );
+    assert_eq!(
+        urgent["observations"],
+        json!(1),
+        "urgent tags one observation: {vocab}"
+    );
+
+    let categories: Vec<&str> = vocab["categories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c["name"].as_str())
+        .collect();
+    assert!(
+        categories.contains(&"decision") && categories.contains(&"pattern"),
+        "observation categories are listed: {vocab}"
+    );
+    let rels: Vec<&str> = vocab["relation_types"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["name"].as_str())
+        .collect();
+    assert!(
+        rels.contains(&"depends_on"),
+        "relation types are listed: {vocab}"
+    );
+
+    // Omitting the domain is an all-domain sweep, which echoes a null domain.
+    let all = call(peer, "vocabulary", json!({})).await.unwrap();
+    assert_eq!(
+        all["domain"],
+        Value::Null,
+        "an all-domain sweep reports a null domain: {all}"
+    );
+}
+
 /// Models routinely double-encode nested tool arguments: a `metadata`
 /// object arriving as a JSON string is accepted by parsing it first, so
 /// temporal bounds set that way land in the frontmatter instead of
@@ -1308,7 +1428,7 @@ type AnnotationRow = (
     Option<bool>,
 );
 
-const EXPECTED_ANNOTATIONS: [AnnotationRow; 18] = [
+const EXPECTED_ANNOTATIONS: [AnnotationRow; 19] = [
     (
         "write_engram",
         "Capture engram",
@@ -1406,6 +1526,14 @@ const EXPECTED_ANNOTATIONS: [AnnotationRow; 18] = [
         Some(false),
     ),
     (
+        "vocabulary",
+        "Vocabulary in use",
+        Some(true),
+        None,
+        None,
+        Some(false),
+    ),
+    (
         "configure",
         "Configure Crystalline",
         Some(false),
@@ -1456,7 +1584,7 @@ const EXPECTED_ANNOTATIONS: [AnnotationRow; 18] = [
 ];
 
 /// A GitHub-enabled server with no domains, built solely to inspect the tool
-/// surface and its annotations. GitHub on plus read-write makes all 18 tools
+/// surface and its annotations. GitHub on plus read-write makes all 19 tools
 /// visible through `get_tool`; read-only narrows it to the read tools plus
 /// `update_domain` and `origin_status`.
 async fn annotation_server(read_only: bool) -> McpServer {
@@ -1476,7 +1604,7 @@ async fn annotation_server(read_only: bool) -> McpServer {
 
 /// Every tool advertises exactly the title and the four annotation hints from
 /// the locked table, and never the annotation-level title (only the top-level
-/// `Tool.title`). GitHub is enabled and the engine read-write so all 18 tools
+/// `Tool.title`). GitHub is enabled and the engine read-write so all 19 tools
 /// are visible.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tool_annotations_match_the_locked_table() {
@@ -2049,9 +2177,9 @@ fn assert_conservative(schema: &Value, context: &str) {
     }
 }
 
-/// Every one of the 18 tools in `EXPECTED_ANNOTATIONS` advertises an input
+/// Every one of the 19 tools in `EXPECTED_ANNOTATIONS` advertises an input
 /// schema that passes the naive conservative-shape sweep, both on the
-/// read-write server where all 18 are visible and on the read-only one where
+/// read-write server where all 19 are visible and on the read-only one where
 /// only a subset resolves through `get_tool`. Also locks down the two
 /// type-less `serde_json::Value` params in this codebase to their documented
 /// object shape.

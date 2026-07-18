@@ -1191,6 +1191,11 @@ async fn dispatch_engine(engine: &Engine, tool: &str, args: Value) -> anyhow::Re
                 .await?
         }
         "infer_schema" => engine.infer_schema(&decode::<InferParams>(args)?).await?,
+        "vocabulary" => {
+            engine
+                .vocabulary(&decode::<VocabularyParams>(args)?)
+                .await?
+        }
         other => anyhow::bail!("unknown tool '{other}'"),
     };
     Ok(v)

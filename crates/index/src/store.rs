@@ -774,6 +774,91 @@ pub enum HostClaim {
     HeldByOther(DomainHost),
 }
 
+/// One tag in use, with how many engrams and how many observations carry it.
+/// The two counts are separate scans so a tag applied on the frontmatter and one
+/// applied on an observation are both visible.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TagCount {
+    /// The tag name, without the leading `#`.
+    pub name: String,
+    /// Number of engrams tagged with it on their frontmatter.
+    pub engrams: i64,
+    /// Number of observations tagged with it.
+    pub observations: i64,
+}
+
+/// One named vocabulary term with its usage count: an observation category or a
+/// relation type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NamedCount {
+    /// The term.
+    pub name: String,
+    /// How many times it is used.
+    pub count: i64,
+}
+
+/// The vocabulary in use across a domain or the whole index: tags with their
+/// engram and observation usage counts, observation categories with counts and
+/// relation types with counts. Backs the `vocabulary` tool so an agent reuses an
+/// existing term instead of coining a near-duplicate.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct Vocabulary {
+    /// Tags, most-used first (engrams + observations), then by name.
+    pub tags: Vec<TagCount>,
+    /// Observation categories, most-used first, then by name.
+    pub categories: Vec<NamedCount>,
+    /// Relation types, most-used first, then by name.
+    pub relation_types: Vec<NamedCount>,
+}
+
+/// Merge the four decoded vocabulary aggregates into a sorted [`Vocabulary`].
+/// Shared by both backends so the ordering is identical regardless of SQL's
+/// grouping order: engram-tag and observation-tag counts merge by tag name, tags
+/// sort by total usage (engrams + observations) descending then name, and
+/// categories and relation types sort by count descending then name.
+pub(crate) fn build_vocabulary(
+    engram_tags: Vec<(String, i64)>,
+    observation_tags: Vec<(String, i64)>,
+    categories: Vec<(String, i64)>,
+    relation_types: Vec<(String, i64)>,
+) -> Vocabulary {
+    let mut merged: HashMap<String, (i64, i64)> = HashMap::new();
+    for (name, count) in engram_tags {
+        merged.entry(name).or_default().0 = count;
+    }
+    for (name, count) in observation_tags {
+        merged.entry(name).or_default().1 = count;
+    }
+    let mut tags: Vec<TagCount> = merged
+        .into_iter()
+        .map(|(name, (engrams, observations))| TagCount {
+            name,
+            engrams,
+            observations,
+        })
+        .collect();
+    tags.sort_by(|a, b| {
+        (b.engrams + b.observations)
+            .cmp(&(a.engrams + a.observations))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+
+    let to_named = |rows: Vec<(String, i64)>| -> Vec<NamedCount> {
+        let mut v: Vec<NamedCount> = rows
+            .into_iter()
+            .map(|(name, count)| NamedCount { name, count })
+            .collect();
+        v.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.name.cmp(&b.name)));
+        v
+    };
+
+    Vocabulary {
+        tags,
+        categories: to_named(categories),
+        relation_types: to_named(relation_types),
+    }
+}
+
 /// The backend-agnostic storage interface. All methods are async so a network
 /// backend can implement the same trait.
 #[async_trait]
@@ -956,6 +1041,13 @@ pub trait Store: Send + Sync {
 
     /// Per-domain counts, in registration order.
     async fn domain_stats(&self) -> Result<Vec<DomainStats>>;
+
+    /// The vocabulary in use: tag, observation-category and relation-type usage
+    /// counts, for one domain or (when `domain` is `None`) across every domain.
+    /// An unknown domain name yields empty vectors rather than an error, so a
+    /// caller can probe a domain that holds no engrams yet. The vectors are
+    /// sorted by usage in Rust for cross-backend determinism.
+    async fn vocabulary(&self, domain: Option<&str>) -> Result<Vocabulary>;
 
     // --- host locks ----------------------------------------------------------
     // The single-writer-per-file-domain rule for shared-database collaboration.

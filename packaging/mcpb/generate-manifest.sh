@@ -169,6 +169,10 @@ cat >"$manifest_path" <<JSON
       "description": "Suggest a Picoschema for a type by generalizing over engrams already captured in a domain."
     },
     {
+      "name": "vocabulary",
+      "description": "List the tags, observation categories and relation types already in use, with counts, so existing terms are reused."
+    },
+    {
       "name": "configure",
       "description": "View and adjust Crystalline's settings, like connecting a GitHub account for team collaboration."
     },

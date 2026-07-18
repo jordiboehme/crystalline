@@ -299,6 +299,70 @@ fn json_shapes_unchanged() {
 }
 
 #[test]
+fn vocabulary_json_shape_and_human_sections() {
+    let work = tempfile::tempdir().unwrap();
+    let (config, db) = seed_two_engrams(work.path());
+
+    // --json returns the { domain, tags, categories, relation_types } shape with
+    // a null domain for the all-domain sweep.
+    let out = bin()
+        .args(["--json", "vocabulary", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let vocab: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        object_keys(&vocab),
+        ["categories", "domain", "relation_types", "tags"],
+        "vocabulary JSON shape: {vocab}"
+    );
+    assert!(
+        vocab["domain"].is_null(),
+        "an all-domain sweep reports a null domain: {vocab}"
+    );
+    let tag_names: Vec<&str> = vocab["tags"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| t["name"].as_str())
+        .collect();
+    assert!(
+        tag_names.contains(&"t"),
+        "the seeded frontmatter tag surfaces: {vocab}"
+    );
+    let rels: Vec<&str> = vocab["relation_types"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["name"].as_str())
+        .collect();
+    assert!(
+        rels.contains(&"depends_on"),
+        "the seeded relation type surfaces: {vocab}"
+    );
+
+    // Human output shows the three labelled sections, scoped to one domain.
+    let human = bin()
+        .args(["vocabulary", "--domain", "eng", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(human.status.success());
+    let stdout = String::from_utf8_lossy(&human.stdout);
+    for needle in ["Tags:", "Categories:", "Relation types:", "depends_on"] {
+        assert!(
+            stdout.contains(needle),
+            "vocabulary human output missing {needle:?}: {stdout}"
+        );
+    }
+}
+
+#[test]
 fn init_add_sync_status_end_to_end() {
     let work = tempfile::tempdir().unwrap();
     let domain_dir = work.path().join("kb");

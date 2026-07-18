@@ -33,8 +33,8 @@ pub use store::{
     ChunkJob, ChunkModelCount, DomainHost, DomainId, DomainKind, DomainStats, EdgeKind,
     EmbeddingCoverage, EmbeddingRow, EngramDescriptor, EngramId, EngramRecord, EngramSummary,
     FileStamp, FilterOp, FtsMode, GraphEdge, GraphNode, GraphSlice, HitKind, HostClaim, InboundRef,
-    MetadataFilter, NewChunk, OutboundRef, Page, RecentFilter, SearchHit, SearchMode, SearchQuery,
-    Store, StoreInfo, StoredEngram, parse_metadata_filters,
+    MetadataFilter, NamedCount, NewChunk, OutboundRef, Page, RecentFilter, SearchHit, SearchMode,
+    SearchQuery, Store, StoreInfo, StoredEngram, TagCount, Vocabulary, parse_metadata_filters,
 };
 pub use sync::{
     DomainScan, SyncReport, apply_scan, scan_domain, scan_paths, sync_domain, sync_domain_with,

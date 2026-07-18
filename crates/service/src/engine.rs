@@ -2280,6 +2280,25 @@ impl Engine {
         }))
     }
 
+    // --- vocabulary ----------------------------------------------------------
+
+    /// List the tags, observation categories and relation types already in use,
+    /// each with a usage count, for one domain or across every domain. An unknown
+    /// domain reports empty lists rather than erroring, matching the store
+    /// contract, so an agent can probe a fresh domain safely. `domain` echoes the
+    /// request, `null` for an all-domain sweep.
+    pub async fn vocabulary(&self, p: &VocabularyParams) -> Result<Value> {
+        let store = self.store.lock().await;
+        let vocab = store.vocabulary(p.domain.as_deref()).await?;
+        drop(store);
+        Ok(json!({
+            "domain": p.domain,
+            "tags": vocab.tags,
+            "categories": vocab.categories,
+            "relation_types": vocab.relation_types,
+        }))
+    }
+
     // --- domain import / export / scaffold -----------------------------------
 
     /// Scaffold a MANIFEST engram into a virtual domain from prebuilt markdown,

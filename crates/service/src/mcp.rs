@@ -19,7 +19,7 @@
 //!
 //! In read-only mode (the engine's `read_only` flag) the four content-mutating
 //! tools are filtered out of `list_tools` and `get_tool`, so the surface is the
-//! eight read tools; the routes stay registered so a client that calls a hidden
+//! nine read tools; the routes stay registered so a client that calls a hidden
 //! tool by name reaches the engine's read-only guard and gets a clean error.
 //!
 //! The collaboration tools (`configure`, `add_domain`, `share_changes`,
@@ -165,7 +165,7 @@ impl McpServer {
     #[tool(
         name = "write_engram",
         title = "Capture engram",
-        description = "Capture a new engram - a unit of knowledge - into a domain. Writes the markdown file and indexes it. Body bullets: '- [decision] we chose X #tag' become observations, '- rel_type [[Target]]' become relations. domain is required so an engram never lands in the wrong place. permalink, status, recorded_at and timestamp are filled in; valid_from/valid_to are never auto-set - absence means always valid; to bound validity pass them inside metadata as plain ISO dates (YYYY-MM-DD). Any other date format is rejected; a sentinel far-future valid_to and an explicit null are dropped, since absence already means valid forever. Recommended type values: engram, guide, decision, architecture, runbook, reference. Recommended status values (guidance, not enforced): current, implemented, draft, proposed, idea, poc, deprecated, superseded, archived, legacy. Errors if the permalink exists unless overwrite is true.",
+        description = "Capture a new engram - a unit of knowledge - into a domain. Writes the markdown file and indexes it. Body bullets: '- [decision] we chose X #tag' become observations, '- rel_type [[Target]]' become relations. domain is required so an engram never lands in the wrong place. permalink, status, recorded_at and timestamp are filled in; valid_from/valid_to are never auto-set - absence means always valid; to bound validity pass them inside metadata as plain ISO dates (YYYY-MM-DD). Any other date format is rejected; a sentinel far-future valid_to and an explicit null are dropped, since absence already means valid forever. Recommended type values: engram, guide, decision, architecture, runbook, reference. Recommended status values (guidance, not enforced): current, implemented, draft, proposed, idea, poc, deprecated, superseded, archived, legacy. Errors if the permalink exists unless overwrite is true. The vocabulary tool lists tags already in use; reuse one before coining a new tag.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -381,6 +381,23 @@ impl McpServer {
     ) -> Result<CallToolResult, ErrorData> {
         self.engine
             .infer_schema(&p)
+            .await
+            .map_err(to_error)
+            .and_then(ok)
+    }
+
+    #[tool(
+        name = "vocabulary",
+        title = "Vocabulary in use",
+        description = "List the vocabulary in use: tags with engram and observation usage counts, observation categories with counts and relation types with counts, for one domain or across all domains. Check it before inventing a new tag or category so existing terms are reused instead of multiplied.",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn vocabulary(
+        &self,
+        Parameters(p): Parameters<VocabularyParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.engine
+            .vocabulary(&p)
             .await
             .map_err(to_error)
             .and_then(ok)

@@ -82,7 +82,8 @@ use crate::store::{
     ChunkJob, ChunkModelCount, DomainHost, DomainId, DomainKind, DomainStats, EdgeKind,
     EmbeddingCoverage, EmbeddingRow, EngramDescriptor, EngramId, EngramRecord, EngramSummary,
     FileStamp, FtsMode, GraphSlice, HostClaim, InboundRef, NewChunk, OutboundRef, Page,
-    RecentFilter, SearchHit, SearchMode, SearchQuery, Store, StoreInfo, StoredEngram,
+    RecentFilter, SearchHit, SearchMode, SearchQuery, Store, StoreInfo, StoredEngram, Vocabulary,
+    build_vocabulary,
 };
 
 /// A PostgreSQL-backed store. Open one with [`PostgresStore::open`].
@@ -1543,6 +1544,77 @@ impl Store for PostgresStore {
                 host_heartbeat_at: cell_text(r, 13),
             })
             .collect())
+    }
+
+    async fn vocabulary(&self, domain: Option<&str>) -> Result<Vocabulary> {
+        // Four grouped scans mirroring the Turso backend exactly: engram tags,
+        // observation tags, observation categories and relation types. When a
+        // domain is named each aggregate joins back to the owning engram's
+        // domain by name, so an unknown name matches no rows and the vocabulary
+        // comes back empty. The maps are merged and every vector sorted in Rust
+        // (see `build_vocabulary`) so the order does not depend on SQL grouping.
+        let dparam = || match domain {
+            Some(d) => vec![Param::Text(d.to_string())],
+            None => vec![],
+        };
+        let decode = |rows: &[PgRow]| -> Vec<(String, i64)> {
+            rows.iter()
+                .map(|r| {
+                    (
+                        cell_text(r, 0).unwrap_or_default(),
+                        cell_i64(r, 1).unwrap_or(0),
+                    )
+                })
+                .collect()
+        };
+
+        let engram_tag_sql = if domain.is_some() {
+            "SELECT t.name, COUNT(*) FROM engram_tag et \
+             JOIN tag t ON t.id=et.tag_id \
+             JOIN engram e ON e.id=et.engram_id \
+             JOIN domain d ON d.id=e.domain_id \
+             WHERE d.name=$1 GROUP BY t.id"
+        } else {
+            "SELECT t.name, COUNT(*) FROM engram_tag et JOIN tag t ON t.id=et.tag_id GROUP BY t.id"
+        };
+        let obs_tag_sql = if domain.is_some() {
+            "SELECT t.name, COUNT(*) FROM observation_tag ot \
+             JOIN tag t ON t.id=ot.tag_id \
+             JOIN observation o ON o.id=ot.observation_id \
+             JOIN engram e ON e.id=o.engram_id \
+             JOIN domain d ON d.id=e.domain_id \
+             WHERE d.name=$1 GROUP BY t.id"
+        } else {
+            "SELECT t.name, COUNT(*) FROM observation_tag ot JOIN tag t ON t.id=ot.tag_id GROUP BY t.id"
+        };
+        let category_sql = if domain.is_some() {
+            "SELECT o.category, COUNT(*) FROM observation o \
+             JOIN engram e ON e.id=o.engram_id \
+             JOIN domain d ON d.id=e.domain_id \
+             WHERE o.category <> '' AND d.name=$1 GROUP BY o.category"
+        } else {
+            "SELECT o.category, COUNT(*) FROM observation o WHERE o.category <> '' GROUP BY o.category"
+        };
+        let rel_sql = if domain.is_some() {
+            "SELECT r.rel_type, COUNT(*) FROM relation r \
+             JOIN domain d ON d.id=r.domain_id \
+             WHERE d.name=$1 GROUP BY r.rel_type"
+        } else {
+            "SELECT r.rel_type, COUNT(*) FROM relation r GROUP BY r.rel_type"
+        };
+
+        let mut conn = self.acquire().await?;
+        let engram_tags = decode(&query_all(conn.as_mut(), engram_tag_sql, dparam()).await?);
+        let observation_tags = decode(&query_all(conn.as_mut(), obs_tag_sql, dparam()).await?);
+        let categories = decode(&query_all(conn.as_mut(), category_sql, dparam()).await?);
+        let relation_types = decode(&query_all(conn.as_mut(), rel_sql, dparam()).await?);
+
+        Ok(build_vocabulary(
+            engram_tags,
+            observation_tags,
+            categories,
+            relation_types,
+        ))
     }
 
     async fn claim_domain_host(

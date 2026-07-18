@@ -13,8 +13,8 @@ use std::path::Path;
 
 use crystalline_index::{
     DomainId, DomainKind, EdgeKind, EmbeddingCoverage, EmbeddingRow, EngramId, EngramRecord,
-    FileStamp, FilterOp, HostClaim, IndexError, MetadataFilter, NewChunk, RecentFilter, SearchMode,
-    SearchQuery, Store, TursoStore, sync_domain,
+    FileStamp, FilterOp, HostClaim, IndexError, MetadataFilter, NamedCount, NewChunk, RecentFilter,
+    SearchMode, SearchQuery, Store, TursoStore, Vocabulary, sync_domain,
 };
 
 fn write(dir: &Path, rel: &str, content: &str) {
@@ -1045,6 +1045,113 @@ async fn recent_newest_first(store: &dyn Store) {
     assert_eq!(recent[0].permalink, "new", "2026-06-01 before 2026-01-01");
 }
 parity!(recent_returns_newest_first, recent_newest_first);
+
+async fn vocabulary_counts(store: &dyn Store) {
+    // Two domains with distinct frontmatter tags, observation tags, observation
+    // categories and relation types, so every facet of the vocabulary is
+    // exercised and the domain filter can be checked against the all-domain
+    // sweep. Alpha carries a frontmatter-only `legacy` tag (engrams 1,
+    // observations 0) and an observation-only `urgent` tag (engrams 0,
+    // observations 1) so a swap of the two tag counts in the backend aggregation
+    // is caught; Beta reuses `database`; Gamma lives in a second domain.
+    let eng = tempfile::tempdir().unwrap();
+    write(
+        eng.path(),
+        "alpha.md",
+        "---\ntype: engram\ntitle: Alpha\npermalink: alpha\ntags:\n  - database\n  - api\n  - legacy\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Alpha\n\n- [decision] chose postgres #database\n\n- [pattern] api uses rest #api #urgent\n\n- depends_on [[Beta]]\n",
+    );
+    write(
+        eng.path(),
+        "beta.md",
+        "---\ntype: engram\ntitle: Beta\npermalink: beta\ntags:\n  - database\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Beta\n\n- [decision] indexed the table #database\n\n- relates_to [[Alpha]]\n",
+    );
+    sync_domain(store, "eng", eng.path()).await.unwrap();
+
+    let ops = tempfile::tempdir().unwrap();
+    write(
+        ops.path(),
+        "gamma.md",
+        "---\ntype: engram\ntitle: Gamma\npermalink: gamma\ntags:\n  - deploy\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Gamma\n\n- [gotcha] watch the rollout #deploy\n\n- depends_on [[Alpha]]\n",
+    );
+    sync_domain(store, "ops", ops.path()).await.unwrap();
+
+    let tag_shape = |v: &Vocabulary| -> Vec<(String, i64, i64)> {
+        v.tags
+            .iter()
+            .map(|t| (t.name.clone(), t.engrams, t.observations))
+            .collect()
+    };
+    let named_shape = |rows: &[NamedCount]| -> Vec<(String, i64)> {
+        rows.iter().map(|n| (n.name.clone(), n.count)).collect()
+    };
+
+    // The all-domain sweep merges the engram-tag and observation-tag counts per
+    // tag and orders by total usage descending then name. `database` leads with
+    // two engrams and two observations; `api` and `deploy` tie and sort by name;
+    // `legacy` (1, 0) and `urgent` (0, 1) have unequal counts, so a swapped
+    // engram/observation assignment in the backend would fail here.
+    let all = store.vocabulary(None).await.unwrap();
+    assert_eq!(
+        tag_shape(&all),
+        vec![
+            ("database".to_string(), 2, 2),
+            ("api".to_string(), 1, 1),
+            ("deploy".to_string(), 1, 1),
+            ("legacy".to_string(), 1, 0),
+            ("urgent".to_string(), 0, 1),
+        ],
+        "tags merge engram and observation counts, most-used first then name: {:?}",
+        all.tags
+    );
+    assert_eq!(
+        named_shape(&all.categories),
+        vec![
+            ("decision".to_string(), 2),
+            ("gotcha".to_string(), 1),
+            ("pattern".to_string(), 1),
+        ],
+        "categories count observations and sort by count then name: {:?}",
+        all.categories
+    );
+    assert_eq!(
+        named_shape(&all.relation_types),
+        vec![("depends_on".to_string(), 2), ("relates_to".to_string(), 1),],
+        "relation types are counted across both domains: {:?}",
+        all.relation_types
+    );
+
+    // The domain filter narrows every facet to one domain's engrams. The eng
+    // domain keeps the unequal-count `legacy` (1, 0) and `urgent` (0, 1) tags and
+    // still excludes the ops `deploy` tag.
+    let eng_vocab = store.vocabulary(Some("eng")).await.unwrap();
+    assert_eq!(
+        tag_shape(&eng_vocab),
+        vec![
+            ("database".to_string(), 2, 2),
+            ("api".to_string(), 1, 1),
+            ("legacy".to_string(), 1, 0),
+            ("urgent".to_string(), 0, 1),
+        ],
+        "the eng domain excludes the ops deploy tag: {:?}",
+        eng_vocab.tags
+    );
+    assert_eq!(
+        named_shape(&eng_vocab.relation_types),
+        vec![("depends_on".to_string(), 1), ("relates_to".to_string(), 1),],
+        "eng relation types tie at one and sort by name: {:?}",
+        eng_vocab.relation_types
+    );
+
+    // An unknown domain yields empty vectors rather than an error.
+    let missing = store.vocabulary(Some("nope")).await.unwrap();
+    assert!(
+        missing.tags.is_empty()
+            && missing.categories.is_empty()
+            && missing.relation_types.is_empty(),
+        "an unknown domain has an empty vocabulary: {missing:?}"
+    );
+}
+parity!(vocabulary_reports_usage_counts, vocabulary_counts);
 
 async fn wipe_clears(store: &dyn Store) {
     let dir = tempfile::tempdir().unwrap();

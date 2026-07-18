@@ -261,6 +261,14 @@ pub struct InferParams {
     pub threshold: Option<f64>,
 }
 
+/// Parameters for `vocabulary`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+pub struct VocabularyParams {
+    /// Restrict to one domain. Omit for a vocabulary across every domain.
+    #[serde(default)]
+    pub domain: Option<String>,
+}
+
 /// Parameters for `configure`. Omit everything to see the current settings
 /// and GitHub connection. `token` or `connect` handle a GitHub connect
 /// action on their own and ignore `set`/`unset` in the same call; give them

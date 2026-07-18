@@ -475,6 +475,15 @@ enum Command {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// List the tags, observation categories and relation types in use.
+    Vocabulary {
+        /// Restrict to one domain. Omit for a vocabulary across every domain.
+        #[arg(long)]
+        domain: Option<String>,
+        /// Load the global config from this file instead of the default path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
     /// Respond to a harness lifecycle hook event over stdin/stdout. Plumbing
     /// for `crystalline install`'s generated hook wiring, not something a
     /// person runs by hand - documented here so anyone who finds it in a
@@ -1017,7 +1026,8 @@ fn main() -> anyhow::Result<()> {
             cmd @ (Command::Read { .. }
             | Command::Search { .. }
             | Command::Context { .. }
-            | Command::Recent { .. }),
+            | Command::Recent { .. }
+            | Command::Vocabulary { .. }),
         ) => on_runtime_current_thread(move || run_data(cmd, cli.db, cli.json)),
         Some(cmd @ (Command::Write { .. } | Command::Edit { .. } | Command::Move { .. })) => {
             on_runtime(move || run_data(cmd, cli.db, cli.json))
@@ -1748,6 +1758,9 @@ async fn run_data(command: Command, db: Option<PathBuf>, json: bool) -> anyhow::
             }),
             config,
         ),
+        Command::Vocabulary { domain, config } => {
+            ("vocabulary", json!({ "domain": domain }), config)
+        }
         _ => unreachable!("run_data only handles data commands"),
     };
 
@@ -1769,6 +1782,7 @@ async fn run_data(command: Command, db: Option<PathBuf>, json: bool) -> anyhow::
         "recent_activity" => render::render_recent(&value, &mut out)?,
         "build_context" => render::render_context(&value, &mut out)?,
         "write_engram" => render::render_write(&value, &mut out)?,
+        "vocabulary" => render::render_vocabulary(&value, &mut out)?,
         _ => {
             let text = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
             writeln!(out, "{text}")?;

@@ -149,6 +149,63 @@ pub fn render_context(v: &Value, out: &mut impl Write) -> io::Result<()> {
     Ok(())
 }
 
+/// `vocabulary`: three labelled sections - the tags in use with their engram
+/// and observation counts, the observation categories with counts and the
+/// relation types with counts. An empty facet prints a `(none)` line so the
+/// section headers stay stable.
+pub fn render_vocabulary(v: &Value, out: &mut impl Write) -> io::Result<()> {
+    let (Some(tags), Some(categories), Some(relation_types)) = (
+        v.get("tags").and_then(Value::as_array),
+        v.get("categories").and_then(Value::as_array),
+        v.get("relation_types").and_then(Value::as_array),
+    ) else {
+        return pretty_fallback(v, out);
+    };
+
+    writeln!(out, "Tags:")?;
+    if tags.is_empty() {
+        writeln!(out, "  (none)")?;
+    }
+    for t in tags {
+        let name = t.get("name").and_then(Value::as_str).unwrap_or("");
+        let engrams = t.get("engrams").and_then(Value::as_i64).unwrap_or(0);
+        let observations = t.get("observations").and_then(Value::as_i64).unwrap_or(0);
+        let eng_word = if engrams == 1 { "engram" } else { "engrams" };
+        let obs_word = if observations == 1 {
+            "observation"
+        } else {
+            "observations"
+        };
+        writeln!(
+            out,
+            "  {name}  {engrams} {eng_word}, {observations} {obs_word}"
+        )?;
+    }
+
+    writeln!(out, "Categories:")?;
+    render_named_counts(categories, out)?;
+
+    writeln!(out, "Relation types:")?;
+    render_named_counts(relation_types, out)?;
+
+    Ok(())
+}
+
+/// The shared body of the `Categories` and `Relation types` sections: one
+/// `name  count` line per term, or a single `(none)` line when the facet is
+/// empty.
+fn render_named_counts(items: &[Value], out: &mut impl Write) -> io::Result<()> {
+    if items.is_empty() {
+        return writeln!(out, "  (none)");
+    }
+    for i in items {
+        let name = i.get("name").and_then(Value::as_str).unwrap_or("");
+        let count = i.get("count").and_then(Value::as_i64).unwrap_or(0);
+        writeln!(out, "  {name}  {count}")?;
+    }
+    Ok(())
+}
+
 /// `write`: a single confirmation line carrying the new engram's address.
 pub fn render_write(v: &Value, out: &mut impl Write) -> io::Result<()> {
     let (Some(domain), Some(permalink)) = (
@@ -274,6 +331,49 @@ mod tests {
         assert_eq!(
             out,
             "context for crystalline://eng/alpha\n  (no related engrams)\n"
+        );
+    }
+
+    #[test]
+    fn vocabulary_lists_tags_categories_and_relation_types() {
+        let v = json!({
+            "domain": "eng",
+            "tags": [
+                { "name": "database", "engrams": 2, "observations": 2 },
+                { "name": "api", "engrams": 1, "observations": 1 },
+            ],
+            "categories": [
+                { "name": "decision", "count": 2 },
+                { "name": "pattern", "count": 1 },
+            ],
+            "relation_types": [
+                { "name": "depends_on", "count": 1 },
+            ],
+        });
+        let out = render_to_string(render_vocabulary, &v);
+        assert_eq!(
+            out,
+            "Tags:\n  database  2 engrams, 2 observations\n  api  1 engram, 1 observation\nCategories:\n  decision  2\n  pattern  1\nRelation types:\n  depends_on  1\n"
+        );
+    }
+
+    #[test]
+    fn vocabulary_empty_facets_print_none() {
+        let v = json!({ "domain": null, "tags": [], "categories": [], "relation_types": [] });
+        let out = render_to_string(render_vocabulary, &v);
+        assert_eq!(
+            out,
+            "Tags:\n  (none)\nCategories:\n  (none)\nRelation types:\n  (none)\n"
+        );
+    }
+
+    #[test]
+    fn vocabulary_falls_back_when_shape_is_wrong() {
+        let v = json!({ "domain": "eng" });
+        let out = render_to_string(render_vocabulary, &v);
+        assert_eq!(
+            out,
+            format!("{}\n", serde_json::to_string_pretty(&v).unwrap())
         );
     }
 
