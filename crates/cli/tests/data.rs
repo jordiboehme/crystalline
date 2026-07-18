@@ -254,16 +254,18 @@ fn json_shapes_unchanged() {
             "content",
             "domain",
             "frontmatter",
+            "links",
             "observations",
             "path",
             "permalink",
+            "related",
             "relations",
             "status",
             "title",
             "type",
             "url",
         ],
-        "read JSON shape unchanged: {read}"
+        "read JSON shape: alpha resolves depends_on Beta so `related` is present, and `links` is always emitted: {read}"
     );
 
     let recent = run(&["recent", "--timeframe", "10y"]);

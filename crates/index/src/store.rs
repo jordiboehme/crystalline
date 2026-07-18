@@ -583,6 +583,26 @@ pub struct InboundRef {
     pub kind: EdgeKind,
 }
 
+/// One outbound reference from an engram: a relation bullet or a prose wikilink,
+/// with whether it currently resolves to a target in the index. Backs the
+/// `read_engram` resolution flags so a reading agent learns which of its links
+/// land and which dangle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OutboundRef {
+    /// One-based source line.
+    pub line: usize,
+    /// Whether the reference came from a relation bullet or a prose link.
+    pub kind: EdgeKind,
+    /// The relation type for a relation edge; `None` for a prose link.
+    pub rel_type: Option<String>,
+    /// The exact target text used in the reference.
+    pub to_target: String,
+    /// An explicit cross-domain target domain, or `None` for same-domain.
+    pub to_domain: Option<String>,
+    /// Whether the reference currently resolves to a target in the index.
+    pub resolved: bool,
+}
+
 /// A chunk awaiting an embedding. Populated by M4; the M3 store returns none.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChunkJob {
@@ -867,6 +887,11 @@ pub trait Store: Send + Sync {
         permalink: &str,
         title: &str,
     ) -> Result<Vec<InboundRef>>;
+
+    /// Every relation and prose link that points out of the given engram, each
+    /// carrying whether it currently resolves to a target in the index. Ordered
+    /// by source line. Backs the `read_engram` resolution flags.
+    async fn outbound_refs(&self, engram_id: EngramId) -> Result<Vec<OutboundRef>>;
 
     /// Run a search and return one page of hits plus the total match count.
     async fn search(&self, query: &SearchQuery) -> Result<Page<SearchHit>>;

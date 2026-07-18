@@ -552,6 +552,69 @@ parity!(
     link_two_pass_resolution
 );
 
+/// `outbound_refs` reports every relation and prose link leaving an engram, in
+/// source-line order, each flagged with whether it currently resolves. A
+/// relation and a prose link to a present target resolve; a relation to a
+/// missing target and a cross-domain link into an unregistered domain do not. An
+/// engram with no outbound references reports none.
+async fn outbound_refs_status(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "target.md",
+        &engram("Target", "target", "engram", "", "target body\n"),
+    );
+    // Two relation bullets then two prose links, on ascending lines: a resolving
+    // relation, a dangling relation, a resolving prose link and a dangling
+    // cross-domain prose link.
+    write(
+        root,
+        "source.md",
+        &engram(
+            "Source",
+            "source",
+            "engram",
+            "",
+            "- depends_on [[Target]]\n- blocks [[Missing]]\n\nProse links [[Target]] inline.\n\nMore prose [[other:Ghost]] here.\n",
+        ),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+
+    let source = store.lookup_id("d", "source").await.unwrap().unwrap();
+    let refs = store.outbound_refs(source).await.unwrap();
+    let shape: Vec<_> = refs
+        .iter()
+        .map(|r| {
+            (
+                r.kind,
+                r.rel_type.as_deref(),
+                r.to_target.as_str(),
+                r.to_domain.as_deref(),
+                r.resolved,
+            )
+        })
+        .collect();
+    assert_eq!(
+        shape,
+        vec![
+            (EdgeKind::Relation, Some("depends_on"), "Target", None, true),
+            (EdgeKind::Relation, Some("blocks"), "Missing", None, false),
+            (EdgeKind::Link, None, "Target", None, true),
+            (EdgeKind::Link, None, "Ghost", Some("other"), false),
+        ],
+        "outbound refs are line-ordered and carry resolution flags: {refs:?}"
+    );
+
+    // The target itself has no outbound references.
+    let target = store.lookup_id("d", "target").await.unwrap().unwrap();
+    assert!(
+        store.outbound_refs(target).await.unwrap().is_empty(),
+        "an engram with no relations or links reports none"
+    );
+}
+parity!(outbound_refs_report_resolution_status, outbound_refs_status);
+
 async fn duplicate_permalink_fails(store: &dyn Store) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();

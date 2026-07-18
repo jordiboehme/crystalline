@@ -25,8 +25,8 @@ use crate::error::{IndexError, Result};
 use crate::store::{
     ChunkJob, ChunkModelCount, DomainHost, DomainId, DomainKind, DomainStats, EdgeKind,
     EmbeddingCoverage, EmbeddingRow, EngramDescriptor, EngramId, EngramRecord, EngramSummary,
-    FileStamp, FtsMode, GraphSlice, HostClaim, InboundRef, NewChunk, Page, RecentFilter, SearchHit,
-    SearchMode, SearchQuery, Store, StoreInfo, StoredEngram,
+    FileStamp, FtsMode, GraphSlice, HostClaim, InboundRef, NewChunk, OutboundRef, Page,
+    RecentFilter, SearchHit, SearchMode, SearchQuery, Store, StoreInfo, StoredEngram,
 };
 
 /// A Turso-backed store. Open one with [`TursoStore::open`].
@@ -286,6 +286,24 @@ fn descriptor_from_row(r: &Row) -> EngramDescriptor {
         title: cell_text(r, 5).unwrap_or_default(),
         engram_type: cell_text(r, 6).unwrap_or_default(),
         status: cell_text(r, 7).unwrap_or_default(),
+    }
+}
+
+/// Decode one `outbound_refs` row: line, kind discriminator (0 relation, 1
+/// link), rel_type (NULL for a link), target text, target domain and resolved
+/// flag. The column layout is identical across both backends.
+fn outbound_ref_from_row(r: &Row) -> OutboundRef {
+    OutboundRef {
+        line: cell_i64(r, 0).unwrap_or(0) as usize,
+        kind: if cell_i64(r, 1).unwrap_or(0) == 0 {
+            EdgeKind::Relation
+        } else {
+            EdgeKind::Link
+        },
+        rel_type: cell_text(r, 2),
+        to_target: cell_text(r, 3).unwrap_or_default(),
+        to_domain: cell_text(r, 4),
+        resolved: cell_i64(r, 5).unwrap_or(0) != 0,
     }
 }
 
@@ -917,6 +935,27 @@ impl Store for TursoStore {
                 },
             })
             .collect())
+    }
+
+    async fn outbound_refs(&self, engram_id: EngramId) -> Result<Vec<OutboundRef>> {
+        // Relation rows then link rows for one engram, each row decoded
+        // identically: line, kind discriminator, rel_type (NULL for a link),
+        // target text, target domain and a resolved flag derived from whether the
+        // forward reference has been bound to a `to_id`. Ordered by source line.
+        let rows = query_all(
+            &self.conn,
+            "SELECT r.line AS line, 0 AS kind, r.rel_type, r.to_target, r.to_domain, \
+                    CASE WHEN r.to_id IS NULL THEN 0 ELSE 1 END AS resolved \
+             FROM relation r WHERE r.engram_id=?1 \
+             UNION ALL \
+             SELECT l.line, 1, NULL, l.to_target, l.to_domain, \
+                    CASE WHEN l.to_id IS NULL THEN 0 ELSE 1 END \
+             FROM link l WHERE l.engram_id=?1 \
+             ORDER BY line",
+            vec![Value::Integer(engram_id.0)],
+        )
+        .await?;
+        Ok(rows.iter().map(outbound_ref_from_row).collect())
     }
 
     async fn search(&self, query: &SearchQuery) -> Result<Page<SearchHit>> {

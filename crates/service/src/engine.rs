@@ -28,13 +28,14 @@ use crystalline_core::emit::{
 };
 use crystalline_core::schema::{self, Schema};
 use crystalline_core::{
-    CrystallineUrl, Engram, Frontmatter, HarnessKind, Manifest, YamlValue, parse_engram, slugify,
+    CrystallineUrl, Engram, Frontmatter, HarnessKind, LinkTarget, Manifest, YamlValue,
+    parse_engram, slugify,
 };
 use crystalline_index::{
-    ChunkParams, DomainHost, DomainId, DomainKind, EmbeddingProvider, EngramDescriptor, EngramId,
-    EngramRecord, FileStamp, HostClaim, RecentFilter, SearchMode, SearchQuery, Store, SyncReport,
-    apply_scan, chunk_engram, configured_model_id, order_jobs_for_batching, parse_metadata_filters,
-    provider_from_config, scan_domain, scan_paths,
+    ChunkParams, DomainHost, DomainId, DomainKind, EdgeKind, EmbeddingProvider, EngramDescriptor,
+    EngramId, EngramRecord, FileStamp, HostClaim, RecentFilter, SearchMode, SearchQuery, Store,
+    SyncReport, apply_scan, chunk_engram, configured_model_id, order_jobs_for_batching,
+    parse_metadata_filters, provider_from_config, scan_domain, scan_paths,
 };
 use crystalline_remote::ops;
 use crystalline_remote::{
@@ -1218,20 +1219,124 @@ impl Engine {
         let content = self.load_content(&source, &desc).await?;
         let engram = parse_engram(&content).map_err(|e| EngineError::Invalid(e.to_string()))?;
         let checksum = sha256_hex(content.as_bytes());
-        Ok(json!({
+
+        // Enrich the response with reference resolution: which outbound links
+        // land, and who points back in. The descriptor carries the ids, so this
+        // works for file, virtual and non-host reads alike.
+        let (outbound, inbound) = {
+            let store = self.store.lock().await;
+            let outbound = store.outbound_refs(desc.id).await?;
+            let inbound = store
+                .inbound_refs(desc.id, desc.domain_id, &desc.permalink, &desc.title)
+                .await?;
+            (outbound, inbound)
+        };
+
+        // A parsed reference resolves when a matching indexed row (same source
+        // line, kind and target) is resolved. An unmatched parsed entry, which a
+        // just-edited or non-host read can produce, is reported as unresolved.
+        let resolves = |kind: EdgeKind, line: usize, target: &LinkTarget| -> bool {
+            outbound.iter().any(|o| {
+                o.kind == kind
+                    && o.line == line
+                    && o.to_target == target.target
+                    && o.to_domain == target.domain
+                    && o.resolved
+            })
+        };
+
+        #[derive(serde::Serialize)]
+        struct RelationOut<'a> {
+            line: usize,
+            rel_type: &'a str,
+            target: &'a LinkTarget,
+            resolved: bool,
+        }
+        #[derive(serde::Serialize)]
+        struct LinkOut<'a> {
+            line: usize,
+            target: &'a LinkTarget,
+            resolved: bool,
+        }
+
+        let relations: Vec<RelationOut> = engram
+            .relations
+            .iter()
+            .map(|r| RelationOut {
+                line: r.line,
+                rel_type: &r.rel_type,
+                target: &r.target,
+                resolved: resolves(EdgeKind::Relation, r.line, &r.target),
+            })
+            .collect();
+        let links: Vec<LinkOut> = engram
+            .links
+            .iter()
+            .map(|l| LinkOut {
+                line: l.line,
+                target: &l.target,
+                resolved: resolves(EdgeKind::Link, l.line, &l.target),
+            })
+            .collect();
+        let resolved_outbound = relations.iter().filter(|r| r.resolved).count()
+            + links.iter().filter(|l| l.resolved).count();
+
+        let url = format!("crystalline://{}/{}", desc.domain, desc.permalink);
+        let mut value = json!({
             "domain": desc.domain,
             "permalink": desc.permalink,
             "title": desc.title,
             "type": desc.engram_type,
             "status": desc.status,
             "path": desc.path,
-            "url": format!("crystalline://{}/{}", desc.domain, desc.permalink),
+            "url": url,
             "content": content,
             "checksum": checksum,
             "frontmatter": engram.frontmatter,
             "observations": engram.observations,
-            "relations": engram.relations,
-        }))
+            "relations": relations,
+            "links": links,
+        });
+        let obj = value
+            .as_object_mut()
+            .expect("read_engram response is a JSON object");
+
+        // Inbound summary: how many references point here, with a small capped
+        // sample so a heavily linked engram never bloats the response. Omitted
+        // entirely when nothing points here.
+        if !inbound.is_empty() {
+            let refs: Vec<Value> = inbound
+                .iter()
+                .take(5)
+                .map(|r| {
+                    json!({
+                        "domain": r.src_domain,
+                        "path": r.src_path,
+                        "kind": match r.kind {
+                            EdgeKind::Relation => "relation",
+                            EdgeKind::Link => "link",
+                        },
+                    })
+                })
+                .collect();
+            obj.insert(
+                "inbound".to_string(),
+                json!({ "count": inbound.len(), "refs": refs }),
+            );
+        }
+
+        // A build_context hint, emitted only when there is a neighbourhood to
+        // explore: something points here, or something here resolves outward.
+        if !inbound.is_empty() || resolved_outbound > 0 {
+            obj.insert(
+                "related".to_string(),
+                json!(format!(
+                    "build_context anchor {url} to explore linked knowledge"
+                )),
+            );
+        }
+
+        Ok(value)
     }
 
     // --- edit ----------------------------------------------------------------

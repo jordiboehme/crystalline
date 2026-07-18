@@ -703,6 +703,148 @@ async fn build_context_follows_prose_wikilinks() {
     );
 }
 
+/// read_engram enriches its response with per-reference resolution: relations
+/// and prose links each carry a `resolved` flag, a resolving reference sets it
+/// true and a dangling one false. A resolving outbound reference also earns the
+/// build_context `related` hint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn read_engram_reports_reference_resolution() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    // A present target, then a source whose two relations and two prose links mix
+    // resolving and dangling references, including a cross-domain link into a
+    // domain that is not registered.
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Target", "content": "the target body" }),
+    )
+    .await
+    .unwrap();
+    call(
+        peer,
+        "write_engram",
+        json!({
+            "domain": "eng",
+            "title": "Source",
+            "content": "Prose mentions [[Target]] and [[other:Ghost]] here.\n\n- depends_on [[Target]]\n- blocks [[Missing]]",
+        }),
+    )
+    .await
+    .unwrap();
+
+    let out = call(
+        peer,
+        "read_engram",
+        json!({ "identifier": "source", "domain": "eng" }),
+    )
+    .await
+    .unwrap();
+
+    // Relations gained a resolved flag, keyed by relation type.
+    let relations = out["relations"].as_array().unwrap();
+    let depends = relations
+        .iter()
+        .find(|r| r["rel_type"] == json!("depends_on"))
+        .expect("depends_on relation present");
+    assert_eq!(
+        depends["resolved"],
+        json!(true),
+        "resolving relation: {out}"
+    );
+    assert_eq!(depends["target"]["target"], json!("Target"));
+    let blocks = relations
+        .iter()
+        .find(|r| r["rel_type"] == json!("blocks"))
+        .expect("blocks relation present");
+    assert_eq!(blocks["resolved"], json!(false), "dangling relation: {out}");
+
+    // The new links array carries the same flag for prose wikilinks.
+    let links = out["links"].as_array().unwrap();
+    let to_target = links
+        .iter()
+        .find(|l| l["target"]["target"] == json!("Target"))
+        .expect("prose link to Target present");
+    assert_eq!(to_target["resolved"], json!(true), "resolving link: {out}");
+    let cross = links
+        .iter()
+        .find(|l| l["target"]["target"] == json!("Ghost"))
+        .expect("cross-domain prose link present");
+    assert_eq!(cross["target"]["domain"], json!("other"));
+    assert_eq!(
+        cross["resolved"],
+        json!(false),
+        "dangling cross-domain link: {out}"
+    );
+
+    // Nothing points at Source, so no inbound summary is emitted.
+    assert!(out.get("inbound").is_none(), "no inbound expected: {out}");
+    // But resolving outbound references earn the build_context hint.
+    let related = out["related"].as_str().expect("related hint present");
+    assert!(
+        related.contains("build_context"),
+        "related names build_context: {related}"
+    );
+}
+
+/// The inbound summary counts every reference pointing at an engram and samples
+/// at most five of them, so a heavily linked engram stays compact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn read_engram_inbound_summary_is_capped() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Hub", "content": "the hub body" }),
+    )
+    .await
+    .unwrap();
+    // Seven distinct engrams each point at Hub with a relation.
+    for i in 0..7 {
+        call(
+            peer,
+            "write_engram",
+            json!({
+                "domain": "eng",
+                "title": format!("Linker {i}"),
+                "content": "- cites [[Hub]]",
+            }),
+        )
+        .await
+        .unwrap();
+    }
+
+    let out = call(
+        peer,
+        "read_engram",
+        json!({ "identifier": "hub", "domain": "eng" }),
+    )
+    .await
+    .unwrap();
+    let inbound = &out["inbound"];
+    assert_eq!(
+        inbound["count"],
+        json!(7),
+        "all seven linkers counted: {out}"
+    );
+    let refs = inbound["refs"].as_array().unwrap();
+    assert_eq!(refs.len(), 5, "the sample is capped at five: {out}");
+    for r in refs {
+        assert_eq!(r["domain"], json!("eng"));
+        assert!(r["path"].as_str().is_some(), "each ref names a path: {r}");
+        assert_eq!(
+            r["kind"],
+            json!("relation"),
+            "kind serializes lowercase: {r}"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recent_list_browse_delete() {
     let h = Harness::new(&["eng"]).await;

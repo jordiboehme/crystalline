@@ -81,8 +81,8 @@ use crate::error::{IndexError, Result};
 use crate::store::{
     ChunkJob, ChunkModelCount, DomainHost, DomainId, DomainKind, DomainStats, EdgeKind,
     EmbeddingCoverage, EmbeddingRow, EngramDescriptor, EngramId, EngramRecord, EngramSummary,
-    FileStamp, FtsMode, GraphSlice, HostClaim, InboundRef, NewChunk, Page, RecentFilter, SearchHit,
-    SearchMode, SearchQuery, Store, StoreInfo, StoredEngram,
+    FileStamp, FtsMode, GraphSlice, HostClaim, InboundRef, NewChunk, OutboundRef, Page,
+    RecentFilter, SearchHit, SearchMode, SearchQuery, Store, StoreInfo, StoredEngram,
 };
 
 /// A PostgreSQL-backed store. Open one with [`PostgresStore::open`].
@@ -517,6 +517,24 @@ fn descriptor_from_row(r: &PgRow) -> EngramDescriptor {
         title: cell_text(r, 5).unwrap_or_default(),
         engram_type: cell_text(r, 6).unwrap_or_default(),
         status: cell_text(r, 7).unwrap_or_default(),
+    }
+}
+
+/// Decode one `outbound_refs` row: line, kind discriminator (0 relation, 1
+/// link), rel_type (NULL for a link), target text, target domain and resolved
+/// flag. The column layout is identical across both backends.
+fn outbound_ref_from_row(r: &PgRow) -> OutboundRef {
+    OutboundRef {
+        line: cell_i64(r, 0).unwrap_or(0) as usize,
+        kind: if cell_i64(r, 1).unwrap_or(0) == 0 {
+            EdgeKind::Relation
+        } else {
+            EdgeKind::Link
+        },
+        rel_type: cell_text(r, 2),
+        to_target: cell_text(r, 3).unwrap_or_default(),
+        to_domain: cell_text(r, 4),
+        resolved: cell_i64(r, 5).unwrap_or(0) != 0,
     }
 }
 
@@ -1116,6 +1134,30 @@ impl Store for PostgresStore {
                 },
             })
             .collect())
+    }
+
+    async fn outbound_refs(&self, engram_id: EngramId) -> Result<Vec<OutboundRef>> {
+        // Relation rows then link rows for one engram, each row decoded
+        // identically: line, kind discriminator, rel_type (NULL for a link),
+        // target text, target domain and a resolved flag derived from whether the
+        // forward reference has been bound to a `to_id`. The integer literals are
+        // cast to `int8` so `cell_i64` decodes them; ordered by source line.
+        let mut conn = self.acquire().await?;
+        let rows = sqlx::query(
+            "SELECT r.line AS line, 0::int8 AS kind, r.rel_type, r.to_target, r.to_domain, \
+                    (CASE WHEN r.to_id IS NULL THEN 0 ELSE 1 END)::int8 AS resolved \
+             FROM relation r WHERE r.engram_id=$1 \
+             UNION ALL \
+             SELECT l.line, 1::int8, NULL, l.to_target, l.to_domain, \
+                    (CASE WHEN l.to_id IS NULL THEN 0 ELSE 1 END)::int8 \
+             FROM link l WHERE l.engram_id=$1 \
+             ORDER BY line",
+        )
+        .bind(engram_id.0)
+        .fetch_all(conn.as_mut())
+        .await
+        .map_err(IndexError::from)?;
+        Ok(rows.iter().map(outbound_ref_from_row).collect())
     }
 
     async fn search(&self, query: &SearchQuery) -> Result<Page<SearchHit>> {
