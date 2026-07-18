@@ -845,6 +845,46 @@ async fn read_engram_inbound_summary_is_capped() {
     }
 }
 
+/// read_engram on an isolated engram - nothing points in, and its one outbound
+/// reference dangles - omits both the inbound summary and the related hint. The
+/// related hint gates on resolved outbound references, not their mere presence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn read_engram_isolated_omits_inbound_and_related() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    // A lone engram whose single relation points at a target that does not
+    // exist: an unresolved outbound reference, and nothing links back.
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Lonely", "content": "- needs [[Nonexistent]]" }),
+    )
+    .await
+    .unwrap();
+
+    let out = call(
+        peer,
+        "read_engram",
+        json!({ "identifier": "lonely", "domain": "eng" }),
+    )
+    .await
+    .unwrap();
+
+    assert!(out.get("inbound").is_none(), "no inbound expected: {out}");
+    assert!(
+        out.get("related").is_none(),
+        "no related hint without a resolved outbound reference: {out}"
+    );
+    // The dangling relation is still reported, flagged unresolved.
+    assert_eq!(
+        out["relations"][0]["resolved"],
+        json!(false),
+        "the dangling relation is unresolved: {out}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recent_list_browse_delete() {
     let h = Harness::new(&["eng"]).await;

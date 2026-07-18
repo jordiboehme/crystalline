@@ -898,7 +898,8 @@ impl Store for TursoStore {
         // engram's permalink or title. Prose wikilinks are never assigned a
         // `to_id`, so the text match is what catches them; `to_domain IS NULL`
         // restricts the rewrite to bare links that would otherwise dangle after
-        // the move.
+        // the move. Ordered by source domain then path (positional `1, 3`) so
+        // `read_engram`'s capped sample is deterministic across both backends.
         let params = vec![
             Value::Integer(engram_id.0),
             Value::Integer(domain_id.0),
@@ -917,7 +918,8 @@ impl Store for TursoStore {
              FROM link l JOIN engram e ON e.id=l.engram_id JOIN domain d ON d.id=e.domain_id \
              WHERE l.to_id=?1 \
                 OR (l.to_id IS NULL AND l.domain_id=?2 AND l.to_domain IS NULL \
-                    AND (l.to_target=?3 OR lower(l.to_target)=lower(?4)))",
+                    AND (l.to_target=?3 OR lower(l.to_target)=lower(?4))) \
+             ORDER BY 1, 3",
             params,
         )
         .await?;

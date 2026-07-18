@@ -1103,7 +1103,9 @@ impl Store for PostgresStore {
         // The kind discriminator is cast to `int8`: a bare Postgres integer
         // literal is `int4`, which `cell_i64` (`try_get::<Option<i64>>`) fails to
         // decode, collapsing every ref to kind 0 (relation). The cast matches
-        // `outbound_refs`.
+        // `outbound_refs`. Ordered by source domain then path (positional
+        // `1, 3`) so `read_engram`'s capped sample is deterministic across both
+        // backends.
         let rows = sqlx::query(
             "SELECT d.name, r.domain_id, e.path, r.to_target, 0::int8 AS kind \
              FROM relation r JOIN engram e ON e.id=r.engram_id JOIN domain d ON d.id=e.domain_id \
@@ -1115,7 +1117,8 @@ impl Store for PostgresStore {
              FROM link l JOIN engram e ON e.id=l.engram_id JOIN domain d ON d.id=e.domain_id \
              WHERE l.to_id=$1 \
                 OR (l.to_id IS NULL AND l.domain_id=$2 AND l.to_domain IS NULL \
-                    AND (l.to_target=$3 OR lower(l.to_target)=lower($4)))",
+                    AND (l.to_target=$3 OR lower(l.to_target)=lower($4))) \
+             ORDER BY 1, 3",
         )
         .bind(engram_id.0)
         .bind(domain_id.0)

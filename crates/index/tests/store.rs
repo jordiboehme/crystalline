@@ -587,6 +587,7 @@ async fn outbound_refs_status(store: &dyn Store) {
         .iter()
         .map(|r| {
             (
+                r.line,
                 r.kind,
                 r.rel_type.as_deref(),
                 r.to_target.as_str(),
@@ -598,10 +599,24 @@ async fn outbound_refs_status(store: &dyn Store) {
     assert_eq!(
         shape,
         vec![
-            (EdgeKind::Relation, Some("depends_on"), "Target", None, true),
-            (EdgeKind::Relation, Some("blocks"), "Missing", None, false),
-            (EdgeKind::Link, None, "Target", None, true),
-            (EdgeKind::Link, None, "Ghost", Some("other"), false),
+            (
+                13,
+                EdgeKind::Relation,
+                Some("depends_on"),
+                "Target",
+                None,
+                true
+            ),
+            (
+                14,
+                EdgeKind::Relation,
+                Some("blocks"),
+                "Missing",
+                None,
+                false
+            ),
+            (16, EdgeKind::Link, None, "Target", None, true),
+            (18, EdgeKind::Link, None, "Ghost", Some("other"), false),
         ],
         "outbound refs are line-ordered and carry resolution flags: {refs:?}"
     );
@@ -658,6 +673,13 @@ async fn inbound_refs_kinds(store: &dyn Store) {
         refs.len(),
         2,
         "one relation and one link point at Hub: {refs:?}"
+    );
+    // Ordered by source domain then path, so a capped sample is deterministic:
+    // both linkers are in domain `d`, so `link.md` sorts before `rel.md`.
+    assert_eq!(
+        refs.iter().map(|r| r.src_path.as_str()).collect::<Vec<_>>(),
+        vec!["link.md", "rel.md"],
+        "inbound refs are ordered by (domain, path): {refs:?}"
     );
     let relation = refs
         .iter()
