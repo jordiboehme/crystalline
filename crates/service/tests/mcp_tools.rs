@@ -1732,3 +1732,190 @@ async fn add_domain_flip_notifies_tool_list_changed() {
         "expected a tools/list_changed notification after add_domain flipped provisioning_declared",
     );
 }
+
+// --- tool schema sanitizer: advertised-shape sweep ---------------------------
+
+/// The JSON Schema `format` values these tools may advertise on purpose,
+/// duplicated from `crate::tool_schema`'s own allowlist rather than imported
+/// from it (the module is private and this check is meant to stand on its
+/// own): a bug shared between the two lists would otherwise hide from both.
+const CONSERVATIVE_FORMAT_ALLOWLIST: &[&str] = &[
+    "date-time",
+    "date",
+    "time",
+    "duration",
+    "email",
+    "idn-email",
+    "hostname",
+    "idn-hostname",
+    "ipv4",
+    "ipv6",
+    "uri",
+    "uri-reference",
+    "iri",
+    "iri-reference",
+    "uuid",
+    "uri-template",
+    "json-pointer",
+    "relative-json-pointer",
+    "regex",
+];
+
+/// A naive whole-tree sweep over an advertised schema: it walks every object
+/// and array value recursively rather than the fixed set of positions
+/// `crate::tool_schema::sanitize_schema` recurses into, so it is a check on
+/// what actually crossed the wire rather than a restatement of the
+/// sanitizer's own recursion list. Asserts, everywhere in the tree: (a) an
+/// array under a `"type"` key never contains the string `"null"`; (b) a
+/// string value under a `"format"` key is in `CONSERVATIVE_FORMAT_ALLOWLIST`;
+/// (c) whenever an object carries a `"properties"` key, every property value
+/// has at least one of type/$ref/enum/const/anyOf/oneOf/allOf/not. `context`
+/// is included in every assertion message so a failure names the tool and
+/// server it came from.
+fn assert_conservative(schema: &Value, context: &str) {
+    match schema {
+        Value::Object(map) => {
+            if let Some(Value::Array(members)) = map.get("type") {
+                assert!(
+                    !members.iter().any(|v| v.as_str() == Some("null")),
+                    "{context}: a type array must never contain null: {members:?}"
+                );
+            }
+            if let Some(format) = map.get("format") {
+                assert!(
+                    format
+                        .as_str()
+                        .is_some_and(|f| CONSERVATIVE_FORMAT_ALLOWLIST.contains(&f)),
+                    "{context}: format {format:?} is not in the conservative allowlist"
+                );
+            }
+            if let Some(Value::Object(properties)) = map.get("properties") {
+                for (property_name, property) in properties {
+                    let Value::Object(property) = property else {
+                        continue;
+                    };
+                    let has_type_bearing_key = [
+                        "type", "$ref", "enum", "const", "anyOf", "oneOf", "allOf", "not",
+                    ]
+                    .iter()
+                    .any(|k| property.contains_key(*k));
+                    assert!(
+                        has_type_bearing_key,
+                        "{context}: property {property_name} has neither a type nor a combinator: {property:?}"
+                    );
+                }
+            }
+            for value in map.values() {
+                assert_conservative(value, context);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                assert_conservative(item, context);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Every one of the 18 tools in `EXPECTED_ANNOTATIONS` advertises an input
+/// schema that passes the naive conservative-shape sweep, both on the
+/// read-write server where all 18 are visible and on the read-only one where
+/// only a subset resolves through `get_tool`. Also locks down the two
+/// type-less `serde_json::Value` params in this codebase to their documented
+/// object shape.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_advertised_tool_schema_is_client_conservative() {
+    use rmcp::ServerHandler;
+
+    let rw = annotation_server(false).await;
+    for (name, ..) in EXPECTED_ANNOTATIONS {
+        let tool = rw
+            .get_tool(name)
+            .unwrap_or_else(|| panic!("tool {name} must be visible on the read-write server"));
+        let schema = serde_json::to_value(&tool.input_schema).unwrap();
+        assert_conservative(&schema, &format!("{name} input schema (read-write)"));
+    }
+
+    // Read-only narrows visibility (see `annotation_hints_line_up_with_the_gating`),
+    // so only the tools still resolving through `get_tool` are swept here.
+    let ro = annotation_server(true).await;
+    for (name, ..) in EXPECTED_ANNOTATIONS {
+        let Some(tool) = ro.get_tool(name) else {
+            continue;
+        };
+        let schema = serde_json::to_value(&tool.input_schema).unwrap();
+        assert_conservative(&schema, &format!("{name} input schema (read-only)"));
+    }
+
+    let write_engram = rw.get_tool("write_engram").expect("write_engram visible");
+    let write_schema = serde_json::to_value(&write_engram.input_schema).unwrap();
+    assert_eq!(
+        write_schema["properties"]["metadata"]["type"],
+        json!("object"),
+        "write_engram.metadata must advertise a plain object type"
+    );
+
+    let search_engrams = rw
+        .get_tool("search_engrams")
+        .expect("search_engrams visible");
+    let search_schema = serde_json::to_value(&search_engrams.input_schema).unwrap();
+    assert_eq!(
+        search_schema["properties"]["metadata_filters"]["type"],
+        json!("object"),
+        "search_engrams.metadata_filters must advertise a plain object type"
+    );
+}
+
+/// The same sweep, but driven through the real `tools/list` JSON-RPC wire
+/// path (the duplex `Harness` from `configure_tool_schema_advertises_plain_object_and_array_types`)
+/// rather than the in-process `get_tool` handler, so a regression in
+/// serialization or in the rmcp router itself would also be caught. Also
+/// spot-checks `search_engrams.limit` and `.min_similarity`, the `Option<usize>`
+/// and `Option<f32>` fields whose schemars-generated `format` (`uint`, `float`)
+/// must be gone while `limit`'s `minimum` keyword survives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wire_list_tools_carries_sanitized_schemas() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let tools = client.peer().list_tools(Default::default()).await.unwrap();
+
+    for tool in &tools.tools {
+        let schema = serde_json::to_value(&tool.input_schema).unwrap();
+        assert_conservative(
+            &schema,
+            &format!("{} input schema over the wire", tool.name),
+        );
+    }
+
+    let search_engrams = tools
+        .tools
+        .iter()
+        .find(|t| t.name == "search_engrams")
+        .expect("search_engrams tool present");
+    let schema = serde_json::to_value(&search_engrams.input_schema).unwrap();
+    assert_eq!(
+        schema["properties"]["limit"]["type"],
+        json!("integer"),
+        "search_engrams.limit must advertise a bare integer type"
+    );
+    assert!(
+        schema["properties"]["limit"].get("minimum").is_some(),
+        "search_engrams.limit must keep its minimum keyword"
+    );
+    assert!(
+        schema["properties"]["limit"].get("format").is_none(),
+        "search_engrams.limit must not advertise a format"
+    );
+    assert_eq!(
+        schema["properties"]["min_similarity"]["type"],
+        json!("number"),
+        "search_engrams.min_similarity must advertise a bare number type"
+    );
+    assert!(
+        schema["properties"]["min_similarity"]
+            .get("format")
+            .is_none(),
+        "search_engrams.min_similarity must not advertise a format"
+    );
+}
