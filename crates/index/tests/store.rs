@@ -615,6 +615,71 @@ async fn outbound_refs_status(store: &dyn Store) {
 }
 parity!(outbound_refs_report_resolution_status, outbound_refs_status);
 
+/// `inbound_refs` reports a relation-kind and a link-kind reference pointing at
+/// an engram, each carrying the correct `kind`. This guards the kind
+/// discriminator decoding identically on both backends: a bare integer literal
+/// does not decode as `i64` on Postgres, so the column must be cast.
+async fn inbound_refs_kinds(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "hub.md",
+        &engram("Hub", "hub", "engram", "", "the hub body\n"),
+    );
+    // A relation bullet pointing at Hub, and a separate engram whose prose links
+    // to Hub. After resolution both are inbound references, of different kinds.
+    write(
+        root,
+        "rel.md",
+        &engram("Rel", "rel", "engram", "", "- cites [[Hub]]\n"),
+    );
+    write(
+        root,
+        "link.md",
+        &engram(
+            "Link",
+            "link",
+            "engram",
+            "",
+            "See [[Hub]] for the details.\n",
+        ),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+
+    let hub = store.lookup_id("d", "hub").await.unwrap().unwrap();
+    let domain = store
+        .upsert_domain("d", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+    let refs = store.inbound_refs(hub, domain, "hub", "Hub").await.unwrap();
+
+    assert_eq!(
+        refs.len(),
+        2,
+        "one relation and one link point at Hub: {refs:?}"
+    );
+    let relation = refs
+        .iter()
+        .find(|r| r.src_path == "rel.md")
+        .expect("the relation linker is present");
+    assert_eq!(
+        relation.kind,
+        EdgeKind::Relation,
+        "the relation bullet is a relation-kind inbound ref: {refs:?}"
+    );
+    let link = refs
+        .iter()
+        .find(|r| r.src_path == "link.md")
+        .expect("the prose linker is present");
+    assert_eq!(
+        link.kind,
+        EdgeKind::Link,
+        "the prose wikilink is a link-kind inbound ref: {refs:?}"
+    );
+}
+parity!(inbound_refs_report_ref_kinds, inbound_refs_kinds);
+
 async fn duplicate_permalink_fails(store: &dyn Store) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();

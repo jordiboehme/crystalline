@@ -1100,14 +1100,18 @@ impl Store for PostgresStore {
         title: &str,
     ) -> Result<Vec<InboundRef>> {
         let mut conn = self.acquire().await?;
+        // The kind discriminator is cast to `int8`: a bare Postgres integer
+        // literal is `int4`, which `cell_i64` (`try_get::<Option<i64>>`) fails to
+        // decode, collapsing every ref to kind 0 (relation). The cast matches
+        // `outbound_refs`.
         let rows = sqlx::query(
-            "SELECT d.name, r.domain_id, e.path, r.to_target, 0 AS kind \
+            "SELECT d.name, r.domain_id, e.path, r.to_target, 0::int8 AS kind \
              FROM relation r JOIN engram e ON e.id=r.engram_id JOIN domain d ON d.id=e.domain_id \
              WHERE r.to_id=$1 \
                 OR (r.to_id IS NULL AND r.domain_id=$2 AND r.to_domain IS NULL \
                     AND (r.to_target=$3 OR lower(r.to_target)=lower($4))) \
              UNION ALL \
-             SELECT d.name, l.domain_id, e.path, l.to_target, 1 AS kind \
+             SELECT d.name, l.domain_id, e.path, l.to_target, 1::int8 AS kind \
              FROM link l JOIN engram e ON e.id=l.engram_id JOIN domain d ON d.id=e.domain_id \
              WHERE l.to_id=$1 \
                 OR (l.to_id IS NULL AND l.domain_id=$2 AND l.to_domain IS NULL \
