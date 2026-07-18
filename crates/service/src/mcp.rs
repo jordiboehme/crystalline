@@ -770,7 +770,10 @@ impl ServerHandler for McpServer {
     /// are filtered the same way against the engine's live `github.enabled` and
     /// `read_only` state (see `hidden_collab_tool`), consulted fresh on every
     /// call rather than cached, since `configure` can flip `github.enabled`
-    /// mid-session.
+    /// mid-session. Both this method and `get_tool` run every surviving
+    /// tool's schema through `crate::tool_schema::sanitize_tool` before
+    /// returning it, so advertised schemas stay in the conservative
+    /// client-compatible shape.
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
@@ -792,6 +795,9 @@ impl ServerHandler for McpServer {
             }
             true
         });
+        for tool in &mut tools {
+            crate::tool_schema::sanitize_tool(tool);
+        }
         Ok(ListToolsResult {
             tools,
             meta: None,
@@ -818,7 +824,9 @@ impl ServerHandler for McpServer {
         {
             return None;
         }
-        Self::tool_router().get(name).cloned()
+        let mut tool = Self::tool_router().get(name).cloned()?;
+        crate::tool_schema::sanitize_tool(&mut tool);
+        Some(tool)
     }
 }
 

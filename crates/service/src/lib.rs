@@ -21,6 +21,7 @@ pub mod params;
 mod poller;
 pub mod settings;
 pub mod stub;
+mod tool_schema;
 
 pub use client::{
     configure, ctl_if_running, ctl_required, domain_export, domain_import, origin_add,
