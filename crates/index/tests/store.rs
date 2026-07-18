@@ -12,8 +12,8 @@
 use std::path::Path;
 
 use crystalline_index::{
-    DomainId, DomainKind, EmbeddingCoverage, EmbeddingRow, EngramId, EngramRecord, FileStamp,
-    FilterOp, HostClaim, IndexError, MetadataFilter, NewChunk, RecentFilter, SearchMode,
+    DomainId, DomainKind, EdgeKind, EmbeddingCoverage, EmbeddingRow, EngramId, EngramRecord,
+    FileStamp, FilterOp, HostClaim, IndexError, MetadataFilter, NewChunk, RecentFilter, SearchMode,
     SearchQuery, Store, TursoStore, sync_domain,
 };
 
@@ -156,7 +156,14 @@ async fn full_sync_counts(store: &dyn Store) {
     assert_eq!(report.added, 3, "three files added");
     assert_eq!(report.updated, 0);
     assert_eq!(report.failed.len(), 0, "no failures: {:?}", report.failed);
-    assert!(report.relations_resolved >= 1, "Alpha->Beta resolved");
+    assert!(
+        report.relations_resolved >= 1,
+        "Alpha->Beta relation resolved"
+    );
+    assert!(
+        report.links_resolved >= 1,
+        "Alpha's prose [[Beta]] resolved"
+    );
 
     let stats = store.domain_stats().await.unwrap();
     assert_eq!(stats.len(), 1);
@@ -165,7 +172,20 @@ async fn full_sync_counts(store: &dyn Store) {
     assert_eq!(s.observations, 1);
     assert_eq!(s.relations, 1);
     assert_eq!(s.unresolved_relations, 0);
+    assert_eq!(s.links, 1, "one prose wikilink");
+    assert_eq!(s.unresolved_links, 0, "the prose wikilink resolved");
     assert!(s.last_sync.is_some());
+
+    // The resolved prose wikilink is a `links_to` edge in graph traversal.
+    let alpha = store.lookup_id("eng", "alpha").await.unwrap().unwrap();
+    let slice = store.neighbors(&[alpha], 1).await.unwrap();
+    assert!(
+        slice
+            .edges
+            .iter()
+            .any(|e| e.kind == EdgeKind::Link && e.rel_type == "links_to"),
+        "Alpha has a links_to edge to Beta"
+    );
 }
 parity!(
     full_sync_counts_engrams_observations_relations,
@@ -475,6 +495,61 @@ async fn forward_reference_resolves_by_title(store: &dyn Store) {
 parity!(
     forward_reference_resolves_by_title_on_later_sync,
     forward_reference_resolves_by_title
+);
+
+/// The prose-wikilink twin of `forward_reference_resolves`: a bare `[[Gamma]]`
+/// mentioned in prose (no relation type) stays unresolved until its target
+/// appears, then resolves on the later sync into a `links_to` graph edge. This
+/// is the whole point of M1: prose wikilinks were indexed but never resolved,
+/// so they never joined graph traversal.
+async fn link_two_pass_resolution(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // A prose mention only, no `- rel_type [[...]]` bullet, so this exercises
+    // the link table, not the relation table.
+    write(
+        root,
+        "a.md",
+        &engram("A", "a", "engram", "", "See [[Gamma]] for the details.\n"),
+    );
+    let first = sync_domain(store, "d", root).await.unwrap();
+    assert_eq!(first.links_resolved, 0, "target absent, link unresolved");
+    assert_eq!(first.relations_resolved, 0, "no relation bullets");
+    let stats = store.domain_stats().await.unwrap();
+    assert_eq!(stats[0].links, 1, "the prose wikilink is indexed");
+    assert_eq!(stats[0].unresolved_links, 1, "and still unresolved");
+
+    // The target appears in a later sync. Its title matches the wikilink text
+    // (its permalink deliberately does not), so the title branch resolves it.
+    write(
+        root,
+        "gamma.md",
+        &engram("Gamma", "gamma-perma", "engram", "", "gamma body\n"),
+    );
+    let second = sync_domain(store, "d", root).await.unwrap();
+    assert_eq!(second.links_resolved, 1, "now resolved");
+    assert_eq!(
+        store.domain_stats().await.unwrap()[0].unresolved_links,
+        0,
+        "no pending links remain"
+    );
+
+    // The resolved wikilink is a `links_to` edge from A to Gamma.
+    let a = store.lookup_id("d", "a").await.unwrap().unwrap();
+    let slice = store.neighbors(&[a], 1).await.unwrap();
+    assert!(
+        slice
+            .edges
+            .iter()
+            .any(|e| e.kind == EdgeKind::Link && e.rel_type == "links_to"),
+        "A has a links_to edge to Gamma"
+    );
+    let perms: Vec<&str> = slice.nodes.iter().map(|n| n.permalink.as_str()).collect();
+    assert!(perms.contains(&"gamma-perma"), "traversal reaches Gamma");
+}
+parity!(
+    prose_wikilink_resolves_on_later_sync,
+    link_two_pass_resolution
 );
 
 async fn duplicate_permalink_fails(store: &dyn Store) {

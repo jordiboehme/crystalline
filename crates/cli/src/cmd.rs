@@ -1141,12 +1141,14 @@ pub fn render_status(data: &serde_json::Value, daemon_note: &str) {
         indexed_names.insert(name.to_string());
         let last_sync = d["last_sync"].as_str().map(relative_time);
         println!(
-            "{}\t{} engrams, {} observations, {} relations ({} unresolved)\tlast sync {}",
+            "{}\t{} engrams, {} observations, {} relations ({} unresolved), {} links ({} unresolved)\tlast sync {}",
             name,
             d["engrams"].as_u64().unwrap_or(0),
             d["observations"].as_u64().unwrap_or(0),
             d["relations"].as_u64().unwrap_or(0),
             d["unresolved_relations"].as_u64().unwrap_or(0),
+            d["links"].as_u64().unwrap_or(0),
+            d["unresolved_links"].as_u64().unwrap_or(0),
             last_sync.as_deref().unwrap_or("never")
         );
     }
@@ -1653,7 +1655,7 @@ fn print_report(r: &crystalline_index::SyncReport) {
         String::new()
     };
     println!(
-        "{}: {} added, {} updated, {} deleted, {} moved, {} unchanged{}, {} resolved ({} ms)",
+        "{}: {} added, {} updated, {} deleted, {} moved, {} unchanged{}, {} relations resolved, {} links resolved ({} ms)",
         r.domain,
         r.added,
         r.updated,
@@ -1662,6 +1664,7 @@ fn print_report(r: &crystalline_index::SyncReport) {
         r.unchanged,
         deferred,
         r.relations_resolved,
+        r.links_resolved,
         r.duration_ms
     );
     for (path, err) in &r.failed {

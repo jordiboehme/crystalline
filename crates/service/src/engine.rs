@@ -1014,6 +1014,7 @@ impl Engine {
             );
             store.replace_chunks(id, &chunks).await?;
             store.resolve_pending_relations(domain_id).await?;
+            store.resolve_pending_links(domain_id).await?;
             Ok::<EngramId, EngineError>(id)
         }
         .await;

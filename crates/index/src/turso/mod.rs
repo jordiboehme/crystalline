@@ -780,6 +780,31 @@ impl Store for TursoStore {
         Ok(n)
     }
 
+    async fn resolve_pending_links(&self, domain: DomainId) -> Result<u64> {
+        // The wikilink twin of resolve_pending_relations over the `link` table.
+        // Target domain is `to_domain` when set, else the link's own domain.
+        // Prefer a permalink match, then a title match. Links carry no rel_type.
+        let tgt_dom =
+            "COALESCE((SELECT d.id FROM domain d WHERE d.name = link.to_domain), link.domain_id)";
+        let by_perma = format!(
+            "(SELECT e.id FROM engram e WHERE e.permalink = link.to_target AND e.domain_id = {tgt_dom} LIMIT 1)"
+        );
+        let by_title = format!(
+            "(SELECT e.id FROM engram e WHERE lower(e.title) = lower(link.to_target) AND e.domain_id = {tgt_dom} LIMIT 1)"
+        );
+        let sql = format!(
+            "UPDATE link SET to_id = COALESCE({by_perma}, {by_title}) \
+             WHERE link.to_id IS NULL AND link.domain_id = ?1 \
+             AND (EXISTS (SELECT 1 FROM engram e WHERE e.permalink = link.to_target AND e.domain_id = {tgt_dom}) \
+                  OR EXISTS (SELECT 1 FROM engram e WHERE lower(e.title) = lower(link.to_target) AND e.domain_id = {tgt_dom}))"
+        );
+        let n = self
+            .conn
+            .execute(&sql, vec![Value::Integer(domain.0)])
+            .await?;
+        Ok(n)
+    }
+
     async fn lookup_id(&self, domain: &str, permalink: &str) -> Result<Option<EngramId>> {
         let row = query_first(
             &self.conn,
@@ -1217,6 +1242,8 @@ impl Store for TursoStore {
              (SELECT count(*) FROM observation o JOIN engram e ON e.id=o.engram_id WHERE e.domain_id=d.id), \
              (SELECT count(*) FROM relation r WHERE r.domain_id=d.id), \
              (SELECT count(*) FROM relation r WHERE r.domain_id=d.id AND r.to_id IS NULL), \
+             (SELECT count(*) FROM link l WHERE l.domain_id=d.id), \
+             (SELECT count(*) FROM link l WHERE l.domain_id=d.id AND l.to_id IS NULL), \
              dl.holder_instance_id, dl.holder_label, dl.heartbeat_at \
              FROM domain d LEFT JOIN domain_lock dl ON dl.domain_id=d.id ORDER BY d.id",
             vec![],
@@ -1233,9 +1260,11 @@ impl Store for TursoStore {
                 observations: cell_i64(r, 6).unwrap_or(0),
                 relations: cell_i64(r, 7).unwrap_or(0),
                 unresolved_relations: cell_i64(r, 8).unwrap_or(0),
-                host_instance_id: cell_text(r, 9),
-                host_label: cell_text(r, 10),
-                host_heartbeat_at: cell_text(r, 11),
+                links: cell_i64(r, 9).unwrap_or(0),
+                unresolved_links: cell_i64(r, 10).unwrap_or(0),
+                host_instance_id: cell_text(r, 11),
+                host_label: cell_text(r, 12),
+                host_heartbeat_at: cell_text(r, 13),
             })
             .collect())
     }

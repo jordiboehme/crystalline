@@ -46,6 +46,11 @@ pub const MIGRATIONS: &[Migration] = &[
         label: "title-lower expression index",
         sql: SCHEMA_V4,
     },
+    Migration {
+        version: 5,
+        label: "link unresolved partial index",
+        sql: SCHEMA_V5,
+    },
 ];
 
 // The whole current schema in one step. The temporal columns stay TEXT ISO
@@ -197,6 +202,15 @@ CREATE TABLE domain_lock (
 // untouched and only gain the index.
 const SCHEMA_V4: &str = r#"
 CREATE INDEX idx_engram_title_lower ON engram(domain_id, lower(title));
+"#;
+
+// The Postgres twin of Turso's v6. Prose wikilinks now resolve into the graph,
+// so the batch resolver scans the `link` table for unresolved rows the same way
+// the relation resolver scans `relation`. The partial index mirrors
+// `idx_relation_unresolved` so each resolve pass seeks the pending links for a
+// domain instead of scanning the whole table. Index-only, so no resync.
+const SCHEMA_V5: &str = r#"
+CREATE INDEX idx_link_unresolved ON link(domain_id, to_target) WHERE to_id IS NULL;
 "#;
 
 /// The tables cleared by `wipe()`, child rows first so the enforced foreign

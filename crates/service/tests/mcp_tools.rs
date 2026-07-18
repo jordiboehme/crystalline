@@ -655,6 +655,55 @@ async fn build_context_glob_and_relations() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn build_context_follows_prose_wikilinks() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    // A pair joined ONLY by a prose wikilink: no `- rel_type [[...]]` bullet
+    // anywhere, so the sole edge between them is a resolved link.
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Target", "content": "the target body" }),
+    )
+    .await
+    .unwrap();
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Linker", "content": "see [[Target]] for the details" }),
+    )
+    .await
+    .unwrap();
+
+    let out = call(
+        peer,
+        "build_context",
+        json!({ "anchor": "crystalline://eng/linker", "depth": 1 }),
+    )
+    .await
+    .unwrap();
+    let perms: Vec<&str> = out["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["permalink"].as_str().unwrap())
+        .collect();
+    assert!(
+        perms.contains(&"target"),
+        "prose link reaches Target: {perms:?}"
+    );
+    let edges = out["edges"].as_array().unwrap();
+    assert!(
+        edges
+            .iter()
+            .any(|e| e["kind"] == "link" && e["rel_type"] == "links_to"),
+        "a links_to edge is present: {edges:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recent_list_browse_delete() {
     let h = Harness::new(&["eng"]).await;
     let (client, _server) = h.connect().await;

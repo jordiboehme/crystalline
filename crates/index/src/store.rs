@@ -709,6 +709,10 @@ pub struct DomainStats {
     pub relations: i64,
     /// Number of relations still awaiting their target (forward refs).
     pub unresolved_relations: i64,
+    /// Number of prose wikilinks.
+    pub links: i64,
+    /// Number of prose wikilinks still awaiting their target (forward refs).
+    pub unresolved_links: i64,
     /// Last successful sync, RFC 3339, or `None` if never synced.
     pub last_sync: Option<String>,
     /// The instance id currently hosting this file domain in a shared database,
@@ -817,6 +821,13 @@ pub trait Store: Send + Sync {
     /// matching the target text against permalink then title within the target
     /// domain. Returns the number of relations newly resolved.
     async fn resolve_pending_relations(&self, domain: DomainId) -> Result<u64>;
+
+    /// Resolve every pending prose wikilink in a domain in one batch, the same
+    /// permalink-then-title match as [`Store::resolve_pending_relations`] but
+    /// over the `link` table. Wikilinks carry no relation type, so a resolved
+    /// link becomes a `links_to` edge in graph traversal. Returns the number of
+    /// links newly resolved.
+    async fn resolve_pending_links(&self, domain: DomainId) -> Result<u64>;
 
     // --- lookups -------------------------------------------------------------
     // Repository-level addressing helpers used by the service layer to turn a
