@@ -165,7 +165,7 @@ crystalline status
 
 Engrams written through Crystalline are indexed immediately; `crystalline sync` only picks up files created outside it (an editor, a `git pull`) when no daemon is watching them. Edit the domain's `MANIFEST.md` `## Scope` and `## When to Use` sections so routing describes it accurately - that file is what the session prompt and an agent's routing decisions read (see [Session onboarding](#session-onboarding)).
 
-[The Crystalline Playbook](docs/playbook.md) teaches the whole workflow by example, as a short mission-based course from your first domain through ingestion, reconciliation, retirement and team sharing.
+[The Crystalline Playbook](docs/playbook.md) teaches the whole workflow by example, a use-case course over one running dataset through recording, querying, ingesting, reconciling, retiring and sharing knowledge.
 
 ## Session onboarding
 
