@@ -417,3 +417,54 @@ fn provisioned_in_root_folder_is_excluded_from_the_scan() {
         report.issues
     );
 }
+
+// --- Tag alias rule (M107) ---------------------------------------------------
+
+/// A structurally valid harbor MANIFEST whose `## Tag Aliases` section carries
+/// `aliases`, so the tag-alias rule fires in isolation from the other M-rules.
+fn manifest_with_tag_aliases(aliases: &str) -> String {
+    format!(
+        "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n## Scope\n\n- Charts of the harbor\n\n## When to Use\n\n- When asked about the harbor\n\n## Tag Aliases\n\n{aliases}"
+    )
+}
+
+#[test]
+fn every_tag_alias_problem_kind_is_one_m107_warning() {
+    // One bullet of each problem kind: malformed, self, duplicate,
+    // non-canonical target and chained - five problems, five M107 warnings.
+    let dir = tempdir().unwrap();
+    write(
+        dir.path(),
+        "MANIFEST.md",
+        &manifest_with_tag_aliases(
+            "- no arrow\n- self -> self\n- dup -> one\n- dup -> two\n- old -> Bad_Target\n- x -> y\n- y -> z\n",
+        ),
+    );
+    let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+    let m107: Vec<_> = report.issues.iter().filter(|i| i.rule == "M107").collect();
+    assert_eq!(m107.len(), 5, "one per problem: {:#?}", report.issues);
+    assert!(m107.iter().all(|i| i.severity == Severity::Warning));
+    assert!(
+        m107.iter().all(|i| i.message.contains("## Tag Aliases")),
+        "{m107:#?}"
+    );
+    // Warnings alone never fail the run.
+    assert_eq!(report.exit_code(), 0);
+}
+
+#[test]
+fn clean_tag_aliases_section_emits_no_m107() {
+    let dir = tempdir().unwrap();
+    write(
+        dir.path(),
+        "MANIFEST.md",
+        &manifest_with_tag_aliases("- multi_word -> multi-word\n- old-name -> new-name\n"),
+    );
+    let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+    assert!(
+        !report.issues.iter().any(|i| i.rule == "M107"),
+        "{:#?}",
+        report.issues
+    );
+    assert_eq!(report.exit_code(), 0);
+}
