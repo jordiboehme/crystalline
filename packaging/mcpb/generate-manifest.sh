@@ -162,7 +162,7 @@ cat >"$manifest_path" <<JSON
     },
     {
       "name": "validate_engrams",
-      "description": "Check a domain's engrams against its schema engrams to keep captured knowledge well-formed."
+      "description": "Check a domain's engrams against its schema engrams to keep captured knowledge well-formed; pass drift to also report observation categories and relation types in use but undeclared, and declared but unused."
     },
     {
       "name": "infer_schema",

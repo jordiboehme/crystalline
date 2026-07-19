@@ -9,7 +9,7 @@ A team domain is an ordinary domain that also tracks a GitHub repository: the fi
 
 ## Session start in a shared domain
 
-Before doing deep work in a domain with a team origin, call `origin_status` for that domain. If it reports the domain is behind, call `update_domain` to bring it up to date first: this merges the team's latest knowledge cleanly where possible and flags any real conflicts for `resolve_conflict`. Skipping this risks building on stale knowledge or creating an avoidable conflict later.
+Before doing deep work in a domain with a team origin, call `origin_status` for that domain. If it reports the domain is behind, call `update_domain` to bring it up to date first: this merges the team's latest knowledge cleanly where possible and flags any real conflicts for `resolve_conflict`. Skipping this risks building on stale knowledge or creating an avoidable conflict later. A teammate's merged changes can also add `## Tag Aliases` entries to a MANIFEST, which change how tag searches fold the moment `update_domain` pulls them in.
 
 ## Capture, then share deliberately
 

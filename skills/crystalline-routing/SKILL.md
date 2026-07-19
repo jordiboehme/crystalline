@@ -55,7 +55,7 @@ Omit `domains` entirely - `search_engrams` defaults to every registered domain, 
 
 Do not pre-filter to the domains you recognize from the routing block; a domain returning no hits for one phrasing does not mean the knowledge is not captured there under different words. If hits span several domains and the guidance conflicts, say so explicitly and name which domain each answer came from rather than picking one silently.
 
-Zero hits is not the only signal to broaden. A scoped search can return plausible hits that do not actually answer the question - common when the question's subject belongs to one domain but the question itself is about ownership, escalation or roles, which another domain owns (who gets paged about refunds is a people question, not a payments one). When the obvious subject-matter domain keeps surfacing near-misses after a rephrasing or two, stop rephrasing inside it and run one unscoped sweep.
+Zero hits is not the only signal to broaden. A scoped search can return plausible hits that do not actually answer the question - common when the question's subject belongs to one domain but the question itself is about ownership, escalation or roles, which another domain owns (who gets paged about refunds is a people question, not a payments one). When the obvious subject-matter domain keeps surfacing near-misses after a rephrasing or two, stop rephrasing inside it and run one unscoped sweep. Each hit also carries its engram's tags (alphabetical, lowercase); use the tags on the strongest hits to sharpen a follow-up scoped search.
 
 ## Read before you answer
 
@@ -128,7 +128,9 @@ Once you have an anchor engram, follow its relations and links (including across
 }
 ```
 
-A `/*` suffix on the anchor globs a permalink prefix, useful for pulling in an entire topic's engrams at once, for example `crystalline://payments/retry-queue/*`. The result carries titles and relations only, no content - follow it with `read_engram` on the nodes that matter.
+A `/*` suffix on the anchor globs a permalink prefix, useful for pulling in an entire topic's engrams at once, for example `crystalline://payments/retry-queue/*`. The result carries node titles, typed relations and untyped prose links (the latter surfaced as `rel_type` `links_to`), still no content - follow it with `read_engram` on the nodes that matter.
+
+`read_engram` feeds this loop: it marks each relation and link `resolved` or not, summarizes `inbound` edges (capped at 5 refs) and, when inbound or resolved outbound edges exist, emits a `related` hint naming the `build_context` anchor to run - follow it when the neighbourhood would help. A `resolved: false` edge means the target is not written yet or sits in an unregistered domain, a signal not an error to chase.
 
 ## Quick reference
 
@@ -140,5 +142,6 @@ A `/*` suffix on the anchor globs a permalink prefix, useful for pulling in an e
 - "Did we adopt X" -> search without a status filter and narrate each hit's status.
 - Need the shape of a domain, not its content -> `browse_domain` or its `MANIFEST.md`.
 - Need what surrounds a known engram -> `build_context`.
+- `read_engram` reports an `inbound` summary or a `related` hint -> more linked knowledge; follow the named `build_context` anchor.
 - Before writing anything, switch to the `crystalline-capture` skill.
 - Domain has a team origin (`origin_status` says so) -> switch to the `crystalline-collaboration` skill for status, sharing and conflicts.

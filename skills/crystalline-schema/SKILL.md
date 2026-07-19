@@ -11,6 +11,8 @@ A domain's engrams need no schema by default - `type` and `status` are free-form
 
 A schema is itself an engram, `type: schema`, whose frontmatter declares the shape for another `type` via `entity`. Body content is optional prose describing the schema; the shape lives entirely in frontmatter.
 
+Before deciding which categories and relations to require, call `vocabulary` for the domain to see what its engrams already use - it complements `infer_schema` by grounding the shape in real terms.
+
 ```yaml
 ---
 type: schema
@@ -114,6 +116,8 @@ Narrow to one engram or one type when iterating on a schema change:
 ```
 
 Issues report as warnings or errors depending on `settings.validation` for the matched schema; a missing required observation, an out-of-enum value or a missing required relation are typical findings. Adopt a new schema with `settings.validation: warn` first, watch what it flags across the domain's existing engrams, and only promote to `strict` once the domain's engrams have actually converged on the shape.
+
+Pass `drift: true` to add a `drift` report per schema entity: the observation categories and relation types in use but undeclared, and those declared but never used. Run it before promoting `warn` to `strict` so the declared shape matches what the domain already writes.
 
 When the report comes back with `schemas: 0`, say plainly that no schema governs the domain before mentioning the zero-issue count - "all engrams conform" implies a validation that never ran.
 
