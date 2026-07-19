@@ -278,23 +278,24 @@ impl PostgresStore {
     }
 
     /// Intern a tag name, returning its id, using the in-process cache. Runs on
-    /// the caller's connection so it stays inside the current transaction.
+    /// the caller's connection so it stays inside the current transaction. Tag
+    /// identity is case-folded: the interned row and every cache key are the
+    /// lowercase form, so `Foo` and `foo` collapse onto one id. Files keep their
+    /// verbatim tag text; only the derived index folds.
     async fn tag_id(&self, conn: &mut PgConnection, name: &str) -> Result<i64> {
-        let cached = self.tag_cache.lock().unwrap().get(name).copied();
+        let folded = name.to_lowercase();
+        let cached = self.tag_cache.lock().unwrap().get(&folded).copied();
         if let Some(id) = cached {
             return Ok(id);
         }
         let row: (i64,) = sqlx::query_as(
             "INSERT INTO tag(name) VALUES($1) ON CONFLICT(name) DO UPDATE SET name=EXCLUDED.name RETURNING id",
         )
-        .bind(name)
+        .bind(&folded)
         .fetch_one(&mut *conn)
         .await
         .map_err(IndexError::from)?;
-        self.tag_cache
-            .lock()
-            .unwrap()
-            .insert(name.to_string(), row.0);
+        self.tag_cache.lock().unwrap().insert(folded, row.0);
         Ok(row.0)
     }
 
@@ -1087,6 +1088,32 @@ impl Store for PostgresStore {
             "SELECT e.id, e.domain_id, d.name, e.path, e.permalink, e.title, e.engram_type, e.status \
              FROM engram e JOIN domain d ON d.id=e.domain_id WHERE {} ORDER BY e.path",
             clauses.join(" AND ")
+        );
+        let mut conn = self.acquire().await?;
+        let rows = query_all(conn.as_mut(), &sql, params).await?;
+        Ok(rows.iter().map(descriptor_from_row).collect())
+    }
+
+    async fn engrams_with_tag(
+        &self,
+        tag: &str,
+        domain: Option<&str>,
+    ) -> Result<Vec<EngramDescriptor>> {
+        let mut params = vec![Param::Text(tag.to_lowercase())];
+        let mut where_domain = String::new();
+        if let Some(d) = domain {
+            where_domain = " AND d.name=$2".to_string();
+            params.push(Param::Text(d.to_string()));
+        }
+        let sql = format!(
+            "SELECT e.id, e.domain_id, d.name, e.path, e.permalink, e.title, e.engram_type, e.status \
+             FROM engram e JOIN domain d ON d.id=e.domain_id \
+             WHERE (EXISTS (SELECT 1 FROM engram_tag et JOIN tag t ON t.id=et.tag_id \
+                            WHERE et.engram_id=e.id AND t.name=$1) \
+                 OR EXISTS (SELECT 1 FROM observation_tag ot JOIN tag t ON t.id=ot.tag_id \
+                            JOIN observation o ON o.id=ot.observation_id \
+                            WHERE o.engram_id=e.id AND t.name=$1)){where_domain} \
+             ORDER BY d.name, e.path"
         );
         let mut conn = self.acquire().await?;
         let rows = query_all(conn.as_mut(), &sql, params).await?;

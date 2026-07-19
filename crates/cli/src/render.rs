@@ -188,6 +188,23 @@ pub fn render_vocabulary(v: &Value, out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "Relation types:")?;
     render_named_counts(relation_types, out)?;
 
+    // Near-duplicate tag clusters, present only when the engine found any.
+    if let Some(clusters) = v.get("clusters").and_then(Value::as_array)
+        && !clusters.is_empty()
+    {
+        writeln!(out, "Near-duplicate tags:")?;
+        for c in clusters {
+            let reason = c.get("reason").and_then(Value::as_str).unwrap_or("");
+            let tags: Vec<&str> = c
+                .get("tags")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            writeln!(out, "  {} ({reason})", tags.join(", "))?;
+        }
+        writeln!(out, "  merge with `crystalline tags merge`")?;
+    }
+
     Ok(())
 }
 

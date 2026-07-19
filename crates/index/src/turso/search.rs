@@ -532,7 +532,8 @@ fn build_scalar_filters(
             clauses.push(format!(
                 "EXISTS (SELECT 1 FROM engram_tag et JOIN tag t ON t.id=et.tag_id WHERE et.engram_id=e.id AND t.name=?{n})"
             ));
-            params.push(Value::Text(tag.clone()));
+            // Tag identity is case-folded in the index, so a filter folds too.
+            params.push(Value::Text(tag.to_lowercase()));
             *n += 1;
         }
     }
@@ -554,7 +555,7 @@ fn metadata_clause(f: &MetadataFilter, params: &mut Vec<Value>, n: &mut usize) -
             let p = format!(
                 "EXISTS (SELECT 1 FROM engram_tag et JOIN tag t ON t.id=et.tag_id WHERE et.engram_id=e.id AND t.name=?{n})"
             );
-            params.push(json_to_value(val));
+            params.push(tag_filter_value(val));
             *n += 1;
             p
         };
@@ -616,6 +617,16 @@ fn op_clause(col: &str, op: &FilterOp, params: &mut Vec<Value>, n: &mut usize) -
             let ph: Vec<String> = vs.iter().map(|v| bind(v, params, n)).collect();
             format!("{col} IN ({})", ph.join(","))
         }
+    }
+}
+
+/// Bind a `tags` filter value, folded to lowercase so it matches the
+/// case-folded `tag.name`. A non-string value passes through unchanged (a tags
+/// filter is a string in practice).
+fn tag_filter_value(v: &serde_json::Value) -> Value {
+    match v {
+        serde_json::Value::String(s) => Value::Text(s.to_lowercase()),
+        other => json_to_value(other),
     }
 }
 

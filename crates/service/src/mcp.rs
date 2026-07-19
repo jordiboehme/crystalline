@@ -389,7 +389,7 @@ impl McpServer {
     #[tool(
         name = "vocabulary",
         title = "Vocabulary in use",
-        description = "List the vocabulary in use: tags with engram and observation usage counts, observation categories with counts and relation types with counts, for one domain or across all domains. Check it before inventing a new tag or category so existing terms are reused instead of multiplied.",
+        description = "List the vocabulary in use: tags with engram and observation usage counts, observation categories with counts and relation types with counts, for one domain or across all domains. Check it before inventing a new tag or category so existing terms are reused instead of multiplied. Near-duplicate tag clusters are reported so they can be merged.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn vocabulary(

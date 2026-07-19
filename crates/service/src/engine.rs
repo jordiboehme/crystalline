@@ -29,7 +29,7 @@ use crystalline_core::emit::{
 use crystalline_core::schema::{self, Schema};
 use crystalline_core::{
     CrystallineUrl, Engram, Frontmatter, HarnessKind, LinkTarget, Manifest, YamlValue,
-    parse_engram, slugify,
+    is_lower_hyphen, parse_engram, slugify,
 };
 use crystalline_index::{
     ChunkParams, DomainHost, DomainId, DomainKind, EdgeKind, EmbeddingProvider, EngramDescriptor,
@@ -1664,6 +1664,135 @@ impl Engine {
         }))
     }
 
+    /// Rename a tag to `new`, or (with `merge`) fold it into an existing `new`,
+    /// across every engram that carries it, optionally scoped to one domain.
+    /// Each affected file is rewritten string-surgically by
+    /// [`crystalline_core::retag`]: only the tag tokens change, every other byte
+    /// (including the `timestamp`) is preserved, so a hygiene rename never
+    /// reflows a file or looks like a fresh edit. Files are the source of truth,
+    /// so each rewrite writes the file (or the virtual row) then reindexes it,
+    /// which is where the index picks up the new tag identity.
+    ///
+    /// The two verbs differ only in a precheck: a `rename` refuses when `new`
+    /// already exists (that would silently merge, so it points at `tags merge`),
+    /// and a `merge` refuses when `new` does not exist yet. `dry_run` reports the
+    /// affected engrams without writing anything.
+    pub async fn retag(
+        &self,
+        old: &str,
+        new: &str,
+        domain: Option<&str>,
+        merge: bool,
+        dry_run: bool,
+    ) -> Result<Value> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        let old_f = old.trim().to_lowercase();
+        let new_f = new.trim().to_lowercase();
+        for (label, name) in [("old", &old_f), ("new", &new_f)] {
+            if !is_lower_hyphen(name) {
+                return Err(EngineError::Invalid(format!(
+                    "{label} tag '{name}' is not a lowercase-with-hyphens tag"
+                )));
+            }
+        }
+        if old_f == new_f {
+            return Err(EngineError::Invalid(
+                "the old and new tag are the same".into(),
+            ));
+        }
+
+        // Precheck against the vocabulary in scope: a rename must not collide
+        // with an existing tag, a merge must land on one.
+        let new_exists = {
+            let store = self.store.lock().await;
+            let vocab = store.vocabulary(domain).await?;
+            vocab.tags.iter().any(|t| t.name == new_f)
+        };
+        let scope = match domain {
+            Some(d) => format!(" in domain '{d}'"),
+            None => String::new(),
+        };
+        if merge {
+            if !new_exists {
+                return Err(EngineError::NotFound(format!(
+                    "cannot merge into '{new_f}': no engram carries it{scope}"
+                )));
+            }
+        } else if new_exists {
+            return Err(EngineError::Conflict(format!(
+                "tag '{new_f}' already exists{scope}; use `crystalline tags merge` to combine them"
+            )));
+        }
+
+        // The engrams carrying the old tag, ordered by domain then path.
+        let targets = {
+            let store = self.store.lock().await;
+            store.engrams_with_tag(&old_f, domain).await?
+        };
+        let listed: Vec<Value> = targets
+            .iter()
+            .map(|d| json!({ "domain": d.domain, "permalink": d.permalink, "path": d.path }))
+            .collect();
+
+        if dry_run {
+            return Ok(json!({
+                "old": old_f, "new": new_f, "merge": merge, "dry_run": true,
+                "engrams": listed, "rewritten": targets.len(),
+            }));
+        }
+
+        // Rewrite each engram, mirroring move_engram's file-vs-virtual branches.
+        let mut rewritten = 0usize;
+        for desc in &targets {
+            match self.read_source(&desc.domain) {
+                ContentSource::File { root } => {
+                    let abs = join_rel(&root, &desc.path);
+                    let Ok(text) = std::fs::read_to_string(&abs) else {
+                        continue;
+                    };
+                    let Some((edited, _)) = crystalline_core::retag(&text, &old_f, &new_f) else {
+                        continue;
+                    };
+                    write_file(&abs, &edited)?;
+                    let store = self.store.lock().await;
+                    self.reindex_file(&*store, desc.domain_id, &root, &desc.path)
+                        .await?;
+                    rewritten += 1;
+                }
+                ContentSource::Virtual => {
+                    let current = {
+                        let store = self.store.lock().await;
+                        store.engram_content(desc.domain_id, &desc.path).await?
+                    };
+                    let Some(text) = current else { continue };
+                    let Some((edited, _)) = crystalline_core::retag(&text, &old_f, &new_f) else {
+                        continue;
+                    };
+                    let stamp = virtual_stamp(&edited);
+                    let store = self.store.lock().await;
+                    self.index_markdown(
+                        &*store,
+                        desc.domain_id,
+                        &desc.path,
+                        &edited,
+                        stamp,
+                        None,
+                        true,
+                    )
+                    .await?;
+                    rewritten += 1;
+                }
+            }
+        }
+
+        Ok(json!({
+            "old": old_f, "new": new_f, "merge": merge, "dry_run": false,
+            "engrams": listed, "rewritten": rewritten,
+        }))
+    }
+
     /// Refuse a move whose destination path is already taken, checking disk for
     /// a file domain and the database for a virtual one.
     async fn ensure_dest_free(
@@ -2291,12 +2420,25 @@ impl Engine {
         let store = self.store.lock().await;
         let vocab = store.vocabulary(p.domain.as_deref()).await?;
         drop(store);
-        Ok(json!({
+        let mut out = json!({
             "domain": p.domain,
             "tags": vocab.tags,
             "categories": vocab.categories,
             "relation_types": vocab.relation_types,
-        }))
+        });
+        // Near-duplicate tag clusters, omitted entirely when there are none so a
+        // clean vocabulary stays quiet. They point at tags to consolidate with
+        // `crystalline tags merge`.
+        let clusters = crystalline_index::tag_clusters(&vocab.tags);
+        if !clusters.is_empty()
+            && let Value::Object(map) = &mut out
+        {
+            map.insert(
+                "clusters".to_string(),
+                serde_json::to_value(&clusters).unwrap_or(Value::Null),
+            );
+        }
+        Ok(out)
     }
 
     // --- domain import / export / scaffold -----------------------------------

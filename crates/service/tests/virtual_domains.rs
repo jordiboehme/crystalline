@@ -542,3 +542,138 @@ async fn import_refuses_file_domain(store: Arc<Mutex<dyn Store>>) {
     );
 }
 both_backends!(import_refuses_a_file_domain, import_refuses_file_domain);
+
+// --- tag rename / merge ------------------------------------------------------
+
+fn tagged(title: &str, content: &str, tags: Vec<&str>) -> WriteParams {
+    WriteParams {
+        domain: "notes".to_string(),
+        title: title.to_string(),
+        content: content.to_string(),
+        folder: None,
+        engram_type: None,
+        tags: tags.into_iter().map(String::from).collect(),
+        status: None,
+        metadata: None,
+        overwrite: false,
+    }
+}
+
+async fn retag_renames_and_merges(store: Arc<Mutex<dyn Store>>) {
+    let engine = virtual_engine(store);
+    // Alpha carries `topic` on its frontmatter and on an observation; Beta
+    // carries a distinct `other`.
+    engine
+        .write_engram(&tagged(
+            "Alpha",
+            "Alpha body.\n\n- [decision] chose it #topic\n",
+            vec!["topic"],
+        ))
+        .await
+        .unwrap();
+    engine
+        .write_engram(&tagged("Beta", "Beta body.", vec!["other"]))
+        .await
+        .unwrap();
+
+    // Dry run reports the one affected engram and writes nothing.
+    let dry = engine
+        .retag("topic", "subject", Some("notes"), false, true)
+        .await
+        .unwrap();
+    assert_eq!(dry["rewritten"], 1);
+    assert_eq!(dry["dry_run"], true);
+    let pre = engine
+        .read_engram(&ReadParams {
+            identifier: "alpha".to_string(),
+            domain: Some("notes".to_string()),
+        })
+        .await
+        .unwrap();
+    assert!(
+        pre["content"].as_str().unwrap().contains("#topic"),
+        "the dry run rewrote nothing"
+    );
+
+    // The real rename rewrites both the frontmatter tag and the hashtag.
+    let done = engine
+        .retag("topic", "subject", Some("notes"), false, false)
+        .await
+        .unwrap();
+    assert_eq!(done["rewritten"], 1);
+    let after = engine
+        .read_engram(&ReadParams {
+            identifier: "alpha".to_string(),
+            domain: Some("notes".to_string()),
+        })
+        .await
+        .unwrap();
+    let content = after["content"].as_str().unwrap();
+    assert!(content.contains("- subject"), "frontmatter tag: {content}");
+    assert!(
+        content.contains("#subject"),
+        "observation hashtag: {content}"
+    );
+    assert!(
+        !content.contains("topic"),
+        "no trace of the old tag: {content}"
+    );
+
+    // The vocabulary now reports `subject`, never `topic`.
+    let vocab = engine
+        .vocabulary(&VocabularyParams {
+            domain: Some("notes".to_string()),
+        })
+        .await
+        .unwrap();
+    let names: Vec<&str> = vocab["tags"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"subject") && !names.contains(&"topic"));
+
+    // Renaming into an existing tag is a conflict pointing at merge.
+    let conflict = engine
+        .retag("other", "subject", Some("notes"), false, false)
+        .await;
+    assert!(matches!(conflict, Err(EngineError::Conflict(_))));
+
+    // Merging into a missing tag is a not-found.
+    let missing = engine
+        .retag("other", "ghost", Some("notes"), true, false)
+        .await;
+    assert!(matches!(missing, Err(EngineError::NotFound(_))));
+
+    // Merging into the existing tag folds `other` away.
+    let merged = engine
+        .retag("other", "subject", Some("notes"), true, false)
+        .await
+        .unwrap();
+    assert_eq!(merged["rewritten"], 1);
+}
+both_backends!(
+    retag_renames_and_merges_a_virtual_domain,
+    retag_renames_and_merges
+);
+
+#[tokio::test]
+async fn retag_refuses_on_a_read_only_instance() {
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let store: Arc<Mutex<dyn Store>> = Arc::new(Mutex::new(store));
+    let engine = virtual_engine(store).with_read_only(true);
+    let refused = engine.retag("foo", "bar", Some("notes"), false, true).await;
+    assert!(matches!(refused, Err(EngineError::ReadOnly)));
+}
+
+#[tokio::test]
+async fn retag_rejects_a_non_canonical_name() {
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let store: Arc<Mutex<dyn Store>> = Arc::new(Mutex::new(store));
+    let engine = virtual_engine(store);
+    let bad = engine
+        .retag("foo", "Bar_Baz", Some("notes"), false, true)
+        .await;
+    assert!(matches!(bad, Err(EngineError::Invalid(_))));
+}

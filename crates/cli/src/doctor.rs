@@ -41,7 +41,7 @@ use crystalline_core::config::{self, DomainEntry, GlobalConfig, OriginConfig};
 use crystalline_core::provision;
 use crystalline_core::verify::{self, VerifyOptions};
 use crystalline_core::{HarnessKind, harness_paths};
-use crystalline_index::{Store, configured_model_id};
+use crystalline_index::{Store, TagCluster, configured_model_id, tag_clusters};
 use crystalline_remote::TokenStore;
 use crystalline_remote::github::auth::auth_base;
 use crystalline_remote::state::{OriginState, verify_base};
@@ -353,6 +353,16 @@ pub struct ProvisioningDoctor {
     pub pending: Vec<ProvisioningPendingDoctor>,
 }
 
+/// Advisory tag-hygiene diagnostics: near-duplicate tag clusters across the
+/// whole index. Purely informational, the same stance provisioning takes:
+/// never feeds [`DoctorReport::remaining_problems`], since consolidating tags is
+/// a judgment call for a person, not a fault to fail on.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct TagsDoctor {
+    /// Near-duplicate tag clusters to consider merging.
+    pub clusters: Vec<TagCluster>,
+}
+
 /// The full `doctor` report.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct DoctorReport {
@@ -376,6 +386,9 @@ pub struct DoctorReport {
     /// Provisioning diagnostics. `None` when no registered domain declares a
     /// `Provisioning` section at all.
     pub provisioning: Option<ProvisioningDoctor>,
+    /// Advisory tag-hygiene diagnostics. `None` when there is no index yet;
+    /// present (possibly with an empty cluster list) once one exists.
+    pub tags: Option<TagsDoctor>,
     /// Whether this report was produced with `--fix`.
     pub fix: bool,
 }
@@ -490,6 +503,8 @@ pub async fn run(
 
     let provisioning = check_provisioning(cfg, &loaded.overlay, &targets)?;
 
+    let tags = check_tags(store_ref).await?;
+
     Ok(DoctorReport {
         domains,
         service,
@@ -498,6 +513,7 @@ pub async fn run(
         embeddings,
         harnesses,
         provisioning,
+        tags,
         fix,
     })
 }
@@ -975,6 +991,23 @@ fn check_provisioning(
     }))
 }
 
+/// Advisory tag-hygiene check: the near-duplicate tag clusters across the whole
+/// index. Read-only, mirroring `check_provisioning`'s stance - it reads the
+/// vocabulary and groups it, never touching a file. `None` when there is no
+/// index to read.
+async fn check_tags(store: Option<&dyn Store>) -> Result<Option<TagsDoctor>> {
+    let Some(store) = store else {
+        return Ok(None);
+    };
+    let vocab = store
+        .vocabulary(None)
+        .await
+        .map_err(|e| anyhow!("could not read the vocabulary: {e}"))?;
+    Ok(Some(TagsDoctor {
+        clusters: tag_clusters(&vocab.tags),
+    }))
+}
+
 /// A stable human label for one [`provision::Decision`] variant, the same
 /// spelling `crystalline provision status` already uses.
 fn provisioning_decision_label(decision: provision::Decision) -> &'static str {
@@ -1410,6 +1443,21 @@ pub fn render_human(report: &DoctorReport) -> String {
                     pd.domain
                 );
             }
+        }
+    }
+
+    // Advisory tag hygiene: near-duplicate clusters, never a counted problem.
+    if let Some(t) = &report.tags
+        && !t.clusters.is_empty()
+    {
+        let _ = writeln!(out, "tags:");
+        for c in &t.clusters {
+            let _ = writeln!(
+                out,
+                "  near-duplicate: {} ({}) - consolidate with `crystalline tags merge`.",
+                c.tags.join(", "),
+                c.reason
+            );
         }
     }
 

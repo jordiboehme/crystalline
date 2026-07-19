@@ -695,6 +695,33 @@ pub async fn domain_import(
         .await?)
 }
 
+/// Rename or merge a tag across the engrams that carry it: over the daemon when
+/// one owns the index, else against a directly opened store.
+pub async fn tags_retag(
+    old: &str,
+    new: &str,
+    domain: Option<&str>,
+    merge: bool,
+    dry_run: bool,
+    db: Option<&Path>,
+    config_path: Option<&Path>,
+) -> anyhow::Result<Value> {
+    use serde_json::json;
+    if use_daemon(db, config_path)
+        && let Some(data) = ctl_if_running(json!({
+            "v": 1, "cmd": "retag", "old": old, "new": new,
+            "domain": domain, "merge": merge, "dry_run": dry_run,
+        }))
+        .await?
+    {
+        return Ok(data);
+    }
+    let loaded = overlay::load(config_path)?;
+    let db_path = resolve_db(db)?;
+    let engine = open_standalone(loaded, &db_path, false).await?;
+    Ok(engine.retag(old, new, domain, merge, dry_run).await?)
+}
+
 /// Export a domain's engrams to a filesystem folder: over the daemon when one
 /// owns the index, else against a directly opened store.
 pub async fn domain_export(

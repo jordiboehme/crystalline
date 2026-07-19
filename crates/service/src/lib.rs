@@ -26,7 +26,7 @@ mod tool_schema;
 pub use client::{
     configure, ctl_if_running, ctl_required, domain_export, domain_import, origin_add,
     origin_discard, origin_resolve, origin_share, origin_status, origin_update, run_mcp, run_tool,
-    scaffold_virtual_manifest, use_daemon, virtual_routing_bullets,
+    scaffold_virtual_manifest, tags_retag, use_daemon, virtual_routing_bullets,
 };
 pub use daemon::run_serve;
 pub use engine::{Engine, EngineError};

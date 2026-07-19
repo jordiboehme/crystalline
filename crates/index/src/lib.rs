@@ -22,6 +22,7 @@ pub mod postgres;
 mod store;
 mod sync;
 pub mod turso;
+pub mod vocab;
 
 pub use embed::{
     ChunkParams, EmbedReport, EmbeddingProvider, ModelDownload, chunk_engram, configured_model_id,
@@ -40,6 +41,7 @@ pub use sync::{
     DomainScan, SyncReport, apply_scan, scan_domain, scan_paths, sync_domain, sync_domain_with,
 };
 pub use turso::TursoStore;
+pub use vocab::{TagCluster, tag_clusters};
 
 #[cfg(feature = "postgres")]
 pub use postgres::PostgresStore;

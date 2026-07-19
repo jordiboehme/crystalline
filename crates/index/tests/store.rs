@@ -1153,6 +1153,115 @@ async fn vocabulary_counts(store: &dyn Store) {
 }
 parity!(vocabulary_reports_usage_counts, vocabulary_counts);
 
+async fn tag_identity_folds(store: &dyn Store) {
+    // Two engrams carry the same tag in different cases on their frontmatter,
+    // plus an observation hashtag in a third case. Tag identity is case-folded
+    // at intern time, so all three land on one lowercase `topic` row.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "alpha.md",
+        "---\ntype: engram\ntitle: Alpha\npermalink: alpha\ntags:\n  - Foo\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Alpha\n\n- [decision] chose it #FOO\n",
+    );
+    write(
+        root,
+        "beta.md",
+        "---\ntype: engram\ntitle: Beta\npermalink: beta\ntags:\n  - foo\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Beta\n\nbody\n",
+    );
+    sync_domain(store, "d", root).await.unwrap();
+
+    // One folded tag row: two engrams (Foo, foo) and one observation (#FOO).
+    let vocab = store.vocabulary(Some("d")).await.unwrap();
+    let shape: Vec<(String, i64, i64)> = vocab
+        .tags
+        .iter()
+        .map(|t| (t.name.clone(), t.engrams, t.observations))
+        .collect();
+    assert_eq!(
+        shape,
+        vec![("foo".to_string(), 2, 1)],
+        "Foo/foo/#FOO fold to one lowercase tag row: {:?}",
+        vocab.tags
+    );
+
+    // A search tag filter folds too, so either case of the query hits both.
+    for query in ["Foo", "foo", "FOO"] {
+        let hits = store
+            .search(&SearchQuery {
+                tags: Some(vec![query.to_string()]),
+                limit: 10,
+                page: 1,
+                ..SearchQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.total, 2,
+            "tag filter {query:?} folds and matches both engrams"
+        );
+    }
+}
+parity!(tag_identity_folds_case, tag_identity_folds);
+
+async fn engrams_with_tag_finds_both_places(store: &dyn Store) {
+    // Alpha carries `topic` on its frontmatter, Beta only on an observation,
+    // Gamma (a second domain) carries a different-cased `Topic` on frontmatter,
+    // and Delta carries no such tag. The lookup finds all three tagged engrams
+    // (folded), ordered by domain then path, and the domain filter scopes it.
+    let eng = tempfile::tempdir().unwrap();
+    write(
+        eng.path(),
+        "alpha.md",
+        "---\ntype: engram\ntitle: Alpha\npermalink: alpha\ntags:\n  - topic\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nbody\n",
+    );
+    write(
+        eng.path(),
+        "beta.md",
+        "---\ntype: engram\ntitle: Beta\npermalink: beta\ntags:\n  - other\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Beta\n\n- [decision] tagged here #topic\n",
+    );
+    write(
+        eng.path(),
+        "delta.md",
+        "---\ntype: engram\ntitle: Delta\npermalink: delta\ntags:\n  - other\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nbody\n",
+    );
+    sync_domain(store, "eng", eng.path()).await.unwrap();
+
+    let ops = tempfile::tempdir().unwrap();
+    write(
+        ops.path(),
+        "gamma.md",
+        "---\ntype: engram\ntitle: Gamma\npermalink: gamma\ntags:\n  - Topic\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nbody\n",
+    );
+    sync_domain(store, "ops", ops.path()).await.unwrap();
+
+    // All domains: three engrams carry the folded `topic`, ordered by domain
+    // then path (eng/alpha, eng/beta, ops/gamma).
+    let all = store.engrams_with_tag("topic", None).await.unwrap();
+    let shape: Vec<(&str, &str)> = all
+        .iter()
+        .map(|d| (d.domain.as_str(), d.permalink.as_str()))
+        .collect();
+    assert_eq!(
+        shape,
+        vec![("eng", "alpha"), ("eng", "beta"), ("ops", "gamma")],
+        "found on frontmatter and observations, both cases, ordered by domain then path"
+    );
+
+    // A mixed-case query folds identically.
+    let upper = store.engrams_with_tag("Topic", None).await.unwrap();
+    assert_eq!(upper.len(), 3, "the query tag folds too");
+
+    // The domain filter scopes the result to one domain.
+    let scoped = store.engrams_with_tag("topic", Some("ops")).await.unwrap();
+    let scoped_shape: Vec<&str> = scoped.iter().map(|d| d.permalink.as_str()).collect();
+    assert_eq!(scoped_shape, vec!["gamma"]);
+}
+parity!(
+    engrams_with_tag_finds_frontmatter_and_observations,
+    engrams_with_tag_finds_both_places
+);
+
 async fn wipe_clears(store: &dyn Store) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();

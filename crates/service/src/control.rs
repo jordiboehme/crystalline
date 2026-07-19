@@ -154,6 +154,18 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                 Err(e) => (envelope_err(e.to_string()), false),
             }
         }
+        // Rename or merge a tag across the engrams that carry it.
+        "retag" => {
+            let old = req.get("old").and_then(Value::as_str).unwrap_or("");
+            let new = req.get("new").and_then(Value::as_str).unwrap_or("");
+            let domain = req.get("domain").and_then(Value::as_str);
+            let merge = req.get("merge").and_then(Value::as_bool).unwrap_or(false);
+            let dry_run = req.get("dry_run").and_then(Value::as_bool).unwrap_or(false);
+            match shared.engine.retag(old, new, domain, merge, dry_run).await {
+                Ok(data) => (envelope_ok(data), false),
+                Err(e) => (envelope_err(e.to_string()), false),
+            }
+        }
         // Export a domain's engrams to a filesystem folder.
         "domain_export" => {
             let domain = req.get("domain").and_then(Value::as_str).unwrap_or("");
@@ -329,9 +341,9 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
         other => (
             envelope_err(format!(
                 "unknown ctl command '{other}'; expected status, sessions, sync, reindex, \
-                 routing_bullets, scaffold_manifest, domain_import, domain_export, configure, \
-                 origin_add, origin_update, origin_status, origin_share, origin_discard, \
-                 origin_resolve, provision, forget_domain or shutdown"
+                 routing_bullets, scaffold_manifest, domain_import, domain_export, retag, \
+                 configure, origin_add, origin_update, origin_status, origin_share, \
+                 origin_discard, origin_resolve, provision, forget_domain or shutdown"
             )),
             false,
         ),

@@ -962,6 +962,17 @@ pub trait Store: Send + Sync {
         engram_type: Option<&str>,
     ) -> Result<Vec<EngramDescriptor>>;
 
+    /// Every engram carrying a tag, on its frontmatter or on one of its
+    /// observations, optionally scoped to one domain. The bound tag is
+    /// case-folded to match the case-folded `tag.name`. Ordered by domain name
+    /// then path so a `tags rename` / `tags merge` rewrites files in a stable
+    /// order. Backs the CLI tag-hygiene commands.
+    async fn engrams_with_tag(
+        &self,
+        tag: &str,
+        domain: Option<&str>,
+    ) -> Result<Vec<EngramDescriptor>>;
+
     /// Every relation or prose link that points at the given engram, with the
     /// linking engram's path and the exact target text. Used by the cross-domain
     /// move to rewrite inbound links.

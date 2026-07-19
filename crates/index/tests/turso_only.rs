@@ -31,8 +31,9 @@ async fn store_info_reports_turso_schema_version() {
     let info = store.store_info().await.unwrap();
     assert_eq!(info.fts_mode, crystalline_index::FtsMode::CandidateScan);
     // v1 initial, v2 vector chunk storage, v3 domain kind, v4 domain host lock,
-    // v5 title-lower expression index, v6 link unresolved partial index.
-    assert_eq!(info.schema_version, 6);
+    // v5 title-lower expression index, v6 link unresolved partial index,
+    // v7 case-folded tag identity.
+    assert_eq!(info.schema_version, 7);
 }
 
 #[tokio::test]
