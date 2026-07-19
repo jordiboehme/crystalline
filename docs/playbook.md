@@ -45,13 +45,15 @@ terminal.
 Start a session and give the agent its first domain in plain language:
 
 ```text
-Set up a place for you to remember everything about this ship - the docking gear,
-the coolant loop, the vent drivers.
+Create a new Crystalline domain called ship-ops for everything about this ship -
+the docking gear, the coolant loop, the vent drivers.
 ```
 
-*The agent proposes a file domain named `ship-ops` under its domains root
+*The agent creates a file domain named `ship-ops` under its domains root
 (`~/Documents/Crystalline` by default), scaffolds its `MANIFEST.md` and registers
-it, confirming the name and location first.* The scaffold is a stub you fill in -
+it, confirming the location before it writes anything. Naming the domain yourself
+keeps the outcome predictable; leave the name out and the agent will propose one
+and ask.* The scaffold is a stub you fill in -
 its routing sections are what an agent reads each session to decide whether a task
 belongs here:
 
@@ -509,7 +511,7 @@ knowledge is worth the review.
 
 | To do this | Say to your agent |
 |---|---|
-| Commission a domain | "Set up a place to remember everything about the ship." |
+| Commission a domain | "Create a new Crystalline domain called ship-ops for everything about the ship." |
 | Capture a fact | "Remember this: the port clamp sticks in the cold." |
 | Recall, scoped | "What do we know about docking?" |
 | Recall, everywhere | "Any single points of failure we should worry about?" |
