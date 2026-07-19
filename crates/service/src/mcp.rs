@@ -355,7 +355,7 @@ impl McpServer {
     #[tool(
         name = "validate_engrams",
         title = "Validate engrams",
-        description = "Check a domain's engrams against its schema engrams to keep captured knowledge well-formed. Optionally narrow to one engram by identifier or to one type. Also runs the temporal checks so malformed dates, inverted validity windows and sentinel far-future dates are reported.",
+        description = "Check a domain's engrams against its schema engrams to keep captured knowledge well-formed. Optionally narrow to one engram by identifier or to one type. Also runs the temporal checks so malformed dates, inverted validity windows and sentinel far-future dates are reported. Set drift to also report observation categories and relation types that drift from the schema - in use but undeclared or declared but unused.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn validate_engrams(

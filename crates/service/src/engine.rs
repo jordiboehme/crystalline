@@ -2342,13 +2342,17 @@ impl Engine {
 
         let mut issues = Vec::new();
         let mut checked = 0usize;
+        // When drift is requested, target engrams are grouped by their selected
+        // schema so `schema::diff` runs once per schema over its own group.
+        let mut drift_groups: Vec<(Schema, Vec<Engram>)> = Vec::new();
         for d in &targets {
             let Some(engram) = self.load_engram(&source, d.domain_id, &d.path).await else {
                 continue;
             };
             checked += 1;
-            if let Some(schema) = schema::select_schema(&engram, &schemas) {
-                for issue in schema::validate(&engram, &schema) {
+            let selected = schema::select_schema(&engram, &schemas);
+            if let Some(schema) = &selected {
+                for issue in schema::validate(&engram, schema) {
                     issues.push(json!({
                         "permalink": d.permalink,
                         "path": d.path,
@@ -2375,15 +2379,40 @@ impl Engine {
                     "line": issue.line,
                 }));
             }
+            if p.drift
+                && let Some(schema) = selected
+            {
+                match drift_groups.iter_mut().find(|(s, _)| *s == schema) {
+                    Some((_, group)) => group.push(engram),
+                    None => drift_groups.push((schema, vec![engram])),
+                }
+            }
         }
 
-        Ok(json!({
+        let mut response = json!({
             "domain": p.domain,
             "checked": checked,
             "schemas": schemas.len(),
             "issue_count": issues.len(),
             "issues": issues,
-        }))
+        });
+        if p.drift {
+            let drift: Vec<Value> = drift_groups
+                .iter()
+                .map(|(schema, engrams)| {
+                    let d = schema::diff(schema, engrams);
+                    json!({
+                        "schema": schema.entity,
+                        "undeclared_observations": d.undeclared_observations,
+                        "undeclared_relations": d.undeclared_relations,
+                        "unused_observations": d.unused_observations,
+                        "unused_relations": d.unused_relations,
+                    })
+                })
+                .collect();
+            response["drift"] = Value::Array(drift);
+        }
+        Ok(response)
     }
 
     // --- infer schema --------------------------------------------------------
