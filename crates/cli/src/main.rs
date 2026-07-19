@@ -2080,7 +2080,8 @@ async fn run_tags(command: TagsCommand, db: Option<PathBuf>, json: bool) -> anyh
             .get("rewritten")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0);
-        println!("Rewrote {n} engrams.");
+        let word = if n == 1 { "engram" } else { "engrams" };
+        println!("Rewrote {n} {word}.");
     }
     Ok(())
 }
@@ -2102,7 +2103,8 @@ fn print_retag_preview(preview: &serde_json::Value) {
         println!("{verb} '{old}' {joiner} '{new}': no engrams carry it.");
         return;
     }
-    println!("{verb} '{old}' {joiner} '{new}' - {n} engrams affected:");
+    let word = if n == 1 { "engram" } else { "engrams" };
+    println!("{verb} '{old}' {joiner} '{new}' - {n} {word} affected:");
     if let Some(list) = engrams {
         for e in list {
             let d = e.get("domain").and_then(Value::as_str).unwrap_or("");

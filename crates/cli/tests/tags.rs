@@ -69,7 +69,7 @@ fn rename_rewrites_only_the_tag_tokens() {
         .arg(&db)
         .assert()
         .success()
-        .stdout(predicates::str::contains("Rewrote 1 engrams."));
+        .stdout(predicates::str::contains("Rewrote 1 engram."));
 
     let after = std::fs::read_to_string(domain_dir.join("alpha.md")).unwrap();
     let expected = "---\ntype: engram\ntitle: Alpha\npermalink: alpha\ntags:\n  - subtopic\n  - keep\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Alpha\n\nProse mentioning #topic stays put.\n\n- [decision] chose it #subtopic (in prod)\n\nMore prose.\n";
@@ -140,7 +140,7 @@ fn merge_folds_a_tag_into_an_existing_one() {
         .arg(&db)
         .assert()
         .success()
-        .stdout(predicates::str::contains("Rewrote 1 engrams."));
+        .stdout(predicates::str::contains("Rewrote 1 engram."));
 
     let after = std::fs::read_to_string(domain_dir.join("alpha.md")).unwrap();
     assert!(

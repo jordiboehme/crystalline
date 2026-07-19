@@ -1695,7 +1695,9 @@ impl Engine {
         // (an underscore or separator variant that the cluster detection flags)
         // onto a clean name, so `old` only has to be a non-empty folded tag.
         if old_f.is_empty() {
-            return Err(EngineError::Invalid("the tag to rename is empty".into()));
+            return Err(EngineError::Invalid(
+                "the tag to rename or merge is empty".into(),
+            ));
         }
         if !is_lower_hyphen(&new_f) {
             return Err(EngineError::Invalid(format!(
