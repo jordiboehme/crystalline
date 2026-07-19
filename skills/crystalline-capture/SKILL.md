@@ -27,7 +27,7 @@ The domain of the surrounding story is not automatically the domain of the knowl
 
 ## Search before you write
 
-Before creating anything, search for it - the same `search_engrams` call `crystalline-routing` already shows, scoped or broad. A hit can be a whole engram or a single observation inside one (`search_engrams` returns both kinds in the same result set, an observation hit carries its source line) - check both before deciding there is nothing to update. When the knowledge could plausibly live in another domain too, run one more sweep with `domains` omitted.
+Before creating anything, search for it - the same `search_engrams` call `crystalline-routing` already shows, scoped or broad. A hit can be a whole engram or a single observation inside one (`search_engrams` returns both kinds in the same result set, an observation hit carries its source line) - check both before deciding there is nothing to update. Every hit also carries its engram's tags, so each search shows the vocabulary already in use. When the knowledge could plausibly live in another domain too, run one more sweep with `domains` omitted.
 
 Treat this as a hard gate: a `search_engrams` call comes before the first `write_engram` or `edit_engram` on a topic, no exceptions, and loading a tool schema does not count as searching. When a hit looks like the owner, `read_engram` it before editing - a snippet is not enough to judge fit or write a correct edit - and pass the returned checksum as `expected_checksum` on the edit so a concurrent change is rejected instead of overwritten. Both tools take the permalink as `identifier`; keep it bare - an identifier without the `crystalline://` scheme is always domain-relative, so a domain-prefixed identifier never resolves.
 
@@ -62,6 +62,12 @@ An engram is what is true now, including what is now known to be outdated - it i
 Outdated knowledge earns its place only when the outdatedness is the point: a deprecated approach kept so it is not recommended again, a rejected alternative kept so it is not re-litigated, a documented anti-pattern. Mark it so it cannot read as current - `status: deprecated` or `superseded` on a whole engram, a `[lesson]` or `[gotcha]` bullet naming why something was retired inside a live one.
 
 Engrams whose topic is inherently historical carry history as structured current content, still not as an append log: a registry row holds its current status and one last-checked value, not a per-check trail; a decision engram tracks its current lifecycle status and is superseded when replaced; a meeting note records one meeting on one date - a new meeting gets a new engram, not an update block on the old one.
+
+## Reuse the vocabulary
+
+Before coining a new tag, observation category or relation type, call `vocabulary` (scoped with `domain`) and reuse an existing term rather than a near-synonym. A `clusters` entry flags near-duplicate tags that drifted apart - surface it to the user rather than acting; `crystalline tags rename` and `tags merge` are CLI cleanups they can run.
+
+A domain MANIFEST may carry a `## Tag Aliases` section of `- old-name -> canonical-name` bullets; searches fold an aliased tag to its canonical form both directions, and `tags merge` records the alias. When the same concept appears under two tags, you MAY propose recording an alias - edit that section with `edit_engram` only after the user agrees, never as silent hygiene.
 
 ## Writing a new engram
 
