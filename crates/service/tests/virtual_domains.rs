@@ -658,6 +658,65 @@ both_backends!(
     retag_renames_and_merges
 );
 
+async fn retag_merges_separator_variant(store: Arc<Mutex<dyn Store>>) {
+    let engine = virtual_engine(store);
+    // The canonical `multi-word` and its underscore variant `multi_word` both in
+    // use - exactly the separator cluster the vocabulary flags for merging.
+    engine
+        .write_engram(&tagged("Hyphen", "Hyphen body.", vec!["multi-word"]))
+        .await
+        .unwrap();
+    engine
+        .write_engram(&tagged("Under", "Under body.", vec!["multi_word"]))
+        .await
+        .unwrap();
+
+    // Merge the non-canonical `multi_word` into `multi-word`. Only the target is
+    // validated as lowercase-with-hyphens; `old` may be any non-empty tag, so
+    // the separator-variant merge the cluster detection recommends is reachable.
+    let merged = engine
+        .retag("multi_word", "multi-word", Some("notes"), true, false)
+        .await
+        .unwrap();
+    assert_eq!(merged["rewritten"], 1);
+
+    let after = engine
+        .read_engram(&ReadParams {
+            identifier: "under".to_string(),
+            domain: Some("notes".to_string()),
+        })
+        .await
+        .unwrap();
+    let content = after["content"].as_str().unwrap();
+    assert!(
+        content.contains("- multi-word"),
+        "the underscore tag folded to the hyphen form: {content}"
+    );
+    assert!(
+        !content.contains("multi_word"),
+        "no trace of the underscore variant: {content}"
+    );
+
+    // The vocabulary now reports only the canonical `multi-word`.
+    let vocab = engine
+        .vocabulary(&VocabularyParams {
+            domain: Some("notes".to_string()),
+        })
+        .await
+        .unwrap();
+    let names: Vec<&str> = vocab["tags"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"multi-word") && !names.contains(&"multi_word"));
+}
+both_backends!(
+    retag_merges_a_separator_variant,
+    retag_merges_separator_variant
+);
+
 #[tokio::test]
 async fn retag_refuses_on_a_read_only_instance() {
     let store = TursoStore::open_in_memory().await.unwrap();

@@ -1201,6 +1201,28 @@ async fn tag_identity_folds(store: &dyn Store) {
             "tag filter {query:?} folds and matches both engrams"
         );
     }
+
+    // The metadata_filters `tags` arm folds identically, for both $eq and $in,
+    // so a mixed-case value still hits the lowercase-interned tag.
+    for wire in [
+        serde_json::json!({ "tags": { "$eq": "Foo" } }),
+        serde_json::json!({ "tags": { "$in": ["FOO"] } }),
+    ] {
+        let filters = crystalline_index::parse_metadata_filters(&wire).unwrap();
+        let hits = store
+            .search(&SearchQuery {
+                metadata_filters: filters,
+                limit: 10,
+                page: 1,
+                ..SearchQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.total, 2,
+            "metadata tags filter {wire} folds and matches both engrams"
+        );
+    }
 }
 parity!(tag_identity_folds_case, tag_identity_folds);
 

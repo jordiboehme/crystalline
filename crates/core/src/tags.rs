@@ -20,7 +20,7 @@
 
 use std::ops::Range;
 
-use crate::parse::{is_hashtag, locate};
+use crate::parse::{fence_marker, is_hashtag, locate};
 
 /// Whether a string is a canonical lowercase-with-hyphens tag: non-empty, no
 /// leading or trailing hyphen and only lowercase ASCII letters, digits and
@@ -362,41 +362,48 @@ fn retag_body(source: &str, old_f: &str, new: &str) -> (String, usize) {
     let mut out = String::with_capacity(source.len());
     out.push_str(head);
     let mut count = 0usize;
-    let mut in_fence = false;
+    // Mirror the parser's stateful fence tracking exactly (see
+    // `crate::parse::body_lines`): a fence closes only on a marker of the same
+    // char, a count at least the opener's and nothing after it, so a shorter
+    // nested marker (``` inside ````) stays content and never toggles the fence.
+    let mut fence: Option<(char, usize)> = None;
     for line in body.split_inclusive('\n') {
         let (content, nl) = match line.strip_suffix('\n') {
             Some(c) => (c, "\n"),
             None => (line, ""),
         };
-        if is_fence(content) {
-            in_fence = !in_fence;
-            out.push_str(line);
-            continue;
+        let text = content.trim_end_matches('\r');
+        match fence {
+            None => {
+                if let Some((c, n, _)) = fence_marker(text) {
+                    // Opening fence line: emit verbatim, do not scan it.
+                    fence = Some((c, n));
+                    out.push_str(line);
+                    continue;
+                }
+                let (new_content, n) = retag_observation_line(content, old_f, new);
+                out.push_str(&new_content);
+                out.push_str(nl);
+                count += n;
+            }
+            Some((fc, fcount)) => {
+                // Inside a fence: emit verbatim and test the parser's close rule.
+                let mut closes = false;
+                if let Some((c, n, _)) = fence_marker(text)
+                    && c == fc
+                    && n >= fcount
+                    && text.trim_start()[n..].trim().is_empty()
+                {
+                    closes = true;
+                }
+                out.push_str(line);
+                if closes {
+                    fence = None;
+                }
+            }
         }
-        if in_fence {
-            out.push_str(line);
-            continue;
-        }
-        let (new_content, n) = retag_observation_line(content, old_f, new);
-        out.push_str(&new_content);
-        out.push_str(nl);
-        count += n;
     }
     (out, count)
-}
-
-/// Whether a line opens or closes a fenced code block (three or more backticks
-/// or tildes, up to three leading spaces). Observation scanning skips fences.
-fn is_fence(content: &str) -> bool {
-    let trimmed = content.trim_start_matches(' ');
-    if content.len() - trimmed.len() > 3 {
-        return false;
-    }
-    let first = match trimmed.chars().next() {
-        Some(c) if c == '`' || c == '~' => c,
-        _ => return false,
-    };
-    trimmed.chars().take_while(|c| *c == first).count() >= 3
 }
 
 /// Rewrite the trailing hashtag run of one line when it is a top-level
@@ -684,6 +691,24 @@ mod tests {
         assert_eq!(
             out,
             "---\ntags:\n  - t\n---\n\n```\n- [decision] fake #foo\n```\n\n- [decision] real #bar\n"
+        );
+    }
+
+    #[test]
+    fn hashtag_inside_nested_fence_is_untouched() {
+        // An outer four-backtick fence contains an inner three-backtick marker.
+        // Under the parser's close rule the inner ``` (count 3 < 4) does not
+        // close the outer fence, so the #foo between them stays fenced and must
+        // not be rewritten; only the real trailing #foo outside is.
+        let src = "---\ntags:\n  - t\n---\n\n````\n```\n- [decision] fake #foo\n```\n````\n\n- [decision] real #foo\n";
+        let (out, n) = retagged(src, "foo", "bar");
+        assert_eq!(
+            n, 1,
+            "only the hashtag outside the nested fence is rewritten"
+        );
+        assert_eq!(
+            out,
+            "---\ntags:\n  - t\n---\n\n````\n```\n- [decision] fake #foo\n```\n````\n\n- [decision] real #bar\n"
         );
     }
 }

@@ -1690,12 +1690,17 @@ impl Engine {
         }
         let old_f = old.trim().to_lowercase();
         let new_f = new.trim().to_lowercase();
-        for (label, name) in [("old", &old_f), ("new", &new_f)] {
-            if !is_lower_hyphen(name) {
-                return Err(EngineError::Invalid(format!(
-                    "{label} tag '{name}' is not a lowercase-with-hyphens tag"
-                )));
-            }
+        // Only the target name must be a canonical lowercase-with-hyphens tag:
+        // the whole point of a rename or merge is to move a non-canonical `old`
+        // (an underscore or separator variant that the cluster detection flags)
+        // onto a clean name, so `old` only has to be a non-empty folded tag.
+        if old_f.is_empty() {
+            return Err(EngineError::Invalid("the tag to rename is empty".into()));
+        }
+        if !is_lower_hyphen(&new_f) {
+            return Err(EngineError::Invalid(format!(
+                "target tag '{new_f}' is not a lowercase-with-hyphens tag"
+            )));
         }
         if old_f == new_f {
             return Err(EngineError::Invalid(

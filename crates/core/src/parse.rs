@@ -510,7 +510,7 @@ fn strip_closing_hashes(s: &str) -> String {
     }
 }
 
-fn fence_marker(line: &str) -> Option<(char, usize, usize)> {
+pub(crate) fn fence_marker(line: &str) -> Option<(char, usize, usize)> {
     let indent = line.len() - line.trim_start_matches(' ').len();
     if indent > 3 {
         return None;
