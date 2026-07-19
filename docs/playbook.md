@@ -11,210 +11,190 @@
 
 You are the new knowledge officer aboard the SS Kobayashi Delorean, a small
 freighter whose transponder still answers to three older names. Your crew
-includes an AI agent that starts every shift a stranger and forgets the last
-one, unless you teach it to remember. Eight missions below, each one runnable
-start to finish: work through them and by the end the ship keeps its own log,
-the agent reads it before it acts and neither of you re-derives the docking
-procedure from scratch ever again.
+includes an AI agent that starts every shift a stranger and forgets the last one,
+unless you teach it to remember. Eight missions below, each runnable start to
+finish: work through them and the ship keeps its own log, the agent reads it
+before acting and neither of you re-derives the docking procedure from scratch
+again.
 
-Each mission is agent-first - the natural-language prompt you say out loud -
-with the exact CLI equivalent underneath for when you want to drive by hand.
-The [reference README](../README.md) is the map; this is the flight training.
+Every mission is a conversation. You speak in plain human terms; the agent infers
+the rest - which domain a fact belongs in, how to file it, what to search first -
+then proposes and does it. The italic line after each prompt shows that inference
+at work. Only the first step and a small terminal corner touch a command line. The
+[reference README](../README.md) is the map; this is the flight training.
 
 ## Mission 00 - Preflight
 
 > *Tank, load me the operations manual. A pause. I know the ship.*
 
-Install the binary first. Pick your platform from the
-[install matrix](../README.md#install-the-binary) - Homebrew, a `.deb`, an MSI
-or a raw binary - and come back. Then one command jacks the agent in:
+Install the binary first - pick your platform from the
+[install matrix](../README.md#install-the-binary) and come back. Then one command
+jacks the agent in:
 
 ```sh
 crystalline install claude-code
 ```
 
-That single step wires the whole rig: the MCP server registration, the
-`SessionStart` routing hook, the `Stop` capture nudge and the four topical
-skills. It is the "I know kung fu" moment - next session the agent wakes up
-already knowing how to route a question, capture a lesson and share with a
-team, with no upload of your own. The same command takes `codex` or `copilot`.
-Claude Desktop has no terminal step: install the `.mcpb` extension from the
-latest release and upload the `crystalline-memory` skill zip.
+That single step wires the whole rig - MCP registration, the `SessionStart`
+routing hook, the `Stop` capture nudge and the four skills. It is the "I know
+kung fu" moment: next session the agent wakes already knowing how to route,
+capture and share. The same command takes `codex` or `copilot`. This is the last
+time you need a terminal. Claude Desktop skips even this: install the `.mcpb`
+extension from the latest release, upload the `crystalline-memory` skill zip and
+never open a terminal.
 
-Run the systems check:
+Start a session and ask what it already knows:
 
-```sh
-crystalline status
+```text
+What do you already know about this ship?
 ```
 
-Call it the archive's sync ratio: `status` reports how many engrams are indexed
-against what is on disk, and a healthy pair tracks one to one. If they drift, the
-index is derived and disposable - you will rebuild it in the appendix without
-losing a byte of knowledge.
+*A fresh install can see no domains yet - that is Mission 01. A healthy archive
+keeps its sync ratio: what the agent sees and what is on disk track one to one.*
 
 ## Mission 01 - Commission the archive
 
 > *Computer: commission the ship's archive. Log our five-year mission.*
 
-A domain is a folder of knowledge with a `MANIFEST.md` at its root. `domain
-init` scaffolds the folder and its manifest; `domain add` registers and indexes
-it in one step, no separate sync:
+A domain is a folder of knowledge with a `MANIFEST.md` at its root. Just tell the
+agent what you want it to remember:
 
-```sh
-crystalline domain init ~/knowledge/ship-ops --name ship-ops
-crystalline domain add ship-ops ~/knowledge/ship-ops
+```text
+Set up a place to keep everything about the ship - the docking gear, the
+coolant loop, the vent drivers.
 ```
 
-Now open that `MANIFEST.md` and write its `## Scope` and `## When to Use`
-sections. This is the routing beacon, not marketing copy: the `When to Use`
-bullets are exactly what an agent reads at the start of every session to decide
-whether a task belongs in `ship-ops` at all. Write them like standing orders -
-"when asked about docking, coolant or the vent drivers, look here". Vague scope
-is a computer that answers every hail with "insufficient data".
+*The agent proposes a file domain named `ship-ops` in its domains folder, scaffolds
+its `MANIFEST.md` and registers it, confirming the name and location first.*
 
-Next session the agent sees the domain in its routing block automatically. You
-have given it somewhere to think.
+Now the manifest matters. Ask the agent to fill in that `MANIFEST.md`, or edit it
+yourself - its `## Scope` and `## When to Use` sections are the routing beacon the
+agent reads each session to decide whether a task belongs here. Write them like
+standing orders - "when asked about docking, coolant or the vent drivers, look
+here". Vague scope is a computer that answers every hail with "insufficient data".
+Next session the domain shows up in the agent's routing block, and you have given
+it somewhere to think.
 
 ## Mission 02 - First entries
 
 > *Captain's log, supplemental: the docking clamps, again.*
 
-Capture is a byproduct of the work, not a chore saved for the end. The atomic
-unit is the observation - a top-level bullet `- [category] a fact or lesson
-#tag`. Say it to the agent in plain language and let it do the ceremony:
+Capture is a byproduct of the work, not a chore. Say what you learned the way you
+would tell a crewmate:
 
 ```text
-Capture this in ship-ops as a [gotcha]: docking clamp 3 reports locked about
-half a second before it actually seats, so wait for the green tone before you
-cut thrust. Tag it docking.
+Remember this: docking clamp 3 reads locked about half a second before it
+actually seats, so wait for the green tone before cutting thrust.
 ```
 
-The agent searches `ship-ops` first (there is no writing before searching),
-finds nothing, proposes the engram and writes it once you say yes. Notice you
-named the domain: every write names one, always, so knowledge never lands in
-the wrong hold. The CLI equivalent:
+*You named no domain and no category. The agent searches the archive first, finds
+nothing, then proposes filing it in `ship-ops` as a `[gotcha]` tagged `docking`
+and writes only once you say yes - it named the domain for you, so nothing lands
+wrong.*
 
-```sh
-crystalline write ship-ops "Docking clamp 3 seats late" \
-  --content "- [gotcha] Clamp 3 reads locked ~0.5s before it seats; wait for the green tone #docking" \
-  --tags docking --type engram
-```
-
-Knowledge that leans on other knowledge gets a relation. Ask for a decision
-that points at an existing engram:
+Knowledge that leans on other knowledge gets a relation. You still just talk:
 
 ```text
-Capture in ship-ops as a [decision]: we route the coolant loop through glycol
-mix B. Link it to the vent driver firmware engram.
+Also note that we decided to run the coolant loop on glycol mix B - it rides on
+the vent driver firmware.
 ```
 
-That records a `- depends_on [[Vent Driver Firmware]]` line, and the graph now
-knows the coolant choice rides on the firmware. Categories are free text but
-precise ones earn their keep - `decision`, `fact`, `pattern`, `gotcha`,
-`convention`, `lesson`, `risk`, `insight` and `idea` cover most of a shift.
-The `type` and `status` fields have recommended values too, but they are
-guidance, not an enum a write is rejected for. Your stardate (`recorded_at`) is
-filled in for you.
+*The agent files a `[decision]` and, seeing the firmware engram already exists,
+links them on disk as `- depends_on [[Vent Driver Firmware]]`.*
+
+On disk each capture is a bullet like `- [gotcha] Clamp 3 seats late #docking`.
+Pick a precise category (the appendix lists them); `type` and `status` have
+recommended values but are guidance, not a fixed enum. Your stardate
+(`recorded_at`) is filled in for you.
 
 ## Mission 03 - Recall
 
 > *Time is a big ball of what-was-true-then. Do be careful. Spoilers.*
 
-A narrow question searches one domain; a broad one sweeps them all. Ask
-narrowly and the agent scopes itself:
+Ask the way it forms in your head:
 
 ```text
 What do we know about the docking clamps?
 ```
 
-Ask broadly and it casts the net wide - the archive is vast, and every domain
-answers:
+*A narrow question, so the agent scopes itself to `ship-ops`.*
 
 ```text
-Search everything we know about coolant.
+What do we know about coolant - check everything.
 ```
 
-The CLI mirrors both, plus filters and the graph walk:
+*The archive is vast and every domain answers; the agent sweeps them all.* For
+the neighbourhood around one engram, ask "what connects to the coolant loop?" and
+the agent walks the relations from Mission 02.
 
-```sh
-crystalline search "docking clamps" --domain ship-ops
-crystalline search "coolant" --tag docking --status current
-crystalline read docking-clamp-3-seats-late --domain ship-ops
-crystalline context "crystalline://ship-ops/coolant-loop-routing" --depth 2
-```
+Two questions, two searches. Ask *what is true now?* and the agent filters on
+status; ask *what applied last June?* and it reasons over validity windows. Heed
+the timey-wimey warning: an engram with no `valid_from` has always been valid and
+one with no `valid_to` is valid forever, so a strict date bound sees only the
+windows that exist and can skip the unbounded rows - the very ones the question
+means to keep. Absence means always, so the agent leans on status for
+now-versus-then, never filtering the open-ended rows into silence.
 
-`--status current` asks for what holds now; the record still remembers what
-held then. `--after` matches the recorded date - `recorded_at`, filled in on
-every write - so it narrows by when a fact was captured, never by its validity.
-Here is the timey-wimey warning, so heed it: a what-was-true-then question runs
-on validity windows instead, and an engram with no `valid_from` has always been
-valid while one with no `valid_to` is valid forever. A strict validity-date
-predicate compares only the bounds that exist, so it can quietly skip those
-unbounded rows - the very ones a "what applied last June" query means to keep.
-Absence means always, so lean on `status` for now-versus-then and do not filter
-the open-ended rows into silence.
-
-To catch up on a return from leave:
-
-```sh
-crystalline recent --timeframe 7d
-```
-
-An engram is what persists of a session after the session itself is gone. Write
-enough of them and the ship remembers what the crew forgets.
+Back from leave? Ask "what changed while I was away?" and the agent pulls the
+recent captures across every domain. An engram is what persists of a session after
+the session is gone; write enough of them and the ship remembers what the crew
+forgets.
 
 ## Mission 04 - Bulk intake
 
 > *Legacy knowledge, like life, finds a way. Preserve it in amber, not a tar pit.*
 
-Crystalline ships no scraper, by design. The agent is the ingester: it reads a
-source and distills it into engrams, one truth per domain. The cardinal sin is
-mirroring - copying a source wholesale so it looks complete. That is filling
-the gaps with frog DNA: it breeds surprises you did not sign off on. Distill the
-durable facts, drop the rest and keep the domain a clean model of what is true,
-not a photocopy of where you found it.
-
-Four intake jobs, four prompts. A webpage (this one needs a harness with web
-access):
+Crystalline ships no scraper, by design: the agent is the ingester, reading a
+source and distilling it into engrams, one truth per domain. The cardinal sin is
+mirroring - copying a source wholesale so it looks complete, filling the gaps with
+frog DNA that breeds surprises nobody signed off on. Distill the durable facts and
+drop the rest. Four intake jobs, four things you say. A webpage:
 
 ```text
-Read <url> and distill the durable facts into ship-ops. Put the source URL in
-resource and its date in source_date, and skip anything that goes stale next
-week.
+Read this page and remember the parts that will still be true next month - and
+keep a link back to where you found it.
 ```
+
+*The agent distills the durable facts into `ship-ops`, records the source URL and
+date in frontmatter (`resource`, `source_date`) and drops whatever goes stale.
+Webpage intake needs a harness with web access.*
 
 Local documents on disk:
 
 ```text
-Read the three PDFs in ./specs and propose engrams for ship-ops - the keepers
-only, one topic each.
+Here are three spec PDFs in ./specs - pull out what is worth keeping, one topic
+each.
 ```
 
-A git repository, into its own new domain:
+*The agent proposes an engram per keeper and waits for your yes.*
+
+A git repository:
 
 ```text
-Clone <repo>, distill its architecture and conventions into a new domain called
-vessel-arch. Propose the engram list first; do not write anything yet.
+Look through this repo and remember how it is built and the conventions it
+follows.
 ```
+
+*The agent proposes a fresh domain for it - say `vessel-arch` - lists the engrams
+it will write and holds until you approve. Distilled architecture, not a copy of
+the code.*
 
 Your team wiki:
 
 ```text
-Export the wiki pages to markdown in ./wiki-export, distill the pages worth
-keeping into ship-ops and leave the fossils in the amber.
+Our team wiki has years of pages - bring over the ones still worth keeping and
+leave the rest.
 ```
 
-For a legacy markdown tree that is already frontmatter-shaped, there is one CLI
-path that converts it into the domain - normalizing types, backfilling status
-and dropping sentinel dates, leaving your source tree untouched:
+*It distills the keepers into `ship-ops` and leaves the fossils in the amber.*
 
-```sh
-crystalline import ./old-notes --domain ship-ops
-```
-
-They spared no expense on the old archive, and it shows: half of it is scaffold.
-The Jurassic Park lesson holds - the crew got so preoccupied with whether they
-could ingest all of it that nobody stopped to ask whether they should. Distill.
+A legacy markdown tree that is already frontmatter-shaped is the one exception
+that stays in the terminal: an import command in the
+[terminal corner](#the-terminal-corner) folds it into the domain, source tree
+untouched. They spared no expense on the old archive, and it shows: half is
+scaffold. The Jurassic Park lesson holds - the crew got so preoccupied with
+whether they could ingest all of it that nobody stopped to ask whether they
+should. Distill.
 
 ## Mission 05 - Reconciliation
 
@@ -222,135 +202,137 @@ could ingest all of it that nobody stopped to ask whether they should. Distill.
 > some serious reconciliation.*
 
 Two standing orders keep the timeline single: search before you write, and edit
-over create. When new knowledge lands on a topic that already has an owner,
-refine the owner in place - do not fork a rival engram that quietly contradicts
-it. Remind the agent when it forgets:
+over create. When new knowledge lands on a topic that already has an owner, that
+owner gets refined in place - no rival engram that contradicts it. Nudge the agent
+when it forgets:
 
 ```text
-Before you write that, search ship-ops - we may already have a coolant engram
-to update instead.
+Do we already have something on coolant? Update it instead of starting a new one.
 ```
 
-Reconcile in place, never as an append log. An engram is what is true now, so
-you replace the changed fact where it stands; you do not staple a dated
-`## Update` section under it. "Checked the source, nothing changed" is not a
-heading either - it is one frontmatter field, `last_verified: <date>`, kept
-current with a `find_replace`. A stale engram nobody has re-checked is the
-photograph where the crew is slowly fading out; a current `last_verified` is
-what keeps everyone in the picture.
+*The agent searches `ship-ops` first and, when an owner exists, refines it in
+place rather than forking a duplicate.*
+
+Reconcile in place, never as an append log. An engram is what is true now, so the
+changed fact gets replaced where it stands; nobody staples a dated `## Update`
+section under it. "Checked the source, nothing changed" is one frontmatter field,
+`last_verified: <date>`, that the agent keeps current. A stale engram nobody has
+re-checked is the photograph where the crew is slowly fading out; a current
+`last_verified` keeps everyone in the picture.
 
 Vocabulary drifts the same way a timeline does - `docking` here, `docking-clamp`
-there, the same idea under two names. Surface it and fold it:
+there, the same idea under two names. Just ask:
 
-```sh
-crystalline vocabulary --domain ship-ops
-crystalline tags merge docking-clamp docking --dry-run
-crystalline tags merge docking-clamp docking
+```text
+Have our tags drifted - anything meaning the same thing under two names?
 ```
 
-A merge records `- docking-clamp -> docking` in the MANIFEST's `## Tag Aliases`
-section, so searches for the old name still find everything - the timeline is
-fixed without erasing the past that led there. The agent may propose an alias
-when it spots the drift, but it edits that section only after you agree.
+*The agent surveys the vocabulary and flags near-duplicate clusters like `docking`
+and `docking-clamp`.* Folding them is a deliberate bulk rewrite, so it stays in
+the terminal: a merge command in the [terminal corner](#the-terminal-corner)
+rewrites the tag everywhere and records `- docking-clamp -> docking` in the
+MANIFEST's `## Tag Aliases` section, so the old name still finds everything. The
+agent proposes the alias when it spots the drift; the merge is yours to run.
 
 ## Mission 06 - Retirement
 
 > *All of this has happened before. The old log stays in the record; the lesson
 > jumps forward.*
 
-Knowledge retires, it does not disappear. When a fact stops holding you
-supersede it, and the supersede recipe is exact - follow it rather than
-overwriting the old truth into silence:
+Knowledge retires, it does not disappear. When a fact stops holding it is
+superseded, not overwritten into silence, and on disk the recipe is exact:
 
-1. Write the replacement as its own new engram with `status: current`. Do not
-   edit the old fact in place; that skips the trail and leaves the outdated
-   value searchable as current.
-2. Edit the old engram: `find_replace` its frontmatter `status: current` to
-   `status: superseded`, and add a `- superseded_by [[New Engram]]` relation.
-3. When you know the date the old fact stopped holding, close its window in the
-   same edit by adding a `valid_to: <date>` line - the real transition date,
-   never a sentinel. A closed window is what lets a later search answer "what
-   applied last June" with the engram that was true then.
-4. Carry the lesson forward. Any insight that outlives the retired fact - why it
-   failed, what to watch for - becomes a `[lesson]` bullet on the new engram.
-   The experience stays time-scoped; what it taught travels on unbounded.
+1. The replacement is written as a new engram with `status: current` - not edited
+   into the old fact, which would leave the outdated value searchable as current.
+2. The old engram is edited: a `find_replace` flips its frontmatter
+   `status: current` to `status: superseded`, and a `- superseded_by [[New
+   Engram]]` relation is added.
+3. If the date it stopped holding is known, the same edit adds a `valid_to:
+   <date>` line - the real transition date, never a sentinel - so a later search
+   can answer "what applied last June" with the engram that was true then.
+4. The lesson carries forward: any insight that outlives the retired fact becomes
+   a `[lesson]` bullet on the new engram. The experience stays time-scoped; what
+   it taught travels on unbounded.
 
-Say it plainly and the agent runs the whole cycle:
+You do not run those steps. You just say what happened:
 
 ```text
-We switched the coolant from glycol mix B to mix C on 2026-06-01. Supersede the
-old engram rather than overwriting it, and carry forward why mix B ran hot.
+The coolant mix changed on the first of June - we are off glycol mix B and
+running mix C now. Mix B ran hot; make sure we remember why.
 ```
 
-By hand, step 2 is a single edit:
+*The agent runs the recipe for you: mix C becomes a new `current` engram, the old
+one flips to `superseded` with a `- superseded_by` link, its window closes at
+2026-06-01 and the "why B ran hot" lesson moves to a `[lesson]` bullet.*
 
-```sh
-crystalline edit coolant-glycol-mix-b ship-ops find_replace \
-  --find-text "status: current" --content "status: superseded"
-```
-
-The status words each mean one thing: `deprecated` says do not do this again,
-`superseded` says a newer engram replaced this one and `archived` says retired
-but kept for the record. `delete` is for mistakes, not for history - the old
-log is how the ship learns it has seen this before.
+The status words: `deprecated` says do not do this again, `superseded` says a
+newer engram replaced this one and `archived` says retired but kept for the
+record. `delete` is for mistakes, not history - the old log is how the ship learns
+it has seen this before.
 
 ## Mission 07 - Joint operations
 
 > *Help us keep this knowledge. Transmit the plans. You are our only hope.*
 
-A team domain is an ordinary domain whose files also live in a GitHub
-repository: your local markdown stays the truth on this machine, and an origin
-records which repository it tracks. Wire up the alliance once:
+A team domain is an ordinary domain whose files also live in a GitHub repository:
+your local markdown stays the truth, and an origin records which repository it
+tracks. Wiring up the alliance is a conversation, not a config file:
 
-```sh
-crystalline config set github.enabled true
-crystalline connect github
-crystalline domain add fleet-ops --origin alliance/fleet-ops --branch main
+```text
+Let us start sharing knowledge with the rest of the fleet.
 ```
 
-`connect github` hands you a short code to confirm in the browser - no git, no
-SSH keys, just this machine's identity. From there the loop is four moves:
+*The agent turns on GitHub team sharing and connects this machine, handing you a
+short browser code to confirm - no git, no SSH keys, just this machine's identity.*
 
-```sh
-crystalline origin status                                   # at session start
-crystalline origin update                                   # before deep work
-crystalline origin share fleet-ops --title "Docking clamp timing"
-crystalline origin resolve fleet-ops fleet-ops/clamp.md --keep mine
+```text
+Pull in the fleet's shared knowledge repo, alliance/fleet-ops.
 ```
 
-`share` does not merge anything - it opens a proposal and hands back a review
-URL. A person at command reads it and merges on GitHub; the agent never merges
-its own work, it only relays the link. If a proposal is declined, that is
-normal traffic, not a failure - abandon it with `crystalline origin discard
-fleet-ops --proposal 4` and move on. Some gave everything to bring the knowledge
-in that repository back; a proposal is how you add to it without trampling what
-it cost.
+*The agent registers it as a team domain - `fleet-ops` - tracking that
+repository's main branch and downloads it.*
+
+From there the loop is a rhythm you speak: ask where the domain stands at session
+start, pull the team's merged work before you dig in and share when your own work
+is worth it:
+
+```text
+My docking clamp notes are worth sharing - send them to the fleet for review.
+```
+
+*The agent opens a proposal from your local changes and hands back a review URL.*
+A person at command reads it and merges on GitHub; the agent never merges its own
+work, only relays the link. A declined proposal is normal - refine and share
+again, or let it lapse (dropping one for good is a terminal-corner move:
+`crystalline origin discard`). If two edits collide, ask the agent to resolve
+it, keeping your side or theirs. Some gave everything to bring that knowledge back; a proposal is how
+you add to it without trampling what it cost.
 
 ## Appendix - The ship's computer
 
 > *This is Mother. I can tell you what I know. You only have to ask.*
 
-The computer answers when queried and stays silent when not, so query it. Skip
-quarantine - skip `verify` before you share, skip `doctor` when something feels
-off - and you are the crew that ignored the protocol and let the thing aboard.
-Knowledge hoarded is knowledge lost; the point of every mission above is that
-what you learn reaches the next shift and the rest of the crew.
+The computer answers when queried and stays silent when not, so query it.
+Knowledge hoarded is knowledge lost - every mission above is about what you learn
+reaching the next shift and the rest of the crew. Below is a quick reference; the
+terminal corner is optional.
 
 ### Quick reference
 
-| To do this | Say to your agent | Or run |
-|---|---|---|
-| Wire up a harness | (once, in the terminal) | `crystalline install claude-code` |
-| Commission a domain | (once, in the terminal) | `crystalline domain init <path> --name <n>` then `crystalline domain add <n> <path>` |
-| Capture a fact | "Capture this in ship-ops as a [gotcha]: ..." | `crystalline write <domain> "<title>" --content "..." --tags a,b --type guide` |
-| Recall, scoped | "What do we know about docking?" | `crystalline search "docking" --domain ship-ops` |
-| Recall, everywhere | "Search everything about coolant." | `crystalline search "coolant" --status current` |
-| Read one engram | "Open the clamp gotcha." | `crystalline read <identifier> --domain <domain>` |
-| Walk the graph | "Show me what connects to the coolant loop." | `crystalline context "crystalline://<domain>/<permalink>" --depth 2` |
-| Refine in place | "Update the coolant engram, do not fork it." | `crystalline edit <identifier> <domain> <operation>` |
-| Catch up | "What changed this week?" | `crystalline recent --timeframe 7d` |
-| Tidy vocabulary | "Any tag drift in ship-ops?" | `crystalline vocabulary --domain <domain>`, `crystalline tags merge <old> <into>` |
-| Share with the team | "Share the docking work as a proposal." | `crystalline origin share <domain> --title "..."` |
+| To do this | Say to your agent |
+|---|---|
+| Commission a domain | "Give me somewhere to remember everything about the ship." |
+| Capture a fact | "Remember this: the port clamp sticks in the cold." |
+| Recall, scoped | "What do we know about docking?" |
+| Recall, everywhere | "What do we know about coolant - check everything." |
+| Read one engram | "Show me the clamp gotcha." |
+| Walk the graph | "What connects to the coolant loop?" |
+| Refine in place | "Update what we have on coolant, do not start a new note." |
+| Catch up | "What changed while I was away?" |
+| Recall what was true then | "What applied last June?" |
+| Tidy vocabulary | "Have our tags drifted?" |
+| Retire a fact | "The old coolant mix is retired - update the archive." |
+| Share with the team | "These notes are worth sharing - send them for review." |
 
 ### Reference blocks
 
@@ -367,25 +349,35 @@ Relation syntax: `- rel_type [[Other Engram]]`, or quote a multi-word type,
 `- "relates to" [[Other Engram]]`.
 
 Temporal rules: no `valid_from` means always valid, no `valid_to` means valid
-forever. Set a bound only when validity is genuinely limited, as a plain ISO
-date (`YYYY-MM-DD`). Never write a sentinel far-future date to mean forever -
-absence already means it.
+forever. Set a bound only when validity is genuinely limited, as a plain ISO date
+(`YYYY-MM-DD`). Never write a sentinel far-future date to mean forever - absence
+already means it.
 
-Address scheme: `crystalline://<domain>/<permalink>` is the one absolute form.
-Any identifier without the scheme is domain-relative, so pass a bare permalink
-and name the domain separately.
+Address scheme: `crystalline://<domain>/<permalink>` is the one absolute form. Any
+identifier without the scheme is domain-relative, so pass a bare permalink and
+name the domain separately.
 
-Maintenance one-liners, run them before you need them:
+### The terminal corner
+
+Optional power-user territory - a reader who never opens a terminal can skip it.
+But skip the quarantine checks before you share and you are the crew that let the
+thing aboard, so `verify` and `doctor` earn their keep. These are the only
+commands the missions did not hand to the agent:
 
 ```sh
-crystalline verify              # static check: frontmatter, links, schema
-crystalline doctor              # diagnose index and service; add --fix to repair
-crystalline reindex --full      # rebuild the derived index from the files
+crystalline install claude-code                     # wire up a harness (Mission 00)
+crystalline import ./old-notes --domain ship-ops    # convert a legacy markdown tree
+crystalline tags rename <old> <new>                 # rename a tag everywhere
+crystalline tags merge <old> <into>                 # fold one tag into another
+crystalline origin discard <domain> --proposal <n>  # drop a declined proposal for good
+crystalline verify                                  # static check: frontmatter, links, schema
+crystalline doctor                                  # diagnose index and service; add --fix to repair
+crystalline reindex --full                          # rebuild the derived index from the files
 ```
 
-The index is disposable and the files are the truth, so `reindex --full` is
-never a data-loss event - it is the clean-room reset that syncs the index back
-to the files, ratio restored.
+The index is disposable and the files are the truth, so `reindex --full` is never
+a data-loss event - it is the clean-room reset that syncs the index back to the
+files, ratio restored.
 
 ---
 
