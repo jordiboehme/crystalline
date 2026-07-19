@@ -53,7 +53,7 @@ the docking gear, the coolant loop, the vent drivers.
 (`~/Documents/Crystalline` by default), scaffolds its `MANIFEST.md` and registers
 it, confirming the location before it writes anything. Naming the domain yourself
 keeps the outcome predictable; leave the name out and the agent will propose one
-and ask.* The scaffold is a stub you fill in -
+and ask.* The scaffold arrives as a stub -
 its routing sections are what an agent reads each session to decide whether a task
 belongs here:
 
@@ -83,9 +83,30 @@ recorded_at: 2026-07-19
 - Add guidance for agents working in this domain
 ```
 
-Replace the placeholders with the ship's real scope - docking, coolant, the vent
-drivers and the hull - so the `When to Use` bullets route clamp and coolant
-questions straight here. From then on every session opens with the agent reading
+The placeholders are not yours to type either - describe the domain and let the
+agent write its own routing:
+
+```text
+Fill in the ship-ops manifest: this domain covers the ship's hardware and
+operations - docking gear, coolant loop, vent drivers and hull - and any
+question about those systems should route here.
+```
+
+*The agent rewrites the placeholder sections in place:*
+
+```markdown
+## Scope
+
+- Hardware and operations of the ship: docking gear, coolant loop, vent
+  drivers and hull
+
+## When to Use
+
+- Route questions about docking, clamps, coolant or vents here
+- Check here before touching hardware the ship has already complained about
+```
+
+From then on every session opens with the agent reading
 those bullets as a routing brief, so it knows `ship-ops` owns them without being
 told. A healthy archive keeps its sync ratio: what the agent sees and what is on
 disk track one to one, and everything below drifts them apart then back.
