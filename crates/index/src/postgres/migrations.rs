@@ -56,6 +56,11 @@ pub const MIGRATIONS: &[Migration] = &[
         label: "case-folded tag identity",
         sql: SCHEMA_V6,
     },
+    Migration {
+        version: 7,
+        label: "tag alias map",
+        sql: SCHEMA_V7,
+    },
 ];
 
 // The whole current schema in one step. The temporal columns stay TEXT ISO
@@ -254,9 +259,26 @@ DELETE FROM tag WHERE id NOT IN (SELECT MIN(id) FROM tag GROUP BY lower(name));
 UPDATE tag SET name = lower(name);
 "#;
 
+// The Postgres twin of Turso's v8: the derived tag-alias map. One row per
+// `(domain, alias)` records the canonical spelling an old tag folds onto at
+// query time, so a search on either spelling matches every engram tagged with a
+// sibling. Derived purely from MANIFEST content and repopulated on the next sync
+// per domain: an upgraded database carries no aliases until each domain resyncs
+// (a new-feature grace), and a wipe+resync is the accepted way to backfill. The
+// canonical index serves the reverse lookup during expansion.
+const SCHEMA_V7: &str = r#"
+CREATE TABLE tag_alias (
+    domain_id BIGINT NOT NULL REFERENCES domain(id),
+    alias TEXT NOT NULL,
+    canonical TEXT NOT NULL,
+    PRIMARY KEY (domain_id, alias)
+);
+CREATE INDEX idx_tag_alias_canonical ON tag_alias(domain_id, canonical);
+"#;
+
 /// The tables cleared by `wipe()`, child rows first so the enforced foreign
-/// keys are satisfied at every step. `domain_lock` references `domain(id)`, so
-/// it is cleared before `domain`.
+/// keys are satisfied at every step. `tag_alias` and `domain_lock` both
+/// reference `domain(id)`, so they are cleared before `domain`.
 pub const WIPE_TABLES: &[&str] = &[
     "observation_tag",
     "engram_tag",
@@ -266,6 +288,7 @@ pub const WIPE_TABLES: &[&str] = &[
     "link",
     "tag",
     "engram",
+    "tag_alias",
     "domain_lock",
     "domain",
 ];

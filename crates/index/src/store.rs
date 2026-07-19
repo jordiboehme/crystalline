@@ -791,6 +791,18 @@ pub struct TagCount {
     pub observations: i64,
 }
 
+/// One folded tag-alias mapping in effect: an `alias` that folds onto a
+/// `canonical` at query time. Derived purely from MANIFEST declarations, so it
+/// carries no usage count; the mapping, not a marker on [`TagCount`], is what
+/// tells an agent two spellings are one tag.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TagAlias {
+    /// The aliased (old) spelling, folded to lowercase.
+    pub alias: String,
+    /// The canonical spelling it folds onto, folded to lowercase.
+    pub canonical: String,
+}
+
 /// One named vocabulary term with its usage count: an observation category or a
 /// relation type.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -813,6 +825,10 @@ pub struct Vocabulary {
     pub categories: Vec<NamedCount>,
     /// Relation types, most-used first, then by name.
     pub relation_types: Vec<NamedCount>,
+    /// Tag aliases in effect, sorted by alias then canonical. Derived from the
+    /// scanned domains' MANIFEST declarations, so an agent sees which spellings
+    /// fold onto which and reuses the canonical.
+    pub aliases: Vec<TagAlias>,
 }
 
 /// Merge the four decoded vocabulary aggregates into a sorted [`Vocabulary`].
@@ -825,6 +841,7 @@ pub(crate) fn build_vocabulary(
     observation_tags: Vec<(String, i64)>,
     categories: Vec<(String, i64)>,
     relation_types: Vec<(String, i64)>,
+    aliases: Vec<(String, String)>,
 ) -> Vocabulary {
     let mut merged: HashMap<String, (i64, i64)> = HashMap::new();
     for (name, count) in engram_tags {
@@ -856,10 +873,25 @@ pub(crate) fn build_vocabulary(
         v
     };
 
+    // Aliases arrive deduped from a `SELECT DISTINCT`, but an all-domain sweep
+    // can still surface the same pair from two domains; dedupe and sort here so
+    // the order never depends on SQL grouping, matching the tag ordering above.
+    let mut aliases: Vec<TagAlias> = aliases
+        .into_iter()
+        .map(|(alias, canonical)| TagAlias { alias, canonical })
+        .collect();
+    aliases.sort_by(|a, b| {
+        a.alias
+            .cmp(&b.alias)
+            .then_with(|| a.canonical.cmp(&b.canonical))
+    });
+    aliases.dedup();
+
     Vocabulary {
         tags,
         categories: to_named(categories),
         relation_types: to_named(relation_types),
+        aliases,
     }
 }
 
@@ -976,6 +1008,22 @@ pub trait Store: Send + Sync {
         tag: &str,
         domain: Option<&str>,
     ) -> Result<Vec<EngramDescriptor>>;
+
+    /// Replace a domain's derived tag-alias rows with the given folded
+    /// `(alias, canonical)` pairs. Deletes every existing row for the domain,
+    /// then inserts each pair, ignoring a duplicate alias. Called by
+    /// [`crate::sync::refresh_tag_aliases`] on every sync, so an empty slice
+    /// clears the domain's aliases. Both sides are already lowercased by the
+    /// caller; the store never parses markdown.
+    async fn replace_tag_aliases(&self, domain: DomainId, pairs: &[(String, String)])
+    -> Result<()>;
+
+    /// The distinct folded `(alias, canonical)` tag-alias pairs, optionally
+    /// scoped to a set of domain names, ordered by alias then canonical. An
+    /// all-domain sweep (no scope) unions every domain's map, so one alias can
+    /// come back paired with more than one canonical. Backs query-time alias
+    /// expansion and the vocabulary surface.
+    async fn tag_aliases(&self, domains: Option<&[String]>) -> Result<Vec<(String, String)>>;
 
     /// Every relation or prose link that points at the given engram, with the
     /// linking engram's path and the exact target text. Used by the cross-domain

@@ -11,7 +11,7 @@
 //! Pure Rust with no store dependency: it works off the [`TagCount`] list the
 //! vocabulary already computes.
 
-use crate::store::TagCount;
+use crate::store::{TagAlias, TagCount};
 
 /// A group of tags that look like variants of one another, with a short reason.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -106,6 +106,62 @@ pub fn tag_clusters(tags: &[TagCount]) -> Vec<TagCluster> {
     // Deterministic order: by first (sorted) member.
     clusters.sort_by(|a, b| a.tags.cmp(&b.tags));
     clusters
+}
+
+/// Near-duplicate tag clusters with declared aliases folded out first. Each tag
+/// name is canonicalized one hop through the alias map (an `alias -> canonical`
+/// mapping), the canonicalized names are deduplicated (summing usage) and
+/// [`tag_clusters`] runs over the result. A cluster that existed only because two
+/// spellings are a declared alias pair collapses onto one canonical name and
+/// drops out, so only the near-duplicates an alias does not already explain are
+/// surfaced, and every surviving member is reported under its canonical spelling.
+/// With no aliases this is byte-identical to [`tag_clusters`].
+pub fn tag_clusters_with_aliases(tags: &[TagCount], aliases: &[TagAlias]) -> Vec<TagCluster> {
+    // One-hop `alias -> canonical` fold, first-wins on a duplicate alias to match
+    // the MANIFEST fold. The canonical is never itself rewritten, so the hop is
+    // single: `a -> b` folds `a` to `b` even when `b -> c` also exists.
+    let mut canonical_of: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    for a in aliases {
+        canonical_of
+            .entry(a.alias.as_str())
+            .or_insert(a.canonical.as_str());
+    }
+
+    // Canonicalize each tag's name and merge duplicates, summing the usage so a
+    // folded canonical carries the combined weight of its spellings. Insertion
+    // order is preserved so an empty alias map reproduces the input exactly.
+    let mut merged: std::collections::HashMap<String, TagCount> = std::collections::HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+    for t in tags {
+        let name = canonical_of
+            .get(t.name.as_str())
+            .copied()
+            .unwrap_or(t.name.as_str())
+            .to_string();
+        match merged.get_mut(&name) {
+            Some(existing) => {
+                existing.engrams += t.engrams;
+                existing.observations += t.observations;
+            }
+            None => {
+                order.push(name.clone());
+                merged.insert(
+                    name.clone(),
+                    TagCount {
+                        name,
+                        engrams: t.engrams,
+                        observations: t.observations,
+                    },
+                );
+            }
+        }
+    }
+
+    let canonicalized: Vec<TagCount> = order
+        .into_iter()
+        .map(|k| merged.remove(&k).expect("every ordered key was inserted"))
+        .collect();
+    tag_clusters(&canonicalized)
 }
 
 /// The strongest relation joining two distinct tag names, or `None`.
@@ -222,6 +278,13 @@ mod tests {
         tag_clusters(&tags)
     }
 
+    fn ta(alias: &str, canonical: &str) -> TagAlias {
+        TagAlias {
+            alias: alias.to_string(),
+            canonical: canonical.to_string(),
+        }
+    }
+
     #[test]
     fn separator_variants_cluster() {
         let out = clusters(&["multi-word", "multi_word", "multi word", "unrelated"]);
@@ -301,5 +364,42 @@ mod tests {
     #[test]
     fn empty_input_is_empty() {
         assert!(tag_clusters(&[]).is_empty());
+    }
+
+    #[test]
+    fn aliases_suppress_the_pairs_they_explain() {
+        let tags: Vec<TagCount> = ["deploy", "deploys", "database", "databse"]
+            .iter()
+            .map(|n| tc(n))
+            .collect();
+
+        // Empty aliases: byte-identical to tag_clusters, both near-dup pairs
+        // cluster (a plural and a one-edit).
+        let plain = tag_clusters(&tags);
+        assert_eq!(plain.len(), 2);
+        assert_eq!(tag_clusters_with_aliases(&tags, &[]), plain);
+
+        // deploys -> deploy is a declared alias: that pair canonicalizes onto the
+        // single name `deploy`, collapses to a singleton and drops out. The
+        // unrelated database/databse edit cluster survives untouched.
+        let with = tag_clusters_with_aliases(&tags, &[ta("deploys", "deploy")]);
+        assert_eq!(with.len(), 1);
+        assert_eq!(
+            with[0].tags,
+            vec!["database".to_string(), "databse".to_string()]
+        );
+        assert_eq!(with[0].reason, "one-character edit");
+    }
+
+    #[test]
+    fn surviving_members_are_reported_under_their_canonical_name() {
+        // colour -> color folds the alias out; `color` and `colr` then cluster
+        // (one edit apart, long enough), reported under the canonical `color`,
+        // never the aliased `colour`.
+        let tags: Vec<TagCount> = ["colour", "colr"].iter().map(|n| tc(n)).collect();
+        let with = tag_clusters_with_aliases(&tags, &[ta("colour", "color")]);
+        assert_eq!(with.len(), 1);
+        assert_eq!(with[0].tags, vec!["color".to_string(), "colr".to_string()]);
+        assert_eq!(with[0].reason, "one-character edit");
     }
 }

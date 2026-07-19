@@ -14,6 +14,7 @@
 //! corrupt or stale index is never a data-loss risk: [`Store::wipe`] followed by
 //! a resync (the `reindex --full` path) recreates it from disk.
 
+mod alias;
 pub mod embed;
 mod error;
 mod factory;
@@ -24,6 +25,7 @@ mod sync;
 pub mod turso;
 pub mod vocab;
 
+pub use alias::AliasMap;
 pub use embed::{
     ChunkParams, EmbedReport, EmbeddingProvider, ModelDownload, chunk_engram, configured_model_id,
     download_local_model, order_jobs_for_batching, provider_from_config, run_embedding_pass,
@@ -35,13 +37,15 @@ pub use store::{
     EmbeddingCoverage, EmbeddingRow, EngramDescriptor, EngramId, EngramRecord, EngramSummary,
     FileStamp, FilterOp, FtsMode, GraphEdge, GraphNode, GraphSlice, HitKind, HostClaim, InboundRef,
     MetadataFilter, NamedCount, NewChunk, OutboundRef, Page, RecentFilter, SearchHit, SearchMode,
-    SearchQuery, Store, StoreInfo, StoredEngram, TagCount, Vocabulary, parse_metadata_filters,
+    SearchQuery, Store, StoreInfo, StoredEngram, TagAlias, TagCount, Vocabulary,
+    parse_metadata_filters,
 };
 pub use sync::{
-    DomainScan, SyncReport, apply_scan, scan_domain, scan_paths, sync_domain, sync_domain_with,
+    DomainScan, SyncReport, apply_scan, refresh_tag_aliases, scan_domain, scan_paths, sync_domain,
+    sync_domain_with,
 };
 pub use turso::TursoStore;
-pub use vocab::{TagCluster, tag_clusters};
+pub use vocab::{TagCluster, tag_clusters, tag_clusters_with_aliases};
 
 #[cfg(feature = "postgres")]
 pub use postgres::PostgresStore;

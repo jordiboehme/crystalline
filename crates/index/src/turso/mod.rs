@@ -21,6 +21,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use turso::{Builder, Connection, Database, Row, Value};
 
+use crate::alias::{AliasMap, query_uses_tags};
 use crate::error::{IndexError, Result};
 use crate::store::{
     ChunkJob, ChunkModelCount, DomainHost, DomainId, DomainKind, DomainStats, EdgeKind,
@@ -727,6 +728,7 @@ impl Store for TursoStore {
             "DELETE FROM relation WHERE domain_id=?1",
             "DELETE FROM link WHERE domain_id=?1",
             "DELETE FROM engram WHERE domain_id=?1",
+            "DELETE FROM tag_alias WHERE domain_id=?1",
         ] {
             self.conn.execute(sql, did.clone()).await?;
         }
@@ -917,6 +919,73 @@ impl Store for TursoStore {
         Ok(rows.iter().map(descriptor_from_row).collect())
     }
 
+    async fn replace_tag_aliases(
+        &self,
+        domain: DomainId,
+        pairs: &[(String, String)],
+    ) -> Result<()> {
+        // Delete then re-insert: the map is fully derived from MANIFEST content,
+        // so each sync replaces the domain's rows wholesale and an empty slice
+        // clears them. `INSERT OR IGNORE` drops a duplicate alias (the caller
+        // already deduped first-wins, so this is belt and braces).
+        self.conn
+            .execute(
+                "DELETE FROM tag_alias WHERE domain_id=?1",
+                vec![Value::Integer(domain.0)],
+            )
+            .await?;
+        for (alias, canonical) in pairs {
+            self.conn
+                .execute(
+                    "INSERT OR IGNORE INTO tag_alias(domain_id, alias, canonical) VALUES(?1, ?2, ?3)",
+                    vec![
+                        Value::Integer(domain.0),
+                        Value::Text(alias.clone()),
+                        Value::Text(canonical.clone()),
+                    ],
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn tag_aliases(&self, domains: Option<&[String]>) -> Result<Vec<(String, String)>> {
+        // SELECT DISTINCT so an all-domain sweep unions duplicate pairs across
+        // domains into one; the positional ORDER BY makes the binding order
+        // deterministic for expansion and the vocabulary surface.
+        let mut params: Vec<Value> = Vec::new();
+        let where_domain = match domains {
+            Some(names) if !names.is_empty() => {
+                let ph: Vec<String> = names
+                    .iter()
+                    .enumerate()
+                    .map(|(i, name)| {
+                        params.push(Value::Text(name.clone()));
+                        format!("?{}", i + 1)
+                    })
+                    .collect();
+                format!(
+                    " JOIN domain d ON d.id=ta.domain_id WHERE d.name IN ({})",
+                    ph.join(",")
+                )
+            }
+            _ => String::new(),
+        };
+        let sql = format!(
+            "SELECT DISTINCT ta.alias, ta.canonical FROM tag_alias ta{where_domain} ORDER BY 1, 2"
+        );
+        let rows = query_all(&self.conn, &sql, params).await?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                (
+                    cell_text(r, 0).unwrap_or_default(),
+                    cell_text(r, 1).unwrap_or_default(),
+                )
+            })
+            .collect())
+    }
+
     async fn inbound_refs(
         &self,
         engram_id: EngramId,
@@ -1001,7 +1070,15 @@ impl Store for TursoStore {
             SearchMode::Semantic | SearchMode::Hybrid => Some(self.embedding_coverage().await?),
             _ => None,
         };
-        search::run_search(&self.conn, query, coverage.as_ref()).await
+        // Load the alias map only when the query filters on tags, so every other
+        // search pays nothing. Scoped to the query's domains, so a search over B
+        // never folds through A's map.
+        let aliases = if query_uses_tags(query) {
+            AliasMap::from_pairs(&self.tag_aliases(query.domains.as_deref()).await?)
+        } else {
+            AliasMap::default()
+        };
+        search::run_search(&self.conn, query, coverage.as_ref(), &aliases).await
     }
 
     async fn neighbors(&self, ids: &[EngramId], depth: u8) -> Result<GraphSlice> {
@@ -1405,11 +1482,31 @@ impl Store for TursoStore {
         };
         let relation_types = decode(&query_all(&self.conn, rel_sql, dparam()).await?);
 
+        // The fifth scan surfaces the derived tag aliases in effect. Scoped by
+        // domain name like the counts; `build_vocabulary` dedupes and sorts.
+        let alias_sql = if domain.is_some() {
+            "SELECT DISTINCT ta.alias, ta.canonical FROM tag_alias ta \
+             JOIN domain d ON d.id=ta.domain_id WHERE d.name=?1"
+        } else {
+            "SELECT DISTINCT ta.alias, ta.canonical FROM tag_alias ta"
+        };
+        let aliases: Vec<(String, String)> = query_all(&self.conn, alias_sql, dparam())
+            .await?
+            .iter()
+            .map(|r| {
+                (
+                    cell_text(r, 0).unwrap_or_default(),
+                    cell_text(r, 1).unwrap_or_default(),
+                )
+            })
+            .collect();
+
         Ok(build_vocabulary(
             engram_tags,
             observation_tags,
             categories,
             relation_types,
+            aliases,
         ))
     }
 
