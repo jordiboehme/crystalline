@@ -380,6 +380,9 @@ fn render_routing_body(
         out.push_str(
             "- write_engram, edit_engram, move_engram and delete_engram always require an explicit domain; there is no default domain for writes.\n",
         );
+        out.push_str(
+            "- vocabulary lists tags and categories already in use; check it before inventing a new tag.\n",
+        );
     }
     out.push_str(
         "- build_context on a crystalline:// anchor assembles related knowledge around a task.\n",

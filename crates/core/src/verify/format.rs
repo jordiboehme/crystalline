@@ -162,7 +162,7 @@ pub(crate) fn check(file: &ScannedFile, domain_name: &str, sink: &mut Sink) {
     }
 
     for tag in &fm.tags {
-        if !is_lower_hyphen(tag) {
+        if !crate::tags::is_lower_hyphen(tag) {
             sink.emit(
                 &file.path,
                 None,
@@ -173,12 +173,4 @@ pub(crate) fn check(file: &ScannedFile, domain_name: &str, sink: &mut Sink) {
             );
         }
     }
-}
-
-fn is_lower_hyphen(s: &str) -> bool {
-    !s.is_empty()
-        && !s.starts_with('-')
-        && !s.ends_with('-')
-        && s.chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }

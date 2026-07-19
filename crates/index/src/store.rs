@@ -427,6 +427,10 @@ pub struct SearchHit {
     pub engram_type: String,
     /// The engram `status`.
     pub status: String,
+    /// The engram's tags, alphabetical and folded to lowercase; empty when the
+    /// engram is untagged. Every hit passively teaches the querying agent the
+    /// existing vocabulary. Observation-kind hits carry their engram's tags.
+    pub tags: Vec<String>,
     /// Whether the hit is the engram or one of its observations.
     #[serde(flatten)]
     pub kind: HitKind,
@@ -583,6 +587,26 @@ pub struct InboundRef {
     pub kind: EdgeKind,
 }
 
+/// One outbound reference from an engram: a relation bullet or a prose wikilink,
+/// with whether it currently resolves to a target in the index. Backs the
+/// `read_engram` resolution flags so a reading agent learns which of its links
+/// land and which dangle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OutboundRef {
+    /// One-based source line.
+    pub line: usize,
+    /// Whether the reference came from a relation bullet or a prose link.
+    pub kind: EdgeKind,
+    /// The relation type for a relation edge; `None` for a prose link.
+    pub rel_type: Option<String>,
+    /// The exact target text used in the reference.
+    pub to_target: String,
+    /// An explicit cross-domain target domain, or `None` for same-domain.
+    pub to_domain: Option<String>,
+    /// Whether the reference currently resolves to a target in the index.
+    pub resolved: bool,
+}
+
 /// A chunk awaiting an embedding. Populated by M4; the M3 store returns none.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChunkJob {
@@ -709,6 +733,10 @@ pub struct DomainStats {
     pub relations: i64,
     /// Number of relations still awaiting their target (forward refs).
     pub unresolved_relations: i64,
+    /// Number of prose wikilinks.
+    pub links: i64,
+    /// Number of prose wikilinks still awaiting their target (forward refs).
+    pub unresolved_links: i64,
     /// Last successful sync, RFC 3339, or `None` if never synced.
     pub last_sync: Option<String>,
     /// The instance id currently hosting this file domain in a shared database,
@@ -748,6 +776,91 @@ pub enum HostClaim {
     /// Another instance holds it and the claim did not qualify for takeover
     /// (not stale, no `take_over`).
     HeldByOther(DomainHost),
+}
+
+/// One tag in use, with how many engrams and how many observations carry it.
+/// The two counts are separate scans so a tag applied on the frontmatter and one
+/// applied on an observation are both visible.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TagCount {
+    /// The tag name, without the leading `#`.
+    pub name: String,
+    /// Number of engrams tagged with it on their frontmatter.
+    pub engrams: i64,
+    /// Number of observations tagged with it.
+    pub observations: i64,
+}
+
+/// One named vocabulary term with its usage count: an observation category or a
+/// relation type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NamedCount {
+    /// The term.
+    pub name: String,
+    /// How many times it is used.
+    pub count: i64,
+}
+
+/// The vocabulary in use across a domain or the whole index: tags with their
+/// engram and observation usage counts, observation categories with counts and
+/// relation types with counts. Backs the `vocabulary` tool so an agent reuses an
+/// existing term instead of coining a near-duplicate.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct Vocabulary {
+    /// Tags, most-used first (engrams + observations), then by name.
+    pub tags: Vec<TagCount>,
+    /// Observation categories, most-used first, then by name.
+    pub categories: Vec<NamedCount>,
+    /// Relation types, most-used first, then by name.
+    pub relation_types: Vec<NamedCount>,
+}
+
+/// Merge the four decoded vocabulary aggregates into a sorted [`Vocabulary`].
+/// Shared by both backends so the ordering is identical regardless of SQL's
+/// grouping order: engram-tag and observation-tag counts merge by tag name, tags
+/// sort by total usage (engrams + observations) descending then name, and
+/// categories and relation types sort by count descending then name.
+pub(crate) fn build_vocabulary(
+    engram_tags: Vec<(String, i64)>,
+    observation_tags: Vec<(String, i64)>,
+    categories: Vec<(String, i64)>,
+    relation_types: Vec<(String, i64)>,
+) -> Vocabulary {
+    let mut merged: HashMap<String, (i64, i64)> = HashMap::new();
+    for (name, count) in engram_tags {
+        merged.entry(name).or_default().0 = count;
+    }
+    for (name, count) in observation_tags {
+        merged.entry(name).or_default().1 = count;
+    }
+    let mut tags: Vec<TagCount> = merged
+        .into_iter()
+        .map(|(name, (engrams, observations))| TagCount {
+            name,
+            engrams,
+            observations,
+        })
+        .collect();
+    tags.sort_by(|a, b| {
+        (b.engrams + b.observations)
+            .cmp(&(a.engrams + a.observations))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+
+    let to_named = |rows: Vec<(String, i64)>| -> Vec<NamedCount> {
+        let mut v: Vec<NamedCount> = rows
+            .into_iter()
+            .map(|(name, count)| NamedCount { name, count })
+            .collect();
+        v.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.name.cmp(&b.name)));
+        v
+    };
+
+    Vocabulary {
+        tags,
+        categories: to_named(categories),
+        relation_types: to_named(relation_types),
+    }
 }
 
 /// The backend-agnostic storage interface. All methods are async so a network
@@ -818,6 +931,13 @@ pub trait Store: Send + Sync {
     /// domain. Returns the number of relations newly resolved.
     async fn resolve_pending_relations(&self, domain: DomainId) -> Result<u64>;
 
+    /// Resolve every pending prose wikilink in a domain in one batch, the same
+    /// permalink-then-title match as [`Store::resolve_pending_relations`] but
+    /// over the `link` table. Wikilinks carry no relation type, so a resolved
+    /// link becomes a `links_to` edge in graph traversal. Returns the number of
+    /// links newly resolved.
+    async fn resolve_pending_links(&self, domain: DomainId) -> Result<u64>;
+
     // --- lookups -------------------------------------------------------------
     // Repository-level addressing helpers used by the service layer to turn a
     // tool identifier or a `crystalline://` anchor into ids and a file path.
@@ -846,6 +966,17 @@ pub trait Store: Send + Sync {
         engram_type: Option<&str>,
     ) -> Result<Vec<EngramDescriptor>>;
 
+    /// Every engram carrying a tag, on its frontmatter or on one of its
+    /// observations, optionally scoped to one domain. The bound tag is
+    /// case-folded to match the case-folded `tag.name`. Ordered by domain name
+    /// then path so a `tags rename` / `tags merge` rewrites files in a stable
+    /// order. Backs the CLI tag-hygiene commands.
+    async fn engrams_with_tag(
+        &self,
+        tag: &str,
+        domain: Option<&str>,
+    ) -> Result<Vec<EngramDescriptor>>;
+
     /// Every relation or prose link that points at the given engram, with the
     /// linking engram's path and the exact target text. Used by the cross-domain
     /// move to rewrite inbound links.
@@ -856,6 +987,11 @@ pub trait Store: Send + Sync {
         permalink: &str,
         title: &str,
     ) -> Result<Vec<InboundRef>>;
+
+    /// Every relation and prose link that points out of the given engram, each
+    /// carrying whether it currently resolves to a target in the index. Ordered
+    /// by source line. Backs the `read_engram` resolution flags.
+    async fn outbound_refs(&self, engram_id: EngramId) -> Result<Vec<OutboundRef>>;
 
     /// Run a search and return one page of hits plus the total match count.
     async fn search(&self, query: &SearchQuery) -> Result<Page<SearchHit>>;
@@ -920,6 +1056,13 @@ pub trait Store: Send + Sync {
 
     /// Per-domain counts, in registration order.
     async fn domain_stats(&self) -> Result<Vec<DomainStats>>;
+
+    /// The vocabulary in use: tag, observation-category and relation-type usage
+    /// counts, for one domain or (when `domain` is `None`) across every domain.
+    /// An unknown domain name yields empty vectors rather than an error, so a
+    /// caller can probe a domain that holds no engrams yet. The vectors are
+    /// sorted by usage in Rust for cross-backend determinism.
+    async fn vocabulary(&self, domain: Option<&str>) -> Result<Vocabulary>;
 
     // --- host locks ----------------------------------------------------------
     // The single-writer-per-file-domain rule for shared-database collaboration.

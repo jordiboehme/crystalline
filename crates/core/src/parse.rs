@@ -510,7 +510,7 @@ fn strip_closing_hashes(s: &str) -> String {
     }
 }
 
-fn fence_marker(line: &str) -> Option<(char, usize, usize)> {
+pub(crate) fn fence_marker(line: &str) -> Option<(char, usize, usize)> {
     let indent = line.len() - line.trim_start_matches(' ').len();
     if indent > 3 {
         return None;
@@ -578,7 +578,7 @@ fn split_observation(body: &str) -> (String, Vec<String>, Option<String>) {
     (s.trim().to_string(), tags, context)
 }
 
-fn is_hashtag(token: &str) -> bool {
+pub(crate) fn is_hashtag(token: &str) -> bool {
     let Some(body) = token.strip_prefix('#') else {
         return false;
     };

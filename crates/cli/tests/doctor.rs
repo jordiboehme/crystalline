@@ -113,6 +113,61 @@ fn reports_clean_when_nothing_is_wrong() {
 }
 
 #[test]
+fn reports_near_duplicate_tag_clusters_without_failing() {
+    let work = tempfile::tempdir().unwrap();
+    let config = work.path().join("config.yaml");
+    let db = work.path().join("index.db");
+    let domain_dir = setup_domain(work.path(), "eng", &config);
+    // Two engrams whose tags are one edit apart: `database` and `databse`.
+    write(
+        &domain_dir,
+        "a.md",
+        "---\ntype: engram\ntitle: A\npermalink: a\ntags:\n  - database\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nBody with enough content.\n\nSecond line.\n",
+    );
+    write(
+        &domain_dir,
+        "b.md",
+        "---\ntype: engram\ntitle: B\npermalink: b\ntags:\n  - databse\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nBody with enough content.\n\nSecond line.\n",
+    );
+    bin()
+        .args(["sync", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .success();
+
+    let mut cmd = bin();
+    shield_ambient_home(&mut cmd, "tag-clusters");
+    let out = cmd
+        .args(["--json", "doctor", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        // Advisory only: near-duplicate tags never fail doctor's exit code.
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&out).unwrap();
+    let clusters = report["tags"]["clusters"]
+        .as_array()
+        .expect("tags.clusters is present once an index exists");
+    assert_eq!(clusters.len(), 1, "one near-duplicate cluster: {report}");
+    let tags: Vec<&str> = clusters[0]["tags"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t.as_str().unwrap())
+        .collect();
+    assert!(
+        tags.contains(&"database") && tags.contains(&"databse"),
+        "the cluster groups the two spellings: {report}"
+    );
+}
+
+#[test]
 fn detects_orphan_and_fix_removes_it() {
     let work = tempfile::tempdir().unwrap();
     let config = work.path().join("config.yaml");

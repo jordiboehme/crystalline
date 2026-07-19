@@ -12,9 +12,9 @@
 use std::path::Path;
 
 use crystalline_index::{
-    DomainId, DomainKind, EmbeddingCoverage, EmbeddingRow, EngramId, EngramRecord, FileStamp,
-    FilterOp, HostClaim, IndexError, MetadataFilter, NewChunk, RecentFilter, SearchMode,
-    SearchQuery, Store, TursoStore, sync_domain,
+    DomainId, DomainKind, EdgeKind, EmbeddingCoverage, EmbeddingRow, EngramId, EngramRecord,
+    FileStamp, FilterOp, HostClaim, IndexError, MetadataFilter, NamedCount, NewChunk, RecentFilter,
+    SearchMode, SearchQuery, Store, TursoStore, Vocabulary, sync_domain,
 };
 
 fn write(dir: &Path, rel: &str, content: &str) {
@@ -156,7 +156,14 @@ async fn full_sync_counts(store: &dyn Store) {
     assert_eq!(report.added, 3, "three files added");
     assert_eq!(report.updated, 0);
     assert_eq!(report.failed.len(), 0, "no failures: {:?}", report.failed);
-    assert!(report.relations_resolved >= 1, "Alpha->Beta resolved");
+    assert!(
+        report.relations_resolved >= 1,
+        "Alpha->Beta relation resolved"
+    );
+    assert!(
+        report.links_resolved >= 1,
+        "Alpha's prose [[Beta]] resolved"
+    );
 
     let stats = store.domain_stats().await.unwrap();
     assert_eq!(stats.len(), 1);
@@ -165,7 +172,20 @@ async fn full_sync_counts(store: &dyn Store) {
     assert_eq!(s.observations, 1);
     assert_eq!(s.relations, 1);
     assert_eq!(s.unresolved_relations, 0);
+    assert_eq!(s.links, 1, "one prose wikilink");
+    assert_eq!(s.unresolved_links, 0, "the prose wikilink resolved");
     assert!(s.last_sync.is_some());
+
+    // The resolved prose wikilink is a `links_to` edge in graph traversal.
+    let alpha = store.lookup_id("eng", "alpha").await.unwrap().unwrap();
+    let slice = store.neighbors(&[alpha], 1).await.unwrap();
+    assert!(
+        slice
+            .edges
+            .iter()
+            .any(|e| e.kind == EdgeKind::Link && e.rel_type == "links_to"),
+        "Alpha has a links_to edge to Beta"
+    );
 }
 parity!(
     full_sync_counts_engrams_observations_relations,
@@ -477,6 +497,211 @@ parity!(
     forward_reference_resolves_by_title
 );
 
+/// The prose-wikilink twin of `forward_reference_resolves`: a bare `[[Gamma]]`
+/// mentioned in prose (no relation type) stays unresolved until its target
+/// appears, then resolves on the later sync into a `links_to` graph edge. This
+/// is the whole point of M1: prose wikilinks were indexed but never resolved,
+/// so they never joined graph traversal.
+async fn link_two_pass_resolution(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // A prose mention only, no `- rel_type [[...]]` bullet, so this exercises
+    // the link table, not the relation table.
+    write(
+        root,
+        "a.md",
+        &engram("A", "a", "engram", "", "See [[Gamma]] for the details.\n"),
+    );
+    let first = sync_domain(store, "d", root).await.unwrap();
+    assert_eq!(first.links_resolved, 0, "target absent, link unresolved");
+    assert_eq!(first.relations_resolved, 0, "no relation bullets");
+    let stats = store.domain_stats().await.unwrap();
+    assert_eq!(stats[0].links, 1, "the prose wikilink is indexed");
+    assert_eq!(stats[0].unresolved_links, 1, "and still unresolved");
+
+    // The target appears in a later sync. Its title matches the wikilink text
+    // (its permalink deliberately does not), so the title branch resolves it.
+    write(
+        root,
+        "gamma.md",
+        &engram("Gamma", "gamma-perma", "engram", "", "gamma body\n"),
+    );
+    let second = sync_domain(store, "d", root).await.unwrap();
+    assert_eq!(second.links_resolved, 1, "now resolved");
+    assert_eq!(
+        store.domain_stats().await.unwrap()[0].unresolved_links,
+        0,
+        "no pending links remain"
+    );
+
+    // The resolved wikilink is a `links_to` edge from A to Gamma.
+    let a = store.lookup_id("d", "a").await.unwrap().unwrap();
+    let slice = store.neighbors(&[a], 1).await.unwrap();
+    assert!(
+        slice
+            .edges
+            .iter()
+            .any(|e| e.kind == EdgeKind::Link && e.rel_type == "links_to"),
+        "A has a links_to edge to Gamma"
+    );
+    let perms: Vec<&str> = slice.nodes.iter().map(|n| n.permalink.as_str()).collect();
+    assert!(perms.contains(&"gamma-perma"), "traversal reaches Gamma");
+}
+parity!(
+    prose_wikilink_resolves_on_later_sync,
+    link_two_pass_resolution
+);
+
+/// `outbound_refs` reports every relation and prose link leaving an engram, in
+/// source-line order, each flagged with whether it currently resolves. A
+/// relation and a prose link to a present target resolve; a relation to a
+/// missing target and a cross-domain link into an unregistered domain do not. An
+/// engram with no outbound references reports none.
+async fn outbound_refs_status(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "target.md",
+        &engram("Target", "target", "engram", "", "target body\n"),
+    );
+    // Two relation bullets then two prose links, on ascending lines: a resolving
+    // relation, a dangling relation, a resolving prose link and a dangling
+    // cross-domain prose link.
+    write(
+        root,
+        "source.md",
+        &engram(
+            "Source",
+            "source",
+            "engram",
+            "",
+            "- depends_on [[Target]]\n- blocks [[Missing]]\n\nProse links [[Target]] inline.\n\nMore prose [[other:Ghost]] here.\n",
+        ),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+
+    let source = store.lookup_id("d", "source").await.unwrap().unwrap();
+    let refs = store.outbound_refs(source).await.unwrap();
+    let shape: Vec<_> = refs
+        .iter()
+        .map(|r| {
+            (
+                r.line,
+                r.kind,
+                r.rel_type.as_deref(),
+                r.to_target.as_str(),
+                r.to_domain.as_deref(),
+                r.resolved,
+            )
+        })
+        .collect();
+    assert_eq!(
+        shape,
+        vec![
+            (
+                13,
+                EdgeKind::Relation,
+                Some("depends_on"),
+                "Target",
+                None,
+                true
+            ),
+            (
+                14,
+                EdgeKind::Relation,
+                Some("blocks"),
+                "Missing",
+                None,
+                false
+            ),
+            (16, EdgeKind::Link, None, "Target", None, true),
+            (18, EdgeKind::Link, None, "Ghost", Some("other"), false),
+        ],
+        "outbound refs are line-ordered and carry resolution flags: {refs:?}"
+    );
+
+    // The target itself has no outbound references.
+    let target = store.lookup_id("d", "target").await.unwrap().unwrap();
+    assert!(
+        store.outbound_refs(target).await.unwrap().is_empty(),
+        "an engram with no relations or links reports none"
+    );
+}
+parity!(outbound_refs_report_resolution_status, outbound_refs_status);
+
+/// `inbound_refs` reports a relation-kind and a link-kind reference pointing at
+/// an engram, each carrying the correct `kind`. This guards the kind
+/// discriminator decoding identically on both backends: a bare integer literal
+/// does not decode as `i64` on Postgres, so the column must be cast.
+async fn inbound_refs_kinds(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "hub.md",
+        &engram("Hub", "hub", "engram", "", "the hub body\n"),
+    );
+    // A relation bullet pointing at Hub, and a separate engram whose prose links
+    // to Hub. After resolution both are inbound references, of different kinds.
+    write(
+        root,
+        "rel.md",
+        &engram("Rel", "rel", "engram", "", "- cites [[Hub]]\n"),
+    );
+    write(
+        root,
+        "link.md",
+        &engram(
+            "Link",
+            "link",
+            "engram",
+            "",
+            "See [[Hub]] for the details.\n",
+        ),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+
+    let hub = store.lookup_id("d", "hub").await.unwrap().unwrap();
+    let domain = store
+        .upsert_domain("d", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+    let refs = store.inbound_refs(hub, domain, "hub", "Hub").await.unwrap();
+
+    assert_eq!(
+        refs.len(),
+        2,
+        "one relation and one link point at Hub: {refs:?}"
+    );
+    // Ordered by source domain then path, so a capped sample is deterministic:
+    // both linkers are in domain `d`, so `link.md` sorts before `rel.md`.
+    assert_eq!(
+        refs.iter().map(|r| r.src_path.as_str()).collect::<Vec<_>>(),
+        vec!["link.md", "rel.md"],
+        "inbound refs are ordered by (domain, path): {refs:?}"
+    );
+    let relation = refs
+        .iter()
+        .find(|r| r.src_path == "rel.md")
+        .expect("the relation linker is present");
+    assert_eq!(
+        relation.kind,
+        EdgeKind::Relation,
+        "the relation bullet is a relation-kind inbound ref: {refs:?}"
+    );
+    let link = refs
+        .iter()
+        .find(|r| r.src_path == "link.md")
+        .expect("the prose linker is present");
+    assert_eq!(
+        link.kind,
+        EdgeKind::Link,
+        "the prose wikilink is a link-kind inbound ref: {refs:?}"
+    );
+}
+parity!(inbound_refs_report_ref_kinds, inbound_refs_kinds);
+
 async fn duplicate_permalink_fails(store: &dyn Store) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
@@ -569,6 +794,97 @@ parity!(
     search_finds_by_title_content_and_observation,
     search_finds_across_fields
 );
+
+async fn search_hits_carry_tags(store: &dyn Store) {
+    // Every search hit teaches the querying agent the engram's tags: alphabetical
+    // and folded to lowercase, an empty vec when untagged, present on filter-only
+    // and observation-kind hits alike (keyed by the engram id either way).
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // A tagged engram whose title matches: an engram-kind text hit.
+    write(
+        root,
+        "photo.md",
+        "---\ntype: engram\ntitle: Photosynthesis primer\npermalink: photo\ntags:\n  - Zebra\n  - apple\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Photosynthesis primer\n\ngeneric body\n",
+    );
+    // An untagged engram whose title also matches: an empty tag vec.
+    write(
+        root,
+        "plain.md",
+        "---\ntype: engram\ntitle: Photosynthesis appendix\npermalink: plain\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Photosynthesis appendix\n\ngeneric body\n",
+    );
+    // A tagged engram whose only match is in an observation carrying its own
+    // hashtag: an observation-kind hit that must still carry the engram's
+    // frontmatter tags, not the observation hashtag.
+    write(
+        root,
+        "obs.md",
+        "---\ntype: engram\ntitle: Generic two\npermalink: obs\ntags:\n  - gamma\n  - beta\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Generic two\n\n- [fact] tardigrades survive vacuum #delta\n",
+    );
+    sync_domain(store, "d", root).await.unwrap();
+
+    // A text search: the tagged engram lists its tags alphabetically and folded,
+    // the untagged engram carries an empty vec. Both are engram-kind title hits.
+    let text = store
+        .search(&SearchQuery::text("photosynthesis"))
+        .await
+        .unwrap();
+    assert_eq!(text.total, 2);
+    let photo = text
+        .items
+        .iter()
+        .find(|h| h.permalink == "photo")
+        .expect("the photo hit is present");
+    assert_eq!(
+        photo.tags,
+        vec!["apple".to_string(), "zebra".to_string()],
+        "frontmatter tags, alphabetical and folded to lowercase"
+    );
+    let plain = text
+        .items
+        .iter()
+        .find(|h| h.permalink == "plain")
+        .expect("the plain hit is present");
+    assert!(
+        plain.tags.is_empty(),
+        "an untagged engram carries an empty tag vec"
+    );
+
+    // A filter-only search (no query text) carries tags too.
+    let filtered = store
+        .search(&SearchQuery {
+            tags: Some(vec!["apple".into()]),
+            limit: 10,
+            page: 1,
+            ..SearchQuery::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(filtered.total, 1);
+    assert_eq!(filtered.items[0].permalink, "photo");
+    assert_eq!(
+        filtered.items[0].tags,
+        vec!["apple".to_string(), "zebra".to_string()]
+    );
+
+    // An observation-kind hit carries its engram's frontmatter tags, not the
+    // observation's own #delta hashtag.
+    let by_obs = store
+        .search(&SearchQuery::text("tardigrades"))
+        .await
+        .unwrap();
+    assert_eq!(by_obs.items[0].permalink, "obs");
+    match by_obs.items[0].kind {
+        crystalline_index::HitKind::Observation { line } => assert!(line > 0),
+        crystalline_index::HitKind::Engram => panic!("expected an observation-level hit"),
+    }
+    assert_eq!(
+        by_obs.items[0].tags,
+        vec!["beta".to_string(), "gamma".to_string()],
+        "the engram's frontmatter tags, never the #delta observation hashtag"
+    );
+}
+parity!(search_hits_carry_their_engram_tags, search_hits_carry_tags);
 
 async fn search_applies_filters(store: &dyn Store) {
     let dir = tempfile::tempdir().unwrap();
@@ -820,6 +1136,244 @@ async fn recent_newest_first(store: &dyn Store) {
     assert_eq!(recent[0].permalink, "new", "2026-06-01 before 2026-01-01");
 }
 parity!(recent_returns_newest_first, recent_newest_first);
+
+async fn vocabulary_counts(store: &dyn Store) {
+    // Two domains with distinct frontmatter tags, observation tags, observation
+    // categories and relation types, so every facet of the vocabulary is
+    // exercised and the domain filter can be checked against the all-domain
+    // sweep. Alpha carries a frontmatter-only `legacy` tag (engrams 1,
+    // observations 0) and an observation-only `urgent` tag (engrams 0,
+    // observations 1) so a swap of the two tag counts in the backend aggregation
+    // is caught; Beta reuses `database`; Gamma lives in a second domain.
+    let eng = tempfile::tempdir().unwrap();
+    write(
+        eng.path(),
+        "alpha.md",
+        "---\ntype: engram\ntitle: Alpha\npermalink: alpha\ntags:\n  - database\n  - api\n  - legacy\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Alpha\n\n- [decision] chose postgres #database\n\n- [pattern] api uses rest #api #urgent\n\n- depends_on [[Beta]]\n",
+    );
+    write(
+        eng.path(),
+        "beta.md",
+        "---\ntype: engram\ntitle: Beta\npermalink: beta\ntags:\n  - database\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Beta\n\n- [decision] indexed the table #database\n\n- relates_to [[Alpha]]\n",
+    );
+    sync_domain(store, "eng", eng.path()).await.unwrap();
+
+    let ops = tempfile::tempdir().unwrap();
+    write(
+        ops.path(),
+        "gamma.md",
+        "---\ntype: engram\ntitle: Gamma\npermalink: gamma\ntags:\n  - deploy\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Gamma\n\n- [gotcha] watch the rollout #deploy\n\n- depends_on [[Alpha]]\n",
+    );
+    sync_domain(store, "ops", ops.path()).await.unwrap();
+
+    let tag_shape = |v: &Vocabulary| -> Vec<(String, i64, i64)> {
+        v.tags
+            .iter()
+            .map(|t| (t.name.clone(), t.engrams, t.observations))
+            .collect()
+    };
+    let named_shape = |rows: &[NamedCount]| -> Vec<(String, i64)> {
+        rows.iter().map(|n| (n.name.clone(), n.count)).collect()
+    };
+
+    // The all-domain sweep merges the engram-tag and observation-tag counts per
+    // tag and orders by total usage descending then name. `database` leads with
+    // two engrams and two observations; `api` and `deploy` tie and sort by name;
+    // `legacy` (1, 0) and `urgent` (0, 1) have unequal counts, so a swapped
+    // engram/observation assignment in the backend would fail here.
+    let all = store.vocabulary(None).await.unwrap();
+    assert_eq!(
+        tag_shape(&all),
+        vec![
+            ("database".to_string(), 2, 2),
+            ("api".to_string(), 1, 1),
+            ("deploy".to_string(), 1, 1),
+            ("legacy".to_string(), 1, 0),
+            ("urgent".to_string(), 0, 1),
+        ],
+        "tags merge engram and observation counts, most-used first then name: {:?}",
+        all.tags
+    );
+    assert_eq!(
+        named_shape(&all.categories),
+        vec![
+            ("decision".to_string(), 2),
+            ("gotcha".to_string(), 1),
+            ("pattern".to_string(), 1),
+        ],
+        "categories count observations and sort by count then name: {:?}",
+        all.categories
+    );
+    assert_eq!(
+        named_shape(&all.relation_types),
+        vec![("depends_on".to_string(), 2), ("relates_to".to_string(), 1),],
+        "relation types are counted across both domains: {:?}",
+        all.relation_types
+    );
+
+    // The domain filter narrows every facet to one domain's engrams. The eng
+    // domain keeps the unequal-count `legacy` (1, 0) and `urgent` (0, 1) tags and
+    // still excludes the ops `deploy` tag.
+    let eng_vocab = store.vocabulary(Some("eng")).await.unwrap();
+    assert_eq!(
+        tag_shape(&eng_vocab),
+        vec![
+            ("database".to_string(), 2, 2),
+            ("api".to_string(), 1, 1),
+            ("legacy".to_string(), 1, 0),
+            ("urgent".to_string(), 0, 1),
+        ],
+        "the eng domain excludes the ops deploy tag: {:?}",
+        eng_vocab.tags
+    );
+    assert_eq!(
+        named_shape(&eng_vocab.relation_types),
+        vec![("depends_on".to_string(), 1), ("relates_to".to_string(), 1),],
+        "eng relation types tie at one and sort by name: {:?}",
+        eng_vocab.relation_types
+    );
+
+    // An unknown domain yields empty vectors rather than an error.
+    let missing = store.vocabulary(Some("nope")).await.unwrap();
+    assert!(
+        missing.tags.is_empty()
+            && missing.categories.is_empty()
+            && missing.relation_types.is_empty(),
+        "an unknown domain has an empty vocabulary: {missing:?}"
+    );
+}
+parity!(vocabulary_reports_usage_counts, vocabulary_counts);
+
+async fn tag_identity_folds(store: &dyn Store) {
+    // Two engrams carry the same tag in different cases on their frontmatter,
+    // plus an observation hashtag in a third case. Tag identity is case-folded
+    // at intern time, so all three land on one lowercase `topic` row.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "alpha.md",
+        "---\ntype: engram\ntitle: Alpha\npermalink: alpha\ntags:\n  - Foo\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Alpha\n\n- [decision] chose it #FOO\n",
+    );
+    write(
+        root,
+        "beta.md",
+        "---\ntype: engram\ntitle: Beta\npermalink: beta\ntags:\n  - foo\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Beta\n\nbody\n",
+    );
+    sync_domain(store, "d", root).await.unwrap();
+
+    // One folded tag row: two engrams (Foo, foo) and one observation (#FOO).
+    let vocab = store.vocabulary(Some("d")).await.unwrap();
+    let shape: Vec<(String, i64, i64)> = vocab
+        .tags
+        .iter()
+        .map(|t| (t.name.clone(), t.engrams, t.observations))
+        .collect();
+    assert_eq!(
+        shape,
+        vec![("foo".to_string(), 2, 1)],
+        "Foo/foo/#FOO fold to one lowercase tag row: {:?}",
+        vocab.tags
+    );
+
+    // A search tag filter folds too, so either case of the query hits both.
+    for query in ["Foo", "foo", "FOO"] {
+        let hits = store
+            .search(&SearchQuery {
+                tags: Some(vec![query.to_string()]),
+                limit: 10,
+                page: 1,
+                ..SearchQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.total, 2,
+            "tag filter {query:?} folds and matches both engrams"
+        );
+    }
+
+    // The metadata_filters `tags` arm folds identically, for both $eq and $in,
+    // so a mixed-case value still hits the lowercase-interned tag.
+    for wire in [
+        serde_json::json!({ "tags": { "$eq": "Foo" } }),
+        serde_json::json!({ "tags": { "$in": ["FOO"] } }),
+    ] {
+        let filters = crystalline_index::parse_metadata_filters(&wire).unwrap();
+        let hits = store
+            .search(&SearchQuery {
+                metadata_filters: filters,
+                limit: 10,
+                page: 1,
+                ..SearchQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.total, 2,
+            "metadata tags filter {wire} folds and matches both engrams"
+        );
+    }
+}
+parity!(tag_identity_folds_case, tag_identity_folds);
+
+async fn engrams_with_tag_finds_both_places(store: &dyn Store) {
+    // Alpha carries `topic` on its frontmatter, Beta only on an observation,
+    // Gamma (a second domain) carries a different-cased `Topic` on frontmatter,
+    // and Delta carries no such tag. The lookup finds all three tagged engrams
+    // (folded), ordered by domain then path, and the domain filter scopes it.
+    let eng = tempfile::tempdir().unwrap();
+    write(
+        eng.path(),
+        "alpha.md",
+        "---\ntype: engram\ntitle: Alpha\npermalink: alpha\ntags:\n  - topic\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nbody\n",
+    );
+    write(
+        eng.path(),
+        "beta.md",
+        "---\ntype: engram\ntitle: Beta\npermalink: beta\ntags:\n  - other\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Beta\n\n- [decision] tagged here #topic\n",
+    );
+    write(
+        eng.path(),
+        "delta.md",
+        "---\ntype: engram\ntitle: Delta\npermalink: delta\ntags:\n  - other\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nbody\n",
+    );
+    sync_domain(store, "eng", eng.path()).await.unwrap();
+
+    let ops = tempfile::tempdir().unwrap();
+    write(
+        ops.path(),
+        "gamma.md",
+        "---\ntype: engram\ntitle: Gamma\npermalink: gamma\ntags:\n  - Topic\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nbody\n",
+    );
+    sync_domain(store, "ops", ops.path()).await.unwrap();
+
+    // All domains: three engrams carry the folded `topic`, ordered by domain
+    // then path (eng/alpha, eng/beta, ops/gamma).
+    let all = store.engrams_with_tag("topic", None).await.unwrap();
+    let shape: Vec<(&str, &str)> = all
+        .iter()
+        .map(|d| (d.domain.as_str(), d.permalink.as_str()))
+        .collect();
+    assert_eq!(
+        shape,
+        vec![("eng", "alpha"), ("eng", "beta"), ("ops", "gamma")],
+        "found on frontmatter and observations, both cases, ordered by domain then path"
+    );
+
+    // A mixed-case query folds identically.
+    let upper = store.engrams_with_tag("Topic", None).await.unwrap();
+    assert_eq!(upper.len(), 3, "the query tag folds too");
+
+    // The domain filter scopes the result to one domain.
+    let scoped = store.engrams_with_tag("topic", Some("ops")).await.unwrap();
+    let scoped_shape: Vec<&str> = scoped.iter().map(|d| d.permalink.as_str()).collect();
+    assert_eq!(scoped_shape, vec!["gamma"]);
+}
+parity!(
+    engrams_with_tag_finds_frontmatter_and_observations,
+    engrams_with_tag_finds_both_places
+);
 
 async fn wipe_clears(store: &dyn Store) {
     let dir = tempfile::tempdir().unwrap();

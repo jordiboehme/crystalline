@@ -46,6 +46,16 @@ pub const MIGRATIONS: &[Migration] = &[
         label: "title-lower expression index",
         sql: SCHEMA_V4,
     },
+    Migration {
+        version: 5,
+        label: "link unresolved partial index",
+        sql: SCHEMA_V5,
+    },
+    Migration {
+        version: 6,
+        label: "case-folded tag identity",
+        sql: SCHEMA_V6,
+    },
 ];
 
 // The whole current schema in one step. The temporal columns stay TEXT ISO
@@ -197,6 +207,51 @@ CREATE TABLE domain_lock (
 // untouched and only gain the index.
 const SCHEMA_V4: &str = r#"
 CREATE INDEX idx_engram_title_lower ON engram(domain_id, lower(title));
+"#;
+
+// The Postgres twin of Turso's v6. Prose wikilinks now resolve into the graph,
+// so the batch resolver scans the `link` table for unresolved rows the same way
+// the relation resolver scans `relation`. The partial index mirrors
+// `idx_relation_unresolved` so each resolve pass seeks the pending links for a
+// domain instead of scanning the whole table. Index-only, so no resync.
+const SCHEMA_V5: &str = r#"
+CREATE INDEX idx_link_unresolved ON link(domain_id, to_target) WHERE to_id IS NULL;
+"#;
+
+// The Postgres twin of Turso's v7: case-folded tag identity. Tag identity is now
+// case-folded at intern time, so `Foo` and `foo` share one tag row. A database
+// written before the fold can still hold case-duplicate rows; this migration
+// merges them. Repoint every join row onto the lowest id per folded name, drop
+// the join rows that still point at a duplicate, drop the duplicate tag rows and
+// lowercase the survivors. The `ON CONFLICT DO NOTHING` step materializes the
+// min-id form of each join row and silently absorbs the primary-key collision
+// when one engram already carried both cases of a tag. Postgres `lower()` folds
+// ASCII (and more), which is a superset of what verify E007 admits, so a
+// canonical tag folds identically to Turso. Every join row ends on a surviving
+// id, so no foreign key is left dangling.
+const SCHEMA_V6: &str = r#"
+INSERT INTO engram_tag(engram_id, tag_id)
+SELECT et.engram_id, m.min_id
+FROM engram_tag et
+JOIN tag t ON t.id = et.tag_id
+JOIN (SELECT lower(name) AS lname, MIN(id) AS min_id FROM tag GROUP BY lower(name)) m
+  ON m.lname = lower(t.name)
+ON CONFLICT DO NOTHING;
+
+INSERT INTO observation_tag(observation_id, tag_id)
+SELECT ot.observation_id, m.min_id
+FROM observation_tag ot
+JOIN tag t ON t.id = ot.tag_id
+JOIN (SELECT lower(name) AS lname, MIN(id) AS min_id FROM tag GROUP BY lower(name)) m
+  ON m.lname = lower(t.name)
+ON CONFLICT DO NOTHING;
+
+DELETE FROM engram_tag WHERE tag_id NOT IN (SELECT MIN(id) FROM tag GROUP BY lower(name));
+DELETE FROM observation_tag WHERE tag_id NOT IN (SELECT MIN(id) FROM tag GROUP BY lower(name));
+
+DELETE FROM tag WHERE id NOT IN (SELECT MIN(id) FROM tag GROUP BY lower(name));
+
+UPDATE tag SET name = lower(name);
 "#;
 
 /// The tables cleared by `wipe()`, child rows first so the enforced foreign

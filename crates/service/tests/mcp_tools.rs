@@ -129,6 +129,7 @@ async fn list_tools_exposes_the_core_tools_plus_configure_and_add_domain() {
         "browse_domain",
         "validate_engrams",
         "infer_schema",
+        "vocabulary",
         "configure",
         "add_domain",
     ] {
@@ -145,7 +146,7 @@ async fn list_tools_exposes_the_core_tools_plus_configure_and_add_domain() {
             "{hidden} must be hidden while github.enabled is off: {names:?}"
         );
     }
-    assert_eq!(names.len(), 14, "exactly 14 tools: {names:?}");
+    assert_eq!(names.len(), 15, "exactly 15 tools: {names:?}");
 }
 
 /// The `configure` tool's `set` and `unset` inputs must advertise the plain
@@ -200,7 +201,7 @@ async fn read_only_hides_the_write_gated_tools() {
             "{hidden} must be hidden in read-only mode: {names:?}"
         );
     }
-    // The eight read tools remain.
+    // The nine read tools remain.
     for expected in [
         "read_engram",
         "search_engrams",
@@ -210,6 +211,7 @@ async fn read_only_hides_the_write_gated_tools() {
         "browse_domain",
         "validate_engrams",
         "infer_schema",
+        "vocabulary",
     ] {
         assert!(names.contains(&expected.to_string()), "missing {expected}");
     }
@@ -228,7 +230,7 @@ async fn read_only_hides_the_write_gated_tools() {
             "{hidden} must be hidden read-only: {names:?}"
         );
     }
-    assert_eq!(names.len(), 8, "exactly 8 tools in read-only: {names:?}");
+    assert_eq!(names.len(), 9, "exactly 9 tools in read-only: {names:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -546,6 +548,8 @@ async fn search_filter_only_and_text_fallback() {
     let hits = out["hits"].as_array().unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0]["permalink"], json!("gadget"));
+    // Every hit teaches the querying agent the engram's vocabulary.
+    assert_eq!(hits[0]["tags"], json!(["software"]));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -652,6 +656,237 @@ async fn build_context_glob_and_relations() {
         .await
         .unwrap_err();
     assert!(err.contains("crystalline://"), "{err}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn build_context_follows_prose_wikilinks() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    // A pair joined ONLY by a prose wikilink: no `- rel_type [[...]]` bullet
+    // anywhere, so the sole edge between them is a resolved link.
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Target", "content": "the target body" }),
+    )
+    .await
+    .unwrap();
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Linker", "content": "see [[Target]] for the details" }),
+    )
+    .await
+    .unwrap();
+
+    let out = call(
+        peer,
+        "build_context",
+        json!({ "anchor": "crystalline://eng/linker", "depth": 1 }),
+    )
+    .await
+    .unwrap();
+    let perms: Vec<&str> = out["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["permalink"].as_str().unwrap())
+        .collect();
+    assert!(
+        perms.contains(&"target"),
+        "prose link reaches Target: {perms:?}"
+    );
+    let edges = out["edges"].as_array().unwrap();
+    assert!(
+        edges
+            .iter()
+            .any(|e| e["kind"] == "link" && e["rel_type"] == "links_to"),
+        "a links_to edge is present: {edges:?}"
+    );
+}
+
+/// read_engram enriches its response with per-reference resolution: relations
+/// and prose links each carry a `resolved` flag, a resolving reference sets it
+/// true and a dangling one false. A resolving outbound reference also earns the
+/// build_context `related` hint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn read_engram_reports_reference_resolution() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    // A present target, then a source whose two relations and two prose links mix
+    // resolving and dangling references, including a cross-domain link into a
+    // domain that is not registered.
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Target", "content": "the target body" }),
+    )
+    .await
+    .unwrap();
+    call(
+        peer,
+        "write_engram",
+        json!({
+            "domain": "eng",
+            "title": "Source",
+            "content": "Prose mentions [[Target]] and [[other:Ghost]] here.\n\n- depends_on [[Target]]\n- blocks [[Missing]]",
+        }),
+    )
+    .await
+    .unwrap();
+
+    let out = call(
+        peer,
+        "read_engram",
+        json!({ "identifier": "source", "domain": "eng" }),
+    )
+    .await
+    .unwrap();
+
+    // Relations gained a resolved flag, keyed by relation type.
+    let relations = out["relations"].as_array().unwrap();
+    let depends = relations
+        .iter()
+        .find(|r| r["rel_type"] == json!("depends_on"))
+        .expect("depends_on relation present");
+    assert_eq!(
+        depends["resolved"],
+        json!(true),
+        "resolving relation: {out}"
+    );
+    assert_eq!(depends["target"]["target"], json!("Target"));
+    let blocks = relations
+        .iter()
+        .find(|r| r["rel_type"] == json!("blocks"))
+        .expect("blocks relation present");
+    assert_eq!(blocks["resolved"], json!(false), "dangling relation: {out}");
+
+    // The new links array carries the same flag for prose wikilinks.
+    let links = out["links"].as_array().unwrap();
+    let to_target = links
+        .iter()
+        .find(|l| l["target"]["target"] == json!("Target"))
+        .expect("prose link to Target present");
+    assert_eq!(to_target["resolved"], json!(true), "resolving link: {out}");
+    let cross = links
+        .iter()
+        .find(|l| l["target"]["target"] == json!("Ghost"))
+        .expect("cross-domain prose link present");
+    assert_eq!(cross["target"]["domain"], json!("other"));
+    assert_eq!(
+        cross["resolved"],
+        json!(false),
+        "dangling cross-domain link: {out}"
+    );
+
+    // Nothing points at Source, so no inbound summary is emitted.
+    assert!(out.get("inbound").is_none(), "no inbound expected: {out}");
+    // But resolving outbound references earn the build_context hint.
+    let related = out["related"].as_str().expect("related hint present");
+    assert!(
+        related.contains("build_context"),
+        "related names build_context: {related}"
+    );
+}
+
+/// The inbound summary counts every reference pointing at an engram and samples
+/// at most five of them, so a heavily linked engram stays compact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn read_engram_inbound_summary_is_capped() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Hub", "content": "the hub body" }),
+    )
+    .await
+    .unwrap();
+    // Seven distinct engrams each point at Hub with a relation.
+    for i in 0..7 {
+        call(
+            peer,
+            "write_engram",
+            json!({
+                "domain": "eng",
+                "title": format!("Linker {i}"),
+                "content": "- cites [[Hub]]",
+            }),
+        )
+        .await
+        .unwrap();
+    }
+
+    let out = call(
+        peer,
+        "read_engram",
+        json!({ "identifier": "hub", "domain": "eng" }),
+    )
+    .await
+    .unwrap();
+    let inbound = &out["inbound"];
+    assert_eq!(
+        inbound["count"],
+        json!(7),
+        "all seven linkers counted: {out}"
+    );
+    let refs = inbound["refs"].as_array().unwrap();
+    assert_eq!(refs.len(), 5, "the sample is capped at five: {out}");
+    for r in refs {
+        assert_eq!(r["domain"], json!("eng"));
+        assert!(r["path"].as_str().is_some(), "each ref names a path: {r}");
+        assert_eq!(
+            r["kind"],
+            json!("relation"),
+            "kind serializes lowercase: {r}"
+        );
+    }
+}
+
+/// read_engram on an isolated engram - nothing points in, and its one outbound
+/// reference dangles - omits both the inbound summary and the related hint. The
+/// related hint gates on resolved outbound references, not their mere presence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn read_engram_isolated_omits_inbound_and_related() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    // A lone engram whose single relation points at a target that does not
+    // exist: an unresolved outbound reference, and nothing links back.
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Lonely", "content": "- needs [[Nonexistent]]" }),
+    )
+    .await
+    .unwrap();
+
+    let out = call(
+        peer,
+        "read_engram",
+        json!({ "identifier": "lonely", "domain": "eng" }),
+    )
+    .await
+    .unwrap();
+
+    assert!(out.get("inbound").is_none(), "no inbound expected: {out}");
+    assert!(
+        out.get("related").is_none(),
+        "no related hint without a resolved outbound reference: {out}"
+    );
+    // The dangling relation is still reported, flagged unresolved.
+    assert_eq!(
+        out["relations"][0]["resolved"],
+        json!(false),
+        "the dangling relation is unresolved: {out}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -767,6 +1002,124 @@ async fn validate_and_infer_schema() {
     .unwrap();
     assert_eq!(inferred["type"], json!("note"));
     assert!(inferred["count"].as_u64().unwrap() >= 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn vocabulary_lists_tags_categories_and_relation_types() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    call(
+        peer,
+        "write_engram",
+        json!({
+            "domain": "eng",
+            "title": "Alpha",
+            // `legacy` is a frontmatter-only tag and `urgent` an observation-only
+            // tag, so their engram and observation counts are unequal and a
+            // swapped assignment in the backend would be caught below.
+            "tags": ["database", "api", "legacy"],
+            "content": "- [decision] chose postgres #database\n\n- [pattern] api uses rest #api #urgent\n\n- depends_on [[Beta]]",
+        }),
+    )
+    .await
+    .unwrap();
+    call(
+        peer,
+        "write_engram",
+        json!({
+            "domain": "eng",
+            "title": "Beta",
+            "tags": ["database"],
+            "content": "- [decision] indexed the table #database",
+        }),
+    )
+    .await
+    .unwrap();
+
+    // Scoped to the domain: the response echoes the domain and each tag carries
+    // both its engram and its observation usage count.
+    let vocab = call(peer, "vocabulary", json!({ "domain": "eng" }))
+        .await
+        .unwrap();
+    assert_eq!(vocab["domain"], json!("eng"));
+    let tags = vocab["tags"].as_array().unwrap();
+    // `database` tags two engrams and two observations, so it leads the list.
+    assert_eq!(
+        tags[0]["name"],
+        json!("database"),
+        "most-used tag first: {vocab}"
+    );
+    assert_eq!(
+        tags[0]["engrams"],
+        json!(2),
+        "database tags two engrams: {vocab}"
+    );
+    assert_eq!(
+        tags[0]["observations"],
+        json!(2),
+        "database tags two observations: {vocab}"
+    );
+    // Unequal-count tags guard the engram-vs-observation aggregation against a
+    // swap: `legacy` is frontmatter-only, `urgent` observation-only.
+    let legacy = tags
+        .iter()
+        .find(|t| t["name"] == json!("legacy"))
+        .expect("legacy tag present");
+    assert_eq!(
+        legacy["engrams"],
+        json!(1),
+        "legacy tags one engram: {vocab}"
+    );
+    assert_eq!(
+        legacy["observations"],
+        json!(0),
+        "legacy is frontmatter-only: {vocab}"
+    );
+    let urgent = tags
+        .iter()
+        .find(|t| t["name"] == json!("urgent"))
+        .expect("urgent tag present");
+    assert_eq!(
+        urgent["engrams"],
+        json!(0),
+        "urgent is observation-only: {vocab}"
+    );
+    assert_eq!(
+        urgent["observations"],
+        json!(1),
+        "urgent tags one observation: {vocab}"
+    );
+
+    let categories: Vec<&str> = vocab["categories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c["name"].as_str())
+        .collect();
+    assert!(
+        categories.contains(&"decision") && categories.contains(&"pattern"),
+        "observation categories are listed: {vocab}"
+    );
+    let rels: Vec<&str> = vocab["relation_types"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["name"].as_str())
+        .collect();
+    assert!(
+        rels.contains(&"depends_on"),
+        "relation types are listed: {vocab}"
+    );
+
+    // Omitting the domain is an all-domain sweep, which echoes a null domain.
+    let all = call(peer, "vocabulary", json!({})).await.unwrap();
+    assert_eq!(
+        all["domain"],
+        Value::Null,
+        "an all-domain sweep reports a null domain: {all}"
+    );
 }
 
 /// Models routinely double-encode nested tool arguments: a `metadata`
@@ -1077,7 +1430,7 @@ type AnnotationRow = (
     Option<bool>,
 );
 
-const EXPECTED_ANNOTATIONS: [AnnotationRow; 18] = [
+const EXPECTED_ANNOTATIONS: [AnnotationRow; 19] = [
     (
         "write_engram",
         "Capture engram",
@@ -1175,6 +1528,14 @@ const EXPECTED_ANNOTATIONS: [AnnotationRow; 18] = [
         Some(false),
     ),
     (
+        "vocabulary",
+        "Vocabulary in use",
+        Some(true),
+        None,
+        None,
+        Some(false),
+    ),
+    (
         "configure",
         "Configure Crystalline",
         Some(false),
@@ -1225,7 +1586,7 @@ const EXPECTED_ANNOTATIONS: [AnnotationRow; 18] = [
 ];
 
 /// A GitHub-enabled server with no domains, built solely to inspect the tool
-/// surface and its annotations. GitHub on plus read-write makes all 18 tools
+/// surface and its annotations. GitHub on plus read-write makes all 19 tools
 /// visible through `get_tool`; read-only narrows it to the read tools plus
 /// `update_domain` and `origin_status`.
 async fn annotation_server(read_only: bool) -> McpServer {
@@ -1245,7 +1606,7 @@ async fn annotation_server(read_only: bool) -> McpServer {
 
 /// Every tool advertises exactly the title and the four annotation hints from
 /// the locked table, and never the annotation-level title (only the top-level
-/// `Tool.title`). GitHub is enabled and the engine read-write so all 18 tools
+/// `Tool.title`). GitHub is enabled and the engine read-write so all 19 tools
 /// are visible.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tool_annotations_match_the_locked_table() {
@@ -1818,9 +2179,9 @@ fn assert_conservative(schema: &Value, context: &str) {
     }
 }
 
-/// Every one of the 18 tools in `EXPECTED_ANNOTATIONS` advertises an input
+/// Every one of the 19 tools in `EXPECTED_ANNOTATIONS` advertises an input
 /// schema that passes the naive conservative-shape sweep, both on the
-/// read-write server where all 18 are visible and on the read-only one where
+/// read-write server where all 19 are visible and on the read-only one where
 /// only a subset resolves through `get_tool`. Also locks down the two
 /// type-less `serde_json::Value` params in this codebase to their documented
 /// object shape.

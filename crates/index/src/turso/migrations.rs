@@ -47,6 +47,16 @@ pub const MIGRATIONS: &[Migration] = &[
         label: "title-lower expression index",
         sql: SCHEMA_V5,
     },
+    Migration {
+        version: 6,
+        label: "link unresolved partial index",
+        sql: SCHEMA_V6,
+    },
+    Migration {
+        version: 7,
+        label: "case-folded tag identity",
+        sql: SCHEMA_V7,
+    },
 ];
 
 const SCHEMA_V1: &str = r#"
@@ -216,6 +226,49 @@ const SCHEMA_V5: &str = r#"
 CREATE INDEX idx_engram_title_lower ON engram(domain_id, lower(title));
 "#;
 
+// Prose wikilinks now resolve into the graph, so the batch resolver scans the
+// `link` table for unresolved rows the same way the relation resolver scans
+// `relation`. The partial index mirrors `idx_relation_unresolved` (the v1
+// precedent) so each resolve pass seeks the pending links for a domain instead
+// of scanning the whole table. Index-only, so no resync is required.
+const SCHEMA_V6: &str = r#"
+CREATE INDEX idx_link_unresolved ON link(domain_id, to_target) WHERE to_id IS NULL;
+"#;
+
+// Tag identity is now case-folded at intern time, so `Foo` and `foo` share one
+// tag row. A database written before the fold can still hold case-duplicate
+// rows; this migration merges them. Repoint every join row onto the lowest id
+// per folded name, drop the join rows that still point at a duplicate, drop the
+// duplicate tag rows and lowercase the survivors. The `INSERT OR IGNORE` step
+// materializes the min-id form of each join row and silently absorbs the
+// primary-key collision when one engram already carried both cases of a tag.
+// SQLite `lower()` is ASCII-only; that is accepted because verify E007
+// restricts a canonical tag to lowercase ASCII with hyphens, so a non-ASCII tag
+// is already off-spec and folds to itself here. Every join row ends on a
+// surviving id, so no foreign key is left dangling.
+const SCHEMA_V7: &str = r#"
+INSERT OR IGNORE INTO engram_tag(engram_id, tag_id)
+SELECT et.engram_id, m.min_id
+FROM engram_tag et
+JOIN tag t ON t.id = et.tag_id
+JOIN (SELECT lower(name) AS lname, MIN(id) AS min_id FROM tag GROUP BY lower(name)) m
+  ON m.lname = lower(t.name);
+
+INSERT OR IGNORE INTO observation_tag(observation_id, tag_id)
+SELECT ot.observation_id, m.min_id
+FROM observation_tag ot
+JOIN tag t ON t.id = ot.tag_id
+JOIN (SELECT lower(name) AS lname, MIN(id) AS min_id FROM tag GROUP BY lower(name)) m
+  ON m.lname = lower(t.name);
+
+DELETE FROM engram_tag WHERE tag_id NOT IN (SELECT MIN(id) FROM tag GROUP BY lower(name));
+DELETE FROM observation_tag WHERE tag_id NOT IN (SELECT MIN(id) FROM tag GROUP BY lower(name));
+
+DELETE FROM tag WHERE id NOT IN (SELECT MIN(id) FROM tag GROUP BY lower(name));
+
+UPDATE tag SET name = lower(name);
+"#;
+
 /// The tables cleared by `wipe()`, child rows first. `domain_lock` references
 /// `domain(id)`, so it is cleared before `domain`.
 pub const WIPE_TABLES: &[&str] = &[
@@ -276,5 +329,150 @@ async fn current_version(conn: &Connection) -> Result<i64> {
             .and_then(|v| v.as_integer().copied())
             .unwrap_or(0)),
         None => Ok(0),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use turso::Builder;
+
+    async fn scalar(conn: &Connection, sql: &str) -> i64 {
+        let mut rows = conn.query(sql, ()).await.unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        row.get_value(0)
+            .ok()
+            .and_then(|v| v.as_integer().copied())
+            .unwrap_or(0)
+    }
+
+    async fn names(conn: &Connection) -> Vec<String> {
+        let mut rows = conn
+            .query("SELECT name FROM tag ORDER BY id", ())
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        while let Some(r) = rows.next().await.unwrap() {
+            if let Ok(turso::Value::Text(s)) = r.get_value(0) {
+                out.push(s);
+            }
+        }
+        out
+    }
+
+    /// Proves the v7 case-fold migration against a real turso connection: apply
+    /// migrations through v6, plant case-duplicate tag rows (including a
+    /// join-row primary-key collision an engram that carries both cases would
+    /// produce), run the v7 SQL and assert the duplicates merged onto the
+    /// lowest id per folded name with every surviving name lowercased and no
+    /// dangling join row. Runs v7 a second time to prove idempotence.
+    #[tokio::test]
+    async fn v7_folds_and_merges_case_duplicate_tags() {
+        let db = Builder::new_local(":memory:").build().await.unwrap();
+        let conn = db.connect().unwrap();
+
+        // Schema through v6 (the six migrations before the fold).
+        for m in &MIGRATIONS[..6] {
+            conn.execute_batch(m.sql).await.unwrap();
+        }
+        assert_eq!(MIGRATIONS[6].version, 7, "the seventh migration is v7");
+
+        // Case-duplicate tag rows: `Foo`/`foo` fold to id 1, `Bar`/`bar` to id 3.
+        // Join rows include a primary-key collision pair on each folded tag
+        // (engram 5 carries both cases of foo; engram 7 both cases of bar; the
+        // same for observation 9) plus single-case rows that must be repointed.
+        conn.execute_batch(
+            r#"
+            INSERT INTO tag(id, name) VALUES (1,'Foo'),(2,'foo'),(3,'Bar'),(4,'bar');
+            INSERT INTO engram_tag(engram_id, tag_id) VALUES (5,1),(5,2),(6,2),(7,3),(7,4),(8,4);
+            INSERT INTO observation_tag(observation_id, tag_id) VALUES (9,1),(9,2),(10,4);
+            "#,
+        )
+        .await
+        .unwrap();
+
+        conn.execute_batch(SCHEMA_V7).await.unwrap();
+
+        // One tag row per folded name, both lowercase, min ids kept.
+        assert_eq!(
+            names(&conn).await,
+            vec!["foo".to_string(), "bar".to_string()]
+        );
+        assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM tag").await, 2);
+        assert_eq!(
+            scalar(&conn, "SELECT COUNT(*) FROM tag WHERE name <> lower(name)").await,
+            0,
+            "every surviving tag name is lowercase"
+        );
+
+        // Join rows are repointed onto the min ids with the collision absorbed:
+        // engram 5 keeps a single (5,1), engram 6 becomes (6,1), engram 7 keeps
+        // (7,3), engram 8 becomes (8,3).
+        assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM engram_tag").await, 4);
+        assert_eq!(
+            scalar(
+                &conn,
+                "SELECT COUNT(*) FROM engram_tag WHERE tag_id NOT IN (1,3)"
+            )
+            .await,
+            0,
+            "no join row points at a merged-away duplicate id"
+        );
+        assert_eq!(
+            scalar(
+                &conn,
+                "SELECT COUNT(*) FROM engram_tag WHERE engram_id=5 AND tag_id=1"
+            )
+            .await,
+            1,
+            "the collision pair collapsed onto the single min-id row"
+        );
+        assert_eq!(
+            scalar(
+                &conn,
+                "SELECT COUNT(*) FROM engram_tag WHERE engram_id=6 AND tag_id=1"
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            scalar(
+                &conn,
+                "SELECT COUNT(*) FROM engram_tag WHERE tag_id NOT IN (SELECT id FROM tag)"
+            )
+            .await,
+            0,
+            "no engram_tag row dangles"
+        );
+
+        // Observation join rows fold the same way: (9,1)/(9,2) collapse to
+        // (9,1) and (10,4) repoints to (10,3).
+        assert_eq!(
+            scalar(&conn, "SELECT COUNT(*) FROM observation_tag").await,
+            2
+        );
+        assert_eq!(
+            scalar(
+                &conn,
+                "SELECT COUNT(*) FROM observation_tag WHERE tag_id NOT IN (SELECT id FROM tag)"
+            )
+            .await,
+            0,
+            "no observation_tag row dangles"
+        );
+
+        // Idempotence: re-running the migration on the merged database changes
+        // nothing.
+        conn.execute_batch(SCHEMA_V7).await.unwrap();
+        assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM tag").await, 2);
+        assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM engram_tag").await, 4);
+        assert_eq!(
+            scalar(&conn, "SELECT COUNT(*) FROM observation_tag").await,
+            2
+        );
+        assert_eq!(
+            names(&conn).await,
+            vec!["foo".to_string(), "bar".to_string()]
+        );
     }
 }

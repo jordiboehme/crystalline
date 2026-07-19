@@ -85,6 +85,9 @@ pub struct SyncReport {
     pub failed: Vec<(String, String)>,
     /// Forward references resolved at the end of this sync.
     pub relations_resolved: u64,
+    /// Prose wikilinks resolved at the end of this sync.
+    #[serde(default)]
+    pub links_resolved: u64,
     /// Wall-clock duration in milliseconds.
     pub duration_ms: u64,
 }
@@ -503,6 +506,15 @@ pub async fn apply_scan<S: Store + ?Sized>(
         }
     };
     report.relations_resolved = resolved;
+
+    let links_resolved = match store.resolve_pending_links(domain).await {
+        Ok(n) => n,
+        Err(e) => {
+            let _ = store.rollback().await;
+            return Err(e);
+        }
+    };
+    report.links_resolved = links_resolved;
 
     let now = chrono::Utc::now().to_rfc3339();
     if let Err(e) = store.record_sync(domain, &now).await {

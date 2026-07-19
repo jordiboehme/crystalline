@@ -196,18 +196,21 @@ The other half of what `crystalline install` wires: a `Stop` hook running `cryst
 
 ## Teach and learn
 
-The MCP server exposes 14 tools, 18 once team domains are turned on (see [Share knowledge with a team](#share-knowledge-with-a-team)); capturing knowledge as a byproduct of work is the core loop:
+The MCP server exposes 15 tools, 19 once team domains are turned on (see [Share knowledge with a team](#share-knowledge-with-a-team)); capturing knowledge as a byproduct of work is the core loop:
 
 - **`write_engram`** - capture a new engram. `domain` is always required (there is no default domain for writes, so an agent never writes into the wrong place). `permalink`, `status` and `recorded_at` are filled in for you.
 - **`search_engrams`** - search before writing, and search to recall what is already known. Defaults to hybrid text-plus-semantic ranking across every domain; pass `domains` to narrow it, or filter by `type`, `tags`, `status` or arbitrary `metadata_filters` with no query text at all.
 - **`edit_engram`** - refine an engram in place (`append`, `prepend`, `find_replace`, `replace_section`, `insert_before_section`, `insert_after_section`) instead of creating a duplicate for the same topic.
 - **`build_context`** - given a `crystalline://domain/permalink` anchor, follow its relations and links (across domains too) to assemble the neighbourhood around a task before diving in.
+- **`vocabulary`** - list the tags, observation categories and relation types already in use, with counts, and reuse an existing term before coining a near-duplicate.
 
 Observations are the atomic unit of an engram's body: top-level bullets like `- [decision] we chose Postgres for the write path #database`. Categories are free text; useful ones include `decision`, `fact`, `pattern`, `gotcha`, `convention`, `lesson`, `risk` and `idea`. Relations connect engrams: `- depends_on [[Other Engram]]`, or `- "relates to" [[Other Engram]]` for a multi-word relation type.
 
 Temporal fields are plain and easy to get wrong by overthinking them: an absent `valid_from` means the engram has always been valid, an absent `valid_to` means it is valid forever. When set, the fields are plain ISO dates (YYYY-MM-DD) at day granularity, and the write drops a sentinel far-future value outright, since absence already means forever. Set them only when a fact is genuinely time-bounded (a policy that changes on a known date, a temporary workaround). `status` and `type` have recommended value sets stated in the tool descriptions themselves (status: `current`, `draft`, `idea`, `deprecated`, `superseded`, and so on; type: `engram`, `guide`, `decision`, `architecture`, `runbook`, `reference`) - they exist so an agent can tell an idea apart from current fact, and they are guidance, never a global enum a write is rejected for.
 
-The CLI mirrors the mutating and read tools directly for scripting and quick edits outside an agent session: `crystalline write`, `read`, `edit`, `move`, `delete`, `search`, `context` and `recent` take the same parameters as their MCP counterparts.
+The CLI mirrors the mutating and read tools directly for scripting and quick edits outside an agent session: `crystalline write`, `read`, `edit`, `move`, `delete`, `search`, `context`, `recent` and `vocabulary` take the same parameters as their MCP counterparts.
+
+Tag identity is case-folded, so `Foo` and `foo` are the same tag; the files keep whatever case you wrote. For the rest of tag drift - a separator swap, a plural, a typo - `crystalline vocabulary` and `crystalline doctor` surface near-duplicate tag clusters, and two CLI-only commands consolidate them. `crystalline tags rename <old> <new>` renames a tag across every engram that carries it; `crystalline tags merge <old> <into>` folds one tag into an existing one, dropping duplicates. Both rewrite the affected files surgically - only the tag tokens change, every other byte is preserved - and both preview the affected engrams first, then ask before writing (pass `--yes` to skip the prompt, `--dry-run` to stop at the preview, `--domain` to scope it). They live on the CLI by design, not as an MCP tool: a bulk file rewrite is a deliberate maintenance step, not something an agent reaches for mid-task.
 
 ## Skills
 

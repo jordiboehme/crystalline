@@ -79,6 +79,14 @@ enum Command {
         #[command(subcommand)]
         command: DomainCommand,
     },
+    /// Rename or merge a tag across every engram that carries it. The affected
+    /// files are rewritten in place, surgically: only the tag tokens change,
+    /// every other byte is kept. CLI-only by design; there is no MCP tool for
+    /// it.
+    Tags {
+        #[command(subcommand)]
+        command: TagsCommand,
+    },
     /// Connect this machine to GitHub, for sharing and updating team domains.
     Connect {
         #[command(subcommand)]
@@ -475,6 +483,15 @@ enum Command {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// List the tags, observation categories and relation types in use.
+    Vocabulary {
+        /// Restrict to one domain. Omit for a vocabulary across every domain.
+        #[arg(long)]
+        domain: Option<String>,
+        /// Load the global config from this file instead of the default path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
     /// Respond to a harness lifecycle hook event over stdin/stdout. Plumbing
     /// for `crystalline install`'s generated hook wiring, not something a
     /// person runs by hand - documented here so anyone who finds it in a
@@ -687,6 +704,52 @@ enum DomainCommand {
     Remove {
         /// The domain name to remove.
         name: String,
+        /// Load the global config from this file instead of the default path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum TagsCommand {
+    /// Rename a tag to a new name across every engram that carries it. Refuses
+    /// when the new name already exists (that would merge two tags); use `tags
+    /// merge` for that.
+    Rename {
+        /// The tag to rename.
+        old: String,
+        /// The new tag name (lowercase-with-hyphens).
+        new: String,
+        /// Restrict to one domain instead of every domain.
+        #[arg(long)]
+        domain: Option<String>,
+        /// Skip the confirmation prompt and rewrite the files.
+        #[arg(long)]
+        yes: bool,
+        /// Report the affected engrams without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Load the global config from this file instead of the default path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Merge a tag into an existing tag across every engram that carries it,
+    /// dropping duplicates. Refuses when the target tag does not exist yet; use
+    /// `tags rename` for that.
+    Merge {
+        /// The tag to fold away.
+        old: String,
+        /// The existing tag to fold it into.
+        into: String,
+        /// Restrict to one domain instead of every domain.
+        #[arg(long)]
+        domain: Option<String>,
+        /// Skip the confirmation prompt and rewrite the files.
+        #[arg(long)]
+        yes: bool,
+        /// Report the affected engrams without writing anything.
+        #[arg(long)]
+        dry_run: bool,
         /// Load the global config from this file instead of the default path.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -916,6 +979,7 @@ fn main() -> anyhow::Result<()> {
             } => run_prompt(workspace, read_only, config, cli.db, cli.json, format),
         },
         Some(Command::Domain { command }) => run_domain(command, cli.db, cli.json),
+        Some(Command::Tags { command }) => on_runtime(move || run_tags(command, cli.db, cli.json)),
         Some(Command::Connect { command }) => on_runtime(move || run_connect(command, cli.json)),
         Some(Command::Install {
             harness,
@@ -1017,7 +1081,8 @@ fn main() -> anyhow::Result<()> {
             cmd @ (Command::Read { .. }
             | Command::Search { .. }
             | Command::Context { .. }
-            | Command::Recent { .. }),
+            | Command::Recent { .. }
+            | Command::Vocabulary { .. }),
         ) => on_runtime_current_thread(move || run_data(cmd, cli.db, cli.json)),
         Some(cmd @ (Command::Write { .. } | Command::Edit { .. } | Command::Move { .. })) => {
             on_runtime(move || run_data(cmd, cli.db, cli.json))
@@ -1748,6 +1813,9 @@ async fn run_data(command: Command, db: Option<PathBuf>, json: bool) -> anyhow::
             }),
             config,
         ),
+        Command::Vocabulary { domain, config } => {
+            ("vocabulary", json!({ "domain": domain }), config)
+        }
         _ => unreachable!("run_data only handles data commands"),
     };
 
@@ -1769,6 +1837,7 @@ async fn run_data(command: Command, db: Option<PathBuf>, json: bool) -> anyhow::
         "recent_activity" => render::render_recent(&value, &mut out)?,
         "build_context" => render::render_context(&value, &mut out)?,
         "write_engram" => render::render_write(&value, &mut out)?,
+        "vocabulary" => render::render_vocabulary(&value, &mut out)?,
         _ => {
             let text = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
             writeln!(out, "{text}")?;
@@ -1913,6 +1982,134 @@ fn run_domain(command: DomainCommand, db: Option<PathBuf>, json: bool) -> anyhow
         }),
         DomainCommand::Remove { name, config } => {
             on_runtime(move || domain_remove_dispatch(name, config, json))
+        }
+    }
+}
+
+/// `tags rename` / `tags merge`: rewrite a tag across every engram that carries
+/// it. Always previews the affected engrams first (a dry run), then confirms
+/// before writing: `--dry-run` stops after the preview, `--yes` skips the
+/// prompt, an interactive terminal is asked and a non-terminal without `--yes`
+/// refuses rather than hang. `--json` needs a non-interactive mode (`--yes` or
+/// `--dry-run`) since it cannot ask a question.
+async fn run_tags(command: TagsCommand, db: Option<PathBuf>, json: bool) -> anyhow::Result<()> {
+    let (old, new, domain, yes, dry_run, config, merge) = match command {
+        TagsCommand::Rename {
+            old,
+            new,
+            domain,
+            yes,
+            dry_run,
+            config,
+        } => (old, new, domain, yes, dry_run, config, false),
+        TagsCommand::Merge {
+            old,
+            into,
+            domain,
+            yes,
+            dry_run,
+            config,
+        } => (old, into, domain, yes, dry_run, config, true),
+    };
+
+    if json && !dry_run && !yes {
+        anyhow::bail!("--json requires --yes or --dry-run");
+    }
+
+    // Always dry-run first to learn and show the affected engrams.
+    let preview = crystalline_service::tags_retag(
+        &old,
+        &new,
+        domain.as_deref(),
+        merge,
+        true,
+        db.as_deref(),
+        config.as_deref(),
+    )
+    .await?;
+
+    if dry_run {
+        if json {
+            print_value(&preview, true);
+        } else {
+            print_retag_preview(&preview);
+        }
+        return Ok(());
+    }
+
+    if !json {
+        print_retag_preview(&preview);
+    }
+
+    let count = preview
+        .get("rewritten")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+
+    // Confirm before writing when there is something to rewrite.
+    if count > 0 && !yes {
+        if std::io::stdin().is_terminal() {
+            print!("Proceed? [y/N] ");
+            std::io::stdout().flush()?;
+            let mut answer = String::new();
+            std::io::stdin().read_line(&mut answer)?;
+            if !matches!(answer.trim(), "y" | "Y") {
+                println!("aborted");
+                return Ok(());
+            }
+        } else {
+            anyhow::bail!("not a terminal; pass --yes");
+        }
+    }
+
+    let result = crystalline_service::tags_retag(
+        &old,
+        &new,
+        domain.as_deref(),
+        merge,
+        false,
+        db.as_deref(),
+        config.as_deref(),
+    )
+    .await?;
+
+    if json {
+        print_value(&result, true);
+    } else {
+        let n = result
+            .get("rewritten")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let word = if n == 1 { "engram" } else { "engrams" };
+        println!("Rewrote {n} {word}.");
+    }
+    Ok(())
+}
+
+/// Print the affected engrams for a `tags rename` / `tags merge` preview.
+fn print_retag_preview(preview: &serde_json::Value) {
+    use serde_json::Value;
+    let old = preview.get("old").and_then(Value::as_str).unwrap_or("");
+    let new = preview.get("new").and_then(Value::as_str).unwrap_or("");
+    let merge = preview
+        .get("merge")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let verb = if merge { "Merge" } else { "Rename" };
+    let joiner = if merge { "into" } else { "to" };
+    let engrams = preview.get("engrams").and_then(Value::as_array);
+    let n = engrams.map(Vec::len).unwrap_or(0);
+    if n == 0 {
+        println!("{verb} '{old}' {joiner} '{new}': no engrams carry it.");
+        return;
+    }
+    let word = if n == 1 { "engram" } else { "engrams" };
+    println!("{verb} '{old}' {joiner} '{new}' - {n} {word} affected:");
+    if let Some(list) = engrams {
+        for e in list {
+            let d = e.get("domain").and_then(Value::as_str).unwrap_or("");
+            let p = e.get("path").and_then(Value::as_str).unwrap_or("");
+            println!("  {d}  {p}");
         }
     }
 }

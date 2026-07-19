@@ -28,13 +28,14 @@ use crystalline_core::emit::{
 };
 use crystalline_core::schema::{self, Schema};
 use crystalline_core::{
-    CrystallineUrl, Engram, Frontmatter, HarnessKind, Manifest, YamlValue, parse_engram, slugify,
+    CrystallineUrl, Engram, Frontmatter, HarnessKind, LinkTarget, Manifest, YamlValue,
+    is_lower_hyphen, parse_engram, slugify,
 };
 use crystalline_index::{
-    ChunkParams, DomainHost, DomainId, DomainKind, EmbeddingProvider, EngramDescriptor, EngramId,
-    EngramRecord, FileStamp, HostClaim, RecentFilter, SearchMode, SearchQuery, Store, SyncReport,
-    apply_scan, chunk_engram, configured_model_id, order_jobs_for_batching, parse_metadata_filters,
-    provider_from_config, scan_domain, scan_paths,
+    ChunkParams, DomainHost, DomainId, DomainKind, EdgeKind, EmbeddingProvider, EngramDescriptor,
+    EngramId, EngramRecord, FileStamp, HostClaim, RecentFilter, SearchMode, SearchQuery, Store,
+    SyncReport, apply_scan, chunk_engram, configured_model_id, order_jobs_for_batching,
+    parse_metadata_filters, provider_from_config, scan_domain, scan_paths,
 };
 use crystalline_remote::ops;
 use crystalline_remote::{
@@ -1014,6 +1015,7 @@ impl Engine {
             );
             store.replace_chunks(id, &chunks).await?;
             store.resolve_pending_relations(domain_id).await?;
+            store.resolve_pending_links(domain_id).await?;
             Ok::<EngramId, EngineError>(id)
         }
         .await;
@@ -1217,20 +1219,124 @@ impl Engine {
         let content = self.load_content(&source, &desc).await?;
         let engram = parse_engram(&content).map_err(|e| EngineError::Invalid(e.to_string()))?;
         let checksum = sha256_hex(content.as_bytes());
-        Ok(json!({
+
+        // Enrich the response with reference resolution: which outbound links
+        // land, and who points back in. The descriptor carries the ids, so this
+        // works for file, virtual and non-host reads alike.
+        let (outbound, inbound) = {
+            let store = self.store.lock().await;
+            let outbound = store.outbound_refs(desc.id).await?;
+            let inbound = store
+                .inbound_refs(desc.id, desc.domain_id, &desc.permalink, &desc.title)
+                .await?;
+            (outbound, inbound)
+        };
+
+        // A parsed reference resolves when a matching indexed row (same source
+        // line, kind and target) is resolved. An unmatched parsed entry, which a
+        // just-edited or non-host read can produce, is reported as unresolved.
+        let resolves = |kind: EdgeKind, line: usize, target: &LinkTarget| -> bool {
+            outbound.iter().any(|o| {
+                o.kind == kind
+                    && o.line == line
+                    && o.to_target == target.target
+                    && o.to_domain == target.domain
+                    && o.resolved
+            })
+        };
+
+        #[derive(serde::Serialize)]
+        struct RelationOut<'a> {
+            line: usize,
+            rel_type: &'a str,
+            target: &'a LinkTarget,
+            resolved: bool,
+        }
+        #[derive(serde::Serialize)]
+        struct LinkOut<'a> {
+            line: usize,
+            target: &'a LinkTarget,
+            resolved: bool,
+        }
+
+        let relations: Vec<RelationOut> = engram
+            .relations
+            .iter()
+            .map(|r| RelationOut {
+                line: r.line,
+                rel_type: &r.rel_type,
+                target: &r.target,
+                resolved: resolves(EdgeKind::Relation, r.line, &r.target),
+            })
+            .collect();
+        let links: Vec<LinkOut> = engram
+            .links
+            .iter()
+            .map(|l| LinkOut {
+                line: l.line,
+                target: &l.target,
+                resolved: resolves(EdgeKind::Link, l.line, &l.target),
+            })
+            .collect();
+        let resolved_outbound = relations.iter().filter(|r| r.resolved).count()
+            + links.iter().filter(|l| l.resolved).count();
+
+        let url = format!("crystalline://{}/{}", desc.domain, desc.permalink);
+        let mut value = json!({
             "domain": desc.domain,
             "permalink": desc.permalink,
             "title": desc.title,
             "type": desc.engram_type,
             "status": desc.status,
             "path": desc.path,
-            "url": format!("crystalline://{}/{}", desc.domain, desc.permalink),
+            "url": url,
             "content": content,
             "checksum": checksum,
             "frontmatter": engram.frontmatter,
             "observations": engram.observations,
-            "relations": engram.relations,
-        }))
+            "relations": relations,
+            "links": links,
+        });
+        let obj = value
+            .as_object_mut()
+            .expect("read_engram response is a JSON object");
+
+        // Inbound summary: how many references point here, with a small capped
+        // sample so a heavily linked engram never bloats the response. Omitted
+        // entirely when nothing points here.
+        if !inbound.is_empty() {
+            let refs: Vec<Value> = inbound
+                .iter()
+                .take(5)
+                .map(|r| {
+                    json!({
+                        "domain": r.src_domain,
+                        "path": r.src_path,
+                        "kind": match r.kind {
+                            EdgeKind::Relation => "relation",
+                            EdgeKind::Link => "link",
+                        },
+                    })
+                })
+                .collect();
+            obj.insert(
+                "inbound".to_string(),
+                json!({ "count": inbound.len(), "refs": refs }),
+            );
+        }
+
+        // A build_context hint, emitted only when there is a neighbourhood to
+        // explore: something points here, or something here resolves outward.
+        if !inbound.is_empty() || resolved_outbound > 0 {
+            obj.insert(
+                "related".to_string(),
+                json!(format!(
+                    "build_context anchor {url} to explore linked knowledge"
+                )),
+            );
+        }
+
+        Ok(value)
     }
 
     // --- edit ----------------------------------------------------------------
@@ -1555,6 +1661,142 @@ impl Engine {
             "to": { "domain": dest_domain, "path": dest_rel },
             "cross_domain": cross,
             "links_rewritten": rewritten,
+        }))
+    }
+
+    /// Rename a tag to `new`, or (with `merge`) fold it into an existing `new`,
+    /// across every engram that carries it, optionally scoped to one domain.
+    /// Each affected file is rewritten string-surgically by
+    /// [`crystalline_core::retag`]: only the tag tokens change, every other byte
+    /// (including the `timestamp`) is preserved, so a hygiene rename never
+    /// reflows a file or looks like a fresh edit. Files are the source of truth,
+    /// so each rewrite writes the file (or the virtual row) then reindexes it,
+    /// which is where the index picks up the new tag identity.
+    ///
+    /// The two verbs differ only in a precheck: a `rename` refuses when `new`
+    /// already exists (that would silently merge, so it points at `tags merge`),
+    /// and a `merge` refuses when `new` does not exist yet. `dry_run` reports the
+    /// affected engrams without writing anything.
+    pub async fn retag(
+        &self,
+        old: &str,
+        new: &str,
+        domain: Option<&str>,
+        merge: bool,
+        dry_run: bool,
+    ) -> Result<Value> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        let old_f = old.trim().to_lowercase();
+        let new_f = new.trim().to_lowercase();
+        // Only the target name must be a canonical lowercase-with-hyphens tag:
+        // the whole point of a rename or merge is to move a non-canonical `old`
+        // (an underscore or separator variant that the cluster detection flags)
+        // onto a clean name, so `old` only has to be a non-empty folded tag.
+        if old_f.is_empty() {
+            return Err(EngineError::Invalid(
+                "the tag to rename or merge is empty".into(),
+            ));
+        }
+        if !is_lower_hyphen(&new_f) {
+            return Err(EngineError::Invalid(format!(
+                "target tag '{new_f}' is not a lowercase-with-hyphens tag"
+            )));
+        }
+        if old_f == new_f {
+            return Err(EngineError::Invalid(
+                "the old and new tag are the same".into(),
+            ));
+        }
+
+        // Precheck against the vocabulary in scope: a rename must not collide
+        // with an existing tag, a merge must land on one.
+        let new_exists = {
+            let store = self.store.lock().await;
+            let vocab = store.vocabulary(domain).await?;
+            vocab.tags.iter().any(|t| t.name == new_f)
+        };
+        let scope = match domain {
+            Some(d) => format!(" in domain '{d}'"),
+            None => String::new(),
+        };
+        if merge {
+            if !new_exists {
+                return Err(EngineError::NotFound(format!(
+                    "cannot merge into '{new_f}': no engram carries it{scope}"
+                )));
+            }
+        } else if new_exists {
+            return Err(EngineError::Conflict(format!(
+                "tag '{new_f}' already exists{scope}; use `crystalline tags merge` to combine them"
+            )));
+        }
+
+        // The engrams carrying the old tag, ordered by domain then path.
+        let targets = {
+            let store = self.store.lock().await;
+            store.engrams_with_tag(&old_f, domain).await?
+        };
+        let listed: Vec<Value> = targets
+            .iter()
+            .map(|d| json!({ "domain": d.domain, "permalink": d.permalink, "path": d.path }))
+            .collect();
+
+        if dry_run {
+            return Ok(json!({
+                "old": old_f, "new": new_f, "merge": merge, "dry_run": true,
+                "engrams": listed, "rewritten": targets.len(),
+            }));
+        }
+
+        // Rewrite each engram, mirroring move_engram's file-vs-virtual branches.
+        let mut rewritten = 0usize;
+        for desc in &targets {
+            match self.read_source(&desc.domain) {
+                ContentSource::File { root } => {
+                    let abs = join_rel(&root, &desc.path);
+                    let Ok(text) = std::fs::read_to_string(&abs) else {
+                        continue;
+                    };
+                    let Some((edited, _)) = crystalline_core::retag(&text, &old_f, &new_f) else {
+                        continue;
+                    };
+                    write_file(&abs, &edited)?;
+                    let store = self.store.lock().await;
+                    self.reindex_file(&*store, desc.domain_id, &root, &desc.path)
+                        .await?;
+                    rewritten += 1;
+                }
+                ContentSource::Virtual => {
+                    let current = {
+                        let store = self.store.lock().await;
+                        store.engram_content(desc.domain_id, &desc.path).await?
+                    };
+                    let Some(text) = current else { continue };
+                    let Some((edited, _)) = crystalline_core::retag(&text, &old_f, &new_f) else {
+                        continue;
+                    };
+                    let stamp = virtual_stamp(&edited);
+                    let store = self.store.lock().await;
+                    self.index_markdown(
+                        &*store,
+                        desc.domain_id,
+                        &desc.path,
+                        &edited,
+                        stamp,
+                        None,
+                        true,
+                    )
+                    .await?;
+                    rewritten += 1;
+                }
+            }
+        }
+
+        Ok(json!({
+            "old": old_f, "new": new_f, "merge": merge, "dry_run": false,
+            "engrams": listed, "rewritten": rewritten,
         }))
     }
 
@@ -2172,6 +2414,38 @@ impl Engine {
             "threshold": threshold,
             "schema": schema,
         }))
+    }
+
+    // --- vocabulary ----------------------------------------------------------
+
+    /// List the tags, observation categories and relation types already in use,
+    /// each with a usage count, for one domain or across every domain. An unknown
+    /// domain reports empty lists rather than erroring, matching the store
+    /// contract, so an agent can probe a fresh domain safely. `domain` echoes the
+    /// request, `null` for an all-domain sweep.
+    pub async fn vocabulary(&self, p: &VocabularyParams) -> Result<Value> {
+        let store = self.store.lock().await;
+        let vocab = store.vocabulary(p.domain.as_deref()).await?;
+        drop(store);
+        let mut out = json!({
+            "domain": p.domain,
+            "tags": vocab.tags,
+            "categories": vocab.categories,
+            "relation_types": vocab.relation_types,
+        });
+        // Near-duplicate tag clusters, omitted entirely when there are none so a
+        // clean vocabulary stays quiet. They point at tags to consolidate with
+        // `crystalline tags merge`.
+        let clusters = crystalline_index::tag_clusters(&vocab.tags);
+        if !clusters.is_empty()
+            && let Value::Object(map) = &mut out
+        {
+            map.insert(
+                "clusters".to_string(),
+                serde_json::to_value(&clusters).unwrap_or(Value::Null),
+            );
+        }
+        Ok(out)
     }
 
     // --- domain import / export / scaffold -----------------------------------

@@ -13,5 +13,6 @@ Behavior:
 - Narrow question, one domain clearly fits: search_engrams with domains=[that domain].
 - Broad or unclear question: search_engrams without domains is an all-domain sweep.
 - write_engram, edit_engram, move_engram and delete_engram always require an explicit domain; there is no default domain for writes.
+- vocabulary lists tags and categories already in use; check it before inventing a new tag.
 - build_context on a crystalline:// anchor assembles related knowledge around a task.
 - Read a domain's MANIFEST via read_engram only when its routing line above is not enough; list_domains with include_routing=true re-fetches this index mid-session.

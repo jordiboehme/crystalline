@@ -25,8 +25,9 @@ use crate::error::{IndexError, Result};
 use crate::store::{
     ChunkJob, ChunkModelCount, DomainHost, DomainId, DomainKind, DomainStats, EdgeKind,
     EmbeddingCoverage, EmbeddingRow, EngramDescriptor, EngramId, EngramRecord, EngramSummary,
-    FileStamp, FtsMode, GraphSlice, HostClaim, InboundRef, NewChunk, Page, RecentFilter, SearchHit,
-    SearchMode, SearchQuery, Store, StoreInfo, StoredEngram,
+    FileStamp, FtsMode, GraphSlice, HostClaim, InboundRef, NewChunk, OutboundRef, Page,
+    RecentFilter, SearchHit, SearchMode, SearchQuery, Store, StoreInfo, StoredEngram, Vocabulary,
+    build_vocabulary,
 };
 
 /// A Turso-backed store. Open one with [`TursoStore::open`].
@@ -191,9 +192,13 @@ impl TursoStore {
         })
     }
 
-    /// Intern a tag name, returning its id, using the in-process cache.
+    /// Intern a tag name, returning its id, using the in-process cache. Tag
+    /// identity is case-folded: the interned row and every cache key are the
+    /// lowercase form, so `Foo` and `foo` collapse onto one id. Files keep their
+    /// verbatim tag text; only the derived index folds.
     async fn tag_id(&self, name: &str) -> Result<i64> {
-        if let Some(id) = self.tag_cache.lock().unwrap().get(name).copied() {
+        let folded = name.to_lowercase();
+        if let Some(id) = self.tag_cache.lock().unwrap().get(&folded).copied() {
             return Ok(id);
         }
         // ON CONFLICT DO UPDATE (a no-op self-set) so RETURNING yields the id on
@@ -201,12 +206,12 @@ impl TursoStore {
         let row = query_first(
             &self.conn,
             "INSERT INTO tag(name) VALUES(?1) ON CONFLICT(name) DO UPDATE SET name=excluded.name RETURNING id",
-            vec![Value::Text(name.to_string())],
+            vec![Value::Text(folded.clone())],
         )
         .await?
         .ok_or_else(|| IndexError::Db("tag upsert returned no id".into()))?;
         let id = cell_i64(&row, 0).ok_or_else(|| IndexError::Db("tag id not an integer".into()))?;
-        self.tag_cache.lock().unwrap().insert(name.to_string(), id);
+        self.tag_cache.lock().unwrap().insert(folded, id);
         Ok(id)
     }
 
@@ -286,6 +291,24 @@ fn descriptor_from_row(r: &Row) -> EngramDescriptor {
         title: cell_text(r, 5).unwrap_or_default(),
         engram_type: cell_text(r, 6).unwrap_or_default(),
         status: cell_text(r, 7).unwrap_or_default(),
+    }
+}
+
+/// Decode one `outbound_refs` row: line, kind discriminator (0 relation, 1
+/// link), rel_type (NULL for a link), target text, target domain and resolved
+/// flag. The column layout is identical across both backends.
+fn outbound_ref_from_row(r: &Row) -> OutboundRef {
+    OutboundRef {
+        line: cell_i64(r, 0).unwrap_or(0) as usize,
+        kind: if cell_i64(r, 1).unwrap_or(0) == 0 {
+            EdgeKind::Relation
+        } else {
+            EdgeKind::Link
+        },
+        rel_type: cell_text(r, 2),
+        to_target: cell_text(r, 3).unwrap_or_default(),
+        to_domain: cell_text(r, 4),
+        resolved: cell_i64(r, 5).unwrap_or(0) != 0,
     }
 }
 
@@ -780,6 +803,31 @@ impl Store for TursoStore {
         Ok(n)
     }
 
+    async fn resolve_pending_links(&self, domain: DomainId) -> Result<u64> {
+        // The wikilink twin of resolve_pending_relations over the `link` table.
+        // Target domain is `to_domain` when set, else the link's own domain.
+        // Prefer a permalink match, then a title match. Links carry no rel_type.
+        let tgt_dom =
+            "COALESCE((SELECT d.id FROM domain d WHERE d.name = link.to_domain), link.domain_id)";
+        let by_perma = format!(
+            "(SELECT e.id FROM engram e WHERE e.permalink = link.to_target AND e.domain_id = {tgt_dom} LIMIT 1)"
+        );
+        let by_title = format!(
+            "(SELECT e.id FROM engram e WHERE lower(e.title) = lower(link.to_target) AND e.domain_id = {tgt_dom} LIMIT 1)"
+        );
+        let sql = format!(
+            "UPDATE link SET to_id = COALESCE({by_perma}, {by_title}) \
+             WHERE link.to_id IS NULL AND link.domain_id = ?1 \
+             AND (EXISTS (SELECT 1 FROM engram e WHERE e.permalink = link.to_target AND e.domain_id = {tgt_dom}) \
+                  OR EXISTS (SELECT 1 FROM engram e WHERE lower(e.title) = lower(link.to_target) AND e.domain_id = {tgt_dom}))"
+        );
+        let n = self
+            .conn
+            .execute(&sql, vec![Value::Integer(domain.0)])
+            .await?;
+        Ok(n)
+    }
+
     async fn lookup_id(&self, domain: &str, permalink: &str) -> Result<Option<EngramId>> {
         let row = query_first(
             &self.conn,
@@ -843,6 +891,32 @@ impl Store for TursoStore {
         Ok(rows.iter().map(descriptor_from_row).collect())
     }
 
+    async fn engrams_with_tag(
+        &self,
+        tag: &str,
+        domain: Option<&str>,
+    ) -> Result<Vec<EngramDescriptor>> {
+        let folded = tag.to_lowercase();
+        let mut params = vec![Value::Text(folded)];
+        let mut where_domain = String::new();
+        if let Some(d) = domain {
+            where_domain = " AND d.name=?2".to_string();
+            params.push(Value::Text(d.to_string()));
+        }
+        let sql = format!(
+            "SELECT e.id, e.domain_id, d.name, e.path, e.permalink, e.title, e.engram_type, e.status \
+             FROM engram e JOIN domain d ON d.id=e.domain_id \
+             WHERE (EXISTS (SELECT 1 FROM engram_tag et JOIN tag t ON t.id=et.tag_id \
+                            WHERE et.engram_id=e.id AND t.name=?1) \
+                 OR EXISTS (SELECT 1 FROM observation_tag ot JOIN tag t ON t.id=ot.tag_id \
+                            JOIN observation o ON o.id=ot.observation_id \
+                            WHERE o.engram_id=e.id AND t.name=?1)){where_domain} \
+             ORDER BY d.name, e.path"
+        );
+        let rows = query_all(&self.conn, &sql, params).await?;
+        Ok(rows.iter().map(descriptor_from_row).collect())
+    }
+
     async fn inbound_refs(
         &self,
         engram_id: EngramId,
@@ -855,7 +929,8 @@ impl Store for TursoStore {
         // engram's permalink or title. Prose wikilinks are never assigned a
         // `to_id`, so the text match is what catches them; `to_domain IS NULL`
         // restricts the rewrite to bare links that would otherwise dangle after
-        // the move.
+        // the move. Ordered by source domain then path (positional `1, 3`) so
+        // `read_engram`'s capped sample is deterministic across both backends.
         let params = vec![
             Value::Integer(engram_id.0),
             Value::Integer(domain_id.0),
@@ -874,7 +949,8 @@ impl Store for TursoStore {
              FROM link l JOIN engram e ON e.id=l.engram_id JOIN domain d ON d.id=e.domain_id \
              WHERE l.to_id=?1 \
                 OR (l.to_id IS NULL AND l.domain_id=?2 AND l.to_domain IS NULL \
-                    AND (l.to_target=?3 OR lower(l.to_target)=lower(?4)))",
+                    AND (l.to_target=?3 OR lower(l.to_target)=lower(?4))) \
+             ORDER BY 1, 3",
             params,
         )
         .await?;
@@ -892,6 +968,27 @@ impl Store for TursoStore {
                 },
             })
             .collect())
+    }
+
+    async fn outbound_refs(&self, engram_id: EngramId) -> Result<Vec<OutboundRef>> {
+        // Relation rows then link rows for one engram, each row decoded
+        // identically: line, kind discriminator, rel_type (NULL for a link),
+        // target text, target domain and a resolved flag derived from whether the
+        // forward reference has been bound to a `to_id`. Ordered by source line.
+        let rows = query_all(
+            &self.conn,
+            "SELECT r.line AS line, 0 AS kind, r.rel_type, r.to_target, r.to_domain, \
+                    CASE WHEN r.to_id IS NULL THEN 0 ELSE 1 END AS resolved \
+             FROM relation r WHERE r.engram_id=?1 \
+             UNION ALL \
+             SELECT l.line, 1, NULL, l.to_target, l.to_domain, \
+                    CASE WHEN l.to_id IS NULL THEN 0 ELSE 1 END \
+             FROM link l WHERE l.engram_id=?1 \
+             ORDER BY line",
+            vec![Value::Integer(engram_id.0)],
+        )
+        .await?;
+        Ok(rows.iter().map(outbound_ref_from_row).collect())
     }
 
     async fn search(&self, query: &SearchQuery) -> Result<Page<SearchHit>> {
@@ -1217,6 +1314,8 @@ impl Store for TursoStore {
              (SELECT count(*) FROM observation o JOIN engram e ON e.id=o.engram_id WHERE e.domain_id=d.id), \
              (SELECT count(*) FROM relation r WHERE r.domain_id=d.id), \
              (SELECT count(*) FROM relation r WHERE r.domain_id=d.id AND r.to_id IS NULL), \
+             (SELECT count(*) FROM link l WHERE l.domain_id=d.id), \
+             (SELECT count(*) FROM link l WHERE l.domain_id=d.id AND l.to_id IS NULL), \
              dl.holder_instance_id, dl.holder_label, dl.heartbeat_at \
              FROM domain d LEFT JOIN domain_lock dl ON dl.domain_id=d.id ORDER BY d.id",
             vec![],
@@ -1233,11 +1332,85 @@ impl Store for TursoStore {
                 observations: cell_i64(r, 6).unwrap_or(0),
                 relations: cell_i64(r, 7).unwrap_or(0),
                 unresolved_relations: cell_i64(r, 8).unwrap_or(0),
-                host_instance_id: cell_text(r, 9),
-                host_label: cell_text(r, 10),
-                host_heartbeat_at: cell_text(r, 11),
+                links: cell_i64(r, 9).unwrap_or(0),
+                unresolved_links: cell_i64(r, 10).unwrap_or(0),
+                host_instance_id: cell_text(r, 11),
+                host_label: cell_text(r, 12),
+                host_heartbeat_at: cell_text(r, 13),
             })
             .collect())
+    }
+
+    async fn vocabulary(&self, domain: Option<&str>) -> Result<Vocabulary> {
+        // Four grouped scans: engram tags, observation tags, observation
+        // categories and relation types. When a domain is named each aggregate
+        // joins back to the owning engram's domain by name, so an unknown name
+        // simply matches no rows and the vocabulary comes back empty. The maps
+        // are merged and every vector sorted in Rust (see `build_vocabulary`) so
+        // the order does not depend on SQL's grouping.
+        let dparam = || match domain {
+            Some(d) => vec![Value::Text(d.to_string())],
+            None => vec![],
+        };
+        let decode = |rows: &[Row]| -> Vec<(String, i64)> {
+            rows.iter()
+                .map(|r| {
+                    (
+                        cell_text(r, 0).unwrap_or_default(),
+                        cell_i64(r, 1).unwrap_or(0),
+                    )
+                })
+                .collect()
+        };
+
+        let engram_tag_sql = if domain.is_some() {
+            "SELECT t.name, COUNT(*) FROM engram_tag et \
+             JOIN tag t ON t.id=et.tag_id \
+             JOIN engram e ON e.id=et.engram_id \
+             JOIN domain d ON d.id=e.domain_id \
+             WHERE d.name=?1 GROUP BY t.id"
+        } else {
+            "SELECT t.name, COUNT(*) FROM engram_tag et JOIN tag t ON t.id=et.tag_id GROUP BY t.id"
+        };
+        let engram_tags = decode(&query_all(&self.conn, engram_tag_sql, dparam()).await?);
+
+        let obs_tag_sql = if domain.is_some() {
+            "SELECT t.name, COUNT(*) FROM observation_tag ot \
+             JOIN tag t ON t.id=ot.tag_id \
+             JOIN observation o ON o.id=ot.observation_id \
+             JOIN engram e ON e.id=o.engram_id \
+             JOIN domain d ON d.id=e.domain_id \
+             WHERE d.name=?1 GROUP BY t.id"
+        } else {
+            "SELECT t.name, COUNT(*) FROM observation_tag ot JOIN tag t ON t.id=ot.tag_id GROUP BY t.id"
+        };
+        let observation_tags = decode(&query_all(&self.conn, obs_tag_sql, dparam()).await?);
+
+        let category_sql = if domain.is_some() {
+            "SELECT o.category, COUNT(*) FROM observation o \
+             JOIN engram e ON e.id=o.engram_id \
+             JOIN domain d ON d.id=e.domain_id \
+             WHERE o.category <> '' AND d.name=?1 GROUP BY o.category"
+        } else {
+            "SELECT o.category, COUNT(*) FROM observation o WHERE o.category <> '' GROUP BY o.category"
+        };
+        let categories = decode(&query_all(&self.conn, category_sql, dparam()).await?);
+
+        let rel_sql = if domain.is_some() {
+            "SELECT r.rel_type, COUNT(*) FROM relation r \
+             JOIN domain d ON d.id=r.domain_id \
+             WHERE d.name=?1 GROUP BY r.rel_type"
+        } else {
+            "SELECT r.rel_type, COUNT(*) FROM relation r GROUP BY r.rel_type"
+        };
+        let relation_types = decode(&query_all(&self.conn, rel_sql, dparam()).await?);
+
+        Ok(build_vocabulary(
+            engram_tags,
+            observation_tags,
+            categories,
+            relation_types,
+        ))
     }
 
     async fn claim_domain_host(
