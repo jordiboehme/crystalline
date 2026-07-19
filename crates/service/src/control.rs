@@ -161,7 +161,18 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
             let domain = req.get("domain").and_then(Value::as_str);
             let merge = req.get("merge").and_then(Value::as_bool).unwrap_or(false);
             let dry_run = req.get("dry_run").and_then(Value::as_bool).unwrap_or(false);
-            match shared.engine.retag(old, new, domain, merge, dry_run).await {
+            // The merge records the fold as a tag alias unless the caller opted
+            // out; an absent field defaults to recording, so existing callers
+            // that never send it keep the recording behavior.
+            let record_alias = !req
+                .get("no_alias")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            match shared
+                .engine
+                .retag(old, new, domain, merge, dry_run, record_alias)
+                .await
+            {
                 Ok(data) => (envelope_ok(data), false),
                 Err(e) => (envelope_err(e.to_string()), false),
             }

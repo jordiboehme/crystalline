@@ -578,7 +578,7 @@ async fn retag_renames_and_merges(store: Arc<Mutex<dyn Store>>) {
 
     // Dry run reports the one affected engram and writes nothing.
     let dry = engine
-        .retag("topic", "subject", Some("notes"), false, true)
+        .retag("topic", "subject", Some("notes"), false, true, false)
         .await
         .unwrap();
     assert_eq!(dry["rewritten"], 1);
@@ -597,7 +597,7 @@ async fn retag_renames_and_merges(store: Arc<Mutex<dyn Store>>) {
 
     // The real rename rewrites both the frontmatter tag and the hashtag.
     let done = engine
-        .retag("topic", "subject", Some("notes"), false, false)
+        .retag("topic", "subject", Some("notes"), false, false, false)
         .await
         .unwrap();
     assert_eq!(done["rewritten"], 1);
@@ -636,19 +636,19 @@ async fn retag_renames_and_merges(store: Arc<Mutex<dyn Store>>) {
 
     // Renaming into an existing tag is a conflict pointing at merge.
     let conflict = engine
-        .retag("other", "subject", Some("notes"), false, false)
+        .retag("other", "subject", Some("notes"), false, false, false)
         .await;
     assert!(matches!(conflict, Err(EngineError::Conflict(_))));
 
     // Merging into a missing tag is a not-found.
     let missing = engine
-        .retag("other", "ghost", Some("notes"), true, false)
+        .retag("other", "ghost", Some("notes"), true, false, false)
         .await;
     assert!(matches!(missing, Err(EngineError::NotFound(_))));
 
     // Merging into the existing tag folds `other` away.
     let merged = engine
-        .retag("other", "subject", Some("notes"), true, false)
+        .retag("other", "subject", Some("notes"), true, false, false)
         .await
         .unwrap();
     assert_eq!(merged["rewritten"], 1);
@@ -675,7 +675,14 @@ async fn retag_merges_separator_variant(store: Arc<Mutex<dyn Store>>) {
     // validated as lowercase-with-hyphens; `old` may be any non-empty tag, so
     // the separator-variant merge the cluster detection recommends is reachable.
     let merged = engine
-        .retag("multi_word", "multi-word", Some("notes"), true, false)
+        .retag(
+            "multi_word",
+            "multi-word",
+            Some("notes"),
+            true,
+            false,
+            false,
+        )
         .await
         .unwrap();
     assert_eq!(merged["rewritten"], 1);
@@ -717,12 +724,88 @@ both_backends!(
     retag_merges_separator_variant
 );
 
+async fn merge_records_alias_in_virtual_manifest(store: Arc<Mutex<dyn Store>>) {
+    let engine = virtual_engine(store);
+
+    // Scaffold the domain's MANIFEST so the merge has somewhere to record.
+    engine
+        .scaffold_virtual_manifest(
+            "notes",
+            "---\ntype: manifest\ntitle: Notes\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Notes\n\n## Scope\n\n- notes\n\n## When to Use\n\n- routing\n",
+        )
+        .await
+        .unwrap();
+
+    // Alpha carries the old spelling; Beta carries the canonical target, so the
+    // merge has a landing tag.
+    engine
+        .write_engram(&tagged("Alpha", "Alpha body.", vec!["colour"]))
+        .await
+        .unwrap();
+    engine
+        .write_engram(&tagged("Beta", "Beta body.", vec!["color"]))
+        .await
+        .unwrap();
+
+    // Merge the old spelling into the canonical one, recording the alias.
+    let merged = engine
+        .retag("colour", "color", Some("notes"), true, false, true)
+        .await
+        .unwrap();
+    assert_eq!(merged["rewritten"], 1);
+    let recorded: Vec<&str> = merged["alias_recorded"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d.as_str().unwrap())
+        .collect();
+    assert_eq!(recorded, vec!["notes"], "the virtual domain is recorded");
+
+    // The virtual MANIFEST now declares the alias, appended as plain content.
+    let manifest = engine
+        .read_engram(&ReadParams {
+            identifier: "manifest".to_string(),
+            domain: Some("notes".to_string()),
+        })
+        .await
+        .unwrap();
+    assert!(
+        manifest["content"]
+            .as_str()
+            .unwrap()
+            .contains("- colour -> color"),
+        "the alias bullet is recorded in the virtual MANIFEST: {}",
+        manifest["content"]
+    );
+
+    // A subsequent search by the old tag folds through the recorded alias and
+    // finds the engrams now carrying the canonical tag.
+    let hits = engine
+        .search_engrams(&SearchParams {
+            tags: vec!["colour".to_string()],
+            domains: vec!["notes".to_string()],
+            ..SearchParams::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        hits["total"], 2,
+        "the old tag folds to the canonical class through the recorded alias"
+    );
+}
+both_backends!(
+    merge_records_alias_in_a_virtual_manifest,
+    merge_records_alias_in_virtual_manifest
+);
+
 #[tokio::test]
 async fn retag_refuses_on_a_read_only_instance() {
     let store = TursoStore::open_in_memory().await.unwrap();
     let store: Arc<Mutex<dyn Store>> = Arc::new(Mutex::new(store));
     let engine = virtual_engine(store).with_read_only(true);
-    let refused = engine.retag("foo", "bar", Some("notes"), false, true).await;
+    let refused = engine
+        .retag("foo", "bar", Some("notes"), false, true, false)
+        .await;
     assert!(matches!(refused, Err(EngineError::ReadOnly)));
 }
 
@@ -732,7 +815,7 @@ async fn retag_rejects_a_non_canonical_name() {
     let store: Arc<Mutex<dyn Store>> = Arc::new(Mutex::new(store));
     let engine = virtual_engine(store);
     let bad = engine
-        .retag("foo", "Bar_Baz", Some("notes"), false, true)
+        .retag("foo", "Bar_Baz", Some("notes"), false, true, false)
         .await;
     assert!(matches!(bad, Err(EngineError::Invalid(_))));
 }

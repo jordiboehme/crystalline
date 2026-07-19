@@ -1016,6 +1016,15 @@ impl Engine {
             store.replace_chunks(id, &chunks).await?;
             store.resolve_pending_relations(domain_id).await?;
             store.resolve_pending_links(domain_id).await?;
+            // A MANIFEST carries the domain's `## Tag Aliases` declarations, so a
+            // single-engram write, edit, scaffold or file reindex of it refreshes
+            // the derived alias rows in the same transaction - the table never
+            // needs a full sync to catch up.
+            if rel == "MANIFEST.md" {
+                store
+                    .replace_tag_aliases(domain_id, &crystalline_core::tag_alias_pairs(text))
+                    .await?;
+            }
             Ok::<EngramId, EngineError>(id)
         }
         .await;
@@ -1677,6 +1686,16 @@ impl Engine {
     /// already exists (that would silently merge, so it points at `tags merge`),
     /// and a `merge` refuses when `new` does not exist yet. `dry_run` reports the
     /// affected engrams without writing anything.
+    ///
+    /// A non-dry-run `merge` with `record_alias` also records the fold as a tag
+    /// alias: it appends `- old -> new` to each affected domain's MANIFEST
+    /// `## Tag Aliases` section (creating the section when absent), so a later
+    /// search for the old name still finds its engrams through the alias. The
+    /// recording is idempotent and permissive: when the pair is already present
+    /// the append no-ops and the domain still counts as recorded (a re-merge of a
+    /// tag that reappeared must work, never be refused), and a domain with no
+    /// MANIFEST lands in `alias_skipped` rather than erroring. A `rename` records
+    /// nothing.
     pub async fn retag(
         &self,
         old: &str,
@@ -1684,6 +1703,7 @@ impl Engine {
         domain: Option<&str>,
         merge: bool,
         dry_run: bool,
+        record_alias: bool,
     ) -> Result<Value> {
         if self.read_only {
             return Err(EngineError::ReadOnly);
@@ -1794,10 +1814,89 @@ impl Engine {
             }
         }
 
-        Ok(json!({
+        let mut response = json!({
             "old": old_f, "new": new_f, "merge": merge, "dry_run": false,
             "engrams": listed, "rewritten": rewritten,
-        }))
+        });
+
+        // Record the fold as a tag alias in each affected domain's MANIFEST, once
+        // per distinct domain in first-seen order. Only a merge records, and only
+        // when the caller did not opt out.
+        if merge && record_alias {
+            let mut domains: Vec<(String, DomainId)> = Vec::new();
+            for desc in &targets {
+                if !domains.iter().any(|(name, _)| *name == desc.domain) {
+                    domains.push((desc.domain.clone(), desc.domain_id));
+                }
+            }
+
+            let mut alias_recorded: Vec<String> = Vec::new();
+            let mut alias_skipped: Vec<String> = Vec::new();
+            let mut virtual_manifest_changed = false;
+            for (name, domain_id) in &domains {
+                match self.read_source(name) {
+                    ContentSource::File { root } => {
+                        let abs = join_rel(&root, "MANIFEST.md");
+                        let Ok(text) = std::fs::read_to_string(&abs) else {
+                            alias_skipped.push(name.clone());
+                            continue;
+                        };
+                        if let Some(edited) =
+                            crystalline_core::append_tag_alias(&text, &old_f, &new_f)
+                        {
+                            write_file(&abs, &edited)?;
+                            let store = self.store.lock().await;
+                            self.reindex_file(&*store, *domain_id, &root, "MANIFEST.md")
+                                .await?;
+                        }
+                        // Some (appended) or None (already present) both count as
+                        // recorded: the mapping is in effect either way.
+                        alias_recorded.push(name.clone());
+                    }
+                    ContentSource::Virtual => {
+                        let current = {
+                            let store = self.store.lock().await;
+                            store.engram_content(*domain_id, "MANIFEST.md").await?
+                        };
+                        let Some(text) = current else {
+                            alias_skipped.push(name.clone());
+                            continue;
+                        };
+                        if let Some(edited) =
+                            crystalline_core::append_tag_alias(&text, &old_f, &new_f)
+                        {
+                            let stamp = virtual_stamp(&edited);
+                            let store = self.store.lock().await;
+                            self.index_markdown(
+                                &*store,
+                                *domain_id,
+                                "MANIFEST.md",
+                                &edited,
+                                stamp,
+                                None,
+                                true,
+                            )
+                            .await?;
+                            virtual_manifest_changed = true;
+                        }
+                        alias_recorded.push(name.clone());
+                    }
+                }
+            }
+
+            // A rewritten virtual MANIFEST may have changed its routing bullets,
+            // so refresh the cache once, after every store lock is released.
+            if virtual_manifest_changed {
+                self.refresh_routing_cache().await;
+            }
+
+            if let Value::Object(map) = &mut response {
+                map.insert("alias_recorded".to_string(), json!(alias_recorded));
+                map.insert("alias_skipped".to_string(), json!(alias_skipped));
+            }
+        }
+
+        Ok(response)
     }
 
     /// Refuse a move whose destination path is already taken, checking disk for
@@ -1844,6 +1943,12 @@ impl Engine {
         }
         let store = self.store.lock().await;
         store.delete_engram(desc.domain_id, &desc.path).await?;
+        // Deleting a MANIFEST removes its `## Tag Aliases` declarations, so clear
+        // the domain's derived alias rows: the content is already gone, so the
+        // refresh folds to no pairs and replaces the rows with nothing.
+        if desc.path == "MANIFEST.md" {
+            crystalline_index::refresh_tag_aliases(&*store, desc.domain_id).await?;
+        }
         drop(store);
 
         // Deleting a virtual domain's MANIFEST engram empties its routing
@@ -2464,14 +2569,25 @@ impl Engine {
         });
         // Near-duplicate tag clusters, omitted entirely when there are none so a
         // clean vocabulary stays quiet. They point at tags to consolidate with
-        // `crystalline tags merge`.
-        let clusters = crystalline_index::tag_clusters(&vocab.tags);
+        // `crystalline tags merge`. Declared aliases are folded out first, so a
+        // cluster an alias already explains is never reported.
+        let clusters = crystalline_index::tag_clusters_with_aliases(&vocab.tags, &vocab.aliases);
         if !clusters.is_empty()
             && let Value::Object(map) = &mut out
         {
             map.insert(
                 "clusters".to_string(),
                 serde_json::to_value(&clusters).unwrap_or(Value::Null),
+            );
+        }
+        // The tag aliases in effect, omitted when there are none. They tell an
+        // agent which spellings fold onto which canonical tag.
+        if !vocab.aliases.is_empty()
+            && let Value::Object(map) = &mut out
+        {
+            map.insert(
+                "aliases".to_string(),
+                serde_json::to_value(&vocab.aliases).unwrap_or(Value::Null),
             );
         }
         Ok(out)

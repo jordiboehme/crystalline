@@ -436,6 +436,113 @@ async fn edit_operations_and_subsection_regression() {
     assert!(read["content"].as_str().unwrap().contains("appended line"));
 }
 
+/// Whether the vocabulary response reports a near-duplicate cluster that contains
+/// every one of `tags`.
+fn cluster_contains(vocab: &Value, tags: &[&str]) -> bool {
+    vocab
+        .get("clusters")
+        .and_then(Value::as_array)
+        .map(|clusters| {
+            clusters.iter().any(|c| {
+                let members: Vec<&str> = c
+                    .get("tags")
+                    .and_then(Value::as_array)
+                    .map(|a| a.iter().filter_map(Value::as_str).collect())
+                    .unwrap_or_default();
+                tags.iter().all(|t| members.contains(t))
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Editing a MANIFEST to declare a tag alias must take effect immediately through
+/// the single-engram index path (no full sync): a subsequent tag search folds the
+/// old spelling onto the canonical class, the vocabulary lists the alias and the
+/// cluster the alias explains stops being reported.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manifest_alias_edit_folds_search_and_suppresses_the_cluster() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    // Two engrams whose tags are a near-duplicate pair (a one-character edit).
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Alpha", "content": "alpha body", "tags": ["colour"] }),
+    )
+    .await
+    .unwrap();
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Beta", "content": "beta body", "tags": ["color"] }),
+    )
+    .await
+    .unwrap();
+
+    // Before any alias: colour and color surface as a cluster, no aliases are
+    // listed and a tag filter on `colour` finds only the colour-tagged engram.
+    let vocab = call(peer, "vocabulary", json!({ "domain": "eng" }))
+        .await
+        .unwrap();
+    assert!(
+        cluster_contains(&vocab, &["color", "colour"]),
+        "colour and color cluster before the alias: {vocab}"
+    );
+    assert!(vocab.get("aliases").is_none(), "no aliases yet: {vocab}");
+    let before = call(
+        peer,
+        "search_engrams",
+        json!({ "domains": ["eng"], "tags": ["colour"] }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        before["total"], 1,
+        "only the colour-tagged engram before the alias"
+    );
+
+    // Declare the alias by editing the MANIFEST: the index_markdown hook refreshes
+    // the derived alias table in the same write, with no full sync.
+    call(
+        peer,
+        "edit_engram",
+        json!({
+            "identifier": "manifest", "domain": "eng", "operation": "append",
+            "content": "## Tag Aliases\n\n- colour -> color",
+        }),
+    )
+    .await
+    .unwrap();
+
+    // Now a tag filter on the old spelling folds through the alias and finds both.
+    let after = call(
+        peer,
+        "search_engrams",
+        json!({ "domains": ["eng"], "tags": ["colour"] }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        after["total"], 2,
+        "the old tag now folds onto the canonical class"
+    );
+
+    // The vocabulary lists the alias and no longer reports the explained cluster.
+    let vocab2 = call(peer, "vocabulary", json!({ "domain": "eng" }))
+        .await
+        .unwrap();
+    let aliases = vocab2["aliases"].as_array().expect("aliases present");
+    assert_eq!(aliases.len(), 1);
+    assert_eq!(aliases[0]["alias"], "colour");
+    assert_eq!(aliases[0]["canonical"], "color");
+    assert!(
+        !cluster_contains(&vocab2, &["color", "colour"]),
+        "the alias-explained cluster is suppressed: {vocab2}"
+    );
+}
+
 /// The identifier grammar is strict: an identifier without the
 /// crystalline:// scheme is domain-relative, always, so a domain-prefixed
 /// composite never resolves - and when a domain is passed alongside, the

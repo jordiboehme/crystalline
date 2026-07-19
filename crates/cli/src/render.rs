@@ -205,6 +205,18 @@ pub fn render_vocabulary(v: &Value, out: &mut impl Write) -> io::Result<()> {
         writeln!(out, "  merge with `crystalline tags merge`")?;
     }
 
+    // Tag aliases in effect, present only when the domain declares any.
+    if let Some(aliases) = v.get("aliases").and_then(Value::as_array)
+        && !aliases.is_empty()
+    {
+        writeln!(out, "Aliases:")?;
+        for a in aliases {
+            let alias = a.get("alias").and_then(Value::as_str).unwrap_or("");
+            let canonical = a.get("canonical").and_then(Value::as_str).unwrap_or("");
+            writeln!(out, "  {alias} -> {canonical}")?;
+        }
+    }
+
     Ok(())
 }
 
@@ -372,6 +384,33 @@ mod tests {
             out,
             "Tags:\n  database  2 engrams, 2 observations\n  api  1 engram, 1 observation\nCategories:\n  decision  2\n  pattern  1\nRelation types:\n  depends_on  1\n"
         );
+    }
+
+    #[test]
+    fn vocabulary_lists_aliases_after_the_other_sections() {
+        let v = json!({
+            "domain": "eng",
+            "tags": [{ "name": "color", "engrams": 2, "observations": 0 }],
+            "categories": [],
+            "relation_types": [],
+            "aliases": [
+                { "alias": "colour", "canonical": "color" },
+                { "alias": "hue", "canonical": "color" },
+            ],
+        });
+        let out = render_to_string(render_vocabulary, &v);
+        assert_eq!(
+            out,
+            "Tags:\n  color  2 engrams, 0 observations\nCategories:\n  (none)\nRelation types:\n  (none)\nAliases:\n  colour -> color\n  hue -> color\n"
+        );
+    }
+
+    #[test]
+    fn vocabulary_omits_the_aliases_section_when_absent() {
+        // The existing shape without an `aliases` key prints no Aliases section.
+        let v = json!({ "domain": "eng", "tags": [], "categories": [], "relation_types": [] });
+        let out = render_to_string(render_vocabulary, &v);
+        assert!(!out.contains("Aliases:"), "no Aliases section: {out}");
     }
 
     #[test]
