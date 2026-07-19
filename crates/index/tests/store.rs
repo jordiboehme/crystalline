@@ -1273,6 +1273,32 @@ async fn metadata_tags_arm_expands(store: &dyn Store) {
 }
 parity!(metadata_filter_tags_arm_expands, metadata_tags_arm_expands);
 
+async fn numeric_tags_metadata_filter_folds(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // An engram whose only tag is the bare number 42: YAML parses it as an
+    // integer, which the engram parser stores as the string "42".
+    write(
+        root,
+        "answer.md",
+        &tagged_engram("Answer", "answer", &["42"]),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+
+    // A `tags` Eq filter carrying the JSON NUMBER 42 (not a string) is stringified
+    // and folded to "42" by fold_tag_value, so it matches the engram identically
+    // on both backends. Pins the stringify-and-fold behavior.
+    let eq = crystalline_index::parse_metadata_filters(&serde_json::json!({ "tags": 42 })).unwrap();
+    assert_eq!(
+        meta_filter_perms(store, eq).await,
+        vec!["answer".to_string()]
+    );
+}
+parity!(
+    numeric_tags_metadata_filter_folds_on_both_backends,
+    numeric_tags_metadata_filter_folds
+);
+
 async fn tags_require_all_survives_expansion(store: &dyn Store) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();

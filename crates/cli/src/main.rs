@@ -2119,6 +2119,23 @@ fn print_alias_note(result: &serde_json::Value) {
         let word = if skipped == 1 { "domain" } else { "domains" };
         println!("Skipped the alias in {skipped} {word} without a MANIFEST.");
     }
+    if let Some(conflicts) = result.get("alias_conflict").and_then(Value::as_array)
+        && !conflicts.is_empty()
+    {
+        let old = result
+            .get("old")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let new = result
+            .get("new")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        for domain in conflicts.iter().filter_map(Value::as_str) {
+            println!(
+                "Alias {old} -> {new} conflicts with an existing alias in {domain}; MANIFEST left unchanged."
+            );
+        }
+    }
 }
 
 /// Print the affected engrams for a `tags rename` / `tags merge` preview.

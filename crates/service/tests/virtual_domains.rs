@@ -798,6 +798,145 @@ both_backends!(
     merge_records_alias_in_virtual_manifest
 );
 
+async fn merge_surfaces_conflict_in_virtual_manifest(store: Arc<Mutex<dyn Store>>) {
+    let engine = virtual_engine(store);
+
+    // Scaffold a MANIFEST that already aliases `colour` to a DIFFERENT canonical.
+    // First-wins parsing keeps that mapping, so recording `colour -> color` would
+    // be inert: the merge must surface the conflict, never a false success.
+    engine
+        .scaffold_virtual_manifest(
+            "notes",
+            "---\ntype: manifest\ntitle: Notes\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Notes\n\n## Scope\n\n- notes\n\n## When to Use\n\n- routing\n\n## Tag Aliases\n\n- colour -> hue\n",
+        )
+        .await
+        .unwrap();
+
+    // Capture the MANIFEST engram content before the merge, to prove it is left
+    // byte-identical (the conflict skips the write).
+    let before = engine
+        .read_engram(&ReadParams {
+            identifier: "manifest".to_string(),
+            domain: Some("notes".to_string()),
+        })
+        .await
+        .unwrap();
+    let manifest_before = before["content"].as_str().unwrap().to_string();
+
+    engine
+        .write_engram(&tagged("Alpha", "Alpha body.", vec!["colour"]))
+        .await
+        .unwrap();
+    engine
+        .write_engram(&tagged("Beta", "Beta body.", vec!["color"]))
+        .await
+        .unwrap();
+
+    let merged = engine
+        .retag("colour", "color", Some("notes"), true, false, true)
+        .await
+        .unwrap();
+    // The tag rewrite still proceeds permissively; only the recording is skipped.
+    assert_eq!(merged["rewritten"], 1);
+    let conflict: Vec<&str> = merged["alias_conflict"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        conflict,
+        vec!["notes"],
+        "the conflicting domain is surfaced"
+    );
+    assert!(
+        merged["alias_recorded"].as_array().unwrap().is_empty(),
+        "a conflicting mapping is not recorded"
+    );
+
+    // The virtual MANIFEST engram is left untouched: nothing was appended.
+    let after = engine
+        .read_engram(&ReadParams {
+            identifier: "manifest".to_string(),
+            domain: Some("notes".to_string()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        after["content"].as_str().unwrap(),
+        manifest_before,
+        "a conflicting alias leaves the virtual MANIFEST untouched"
+    );
+}
+both_backends!(
+    merge_surfaces_conflict_in_a_virtual_manifest,
+    merge_surfaces_conflict_in_virtual_manifest
+);
+
+async fn deleting_manifest_clears_alias_folding(store: Arc<Mutex<dyn Store>>) {
+    let engine = virtual_engine(store);
+
+    // A MANIFEST that declares an alias, plus two engrams split across the old and
+    // canonical spellings.
+    engine
+        .scaffold_virtual_manifest(
+            "notes",
+            "---\ntype: manifest\ntitle: Notes\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Notes\n\n## Scope\n\n- notes\n\n## When to Use\n\n- routing\n\n## Tag Aliases\n\n- colour -> color\n",
+        )
+        .await
+        .unwrap();
+    engine
+        .write_engram(&tagged("Alpha", "Alpha body.", vec!["colour"]))
+        .await
+        .unwrap();
+    engine
+        .write_engram(&tagged("Beta", "Beta body.", vec!["color"]))
+        .await
+        .unwrap();
+
+    // The declared alias folds: a search by the old tag finds both engrams.
+    let folded = engine
+        .search_engrams(&SearchParams {
+            tags: vec!["colour".to_string()],
+            domains: vec!["notes".to_string()],
+            ..SearchParams::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        folded["total"], 2,
+        "the declared alias folds before the delete"
+    );
+
+    // Delete the MANIFEST engram through the engine delete path.
+    engine
+        .delete_engram(&DeleteParams {
+            identifier: "manifest".to_string(),
+            domain: "notes".to_string(),
+        })
+        .await
+        .unwrap();
+
+    // The derived alias rows are cleared, so folding stops: the old tag now finds
+    // only its own engram.
+    let unfolded = engine
+        .search_engrams(&SearchParams {
+            tags: vec!["colour".to_string()],
+            domains: vec!["notes".to_string()],
+            ..SearchParams::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        unfolded["total"], 1,
+        "deleting the MANIFEST clears the alias, so folding stops"
+    );
+}
+both_backends!(
+    deleting_a_virtual_manifest_stops_alias_folding,
+    deleting_manifest_clears_alias_folding
+);
+
 #[tokio::test]
 async fn retag_refuses_on_a_read_only_instance() {
     let store = TursoStore::open_in_memory().await.unwrap();

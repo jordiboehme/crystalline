@@ -1694,8 +1694,12 @@ impl Engine {
     /// recording is idempotent and permissive: when the pair is already present
     /// the append no-ops and the domain still counts as recorded (a re-merge of a
     /// tag that reappeared must work, never be refused), and a domain with no
-    /// MANIFEST lands in `alias_skipped` rather than erroring. A `rename` records
-    /// nothing.
+    /// MANIFEST lands in `alias_skipped` rather than erroring. When `old` is
+    /// already aliased to a different canonical, first-wins parsing keeps the
+    /// existing mapping, so a fresh bullet would be inert: the MANIFEST is left
+    /// untouched and the domain is surfaced in `alias_conflict` rather than a
+    /// false `alias_recorded`. The merge's tag rewrites still proceed either way;
+    /// only the recording is skipped. A `rename` records nothing.
     pub async fn retag(
         &self,
         old: &str,
@@ -1832,6 +1836,7 @@ impl Engine {
 
             let mut alias_recorded: Vec<String> = Vec::new();
             let mut alias_skipped: Vec<String> = Vec::new();
+            let mut alias_conflict: Vec<String> = Vec::new();
             let mut virtual_manifest_changed = false;
             for (name, domain_id) in &domains {
                 match self.read_source(name) {
@@ -1841,17 +1846,17 @@ impl Engine {
                             alias_skipped.push(name.clone());
                             continue;
                         };
-                        if let Some(edited) =
-                            crystalline_core::append_tag_alias(&text, &old_f, &new_f)
-                        {
-                            write_file(&abs, &edited)?;
-                            let store = self.store.lock().await;
-                            self.reindex_file(&*store, *domain_id, &root, "MANIFEST.md")
-                                .await?;
+                        match decide_alias_record(&text, &old_f, &new_f) {
+                            AliasRecord::Recorded(edited) => {
+                                write_file(&abs, &edited)?;
+                                let store = self.store.lock().await;
+                                self.reindex_file(&*store, *domain_id, &root, "MANIFEST.md")
+                                    .await?;
+                                alias_recorded.push(name.clone());
+                            }
+                            AliasRecord::AlreadyPresent => alias_recorded.push(name.clone()),
+                            AliasRecord::Conflict => alias_conflict.push(name.clone()),
                         }
-                        // Some (appended) or None (already present) both count as
-                        // recorded: the mapping is in effect either way.
-                        alias_recorded.push(name.clone());
                     }
                     ContentSource::Virtual => {
                         let current = {
@@ -1862,24 +1867,26 @@ impl Engine {
                             alias_skipped.push(name.clone());
                             continue;
                         };
-                        if let Some(edited) =
-                            crystalline_core::append_tag_alias(&text, &old_f, &new_f)
-                        {
-                            let stamp = virtual_stamp(&edited);
-                            let store = self.store.lock().await;
-                            self.index_markdown(
-                                &*store,
-                                *domain_id,
-                                "MANIFEST.md",
-                                &edited,
-                                stamp,
-                                None,
-                                true,
-                            )
-                            .await?;
-                            virtual_manifest_changed = true;
+                        match decide_alias_record(&text, &old_f, &new_f) {
+                            AliasRecord::Recorded(edited) => {
+                                let stamp = virtual_stamp(&edited);
+                                let store = self.store.lock().await;
+                                self.index_markdown(
+                                    &*store,
+                                    *domain_id,
+                                    "MANIFEST.md",
+                                    &edited,
+                                    stamp,
+                                    None,
+                                    true,
+                                )
+                                .await?;
+                                virtual_manifest_changed = true;
+                                alias_recorded.push(name.clone());
+                            }
+                            AliasRecord::AlreadyPresent => alias_recorded.push(name.clone()),
+                            AliasRecord::Conflict => alias_conflict.push(name.clone()),
                         }
-                        alias_recorded.push(name.clone());
                     }
                 }
             }
@@ -1893,6 +1900,7 @@ impl Engine {
             if let Value::Object(map) = &mut response {
                 map.insert("alias_recorded".to_string(), json!(alias_recorded));
                 map.insert("alias_skipped".to_string(), json!(alias_skipped));
+                map.insert("alias_conflict".to_string(), json!(alias_conflict));
             }
         }
 
@@ -5421,6 +5429,41 @@ fn section_err(e: crystalline_core::emit::EditError) -> EngineError {
     match e {
         crystalline_core::emit::EditError::SectionNotFound { path } => {
             EngineError::NotFound(format!("no section found for heading path: {path}"))
+        }
+    }
+}
+
+/// How recording an `old -> new` tag alias in a MANIFEST source resolves, once
+/// per affected domain. Both the file and virtual recording branches route
+/// through [`decide_alias_record`] so they can never diverge on the decision.
+enum AliasRecord {
+    /// The source gained the mapping; write this edited text back.
+    Recorded(String),
+    /// The exact folded pair was already declared, so nothing is written but the
+    /// mapping is in effect and the domain still counts as recorded.
+    AlreadyPresent,
+    /// `old` is already aliased to a different canonical, which first-wins
+    /// parsing keeps, so an appended bullet would be inert: nothing is written
+    /// and the domain is surfaced as a conflict rather than a false success.
+    Conflict,
+}
+
+/// Decide how recording `old_f -> new_f` in a MANIFEST `source` should be
+/// handled, touching no store. `old_f` and `new_f` are already folded. A `Some`
+/// append that first-wins parsing would not honor (a different mapping for
+/// `old_f` already wins) is reported as a [`AliasRecord::Conflict`].
+fn decide_alias_record(source: &str, old_f: &str, new_f: &str) -> AliasRecord {
+    match crystalline_core::append_tag_alias(source, old_f, new_f) {
+        None => AliasRecord::AlreadyPresent,
+        Some(edited) => {
+            let effective = crystalline_core::tag_alias_pairs(&edited)
+                .into_iter()
+                .any(|(alias, canonical)| alias == old_f && canonical == new_f);
+            if effective {
+                AliasRecord::Recorded(edited)
+            } else {
+                AliasRecord::Conflict
+            }
         }
     }
 }

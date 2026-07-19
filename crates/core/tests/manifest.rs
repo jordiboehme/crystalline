@@ -617,3 +617,21 @@ fn append_tag_alias_ignores_a_fenced_fake_heading() {
     let expected = "---\ntype: manifest\ntitle: KB\n---\n\n## Scope\n\n- s\n\n```\n## Tag Aliases\n\n- fake -> fake-canonical\n```\n\n## Tag Aliases\n\n- old -> new\n";
     assert_eq!(out, expected);
 }
+
+#[test]
+fn append_tag_alias_preserves_crlf_endings_and_appends_lf() {
+    // Pin the current behavior on a CRLF-line-ending MANIFEST: every original
+    // byte is kept verbatim (CRLF endings intact) and the appended bullet uses
+    // the LF ending the helper always produces. No EOL detection is attempted.
+    let src = "---\r\ntype: manifest\r\ntitle: KB\r\n---\r\n\r\n## Tag Aliases\r\n\r\n- a -> b\r\n";
+    let out = append_tag_alias(src, "c", "d").expect("appended");
+    assert_eq!(
+        out,
+        format!("{src}- c -> d\n"),
+        "every CRLF byte survives and only an LF-terminated bullet is spliced in"
+    );
+    assert!(
+        tag_alias_pairs(&out).contains(&("c".to_string(), "d".to_string())),
+        "the appended pair parses from the CRLF source: {out:?}"
+    );
+}
