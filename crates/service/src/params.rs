@@ -246,6 +246,10 @@ pub struct ValidateParams {
     /// Validate only engrams of this `type`.
     #[serde(rename = "type", default)]
     pub engram_type: Option<String>,
+    /// Also report schema drift: observation categories and relation types
+    /// in use but undeclared by the schema, and declared but unused.
+    #[serde(default)]
+    pub drift: bool,
 }
 
 /// Parameters for `infer_schema`.

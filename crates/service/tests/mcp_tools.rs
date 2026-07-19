@@ -1004,6 +1004,93 @@ async fn validate_and_infer_schema() {
     assert!(inferred["count"].as_u64().unwrap() >= 2);
 }
 
+/// The opt-in `drift` flag reports observation categories and relation types
+/// that drift from the schema: in use but undeclared, and declared but unused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn validate_engrams_reports_schema_drift() {
+    // `bare` has no schema engram: the zero-schema drift shape is checked there.
+    let h = Harness::new(&["eng", "bare"]).await;
+
+    // A schema for `note` engrams declaring two observation categories
+    // (`decision`, `pattern`) and one relation type (`depends_on`).
+    let schema_md = "---\ntype: schema\ntitle: Note Schema\npermalink: note-schema\ntags:\n  - schema\nstatus: current\nrecorded_at: 2026-01-01\nentity: note\nversion: 1\nschema:\n  decision: string\n  pattern: string\n  depends_on: Note\nsettings:\n  validation: warn\n---\n\n# Note Schema\n";
+    std::fs::write(h.root.join("eng/note-schema.md"), schema_md).unwrap();
+    h.engine.sync(None).await.unwrap();
+
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    // A note that uses `decision` (declared) and `insight` (undeclared), and
+    // relates via `depends_on` (declared) and `relates_to` (undeclared). The
+    // declared `pattern` category is left unused.
+    call(
+        peer,
+        "write_engram",
+        json!({
+            "domain": "eng",
+            "title": "Drifter",
+            "type": "note",
+            "content": "- [decision] chose it\n\n- [insight] noticed something\n\n- depends_on [[Foo]]\n\n- relates_to [[Bar]]",
+        }),
+    )
+    .await
+    .unwrap();
+
+    // Flag on: the drift block reports each of the four lists precisely.
+    let out = call(
+        peer,
+        "validate_engrams",
+        json!({ "domain": "eng", "type": "note", "drift": true }),
+    )
+    .await
+    .unwrap();
+    let drift = out["drift"].as_array().unwrap();
+    assert_eq!(
+        drift.len(),
+        1,
+        "one entry per schema with a target: {drift:?}"
+    );
+    let entry = &drift[0];
+    assert_eq!(entry["schema"], json!("note"));
+    assert_eq!(entry["undeclared_observations"], json!(["insight"]));
+    assert_eq!(entry["undeclared_relations"], json!(["relates_to"]));
+    assert_eq!(entry["unused_observations"], json!(["pattern"]));
+    assert_eq!(entry["unused_relations"], json!([]));
+
+    // Flag off (the default): the drift key is absent, leaving existing callers
+    // untouched.
+    let off = call(
+        peer,
+        "validate_engrams",
+        json!({ "domain": "eng", "type": "note" }),
+    )
+    .await
+    .unwrap();
+    assert!(
+        off.get("drift").is_none(),
+        "drift key absent when the flag is off: {off}"
+    );
+
+    // Flag on with no schema in the domain: `schemas` is zero and `drift` is an
+    // honest empty array, not absent.
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "bare", "title": "Loose", "type": "note", "content": "- [decision] whatever" }),
+    )
+    .await
+    .unwrap();
+    let bare = call(
+        peer,
+        "validate_engrams",
+        json!({ "domain": "bare", "drift": true }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(bare["schemas"], json!(0));
+    assert_eq!(bare["drift"], json!([]));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn vocabulary_lists_tags_categories_and_relation_types() {
     let h = Harness::new(&["eng"]).await;

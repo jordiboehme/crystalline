@@ -781,3 +781,28 @@ pub fn diff(schema: &Schema, engrams: &[Engram]) -> SchemaDrift {
         unused_relations: declared_rel.difference(&observed_rel).cloned().collect(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parse::parse_engram;
+
+    /// `diff` pins the four drift lists: an observation category and a relation
+    /// type in use but undeclared land in the `undeclared_*` lists, a declared
+    /// category never used lands in `unused_observations` and a declared
+    /// relation that is used stays out of `unused_relations`.
+    #[test]
+    fn diff_reports_the_four_drift_lists() {
+        let schema_md = "---\ntype: schema\ntitle: Note Schema\npermalink: note-schema\nstatus: current\nentity: note\nversion: 1\nschema:\n  decision: string\n  pattern: string\n  depends_on: Note\nsettings:\n  validation: warn\n---\n\n# Note Schema\n";
+        let schema = Schema::from_engram(&parse_engram(schema_md).unwrap()).unwrap();
+
+        let note_md = "---\ntype: note\ntitle: Drifter\npermalink: drifter\nstatus: current\n---\n\n- [decision] chose it\n\n- [insight] noticed something\n\n- depends_on [[Foo]]\n\n- relates_to [[Bar]]\n";
+        let note = parse_engram(note_md).unwrap();
+
+        let drift = diff(&schema, std::slice::from_ref(&note));
+        assert_eq!(drift.undeclared_observations, vec!["insight".to_string()]);
+        assert_eq!(drift.undeclared_relations, vec!["relates_to".to_string()]);
+        assert_eq!(drift.unused_observations, vec!["pattern".to_string()]);
+        assert!(drift.unused_relations.is_empty());
+    }
+}
