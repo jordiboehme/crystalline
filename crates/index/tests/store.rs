@@ -965,6 +965,470 @@ parity!(
     search_applies_filters
 );
 
+// --- tag alias map -----------------------------------------------------------
+
+/// A minimal engram carrying an explicit tag set on its frontmatter.
+fn tagged_engram(title: &str, permalink: &str, tags: &[&str]) -> String {
+    let tag_lines: String = tags.iter().map(|t| format!("  - {t}\n")).collect();
+    format!(
+        "---\ntype: engram\ntitle: {title}\npermalink: {permalink}\ntags:\n{tag_lines}status: current\nrecorded_at: 2026-01-01\n---\n\n# {title}\n\nbody\n"
+    )
+}
+
+/// A MANIFEST whose body carries the given trailing section text (a
+/// `## Tag Aliases` block, or empty for none), so the sync's alias refresh has a
+/// real MANIFEST to read.
+fn manifest_with_aliases(trailing: &str) -> String {
+    format!(
+        "---\ntype: manifest\ntitle: Manifest\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Manifest\n\n## Scope\n\n- covers things\n\n## When to Use\n\n- when routing\n\n{trailing}"
+    )
+}
+
+/// Run a tags-field filter search and return the hit permalinks, sorted.
+async fn tag_filter_perms(
+    store: &dyn Store,
+    tags: &[&str],
+    domains: Option<Vec<String>>,
+) -> Vec<String> {
+    let page = store
+        .search(&SearchQuery {
+            tags: Some(tags.iter().map(|t| t.to_string()).collect()),
+            domains,
+            limit: 50,
+            page: 1,
+            ..SearchQuery::default()
+        })
+        .await
+        .unwrap();
+    let mut perms: Vec<String> = page.items.iter().map(|h| h.permalink.clone()).collect();
+    perms.sort();
+    perms
+}
+
+/// Run a metadata-filter search and return the hit permalinks, sorted.
+async fn meta_filter_perms(store: &dyn Store, filters: Vec<MetadataFilter>) -> Vec<String> {
+    let page = store
+        .search(&SearchQuery {
+            metadata_filters: filters,
+            limit: 50,
+            page: 1,
+            ..SearchQuery::default()
+        })
+        .await
+        .unwrap();
+    let mut perms: Vec<String> = page.items.iter().map(|h| h.permalink.clone()).collect();
+    perms.sort();
+    perms
+}
+
+/// The domain id for a name, via the idempotent upsert (a resync returns the
+/// same id), so a test can inject alias rows against a synced domain.
+async fn domain_id(store: &dyn Store, name: &str, root: &Path) -> DomainId {
+    store
+        .upsert_domain(name, Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap()
+}
+
+async fn replace_tag_aliases_roundtrip(store: &dyn Store) {
+    let a = store
+        .upsert_domain("a", Some("/k/a"), DomainKind::File)
+        .await
+        .unwrap();
+    let b = store
+        .upsert_domain("b", Some("/k/b"), DomainKind::File)
+        .await
+        .unwrap();
+
+    let pairs_a = vec![
+        ("old".to_string(), "new".to_string()),
+        ("legacy".to_string(), "modern".to_string()),
+    ];
+    store.replace_tag_aliases(a, &pairs_a).await.unwrap();
+    // Idempotent: replacing again with the same pairs leaves the same rows.
+    store.replace_tag_aliases(a, &pairs_a).await.unwrap();
+
+    // A scoped read is sorted by alias then canonical.
+    assert_eq!(
+        store.tag_aliases(Some(&["a".to_string()])).await.unwrap(),
+        vec![
+            ("legacy".to_string(), "modern".to_string()),
+            ("old".to_string(), "new".to_string()),
+        ]
+    );
+
+    // A second domain's map is separate; the union read merges both and dedupes
+    // the shared `old -> new` pair.
+    store
+        .replace_tag_aliases(b, &[("old".to_string(), "new".to_string())])
+        .await
+        .unwrap();
+    assert_eq!(
+        store.tag_aliases(None).await.unwrap(),
+        vec![
+            ("legacy".to_string(), "modern".to_string()),
+            ("old".to_string(), "new".to_string()),
+        ]
+    );
+
+    // Replacing with an empty slice clears just that domain's rows.
+    store.replace_tag_aliases(a, &[]).await.unwrap();
+    assert!(
+        store
+            .tag_aliases(Some(&["a".to_string()]))
+            .await
+            .unwrap()
+            .is_empty(),
+        "domain a is cleared"
+    );
+    assert_eq!(
+        store.tag_aliases(Some(&["b".to_string()])).await.unwrap(),
+        vec![("old".to_string(), "new".to_string())],
+        "domain b is untouched"
+    );
+}
+parity!(
+    replace_tag_aliases_is_idempotent_and_readable,
+    replace_tag_aliases_roundtrip
+);
+
+async fn search_expands_both_directions(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "modern.md",
+        &tagged_engram("Modern", "modern", &["modern"]),
+    );
+    write(
+        root,
+        "legacy.md",
+        &tagged_engram("Legacy", "legacy", &["legacy"]),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+    let d = domain_id(store, "d", root).await;
+    store
+        .replace_tag_aliases(d, &[("legacy".into(), "modern".into())])
+        .await
+        .unwrap();
+
+    let want = vec!["legacy".to_string(), "modern".to_string()];
+    // Searching the alias spelling reaches the canonical-tagged engram.
+    assert_eq!(tag_filter_perms(store, &["legacy"], None).await, want);
+    // Searching the canonical spelling reaches the alias-tagged engram.
+    assert_eq!(tag_filter_perms(store, &["modern"], None).await, want);
+    // A case-different query still folds and expands.
+    assert_eq!(tag_filter_perms(store, &["LEGACY"], None).await, want);
+}
+parity!(
+    search_tags_filter_expands_alias_both_directions,
+    search_expands_both_directions
+);
+
+async fn search_sibling_aliases(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "beta.md", &tagged_engram("Beta", "beta", &["b"]));
+    write(
+        root,
+        "other.md",
+        &tagged_engram("Other", "other", &["unrelated"]),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+    let d = domain_id(store, "d", root).await;
+    // a and b are siblings: both alias onto the shared canonical c.
+    store
+        .replace_tag_aliases(d, &[("a".into(), "c".into()), ("b".into(), "c".into())])
+        .await
+        .unwrap();
+
+    // Searching `a` reaches sibling `b`'s engram through the shared canonical,
+    // and never touches the unrelated engram.
+    assert_eq!(
+        tag_filter_perms(store, &["a"], None).await,
+        vec!["beta".to_string()]
+    );
+}
+parity!(search_expands_sibling_aliases, search_sibling_aliases);
+
+async fn search_single_hop_no_chain(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "ea.md", &tagged_engram("EA", "e-a", &["a"]));
+    write(root, "eb.md", &tagged_engram("EB", "e-b", &["b"]));
+    write(root, "ec.md", &tagged_engram("EC", "e-c", &["c"]));
+    sync_domain(store, "d", root).await.unwrap();
+    let d = domain_id(store, "d", root).await;
+    // A chain a -> b -> c: expansion is a single hop only.
+    store
+        .replace_tag_aliases(d, &[("a".into(), "b".into()), ("b".into(), "c".into())])
+        .await
+        .unwrap();
+
+    // `a` reaches a and b but never chains through to c.
+    let hits = tag_filter_perms(store, &["a"], None).await;
+    assert_eq!(hits, vec!["e-a".to_string(), "e-b".to_string()]);
+    assert!(
+        !hits.contains(&"e-c".to_string()),
+        "single hop must not chain onto c: {hits:?}"
+    );
+}
+parity!(search_alias_single_hop_no_chain, search_single_hop_no_chain);
+
+async fn search_union_all_domain_sweep(store: &dyn Store) {
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    write(dir_a.path(), "p.md", &tagged_engram("P", "ep", &["p"]));
+    write(dir_b.path(), "q.md", &tagged_engram("Q", "eq", &["q"]));
+    sync_domain(store, "a", dir_a.path()).await.unwrap();
+    sync_domain(store, "b", dir_b.path()).await.unwrap();
+    let a = domain_id(store, "a", dir_a.path()).await;
+    let b = domain_id(store, "b", dir_b.path()).await;
+    // The same alias `x` maps onto a different canonical in each domain.
+    store
+        .replace_tag_aliases(a, &[("x".into(), "p".into())])
+        .await
+        .unwrap();
+    store
+        .replace_tag_aliases(b, &[("x".into(), "q".into())])
+        .await
+        .unwrap();
+
+    // An all-domain search unions both maps, so x reaches both p and q.
+    assert_eq!(
+        tag_filter_perms(store, &["x"], None).await,
+        vec!["ep".to_string(), "eq".to_string()]
+    );
+}
+parity!(
+    search_alias_union_all_domain_sweep,
+    search_union_all_domain_sweep
+);
+
+async fn search_respects_domain_scope(store: &dyn Store) {
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    // Both domains hold an engram tagged with the canonical `acanon`.
+    write(dir_a.path(), "a.md", &tagged_engram("A", "ea", &["acanon"]));
+    write(dir_b.path(), "b.md", &tagged_engram("B", "eb", &["acanon"]));
+    sync_domain(store, "a", dir_a.path()).await.unwrap();
+    sync_domain(store, "b", dir_b.path()).await.unwrap();
+    let a = domain_id(store, "a", dir_a.path()).await;
+    // Only domain A declares `shared -> acanon`; B declares nothing.
+    store
+        .replace_tag_aliases(a, &[("shared".into(), "acanon".into())])
+        .await
+        .unwrap();
+
+    // Scoped to A, `shared` expands through A's map onto acanon and finds ea.
+    assert_eq!(
+        tag_filter_perms(store, &["shared"], Some(vec!["a".into()])).await,
+        vec!["ea".to_string()]
+    );
+    // Scoped to B, B has no map, so `shared` matches nothing: A's map is never
+    // used for a B-scoped search even though B holds an `acanon`-tagged engram.
+    assert!(
+        tag_filter_perms(store, &["shared"], Some(vec!["b".into()]))
+            .await
+            .is_empty(),
+        "a B-scoped search must not use A's alias map"
+    );
+}
+parity!(
+    search_alias_respects_domain_scope,
+    search_respects_domain_scope
+);
+
+async fn metadata_tags_arm_expands(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "modern.md",
+        &tagged_engram("Modern", "modern", &["modern"]),
+    );
+    write(
+        root,
+        "legacy.md",
+        &tagged_engram("Legacy", "legacy", &["legacy"]),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+    let d = domain_id(store, "d", root).await;
+    store
+        .replace_tag_aliases(d, &[("legacy".into(), "modern".into())])
+        .await
+        .unwrap();
+
+    let want = vec!["legacy".to_string(), "modern".to_string()];
+    // The Eq form `{ "tags": "legacy" }` expands to the whole class.
+    let eq = crystalline_index::parse_metadata_filters(&serde_json::json!({ "tags": "legacy" }))
+        .unwrap();
+    assert_eq!(meta_filter_perms(store, eq).await, want);
+    // The In form `{ "tags": { "$in": ["modern"] } }` expands the same class.
+    let in_op = crystalline_index::parse_metadata_filters(
+        &serde_json::json!({ "tags": { "$in": ["modern"] } }),
+    )
+    .unwrap();
+    assert_eq!(meta_filter_perms(store, in_op).await, want);
+}
+parity!(metadata_filter_tags_arm_expands, metadata_tags_arm_expands);
+
+async fn numeric_tags_metadata_filter_folds(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // An engram whose only tag is the bare number 42: YAML parses it as an
+    // integer, which the engram parser stores as the string "42".
+    write(
+        root,
+        "answer.md",
+        &tagged_engram("Answer", "answer", &["42"]),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+
+    // A `tags` Eq filter carrying the JSON NUMBER 42 (not a string) is stringified
+    // and folded to "42" by fold_tag_value, so it matches the engram identically
+    // on both backends. Pins the stringify-and-fold behavior.
+    let eq = crystalline_index::parse_metadata_filters(&serde_json::json!({ "tags": 42 })).unwrap();
+    assert_eq!(
+        meta_filter_perms(store, eq).await,
+        vec!["answer".to_string()]
+    );
+}
+parity!(
+    numeric_tags_metadata_filter_folds_on_both_backends,
+    numeric_tags_metadata_filter_folds
+);
+
+async fn tags_require_all_survives_expansion(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "both.md",
+        &tagged_engram("Both", "both", &["modern", "keep"]),
+    );
+    write(
+        root,
+        "onlymodern.md",
+        &tagged_engram("OnlyModern", "only-modern", &["modern"]),
+    );
+    write(
+        root,
+        "onlykeep.md",
+        &tagged_engram("OnlyKeep", "only-keep", &["keep"]),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+    let d = domain_id(store, "d", root).await;
+    store
+        .replace_tag_aliases(d, &[("legacy".into(), "modern".into())])
+        .await
+        .unwrap();
+
+    // Require both `legacy` (expands to {legacy, modern}) and `keep`. Only the
+    // engram carrying a modern-class tag AND keep qualifies: expansion widens the
+    // first predicate, but the AND across the two requested tags is preserved.
+    assert_eq!(
+        tag_filter_perms(store, &["legacy", "keep"], None).await,
+        vec!["both".to_string()]
+    );
+}
+parity!(
+    tags_require_all_survives_alias_expansion,
+    tags_require_all_survives_expansion
+);
+
+async fn sync_populates_and_clears(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    // A MANIFEST declaring one alias: the sync folds and stores it.
+    write(
+        root,
+        "MANIFEST.md",
+        &manifest_with_aliases("## Tag Aliases\n\n- old -> new\n"),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+    assert_eq!(
+        store.tag_aliases(Some(&["d".to_string()])).await.unwrap(),
+        vec![("old".to_string(), "new".to_string())],
+        "the sync populated the alias from the MANIFEST"
+    );
+
+    // A resync follows a changed section, replacing the whole map.
+    write(
+        root,
+        "MANIFEST.md",
+        &manifest_with_aliases("## Tag Aliases\n\n- alpha -> beta\n"),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+    assert_eq!(
+        store.tag_aliases(Some(&["d".to_string()])).await.unwrap(),
+        vec![("alpha".to_string(), "beta".to_string())],
+        "the resync replaced the map with the new declaration"
+    );
+
+    // Removing the section clears the rows on the next sync.
+    write(root, "MANIFEST.md", &manifest_with_aliases(""));
+    sync_domain(store, "d", root).await.unwrap();
+    assert!(
+        store
+            .tag_aliases(Some(&["d".to_string()]))
+            .await
+            .unwrap()
+            .is_empty(),
+        "removing the section cleared the alias map"
+    );
+}
+parity!(
+    sync_populates_and_clears_tag_aliases,
+    sync_populates_and_clears
+);
+
+async fn vocabulary_reports_its_aliases(store: &dyn Store) {
+    let d1 = store
+        .upsert_domain("d1", Some("/k/d1"), DomainKind::File)
+        .await
+        .unwrap();
+    let d2 = store
+        .upsert_domain("d2", Some("/k/d2"), DomainKind::File)
+        .await
+        .unwrap();
+    store
+        .replace_tag_aliases(d1, &[("old".into(), "new".into())])
+        .await
+        .unwrap();
+    store
+        .replace_tag_aliases(
+            d2,
+            &[("old".into(), "new".into()), ("foo".into(), "bar".into())],
+        )
+        .await
+        .unwrap();
+
+    let pairs = |v: &Vocabulary| -> Vec<(String, String)> {
+        v.aliases
+            .iter()
+            .map(|a| (a.alias.clone(), a.canonical.clone()))
+            .collect()
+    };
+
+    // Scoped: just d1's alias.
+    let scoped = store.vocabulary(Some("d1")).await.unwrap();
+    assert_eq!(pairs(&scoped), vec![("old".to_string(), "new".to_string())]);
+
+    // All-domain: the union, deduped across the shared `old -> new` and sorted
+    // by alias then canonical.
+    let all = store.vocabulary(None).await.unwrap();
+    assert_eq!(
+        pairs(&all),
+        vec![
+            ("foo".to_string(), "bar".to_string()),
+            ("old".to_string(), "new".to_string()),
+        ]
+    );
+}
+parity!(vocabulary_reports_aliases, vocabulary_reports_its_aliases);
+
 async fn canonical_temporal_filter(store: &dyn Store) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();

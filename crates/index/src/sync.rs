@@ -516,6 +516,15 @@ pub async fn apply_scan<S: Store + ?Sized>(
     };
     report.links_resolved = links_resolved;
 
+    // Refresh the derived tag-alias map from the (now-current) MANIFEST, inside
+    // the same transaction. Unconditional, which is what delivers
+    // populate-on-next-sync: a domain that has never synced under this feature
+    // gains its aliases on its first sync, and a removed section clears them.
+    if let Err(e) = refresh_tag_aliases(store, domain).await {
+        let _ = store.rollback().await;
+        return Err(e);
+    }
+
     let now = chrono::Utc::now().to_rfc3339();
     if let Err(e) = store.record_sync(domain, &now).await {
         let _ = store.rollback().await;
@@ -525,6 +534,20 @@ pub async fn apply_scan<S: Store + ?Sized>(
 
     report.duration_ms = duration_ms(started.elapsed());
     Ok(report)
+}
+
+/// Refresh a domain's derived tag-alias rows from its MANIFEST. Reads the stored
+/// `MANIFEST.md` content, folds its `## Tag Aliases` declarations to `(alias,
+/// canonical)` pairs and replaces the domain's rows with them. A missing or
+/// unparseable MANIFEST folds to no pairs, so the rows are cleared and a removed
+/// section takes effect on the next sync. The store never parses markdown: the
+/// pairs are folded here in the format layer and handed over already lowercased.
+pub async fn refresh_tag_aliases<S: Store + ?Sized>(store: &S, domain: DomainId) -> Result<()> {
+    let pairs = match store.engram_content(domain, "MANIFEST.md").await? {
+        Some(content) => crystalline_core::tag_alias_pairs(&content),
+        None => Vec::new(),
+    };
+    store.replace_tag_aliases(domain, &pairs).await
 }
 
 #[allow(clippy::too_many_arguments)]

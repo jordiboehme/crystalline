@@ -160,3 +160,214 @@ fn merge_folds_a_tag_into_an_existing_one() {
         "the prose hashtag is never touched: {after}"
     );
 }
+
+#[test]
+fn merge_records_the_alias_in_the_manifest() {
+    let work = tempfile::tempdir().unwrap();
+    let (domain_dir, config, db) = seed(work.path());
+
+    let manifest_before = std::fs::read_to_string(domain_dir.join("MANIFEST.md")).unwrap();
+
+    bin()
+        .args(["tags", "merge", "topic", "subject", "--yes", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "Recorded the alias in 1 MANIFEST.",
+        ));
+
+    // The alias section is appended verbatim: every prior byte is preserved and a
+    // fresh `## Tag Aliases` section carrying the one bullet lands at end of file.
+    let manifest_after = std::fs::read_to_string(domain_dir.join("MANIFEST.md")).unwrap();
+    assert_eq!(
+        manifest_after,
+        format!("{manifest_before}\n## Tag Aliases\n\n- topic -> subject\n"),
+        "the merge appends exactly the alias bullet, nothing else moves"
+    );
+}
+
+#[test]
+fn no_alias_leaves_the_manifest_untouched() {
+    let work = tempfile::tempdir().unwrap();
+    let (domain_dir, config, db) = seed(work.path());
+
+    let manifest_before = std::fs::read_to_string(domain_dir.join("MANIFEST.md")).unwrap();
+
+    bin()
+        .args([
+            "tags",
+            "merge",
+            "topic",
+            "subject",
+            "--no-alias",
+            "--yes",
+            "--config",
+        ])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("Rewrote 1 engram."));
+
+    let manifest_after = std::fs::read_to_string(domain_dir.join("MANIFEST.md")).unwrap();
+    assert_eq!(
+        manifest_after, manifest_before,
+        "--no-alias records nothing, so the MANIFEST is byte-identical"
+    );
+}
+
+#[test]
+fn rename_records_no_alias() {
+    let work = tempfile::tempdir().unwrap();
+    let (domain_dir, config, db) = seed(work.path());
+
+    let manifest_before = std::fs::read_to_string(domain_dir.join("MANIFEST.md")).unwrap();
+
+    bin()
+        .args(["tags", "rename", "topic", "subtopic", "--yes", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .success();
+
+    let manifest_after = std::fs::read_to_string(domain_dir.join("MANIFEST.md")).unwrap();
+    assert_eq!(
+        manifest_after, manifest_before,
+        "a rename never records an alias, so the MANIFEST is byte-identical"
+    );
+}
+
+#[test]
+fn merge_json_response_carries_alias_recorded() {
+    let work = tempfile::tempdir().unwrap();
+    let (_domain_dir, config, db) = seed(work.path());
+
+    let out = bin()
+        .args([
+            "tags", "merge", "topic", "subject", "--yes", "--json", "--config",
+        ])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let recorded: Vec<&str> = value["alias_recorded"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d.as_str().unwrap())
+        .collect();
+    assert_eq!(recorded, vec!["eng"], "the affected domain is recorded");
+    assert!(
+        value["alias_skipped"].as_array().unwrap().is_empty(),
+        "no domain was skipped"
+    );
+}
+
+#[test]
+fn merge_skips_a_domain_without_a_manifest() {
+    let work = tempfile::tempdir().unwrap();
+    let (domain_dir, config, db) = seed(work.path());
+
+    // Remove the MANIFEST from disk after the domain is indexed: the merge still
+    // rewrites the engram, but recording the alias finds no MANIFEST to append to.
+    std::fs::remove_file(domain_dir.join("MANIFEST.md")).unwrap();
+
+    let out = bin()
+        .args([
+            "tags", "merge", "topic", "subject", "--yes", "--json", "--config",
+        ])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["rewritten"], 1, "the engram is still rewritten");
+    let skipped: Vec<&str> = value["alias_skipped"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d.as_str().unwrap())
+        .collect();
+    assert_eq!(skipped, vec!["eng"], "the MANIFEST-less domain is skipped");
+    assert!(
+        value["alias_recorded"].as_array().unwrap().is_empty(),
+        "nothing was recorded"
+    );
+}
+
+#[test]
+fn merge_surfaces_a_conflicting_alias_and_leaves_the_manifest_untouched() {
+    let work = tempfile::tempdir().unwrap();
+    let (domain_dir, config, db) = seed(work.path());
+
+    // Pre-declare a different mapping for `topic`: first-wins parsing keeps this,
+    // so recording `topic -> subject` would be inert. The merge must surface the
+    // conflict and leave the MANIFEST byte-identical, never a false success.
+    let manifest_path = domain_dir.join("MANIFEST.md");
+    let mut manifest_before = std::fs::read_to_string(&manifest_path).unwrap();
+    manifest_before.push_str("\n## Tag Aliases\n\n- topic -> other\n");
+    std::fs::write(&manifest_path, &manifest_before).unwrap();
+
+    let out = bin()
+        .args([
+            "tags", "merge", "topic", "subject", "--yes", "--json", "--config",
+        ])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+
+    let conflict: Vec<&str> = value["alias_conflict"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d.as_str().unwrap())
+        .collect();
+    assert_eq!(conflict, vec!["eng"], "the conflicting domain is surfaced");
+    assert!(
+        value["alias_recorded"].as_array().unwrap().is_empty(),
+        "a conflicting mapping is not recorded"
+    );
+
+    let manifest_after = std::fs::read_to_string(&manifest_path).unwrap();
+    assert_eq!(
+        manifest_after, manifest_before,
+        "a conflicting alias leaves the MANIFEST byte-identical"
+    );
+}
+
+#[test]
+fn merge_prints_a_conflict_note_for_a_conflicting_alias() {
+    let work = tempfile::tempdir().unwrap();
+    let (domain_dir, config, db) = seed(work.path());
+
+    // Same conflicting pre-declaration, checked through the human-readable path.
+    let manifest_path = domain_dir.join("MANIFEST.md");
+    let mut manifest = std::fs::read_to_string(&manifest_path).unwrap();
+    manifest.push_str("\n## Tag Aliases\n\n- topic -> other\n");
+    std::fs::write(&manifest_path, &manifest).unwrap();
+
+    bin()
+        .args(["tags", "merge", "topic", "subject", "--yes", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "Alias topic -> subject conflicts with an existing alias in eng; MANIFEST left unchanged.",
+        ));
+}

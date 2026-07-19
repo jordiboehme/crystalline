@@ -38,7 +38,8 @@ pub use engram::{
 pub use harness::{HarnessKind, HarnessPaths, artifact_base, harness_paths};
 pub use manifest::{
     ArtifactType, Manifest, ProblemKind, ProvisioningDecl, ProvisioningProblem,
-    ProvisioningSection, in_root_artifact_dirs, manifest_template,
+    ProvisioningSection, TagAliasDecl, TagAliasProblem, TagAliasProblemKind, TagAliasSection,
+    append_tag_alias, in_root_artifact_dirs, manifest_template, tag_alias_pairs,
 };
 pub use parse::{LosslessEngram, ParseError, parse_engram, parse_engram_lossless};
 pub use prompt::{

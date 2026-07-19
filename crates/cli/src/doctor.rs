@@ -41,7 +41,7 @@ use crystalline_core::config::{self, DomainEntry, GlobalConfig, OriginConfig};
 use crystalline_core::provision;
 use crystalline_core::verify::{self, VerifyOptions};
 use crystalline_core::{HarnessKind, harness_paths};
-use crystalline_index::{Store, TagCluster, configured_model_id, tag_clusters};
+use crystalline_index::{Store, TagCluster, configured_model_id, tag_clusters_with_aliases};
 use crystalline_remote::TokenStore;
 use crystalline_remote::github::auth::auth_base;
 use crystalline_remote::state::{OriginState, verify_base};
@@ -1004,7 +1004,9 @@ async fn check_tags(store: Option<&dyn Store>) -> Result<Option<TagsDoctor>> {
         .await
         .map_err(|e| anyhow!("could not read the vocabulary: {e}"))?;
     Ok(Some(TagsDoctor {
-        clusters: tag_clusters(&vocab.tags),
+        // Fold declared aliases out first, so a cluster an alias already explains
+        // is never surfaced as tag drift.
+        clusters: tag_clusters_with_aliases(&vocab.tags, &vocab.aliases),
     }))
 }
 
@@ -1479,4 +1481,64 @@ fn render_provision_counts(counts: &BTreeMap<String, usize>) -> String {
         .map(|(kind, n)| format!("{n} {kind}"))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crystalline_index::{TursoStore, sync_domain};
+
+    /// Sync a temp file domain holding a MANIFEST (whose tail is `manifest_tail`,
+    /// so a test can add a `## Tag Aliases` section) plus two engrams whose tags
+    /// are a near-duplicate pair, then return its doctor tag diagnostics.
+    async fn tags_doctor_over(manifest_tail: &str) -> TagsDoctor {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("MANIFEST.md"),
+            format!(
+                "---\ntype: manifest\ntitle: KB\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# KB\n\n## Scope\n\n- kb\n\n## When to Use\n\n- routing\n{manifest_tail}"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("a.md"),
+            "---\ntype: engram\ntitle: A\npermalink: a\ntags:\n  - colour\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nbody a\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("b.md"),
+            "---\ntype: engram\ntitle: B\npermalink: b\ntags:\n  - color\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nbody b\n",
+        )
+        .unwrap();
+        let store = TursoStore::open_in_memory().await.unwrap();
+        sync_domain(&store, "kb", root).await.unwrap();
+        let store_ref: &dyn Store = &store;
+        check_tags(Some(store_ref)).await.unwrap().unwrap()
+    }
+
+    #[tokio::test]
+    async fn near_duplicate_tags_cluster_without_an_alias() {
+        let doctor = tags_doctor_over("").await;
+        assert!(
+            doctor.clusters.iter().any(|c| {
+                c.tags.contains(&"colour".to_string()) && c.tags.contains(&"color".to_string())
+            }),
+            "colour and color cluster when no alias explains them: {:?}",
+            doctor.clusters
+        );
+    }
+
+    #[tokio::test]
+    async fn a_declared_alias_suppresses_its_cluster() {
+        let doctor = tags_doctor_over("\n## Tag Aliases\n\n- colour -> color\n").await;
+        assert!(
+            !doctor
+                .clusters
+                .iter()
+                .any(|c| c.tags.contains(&"colour".to_string())),
+            "the alias folds colour onto color, so the cluster is suppressed: {:?}",
+            doctor.clusters
+        );
+    }
 }

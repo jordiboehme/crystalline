@@ -10,7 +10,9 @@
 use indexmap::IndexMap;
 
 use crate::engram::Heading;
-use crate::manifest::{Manifest, ProblemKind, ProvisioningSection, in_root_artifact_dirs};
+use crate::manifest::{
+    Manifest, ProblemKind, ProvisioningSection, TagAliasSection, in_root_artifact_dirs,
+};
 
 use super::scanner::Domain;
 use super::{Severity, Sink};
@@ -117,6 +119,10 @@ fn check_manifest(domain: &Domain, sink: &mut Sink) {
         check_provisioning(&section, &file.path, &domain.root, sink);
     }
 
+    if let Some(section) = manifest.tag_aliases() {
+        check_tag_aliases(&section, &file.path, sink);
+    }
+
     check_duplicate_h2(&engram.headings, &file.path, sink);
 }
 
@@ -164,6 +170,24 @@ fn check_provisioning(
                 None,
             );
         }
+    }
+}
+
+/// The `## Tag Aliases` rules. Every parse problem - a malformed bullet, a
+/// self alias, a duplicate alias, a non-canonical target or a chained alias -
+/// is one `M107` warning carrying the problem's own reason, so no message text
+/// is matched. Overlong bullets are already covered by `M102` across every
+/// section, so this rule adds nothing there.
+fn check_tag_aliases(section: &TagAliasSection, path: &std::path::Path, sink: &mut Sink) {
+    for problem in &section.problems {
+        sink.emit(
+            path,
+            None,
+            "M107",
+            Severity::Warning,
+            format!("`## Tag Aliases`: {}", problem.reason),
+            None,
+        );
     }
 }
 

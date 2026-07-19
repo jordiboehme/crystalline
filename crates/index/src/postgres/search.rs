@@ -14,6 +14,7 @@ use std::collections::HashSet;
 
 use sqlx::PgConnection;
 
+use crate::alias::AliasMap;
 use crate::error::{IndexError, Result};
 use crate::store::{
     EdgeKind, EmbeddingCoverage, EngramId, FilterOp, GraphEdge, GraphNode, GraphSlice, HitKind,
@@ -46,11 +47,14 @@ pub(super) async fn run_search(
     conn: &mut PgConnection,
     query: &SearchQuery,
     coverage: Option<&EmbeddingCoverage>,
+    aliases: &AliasMap,
 ) -> Result<Page<SearchHit>> {
     match query.mode {
-        SearchMode::Semantic => run_semantic(conn, query, require_coverage(coverage)?).await,
-        SearchMode::Hybrid => run_hybrid(conn, query, require_coverage(coverage)?).await,
-        _ => run_lexical(conn, query).await,
+        SearchMode::Semantic => {
+            run_semantic(conn, query, require_coverage(coverage)?, aliases).await
+        }
+        SearchMode::Hybrid => run_hybrid(conn, query, require_coverage(coverage)?, aliases).await,
+        _ => run_lexical(conn, query, aliases).await,
     }
 }
 
@@ -119,7 +123,11 @@ async fn attach_tags(conn: &mut PgConnection, hits: &mut [(i64, SearchHit)]) -> 
 
 /// The lexical modes: Text, Title and Permalink. A LIKE-candidate prefilter in
 /// SQL, ranked in Rust by a weighted term-frequency score.
-async fn run_lexical(conn: &mut PgConnection, query: &SearchQuery) -> Result<Page<SearchHit>> {
+async fn run_lexical(
+    conn: &mut PgConnection,
+    query: &SearchQuery,
+    aliases: &AliasMap,
+) -> Result<Page<SearchHit>> {
     let limit = if query.limit == 0 { 10 } else { query.limit };
     let page = query.page.max(1);
 
@@ -129,7 +137,7 @@ async fn run_lexical(conn: &mut PgConnection, query: &SearchQuery) -> Result<Pag
         let mut clauses: Vec<String> = Vec::new();
         let mut params: Vec<Param> = Vec::new();
         let mut n = 1usize;
-        build_scalar_filters(query, &mut clauses, &mut params, &mut n);
+        build_scalar_filters(query, &mut clauses, &mut params, &mut n, aliases);
         let where_sql = if clauses.is_empty() {
             String::new()
         } else {
@@ -138,7 +146,7 @@ async fn run_lexical(conn: &mut PgConnection, query: &SearchQuery) -> Result<Pag
         return filter_only(conn, &where_sql, params, limit, page).await;
     }
 
-    let scored = scored_lexical(conn, query, &terms).await?;
+    let scored = scored_lexical(conn, query, &terms, aliases).await?;
     let total = scored.len();
     let start = (page - 1) * limit;
     let mut items: Vec<(i64, SearchHit)> = Vec::new();
@@ -155,11 +163,12 @@ async fn scored_lexical(
     conn: &mut PgConnection,
     query: &SearchQuery,
     terms: &[String],
+    aliases: &AliasMap,
 ) -> Result<Vec<(f64, Candidate)>> {
     let mut clauses: Vec<String> = Vec::new();
     let mut params: Vec<Param> = Vec::new();
     let mut n = 1usize;
-    build_scalar_filters(query, &mut clauses, &mut params, &mut n);
+    build_scalar_filters(query, &mut clauses, &mut params, &mut n, aliases);
 
     let cols: &[&str] = match query.mode {
         SearchMode::Title => &["title"],
@@ -261,6 +270,7 @@ async fn run_semantic(
     conn: &mut PgConnection,
     query: &SearchQuery,
     coverage: &EmbeddingCoverage,
+    aliases: &AliasMap,
 ) -> Result<Page<SearchHit>> {
     let qvec = query
         .query_embedding
@@ -277,7 +287,7 @@ async fn run_semantic(
 
     check_staleness(coverage, active, dims)?;
 
-    let mut hits = semantic_candidates(conn, query, qvec, active, dims).await?;
+    let mut hits = semantic_candidates(conn, query, qvec, active, dims, aliases).await?;
     hits.retain(|(sim, _)| *sim >= min_sim);
     hits.sort_by(|a, b| {
         b.0.partial_cmp(&a.0)
@@ -307,6 +317,7 @@ async fn run_hybrid(
     conn: &mut PgConnection,
     query: &SearchQuery,
     coverage: &EmbeddingCoverage,
+    aliases: &AliasMap,
 ) -> Result<Page<SearchHit>> {
     let qvec = query
         .query_embedding
@@ -327,9 +338,9 @@ async fn run_hybrid(
     let text_scored = if terms.is_empty() {
         Vec::new()
     } else {
-        scored_lexical(conn, query, &terms).await?
+        scored_lexical(conn, query, &terms, aliases).await?
     };
-    let mut sem = semantic_candidates(conn, query, qvec, active, dims).await?;
+    let mut sem = semantic_candidates(conn, query, qvec, active, dims, aliases).await?;
     sem.retain(|(sim, _)| *sim >= min_sim);
 
     let max_text = text_scored.iter().map(|(s, _)| *s).fold(0.0_f64, f64::max);
@@ -419,13 +430,14 @@ async fn semantic_candidates(
     qvec: &[f32],
     active: &str,
     dims: usize,
+    aliases: &AliasMap,
 ) -> Result<Vec<(f64, Candidate)>> {
     // $1 is the query vector; scalar filters and the model and dims predicates
     // take the placeholders after it.
     let mut params: Vec<Param> = vec![Param::Vector(pgvector::Vector::from(qvec.to_vec()))];
     let mut clauses: Vec<String> = Vec::new();
     let mut n = 2usize;
-    build_scalar_filters(query, &mut clauses, &mut params, &mut n);
+    build_scalar_filters(query, &mut clauses, &mut params, &mut n, aliases);
     let model_ph = n;
     params.push(Param::Text(active.to_string()));
     n += 1;
@@ -492,6 +504,7 @@ fn build_scalar_filters(
     clauses: &mut Vec<String>,
     params: &mut Vec<Param>,
     n: &mut usize,
+    aliases: &AliasMap,
 ) {
     if let Some(domains) = &query.domains
         && !domains.is_empty()
@@ -542,20 +555,44 @@ fn build_scalar_filters(
 
     if let Some(tags) = &query.tags {
         for tag in tags {
-            clauses.push(format!(
-                "EXISTS (SELECT 1 FROM engram_tag et JOIN tag t ON t.id=et.tag_id WHERE et.engram_id=e.id AND t.name=${n})"
-            ));
-            // Tag identity is case-folded in the index, so a filter folds too.
-            params.push(Param::Text(tag.to_lowercase()));
-            *n += 1;
+            // One EXISTS per requested tag (require-ALL preserved), each matching
+            // the tag's whole alias equivalence class via an IN list (OR within
+            // the class). The class is sorted, so the binding order is stable.
+            clauses.push(tag_class_exists(&tag.to_lowercase(), aliases, params, n));
         }
     }
 
     for f in &query.metadata_filters {
-        if let Some(clause) = metadata_clause(f, params, n) {
+        if let Some(clause) = metadata_clause(f, params, n, aliases) {
             clauses.push(clause);
         }
     }
+}
+
+/// An `EXISTS` matching an engram that carries any member of a folded tag's
+/// alias equivalence class. Tag identity is case-folded in the index, so the
+/// class members (already folded) match `tag.name` directly. When the map is
+/// empty the class is the tag alone, so this is a one-placeholder `IN`.
+fn tag_class_exists(
+    folded: &str,
+    aliases: &AliasMap,
+    params: &mut Vec<Param>,
+    n: &mut usize,
+) -> String {
+    let class = aliases.class_of(folded);
+    let ph: Vec<String> = class
+        .iter()
+        .map(|member| {
+            params.push(Param::Text(member.clone()));
+            let p = format!("${n}");
+            *n += 1;
+            p
+        })
+        .collect();
+    format!(
+        "EXISTS (SELECT 1 FROM engram_tag et JOIN tag t ON t.id=et.tag_id WHERE et.engram_id=e.id AND t.name IN ({}))",
+        ph.join(",")
+    )
 }
 
 /// Map one metadata filter to a SQL predicate, appending its bound values.
@@ -563,17 +600,19 @@ fn build_scalar_filters(
 /// Non-promoted comparisons are lexical (ISO-string ordering for dates), matching
 /// the Turso backend's stance; numeric ordering on custom keys is a documented
 /// v0.2.0 limitation.
-fn metadata_clause(f: &MetadataFilter, params: &mut Vec<Param>, n: &mut usize) -> Option<String> {
+fn metadata_clause(
+    f: &MetadataFilter,
+    params: &mut Vec<Param>,
+    n: &mut usize,
+    aliases: &AliasMap,
+) -> Option<String> {
     let key = f.key.as_str();
 
     if key == "tags" {
+        // A `tags` metadata filter folds the same as the dedicated `tags` field:
+        // each value expands to its alias equivalence class.
         let exists = |val: &serde_json::Value, params: &mut Vec<Param>, n: &mut usize| {
-            let p = format!(
-                "EXISTS (SELECT 1 FROM engram_tag et JOIN tag t ON t.id=et.tag_id WHERE et.engram_id=e.id AND t.name=${n})"
-            );
-            params.push(tag_filter_param(val));
-            *n += 1;
-            p
+            tag_class_exists(&fold_tag_value(val), aliases, params, n)
         };
         return match &f.op {
             FilterOp::Eq(v) => Some(exists(v, params, n)),
@@ -649,13 +688,14 @@ fn json_to_param(v: &serde_json::Value) -> Param {
     }
 }
 
-/// Bind a `tags` filter value, folded to lowercase so it matches the
-/// case-folded `tag.name`. A non-string value passes through unchanged (a tags
-/// filter is a string in practice).
-fn tag_filter_param(v: &serde_json::Value) -> Param {
+/// Fold a `tags` filter value to the lowercase string used for alias expansion
+/// and matched against the case-folded `tag.name`. A tags filter is a string in
+/// practice; a non-string value is stringified so it still binds to the TEXT
+/// column.
+fn fold_tag_value(v: &serde_json::Value) -> String {
     match v {
-        serde_json::Value::String(s) => Param::Text(s.to_lowercase()),
-        other => json_to_param(other),
+        serde_json::Value::String(s) => s.to_lowercase(),
+        other => other.to_string().to_lowercase(),
     }
 }
 

@@ -697,12 +697,14 @@ pub async fn domain_import(
 
 /// Rename or merge a tag across the engrams that carry it: over the daemon when
 /// one owns the index, else against a directly opened store.
+#[allow(clippy::too_many_arguments)]
 pub async fn tags_retag(
     old: &str,
     new: &str,
     domain: Option<&str>,
     merge: bool,
     dry_run: bool,
+    no_alias: bool,
     db: Option<&Path>,
     config_path: Option<&Path>,
 ) -> anyhow::Result<Value> {
@@ -710,7 +712,7 @@ pub async fn tags_retag(
     if use_daemon(db, config_path)
         && let Some(data) = ctl_if_running(json!({
             "v": 1, "cmd": "retag", "old": old, "new": new,
-            "domain": domain, "merge": merge, "dry_run": dry_run,
+            "domain": domain, "merge": merge, "dry_run": dry_run, "no_alias": no_alias,
         }))
         .await?
     {
@@ -719,7 +721,9 @@ pub async fn tags_retag(
     let loaded = overlay::load(config_path)?;
     let db_path = resolve_db(db)?;
     let engine = open_standalone(loaded, &db_path, false).await?;
-    Ok(engine.retag(old, new, domain, merge, dry_run).await?)
+    Ok(engine
+        .retag(old, new, domain, merge, dry_run, !no_alias)
+        .await?)
 }
 
 /// Export a domain's engrams to a filesystem folder: over the daemon when one

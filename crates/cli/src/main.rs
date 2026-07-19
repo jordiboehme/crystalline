@@ -750,6 +750,9 @@ enum TagsCommand {
         /// Report the affected engrams without writing anything.
         #[arg(long)]
         dry_run: bool,
+        /// Do not record the merge as a tag alias in the affected MANIFESTs.
+        #[arg(long)]
+        no_alias: bool,
         /// Load the global config from this file instead of the default path.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -1993,7 +1996,7 @@ fn run_domain(command: DomainCommand, db: Option<PathBuf>, json: bool) -> anyhow
 /// refuses rather than hang. `--json` needs a non-interactive mode (`--yes` or
 /// `--dry-run`) since it cannot ask a question.
 async fn run_tags(command: TagsCommand, db: Option<PathBuf>, json: bool) -> anyhow::Result<()> {
-    let (old, new, domain, yes, dry_run, config, merge) = match command {
+    let (old, new, domain, yes, dry_run, config, merge, no_alias) = match command {
         TagsCommand::Rename {
             old,
             new,
@@ -2001,15 +2004,16 @@ async fn run_tags(command: TagsCommand, db: Option<PathBuf>, json: bool) -> anyh
             yes,
             dry_run,
             config,
-        } => (old, new, domain, yes, dry_run, config, false),
+        } => (old, new, domain, yes, dry_run, config, false, false),
         TagsCommand::Merge {
             old,
             into,
             domain,
             yes,
             dry_run,
+            no_alias,
             config,
-        } => (old, into, domain, yes, dry_run, config, true),
+        } => (old, into, domain, yes, dry_run, config, true, no_alias),
     };
 
     if json && !dry_run && !yes {
@@ -2023,6 +2027,7 @@ async fn run_tags(command: TagsCommand, db: Option<PathBuf>, json: bool) -> anyh
         domain.as_deref(),
         merge,
         true,
+        no_alias,
         db.as_deref(),
         config.as_deref(),
     )
@@ -2068,6 +2073,7 @@ async fn run_tags(command: TagsCommand, db: Option<PathBuf>, json: bool) -> anyh
         domain.as_deref(),
         merge,
         false,
+        no_alias,
         db.as_deref(),
         config.as_deref(),
     )
@@ -2082,8 +2088,54 @@ async fn run_tags(command: TagsCommand, db: Option<PathBuf>, json: bool) -> anyh
             .unwrap_or(0);
         let word = if n == 1 { "engram" } else { "engrams" };
         println!("Rewrote {n} {word}.");
+        print_alias_note(&result);
     }
     Ok(())
+}
+
+/// Print the tag-alias recording summary of a merge, when the response carries
+/// it. A rename or a `--no-alias` merge omits the fields, so nothing prints.
+fn print_alias_note(result: &serde_json::Value) {
+    use serde_json::Value;
+    let recorded = result
+        .get("alias_recorded")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    if recorded > 0 {
+        let word = if recorded == 1 {
+            "MANIFEST"
+        } else {
+            "MANIFESTs"
+        };
+        println!("Recorded the alias in {recorded} {word}.");
+    }
+    let skipped = result
+        .get("alias_skipped")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    if skipped > 0 {
+        let word = if skipped == 1 { "domain" } else { "domains" };
+        println!("Skipped the alias in {skipped} {word} without a MANIFEST.");
+    }
+    if let Some(conflicts) = result.get("alias_conflict").and_then(Value::as_array)
+        && !conflicts.is_empty()
+    {
+        let old = result
+            .get("old")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let new = result
+            .get("new")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        for domain in conflicts.iter().filter_map(Value::as_str) {
+            println!(
+                "Alias {old} -> {new} conflicts with an existing alias in {domain}; MANIFEST left unchanged."
+            );
+        }
+    }
 }
 
 /// Print the affected engrams for a `tags rename` / `tags merge` preview.

@@ -57,6 +57,11 @@ pub const MIGRATIONS: &[Migration] = &[
         label: "case-folded tag identity",
         sql: SCHEMA_V7,
     },
+    Migration {
+        version: 8,
+        label: "tag alias map",
+        sql: SCHEMA_V8,
+    },
 ];
 
 const SCHEMA_V1: &str = r#"
@@ -269,8 +274,26 @@ DELETE FROM tag WHERE id NOT IN (SELECT MIN(id) FROM tag GROUP BY lower(name));
 UPDATE tag SET name = lower(name);
 "#;
 
-/// The tables cleared by `wipe()`, child rows first. `domain_lock` references
-/// `domain(id)`, so it is cleared before `domain`.
+// The derived tag-alias map. One row per `(domain, alias)` records the canonical
+// spelling an old tag folds onto at query time, so a search on either spelling
+// matches every engram tagged with a sibling. Derived purely from MANIFEST
+// content and repopulated on the next sync per domain: an upgraded database
+// carries no aliases until each domain resyncs (a new-feature grace), and a
+// wipe+resync is the accepted way to backfill. The canonical index serves the
+// reverse lookup during expansion.
+const SCHEMA_V8: &str = r#"
+CREATE TABLE tag_alias (
+    domain_id INTEGER NOT NULL REFERENCES domain(id),
+    alias TEXT NOT NULL,
+    canonical TEXT NOT NULL,
+    PRIMARY KEY (domain_id, alias)
+);
+CREATE INDEX idx_tag_alias_canonical ON tag_alias(domain_id, canonical);
+"#;
+
+/// The tables cleared by `wipe()`, child rows first. `tag_alias` and
+/// `domain_lock` both reference `domain(id)`, so they are cleared before
+/// `domain`.
 pub const WIPE_TABLES: &[&str] = &[
     "observation_tag",
     "engram_tag",
@@ -280,6 +303,7 @@ pub const WIPE_TABLES: &[&str] = &[
     "link",
     "tag",
     "engram",
+    "tag_alias",
     "domain_lock",
     "domain",
 ];
