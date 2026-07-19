@@ -427,6 +427,10 @@ pub struct SearchHit {
     pub engram_type: String,
     /// The engram `status`.
     pub status: String,
+    /// The engram's tags, alphabetical and folded to lowercase; empty when the
+    /// engram is untagged. Every hit passively teaches the querying agent the
+    /// existing vocabulary. Observation-kind hits carry their engram's tags.
+    pub tags: Vec<String>,
     /// Whether the hit is the engram or one of its observations.
     #[serde(flatten)]
     pub kind: HitKind,

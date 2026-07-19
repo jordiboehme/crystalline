@@ -548,6 +548,8 @@ async fn search_filter_only_and_text_fallback() {
     let hits = out["hits"].as_array().unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0]["permalink"], json!("gadget"));
+    // Every hit teaches the querying agent the engram's vocabulary.
+    assert_eq!(hits[0]["tags"], json!(["software"]));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -245,6 +245,13 @@ fn json_shapes_unchanged() {
         ["count", "hits", "limit", "mode", "page", "total"],
         "search JSON shape unchanged: {search}"
     );
+    // Each hit carries the engram's tags so a JSON consumer learns the vocabulary.
+    let hit = &search["hits"][0];
+    assert_eq!(
+        hit["tags"],
+        serde_json::json!(["t"]),
+        "hit tags in JSON: {hit}"
+    );
 
     let read = run(&["read", "alpha"]);
     assert_eq!(

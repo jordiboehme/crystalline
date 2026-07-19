@@ -58,6 +58,60 @@ fn require_coverage(coverage: Option<&EmbeddingCoverage>) -> Result<&EmbeddingCo
     })
 }
 
+/// Attach each page hit's tags, drop the ids and wrap the page. The single seam
+/// every search mode routes its final page through, so tagging is defined once
+/// and never duplicated per mode.
+async fn finish_page(
+    conn: &Connection,
+    mut hits: Vec<(i64, SearchHit)>,
+    page: usize,
+    limit: usize,
+    total: usize,
+) -> Result<Page<SearchHit>> {
+    attach_tags(conn, &mut hits).await?;
+    Ok(Page {
+        items: hits.into_iter().map(|(_, hit)| hit).collect(),
+        page,
+        limit,
+        total,
+    })
+}
+
+/// Load the tags for the page's engrams in one batch query and set them on each
+/// hit, alphabetical within a hit. Runs once per search over the final page's
+/// engram ids only (never the candidate prefilter) and is skipped when the page
+/// is empty. An untagged engram keeps its empty vec. An observation-kind hit is
+/// keyed by its engram id, so it carries that engram's tags like any other.
+async fn attach_tags(conn: &Connection, hits: &mut [(i64, SearchHit)]) -> Result<()> {
+    if hits.is_empty() {
+        return Ok(());
+    }
+    let ids = hits
+        .iter()
+        .map(|(id, _)| id.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT et.engram_id, t.name FROM engram_tag et JOIN tag t ON t.id=et.tag_id \
+         WHERE et.engram_id IN ({ids}) ORDER BY et.engram_id, t.name"
+    );
+    let rows = query_all(conn, &sql, vec![]).await?;
+    let mut by_id: std::collections::HashMap<i64, Vec<String>> = std::collections::HashMap::new();
+    for r in &rows {
+        let id = cell_i64(r, 0).unwrap_or(0);
+        by_id
+            .entry(id)
+            .or_default()
+            .push(cell_text(r, 1).unwrap_or_default());
+    }
+    for (id, hit) in hits.iter_mut() {
+        if let Some(tags) = by_id.get(id) {
+            hit.tags = tags.clone();
+        }
+    }
+    Ok(())
+}
+
 /// The lexical modes: Text, Title and Permalink. A LIKE-candidate prefilter in
 /// SQL, ranked in Rust by a weighted term-frequency score.
 async fn run_lexical(conn: &Connection, query: &SearchQuery) -> Result<Page<SearchHit>> {
@@ -82,16 +136,12 @@ async fn run_lexical(conn: &Connection, query: &SearchQuery) -> Result<Page<Sear
     let scored = scored_lexical(conn, query, &terms).await?;
     let total = scored.len();
     let start = (page - 1) * limit;
-    let mut items = Vec::new();
+    let mut items: Vec<(i64, SearchHit)> = Vec::new();
     for (score, cand) in scored.into_iter().skip(start).take(limit) {
-        items.push(cand.into_hit(conn, &terms, score).await?);
+        let id = cand.id;
+        items.push((id, cand.into_hit(conn, &terms, score).await?));
     }
-    Ok(Page {
-        items,
-        page,
-        limit,
-        total,
-    })
+    finish_page(conn, items, page, limit, total).await
 }
 
 /// Load the lexical candidate rows and score them, sorted best first. Shared by
@@ -169,33 +219,33 @@ async fn filter_only(
          ORDER BY e.recorded_at DESC, e.permalink ASC LIMIT {limit} OFFSET {offset}"
     );
     let rows = query_all(conn, &sql, params).await?;
-    let items = rows
+    let items: Vec<(i64, SearchHit)> = rows
         .iter()
         .map(|r| {
             let c = Candidate::from_row(r);
+            let id = c.id;
             let snippet = if let Some(d) = c.description.as_ref().filter(|d| !d.is_empty()) {
                 lead(d)
             } else {
                 lead(&c.content)
             };
-            SearchHit {
-                domain: c.domain,
-                permalink: c.permalink,
-                title: c.title,
-                snippet,
-                score: 0.0,
-                engram_type: c.engram_type,
-                status: c.status,
-                kind: HitKind::Engram,
-            }
+            (
+                id,
+                SearchHit {
+                    domain: c.domain,
+                    permalink: c.permalink,
+                    title: c.title,
+                    snippet,
+                    score: 0.0,
+                    engram_type: c.engram_type,
+                    status: c.status,
+                    tags: Vec::new(),
+                    kind: HitKind::Engram,
+                },
+            )
         })
         .collect();
-    Ok(Page {
-        items,
-        page,
-        limit,
-        total,
-    })
+    finish_page(conn, items, page, limit, total).await
 }
 
 // --- semantic and hybrid search ----------------------------------------------
@@ -243,21 +293,17 @@ async fn run_semantic(
 
     let total = hits.len();
     let start = (page - 1) * limit;
-    let items: Vec<SearchHit> = hits
+    let items: Vec<(i64, SearchHit)> = hits
         .into_iter()
         .skip(start)
         .take(limit)
         .map(|(sim, cand)| {
+            let id = cand.id;
             let snippet = cand.lead_snippet();
-            cand.into_engram_hit(snippet, sim)
+            (id, cand.into_engram_hit(snippet, sim))
         })
         .collect();
-    Ok(Page {
-        items,
-        page,
-        limit,
-        total,
-    })
+    finish_page(conn, items, page, limit, total).await
 }
 
 /// Hybrid search: a lexical candidate scan and a semantic top-k, each normalized
@@ -363,25 +409,21 @@ async fn run_hybrid(
 
     let total = ranked.len();
     let start = (page - 1) * limit;
-    let items: Vec<SearchHit> = ranked
+    let items: Vec<(i64, SearchHit)> = ranked
         .into_iter()
         .skip(start)
         .take(limit)
         .map(|(score, m)| {
+            let id = m.cand.id;
             let snippet = if !terms.is_empty() && m.text.is_some() {
                 m.cand.text_snippet(&terms)
             } else {
                 m.cand.lead_snippet()
             };
-            m.cand.into_engram_hit(snippet, score)
+            (id, m.cand.into_engram_hit(snippet, score))
         })
         .collect();
-    Ok(Page {
-        items,
-        page,
-        limit,
-        total,
-    })
+    finish_page(conn, items, page, limit, total).await
 }
 
 /// The nearest engrams to the query vector, as `(similarity, candidate)` pairs.
@@ -728,6 +770,7 @@ impl Candidate {
                 score,
                 engram_type: self.engram_type,
                 status: self.status,
+                tags: Vec::new(),
             });
         }
 
@@ -753,6 +796,7 @@ impl Candidate {
             score,
             engram_type: self.engram_type,
             status: self.status,
+            tags: Vec::new(),
         })
     }
 
@@ -790,6 +834,7 @@ impl Candidate {
             score,
             engram_type: self.engram_type,
             status: self.status,
+            tags: Vec::new(),
             kind: HitKind::Engram,
         }
     }

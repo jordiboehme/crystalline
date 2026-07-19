@@ -795,6 +795,97 @@ parity!(
     search_finds_across_fields
 );
 
+async fn search_hits_carry_tags(store: &dyn Store) {
+    // Every search hit teaches the querying agent the engram's tags: alphabetical
+    // and folded to lowercase, an empty vec when untagged, present on filter-only
+    // and observation-kind hits alike (keyed by the engram id either way).
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // A tagged engram whose title matches: an engram-kind text hit.
+    write(
+        root,
+        "photo.md",
+        "---\ntype: engram\ntitle: Photosynthesis primer\npermalink: photo\ntags:\n  - Zebra\n  - apple\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Photosynthesis primer\n\ngeneric body\n",
+    );
+    // An untagged engram whose title also matches: an empty tag vec.
+    write(
+        root,
+        "plain.md",
+        "---\ntype: engram\ntitle: Photosynthesis appendix\npermalink: plain\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Photosynthesis appendix\n\ngeneric body\n",
+    );
+    // A tagged engram whose only match is in an observation carrying its own
+    // hashtag: an observation-kind hit that must still carry the engram's
+    // frontmatter tags, not the observation hashtag.
+    write(
+        root,
+        "obs.md",
+        "---\ntype: engram\ntitle: Generic two\npermalink: obs\ntags:\n  - gamma\n  - beta\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Generic two\n\n- [fact] tardigrades survive vacuum #delta\n",
+    );
+    sync_domain(store, "d", root).await.unwrap();
+
+    // A text search: the tagged engram lists its tags alphabetically and folded,
+    // the untagged engram carries an empty vec. Both are engram-kind title hits.
+    let text = store
+        .search(&SearchQuery::text("photosynthesis"))
+        .await
+        .unwrap();
+    assert_eq!(text.total, 2);
+    let photo = text
+        .items
+        .iter()
+        .find(|h| h.permalink == "photo")
+        .expect("the photo hit is present");
+    assert_eq!(
+        photo.tags,
+        vec!["apple".to_string(), "zebra".to_string()],
+        "frontmatter tags, alphabetical and folded to lowercase"
+    );
+    let plain = text
+        .items
+        .iter()
+        .find(|h| h.permalink == "plain")
+        .expect("the plain hit is present");
+    assert!(
+        plain.tags.is_empty(),
+        "an untagged engram carries an empty tag vec"
+    );
+
+    // A filter-only search (no query text) carries tags too.
+    let filtered = store
+        .search(&SearchQuery {
+            tags: Some(vec!["apple".into()]),
+            limit: 10,
+            page: 1,
+            ..SearchQuery::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(filtered.total, 1);
+    assert_eq!(filtered.items[0].permalink, "photo");
+    assert_eq!(
+        filtered.items[0].tags,
+        vec!["apple".to_string(), "zebra".to_string()]
+    );
+
+    // An observation-kind hit carries its engram's frontmatter tags, not the
+    // observation's own #delta hashtag.
+    let by_obs = store
+        .search(&SearchQuery::text("tardigrades"))
+        .await
+        .unwrap();
+    assert_eq!(by_obs.items[0].permalink, "obs");
+    match by_obs.items[0].kind {
+        crystalline_index::HitKind::Observation { line } => assert!(line > 0),
+        crystalline_index::HitKind::Engram => panic!("expected an observation-level hit"),
+    }
+    assert_eq!(
+        by_obs.items[0].tags,
+        vec!["beta".to_string(), "gamma".to_string()],
+        "the engram's frontmatter tags, never the #delta observation hashtag"
+    );
+}
+parity!(search_hits_carry_their_engram_tags, search_hits_carry_tags);
+
 async fn search_applies_filters(store: &dyn Store) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
