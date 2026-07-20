@@ -547,6 +547,37 @@ fn home_dir() -> Result<PathBuf, ConfigError> {
     etcetera::home_dir().map_err(|e| ConfigError::Home(e.to_string()))
 }
 
+/// The remediation text appended when macOS privacy protection is the likely
+/// cause of an io error. Kept to one sentence so every surface (an MCP tool
+/// error, the daemon log, the CLI) can carry it verbatim.
+const MACOS_PRIVACY_HINT: &str = "macOS privacy protection is likely blocking access to this folder - allow it in System Settings > Privacy & Security > Files and Folders for the app that runs Crystalline (for example Claude or your terminal) or grant that app Full Disk Access, then restart it";
+
+/// A suffix for io error displays when macOS privacy protection is the likely
+/// cause: the error is EPERM (os error 1, what TCC denials return, unlike the
+/// EACCES of plain permission bits) and the path sits in a protected user
+/// folder (Documents, Desktop, Downloads). Empty otherwise, so display
+/// attributes can append it unconditionally.
+pub fn io_hint_suffix(path: &str, source: &std::io::Error) -> String {
+    if cfg!(target_os = "macos")
+        && source.raw_os_error() == Some(1)
+        && let Ok(home) = home_dir()
+        && in_protected_folder(path, &home)
+    {
+        return format!("; {MACOS_PRIVACY_HINT}");
+    }
+    String::new()
+}
+
+/// Whether `path` sits inside one of the user folders macOS privacy
+/// protection guards. Component-wise prefix match, so `Documents-alt` never
+/// matches.
+fn in_protected_folder(path: &str, home: &std::path::Path) -> bool {
+    let p = std::path::Path::new(path);
+    ["Documents", "Desktop", "Downloads"]
+        .iter()
+        .any(|f| p.starts_with(home.join(f)))
+}
+
 // --- default paths -----------------------------------------------------------
 
 const APP: &str = "crystalline";
@@ -678,6 +709,38 @@ pub fn models_dir() -> Result<PathBuf, ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protected_folder_detection_is_prefix_scoped() {
+        let home = Path::new("/Users/u");
+        assert!(in_protected_folder(
+            "/Users/u/Documents/Crystalline/x.md",
+            home
+        ));
+        assert!(in_protected_folder("/Users/u/Desktop/a", home));
+        assert!(in_protected_folder("/Users/u/Downloads/b", home));
+        assert!(!in_protected_folder("/Users/u/Projects/x.md", home));
+        assert!(!in_protected_folder("/Users/u/Documents-alt/x.md", home));
+        assert!(!in_protected_folder("/tmp/Documents/x.md", home));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn eperm_under_documents_earns_the_privacy_hint() {
+        let docs = crate::config::expand_tilde("~/Documents/Crystalline/kb/x.md");
+        let path = docs.to_string_lossy();
+        let eperm = std::io::Error::from_raw_os_error(1);
+        let suffix = io_hint_suffix(&path, &eperm);
+        assert!(
+            suffix.contains("Files and Folders"),
+            "hint expected: {suffix}"
+        );
+        // EACCES is a plain permission problem, not privacy protection.
+        let eacces = std::io::Error::from_raw_os_error(13);
+        assert_eq!(io_hint_suffix(&path, &eacces), "");
+        // EPERM outside a protected folder gets no hint.
+        assert_eq!(io_hint_suffix("/tmp/x.md", &eperm), "");
+    }
 
     #[test]
     fn database_absent_defaults_to_turso() {

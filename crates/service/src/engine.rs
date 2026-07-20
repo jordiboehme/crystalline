@@ -107,7 +107,7 @@ pub enum EngineError {
     )]
     EnvTokenConnect,
     /// A filesystem error.
-    #[error("io error at {path}: {source}")]
+    #[error("io error at {path}: {source}{}", crystalline_core::config::io_hint_suffix(.path, .source))]
     Io {
         /// The path involved.
         path: String,
@@ -152,6 +152,25 @@ impl From<crystalline_index::IndexError> for EngineError {
             }
             other => EngineError::Internal(other.to_string()),
         }
+    }
+}
+
+// The whole module is macos-gated, not just the test: on other platforms a
+// gated-out lone test would leave `use super::*` dangling and fail clippy.
+#[cfg(all(test, target_os = "macos"))]
+mod error_tests {
+    use super::*;
+
+    #[test]
+    fn io_display_carries_the_privacy_hint_for_eperm_under_documents() {
+        let path = crystalline_core::config::expand_tilde("~/Documents/x")
+            .to_string_lossy()
+            .to_string();
+        let e = EngineError::Io {
+            path,
+            source: std::io::Error::from_raw_os_error(1),
+        };
+        assert!(e.to_string().contains("Files and Folders"), "{e}");
     }
 }
 
@@ -2827,6 +2846,7 @@ impl Engine {
         let collab = !self.instance_id.is_empty();
         let mut reports = Vec::new();
         let mut skipped = Vec::new();
+        let mut failed = Vec::new();
         // Two short store-lock windows per domain with the scan in between, so the
         // walk-hash-parse pass of a large domain no longer blocks every concurrent
         // read behind the mutex. The first window claims the host, resolves the
@@ -2867,7 +2887,18 @@ impl Engine {
                 let snapshot = store.file_stamps(domain).await?;
                 (domain, snapshot)
             };
-            let scan = scan_domain(name, root, snapshot, &self.chunk_params).await;
+            let scan = match scan_domain(name, root, snapshot, &self.chunk_params).await {
+                Ok(scan) => scan,
+                Err(e) if only.is_none() => {
+                    // One denied domain must not block the rest of the
+                    // sweep; its error is carried in the result and the
+                    // daemon log, and the next sync retries it.
+                    tracing::warn!("sync of '{name}' skipped: {e}");
+                    failed.push(json!({ "domain": name, "error": e.to_string() }));
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            };
             let report = {
                 let store = self.store.lock().await;
                 apply_scan(&*store, domain, scan)
@@ -2879,6 +2910,7 @@ impl Engine {
         Ok(json!({
             "reports": serde_json::to_value(&reports).unwrap_or(Value::Null),
             "skipped": skipped,
+            "failed": failed,
         }))
     }
 
@@ -2982,7 +3014,7 @@ impl Engine {
                 let snapshot = store.file_stamps(domain).await?;
                 (domain, snapshot)
             };
-            let scan = scan_domain(&name, &root, snapshot, &self.chunk_params).await;
+            let scan = scan_domain(&name, &root, snapshot, &self.chunk_params).await?;
             let report = {
                 let store = self.store.lock().await;
                 apply_scan(&*store, domain, scan).await.map_err(|e| {

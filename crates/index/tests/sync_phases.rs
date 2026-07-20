@@ -141,7 +141,7 @@ async fn concurrent_write_defers(store: &dyn Store) {
     let domain = upsert_domain(store, "d", root).await;
     let snapshot = store.file_stamps(domain).await.unwrap();
     assert!(snapshot.is_empty(), "nothing indexed yet");
-    let scan = scan_domain("d", root, snapshot, &params()).await;
+    let scan = scan_domain("d", root, snapshot, &params()).await.unwrap();
 
     // A concurrent writer indexes the same path with different content between
     // the snapshot and the apply.
@@ -191,7 +191,7 @@ async fn concurrent_rewrite_skips_delete(store: &dyn Store) {
     std::fs::remove_file(root.join("a.md")).unwrap();
     let snapshot = store.file_stamps(domain).await.unwrap();
     assert!(snapshot.contains_key("a.md"), "a.md still recorded");
-    let scan = scan_domain("d", root, snapshot, &params()).await;
+    let scan = scan_domain("d", root, snapshot, &params()).await.unwrap();
 
     // A concurrent writer rewrites the row (a new stamp) mid-window.
     store
@@ -230,7 +230,7 @@ async fn recreated_file_skips_delete(store: &dyn Store) {
     // can catch this.
     std::fs::remove_file(root.join("a.md")).unwrap();
     let snapshot = store.file_stamps(domain).await.unwrap();
-    let scan = scan_domain("d", root, snapshot, &params()).await;
+    let scan = scan_domain("d", root, snapshot, &params()).await.unwrap();
     write(root, "a.md", &engram("A", "a", "recreated body"));
 
     let report = apply_scan(store, domain, scan).await.unwrap();
@@ -260,7 +260,7 @@ async fn move_with_moved_end_defers(store: &dyn Store) {
     // move.
     std::fs::rename(root.join("old.md"), root.join("new.md")).unwrap();
     let snapshot = store.file_stamps(domain).await.unwrap();
-    let scan = scan_domain("d", root, snapshot, &params()).await;
+    let scan = scan_domain("d", root, snapshot, &params()).await.unwrap();
 
     // A concurrent writer mutates the move's `from` end mid-window.
     store
@@ -342,3 +342,58 @@ parity!(
     the_composition_is_identical_when_uncontended,
     composition_identical_uncontended
 );
+
+/// A denied domain root is a loud per-domain error, not a silent empty scan: a
+/// full scan of an unreadable root returns an io error and the recorded rows
+/// survive, rather than the scan seeing zero files and the apply deleting them.
+#[cfg(unix)]
+mod unreadable_root {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn full_scan_of_an_unreadable_root_errors_and_keeps_the_rows() {
+        let store = TursoStore::open_in_memory().await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "a.md", &engram("A", "a", "keepme body"));
+
+        let seeded = sync_domain_with(&store, "d", root, &params())
+            .await
+            .unwrap();
+        assert_eq!(seeded.added, 1, "the seed indexed the file");
+        let domain = upsert_domain(&store, "d", root).await;
+        assert!(
+            store
+                .file_stamps(domain)
+                .await
+                .unwrap()
+                .contains_key("a.md"),
+            "the row exists after the seed sync"
+        );
+
+        // Deny the root so the walk cannot read its entries.
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = sync_domain_with(&store, "d", root, &params()).await;
+        // Restore before any assertion can unwind past the tempdir drop.
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let err = result.expect_err("an unreadable root must error, not scan empty");
+        let msg = err.to_string();
+        assert!(msg.contains("io error at"), "io error expected: {msg}");
+        assert!(
+            msg.contains(&root.display().to_string()),
+            "the root path is named: {msg}"
+        );
+        // The scan errored before the apply, so the row was never deleted.
+        assert!(
+            store
+                .file_stamps(domain)
+                .await
+                .unwrap()
+                .contains_key("a.md"),
+            "the row survives a denied scan"
+        );
+    }
+}

@@ -34,7 +34,7 @@ pub enum IndexError {
     #[error("json error: {0}")]
     Json(String),
     /// A filesystem error during sync.
-    #[error("io error at {path}: {source}")]
+    #[error("io error at {path}: {source}{}", crystalline_core::config::io_hint_suffix(.path, .source))]
     Io {
         /// The path involved.
         path: String,
@@ -108,5 +108,24 @@ impl From<sqlx::Error> for IndexError {
 impl From<reqwest::Error> for IndexError {
     fn from(e: reqwest::Error) -> Self {
         IndexError::Remote(e.to_string())
+    }
+}
+
+// The whole module is macos-gated, not just the test: on other platforms a
+// gated-out lone test would leave `use super::*` dangling and fail clippy.
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn io_display_carries_the_privacy_hint_for_eperm_under_documents() {
+        let path = crystalline_core::config::expand_tilde("~/Documents/x")
+            .to_string_lossy()
+            .to_string();
+        let e = IndexError::Io {
+            path,
+            source: std::io::Error::from_raw_os_error(1),
+        };
+        assert!(e.to_string().contains("Files and Folders"), "{e}");
     }
 }

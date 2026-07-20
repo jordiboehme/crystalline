@@ -325,7 +325,7 @@ pub(crate) async fn sync_domain_direct(
         let snapshot = store.file_stamps(domain).await?;
         (domain, snapshot)
     };
-    let scan = scan_domain(name, root, snapshot, &params).await;
+    let scan = scan_domain(name, root, snapshot, &params).await?;
     let store = store.lock().await;
     apply_scan(&*store, domain, scan)
         .await
@@ -861,7 +861,7 @@ pub async fn sync(
             let snapshot = store.file_stamps(domain).await?;
             (domain, snapshot)
         };
-        let scan = scan_domain(&name, &path, snapshot, &params).await;
+        let scan = scan_domain(&name, &path, snapshot, &params).await?;
         let report = {
             let store = store.lock().await;
             apply_scan(&*store, domain, scan)
@@ -949,7 +949,7 @@ pub async fn reindex(
             let snapshot = store.file_stamps(domain).await?;
             (domain, snapshot)
         };
-        let scan = scan_domain(name, path, snapshot, &params).await;
+        let scan = scan_domain(name, path, snapshot, &params).await?;
         let report = {
             let store = store.lock().await;
             apply_scan(&*store, domain, scan)
