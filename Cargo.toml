@@ -26,7 +26,7 @@ crystalline-remote = { path = "crates/remote" }
 crystalline-service = { path = "crates/service" }
 
 clap = { version = "4.6.2", features = ["derive"] }
-tokio = { version = "1.53.0", features = ["full"] }
+tokio = { version = "1.53.1", features = ["full"] }
 rmcp = "2.2.0"
 turso = "0.7.0"
 candle-core = "0.11.0"
@@ -80,7 +80,7 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Syste
 
 # GitHub collaboration (crates/remote): plain-text three-way merge, the
 # GitHub-issued token in the OS keychain and repository tarball extraction.
-diffy = "0.5.0"
+diffy = "0.5.1"
 # `v1` pulls in exactly the apple-native (Keychain), windows-native and
 # zbus-secret-service (pure-Rust, no libdbus) backends; the 0600 file fallback
 # in crates/remote covers everything else (headless Linux without a session
