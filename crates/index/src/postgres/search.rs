@@ -214,7 +214,7 @@ async fn scored_lexical(
     };
     let sql = format!(
         "SELECT e.id, d.name, e.permalink, e.title, e.engram_type, e.status, e.description, e.content, \
-         (e.metadata ->> 'salience')::double precision \
+         CASE WHEN jsonb_typeof(e.metadata -> 'salience') = 'number' THEN (e.metadata ->> 'salience')::double precision END \
          FROM engram e JOIN domain d ON d.id=e.domain_id {where_sql}"
     );
     let rows = query_all(conn, &sql, params).await?;
@@ -252,7 +252,7 @@ async fn filter_only(
     let offset = (page - 1) * limit;
     let sql = format!(
         "SELECT e.id, d.name, e.permalink, e.title, e.engram_type, e.status, e.description, e.content, \
-         (e.metadata ->> 'salience')::double precision \
+         CASE WHEN jsonb_typeof(e.metadata -> 'salience') = 'number' THEN (e.metadata ->> 'salience')::double precision END \
          FROM engram e JOIN domain d ON d.id=e.domain_id {where_sql} \
          ORDER BY e.recorded_at DESC, e.permalink ASC LIMIT {limit} OFFSET {offset}"
     );
@@ -476,7 +476,7 @@ async fn semantic_candidates(
     let where_sql = format!("WHERE {}", clauses.join(" AND "));
     let sql = format!(
         "SELECT e.id, d.name, e.permalink, e.title, e.engram_type, e.status, e.description, e.content, \
-         (e.metadata ->> 'salience')::double precision, \
+         CASE WHEN jsonb_typeof(e.metadata -> 'salience') = 'number' THEN (e.metadata ->> 'salience')::double precision END, \
          min(c.embedding <=> $1) AS dist \
          FROM chunk c JOIN engram e ON e.id=c.engram_id JOIN domain d ON d.id=e.domain_id \
          {where_sql} GROUP BY e.id, d.name ORDER BY dist ASC LIMIT {SEMANTIC_TOPK}"

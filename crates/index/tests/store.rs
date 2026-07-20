@@ -795,6 +795,60 @@ parity!(
     search_finds_across_fields
 );
 
+async fn non_numeric_salience_search(store: &dyn Store) {
+    // A hand-edited `salience: high` must never break search: `Candidate.salience`
+    // is documented as `None` when the frontmatter value is absent or non-numeric,
+    // so a non-numeric value should read as no salience prior, not error out the
+    // query. Regression test for the Postgres `(metadata ->> 'salience')::double
+    // precision` cast, which raised `22P02 invalid input syntax for type double
+    // precision` on any non-numeric salience in the corpus and broke lexical,
+    // filter-only, semantic and hybrid search across the whole backend.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "numeric.md",
+        &engram(
+            "Numeric salience",
+            "numeric-salience",
+            "engram",
+            "salience: 8\n",
+            "gizmoquartz is mentioned in this engram.\n",
+        ),
+    );
+    write(
+        root,
+        "nonnumeric.md",
+        &engram(
+            "Non-numeric salience",
+            "nonnumeric-salience",
+            "engram",
+            "salience: high\n",
+            "gizmoquartz is mentioned in this engram too.\n",
+        ),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+
+    // The search must succeed (not error) and find both engrams, the numeric-
+    // salience one and the non-numeric one alike.
+    let page = store
+        .search(&SearchQuery::text("gizmoquartz"))
+        .await
+        .unwrap();
+    assert_eq!(
+        page.total, 2,
+        "both engrams match despite one non-numeric salience"
+    );
+    let perms: std::collections::HashSet<_> =
+        page.items.iter().map(|h| h.permalink.clone()).collect();
+    assert!(perms.contains("numeric-salience"));
+    assert!(perms.contains("nonnumeric-salience"));
+}
+parity!(
+    non_numeric_salience_does_not_break_search,
+    non_numeric_salience_search
+);
+
 async fn search_hits_carry_tags(store: &dyn Store) {
     // Every search hit teaches the querying agent the engram's tags: alphabetical
     // and folded to lowercase, an empty vec when untagged, present on filter-only
