@@ -90,6 +90,8 @@ An engram needs at least 3 non-blank content lines to pass verification - a lone
 
 `permalink`, `status` (defaults to `current`), `recorded_at` and `timestamp` are filled in for you; `valid_from`/`valid_to` are never auto-set. Recommended `type` values: `engram`, `guide`, `decision`, `architecture`, `runbook`, `reference`. Recommended `status` values: `current`, `implemented`, `draft`, `proposed`, `idea`, `poc`, `deprecated`, `superseded`, `archived`, `legacy` - this is guidance so you can tell an idea or draft apart from current fact, not a fixed enum a write is rejected for.
 
+Exceptionally valuable knowledge - a hard-won debugging insight, the decision that keeps paying off - can carry a numeric `salience` key (0 to 10) in `metadata`. Hybrid search adds a small bounded lift for it, so a salient engram ranks above equally relevant unmarked ones while relevance still dominates and nothing is ever filtered out by it. Most engrams need none; reserve it for knowledge that clearly outranks its neighbours, and when an engram later proves to be the key to a task, raise its salience with a `find_replace` on the frontmatter line (the same mechanism `last_verified` uses).
+
 ## Observation categories
 
 Pick the most precise bullet category for `- [category] content #tag`:
