@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crystalline_core::config::{self, GlobalConfig};
+use crystalline_core::config::{self, GlobalConfig, ResponseFormat, ServiceConfig};
 use serde_json::{Value, json};
 
 fn bin() -> PathBuf {
@@ -71,6 +71,24 @@ impl Env {
     /// lock. Leaving it off lets `domain add` route its sync through a live
     /// daemon exactly as a plain invocation does.
     fn setup_domain(&self, name: &str) {
+        // Pin the wire format to json so the suite's assertions stay on data
+        // semantics; the TOON default gets its dedicated tests in
+        // crates/service/tests. Written once, before the first `domain add`
+        // creates config.yaml: `domain add` only ever loads the existing file
+        // and rewrites its `domains` map, so this pin rides along untouched
+        // through every later `setup_domain` call in the same `Env`.
+        if !self.config_path().exists() {
+            std::fs::create_dir_all(self.config_path().parent().unwrap()).unwrap();
+            let cfg = GlobalConfig {
+                service: Some(ServiceConfig {
+                    response_format: Some(ResponseFormat::Json),
+                    ..ServiceConfig::default()
+                }),
+                ..GlobalConfig::default()
+            };
+            config::save_yaml(&self.config_path(), &cfg).unwrap();
+        }
+
         let dir = self.dir.join(format!("kb-{name}"));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
