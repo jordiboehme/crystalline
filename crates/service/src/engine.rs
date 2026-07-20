@@ -13,6 +13,7 @@
 //! daemon's debounced watcher classifies the file as unchanged and never
 //! reprocesses it (the idempotency guard, see `research/single-instance-ipc.md`).
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -32,10 +33,11 @@ use crystalline_core::{
     is_lower_hyphen, parse_engram, slugify,
 };
 use crystalline_index::{
-    ChunkParams, DomainHost, DomainId, DomainKind, EdgeKind, EmbeddingProvider, EngramDescriptor,
-    EngramId, EngramRecord, FileStamp, HostClaim, RecentFilter, SearchMode, SearchQuery, Store,
-    SyncReport, apply_scan, chunk_engram, configured_model_id, order_jobs_for_batching,
-    parse_metadata_filters, provider_from_config, scan_domain, scan_paths,
+    ChunkParams, DEFAULT_SALIENCE_WEIGHT, DomainHost, DomainId, DomainKind, EdgeKind,
+    EmbeddingProvider, EngramDescriptor, EngramId, EngramRecord, FileStamp, GraphNode, GraphSlice,
+    HostClaim, RecentFilter, SearchMode, SearchQuery, Store, SyncReport, apply_scan, chunk_engram,
+    configured_model_id, order_jobs_for_batching, parse_metadata_filters, provider_from_config,
+    salience_prior, scan_domain, scan_paths,
 };
 use crystalline_remote::ops;
 use crystalline_remote::{
@@ -61,6 +63,16 @@ const DEFAULT_HEARTBEAT_SECS: i64 = 30;
 /// lock whose last heartbeat is older than this is takeable by another instance.
 /// Overridable via `CRYSTALLINE_STALE_SECS`.
 const DEFAULT_STALE_SECS: i64 = 90;
+
+/// The probability of following an edge rather than teleporting back to a
+/// seed during context ranking; the standard PageRank damping factor.
+const CONTEXT_DAMPING: f64 = 0.85;
+/// Power-iteration cap for context ranking. Context slices are tens of
+/// nodes, far past convergence at this count.
+const CONTEXT_MAX_ITERATIONS: usize = 50;
+/// Early-exit threshold on the L1 delta between iterations. Data-dependent
+/// only, so ranking stays deterministic.
+const CONTEXT_TOLERANCE: f64 = 1e-10;
 
 /// Read a positive-integer seconds value from an environment variable, falling
 /// back to `default` when unset, empty, unparseable or non-positive.
@@ -2122,23 +2134,50 @@ impl Engine {
         let ids: Vec<EngramId> = seeds.iter().map(|d| d.id).collect();
         let slice = store.neighbors(&ids, depth).await?;
 
-        // Keep every seed, cap related nodes and apply the optional domain filter.
-        let mut kept: HashSet<i64> = HashSet::new();
-        let mut nodes = Vec::new();
-        let mut related = 0usize;
+        // Rank the full slice before any filtering so a domain-filtered node
+        // still conducts mass as a bridge; the domain filter applies only at
+        // output selection, preserving the current presentation.
+        let mass = context_rank(&slice, &seed_ids);
+        let weight = self
+            .config
+            .read()
+            .unwrap()
+            .salience_weight()
+            .unwrap_or(DEFAULT_SALIENCE_WEIGHT);
+
+        // Output pass: keep seeds in slice (ascending-id) order, then rank the
+        // related nodes by spread mass lifted by the salience prior, highest
+        // first with an ascending-id tiebreak, capped at max_related.
+        let mut seed_nodes: Vec<&GraphNode> = Vec::new();
+        let mut related: Vec<(f64, &GraphNode)> = Vec::new();
         for node in &slice.nodes {
             if let Some(filter) = &domain_filter
                 && !filter.contains(&node.domain)
             {
                 continue;
             }
-            let is_seed = seed_ids.contains(&node.id.0);
-            if !is_seed {
-                if related >= max_related {
-                    continue;
-                }
-                related += 1;
+            if seed_ids.contains(&node.id.0) {
+                seed_nodes.push(node);
+            } else {
+                let score = mass.get(&node.id.0).copied().unwrap_or(0.0)
+                    * (1.0 + salience_prior(node.salience, weight));
+                related.push((score, node));
             }
+        }
+        related.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| a.1.id.0.cmp(&b.1.id.0))
+        });
+        related.truncate(max_related);
+
+        let mut kept: HashSet<i64> = HashSet::new();
+        let mut nodes = Vec::new();
+        for node in seed_nodes
+            .into_iter()
+            .chain(related.into_iter().map(|(_, node)| node))
+        {
+            let is_seed = seed_ids.contains(&node.id.0);
             kept.insert(node.id.0);
             nodes.push(json!({
                 "id": node.id.0,
@@ -5055,6 +5094,86 @@ impl Engine {
     }
 }
 
+/// Rank a context slice by personalized PageRank so the neighbors on the
+/// shortest, best-connected paths back to the seeds surface first.
+///
+/// The random walk teleports to the seeds (uniform over the seeds present in
+/// the slice), so mass concentrates near them and decays with graph distance.
+/// Power iteration over a dense, ascending-id index keeps the result
+/// deterministic: every accumulation runs over `Vec`s in that fixed order,
+/// never over a `HashMap`.
+///
+/// The adjacency is symmetric - every [`GraphEdge`] contributes both
+/// directions - so a pair joined by more than one edge (a relation plus a
+/// wikilink, or reciprocal relations) is counted once per edge and conducts
+/// proportionally more mass. That double counting is deliberate and is the
+/// seam where per-edge-kind weighting would slot in later.
+fn context_rank(slice: &GraphSlice, seed_ids: &HashSet<i64>) -> HashMap<i64, f64> {
+    // Dense, ascending-id index: id -> position in the fixed-order Vecs.
+    let mut ids: Vec<i64> = slice.nodes.iter().map(|n| n.id.0).collect();
+    ids.sort_unstable();
+    let n = ids.len();
+    if n == 0 {
+        return HashMap::new();
+    }
+    let index: HashMap<i64, usize> = ids.iter().enumerate().map(|(i, &id)| (id, i)).collect();
+
+    // Symmetric adjacency; skip an edge whose endpoint is not in the node map
+    // (defensive, the store returns only in-slice edges).
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for e in &slice.edges {
+        if let (Some(&a), Some(&b)) = (index.get(&e.from.0), index.get(&e.to.0)) {
+            adj[a].push(b);
+            adj[b].push(a);
+        }
+    }
+
+    // Teleport vector: uniform over the seeds present in the slice; fall back
+    // to uniform over every node when no seed made it in (defensive, so the
+    // iteration still converges).
+    let mut teleport = vec![0.0f64; n];
+    let seed_positions: Vec<usize> = ids
+        .iter()
+        .enumerate()
+        .filter(|(_, id)| seed_ids.contains(id))
+        .map(|(i, _)| i)
+        .collect();
+    if seed_positions.is_empty() {
+        let uniform = 1.0 / n as f64;
+        for t in teleport.iter_mut() {
+            *t = uniform;
+        }
+    } else {
+        let share = 1.0 / seed_positions.len() as f64;
+        for &i in &seed_positions {
+            teleport[i] = share;
+        }
+    }
+
+    // Power iteration from the teleport distribution.
+    let mut rank = teleport.clone();
+    let mut next = vec![0.0f64; n];
+    for _ in 0..CONTEXT_MAX_ITERATIONS {
+        // Mass stranded on zero-degree nodes (only an isolated seed can be one,
+        // since every non-seed entered the slice over an edge) is redistributed
+        // over the teleport vector so no mass leaks out of the system.
+        let dangling: f64 = (0..n).filter(|&i| adj[i].is_empty()).map(|i| rank[i]).sum();
+        for i in 0..n {
+            let inbound: f64 = adj[i].iter().map(|&j| rank[j] / adj[j].len() as f64).sum();
+            next[i] = (1.0 - CONTEXT_DAMPING) * teleport[i]
+                + CONTEXT_DAMPING * inbound
+                + CONTEXT_DAMPING * dangling * teleport[i];
+        }
+        let delta: f64 = (0..n).map(|i| (next[i] - rank[i]).abs()).sum();
+        rank.copy_from_slice(&next);
+        if delta < CONTEXT_TOLERANCE {
+            break;
+        }
+    }
+
+    ids.into_iter().zip(rank).collect()
+}
+
 /// The one-line status paired with `github_enabled` in a fresh connect
 /// response (see [`Engine::connect_with_token`] and
 /// [`Engine::start_device_connect`]), so an agent narrates enablement from
@@ -5850,5 +5969,119 @@ mod activity_tests {
         assert_eq!(snap["now"][0]["kind"], "embed");
         assert_eq!(snap["last"]["kind"], "sync");
         drop(embed);
+    }
+}
+
+#[cfg(test)]
+mod context_rank_tests {
+    use super::*;
+    use crystalline_index::GraphEdge;
+
+    /// A slice node with the given id and optional salience; the descriptive
+    /// fields are filler that context ranking never reads.
+    fn node(id: i64, salience: Option<f64>) -> GraphNode {
+        GraphNode {
+            id: EngramId(id),
+            domain: "d".to_string(),
+            permalink: format!("p{id}"),
+            title: format!("t{id}"),
+            engram_type: "engram".to_string(),
+            salience,
+        }
+    }
+
+    /// A relation edge between two ids; direction is irrelevant to the
+    /// symmetric adjacency the ranker builds.
+    fn edge(from: i64, to: i64) -> GraphEdge {
+        GraphEdge {
+            from: EngramId(from),
+            to: EngramId(to),
+            rel_type: "rel".to_string(),
+            kind: EdgeKind::Relation,
+        }
+    }
+
+    fn seeds(ids: &[i64]) -> HashSet<i64> {
+        ids.iter().copied().collect()
+    }
+
+    /// S - A - C chain seeded at S: mass decays with graph distance from the
+    /// seed, so the nearer node A outranks the farther node C.
+    #[test]
+    fn chain_decays_with_distance() {
+        let slice = GraphSlice {
+            nodes: vec![node(1, None), node(2, None), node(3, None)],
+            edges: vec![edge(1, 2), edge(2, 3)],
+        };
+        let mass = context_rank(&slice, &seeds(&[1]));
+        assert!(
+            mass[&2] > mass[&3],
+            "A ({}) should outrank C ({})",
+            mass[&2],
+            mass[&3]
+        );
+    }
+
+    /// Two seeds both edge to A, one of them also to B: A draws teleport mass
+    /// from both seeds while B draws from one, so connectivity beats distance.
+    #[test]
+    fn connectivity_beats_distance() {
+        let slice = GraphSlice {
+            nodes: vec![node(1, None), node(2, None), node(3, None), node(4, None)],
+            edges: vec![edge(1, 3), edge(2, 3), edge(1, 4)],
+        };
+        let mass = context_rank(&slice, &seeds(&[1, 2]));
+        assert!(
+            mass[&3] > mass[&4],
+            "A ({}) should outrank B ({})",
+            mass[&3],
+            mass[&4]
+        );
+    }
+
+    /// The ranker is a pure function of its inputs: two runs over the same
+    /// slice return byte-identical masses (exact f64 equality).
+    #[test]
+    fn repeat_calls_are_identical() {
+        let slice = GraphSlice {
+            nodes: vec![node(1, None), node(2, None), node(3, None)],
+            edges: vec![edge(1, 2), edge(2, 3)],
+        };
+        let first = context_rank(&slice, &seeds(&[1]));
+        let second = context_rank(&slice, &seeds(&[1]));
+        assert_eq!(first, second);
+    }
+
+    /// A lone seed with no edges is a dangling node: its mass stays finite,
+    /// never NaN, and concentrates on the seed itself.
+    #[test]
+    fn isolated_seed_is_finite() {
+        let slice = GraphSlice {
+            nodes: vec![node(1, None)],
+            edges: vec![],
+        };
+        let mass = context_rank(&slice, &seeds(&[1]));
+        let m = mass[&1];
+        assert!(m.is_finite(), "mass must be finite, got {m}");
+        assert!(!m.is_nan(), "mass must not be NaN");
+        assert!(
+            m > 0.99,
+            "mass should concentrate on the lone seed, got {m}"
+        );
+    }
+
+    /// Personalized PageRank conserves mass: the ranked masses sum to one.
+    #[test]
+    fn masses_sum_to_one() {
+        let slice = GraphSlice {
+            nodes: vec![node(1, None), node(2, None), node(3, None)],
+            edges: vec![edge(1, 2), edge(2, 3)],
+        };
+        let mass = context_rank(&slice, &seeds(&[1]));
+        let total: f64 = mass.values().sum();
+        assert!(
+            (total - 1.0).abs() < 1e-6,
+            "masses should sum to 1, got {total}"
+        );
     }
 }
