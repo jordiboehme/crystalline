@@ -34,7 +34,7 @@ pub enum IndexError {
     #[error("json error: {0}")]
     Json(String),
     /// A filesystem error during sync.
-    #[error("io error at {path}: {source}")]
+    #[error("io error at {path}: {source}{}", crystalline_core::config::io_hint_suffix(.path, .source))]
     Io {
         /// The path involved.
         path: String,
@@ -108,5 +108,23 @@ impl From<sqlx::Error> for IndexError {
 impl From<reqwest::Error> for IndexError {
     fn from(e: reqwest::Error) -> Self {
         IndexError::Remote(e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn io_display_carries_the_privacy_hint_for_eperm_under_documents() {
+        let path = crystalline_core::config::expand_tilde("~/Documents/x")
+            .to_string_lossy()
+            .to_string();
+        let e = IndexError::Io {
+            path,
+            source: std::io::Error::from_raw_os_error(1),
+        };
+        assert!(e.to_string().contains("Files and Folders"), "{e}");
     }
 }
