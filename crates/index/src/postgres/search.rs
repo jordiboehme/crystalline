@@ -40,6 +40,28 @@ const HYBRID_SEMANTIC_WEIGHT: f64 = 0.6;
 /// above it (a both-signal hit can reach 1.0, a single-signal hit at most 0.85).
 const SINGLE_SOURCE_PENALTY: f64 = 0.85;
 
+/// The frontmatter salience scale: a salience of `SALIENCE_SCALE` maps to the
+/// full prior; absent or non-positive salience adds nothing.
+const SALIENCE_SCALE: f64 = 10.0;
+/// The default salience-prior weight when a query does not override it: the
+/// maximum lift a fully-salient engram gets on the normalized [0,1] relevance
+/// score. Small on purpose so relevance dominates and the prior only reorders
+/// within a relevance band, never filters.
+pub(super) const DEFAULT_SALIENCE_WEIGHT: f64 = 0.15;
+
+/// The bounded, non-negative salience prior added to a normalized relevance
+/// score. `salience` is the raw frontmatter value (`None` or non-positive means
+/// no lift); `weight` is the maximum lift. The result is never negative and
+/// never exceeds `weight`, so it can reorder within a relevance band but can
+/// never exclude a result.
+pub(super) fn salience_prior(salience: Option<f64>, weight: f64) -> f64 {
+    let s = salience.unwrap_or(0.0);
+    if s <= 0.0 || weight <= 0.0 {
+        return 0.0;
+    }
+    weight * (s / SALIENCE_SCALE).clamp(0.0, 1.0)
+}
+
 /// Run a search and return one page of hits plus the total match count. The
 /// `coverage` snapshot is supplied by the store for the semantic and hybrid modes
 /// (which gate on embedding staleness) and is `None` for the lexical modes.
@@ -191,7 +213,8 @@ async fn scored_lexical(
         format!("WHERE {}", clauses.join(" AND "))
     };
     let sql = format!(
-        "SELECT e.id, d.name, e.permalink, e.title, e.engram_type, e.status, e.description, e.content \
+        "SELECT e.id, d.name, e.permalink, e.title, e.engram_type, e.status, e.description, e.content, \
+         (e.metadata ->> 'salience')::double precision \
          FROM engram e JOIN domain d ON d.id=e.domain_id {where_sql}"
     );
     let rows = query_all(conn, &sql, params).await?;
@@ -228,7 +251,8 @@ async fn filter_only(
 
     let offset = (page - 1) * limit;
     let sql = format!(
-        "SELECT e.id, d.name, e.permalink, e.title, e.engram_type, e.status, e.description, e.content \
+        "SELECT e.id, d.name, e.permalink, e.title, e.engram_type, e.status, e.description, e.content, \
+         (e.metadata ->> 'salience')::double precision \
          FROM engram e JOIN domain d ON d.id=e.domain_id {where_sql} \
          ORDER BY e.recorded_at DESC, e.permalink ASC LIMIT {limit} OFFSET {offset}"
     );
@@ -331,6 +355,7 @@ async fn run_hybrid(
     let limit = if query.limit == 0 { 10 } else { query.limit };
     let page = query.page.max(1);
     let min_sim = query.min_similarity.unwrap_or(DEFAULT_MIN_SIMILARITY) as f64;
+    let salience_weight = query.salience_weight.unwrap_or(DEFAULT_SALIENCE_WEIGHT);
 
     check_staleness(coverage, active, dims)?;
 
@@ -385,12 +410,13 @@ async fn run_hybrid(
     let mut ranked: Vec<(f64, Merged)> = merged
         .into_values()
         .map(|m| {
-            let score = match (m.text, m.sem) {
+            let relevance = match (m.text, m.sem) {
                 (Some(t), Some(s)) => HYBRID_TEXT_WEIGHT * t + HYBRID_SEMANTIC_WEIGHT * s,
                 (Some(t), None) => t * SINGLE_SOURCE_PENALTY,
                 (None, Some(s)) => s * SINGLE_SOURCE_PENALTY,
                 (None, None) => 0.0,
             };
+            let score = relevance + salience_prior(m.cand.salience, salience_weight);
             (score, m)
         })
         .collect();
@@ -450,6 +476,7 @@ async fn semantic_candidates(
     let where_sql = format!("WHERE {}", clauses.join(" AND "));
     let sql = format!(
         "SELECT e.id, d.name, e.permalink, e.title, e.engram_type, e.status, e.description, e.content, \
+         (e.metadata ->> 'salience')::double precision, \
          min(c.embedding <=> $1) AS dist \
          FROM chunk c JOIN engram e ON e.id=c.engram_id JOIN domain d ON d.id=e.domain_id \
          {where_sql} GROUP BY e.id, d.name ORDER BY dist ASC LIMIT {SEMANTIC_TOPK}"
@@ -457,7 +484,7 @@ async fn semantic_candidates(
     let rows = query_all(conn, &sql, params).await?;
     let mut out = Vec::with_capacity(rows.len());
     for r in &rows {
-        let dist = cell_real(r, 8).unwrap_or(1.0);
+        let dist = cell_real(r, 9).unwrap_or(1.0);
         out.push((1.0 - dist, Candidate::from_row(r)));
     }
     Ok(out)
@@ -732,6 +759,9 @@ struct Candidate {
     title_lower: String,
     desc_lower: String,
     content_lower: String,
+    /// The raw `salience` frontmatter value if present, read from the metadata
+    /// JSON column. `None` when absent or non-numeric. Feeds the ranking prior.
+    salience: Option<f64>,
 }
 
 impl Candidate {
@@ -748,6 +778,7 @@ impl Candidate {
             title_lower: String::new(),
             desc_lower: String::new(),
             content_lower: String::new(),
+            salience: cell_real(r, 8),
         }
     }
 
