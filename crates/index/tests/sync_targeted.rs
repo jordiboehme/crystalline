@@ -314,3 +314,52 @@ parity!(
     rows_outside_the_targeted_batch_are_untouched,
     outside_batch_untouched
 );
+
+/// An unreadable targeted path is a reported failure, not a delete: a metadata
+/// error other than "not found" keeps the row in the index and surfaces the
+/// path in the report's `failed` list instead of dropping it.
+#[cfg(unix)]
+mod unreadable_path {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn targeted_scan_of_an_unreadable_path_reports_failure_and_keeps_the_row() {
+        let store = TursoStore::open_in_memory().await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "sub/a.md", &engram("A", "a", "keepme body"));
+
+        let seeded = sync_domain_with(&store, "d", root, &params())
+            .await
+            .unwrap();
+        assert_eq!(seeded.added, 1, "the seed indexed the file");
+        let domain = upsert_domain(&store, "d", root).await;
+
+        // Deny the subfolder so the file's metadata cannot be stat'd.
+        let sub = root.join("sub");
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let snapshot = store.file_stamps(domain).await.unwrap();
+        let scan = scan_paths("d", root, snapshot, vec!["sub/a.md".to_string()], &params()).await;
+        let report = apply_scan(&store, domain, scan).await.unwrap();
+
+        // Restore before any assertion can unwind past the tempdir drop.
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            report.failed.iter().any(|(p, _)| p == "sub/a.md"),
+            "the unreadable path is reported as failed: {report:?}"
+        );
+        assert_eq!(report.deleted, 0, "an unreadable path is not a delete");
+        assert!(
+            store
+                .file_stamps(domain)
+                .await
+                .unwrap()
+                .contains_key("sub/a.md"),
+            "the row survives an unreadable targeted path"
+        );
+    }
+}

@@ -139,7 +139,7 @@ pub async fn sync_domain_with<S: Store + ?Sized>(
         )
         .await?;
     let stamps = store.file_stamps(domain).await?;
-    let scan = scan_domain(name, root, stamps, chunk_params).await;
+    let scan = scan_domain(name, root, stamps, chunk_params).await?;
     apply_scan(store, domain, scan).await
 }
 
@@ -183,7 +183,7 @@ pub async fn scan_domain(
     root: &Path,
     stamps: HashMap<String, FileStamp>,
     chunk_params: &ChunkParams,
-) -> DomainScan {
+) -> Result<DomainScan> {
     let started = Instant::now();
 
     // Folders the MANIFEST provisions from inside this root hold deployable
@@ -206,6 +206,20 @@ pub async fn scan_domain(
     {
         let entry = match entry {
             Ok(e) => e,
+            // The walk root itself being unreadable is a domain-level
+            // failure: scanning on would see zero files and mark every
+            // recorded engram deleted, so a denied root errors loudly
+            // instead of emptying the index.
+            Err(err) if err.depth() == 0 => {
+                let msg = err.to_string();
+                let source = err
+                    .into_io_error()
+                    .unwrap_or_else(|| std::io::Error::other(msg));
+                return Err(IndexError::Io {
+                    path: root.display().to_string(),
+                    source,
+                });
+            }
             Err(_) => continue,
         };
         if !entry.file_type().is_file() {
@@ -242,16 +256,17 @@ pub async fn scan_domain(
         .cloned()
         .collect();
 
-    classify_and_parse(
+    Ok(classify_and_parse(
         name,
         root,
         stamps,
         current,
         deleted_paths,
+        Vec::new(),
         chunk_params,
         started,
     )
-    .await
+    .await)
 }
 
 /// Scan a specific list of relative paths against a stamp snapshot, the
@@ -295,6 +310,7 @@ pub async fn scan_paths(
 
     let mut current: HashMap<String, Scanned> = HashMap::new();
     let mut deleted_paths: Vec<String> = Vec::new();
+    let mut unreadable: Vec<(String, String)> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     for rel in paths {
         // The same path can arrive twice in one debounce batch; classify it once.
@@ -329,13 +345,18 @@ pub async fn scan_paths(
             // non-markdown file, a hidden or artifact path): ignore it, matching
             // the walk which never indexes it either.
             Ok(_) => {}
-            // Absent on disk: a recorded path is a delete candidate (scoped to
-            // the given paths, no walk), an unrecorded one is a no-op.
-            Err(_) => {
+            // Not found on disk: a recorded path is a delete candidate (scoped
+            // to the given paths, no walk), an unrecorded one is a no-op.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 if stamps.contains_key(&rel) {
                     deleted_paths.push(rel);
                 }
             }
+            // Any other metadata error (a denied parent, an io fault) means the
+            // path is unreadable, not gone: reporting it as failed keeps the row
+            // instead of dropping an engram that is still there but momentarily
+            // unreadable, the targeted counterpart of the walk-root guard.
+            Err(e) => unreadable.push((rel, e.to_string())),
         }
     }
 
@@ -345,6 +366,7 @@ pub async fn scan_paths(
         stamps,
         current,
         deleted_paths,
+        unreadable,
         chunk_params,
         started,
     )
@@ -370,12 +392,18 @@ async fn classify_and_parse(
     stamps: HashMap<String, FileStamp>,
     current: HashMap<String, Scanned>,
     deleted_paths: Vec<String>,
+    unreadable: Vec<(String, String)>,
     chunk_params: &ChunkParams,
     started: Instant,
 ) -> DomainScan {
     // Prefilter: unchanged files (same mtime and size) are skipped entirely.
     let mut report = SyncReport {
         domain: name.to_string(),
+        // Paths that could not be stat'd (a denied parent, an io fault) are
+        // failures the caller already collected: fold them in up front, then
+        // the hashing and parsing phases append their own read and parse
+        // failures to the same list.
+        failed: unreadable,
         ..SyncReport::default()
     };
     let mut to_hash: Vec<Scanned> = Vec::new();

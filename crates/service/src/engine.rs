@@ -2838,6 +2838,7 @@ impl Engine {
         let collab = !self.instance_id.is_empty();
         let mut reports = Vec::new();
         let mut skipped = Vec::new();
+        let mut failed = Vec::new();
         // Two short store-lock windows per domain with the scan in between, so the
         // walk-hash-parse pass of a large domain no longer blocks every concurrent
         // read behind the mutex. The first window claims the host, resolves the
@@ -2878,7 +2879,18 @@ impl Engine {
                 let snapshot = store.file_stamps(domain).await?;
                 (domain, snapshot)
             };
-            let scan = scan_domain(name, root, snapshot, &self.chunk_params).await;
+            let scan = match scan_domain(name, root, snapshot, &self.chunk_params).await {
+                Ok(scan) => scan,
+                Err(e) if only.is_none() => {
+                    // One denied domain must not block the rest of the
+                    // sweep; its error is carried in the result and the
+                    // daemon log, and the next sync retries it.
+                    tracing::warn!("sync of '{name}' skipped: {e}");
+                    failed.push(json!({ "domain": name, "error": e.to_string() }));
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            };
             let report = {
                 let store = self.store.lock().await;
                 apply_scan(&*store, domain, scan)
@@ -2890,6 +2902,7 @@ impl Engine {
         Ok(json!({
             "reports": serde_json::to_value(&reports).unwrap_or(Value::Null),
             "skipped": skipped,
+            "failed": failed,
         }))
     }
 
@@ -2993,7 +3006,7 @@ impl Engine {
                 let snapshot = store.file_stamps(domain).await?;
                 (domain, snapshot)
             };
-            let scan = scan_domain(&name, &root, snapshot, &self.chunk_params).await;
+            let scan = scan_domain(&name, &root, snapshot, &self.chunk_params).await?;
             let report = {
                 let store = self.store.lock().await;
                 apply_scan(&*store, domain, scan).await.map_err(|e| {
