@@ -468,6 +468,12 @@ pub struct GraphNode {
     pub title: String,
     /// The engram `type`.
     pub engram_type: String,
+    /// The raw `salience` frontmatter value, `None` when absent. A non-numeric
+    /// value reads as neutral too, though not byte-identically across backends:
+    /// Postgres's `jsonb_typeof` guard yields `None`, Turso's `CAST` yields
+    /// `Some(0.0)`. Both are zero lift for ranking, so callers must compare
+    /// against neutral (`<= 0.0` or absent), never assert an exact `None`.
+    pub salience: Option<f64>,
 }
 
 /// Whether an edge came from a relation bullet or a prose wikilink.
@@ -500,6 +506,28 @@ pub struct GraphSlice {
     pub nodes: Vec<GraphNode>,
     /// Every edge among those nodes, including cross-domain edges.
     pub edges: Vec<GraphEdge>,
+}
+
+/// The frontmatter salience scale: a salience of `SALIENCE_SCALE` maps to the
+/// full prior; absent or non-positive salience adds nothing.
+const SALIENCE_SCALE: f64 = 10.0;
+/// The default salience-prior weight when a query does not override it: the
+/// maximum lift a fully-salient engram gets on the normalized [0,1] relevance
+/// score. Small on purpose so relevance dominates and the prior only reorders
+/// within a relevance band, never filters.
+pub const DEFAULT_SALIENCE_WEIGHT: f64 = 0.15;
+
+/// The bounded, non-negative salience prior added to a normalized relevance
+/// score. `salience` is the raw frontmatter value (`None` or non-positive means
+/// no lift); `weight` is the maximum lift. The result is never negative and
+/// never exceeds `weight`, so it can reorder within a relevance band but can
+/// never exclude a result.
+pub fn salience_prior(salience: Option<f64>, weight: f64) -> f64 {
+    let s = salience.unwrap_or(0.0);
+    if s <= 0.0 || weight <= 0.0 {
+        return 0.0;
+    }
+    weight * (s / SALIENCE_SCALE).clamp(0.0, 1.0)
 }
 
 /// A filter for recent activity.
@@ -1171,4 +1199,49 @@ pub trait Store: Send + Sync {
     async fn commit(&self) -> Result<()>;
     /// Roll back the current write transaction.
     async fn rollback(&self) -> Result<()>;
+}
+
+#[cfg(test)]
+mod salience_tests {
+    use super::{DEFAULT_SALIENCE_WEIGHT, salience_prior};
+
+    #[test]
+    fn salience_prior_absent_is_neutral() {
+        assert_eq!(salience_prior(None, 0.15), 0.0);
+    }
+
+    #[test]
+    fn salience_prior_zero_or_negative_is_neutral() {
+        assert_eq!(salience_prior(Some(0.0), 0.15), 0.0);
+        assert_eq!(salience_prior(Some(-4.0), 0.15), 0.0);
+    }
+
+    #[test]
+    fn salience_prior_max_is_weight() {
+        assert!((salience_prior(Some(10.0), 0.15) - 0.15).abs() < 1e-9);
+    }
+
+    #[test]
+    fn salience_prior_is_clamped_above_scale() {
+        assert!((salience_prior(Some(50.0), 0.15) - 0.15).abs() < 1e-9);
+    }
+
+    #[test]
+    fn salience_prior_is_monotonic_and_bounded() {
+        let low = salience_prior(Some(3.0), 0.15);
+        let high = salience_prior(Some(7.0), 0.15);
+        assert!(low < high);
+        assert!(high <= 0.15 + 1e-9);
+    }
+
+    #[test]
+    fn salience_prior_zero_weight_disables() {
+        assert_eq!(salience_prior(Some(9.0), 0.0), 0.0);
+    }
+
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn default_weight_is_conservative() {
+        assert!(DEFAULT_SALIENCE_WEIGHT > 0.0 && DEFAULT_SALIENCE_WEIGHT < 0.5);
+    }
 }

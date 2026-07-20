@@ -1634,6 +1634,86 @@ async fn neighbors_cross_domain(store: &dyn Store) {
 }
 parity!(neighbors_depth_and_cross_domain, neighbors_cross_domain);
 
+async fn neighbors_carries_salience(store: &dyn Store) {
+    // The seed relates to three targets: numeric salience, no salience, and a
+    // hand-edited non-numeric salience. `neighbors` must carry each target's
+    // raw salience through onto its `GraphNode` (the later ranking pass reads
+    // it there rather than issuing a second query); the numeric target is the
+    // only one that should read as anything other than neutral. Absent and
+    // non-numeric salience are both neutral but not byte-identical across
+    // backends (Turso's CAST yields `Some(0.0)`, Postgres's jsonb_typeof guard
+    // yields `None`), so both must be asserted as neutral, never as exact
+    // `None`.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "seed.md",
+        &engram(
+            "Seed",
+            "seed",
+            "engram",
+            "",
+            "- relates_to [[numeric]]\n- relates_to [[none]]\n- relates_to [[nonnumeric]]\n",
+        ),
+    );
+    write(
+        root,
+        "numeric.md",
+        &engram("Numeric", "numeric", "engram", "salience: 8\n", "body\n"),
+    );
+    write(
+        root,
+        "none.md",
+        &engram("None", "none", "engram", "", "body\n"),
+    );
+    write(
+        root,
+        "nonnumeric.md",
+        &engram(
+            "Nonnumeric",
+            "nonnumeric",
+            "engram",
+            "salience: high\n",
+            "body\n",
+        ),
+    );
+
+    let report = sync_domain(store, "d", root).await.unwrap();
+    assert_eq!(report.relations_resolved, 3, "all three relations resolve");
+
+    let seed = store.lookup_id("d", "seed").await.unwrap().unwrap();
+    let slice = store.neighbors(&[seed], 1).await.unwrap();
+
+    let numeric = slice
+        .nodes
+        .iter()
+        .find(|n| n.permalink == "numeric")
+        .expect("numeric target present");
+    assert_eq!(numeric.salience, Some(8.0));
+
+    let none = slice
+        .nodes
+        .iter()
+        .find(|n| n.permalink == "none")
+        .expect("no-salience target present");
+    assert!(
+        none.salience.is_none_or(|s| s <= 0.0),
+        "absent salience is neutral, not a lift"
+    );
+
+    let nonnumeric = slice
+        .nodes
+        .iter()
+        .find(|n| n.permalink == "nonnumeric")
+        .expect("non-numeric target present");
+    assert!(
+        nonnumeric.salience.is_none_or(|s| s <= 0.0),
+        "non-numeric salience is neutral, not a lift or an error"
+    );
+}
+parity!(neighbors_carries_salience_prior, neighbors_carries_salience);
+
 async fn recent_newest_first(store: &dyn Store) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
