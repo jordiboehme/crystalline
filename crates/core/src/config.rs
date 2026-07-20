@@ -82,6 +82,17 @@ impl GlobalConfig {
             .unwrap_or(false)
     }
 
+    /// How the MCP server encodes list-shaped tool results, from
+    /// `service.response_format`. Absent config or an absent key means TOON,
+    /// the token-efficient default; `json` restores plain compact JSON for
+    /// every tool.
+    pub fn response_format(&self) -> ResponseFormat {
+        self.service
+            .as_ref()
+            .and_then(|s| s.response_format)
+            .unwrap_or_default()
+    }
+
     /// The effective database configuration: the configured `database` block,
     /// or the Turso default when absent. The store factory validates this
     /// before opening a backend.
@@ -317,6 +328,10 @@ pub struct ServiceConfig {
     /// Absent means loopback-only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_hosts: Option<Vec<String>>,
+    /// How the MCP server encodes list-shaped tool results. Absent means
+    /// TOON, the token-efficient default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<ResponseFormat>,
 }
 
 /// The `service.http` value: either enabled/disabled, or a bind address.
@@ -327,6 +342,18 @@ pub enum HttpSetting {
     Enabled(bool),
     /// An explicit `host:port` bind address.
     Address(String),
+}
+
+/// The `service.response_format` value: how the MCP server encodes
+/// list-shaped tool results.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ResponseFormat {
+    /// Token-efficient TOON encoding for list-shaped tool results.
+    #[default]
+    Toon,
+    /// Plain compact JSON for every tool result.
+    Json,
 }
 
 /// Embedding provider configuration.

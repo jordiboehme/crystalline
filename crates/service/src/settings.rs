@@ -10,7 +10,8 @@
 use std::path::PathBuf;
 
 use crystalline_core::config::{
-    DatabaseBackend, DatabaseConfig, GitHubConfig, GlobalConfig, HttpSetting, ServiceConfig,
+    DatabaseBackend, DatabaseConfig, GitHubConfig, GlobalConfig, HttpSetting, ResponseFormat,
+    ServiceConfig,
 };
 
 use crate::overlay::EnvOverlay;
@@ -174,6 +175,15 @@ pub fn registry() -> &'static [SettingSpec] {
             apply: set_allowed_hosts,
             clear: clear_allowed_hosts,
             effective: allowed_hosts_effective,
+        },
+        SettingSpec {
+            key: "service.response_format",
+            doc: "How list-shaped MCP tool results are encoded: toon (token-efficient, default) or json",
+            kind: SettingKind::String,
+            startup_effective: false,
+            apply: set_response_format,
+            clear: clear_response_format,
+            effective: response_format_effective,
         },
         SettingSpec {
             key: "database.backend",
@@ -586,6 +596,41 @@ fn allowed_hosts_effective(config: &GlobalConfig) -> (String, bool) {
     }
 }
 
+// --- service.response_format ------------------------------------------------
+
+fn set_response_format(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
+    let parsed = match value {
+        "toon" => ResponseFormat::Toon,
+        "json" => ResponseFormat::Json,
+        _ => {
+            return Err(SettingsError(format!(
+                "service.response_format must be toon or json, got '{value}'"
+            )));
+        }
+    };
+    config
+        .service
+        .get_or_insert_with(ServiceConfig::default)
+        .response_format = Some(parsed);
+    Ok(())
+}
+
+fn clear_response_format(config: &mut GlobalConfig) {
+    if let Some(s) = config.service.as_mut() {
+        s.response_format = None;
+    }
+    drop_service_if_empty(config);
+}
+
+fn response_format_effective(config: &GlobalConfig) -> (String, bool) {
+    let stored = config.service.as_ref().and_then(|s| s.response_format);
+    let value = match stored.unwrap_or_default() {
+        ResponseFormat::Toon => "toon",
+        ResponseFormat::Json => "json",
+    };
+    (value.to_string(), stored.is_none())
+}
+
 // --- database.backend ----------------------------------------------------------
 
 fn set_database_backend(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
@@ -683,7 +728,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_lists_exactly_the_ten_keys_in_order() {
+    fn registry_lists_exactly_the_eleven_keys_in_order() {
         assert_eq!(
             known_keys(),
             vec![
@@ -695,6 +740,7 @@ mod tests {
                 "service.read_only",
                 "service.http",
                 "service.allowed_hosts",
+                "service.response_format",
                 "database.backend",
                 "database.url",
             ]
@@ -729,6 +775,10 @@ mod tests {
                     "CRYSTALLINE_SERVICE_ALLOWED_HOSTS".to_string()
                 ),
                 (
+                    "service.response_format",
+                    "CRYSTALLINE_SERVICE_RESPONSE_FORMAT".to_string()
+                ),
+                (
                     "database.backend",
                     "CRYSTALLINE_DATABASE_BACKEND".to_string()
                 ),
@@ -748,6 +798,7 @@ mod tests {
         assert!(change_note("service.read_only", &no_env).is_some());
         assert!(change_note("service.http", &no_env).is_some());
         assert!(change_note("service.allowed_hosts", &no_env).is_some());
+        assert!(change_note("service.response_format", &no_env).is_none());
         assert!(change_note("database.backend", &no_env).is_some());
         assert!(change_note("database.url", &no_env).is_some());
         assert!(change_note("github.bogus", &no_env).is_none());
@@ -823,6 +874,37 @@ mod tests {
         apply(&mut cfg, "service.allowed_hosts", "").unwrap();
         assert!(cfg.service.is_none());
         assert_eq!(allowed_hosts_effective(&cfg), (String::new(), true));
+    }
+
+    #[test]
+    fn response_format_applies_clears_and_rejects() {
+        let mut config = GlobalConfig::default();
+        // The default is toon, reported as such.
+        assert_eq!(
+            response_format_effective(&config),
+            ("toon".to_string(), true)
+        );
+        apply(&mut config, "service.response_format", "json").unwrap();
+        assert_eq!(config.response_format(), ResponseFormat::Json);
+        assert_eq!(
+            response_format_effective(&config),
+            ("json".to_string(), false)
+        );
+        apply(&mut config, "service.response_format", "toon").unwrap();
+        assert_eq!(config.response_format(), ResponseFormat::Toon);
+        assert_eq!(
+            response_format_effective(&config),
+            ("toon".to_string(), false)
+        );
+        let err = apply(&mut config, "service.response_format", "yaml").unwrap_err();
+        assert!(err.to_string().contains("toon or json"), "{err}");
+        unset(&mut config, "service.response_format").unwrap();
+        assert_eq!(
+            response_format_effective(&config),
+            ("toon".to_string(), true)
+        );
+        // The service block is dropped once its last field clears.
+        assert!(config.service.is_none());
     }
 
     #[test]
@@ -980,7 +1062,7 @@ mod tests {
         apply(&mut cfg, "github.enabled", "true").unwrap();
 
         let views = snapshot(&cfg, &EnvOverlay::default());
-        assert_eq!(views.len(), 10);
+        assert_eq!(views.len(), 11);
         assert_eq!(
             views.iter().map(|v| v.key.as_str()).collect::<Vec<_>>(),
             vec![
@@ -992,6 +1074,7 @@ mod tests {
                 "service.read_only",
                 "service.http",
                 "service.allowed_hosts",
+                "service.response_format",
                 "database.backend",
                 "database.url",
             ]
@@ -1034,11 +1117,15 @@ mod tests {
         assert_eq!(allowed_hosts.value, "");
         assert_eq!(allowed_hosts.source, SettingSource::Default);
 
-        let backend = &views[8];
+        let response_format = &views[8];
+        assert_eq!(response_format.value, "toon");
+        assert_eq!(response_format.source, SettingSource::Default);
+
+        let backend = &views[9];
         assert_eq!(backend.value, "turso");
         assert_eq!(backend.source, SettingSource::Default);
 
-        let url = &views[9];
+        let url = &views[10];
         assert_eq!(url.value, "");
         assert_eq!(url.source, SettingSource::Default);
     }
