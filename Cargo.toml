@@ -93,6 +93,10 @@ base64 = "0.22.1"
 insta = { version = "1.48.0", features = ["yaml"] }
 assert_cmd = "2.2.2"
 tempfile = "3.27.0"
+# o200k_base tokenizer for the TOON vs JSON payload measurement test; pulls no
+# serde_json (verified against its crates.io dependency list), so it cannot
+# reintroduce the preserve_order feature into this workspace.
+tiktoken-rs = "0.12.0"
 
 # Dev and test builds carry line tables only: panics and backtraces keep
 # file:line, links across the 45 integration-test binaries stay fast and the

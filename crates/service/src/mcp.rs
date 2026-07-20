@@ -112,6 +112,10 @@ const COLLAB_TOOLS: [&str; 5] = [
 /// update like sync; status is a pure read).
 const COLLAB_WRITE_TOOLS: [&str; 3] = ["configure", "share_changes", "resolve_conflict"];
 
+/// Appended to the initialize instructions while TOON responses are active,
+/// so a client model reads list results as structured data rather than prose.
+const TOON_INSTRUCTIONS_NOTE: &str = "\n\nList-shaped tool results (search hits, activity, listings and status reports) arrive TOON-encoded rather than as JSON: indentation nests objects, `name[N]{field1,field2}:` heads a uniform array with one comma-separated row per record and a tags cell joins its values with commas. Read them as data with exactly those fields.";
+
 /// Whether `name` is one of the five collaboration tools.
 fn is_collab_tool(name: &str) -> bool {
     COLLAB_TOOLS.contains(&name)
@@ -142,6 +146,8 @@ fn hidden_collab_tool(name: &str, github_enabled: bool, read_only: bool) -> bool
     }
     false
 }
+
+use crystalline_core::config::ResponseFormat;
 
 use crate::engine::{ConfigureAction, Engine, EngineError, ProvisionAction};
 use crate::params::*;
@@ -281,7 +287,7 @@ impl McpServer {
             .search_engrams(&p)
             .await
             .map_err(to_error)
-            .and_then(ok)
+            .and_then(|v| self.ok_list(v))
     }
 
     #[tool(
@@ -298,7 +304,7 @@ impl McpServer {
             .build_context(&p)
             .await
             .map_err(to_error)
-            .and_then(ok)
+            .and_then(|v| self.ok_list(v))
     }
 
     #[tool(
@@ -315,7 +321,7 @@ impl McpServer {
             .recent_activity(&p)
             .await
             .map_err(to_error)
-            .and_then(ok)
+            .and_then(|v| self.ok_list(v))
     }
 
     #[tool(
@@ -332,7 +338,7 @@ impl McpServer {
             .list_domains(&p)
             .await
             .map_err(to_error)
-            .and_then(ok)
+            .and_then(|v| self.ok_list(v))
     }
 
     #[tool(
@@ -349,7 +355,7 @@ impl McpServer {
             .browse_domain(&p)
             .await
             .map_err(to_error)
-            .and_then(ok)
+            .and_then(|v| self.ok_list(v))
     }
 
     #[tool(
@@ -366,7 +372,7 @@ impl McpServer {
             .validate_engrams(&p)
             .await
             .map_err(to_error)
-            .and_then(ok)
+            .and_then(|v| self.ok_list(v))
     }
 
     #[tool(
@@ -400,7 +406,7 @@ impl McpServer {
             .vocabulary(&p)
             .await
             .map_err(to_error)
-            .and_then(ok)
+            .and_then(|v| self.ok_list(v))
     }
 
     #[tool(
@@ -452,7 +458,7 @@ impl McpServer {
             .configure_snapshot()
             .await
             .map_err(to_error)
-            .and_then(ok)
+            .and_then(|v| self.ok_list(v))
     }
 
     #[tool(
@@ -594,7 +600,7 @@ impl McpServer {
         {
             tracing::warn!("failed to send tools/list_changed after update_domain: {e}");
         }
-        result.map_err(to_error).and_then(ok)
+        result.map_err(to_error).and_then(|v| self.ok_list(v))
     }
 
     #[tool(
@@ -611,7 +617,7 @@ impl McpServer {
             .origin_status(p.domain.as_deref())
             .await
             .map_err(to_error)
-            .and_then(ok)
+            .and_then(|v| self.ok_list(v))
     }
 
     #[tool(
@@ -699,11 +705,24 @@ impl McpServer {
             .provision(&action)
             .await
             .map_err(to_error)
-            .and_then(ok)
+            .and_then(|v| self.ok_list(v))
     }
 }
 
 impl McpServer {
+    /// Wrap a list-shaped engine value as a successful tool result: TOON
+    /// under the default `service.response_format`, byte-identical to [`ok`]
+    /// under `json`. The format is read per response, so a runtime configure
+    /// switch applies from the next tool call on.
+    fn ok_list(&self, value: Value) -> Result<CallToolResult, ErrorData> {
+        match self.engine.response_format() {
+            ResponseFormat::Json => ok(value),
+            ResponseFormat::Toon => Ok(CallToolResult::success(vec![ContentBlock::text(
+                crate::toon::render(&value),
+            )])),
+        }
+    }
+
     /// Applies `configure`'s `set` map then `unset` list, one key at a time
     /// through the engine's existing per-key [`ConfigureAction`], stopping at
     /// the first failure. On success every applied key has already taken
@@ -772,7 +791,11 @@ impl ServerHandler for McpServer {
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::default();
         info.server_info = Implementation::new("crystalline", crystalline_core::VERSION);
-        info.instructions = Some(self.engine.routing_text());
+        let mut instructions = self.engine.routing_text();
+        if self.engine.response_format() == ResponseFormat::Toon {
+            instructions.push_str(TOON_INSTRUCTIONS_NOTE);
+        }
+        info.instructions = Some(instructions);
         info.capabilities = ServerCapabilities::builder()
             .enable_tools()
             .enable_tool_list_changed()

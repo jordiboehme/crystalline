@@ -7,7 +7,9 @@
 
 use std::sync::Arc;
 
-use crystalline_core::config::{DomainEntry, GitHubConfig, GlobalConfig};
+use crystalline_core::config::{
+    DomainEntry, GitHubConfig, GlobalConfig, ResponseFormat, ServiceConfig,
+};
 use crystalline_index::TursoStore;
 use crystalline_service::Engine;
 use crystalline_service::mcp::McpServer;
@@ -30,15 +32,22 @@ struct Harness {
 
 impl Harness {
     async fn new(domains: &[&str]) -> Harness {
-        Harness::build(domains, false).await
+        Harness::build(domains, false, true).await
     }
 
     /// A harness whose engine serves the content API read-only.
     async fn new_read_only(domains: &[&str]) -> Harness {
-        Harness::build(domains, true).await
+        Harness::build(domains, true, true).await
     }
 
-    async fn build(domains: &[&str], read_only: bool) -> Harness {
+    /// A harness whose engine keeps the default TOON response format, for
+    /// the dedicated format tests; every other test pins json so its
+    /// assertions stay on data semantics over byte-identical JSON.
+    async fn new_toon(domains: &[&str]) -> Harness {
+        Harness::build(domains, false, false).await
+    }
+
+    async fn build(domains: &[&str], read_only: bool, pin_json: bool) -> Harness {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();
         let mut cfg = GlobalConfig::default();
@@ -54,9 +63,18 @@ impl Harness {
             .unwrap();
             cfg.domains.insert(d.to_string(), DomainEntry::file(dir));
         }
+        if pin_json {
+            cfg.service = Some(ServiceConfig {
+                response_format: Some(ResponseFormat::Json),
+                ..ServiceConfig::default()
+            });
+        }
+        let config_path = root.join("config.yaml");
+        crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
         let store = TursoStore::open_in_memory().await.unwrap();
         let engine = Arc::new(
-            Engine::new(Arc::new(Mutex::new(store)), cfg, None, None).with_read_only(read_only),
+            Engine::new(Arc::new(Mutex::new(store)), cfg, None, Some(config_path))
+                .with_read_only(read_only),
         );
         engine.sync(None).await.unwrap();
         Harness {
@@ -103,6 +121,89 @@ async fn call(peer: &Peer<RoleClient>, tool: &str, args: Value) -> Result<Value,
         }
         Err(e) => Err(e.to_string()),
     }
+}
+
+/// Call a tool, returning the raw text of its first content block on success.
+async fn call_text(peer: &Peer<RoleClient>, tool: &str, args: Value) -> Result<String, String> {
+    let mut params = CallToolRequestParams::new(tool.to_string());
+    if let Value::Object(map) = args {
+        params = params.with_arguments(map);
+    }
+    match peer.call_tool(params).await {
+        Ok(result) => {
+            let v = serde_json::to_value(&result).unwrap();
+            Ok(v.pointer("/content/0/text")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string())
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn list_shaped_responses_default_to_toon_and_configure_restores_json() {
+    let h = Harness::new_toon(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Alpha", "content": "Alpha knowledge", "tags": ["alpha"] }),
+    )
+    .await
+    .unwrap();
+
+    // The default format serves search results as TOON: an envelope of
+    // key: value lines with a tabular hits header, not a JSON object.
+    let text = call_text(peer, "search_engrams", json!({ "query": "alpha" }))
+        .await
+        .unwrap();
+    assert!(
+        !text.trim_start().starts_with('{'),
+        "TOON expected, got JSON: {text}"
+    );
+    assert!(
+        text.contains("count: 1"),
+        "TOON envelope line expected: {text}"
+    );
+    assert!(
+        text.contains("hits[1]{"),
+        "tabular hits header expected: {text}"
+    );
+
+    // A confirmation tool stays compact JSON under the same default.
+    let confirm = call_text(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Beta", "content": "Beta knowledge" }),
+    )
+    .await
+    .unwrap();
+    assert!(
+        confirm.starts_with('{'),
+        "confirmations stay JSON: {confirm}"
+    );
+
+    // configure switches the format back to plain JSON at runtime. Its own
+    // response to the set call is TOON (configure is a list-shaped tool and
+    // the switch applies from the next call on), so take the raw text and
+    // ignore it.
+    call_text(
+        peer,
+        "configure",
+        json!({ "set": { "service.response_format": "json" } }),
+    )
+    .await
+    .unwrap();
+    let text = call_text(peer, "search_engrams", json!({ "query": "alpha" }))
+        .await
+        .unwrap();
+    assert!(
+        text.starts_with('{'),
+        "json mode restores compact JSON: {text}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2090,6 +2191,13 @@ async fn provision_allow_then_status_flow() {
     let mut cfg = GlobalConfig::default();
     cfg.domains
         .insert("harbor".to_string(), DomainEntry::file(harbor_dir));
+    // This test asserts on data semantics through the JSON-parsing `call`
+    // helper, so pin json the same way `Harness::build` does; provision is a
+    // list-shaped tool and defaults to TOON otherwise.
+    cfg.service = Some(ServiceConfig {
+        response_format: Some(ResponseFormat::Json),
+        ..ServiceConfig::default()
+    });
     let config_path = work.path().join("config.yaml");
     let store = TursoStore::open_in_memory().await.unwrap();
     let engine = Arc::new(Engine::new(

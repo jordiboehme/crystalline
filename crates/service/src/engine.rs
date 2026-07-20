@@ -20,7 +20,7 @@ use std::time::Instant;
 
 use chrono::{DateTime, Duration, FixedOffset, Utc};
 use crystalline_core::config::{
-    DomainEntry, DomainKind as CoreDomainKind, GlobalConfig, OriginConfig,
+    DomainEntry, DomainKind as CoreDomainKind, GlobalConfig, OriginConfig, ResponseFormat,
 };
 use crystalline_core::emit::{
     append_body, insert_after_section, insert_before_section, prepend_body,
@@ -656,6 +656,13 @@ impl Engine {
     /// a full snapshot.
     pub fn github_enabled(&self) -> bool {
         self.config.read().unwrap().github_enabled()
+    }
+
+    /// How the MCP server encodes list-shaped tool results, from the
+    /// effective `service.response_format`. Read per response, so a runtime
+    /// configure switch applies from the next tool call on.
+    pub fn response_format(&self) -> ResponseFormat {
+        self.config.read().unwrap().response_format()
     }
 
     /// The active embedding model id.
