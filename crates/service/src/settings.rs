@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use crystalline_core::config::{
     DatabaseBackend, DatabaseConfig, GitHubConfig, GlobalConfig, HttpSetting, ResponseFormat,
-    ServiceConfig,
+    SearchConfig, ServiceConfig,
 };
 
 use crate::overlay::EnvOverlay;
@@ -30,6 +30,8 @@ pub enum SettingKind {
     Bool,
     /// An unsigned integer.
     U64,
+    /// A floating-point value.
+    F64,
     /// A string.
     String,
 }
@@ -97,6 +99,11 @@ const MIN_POLL_SECS: u64 = 60;
 /// default documented on
 /// [`crystalline_core::config::GitHubConfig::api_url`].
 const DEFAULT_API_URL: &str = "https://api.github.com";
+
+/// The salience-prior weight used when `search.salience_weight` is absent.
+/// Mirrors the store's own `DEFAULT_SALIENCE_WEIGHT`, kept as a separate
+/// constant here since the index crate's copy is private to its backends.
+const DEFAULT_SALIENCE_WEIGHT: f64 = 0.15;
 
 /// The registry: every setting an agent or a user may change, in display
 /// order. This is the only place a setting key is declared; every consumer
@@ -202,6 +209,15 @@ pub fn registry() -> &'static [SettingSpec] {
             apply: set_database_url,
             clear: clear_database_url,
             effective: database_url_effective,
+        },
+        SettingSpec {
+            key: "search.salience_weight",
+            doc: "How strongly a salient engram is lifted in hybrid ranking, 0.0 to 1.0 (default 0.15); a soft prior that reorders within a relevance band and never filters",
+            kind: SettingKind::F64,
+            startup_effective: false,
+            apply: set_salience_weight,
+            clear: clear_salience_weight,
+            effective: salience_weight_effective,
         },
     ]
 }
@@ -337,6 +353,15 @@ fn drop_service_if_empty(config: &mut GlobalConfig) {
 fn drop_database_if_empty(config: &mut GlobalConfig) {
     if config.database.as_ref() == Some(&DatabaseConfig::default()) {
         config.database = None;
+    }
+}
+
+/// Drop the `search` block entirely once every field in it has been cleared,
+/// so an unset config round-trips to exactly the pre-feature shape (no empty
+/// `search: {}` line).
+fn drop_search_if_empty(config: &mut GlobalConfig) {
+    if config.search.as_ref() == Some(&SearchConfig::default()) {
+        config.search = None;
     }
 }
 
@@ -695,6 +720,40 @@ fn database_url_effective(config: &GlobalConfig) -> (String, bool) {
     (stored.unwrap_or_default(), is_default)
 }
 
+// --- search.salience_weight --------------------------------------------------
+
+fn set_salience_weight(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
+    let w: f64 = value.parse().map_err(|_| {
+        SettingsError(format!(
+            "search.salience_weight must be a number, got '{value}'"
+        ))
+    })?;
+    if !(0.0..=1.0).contains(&w) {
+        return Err(SettingsError(format!(
+            "search.salience_weight must be between 0.0 and 1.0, got {w}"
+        )));
+    }
+    config
+        .search
+        .get_or_insert_with(SearchConfig::default)
+        .salience_weight = Some(w);
+    Ok(())
+}
+
+fn clear_salience_weight(config: &mut GlobalConfig) {
+    if let Some(s) = config.search.as_mut() {
+        s.salience_weight = None;
+    }
+    drop_search_if_empty(config);
+}
+
+fn salience_weight_effective(config: &GlobalConfig) -> (String, bool) {
+    match config.salience_weight() {
+        Some(w) => (format!("{w}"), false),
+        None => (DEFAULT_SALIENCE_WEIGHT.to_string(), true),
+    }
+}
+
 // --- domains_root ----------------------------------------------------------
 
 fn set_domains_root(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
@@ -728,7 +787,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_lists_exactly_the_eleven_keys_in_order() {
+    fn registry_lists_exactly_the_twelve_keys_in_order() {
         assert_eq!(
             known_keys(),
             vec![
@@ -743,6 +802,7 @@ mod tests {
                 "service.response_format",
                 "database.backend",
                 "database.url",
+                "search.salience_weight",
             ]
         );
     }
@@ -783,6 +843,10 @@ mod tests {
                     "CRYSTALLINE_DATABASE_BACKEND".to_string()
                 ),
                 ("database.url", "CRYSTALLINE_DATABASE_URL".to_string()),
+                (
+                    "search.salience_weight",
+                    "CRYSTALLINE_SEARCH_SALIENCE_WEIGHT".to_string()
+                ),
             ]
         );
     }
@@ -801,6 +865,7 @@ mod tests {
         assert!(change_note("service.response_format", &no_env).is_none());
         assert!(change_note("database.backend", &no_env).is_some());
         assert!(change_note("database.url", &no_env).is_some());
+        assert!(change_note("search.salience_weight", &no_env).is_none());
         assert!(change_note("github.bogus", &no_env).is_none());
     }
 
@@ -1062,7 +1127,7 @@ mod tests {
         apply(&mut cfg, "github.enabled", "true").unwrap();
 
         let views = snapshot(&cfg, &EnvOverlay::default());
-        assert_eq!(views.len(), 11);
+        assert_eq!(views.len(), 12);
         assert_eq!(
             views.iter().map(|v| v.key.as_str()).collect::<Vec<_>>(),
             vec![
@@ -1077,6 +1142,7 @@ mod tests {
                 "service.response_format",
                 "database.backend",
                 "database.url",
+                "search.salience_weight",
             ]
         );
 
@@ -1128,6 +1194,10 @@ mod tests {
         let url = &views[10];
         assert_eq!(url.value, "");
         assert_eq!(url.source, SettingSource::Default);
+
+        let salience_weight = &views[11];
+        assert_eq!(salience_weight.value, "0.15");
+        assert_eq!(salience_weight.source, SettingSource::Default);
     }
 
     #[test]

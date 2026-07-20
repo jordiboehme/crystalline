@@ -359,7 +359,7 @@ async fn configure_with_no_args_reports_the_settings_snapshot_and_github_block()
 
     let out = call(peer, "configure", json!({})).await.unwrap();
     let settings = out["settings"].as_array().unwrap();
-    assert_eq!(settings.len(), 11, "{settings:?}");
+    assert_eq!(settings.len(), 12, "{settings:?}");
     assert!(settings.iter().any(|s| s["key"] == "github.enabled"));
     assert!(settings.iter().any(|s| s["key"] == "domains_root"));
     assert_eq!(out["github"]["connected"], json!(false));

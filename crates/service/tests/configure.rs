@@ -56,7 +56,7 @@ async fn show_lists_every_registry_key_at_its_default() {
 
     let data = engine.configure(&ConfigureAction::Show).await.unwrap();
     let views = settings_of(&data);
-    assert_eq!(views.len(), 11);
+    assert_eq!(views.len(), 12);
     assert!(
         views
             .iter()
@@ -400,4 +400,28 @@ async fn set_on_an_env_overridden_key_persists_the_file_value_while_the_view_sta
     let poll = views.iter().find(|v| v.key == "github.poll_secs").unwrap();
     assert_eq!(poll.value, "600");
     assert_eq!(poll.source, SettingSource::Env);
+}
+
+#[test]
+fn salience_weight_round_trips() {
+    let mut config = crystalline_core::config::GlobalConfig::default();
+    crystalline_service::settings::apply(&mut config, "search.salience_weight", "0.25").unwrap();
+    assert_eq!(config.salience_weight(), Some(0.25));
+    crystalline_service::settings::unset(&mut config, "search.salience_weight").unwrap();
+    assert_eq!(config.salience_weight(), None);
+}
+
+#[test]
+fn salience_weight_rejects_out_of_range() {
+    let mut config = crystalline_core::config::GlobalConfig::default();
+    assert!(
+        crystalline_service::settings::apply(&mut config, "search.salience_weight", "5").is_err()
+    );
+    assert!(
+        crystalline_service::settings::apply(&mut config, "search.salience_weight", "-1").is_err()
+    );
+    assert!(
+        crystalline_service::settings::apply(&mut config, "search.salience_weight", "notanumber")
+            .is_err()
+    );
 }

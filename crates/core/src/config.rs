@@ -68,6 +68,10 @@ pub struct GlobalConfig {
     /// every existing config keeps working untouched.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub github: Option<GitHubConfig>,
+    /// Search ranking settings. Absent means the built-in defaults, so every
+    /// existing config keeps working untouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search: Option<SearchConfig>,
 }
 
 impl GlobalConfig {
@@ -118,6 +122,11 @@ impl GlobalConfig {
             .as_ref()
             .and_then(|g| g.enabled)
             .unwrap_or(false)
+    }
+
+    /// The configured salience-prior weight, or `None` to use the store default.
+    pub fn salience_weight(&self) -> Option<f64> {
+        self.search.as_ref().and_then(|s| s.salience_weight)
     }
 }
 
@@ -388,6 +397,15 @@ pub struct PromptRule {
     /// Domains to exclude.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exclude: Option<Vec<String>>,
+}
+
+/// Search ranking configuration.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SearchConfig {
+    /// The salience-prior weight for hybrid ranking. Absent uses the store
+    /// default. The maximum lift a fully-salient engram receives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub salience_weight: Option<f64>,
 }
 
 // --- per-domain config -------------------------------------------------------

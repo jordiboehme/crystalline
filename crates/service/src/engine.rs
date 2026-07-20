@@ -2017,6 +2017,7 @@ impl Engine {
             page: p.page.unwrap_or(1).max(1),
             ..SearchQuery::default()
         };
+        query.salience_weight = self.config.read().unwrap().salience_weight();
         if let Some(mf) = &p.metadata_filters {
             query.metadata_filters =
                 parse_metadata_filters(mf).map_err(|e| EngineError::Invalid(e.to_string()))?;
