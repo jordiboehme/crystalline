@@ -44,8 +44,12 @@ use crystalline_core::config;
 /// The reminder printed on the one Stop call per session that earns it. Exact
 /// wording is load-bearing: it is the whole of what the agent sees, so it
 /// names the capture skill's own shape (propose, name the domain, wait for a
-/// yes) rather than re-describing it loosely.
-pub const NUDGE_REASON: &str = "Review this conversation for durable learnings before finishing: new facts, decisions, patterns and antipatterns, gotchas, corrections from the user or researched answers worth keeping. If any are not yet captured, propose capturing each one as an engram into the fitting crystalline domain: name the insight and the domain and wait for a yes. If nothing qualifies or everything is already captured, finish normally without mentioning this check.";
+/// yes) rather than re-describing it loosely. It also now carries the
+/// salience-feedback half of the learning loop, closing it directly (no
+/// propose-first) because that mirrors the routing prompt's own standing
+/// bullet to raise the salience of an engram that turned out to be the key
+/// to a task.
+pub const NUDGE_REASON: &str = "Review this conversation for durable learnings before finishing: new facts, decisions, patterns and antipatterns, gotchas, corrections from the user or researched answers worth keeping. If any are not yet captured, propose capturing each one as an engram into the fitting crystalline domain: name the insight and the domain and wait for a yes. If a recalled engram proved to be the key to the task, raise its salience. If nothing qualifies or everything is already captured, finish normally without mentioning this check.";
 
 /// A transcript byte size at or above this is substantial on its own, no
 /// read required: `run_stop` stats the file first and only reads it when the

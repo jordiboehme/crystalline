@@ -18,7 +18,7 @@ use assert_cmd::Command;
 /// The exact reminder text `hook.rs` prints, duplicated here because the
 /// `crystalline` binary has no library target for a test to import it from;
 /// this is a black-box check on what the subprocess actually printed.
-const NUDGE_REASON: &str = "Review this conversation for durable learnings before finishing: new facts, decisions, patterns and antipatterns, gotchas, corrections from the user or researched answers worth keeping. If any are not yet captured, propose capturing each one as an engram into the fitting crystalline domain: name the insight and the domain and wait for a yes. If nothing qualifies or everything is already captured, finish normally without mentioning this check.";
+const NUDGE_REASON: &str = "Review this conversation for durable learnings before finishing: new facts, decisions, patterns and antipatterns, gotchas, corrections from the user or researched answers worth keeping. If any are not yet captured, propose capturing each one as an engram into the fitting crystalline domain: name the insight and the domain and wait for a yes. If a recalled engram proved to be the key to the task, raise its salience. If nothing qualifies or everything is already captured, finish normally without mentioning this check.";
 
 fn bin() -> Command {
     Command::cargo_bin("crystalline").unwrap()
