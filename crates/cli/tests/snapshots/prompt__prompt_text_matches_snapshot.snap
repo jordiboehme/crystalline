@@ -14,5 +14,6 @@ Behavior:
 - Broad or unclear question: search_engrams without domains is an all-domain sweep.
 - write_engram, edit_engram, move_engram and delete_engram always require an explicit domain; there is no default domain for writes.
 - vocabulary lists tags and categories already in use; check it before inventing a new tag.
+- Mark exceptionally valuable knowledge with a numeric salience (0-10) at write time; salient engrams rank higher in search. Raise the salience of an engram that turned out to be the key to a task.
 - build_context on a crystalline:// anchor assembles related knowledge around a task.
 - Read a domain's MANIFEST via read_engram only when its routing line above is not enough; list_domains with include_routing=true re-fetches this index mid-session.

@@ -383,6 +383,9 @@ fn render_routing_body(
         out.push_str(
             "- vocabulary lists tags and categories already in use; check it before inventing a new tag.\n",
         );
+        out.push_str(
+            "- Mark exceptionally valuable knowledge with a numeric salience (0-10) at write time; salient engrams rank higher in search. Raise the salience of an engram that turned out to be the key to a task.\n",
+        );
     }
     out.push_str(
         "- build_context on a crystalline:// anchor assembles related knowledge around a task.\n",

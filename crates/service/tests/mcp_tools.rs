@@ -250,6 +250,40 @@ async fn list_tools_exposes_the_core_tools_plus_configure_and_add_domain() {
     assert_eq!(names.len(), 15, "exactly 15 tools: {names:?}");
 }
 
+/// The salience prior (Tasks 1-4) is invisible to an agent unless the tool
+/// copy teaches it: `write_engram` documents the `salience` metadata key an
+/// agent sets to mark exceptionally valuable knowledge, and `search_engrams`
+/// documents that hybrid ranking lifts a salient hit without ever excluding
+/// one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tool_descriptions_teach_salience() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let tools = client.peer().list_tools(Default::default()).await.unwrap();
+
+    let write = tools
+        .tools
+        .iter()
+        .find(|t| t.name == "write_engram")
+        .expect("write_engram tool present");
+    let write_description = write.description.as_deref().unwrap_or("");
+    assert!(
+        write_description.to_lowercase().contains("salience"),
+        "write_engram teaches salience: {write_description}"
+    );
+
+    let search = tools
+        .tools
+        .iter()
+        .find(|t| t.name == "search_engrams")
+        .expect("search_engrams tool present");
+    let search_description = search.description.as_deref().unwrap_or("");
+    assert!(
+        search_description.to_lowercase().contains("salience"),
+        "search_engrams teaches salience: {search_description}"
+    );
+}
+
 /// The `configure` tool's `set` and `unset` inputs must advertise the plain
 /// `object`/`array` JSON Schema `type` rather than a `["object", "null"]` or
 /// `["array", "null"]` union: some MCP clients (Claude Desktop) do not
