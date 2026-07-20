@@ -111,11 +111,12 @@ impl From<reqwest::Error> for IndexError {
     }
 }
 
-#[cfg(test)]
+// The whole module is macos-gated, not just the test: on other platforms a
+// gated-out lone test would leave `use super::*` dangling and fail clippy.
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn io_display_carries_the_privacy_hint_for_eperm_under_documents() {
         let path = crystalline_core::config::expand_tilde("~/Documents/x")
