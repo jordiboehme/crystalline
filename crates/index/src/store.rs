@@ -370,6 +370,12 @@ pub struct SearchQuery {
     /// Minimum cosine similarity for a semantic hit, `None` uses the store
     /// default (`0.55`). Ignored by the text, title and permalink modes.
     pub min_similarity: Option<f32>,
+    /// The salience-prior weight for hybrid ranking; `None` uses the store
+    /// default (`DEFAULT_SALIENCE_WEIGHT`). The maximum lift a fully-salient
+    /// engram receives on the normalized relevance score. A soft additive
+    /// prior, never a filter: it can reorder within a relevance band but never
+    /// excludes a result.
+    pub salience_weight: Option<f64>,
     /// The query text already embedded by the active provider, required by the
     /// semantic and hybrid modes. The caller owns the provider and embeds the
     /// query (with the query instruction prefix) before calling the store, which
