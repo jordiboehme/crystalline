@@ -192,7 +192,7 @@ pub struct ContextParams {
     /// A recency window such as `7d`; advisory in this version.
     #[serde(default)]
     pub timeframe: Option<String>,
-    /// Maximum related engrams beyond the anchors. Defaults to 10.
+    /// Maximum related engrams beyond the anchors, keeping the top-ranked. Defaults to 10.
     #[serde(default)]
     pub max_related: Option<usize>,
 }
