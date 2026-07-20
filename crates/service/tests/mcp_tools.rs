@@ -949,6 +949,231 @@ async fn build_context_follows_prose_wikilinks() {
     );
 }
 
+/// The neighbour ranking (seeded personalized PageRank, salience-lifted) picks
+/// the truncation survivor by spread mass rather than by ascending engram id.
+/// Far is written first so it lands the smallest id; under the old
+/// ascending-id truncation it would be the one kept. Near sits one hop from
+/// the seed and Far two, so ranked mass favors Near - the new behavior keeps
+/// Near and drops Far.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn build_context_ranked_truncation_keeps_near_over_far() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    // Write order fixes ascending ids: Far, then Near, then Seed.
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Far", "content": "far outpost ranking fixture" }),
+    )
+    .await
+    .unwrap();
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Near", "content": "- relates_to [[Far]]" }),
+    )
+    .await
+    .unwrap();
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Seed", "content": "- relates_to [[Near]]" }),
+    )
+    .await
+    .unwrap();
+
+    let out = call(
+        peer,
+        "build_context",
+        json!({ "anchor": "crystalline://eng/seed", "depth": 2, "max_related": 1 }),
+    )
+    .await
+    .unwrap();
+    let nodes = out["nodes"].as_array().unwrap();
+    let perms: Vec<&str> = nodes
+        .iter()
+        .map(|n| n["permalink"].as_str().unwrap())
+        .collect();
+    assert_eq!(nodes.len(), 2, "seed plus exactly one related: {perms:?}");
+    assert!(perms.contains(&"near"), "near kept over far: {perms:?}");
+    assert!(!perms.contains(&"far"), "far dropped: {perms:?}");
+    let seed_node = nodes.iter().find(|n| n["permalink"] == "seed").unwrap();
+    assert_eq!(seed_node["seed"], json!(true));
+}
+
+/// A and B hang off Seed with the identical edge shape (one `relates_to` bullet
+/// each), so pure spreading-activation mass ties them exactly. A is written
+/// first (smaller id, plain) - the old ascending-id truncation, and a pure
+/// mass tiebreak, would both keep A. Only the salience prior (B carries
+/// `metadata.salience: 9`) breaks the tie, proving the store-to-engine
+/// salience plumbing end to end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn build_context_salient_neighbor_outranks_plain() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "A", "content": "plain neighbor salience fixture" }),
+    )
+    .await
+    .unwrap();
+    call(
+        peer,
+        "write_engram",
+        json!({
+            "domain": "eng",
+            "title": "B",
+            "content": "salient neighbor salience fixture",
+            "metadata": { "salience": 9 },
+        }),
+    )
+    .await
+    .unwrap();
+    call(
+        peer,
+        "write_engram",
+        json!({
+            "domain": "eng",
+            "title": "Seed",
+            "content": "- relates_to [[A]]\n- relates_to [[B]]",
+        }),
+    )
+    .await
+    .unwrap();
+
+    let out = call(
+        peer,
+        "build_context",
+        json!({ "anchor": "crystalline://eng/seed", "depth": 1, "max_related": 1 }),
+    )
+    .await
+    .unwrap();
+    let perms: Vec<&str> = out["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["permalink"].as_str().unwrap())
+        .collect();
+    assert!(perms.contains(&"b"), "salient B kept: {perms:?}");
+    assert!(!perms.contains(&"a"), "plain A dropped: {perms:?}");
+}
+
+/// A glob anchor over a shared permalink prefix seeds two engrams at once.
+/// With `max_related: 0` the ranking has no truncation budget for anything
+/// beyond the seeds, so both must still come back - seeds are never subject
+/// to the related-node cap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn build_context_seeds_always_kept() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    call(
+        peer,
+        "write_engram",
+        json!({
+            "domain": "eng",
+            "title": "Grove Alpha",
+            "content": "grove alpha seed-cap fixture",
+            "folder": "grove",
+        }),
+    )
+    .await
+    .unwrap();
+    call(
+        peer,
+        "write_engram",
+        json!({
+            "domain": "eng",
+            "title": "Grove Beta",
+            "content": "grove beta seed-cap fixture",
+            "folder": "grove",
+        }),
+    )
+    .await
+    .unwrap();
+
+    let out = call(
+        peer,
+        "build_context",
+        json!({ "anchor": "crystalline://eng/grove/*", "depth": 1, "max_related": 0 }),
+    )
+    .await
+    .unwrap();
+    let nodes = out["nodes"].as_array().unwrap();
+    let perms: Vec<&str> = nodes
+        .iter()
+        .map(|n| n["permalink"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        nodes.len(),
+        2,
+        "both seeds present, nothing else: {perms:?}"
+    );
+    assert!(perms.contains(&"grove/grove-alpha"), "{perms:?}");
+    assert!(perms.contains(&"grove/grove-beta"), "{perms:?}");
+    assert!(
+        nodes.iter().all(|n| n["seed"] == json!(true)),
+        "every node is a seed: {nodes:?}"
+    );
+}
+
+/// The ranker is a pure function of the graph slice, and seeds are always
+/// emitted before related nodes: two identical calls return byte-identical
+/// `nodes` arrays, and no related node ever precedes a seed within one array.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn build_context_is_deterministic_and_seeds_first() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    // Same chain shape as the truncation test (Origin -> Inner -> Outer), but
+    // max_related is generous enough here to keep every node in view.
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Outer", "content": "outer determinism fixture" }),
+    )
+    .await
+    .unwrap();
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Inner", "content": "- relates_to [[Outer]]" }),
+    )
+    .await
+    .unwrap();
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Origin", "content": "- relates_to [[Inner]]" }),
+    )
+    .await
+    .unwrap();
+
+    let params = json!({ "anchor": "crystalline://eng/origin", "depth": 2, "max_related": 10 });
+    let first = call(peer, "build_context", params.clone()).await.unwrap();
+    let second = call(peer, "build_context", params).await.unwrap();
+    assert_eq!(first["nodes"], second["nodes"], "identical across calls");
+
+    let nodes = first["nodes"].as_array().unwrap();
+    assert_eq!(nodes.len(), 3, "seed plus both related nodes: {nodes:?}");
+    let mut seen_non_seed = false;
+    for node in nodes {
+        let is_seed = node["seed"].as_bool().unwrap();
+        if is_seed {
+            assert!(!seen_non_seed, "seed after non-seed: {nodes:?}");
+        } else {
+            seen_non_seed = true;
+        }
+    }
+}
+
 /// read_engram enriches its response with per-reference resolution: relations
 /// and prose links each carry a `resolved` flag, a resolving reference sets it
 /// true and a dangling one false. A resolving outbound reference also earns the
