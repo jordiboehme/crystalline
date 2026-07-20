@@ -9,7 +9,6 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use interprocess::local_socket::tokio::Stream as IpcStream;
-use rmcp::model::{CallToolRequestParams, CallToolResult};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader, ReadBuf};
@@ -631,11 +630,19 @@ pub async fn run_tool(
     db: Option<&Path>,
     config_path: Option<&Path>,
 ) -> anyhow::Result<Value> {
+    use serde_json::json;
+    // A running daemon owns the index, so route the data verb to its shared
+    // engine over the ctl `tool` command, which always answers in JSON. The
+    // MCP round trip is avoided on purpose: the list-shaped tools answer an MCP
+    // call in the session's response format (TOON by default), which neither
+    // the `--json` byte contract nor the human renderers can consume.
     if use_daemon(db, config_path)
-        && let Some(conn) = try_attach().await
+        && let Some(data) = ctl_if_running(json!({
+            "v": 1, "cmd": "tool", "tool": tool, "args": args.clone(),
+        }))
+        .await?
     {
-        let stream = conn.into_mcp().await?;
-        return call_tool_over_stream(stream, tool, args).await;
+        return Ok(data);
     }
     let loaded = overlay::load(config_path)?;
     let db_path = resolve_db(db)?;
@@ -1158,37 +1165,15 @@ pub async fn virtual_routing_bullets(
     }
 }
 
-/// Call a tool over an MCP client on a socket stream and return its JSON value.
-async fn call_tool_over_stream(
-    stream: IpcStream,
+/// Dispatch a tool to the shared engine by name, decoding `args` into the
+/// tool's params type. Reachable from [`crate::control`] so the ctl `tool`
+/// command dispatches a daemon-attached CLI data verb through the exact same
+/// name-to-method mapping the standalone path uses.
+pub(crate) async fn dispatch_engine(
+    engine: &Engine,
     tool: &str,
     args: Value,
 ) -> anyhow::Result<Value> {
-    let client = rmcp::serve_client((), stream).await?;
-    let mut params = CallToolRequestParams::new(tool.to_string());
-    if let Value::Object(map) = args {
-        params = params.with_arguments(map);
-    }
-    let result = client.peer().call_tool(params).await;
-    let out = match result {
-        Ok(result) => extract_tool_value(&result),
-        Err(e) => Err(anyhow::anyhow!("{e}")),
-    };
-    let _ = client.cancel().await;
-    out
-}
-
-/// Pull the tool's JSON body out of the single text content block.
-fn extract_tool_value(result: &CallToolResult) -> anyhow::Result<Value> {
-    let v = serde_json::to_value(result)?;
-    if let Some(text) = v.pointer("/content/0/text").and_then(Value::as_str) {
-        return Ok(serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.to_string())));
-    }
-    Ok(v)
-}
-
-/// Dispatch a tool to the in-process engine.
-async fn dispatch_engine(engine: &Engine, tool: &str, args: Value) -> anyhow::Result<Value> {
     let v = match tool {
         "write_engram" => engine.write_engram(&decode::<WriteParams>(args)?).await?,
         "read_engram" => engine.read_engram(&decode::<ReadParams>(args)?).await?,

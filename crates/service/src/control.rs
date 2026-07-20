@@ -3,10 +3,12 @@
 //! Each request is one JSON line `{ "v": 1, "cmd": ..., ... }`; each response is
 //! one line `{ "v": 1, "ok": true, "data": ... }` or
 //! `{ "v": 1, "ok": false, "error": ... }`. Commands: sync, status, reindex,
-//! sessions, configure, origin_add, origin_update, origin_status,
+//! sessions, tool, configure, origin_add, origin_update, origin_status,
 //! origin_share, origin_discard, origin_resolve, provision, forget_domain,
-//! shutdown. This is the operator channel; data operations go over the MCP
-//! handshake instead.
+//! shutdown. This is the operator channel plus the `tool` command, which
+//! dispatches a daemon-attached CLI data verb to the shared engine and
+//! returns raw engine JSON; an MCP client's data operations still go over the
+//! MCP handshake.
 
 use std::sync::Arc;
 
@@ -88,6 +90,19 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
             })),
             false,
         ),
+        // Dispatch a data verb to the shared engine and return its JSON, so a
+        // daemon-attached CLI data command receives engine JSON directly rather
+        // than the MCP stream's format-dependent tool envelope (TOON by
+        // default). The engine methods self-guard read-only mutations, so this
+        // keeps the same refusals the MCP path gave.
+        "tool" => {
+            let tool = req.get("tool").and_then(Value::as_str).unwrap_or("");
+            let args = req.get("args").cloned().unwrap_or_else(|| json!({}));
+            match crate::client::dispatch_engine(&shared.engine, tool, args).await {
+                Ok(data) => (envelope_ok(data), false),
+                Err(e) => (envelope_err(e.to_string()), false),
+            }
+        }
         "sync" => {
             let domain = req.get("domain").and_then(Value::as_str);
             let embed = req.get("embed").and_then(Value::as_bool).unwrap_or(false);
@@ -351,7 +366,7 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
         }
         other => (
             envelope_err(format!(
-                "unknown ctl command '{other}'; expected status, sessions, sync, reindex, \
+                "unknown ctl command '{other}'; expected status, sessions, tool, sync, reindex, \
                  routing_bullets, scaffold_manifest, domain_import, domain_export, retag, \
                  configure, origin_add, origin_update, origin_status, origin_share, \
                  origin_discard, origin_resolve, provision, forget_domain or shutdown"

@@ -63,28 +63,45 @@ impl Env {
     }
 
     /// Create a domain directory with a MANIFEST and a seed engram, then register
-    /// it in the config. Config selection rides on the isolated `XDG_CONFIG_HOME`
-    /// (`apply` below), never an explicit `--config`: the default config path
-    /// already resolves to `config_path()`, and an explicit override would mean
-    /// "bypass the daemon" (see `crystalline_service::use_daemon`), which would
-    /// wrongly force the direct index path and collide with a running daemon's
-    /// lock. Leaving it off lets `domain add` route its sync through a live
-    /// daemon exactly as a plain invocation does.
+    /// it in the config, pinning the wire format to json. Config selection rides
+    /// on the isolated `XDG_CONFIG_HOME` (`apply` below), never an explicit
+    /// `--config`: the default config path already resolves to `config_path()`,
+    /// and an explicit override would mean "bypass the daemon" (see
+    /// `crystalline_service::use_daemon`), which would wrongly force the direct
+    /// index path and collide with a running daemon's lock. Leaving it off lets
+    /// `domain add` route its sync through a live daemon exactly as a plain
+    /// invocation does.
     fn setup_domain(&self, name: &str) {
-        // Pin the wire format to json so the suite's assertions stay on data
+        self.setup_domain_inner(name, true);
+    }
+
+    /// Like [`Self::setup_domain`] but leaves `service.response_format` on its
+    /// TOON default instead of pinning json, so a data command exercises the
+    /// daemon seam under the default wire format. Used by the one test that
+    /// proves the CLI receives structured JSON regardless of that format.
+    fn setup_domain_toon(&self, name: &str) {
+        self.setup_domain_inner(name, false);
+    }
+
+    fn setup_domain_inner(&self, name: &str, pin_json: bool) {
+        // The pin (when requested) keeps the suite's assertions on data
         // semantics; the TOON default gets its dedicated tests in
         // crates/service/tests. Written once, before the first `domain add`
         // creates config.yaml: `domain add` only ever loads the existing file
-        // and rewrites its `domains` map, so this pin rides along untouched
-        // through every later `setup_domain` call in the same `Env`.
+        // and rewrites its `domains` map, so this rides along untouched through
+        // every later `setup_domain` call in the same `Env`.
         if !self.config_path().exists() {
             std::fs::create_dir_all(self.config_path().parent().unwrap()).unwrap();
-            let cfg = GlobalConfig {
-                service: Some(ServiceConfig {
-                    response_format: Some(ResponseFormat::Json),
-                    ..ServiceConfig::default()
-                }),
-                ..GlobalConfig::default()
+            let cfg = if pin_json {
+                GlobalConfig {
+                    service: Some(ServiceConfig {
+                        response_format: Some(ResponseFormat::Json),
+                        ..ServiceConfig::default()
+                    }),
+                    ..GlobalConfig::default()
+                }
+            } else {
+                GlobalConfig::default()
             };
             config::save_yaml(&self.config_path(), &cfg).unwrap();
         }
@@ -734,6 +751,38 @@ fn explicit_overrides_bypass_a_running_daemon() {
         0,
         "the daemon's index holds none of the side domain's content: {hits}"
     );
+
+    drop(c1);
+    let _ = env.run(&["ctl", "shutdown"]);
+}
+
+/// The CLI-daemon seam must stay format-independent. A daemon on the TOON
+/// response-format default still answers a CLI data command with structured
+/// engine JSON, because the command routes over the ctl `tool` command rather
+/// than the MCP stream whose list-shaped tools would emit TOON. Without that
+/// routing `--json` would hand back one opaque TOON string instead of a
+/// parseable object, breaking its byte contract.
+#[test]
+fn data_command_against_a_toon_daemon_returns_json() {
+    let env = Env::new("toon-seam");
+    // No json pin: the daemon serves the TOON response-format default.
+    env.setup_domain_toon("eng");
+
+    // A real daemon owns this HOME's default config and index.
+    let mut c1 = Mcp::spawn(&env);
+    c1.initialize();
+    env.wait_ready();
+
+    // A data verb through the real CLI, routed to the running daemon.
+    let (ok, out) = env.run(&["search", "seed body token", "--json"]);
+    assert!(ok, "search --json: {out}");
+    let value: Value = serde_json::from_str(out.trim())
+        .expect("the CLI returns structured JSON even when the daemon default is TOON");
+    assert!(
+        value["total"].as_u64().unwrap_or(0) >= 1,
+        "search finds the seeded engram as parseable JSON: {value}"
+    );
+    assert!(value["hits"].is_array(), "hits is a JSON array: {value}");
 
     drop(c1);
     let _ = env.run(&["ctl", "shutdown"]);
