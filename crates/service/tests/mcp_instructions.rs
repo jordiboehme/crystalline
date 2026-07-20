@@ -120,6 +120,33 @@ fn instructions(client: &RunningService<RoleClient, ()>) -> String {
         .unwrap_or_default()
 }
 
+/// The default TOON response format appends a note to the initialize
+/// instructions so a client model reads list results as data; switching the
+/// format to json drops the note for the next connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn instructions_note_toon_only_while_the_format_is_active() {
+    let h = Harness::build(&[("eng", &["Route here for eng questions"])], &[], false).await;
+    let (client, _server) = h.connect().await;
+    let text = instructions(&client);
+    assert!(
+        text.contains("TOON"),
+        "default instructions carry the TOON note:\n{text}"
+    );
+    drop(client);
+
+    // Switching to json removes the note for the next connection.
+    h.engine
+        .configure(&crystalline_service::engine::ConfigureAction::Set {
+            key: "service.response_format".to_string(),
+            value: "json".to_string(),
+        })
+        .await
+        .unwrap();
+    let (client, _server) = h.connect().await;
+    let text = instructions(&client);
+    assert!(!text.contains("TOON"), "json mode drops the note:\n{text}");
+}
+
 /// A routing line per file domain, the header and the Behavior tool names.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn instructions_carry_a_routing_line_per_file_domain() {

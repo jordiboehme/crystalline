@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::Arc;
 
-use crystalline_core::config::{GitHubConfig, GlobalConfig};
+use crystalline_core::config::{GitHubConfig, GlobalConfig, ResponseFormat, ServiceConfig};
 use crystalline_index::TursoStore;
 use crystalline_remote::{DeviceFlowStart, RemoteError, StoredToken, TokenStore};
 use crystalline_service::Engine;
@@ -43,6 +43,13 @@ fn config(github_enabled: bool) -> GlobalConfig {
             ..GitHubConfig::default()
         });
     }
+    // The collab tools origin_status and update_domain are list-shaped and so
+    // default to TOON; pin json so these tests assert on data semantics over
+    // byte-identical JSON.
+    cfg.service = Some(ServiceConfig {
+        response_format: Some(ResponseFormat::Json),
+        ..ServiceConfig::default()
+    });
     cfg
 }
 
