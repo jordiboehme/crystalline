@@ -217,8 +217,10 @@ fn escape(s: &str) -> String {
 
 /// The tabular-eligibility pre-pass, applied to every array whose elements
 /// are all objects: missing keys are filled with null so rows stay uniform,
-/// and a row field that is an array of strings joins into one
-/// comma-separated cell (an empty list becomes the empty string).
+/// and a row field that is an array of comma-free strings joins into one
+/// comma-separated cell (an empty list becomes the empty string). A string
+/// list with a comma inside any element is left as an array so its boundaries
+/// survive, at the cost of that array's tabular form.
 fn normalize(value: Value) -> Value {
     match value {
         Value::Array(items) => {
@@ -260,17 +262,28 @@ fn fill_rows(rows: Vec<Value>) -> Vec<Value> {
         .collect()
 }
 
-/// A cell that is an array of strings becomes one comma-joined string, since
-/// tabular rows only allow primitive cells. Anything else passes through.
+/// A cell that is an array of strings, every one free of commas, becomes one
+/// comma-joined string, since tabular rows only allow primitive cells (an empty
+/// list joins to the empty string). When any element itself contains a comma
+/// the join would erase the element boundaries, so the array is left untouched:
+/// the row keeps a non-primitive cell, forfeits tabular eligibility and falls
+/// back to the expanded list form, which preserves every string exactly.
+/// Anything that is not an all-strings array passes through unchanged.
 fn join_string_array(value: Value) -> Value {
     match &value {
-        Value::Array(items) if items.iter().all(Value::is_string) => Value::String(
-            items
+        Value::Array(items)
+            if items
                 .iter()
-                .filter_map(Value::as_str)
-                .collect::<Vec<_>>()
-                .join(","),
-        ),
+                .all(|v| v.as_str().is_some_and(|s| !s.contains(','))) =>
+        {
+            Value::String(
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(","),
+            )
+        }
         _ => value,
     }
 }
@@ -378,6 +391,20 @@ mod tests {
             { "a": 2, "b": true, "tags": [] }
         ]});
         let expected = "hits[2]{a,b,tags}:\n  1,null,\"x,y\"\n  2,true,\"\"";
+        assert_eq!(render(&v), expected);
+    }
+
+    #[test]
+    fn comma_bearing_string_lists_stay_arrays_and_fall_back_to_the_list_form() {
+        // A free-text bullet list (list_domains' `when_to_use`) whose strings
+        // carry commas must not be comma-joined: the join would erase the
+        // bullet boundaries. The array stays put, the row forfeits tabular
+        // eligibility and the expanded list form preserves both strings exactly.
+        let v = json!({ "domains": [
+            { "name": "eng", "when_to_use": ["Route here for a, b", "Also c"] }
+        ]});
+        let expected =
+            "domains[1]:\n  - name: eng\n    when_to_use[2]: \"Route here for a, b\",Also c";
         assert_eq!(render(&v), expected);
     }
 }

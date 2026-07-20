@@ -7,7 +7,7 @@
 
 // The harness below is copied verbatim from mcp_tools.rs (integration test
 // files are separate crates and cannot share it); this file only exercises
-// `new_toon`, `new` and `connect`, so its unused pieces (`new_read_only`,
+// `new_toon` and `connect`, so its unused pieces (`new_read_only`,
 // `root`, the second half of the `connect` tuple) are allowed dead here
 // rather than trimmed, to keep the copy a faithful one.
 #![allow(dead_code)]
