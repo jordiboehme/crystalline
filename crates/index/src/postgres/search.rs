@@ -17,8 +17,9 @@ use sqlx::PgConnection;
 use crate::alias::AliasMap;
 use crate::error::{IndexError, Result};
 use crate::store::{
-    DEFAULT_SALIENCE_WEIGHT, EdgeKind, EmbeddingCoverage, EngramId, FilterOp, GraphEdge, GraphNode,
-    GraphSlice, HitKind, MetadataFilter, Page, SearchHit, SearchMode, SearchQuery, salience_prior,
+    DEFAULT_RETIRED_WEIGHT, DEFAULT_SALIENCE_WEIGHT, EdgeKind, EmbeddingCoverage, EngramId,
+    FilterOp, GraphEdge, GraphNode, GraphSlice, HitKind, MetadataFilter, Page, SearchHit,
+    SearchMode, SearchQuery, retired_factor, salience_prior,
 };
 
 use super::{Param, cell_i64, cell_real, cell_text, query_all, query_first, scalar_i64};
@@ -146,7 +147,16 @@ async fn run_lexical(
         return filter_only(conn, &where_sql, params, limit, page).await;
     }
 
-    let scored = scored_lexical(conn, query, &terms, aliases).await?;
+    let mut scored = scored_lexical(conn, query, &terms, aliases).await?;
+    let retired_weight = query.retired_weight.unwrap_or(DEFAULT_RETIRED_WEIGHT);
+    for entry in &mut scored {
+        entry.0 *= retired_factor(&entry.1.status, retired_weight);
+    }
+    scored.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.title.cmp(&b.1.title))
+    });
     let total = scored.len();
     let start = (page - 1) * limit;
     let mut items: Vec<(i64, SearchHit)> = Vec::new();
@@ -158,7 +168,10 @@ async fn run_lexical(
 }
 
 /// Load the lexical candidate rows and score them, sorted best first. Shared by
-/// the lexical modes and the lexical half of hybrid search.
+/// the lexical modes and the lexical half of hybrid search: the retired-status
+/// fade is applied by each of those callers exactly once, over this function's
+/// returned scores, never in here - applying it here would double-fade the
+/// hybrid path and distort its `max_text` normalization.
 async fn scored_lexical(
     conn: &mut PgConnection,
     query: &SearchQuery,
@@ -286,11 +299,19 @@ async fn run_semantic(
     let limit = if query.limit == 0 { 10 } else { query.limit };
     let page = query.page.max(1);
     let min_sim = query.min_similarity.unwrap_or(DEFAULT_MIN_SIMILARITY) as f64;
+    let retired_weight = query.retired_weight.unwrap_or(DEFAULT_RETIRED_WEIGHT);
 
     check_staleness(coverage, active, dims)?;
 
     let mut hits = semantic_candidates(conn, query, qvec, active, dims, aliases).await?;
+    // The min_similarity gate applies to the raw cosine similarity; the
+    // retired-status fade lands after it, so fading can never drop a hit that
+    // cleared the gate - a retired hit's reported score is the faded
+    // similarity, which may itself land below min_similarity.
     hits.retain(|(sim, _)| *sim >= min_sim);
+    for entry in &mut hits {
+        entry.0 *= retired_factor(&entry.1.status, retired_weight);
+    }
     hits.sort_by(|a, b| {
         b.0.partial_cmp(&a.0)
             .unwrap_or(std::cmp::Ordering::Equal)
@@ -334,6 +355,7 @@ async fn run_hybrid(
     let page = query.page.max(1);
     let min_sim = query.min_similarity.unwrap_or(DEFAULT_MIN_SIMILARITY) as f64;
     let salience_weight = query.salience_weight.unwrap_or(DEFAULT_SALIENCE_WEIGHT);
+    let retired_weight = query.retired_weight.unwrap_or(DEFAULT_RETIRED_WEIGHT);
 
     check_staleness(coverage, active, dims)?;
 
@@ -394,7 +416,8 @@ async fn run_hybrid(
                 (None, Some(s)) => s * SINGLE_SOURCE_PENALTY,
                 (None, None) => 0.0,
             };
-            let score = relevance + salience_prior(m.cand.salience, salience_weight);
+            let score = (relevance + salience_prior(m.cand.salience, salience_weight))
+                * retired_factor(&m.cand.status, retired_weight);
             (score, m)
         })
         .collect();
@@ -982,7 +1005,8 @@ pub(super) async fn neighbors(
             conn,
             &format!(
                 "SELECT e.id, d.name, e.permalink, e.title, e.engram_type, \
-                 CASE WHEN jsonb_typeof(e.metadata -> 'salience') = 'number' THEN (e.metadata ->> 'salience')::double precision END \
+                 CASE WHEN jsonb_typeof(e.metadata -> 'salience') = 'number' THEN (e.metadata ->> 'salience')::double precision END, \
+                 e.status \
                  FROM engram e JOIN domain d ON d.id=e.domain_id WHERE e.id IN ({list}) ORDER BY e.id"
             ),
             vec![],
@@ -996,6 +1020,7 @@ pub(super) async fn neighbors(
                 title: cell_text(r, 3).unwrap_or_default(),
                 engram_type: cell_text(r, 4).unwrap_or_default(),
                 salience: cell_real(r, 5),
+                status: cell_text(r, 6).unwrap_or_default(),
             });
         }
     }
