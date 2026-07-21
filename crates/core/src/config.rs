@@ -128,6 +128,12 @@ impl GlobalConfig {
     pub fn salience_weight(&self) -> Option<f64> {
         self.search.as_ref().and_then(|s| s.salience_weight)
     }
+
+    /// The configured retired-status ranking multiplier, or `None` to use the
+    /// store default.
+    pub fn retired_weight(&self) -> Option<f64> {
+        self.search.as_ref().and_then(|s| s.retired_weight)
+    }
 }
 
 /// Which side of the one-truth-per-domain rule a domain lives on: files on
@@ -406,6 +412,11 @@ pub struct SearchConfig {
     /// default. The maximum lift a fully-salient engram receives.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub salience_weight: Option<f64>,
+    /// The ranking multiplier for engrams whose status is deprecated,
+    /// superseded, archived or legacy. Absent uses the store default. A soft
+    /// fade that reorders results and never filters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retired_weight: Option<f64>,
 }
 
 // --- per-domain config -------------------------------------------------------

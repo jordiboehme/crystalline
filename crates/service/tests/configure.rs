@@ -56,7 +56,7 @@ async fn show_lists_every_registry_key_at_its_default() {
 
     let data = engine.configure(&ConfigureAction::Show).await.unwrap();
     let views = settings_of(&data);
-    assert_eq!(views.len(), 12);
+    assert_eq!(views.len(), 13);
     assert!(
         views
             .iter()
@@ -422,6 +422,30 @@ fn salience_weight_rejects_out_of_range() {
     );
     assert!(
         crystalline_service::settings::apply(&mut config, "search.salience_weight", "notanumber")
+            .is_err()
+    );
+}
+
+#[test]
+fn retired_weight_round_trips() {
+    let mut config = crystalline_core::config::GlobalConfig::default();
+    crystalline_service::settings::apply(&mut config, "search.retired_weight", "0.4").unwrap();
+    assert_eq!(config.retired_weight(), Some(0.4));
+    crystalline_service::settings::unset(&mut config, "search.retired_weight").unwrap();
+    assert_eq!(config.retired_weight(), None);
+}
+
+#[test]
+fn retired_weight_rejects_out_of_range() {
+    let mut config = crystalline_core::config::GlobalConfig::default();
+    assert!(
+        crystalline_service::settings::apply(&mut config, "search.retired_weight", "5").is_err()
+    );
+    assert!(
+        crystalline_service::settings::apply(&mut config, "search.retired_weight", "-1").is_err()
+    );
+    assert!(
+        crystalline_service::settings::apply(&mut config, "search.retired_weight", "notanumber")
             .is_err()
     );
 }

@@ -13,7 +13,7 @@ use crystalline_core::config::{
     DatabaseBackend, DatabaseConfig, GitHubConfig, GlobalConfig, HttpSetting, ResponseFormat,
     SearchConfig, ServiceConfig,
 };
-use crystalline_index::DEFAULT_SALIENCE_WEIGHT;
+use crystalline_index::{DEFAULT_RETIRED_WEIGHT, DEFAULT_SALIENCE_WEIGHT};
 
 use crate::overlay::EnvOverlay;
 
@@ -214,6 +214,15 @@ pub fn registry() -> &'static [SettingSpec] {
             apply: set_salience_weight,
             clear: clear_salience_weight,
             effective: salience_weight_effective,
+        },
+        SettingSpec {
+            key: "search.retired_weight",
+            doc: "The ranking multiplier for engrams whose status is deprecated, superseded, archived or legacy, 0.0 to 1.0 (default 0.6, 1.0 disables); a soft fade that reorders results and never filters",
+            kind: SettingKind::F64,
+            startup_effective: false,
+            apply: set_retired_weight,
+            clear: clear_retired_weight,
+            effective: retired_weight_effective,
         },
     ]
 }
@@ -750,6 +759,40 @@ fn salience_weight_effective(config: &GlobalConfig) -> (String, bool) {
     }
 }
 
+// --- search.retired_weight ----------------------------------------------------
+
+fn set_retired_weight(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
+    let w: f64 = value.parse().map_err(|_| {
+        SettingsError(format!(
+            "search.retired_weight must be a number, got '{value}'"
+        ))
+    })?;
+    if !(0.0..=1.0).contains(&w) {
+        return Err(SettingsError(format!(
+            "search.retired_weight must be between 0.0 and 1.0, got {w}"
+        )));
+    }
+    config
+        .search
+        .get_or_insert_with(SearchConfig::default)
+        .retired_weight = Some(w);
+    Ok(())
+}
+
+fn clear_retired_weight(config: &mut GlobalConfig) {
+    if let Some(s) = config.search.as_mut() {
+        s.retired_weight = None;
+    }
+    drop_search_if_empty(config);
+}
+
+fn retired_weight_effective(config: &GlobalConfig) -> (String, bool) {
+    match config.retired_weight() {
+        Some(w) => (format!("{w}"), false),
+        None => (DEFAULT_RETIRED_WEIGHT.to_string(), true),
+    }
+}
+
 // --- domains_root ----------------------------------------------------------
 
 fn set_domains_root(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
@@ -783,7 +826,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_lists_exactly_the_twelve_keys_in_order() {
+    fn registry_lists_exactly_the_thirteen_keys_in_order() {
         assert_eq!(
             known_keys(),
             vec![
@@ -799,6 +842,7 @@ mod tests {
                 "database.backend",
                 "database.url",
                 "search.salience_weight",
+                "search.retired_weight",
             ]
         );
     }
@@ -843,6 +887,10 @@ mod tests {
                     "search.salience_weight",
                     "CRYSTALLINE_SEARCH_SALIENCE_WEIGHT".to_string()
                 ),
+                (
+                    "search.retired_weight",
+                    "CRYSTALLINE_SEARCH_RETIRED_WEIGHT".to_string()
+                ),
             ]
         );
     }
@@ -862,6 +910,7 @@ mod tests {
         assert!(change_note("database.backend", &no_env).is_some());
         assert!(change_note("database.url", &no_env).is_some());
         assert!(change_note("search.salience_weight", &no_env).is_none());
+        assert!(change_note("search.retired_weight", &no_env).is_none());
         assert!(change_note("github.bogus", &no_env).is_none());
     }
 
@@ -1123,7 +1172,7 @@ mod tests {
         apply(&mut cfg, "github.enabled", "true").unwrap();
 
         let views = snapshot(&cfg, &EnvOverlay::default());
-        assert_eq!(views.len(), 12);
+        assert_eq!(views.len(), 13);
         assert_eq!(
             views.iter().map(|v| v.key.as_str()).collect::<Vec<_>>(),
             vec![
@@ -1139,6 +1188,7 @@ mod tests {
                 "database.backend",
                 "database.url",
                 "search.salience_weight",
+                "search.retired_weight",
             ]
         );
 
@@ -1194,6 +1244,10 @@ mod tests {
         let salience_weight = &views[11];
         assert_eq!(salience_weight.value, "0.15");
         assert_eq!(salience_weight.source, SettingSource::Default);
+
+        let retired_weight = &views[12];
+        assert_eq!(retired_weight.value, "0.6");
+        assert_eq!(retired_weight.source, SettingSource::Default);
     }
 
     #[test]
