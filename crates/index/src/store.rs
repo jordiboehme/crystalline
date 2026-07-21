@@ -376,6 +376,11 @@ pub struct SearchQuery {
     /// prior, never a filter: it can reorder within a relevance band but never
     /// excludes a result.
     pub salience_weight: Option<f64>,
+    /// The multiplicative retired-status fade weight, in `[0, 1]`; `None` uses
+    /// the store default (`DEFAULT_RETIRED_WEIGHT`). A soft reorder, never a
+    /// filter: it scales down a retired engram's final score but never
+    /// excludes it from the results.
+    pub retired_weight: Option<f64>,
     /// The query text already embedded by the active provider, required by the
     /// semantic and hybrid modes. The caller owns the provider and embeds the
     /// query (with the query instruction prefix) before calling the store, which
