@@ -663,27 +663,45 @@ async fn run_http(
     http_sessions: Arc<AtomicUsize>,
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
-    use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
-    use rmcp::transport::streamable_http_server::tower::StreamableHttpService;
-
-    let session_manager = Arc::new(LocalSessionManager::default());
-    let factory_engine = engine.clone();
-    let service = StreamableHttpService::new(
-        move || {
-            http_sessions.fetch_add(1, Ordering::Relaxed);
-            Ok(McpServer::new(factory_engine.clone()))
-        },
-        session_manager,
-        http_config(&allowed_hosts),
-    );
-    let router = axum::Router::new()
-        .route("/health", axum::routing::get(health))
-        .fallback_service(service);
+    let router = http_router(engine, http_sessions, &allowed_hosts);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, router)
         .with_graceful_shutdown(async move { wait_true(&mut shutdown).await })
         .await?;
     Ok(())
+}
+
+/// Build the router `serve --http` mounts: the tool router behind rmcp's
+/// streamable-HTTP service, plus the `/health` probe. Public and
+/// doc-commented on purpose (not `pub(crate)`) so an integration test can
+/// drive the exact production construction over a real `TcpListener` instead
+/// of reimplementing it; `run_http` is the only other caller.
+pub fn http_router(
+    engine: Arc<Engine>,
+    http_sessions: Arc<AtomicUsize>,
+    allowed_hosts: &[String],
+) -> axum::Router {
+    use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+    use rmcp::transport::streamable_http_server::tower::StreamableHttpService;
+
+    // The session manager drives per-request stream priming (e.g. the
+    // tools/list response); its own `session_config.sse_retry` default must be
+    // cleared independently of `http_config`'s, since `SessionConfig` is
+    // `#[non_exhaustive]` and only reachable through the `Default` instance.
+    let mut session_manager = LocalSessionManager::default();
+    session_manager.session_config.sse_retry = None;
+    let session_manager = Arc::new(session_manager);
+    let service = StreamableHttpService::new(
+        move || {
+            http_sessions.fetch_add(1, Ordering::Relaxed);
+            Ok(McpServer::new(engine.clone()))
+        },
+        session_manager,
+        http_config(allowed_hosts),
+    );
+    axum::Router::new()
+        .route("/health", axum::routing::get(health))
+        .fallback_service(service)
 }
 
 /// Liveness probe for load balancers and uptime monitors: a static payload
@@ -1041,19 +1059,31 @@ fn resolve_allowed_hosts(flag: &[String], config: &GlobalConfig) -> Vec<String> 
         .unwrap_or_default()
 }
 
-/// Build the streamable-HTTP config, applying the DNS-rebinding `Host` guard.
-/// An empty list keeps rmcp's loopback-only default; a single `*` disables the
-/// guard (any Host allowed); otherwise loopback is merged with the configured
-/// hosts so local access never breaks.
+/// Build the streamable-HTTP config, applying the DNS-rebinding `Host` guard
+/// and dropping the SSE priming frame. An empty `allowed_hosts` keeps rmcp's
+/// loopback-only default; a single `*` disables the guard (any Host allowed);
+/// otherwise loopback is merged with the configured hosts so local access
+/// never breaks.
+///
+/// The priming frame (SEP-1699: an empty `data:` event carrying only an `id:`
+/// and a `retry:` reconnection hint, sent ahead of the real JSON-RPC response)
+/// is dropped unconditionally by clearing `sse_retry`. Strict SSE parsers -
+/// AWS Bedrock AgentCore Gateway among them - reject the optional `retry:`
+/// field and the empty `data:` line outright, breaking every tool call behind
+/// such a gateway. The MCP Python SDK never emits it, so a single-`data:`-event
+/// stream is the compatibility baseline the ecosystem already assumes; the
+/// reconnection hint itself is worthless for the sub-second request/response
+/// streams this server produces.
 fn http_config(
     allowed_hosts: &[String],
 ) -> rmcp::transport::streamable_http_server::tower::StreamableHttpServerConfig {
     use rmcp::transport::streamable_http_server::tower::StreamableHttpServerConfig;
+    let base = StreamableHttpServerConfig::default().with_sse_retry(None);
     if allowed_hosts.iter().any(|h| h == "*") {
-        return StreamableHttpServerConfig::default().disable_allowed_hosts();
+        return base.disable_allowed_hosts();
     }
     if allowed_hosts.is_empty() {
-        return StreamableHttpServerConfig::default();
+        return base;
     }
     let mut hosts = vec![
         "localhost".to_string(),
@@ -1061,7 +1091,7 @@ fn http_config(
         "::1".to_string(),
     ];
     hosts.extend(allowed_hosts.iter().cloned());
-    StreamableHttpServerConfig::default().with_allowed_hosts(hosts)
+    base.with_allowed_hosts(hosts)
 }
 
 pub(crate) fn resolve_db(db: Option<&Path>) -> anyhow::Result<PathBuf> {
