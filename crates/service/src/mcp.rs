@@ -293,7 +293,7 @@ impl McpServer {
     #[tool(
         name = "build_context",
         title = "Build context",
-        description = "Assemble the neighbourhood around an anchor engram by following its relations and links, across domains too, to gather related context before a task. The anchor is a crystalline:// URL; a /* suffix globs a permalink prefix. depth is 1 to 3.",
+        description = "Assemble the neighbourhood around an anchor engram by following its relations and links, across domains too, to gather related context before a task. Related engrams come back ranked by how strongly they connect to the anchor, salience-aware, and max_related keeps the top-ranked. The anchor is a crystalline:// URL; a /* suffix globs a permalink prefix. depth is 1 to 3.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn build_context(

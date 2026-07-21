@@ -14,8 +14,8 @@ use turso::{Connection, Row, Value};
 use crate::alias::AliasMap;
 use crate::error::{IndexError, Result};
 use crate::store::{
-    EdgeKind, EmbeddingCoverage, EngramId, FilterOp, GraphEdge, GraphNode, GraphSlice, HitKind,
-    MetadataFilter, Page, SearchHit, SearchMode, SearchQuery,
+    DEFAULT_SALIENCE_WEIGHT, EdgeKind, EmbeddingCoverage, EngramId, FilterOp, GraphEdge, GraphNode,
+    GraphSlice, HitKind, MetadataFilter, Page, SearchHit, SearchMode, SearchQuery, salience_prior,
 };
 
 use super::{cell_i64, cell_real, cell_text, query_all, query_first, scalar_i64};
@@ -34,28 +34,6 @@ const HYBRID_SEMANTIC_WEIGHT: f64 = 0.6;
 /// by this factor, so an equally strong hit corroborated by both signals ranks
 /// above it (a both-signal hit can reach 1.0, a single-signal hit at most 0.85).
 const SINGLE_SOURCE_PENALTY: f64 = 0.85;
-
-/// The frontmatter salience scale: a salience of `SALIENCE_SCALE` maps to the
-/// full prior; absent or non-positive salience adds nothing.
-const SALIENCE_SCALE: f64 = 10.0;
-/// The default salience-prior weight when a query does not override it: the
-/// maximum lift a fully-salient engram gets on the normalized [0,1] relevance
-/// score. Small on purpose so relevance dominates and the prior only reorders
-/// within a relevance band, never filters.
-pub(super) const DEFAULT_SALIENCE_WEIGHT: f64 = 0.15;
-
-/// The bounded, non-negative salience prior added to a normalized relevance
-/// score. `salience` is the raw frontmatter value (`None` or non-positive means
-/// no lift); `weight` is the maximum lift. The result is never negative and
-/// never exceeds `weight`, so it can reorder within a relevance band but can
-/// never exclude a result.
-pub(super) fn salience_prior(salience: Option<f64>, weight: f64) -> f64 {
-    let s = salience.unwrap_or(0.0);
-    if s <= 0.0 || weight <= 0.0 {
-        return 0.0;
-    }
-    weight * (s / SALIENCE_SCALE).clamp(0.0, 1.0)
-}
 
 /// Run a search and return one page of hits plus the total match count. The
 /// `coverage` snapshot is supplied by the store for the semantic and hybrid modes
@@ -1015,7 +993,8 @@ pub(super) async fn neighbors(
         let rows = query_all(
             conn,
             &format!(
-                "SELECT e.id, d.name, e.permalink, e.title, e.engram_type \
+                "SELECT e.id, d.name, e.permalink, e.title, e.engram_type, \
+                 CAST(json_extract(e.metadata, '$.salience') AS REAL) \
                  FROM engram e JOIN domain d ON d.id=e.domain_id WHERE e.id IN ({list}) ORDER BY e.id"
             ),
             vec![],
@@ -1028,6 +1007,7 @@ pub(super) async fn neighbors(
                 permalink: cell_text(r, 2).unwrap_or_default(),
                 title: cell_text(r, 3).unwrap_or_default(),
                 engram_type: cell_text(r, 4).unwrap_or_default(),
+                salience: cell_real(r, 5),
             });
         }
     }
@@ -1154,49 +1134,4 @@ fn eq_ci(a: char, b: char) -> bool {
 
 fn collapse_ws(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-#[cfg(test)]
-mod salience_tests {
-    use super::{DEFAULT_SALIENCE_WEIGHT, salience_prior};
-
-    #[test]
-    fn salience_prior_absent_is_neutral() {
-        assert_eq!(salience_prior(None, 0.15), 0.0);
-    }
-
-    #[test]
-    fn salience_prior_zero_or_negative_is_neutral() {
-        assert_eq!(salience_prior(Some(0.0), 0.15), 0.0);
-        assert_eq!(salience_prior(Some(-4.0), 0.15), 0.0);
-    }
-
-    #[test]
-    fn salience_prior_max_is_weight() {
-        assert!((salience_prior(Some(10.0), 0.15) - 0.15).abs() < 1e-9);
-    }
-
-    #[test]
-    fn salience_prior_is_clamped_above_scale() {
-        assert!((salience_prior(Some(50.0), 0.15) - 0.15).abs() < 1e-9);
-    }
-
-    #[test]
-    fn salience_prior_is_monotonic_and_bounded() {
-        let low = salience_prior(Some(3.0), 0.15);
-        let high = salience_prior(Some(7.0), 0.15);
-        assert!(low < high);
-        assert!(high <= 0.15 + 1e-9);
-    }
-
-    #[test]
-    fn salience_prior_zero_weight_disables() {
-        assert_eq!(salience_prior(Some(9.0), 0.0), 0.0);
-    }
-
-    #[test]
-    #[allow(clippy::assertions_on_constants)]
-    fn default_weight_is_conservative() {
-        assert!(DEFAULT_SALIENCE_WEIGHT > 0.0 && DEFAULT_SALIENCE_WEIGHT < 0.5);
-    }
 }

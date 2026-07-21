@@ -128,7 +128,7 @@ Once you have an anchor engram, follow its relations and links (including across
 }
 ```
 
-A `/*` suffix on the anchor globs a permalink prefix, useful for pulling in an entire topic's engrams at once, for example `crystalline://payments/retry-queue/*`. The result carries node titles, typed relations and untyped prose links (the latter surfaced as `rel_type` `links_to`), still no content - follow it with `read_engram` on the nodes that matter.
+A `/*` suffix on the anchor globs a permalink prefix, useful for pulling in an entire topic's engrams at once, for example `crystalline://payments/retry-queue/*`. The result carries node titles, typed relations and untyped prose links (the latter surfaced as `rel_type` `links_to`), still no content, ranked by how strongly each node connects to the anchor - follow it with `read_engram` on the nodes that matter.
 
 `read_engram` feeds this loop: it marks each relation and link `resolved` or not, summarizes `inbound` edges (capped at 5 refs) and, when inbound or resolved outbound edges exist, emits a `related` hint naming the `build_context` anchor to run - follow it when the neighbourhood would help. A `resolved: false` edge means the target is not written yet or sits in an unregistered domain, a signal not an error to chase.
 

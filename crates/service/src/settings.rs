@@ -13,6 +13,7 @@ use crystalline_core::config::{
     DatabaseBackend, DatabaseConfig, GitHubConfig, GlobalConfig, HttpSetting, ResponseFormat,
     SearchConfig, ServiceConfig,
 };
+use crystalline_index::DEFAULT_SALIENCE_WEIGHT;
 
 use crate::overlay::EnvOverlay;
 
@@ -99,11 +100,6 @@ const MIN_POLL_SECS: u64 = 60;
 /// default documented on
 /// [`crystalline_core::config::GitHubConfig::api_url`].
 const DEFAULT_API_URL: &str = "https://api.github.com";
-
-/// The salience-prior weight used when `search.salience_weight` is absent.
-/// Mirrors the store's own `DEFAULT_SALIENCE_WEIGHT`, kept as a separate
-/// constant here since the index crate's copy is private to its backends.
-const DEFAULT_SALIENCE_WEIGHT: f64 = 0.15;
 
 /// The registry: every setting an agent or a user may change, in display
 /// order. This is the only place a setting key is declared; every consumer

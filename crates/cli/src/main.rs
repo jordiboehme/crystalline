@@ -461,7 +461,7 @@ enum Command {
         /// Restrict the neighborhood to these domains (repeatable).
         #[arg(long)]
         domain: Vec<String>,
-        /// Maximum related engrams beyond the anchors.
+        /// Maximum related engrams beyond the anchors, keeping the top-ranked.
         #[arg(long)]
         max_related: Option<usize>,
         /// Load the global config from this file instead of the default path.
