@@ -1063,6 +1063,73 @@ async fn build_context_salient_neighbor_outranks_plain() {
     assert!(!perms.contains(&"a"), "plain A dropped: {perms:?}");
 }
 
+/// A and B hang off Seed with the identical edge shape (one `relates_to`
+/// bullet each) and neither carries salience metadata, so pure
+/// spreading-activation mass ties them exactly. A is written first (smaller
+/// id) - the ascending-id tiebreak would keep A on a pure mass tie. Only the
+/// retired-status fade (A is `superseded`, B is default `current`) can flip
+/// the tiebreak to B, proving the store-to-engine retired-weight plumbing end
+/// to end. The node objects must carry no `status` key - the wire shape is
+/// unchanged even though `GraphNode.status` now feeds ranking internally.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn build_context_retired_neighbor_loses_to_equal_current() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    call(
+        peer,
+        "write_engram",
+        json!({
+            "domain": "eng",
+            "title": "A",
+            "content": "retired neighbor fixture",
+            "status": "superseded",
+        }),
+    )
+    .await
+    .unwrap();
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "B", "content": "current neighbor fixture" }),
+    )
+    .await
+    .unwrap();
+    call(
+        peer,
+        "write_engram",
+        json!({
+            "domain": "eng",
+            "title": "Seed",
+            "content": "- relates_to [[A]]\n- relates_to [[B]]",
+        }),
+    )
+    .await
+    .unwrap();
+
+    let out = call(
+        peer,
+        "build_context",
+        json!({ "anchor": "crystalline://eng/seed", "depth": 1, "max_related": 1 }),
+    )
+    .await
+    .unwrap();
+    let nodes = out["nodes"].as_array().unwrap();
+    let perms: Vec<&str> = nodes
+        .iter()
+        .map(|n| n["permalink"].as_str().unwrap())
+        .collect();
+    assert!(perms.contains(&"b"), "current B kept: {perms:?}");
+    assert!(!perms.contains(&"a"), "retired A dropped: {perms:?}");
+    for node in nodes {
+        assert!(
+            node.get("status").is_none(),
+            "node objects must not carry a status key: {node:?}"
+        );
+    }
+}
+
 /// A glob anchor over a shared permalink prefix seeds two engrams at once.
 /// With `max_related: 0` the ranking has no truncation budget for anything
 /// beyond the seeds, so both must still come back - seeds are never subject

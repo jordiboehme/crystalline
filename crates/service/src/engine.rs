@@ -33,11 +33,11 @@ use crystalline_core::{
     is_lower_hyphen, parse_engram, slugify,
 };
 use crystalline_index::{
-    ChunkParams, DEFAULT_SALIENCE_WEIGHT, DomainHost, DomainId, DomainKind, EdgeKind,
-    EmbeddingProvider, EngramDescriptor, EngramId, EngramRecord, FileStamp, GraphNode, GraphSlice,
-    HostClaim, RecentFilter, SearchMode, SearchQuery, Store, SyncReport, apply_scan, chunk_engram,
-    configured_model_id, order_jobs_for_batching, parse_metadata_filters, provider_from_config,
-    salience_prior, scan_domain, scan_paths,
+    ChunkParams, DEFAULT_RETIRED_WEIGHT, DEFAULT_SALIENCE_WEIGHT, DomainHost, DomainId, DomainKind,
+    EdgeKind, EmbeddingProvider, EngramDescriptor, EngramId, EngramRecord, FileStamp, GraphNode,
+    GraphSlice, HostClaim, RecentFilter, SearchMode, SearchQuery, Store, SyncReport, apply_scan,
+    chunk_engram, configured_model_id, order_jobs_for_batching, parse_metadata_filters,
+    provider_from_config, retired_factor, salience_prior, scan_domain, scan_paths,
 };
 use crystalline_remote::ops;
 use crystalline_remote::{
@@ -2029,7 +2029,11 @@ impl Engine {
             page: p.page.unwrap_or(1).max(1),
             ..SearchQuery::default()
         };
-        query.salience_weight = self.config.read().unwrap().salience_weight();
+        {
+            let config = self.config.read().unwrap();
+            query.salience_weight = config.salience_weight();
+            query.retired_weight = config.retired_weight();
+        }
         if let Some(mf) = &p.metadata_filters {
             query.metadata_filters =
                 parse_metadata_filters(mf).map_err(|e| EngineError::Invalid(e.to_string()))?;
@@ -2138,12 +2142,13 @@ impl Engine {
         // still conducts mass as a bridge; the domain filter applies only at
         // output selection, preserving the current presentation.
         let mass = context_rank(&slice, &seed_ids);
-        let weight = self
-            .config
-            .read()
-            .unwrap()
-            .salience_weight()
-            .unwrap_or(DEFAULT_SALIENCE_WEIGHT);
+        let (weight, retired_weight) = {
+            let config = self.config.read().unwrap();
+            (
+                config.salience_weight().unwrap_or(DEFAULT_SALIENCE_WEIGHT),
+                config.retired_weight().unwrap_or(DEFAULT_RETIRED_WEIGHT),
+            )
+        };
 
         // Output pass: keep seeds in slice (ascending-id) order, then rank the
         // related nodes by spread mass lifted by the salience prior, highest
@@ -2160,7 +2165,8 @@ impl Engine {
                 seed_nodes.push(node);
             } else {
                 let score = mass.get(&node.id.0).copied().unwrap_or(0.0)
-                    * (1.0 + salience_prior(node.salience, weight));
+                    * (1.0 + salience_prior(node.salience, weight))
+                    * retired_factor(&node.status, retired_weight);
                 related.push((score, node));
             }
         }
