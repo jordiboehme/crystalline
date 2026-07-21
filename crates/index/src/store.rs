@@ -532,6 +532,25 @@ pub fn salience_prior(salience: Option<f64>, weight: f64) -> f64 {
     weight * (s / SALIENCE_SCALE).clamp(0.0, 1.0)
 }
 
+/// Statuses that mark knowledge as retired. Exact lowercase match, the same
+/// stance as the canonical `e.status = 'current'` filter.
+const RETIRED_STATUSES: [&str; 4] = ["deprecated", "superseded", "archived", "legacy"];
+
+/// The default retired-status fade when a query does not override it.
+pub const DEFAULT_RETIRED_WEIGHT: f64 = 0.6;
+
+/// The multiplicative ranking factor for an engram's status: statuses in the
+/// retired set fade by `weight` (clamped into the unit range) and every other
+/// value keeps full rank. Never a filter - it reorders scores and can never
+/// exclude a result.
+pub fn retired_factor(status: &str, weight: f64) -> f64 {
+    if RETIRED_STATUSES.contains(&status) {
+        weight.clamp(0.0, 1.0)
+    } else {
+        1.0
+    }
+}
+
 /// A filter for recent activity.
 #[derive(Debug, Clone, Default)]
 pub struct RecentFilter {
@@ -1245,5 +1264,48 @@ mod salience_tests {
     #[allow(clippy::assertions_on_constants)]
     fn default_weight_is_conservative() {
         assert!(DEFAULT_SALIENCE_WEIGHT > 0.0 && DEFAULT_SALIENCE_WEIGHT < 0.5);
+    }
+}
+
+#[cfg(test)]
+mod retired_tests {
+    use super::{DEFAULT_RETIRED_WEIGHT, retired_factor};
+
+    #[test]
+    fn retired_factor_fades_all_four_retired_statuses() {
+        for status in ["deprecated", "superseded", "archived", "legacy"] {
+            assert_eq!(retired_factor(status, DEFAULT_RETIRED_WEIGHT), 0.6);
+        }
+    }
+
+    #[test]
+    fn retired_factor_keeps_full_rank_for_other_statuses() {
+        for status in ["current", "draft", "idea", "proposed", "poc", "", "wip"] {
+            assert_eq!(retired_factor(status, DEFAULT_RETIRED_WEIGHT), 1.0);
+        }
+    }
+
+    #[test]
+    fn retired_factor_is_case_sensitive_exact_match() {
+        for status in ["Deprecated", "SUPERSEDED", " deprecated"] {
+            assert_eq!(retired_factor(status, DEFAULT_RETIRED_WEIGHT), 1.0);
+        }
+    }
+
+    #[test]
+    fn retired_factor_clamps_weight_into_unit_range() {
+        assert_eq!(retired_factor("deprecated", 1.5), 1.0);
+        assert_eq!(retired_factor("deprecated", -0.5), 0.0);
+    }
+
+    #[test]
+    fn retired_weight_one_is_a_no_op() {
+        assert_eq!(retired_factor("superseded", 1.0), 1.0);
+    }
+
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn default_retired_weight_is_a_soft_fade() {
+        assert!(DEFAULT_RETIRED_WEIGHT > 0.0 && DEFAULT_RETIRED_WEIGHT < 1.0);
     }
 }

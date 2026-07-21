@@ -33,12 +33,12 @@ pub use embed::{
 pub use error::{IndexError, Result};
 pub use factory::open_store;
 pub use store::{
-    ChunkJob, ChunkModelCount, DEFAULT_SALIENCE_WEIGHT, DomainHost, DomainId, DomainKind,
-    DomainStats, EdgeKind, EmbeddingCoverage, EmbeddingRow, EngramDescriptor, EngramId,
-    EngramRecord, EngramSummary, FileStamp, FilterOp, FtsMode, GraphEdge, GraphNode, GraphSlice,
-    HitKind, HostClaim, InboundRef, MetadataFilter, NamedCount, NewChunk, OutboundRef, Page,
-    RecentFilter, SearchHit, SearchMode, SearchQuery, Store, StoreInfo, StoredEngram, TagAlias,
-    TagCount, Vocabulary, parse_metadata_filters, salience_prior,
+    ChunkJob, ChunkModelCount, DEFAULT_RETIRED_WEIGHT, DEFAULT_SALIENCE_WEIGHT, DomainHost,
+    DomainId, DomainKind, DomainStats, EdgeKind, EmbeddingCoverage, EmbeddingRow, EngramDescriptor,
+    EngramId, EngramRecord, EngramSummary, FileStamp, FilterOp, FtsMode, GraphEdge, GraphNode,
+    GraphSlice, HitKind, HostClaim, InboundRef, MetadataFilter, NamedCount, NewChunk, OutboundRef,
+    Page, RecentFilter, SearchHit, SearchMode, SearchQuery, Store, StoreInfo, StoredEngram,
+    TagAlias, TagCount, Vocabulary, parse_metadata_filters, retired_factor, salience_prior,
 };
 pub use sync::{
     DomainScan, SyncReport, apply_scan, refresh_tag_aliases, scan_domain, scan_paths, sync_domain,
