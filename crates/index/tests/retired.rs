@@ -206,6 +206,15 @@ async fn hybrid_fade(store: &dyn Store) {
     assert_eq!(page.items[1].permalink, "superseded");
     assert!(page.items[0].score > 0.0);
     assert!(page.items[1].score > 0.0);
+    // The pair's unfaded scores tie exactly (identical bodies; both titles
+    // hash into fresh embedding buckets), so the score ratio IS the factor.
+    // This pins a single application of the default fade: a double-fade
+    // (0.36) and a missing fade (1.0) both fail here.
+    let ratio = page.items[1].score / page.items[0].score;
+    assert!(
+        (ratio - 0.6).abs() < 0.02,
+        "the retired score is faded exactly once, got ratio {ratio}"
+    );
 }
 parity!(
     retired_engram_fades_in_hybrid_but_is_never_filtered,
