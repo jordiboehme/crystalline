@@ -1005,7 +1005,8 @@ pub(super) async fn neighbors(
             conn,
             &format!(
                 "SELECT e.id, d.name, e.permalink, e.title, e.engram_type, \
-                 CASE WHEN jsonb_typeof(e.metadata -> 'salience') = 'number' THEN (e.metadata ->> 'salience')::double precision END \
+                 CASE WHEN jsonb_typeof(e.metadata -> 'salience') = 'number' THEN (e.metadata ->> 'salience')::double precision END, \
+                 e.status \
                  FROM engram e JOIN domain d ON d.id=e.domain_id WHERE e.id IN ({list}) ORDER BY e.id"
             ),
             vec![],
@@ -1019,6 +1020,7 @@ pub(super) async fn neighbors(
                 title: cell_text(r, 3).unwrap_or_default(),
                 engram_type: cell_text(r, 4).unwrap_or_default(),
                 salience: cell_real(r, 5),
+                status: cell_text(r, 6).unwrap_or_default(),
             });
         }
     }

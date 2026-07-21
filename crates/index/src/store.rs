@@ -479,6 +479,9 @@ pub struct GraphNode {
     /// `Some(0.0)`. Both are zero lift for ranking, so callers must compare
     /// against neutral (`<= 0.0` or absent), never assert an exact `None`.
     pub salience: Option<f64>,
+    /// The engram's exact frontmatter status; feeds the retired-status fade in
+    /// context ranking.
+    pub status: String,
 }
 
 /// Whether an edge came from a relation bullet or a prose wikilink.

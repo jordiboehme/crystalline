@@ -1017,7 +1017,7 @@ pub(super) async fn neighbors(
             conn,
             &format!(
                 "SELECT e.id, d.name, e.permalink, e.title, e.engram_type, \
-                 CAST(json_extract(e.metadata, '$.salience') AS REAL) \
+                 CAST(json_extract(e.metadata, '$.salience') AS REAL), e.status \
                  FROM engram e JOIN domain d ON d.id=e.domain_id WHERE e.id IN ({list}) ORDER BY e.id"
             ),
             vec![],
@@ -1031,6 +1031,7 @@ pub(super) async fn neighbors(
                 title: cell_text(r, 3).unwrap_or_default(),
                 engram_type: cell_text(r, 4).unwrap_or_default(),
                 salience: cell_real(r, 5),
+                status: cell_text(r, 6).unwrap_or_default(),
             });
         }
     }

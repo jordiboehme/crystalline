@@ -1714,6 +1714,57 @@ async fn neighbors_carries_salience(store: &dyn Store) {
 }
 parity!(neighbors_carries_salience_prior, neighbors_carries_salience);
 
+async fn neighbors_carries_status(store: &dyn Store) {
+    // The seed relates to two targets: current and superseded status.
+    // `neighbors` must carry each target's exact frontmatter status through
+    // onto its `GraphNode` verbatim (the later ranking pass reads it there to
+    // fade retired-status neighbors rather than issuing a second query).
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "seed.md",
+        &engram(
+            "Seed",
+            "seed",
+            "engram",
+            "",
+            "- relates_to [[current-target]]\n- relates_to [[superseded-target]]\n",
+        ),
+    );
+    write(
+        root,
+        "current.md",
+        &engram("Current", "current-target", "engram", "", "body\n"),
+    );
+    write(
+        root,
+        "superseded.md",
+        "---\ntype: engram\ntitle: Superseded\npermalink: superseded-target\ntags:\n  - t\nstatus: superseded\nrecorded_at: 2026-01-01\n---\n\nbody\n",
+    );
+
+    let report = sync_domain(store, "d", root).await.unwrap();
+    assert_eq!(report.relations_resolved, 2, "both relations resolve");
+
+    let seed = store.lookup_id("d", "seed").await.unwrap().unwrap();
+    let slice = store.neighbors(&[seed], 1).await.unwrap();
+
+    let current = slice
+        .nodes
+        .iter()
+        .find(|n| n.permalink == "current-target")
+        .expect("current target present");
+    assert_eq!(current.status, "current");
+
+    let superseded = slice
+        .nodes
+        .iter()
+        .find(|n| n.permalink == "superseded-target")
+        .expect("superseded target present");
+    assert_eq!(superseded.status, "superseded");
+}
+parity!(neighbors_carries_status_prior, neighbors_carries_status);
+
 async fn recent_newest_first(store: &dyn Store) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
