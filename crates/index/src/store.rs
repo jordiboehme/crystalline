@@ -521,7 +521,9 @@ pub const DEFAULT_SALIENCE_WEIGHT: f64 = 0.15;
 /// score. `salience` is the raw frontmatter value (`None` or non-positive means
 /// no lift); `weight` is the maximum lift. The result is never negative and
 /// never exceeds `weight`, so it can reorder within a relevance band but can
-/// never exclude a result.
+/// never exclude a result. build_context ranking is the other consumer: it
+/// multiplies a neighbor's propagated mass by `1 + prior`, so the same
+/// bounded [0, weight] contract holds there too.
 pub fn salience_prior(salience: Option<f64>, weight: f64) -> f64 {
     let s = salience.unwrap_or(0.0);
     if s <= 0.0 || weight <= 0.0 {

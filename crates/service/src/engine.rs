@@ -5127,6 +5127,15 @@ fn context_rank(slice: &GraphSlice, seed_ids: &HashSet<i64>) -> HashMap<i64, f64
             adj[b].push(a);
         }
     }
+    // Pin accumulation order: the edge-collection SQL has no ORDER BY, so
+    // `slice.edges` order is not guaranteed identical across backends or
+    // calls. Sorting each adjacency list makes the inbound-sum order (and so
+    // the ranking) bit-identical regardless of edge collection order.
+    // Multi-edge duplicates (deliberate weight) are preserved; only their
+    // order becomes canonical.
+    for list in &mut adj {
+        list.sort_unstable();
+    }
 
     // Teleport vector: uniform over the seeds present in the slice; fall back
     // to uniform over every node when no seed made it in (defensive, so the
@@ -6083,5 +6092,29 @@ mod context_rank_tests {
             (total - 1.0).abs() < 1e-6,
             "masses should sum to 1, got {total}"
         );
+    }
+
+    /// The edge-collection SQL has no ORDER BY, so `slice.edges` order is not
+    /// guaranteed identical across backends or calls. Node 3 here has two
+    /// edges (one from each seed), so its inbound sum actually depends on
+    /// accumulation order: reversing the edge Vec must still produce
+    /// byte-identical masses (exact f64 equality).
+    #[test]
+    fn edge_order_does_not_change_masses() {
+        let nodes = vec![node(1, None), node(2, None), node(3, None), node(4, None)];
+        let edges = vec![edge(1, 3), edge(2, 3), edge(1, 4)];
+        let forward = GraphSlice {
+            nodes: nodes.clone(),
+            edges: edges.clone(),
+        };
+        let mut reversed_edges = edges;
+        reversed_edges.reverse();
+        let reversed = GraphSlice {
+            nodes,
+            edges: reversed_edges,
+        };
+        let first = context_rank(&forward, &seeds(&[1, 2]));
+        let second = context_rank(&reversed, &seeds(&[1, 2]));
+        assert_eq!(first, second);
     }
 }
