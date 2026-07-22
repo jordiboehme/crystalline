@@ -100,9 +100,11 @@ cat >"$manifest_path" <<JSON
     "url": "https://github.com/jordiboehme/crystalline.git"
   },
   "homepage": "https://github.com/jordiboehme/crystalline",
+  "documentation": "https://github.com/jordiboehme/crystalline/tree/main/docs",
   "support": "https://github.com/jordiboehme/crystalline/issues",
   "icon": "icon.png",
   "license": "AGPL-3.0-or-later",
+  "privacy_policies": ["https://github.com/jordiboehme/crystalline#privacy-policy", "https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement", "https://huggingface.co/privacy"],
   "keywords": ["knowledge", "memory", "agent", "mcp", "markdown"],
   "server": {
     "type": "binary",

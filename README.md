@@ -411,6 +411,19 @@ In your domain folders, as plain markdown you can read, edit and back up with an
 
 No. Team domains talk to GitHub directly over its API - no git, no gh, no local clones. Members connect once with a browser code and Crystalline handles the rest.
 
+## Privacy Policy
+
+Crystalline is local-first: no telemetry, no analytics, no accounts and no data collection by the developer. Every engram lives as a markdown file plus a local search index on your own machine, entirely under your control.
+
+Two outbound connections exist, each opt-in and user-initiated - nothing else ever leaves the machine:
+
+- **GitHub**, only once you turn on team collaboration (`crystalline config set github.enabled true` and `crystalline connect github`). It uses your own OAuth token, and engram data flows only to the repositories you choose to share it with - governed by [GitHub's privacy statement](https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement).
+- **Hugging Face**, for a one-time download of the local embedding model, automatic on first start or explicit via `crystalline model download` - governed by the [Hugging Face privacy policy](https://huggingface.co/privacy).
+
+The developer shares nothing with anyone. Data retention is entirely user-controlled: deleting a domain or an engram deletes the data, and uninstalling Crystalline leaves your markdown untouched.
+
+Questions: jordi@boehme-lopez.de.
+
 ## License
 
 GNU Affero General Public License v3.0 - see [LICENSE](LICENSE).
