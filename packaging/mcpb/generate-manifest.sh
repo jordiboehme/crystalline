@@ -5,8 +5,10 @@
 # `@anthropic-ai/mcpb` CLI.
 #
 # Usage: generate-manifest.sh <platform> <version> <outdir>
-#   platform  one of macos-arm64, macos-intel, windows-amd64, windows-arm64,
-#             linux-amd64, linux-arm64
+#   platform  one of universal, macos-arm64, macos-intel, windows-amd64,
+#             windows-arm64. universal bundles the macOS arm64 binary plus
+#             the windows amd64 exe in one bundle, for Claude Desktop and
+#             the Connectors Directory
 #   version   release version without a leading v, e.g. 0.2.0
 #   outdir    directory manifest.json and icon.png are written into
 #             (created if missing)
@@ -14,7 +16,7 @@ set -euo pipefail
 
 usage() {
     echo "usage: $(basename "$0") <platform> <version> <outdir>" >&2
-    echo "  platform: macos-arm64 | macos-intel | windows-amd64 | windows-arm64 | linux-amd64 | linux-arm64" >&2
+    echo "  platform: universal | macos-arm64 | macos-intel | windows-amd64 | windows-arm64" >&2
     exit 1
 }
 
@@ -34,20 +36,32 @@ entry_point="server/crystalline"
 # shell variable: single-quoted on purpose.
 # shellcheck disable=SC2016
 command_path='${__dirname}/server/crystalline'
-os_platform=""
+platforms_json=""
+platform_overrides_fragment=""
 
 case "$platform" in
     macos-arm64 | macos-intel)
-        os_platform="darwin"
+        platforms_json='"darwin"'
         ;;
     windows-amd64 | windows-arm64)
         entry_point="server/crystalline.exe"
         # shellcheck disable=SC2016
         command_path='${__dirname}/server/crystalline.exe'
-        os_platform="win32"
+        platforms_json='"win32"'
         ;;
-    linux-amd64 | linux-arm64)
-        os_platform="linux"
+    universal)
+        # Entry point and default command stay the darwin ones; the win32
+        # override below is what the mcpb host swaps in on Windows.
+        platforms_json='"darwin", "win32"'
+        # Literal placeholder for the mcpb host to expand at install time,
+        # not a shell variable: single-quoted on purpose.
+        # shellcheck disable=SC2016
+        platform_overrides_fragment=',
+      "platform_overrides": {
+        "win32": {
+          "command": "${__dirname}/server/crystalline.exe"
+        }
+      }'
         ;;
     *)
         echo "error: unknown platform '$platform'" >&2
@@ -114,12 +128,12 @@ cat >"$manifest_path" <<JSON
       "args": ["mcp"],
       "env": {
         "CRYSTALLINE_CHANNEL": "mcpb"
-      }
+      }$platform_overrides_fragment
     }
   },
   "compatibility": {
     "claude_desktop": ">=0.10.0",
-    "platforms": ["$os_platform"]
+    "platforms": [$platforms_json]
   },
   "tools": [
     {

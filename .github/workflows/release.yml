@@ -404,8 +404,8 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     # No tag guard, unlike publish/images/homebrew below: a workflow_dispatch
-    # dry run packages and validates all six bundles too, it just has
-    # nowhere to upload them.
+    # dry run packages and validates all five bundles too (four per-arch
+    # plus the universal one), it just has nowhere to upload them.
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
@@ -434,18 +434,6 @@ jobs:
           name: crystalline-macos-intel
           path: downloads/macos-intel
 
-      - name: Download linux-amd64 artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: crystalline-linux-amd64
-          path: downloads/linux-amd64
-
-      - name: Download linux-arm64 artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: crystalline-linux-arm64
-          path: downloads/linux-arm64
-
       - name: Download windows-amd64 artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -458,16 +446,18 @@ jobs:
           name: crystalline-windows-arm64
           path: downloads/windows-arm64
 
-      # One shell loop over the six platforms rather than a build-style
-      # matrix, so the six resulting .mcpb files land in a single directory
-      # and can be uploaded as one combined artifact below.
+      # One shell loop over the four per-arch platforms rather than a
+      # build-style matrix, so the four resulting .mcpb files land in a
+      # single directory and can be uploaded as one combined artifact below,
+      # plus one extra universal bundle staged from binaries the loop already
+      # extracted.
       - name: Stage bundles, generate manifests and pack
         shell: bash
         run: |
           set -euo pipefail
           version="${{ steps.version.outputs.version }}"
           mkdir -p mcpb-out
-          for platform in macos-arm64 macos-intel linux-amd64 linux-arm64 windows-amd64 windows-arm64; do
+          for platform in macos-arm64 macos-intel windows-amd64 windows-arm64; do
             download_dir="downloads/$platform"
             stage="bundle/$platform"
             mkdir -p "$stage/server"
@@ -487,6 +477,19 @@ jobs:
             npx --yes @anthropic-ai/mcpb validate "$stage"
             npx --yes @anthropic-ai/mcpb pack "$stage" "mcpb-out/crystalline-v${version}-${platform}.mcpb"
           done
+
+          # Universal bundle: macOS arm64 plus windows amd64 in one package,
+          # reusing the binaries the loop above already staged so nothing is
+          # re-extracted from the downloaded archives.
+          stage="bundle/universal"
+          mkdir -p "$stage/server"
+          cp bundle/macos-arm64/server/crystalline "$stage/server/crystalline"
+          chmod +x "$stage/server/crystalline"
+          cp bundle/windows-amd64/server/crystalline.exe "$stage/server/crystalline.exe"
+
+          packaging/mcpb/generate-manifest.sh universal "$version" "$stage"
+          npx --yes @anthropic-ai/mcpb validate "$stage"
+          npx --yes @anthropic-ai/mcpb pack "$stage" "mcpb-out/crystalline-v${version}.mcpb"
 
       - name: Upload mcpb artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
