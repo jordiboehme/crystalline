@@ -1,0 +1,5 @@
+---
+source: crates/cli/tests/prompt.rs
+expression: text
+---
+This environment includes the Crystalline knowledge server over MCP. At the start of every session call its list_domains tool with include_routing set to true; the result is your onboarding: one routing line per knowledge domain plus the behavior rules for this server's tools. Follow it, search those domains before answering from memory and re-fetch the index mid-session with the same call whenever you need it again.

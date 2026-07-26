@@ -520,8 +520,10 @@ enum HookEvent {
     Stop,
 }
 
-/// The kind of prompt to generate. `system` is the only kind today; future
-/// kinds attach here without reshaping the `prompt` command again.
+/// The kind of prompt to generate: `system` renders the live routing block for
+/// a hook-driven harness, `connector` prints the static snippet a remote client
+/// takes as standing custom instructions. Future kinds attach here without
+/// reshaping the `prompt` command again.
 #[derive(Subcommand, Debug)]
 enum PromptKind {
     /// Generate the knowledge routing prompt for a workspace: registered
@@ -545,6 +547,13 @@ enum PromptKind {
         #[arg(long, value_enum)]
         format: Option<PromptFormat>,
     },
+    /// Print the standing onboarding snippet for a remote MCP client: paste it
+    /// into the client's custom instructions and the agent onboards itself
+    /// through `list_domains` on every session. The text is static, so this
+    /// reads no config and touches no database: deterministic and instant,
+    /// satisfying the prompt module's determinism and latency contracts by
+    /// construction.
+    Connector,
 }
 
 /// How `prompt system` renders its output. `Text` and `Json` are the two
@@ -980,6 +989,7 @@ fn main() -> anyhow::Result<()> {
                 config,
                 format,
             } => run_prompt(workspace, read_only, config, cli.db, cli.json, format),
+            PromptKind::Connector => run_prompt_connector(cli.json),
         },
         Some(Command::Domain { command }) => run_domain(command, cli.db, cli.json),
         Some(Command::Tags { command }) => on_runtime(move || run_tags(command, cli.db, cli.json)),
@@ -2481,6 +2491,26 @@ fn run_verify(
     }
 
     std::process::exit(report.exit_code());
+}
+
+/// Print the static connector snippet, plain or wrapped in the same
+/// `{version, kind, text}` envelope shape `--json` uses elsewhere. Nothing is
+/// loaded, reconciled or read: the copy is a constant, so the command answers
+/// identically on a machine with no config at all.
+fn run_prompt_connector(json: bool) -> anyhow::Result<()> {
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "version": 1,
+                "kind": "connector",
+                "text": crystalline_core::CONNECTOR_SNIPPET,
+            })
+        );
+    } else {
+        println!("{}", crystalline_core::CONNECTOR_SNIPPET);
+    }
+    Ok(())
 }
 
 fn run_prompt(

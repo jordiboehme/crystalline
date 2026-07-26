@@ -364,38 +364,62 @@ fn render_routing_body(
     }
 
     out.push_str("Behavior:\n");
-    out.push_str(
-        "- Narrow question, one domain clearly fits: search_engrams with domains=[that domain].\n",
-    );
-    out.push_str(
-        "- Broad or unclear question: search_engrams without domains is an all-domain sweep.\n",
-    );
-    if output.read_only {
+    for bullet in behavior_bullets(output.read_only) {
+        let _ = writeln!(out, "- {bullet}");
+    }
+}
+
+/// The behavior rules an agent follows when working with this server's tools,
+/// one string per rule, without the leading `- ` and without a trailing
+/// newline. The read-only set drops the four content-mutating tools and the
+/// capture language; the read-write set names them.
+///
+/// This is the single source of the rule set: [`render_routing_body`] renders
+/// it as the Behavior block of both onboarding renderers, and the MCP
+/// `list_domains` response returns it verbatim for remote clients that never
+/// see the initialize instructions. Both paths therefore teach exactly the
+/// same rules and the set can never drift between them.
+pub fn behavior_bullets(read_only: bool) -> Vec<String> {
+    let mut bullets = vec![
+        "Narrow question, one domain clearly fits: search_engrams with domains=[that domain]."
+            .to_string(),
+        "Broad or unclear question: search_engrams without domains is an all-domain sweep."
+            .to_string(),
+    ];
+    if read_only {
         // Read-only variant: no write-tools line and no capture language; the
         // knowledge is maintained outside this deployment.
-        out.push_str(
-            "- This deployment's knowledge is read-only and curated externally; search and read to learn and do not attempt to capture or change anything.\n",
+        bullets.push(
+            "This deployment's knowledge is read-only and curated externally; search and read to learn and do not attempt to capture or change anything."
+                .to_string(),
         );
     } else {
-        out.push_str(
-            "- write_engram, edit_engram, move_engram and delete_engram always require an explicit domain; there is no default domain for writes.\n",
+        bullets.push(
+            "write_engram, edit_engram, move_engram and delete_engram always require an explicit domain; there is no default domain for writes."
+                .to_string(),
         );
-        out.push_str(
-            "- Match the domain's folder layout when writing: write_engram's folder files an engram under a topic prefix that build_context can glob; start a subfolder when a topic clusters, keep singletons at the root.\n",
+        bullets.push(
+            "Match the domain's folder layout when writing: write_engram's folder files an engram under a topic prefix that build_context can glob; start a subfolder when a topic clusters, keep singletons at the root."
+                .to_string(),
         );
-        out.push_str(
-            "- vocabulary lists tags and categories already in use; check it before inventing a new tag.\n",
+        bullets.push(
+            "vocabulary lists tags and categories already in use; check it before inventing a new tag."
+                .to_string(),
         );
-        out.push_str(
-            "- Mark exceptionally valuable knowledge with a numeric salience (0-10) at write time; salient engrams rank higher in search. Raise the salience of an engram that turned out to be the key to a task.\n",
+        bullets.push(
+            "Mark exceptionally valuable knowledge with a numeric salience (0-10) at write time; salient engrams rank higher in search. Raise the salience of an engram that turned out to be the key to a task."
+                .to_string(),
         );
     }
-    out.push_str(
-        "- build_context on a crystalline:// anchor assembles related knowledge around a task.\n",
+    bullets.push(
+        "build_context on a crystalline:// anchor assembles related knowledge around a task."
+            .to_string(),
     );
-    out.push_str(
-        "- Read a domain's MANIFEST via read_engram only when its routing line above is not enough; list_domains with include_routing=true re-fetches this index mid-session.\n",
+    bullets.push(
+        "Read a domain's MANIFEST via read_engram only when its routing line above is not enough; list_domains with include_routing=true re-fetches this index mid-session."
+            .to_string(),
     );
+    bullets
 }
 
 /// Render the onboarding block for the MCP `instructions` channel: the same
@@ -406,26 +430,40 @@ fn render_routing_body(
 /// This is the block a server hands the model at initialize, so the intro
 /// frames the tools as this server's own (the harness may prefix their names)
 /// rather than assuming a workspace context: there is no workspace over MCP, so
-/// `prompt.rules` and `preferred_domains` never shaped this output. The
-/// read-write intro tells the agent to read, write and refine engrams and to
-/// search before writing; the read-only intro states the knowledge is curated
-/// and drops the write sentence. The shared body then handles read-only tool
-/// dropping and the `list_domains include_routing=true` re-fetch.
+/// `prompt.rules` and `preferred_domains` never shaped this output. Both intros
+/// are compressed so that the first 512 bytes of the rendered block stand on
+/// their own: a client that truncates the instructions still reads what
+/// Crystalline is, that searching these domains comes before answering from
+/// memory and that `list_domains` with `include_routing=true` re-fetches the
+/// whole index and its behavior rules at any time. The read-write intro adds
+/// the write and refine language and the search-before-you-write rule; the
+/// read-only intro states the knowledge is curated and drops both. The shared
+/// body then handles read-only tool dropping and repeats the re-fetch rule.
 pub fn render_instructions(output: &PromptOutput) -> String {
     let mut out = String::new();
     out.push_str("CRYSTALLINE KNOWLEDGE ROUTING\n\n");
     if output.read_only {
         out.push_str(
-            "Crystalline gives you durable memory across sessions: the domains below hold curated knowledge as engrams you search and read while you work. These instructions govern this server's tools (your harness may prefix their names, for example mcp__crystalline__search_engrams). Route searches and reads through these domains instead of starting from zero.\n\n",
+            "Crystalline gives you durable memory across sessions: the domains below hold curated knowledge as engrams you search and read while you work (your harness may prefix tool names, for example mcp__crystalline__search_engrams). Search these domains before answering from memory; list_domains with include_routing=true returns this full index and its behavior rules at any time.\n\n",
         );
     } else {
         out.push_str(
-            "Crystalline gives you durable memory across sessions: the domains below hold knowledge as engrams you read, write and refine while you work. These instructions govern this server's tools (your harness may prefix their names, for example mcp__crystalline__search_engrams). Route searches and reads through these domains instead of starting from zero and search before you write.\n\n",
+            "Crystalline gives you durable memory across sessions: the domains below hold knowledge as engrams you read, write and refine while you work (your harness may prefix tool names, for example mcp__crystalline__search_engrams). Search these domains before answering from memory and search before you write; list_domains with include_routing=true returns this full index and its behavior rules at any time.\n\n",
         );
     }
     render_routing_body(output, 3, "(no domains are registered yet)", &mut out);
     out
 }
+
+/// The paste-able custom-instructions snippet for remote clients whose harness
+/// runs no session hooks and never shows the model a server's initialize
+/// instructions: a standing instruction that points the agent at the one tool
+/// call which onboards it.
+///
+/// It is deliberately static and content-free - it names no domain, no count
+/// and no setting - so it can never go stale in a place Crystalline cannot
+/// update. All dynamic routing comes from the `list_domains` call it points at.
+pub const CONNECTOR_SNIPPET: &str = "This environment includes the Crystalline knowledge server over MCP. At the start of every session call its list_domains tool with include_routing set to true; the result is your onboarding: one routing line per knowledge domain plus the behavior rules for this server's tools. Follow it, search those domains before answering from memory and re-fetch the index mid-session with the same call whenever you need it again.";
 
 #[derive(Serialize)]
 struct JsonPromptDomain<'a> {
@@ -715,6 +753,30 @@ mod tests {
         // The read tools an agent still needs are named.
         assert!(text.contains("search_engrams"));
         assert!(text.contains("build_context"));
+    }
+
+    /// A remote client may truncate the instructions it shows the model, so
+    /// the head of the block has to stand on its own: the fallback that
+    /// re-fetches the whole index must be inside the first 512 bytes in both
+    /// modes, even with no domain registered at all.
+    #[test]
+    fn render_instructions_first_512_bytes_carry_the_fallback_call() {
+        let global = GlobalConfig::default();
+        let mut output = generate_prompt_unscoped(&global, &BTreeMap::new());
+        assert!(output.domains.is_empty());
+        for read_only in [false, true] {
+            output.read_only = read_only;
+            let text = render_instructions(&output);
+            let head = std::str::from_utf8(&text.as_bytes()[..512.min(text.len())]).unwrap();
+            assert!(
+                head.contains("list_domains"),
+                "read_only={read_only}: list_domains expected in the first 512 bytes:\n{head}"
+            );
+            assert!(
+                head.contains("include_routing=true"),
+                "read_only={read_only}: include_routing=true expected in the first 512 bytes:\n{head}"
+            );
+        }
     }
 
     #[test]

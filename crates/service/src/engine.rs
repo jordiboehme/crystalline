@@ -2246,6 +2246,12 @@ impl Engine {
     /// domain reports its path and reads routing bullets from its `MANIFEST.md`
     /// on disk; a virtual domain reports a null path, its kind and reads routing
     /// bullets from its MANIFEST engram in the database.
+    ///
+    /// With `include_routing` the response also carries a top-level `behavior`
+    /// array: the same rules the onboarding block renders, from
+    /// [`crystalline_core::behavior_bullets`]. Remote clients never show the
+    /// model the initialize instructions, so this one call is their whole
+    /// onboarding - the routing lines and the rules that govern them together.
     pub async fn list_domains(&self, p: &ListDomainsParams) -> Result<Value> {
         let store = self.store.lock().await;
         let stats = store.domain_stats().await.unwrap_or_default();
@@ -2286,6 +2292,12 @@ impl Engine {
                 obj["when_to_use"] = json!(bullets);
             }
             out.push(obj);
+        }
+        if p.include_routing {
+            return Ok(json!({
+                "behavior": crystalline_core::behavior_bullets(self.read_only()),
+                "domains": out,
+            }));
         }
         Ok(json!({ "domains": out }))
     }

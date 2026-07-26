@@ -275,6 +275,81 @@ fn bare_prompt_without_a_kind_fails_with_subcommand_help() {
         .stderr(predicate::str::contains("system"));
 }
 
+/// The connector snippet is the standing instruction a remote client pastes
+/// into its custom instructions: static copy, printed as one paragraph.
+#[test]
+fn prompt_connector_matches_snapshot() {
+    let output = Command::cargo_bin("crystalline")
+        .unwrap()
+        .args(["prompt", "connector"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let text = String::from_utf8(output).unwrap();
+    assert!(
+        text.contains("include_routing"),
+        "the snippet must point at the onboarding call:\n{text}"
+    );
+    insta::assert_snapshot!(text);
+}
+
+#[test]
+fn prompt_connector_json_matches_snapshot() {
+    let output = Command::cargo_bin("crystalline")
+        .unwrap()
+        .args(["prompt", "connector", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let line = String::from_utf8(output).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+    assert_eq!(parsed["kind"], "connector");
+    insta::assert_snapshot!(line);
+}
+
+/// Determinism contract: the snippet is a constant, so two separate
+/// invocations must agree byte for byte.
+#[test]
+fn prompt_connector_is_byte_identical_across_invocations() {
+    let run = || {
+        Command::cargo_bin("crystalline")
+            .unwrap()
+            .args(["prompt", "connector"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone()
+    };
+
+    assert_eq!(
+        run(),
+        run(),
+        "crystalline prompt connector must produce byte-identical stdout across separate process invocations"
+    );
+}
+
+/// The snippet is what a user reaches for before anything is configured, so
+/// the command must answer from a directory with no config at all.
+#[test]
+fn prompt_connector_works_with_no_config() {
+    let tmp = tempfile::tempdir().unwrap();
+    Command::cargo_bin("crystalline")
+        .unwrap()
+        .current_dir(tmp.path())
+        .env("CRYSTALLINE_CONFIG", tmp.path().join("config.yaml"))
+        .args(["prompt", "connector"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("list_domains"));
+}
+
 /// Latency contract, part (c): a CI-safe guard, generous against runner
 /// noise, that `prompt system` stays well under budget even at 30 scaffolded
 /// domains. The real target (under 50ms wall-clock in a release build) is
