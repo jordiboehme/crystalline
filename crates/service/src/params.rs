@@ -392,6 +392,15 @@ pub struct ResolveConflictParams {
     pub content: Option<String>,
 }
 
+/// Parameters for `skills`.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct SkillsParams {
+    /// The skill to read in full. Omit for the index of every shipped skill
+    /// with its description.
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
 /// Parameters for `provision`.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ProvisionParams {

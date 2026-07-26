@@ -195,6 +195,10 @@ cat >"$manifest_path" <<JSON
     {
       "name": "add_domain",
       "description": "Create or connect a domain to capture engrams in: a local folder of markdown files, a database-backed virtual domain or a GitHub team domain."
+    },
+    {
+      "name": "skills",
+      "description": "List the agent skills this server ships and read any skill's full playbook before its kind of task."
     }
   ],
   "tools_generated": false

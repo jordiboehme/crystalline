@@ -689,6 +689,14 @@ impl Engine {
         self.config.read().unwrap().github_enabled()
     }
 
+    /// Whether the shipped agent skills are served over MCP, read fresh under
+    /// the config guard the same way [`Engine::github_enabled`] is, so a
+    /// runtime `configure` flip of `skills.serve` applies from the next call
+    /// on rather than at the next daemon start.
+    pub fn skills_serve(&self) -> bool {
+        self.config.read().unwrap().skills_serve()
+    }
+
     /// How the MCP server encodes list-shaped tool results, from the
     /// effective `service.response_format`. Read per response, so a runtime
     /// configure switch applies from the next tool call on.

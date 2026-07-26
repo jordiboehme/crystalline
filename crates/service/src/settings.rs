@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use crystalline_core::config::{
     DatabaseBackend, DatabaseConfig, GitHubConfig, GlobalConfig, HttpSetting, ResponseFormat,
-    SearchConfig, ServiceConfig,
+    SearchConfig, ServiceConfig, SkillsConfig,
 };
 use crystalline_index::{DEFAULT_RETIRED_WEIGHT, DEFAULT_SALIENCE_WEIGHT};
 
@@ -189,6 +189,15 @@ pub fn registry() -> &'static [SettingSpec] {
             effective: response_format_effective,
         },
         SettingSpec {
+            key: "skills.serve",
+            doc: "Serve the shipped agent skills over MCP: the skills tool, skill:// resources and the onboarding and connector prompts (default true)",
+            kind: SettingKind::Bool,
+            startup_effective: false,
+            apply: set_skills_serve,
+            clear: clear_skills_serve,
+            effective: skills_serve_effective,
+        },
+        SettingSpec {
             key: "database.backend",
             doc: "Which storage backend serves the derived index, turso or postgres (applies at the next daemon start)",
             kind: SettingKind::String,
@@ -358,6 +367,15 @@ fn drop_service_if_empty(config: &mut GlobalConfig) {
 fn drop_database_if_empty(config: &mut GlobalConfig) {
     if config.database.as_ref() == Some(&DatabaseConfig::default()) {
         config.database = None;
+    }
+}
+
+/// Drop the `skills` block entirely once every field in it has been cleared,
+/// so an unset config round-trips to exactly the pre-feature shape (no empty
+/// `skills: {}` line).
+fn drop_skills_if_empty(config: &mut GlobalConfig) {
+    if config.skills.as_ref() == Some(&SkillsConfig::default()) {
+        config.skills = None;
     }
 }
 
@@ -626,6 +644,31 @@ fn allowed_hosts_effective(config: &GlobalConfig) -> (String, bool) {
     }
 }
 
+// --- skills.serve -------------------------------------------------------------
+
+fn set_skills_serve(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
+    let parsed: bool = value
+        .parse()
+        .map_err(|_| SettingsError(format!("skills.serve must be true or false, got '{value}'")))?;
+    config
+        .skills
+        .get_or_insert_with(SkillsConfig::default)
+        .serve = Some(parsed);
+    Ok(())
+}
+
+fn clear_skills_serve(config: &mut GlobalConfig) {
+    if let Some(s) = config.skills.as_mut() {
+        s.serve = None;
+    }
+    drop_skills_if_empty(config);
+}
+
+fn skills_serve_effective(config: &GlobalConfig) -> (String, bool) {
+    let is_default = config.skills.as_ref().and_then(|s| s.serve).is_none();
+    (config.skills_serve().to_string(), is_default)
+}
+
 // --- service.response_format ------------------------------------------------
 
 fn set_response_format(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
@@ -826,7 +869,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_lists_exactly_the_thirteen_keys_in_order() {
+    fn registry_lists_exactly_the_fourteen_keys_in_order() {
         assert_eq!(
             known_keys(),
             vec![
@@ -839,6 +882,7 @@ mod tests {
                 "service.http",
                 "service.allowed_hosts",
                 "service.response_format",
+                "skills.serve",
                 "database.backend",
                 "database.url",
                 "search.salience_weight",
@@ -878,6 +922,7 @@ mod tests {
                     "service.response_format",
                     "CRYSTALLINE_SERVICE_RESPONSE_FORMAT".to_string()
                 ),
+                ("skills.serve", "CRYSTALLINE_SKILLS_SERVE".to_string()),
                 (
                     "database.backend",
                     "CRYSTALLINE_DATABASE_BACKEND".to_string()
@@ -1172,7 +1217,7 @@ mod tests {
         apply(&mut cfg, "github.enabled", "true").unwrap();
 
         let views = snapshot(&cfg, &EnvOverlay::default());
-        assert_eq!(views.len(), 13);
+        assert_eq!(views.len(), 14);
         assert_eq!(
             views.iter().map(|v| v.key.as_str()).collect::<Vec<_>>(),
             vec![
@@ -1185,6 +1230,7 @@ mod tests {
                 "service.http",
                 "service.allowed_hosts",
                 "service.response_format",
+                "skills.serve",
                 "database.backend",
                 "database.url",
                 "search.salience_weight",
@@ -1233,19 +1279,23 @@ mod tests {
         assert_eq!(response_format.value, "toon");
         assert_eq!(response_format.source, SettingSource::Default);
 
-        let backend = &views[9];
+        let skills_serve = &views[9];
+        assert_eq!(skills_serve.value, "true");
+        assert_eq!(skills_serve.source, SettingSource::Default);
+
+        let backend = &views[10];
         assert_eq!(backend.value, "turso");
         assert_eq!(backend.source, SettingSource::Default);
 
-        let url = &views[10];
+        let url = &views[11];
         assert_eq!(url.value, "");
         assert_eq!(url.source, SettingSource::Default);
 
-        let salience_weight = &views[11];
+        let salience_weight = &views[12];
         assert_eq!(salience_weight.value, "0.15");
         assert_eq!(salience_weight.source, SettingSource::Default);
 
-        let retired_weight = &views[12];
+        let retired_weight = &views[13];
         assert_eq!(retired_weight.value, "0.6");
         assert_eq!(retired_weight.source, SettingSource::Default);
     }

@@ -89,30 +89,22 @@ const SESSION_START_MATCHER: &str = "startup|clear|compact";
 /// is generous headroom, not a real budget.
 const HOOK_TIMEOUT_SECS: u64 = 10;
 
-/// The topical skills copied into every harness's skills folder,
-/// each as `(folder name, embedded SKILL.md)`. Embedded with `include_str!`
-/// so the binary is self-contained and an install from a downloaded release
-/// carries the same skills a clone would. `crystalline-memory` is deliberately
-/// absent: it is the single consolidated skill for Claude Desktop, which has
-/// no hooks and installs one skill at a time.
-pub(crate) const MANAGED_SKILLS: &[(&str, &str)] = &[
-    (
-        "crystalline-routing",
-        include_str!("../../../skills/crystalline-routing/SKILL.md"),
-    ),
-    (
-        "crystalline-capture",
-        include_str!("../../../skills/crystalline-capture/SKILL.md"),
-    ),
-    (
-        "crystalline-schema",
-        include_str!("../../../skills/crystalline-schema/SKILL.md"),
-    ),
-    (
-        "crystalline-collaboration",
-        include_str!("../../../skills/crystalline-collaboration/SKILL.md"),
-    ),
-];
+/// The topical skills copied into every harness's skills folder, each as
+/// `(folder name, embedded SKILL.md)`, derived from the shipped skill assets
+/// in [`crystalline_core::SKILL_ASSETS`] by their `install_managed` flag. The
+/// assets are embedded with `include_str!` so the binary is self-contained and
+/// an install from a downloaded release carries the same skills a clone would.
+/// `crystalline-memory` is deliberately not managed: it is the single
+/// consolidated skill for Claude Desktop, which has no hooks and installs one
+/// skill at a time. The MCP server serves all five regardless (see
+/// [`crystalline_core::skills`]); only installation is filtered here.
+pub(crate) fn managed_skills() -> Vec<(&'static str, &'static str)> {
+    crystalline_core::SKILL_ASSETS
+        .iter()
+        .filter(|s| s.install_managed)
+        .map(|s| (s.name, s.content))
+        .collect()
+}
 
 /// Skill folder names shipped by past releases and no longer managed. When a
 /// release drops or renames a managed skill, its old folder name is appended
@@ -721,7 +713,7 @@ fn uninstall_owned_hooks(path: &Path) -> anyhow::Result<HooksReport> {
 
 // --- skills install / uninstall ----------------------------------------------
 
-/// Reconcile one skills folder against [`MANAGED_SKILLS`]: install or update
+/// Reconcile one skills folder against [`managed_skills`]: install or update
 /// every current skill, retire leftovers named by the receipt or by
 /// [`RETIRED_SKILLS`] and return the per-skill report plus fresh receipt
 /// records for everything now on disk.
@@ -730,7 +722,7 @@ pub(crate) fn reconcile_skills(
     prior: &[receipt::RecordedSkill],
     mode: ReconcileMode,
 ) -> anyhow::Result<(SkillsReport, Vec<receipt::RecordedSkill>)> {
-    reconcile_skill_set(dir, MANAGED_SKILLS, RETIRED_SKILLS, prior, mode)
+    reconcile_skill_set(dir, &managed_skills(), RETIRED_SKILLS, prior, mode)
 }
 
 /// The engine behind [`reconcile_skills`], parameterized over the current
@@ -836,7 +828,7 @@ fn reconcile_skill_set(
 /// Whether `name` is safe to use as a single path component under a skills
 /// folder, i.e. whether `dir.join(name)` can only ever land inside `dir`.
 ///
-/// [`MANAGED_SKILLS`] and [`RETIRED_SKILLS`] are compiled into this binary,
+/// [`managed_skills`] and [`RETIRED_SKILLS`] are compiled into this binary,
 /// so their names are trusted outright. A name read back from the install
 /// receipt is not: the receipt is attacker-writable local state (plain JSON
 /// under `<state_dir>/installs.json`, editable by anything that can write
@@ -953,7 +945,7 @@ fn uninstall_skills(
         }
     };
 
-    for &(name, content) in MANAGED_SKILLS {
+    for &(name, content) in managed_skills().iter() {
         seen.insert(name);
         if let Some(status) = drop_one(name, Some(content))? {
             skills.push(SkillReport {

@@ -10,6 +10,14 @@
 //! this binary's version, the daemon that owns the index and the fix, so the
 //! model can relay it to the user rather than the whole session going dark.
 //!
+//! The healthy server also serves the shipped agent skills (the `skills`
+//! tool, `skill://` resources and two prompts); this one deliberately does
+//! not. There is no engine here to read the `skills.serve` gate from, and a
+//! degraded session that answered a skills listing normally would look
+//! healthy in exactly the place it must not: the whole point of this server is
+//! to report the failure and the fix, with nothing else competing for the
+//! model's attention.
+//!
 //! The most common cause is an upgrade skew: the Claude Desktop extension
 //! bundles its own `crystalline` binary, and a daemon installed another way
 //! (a newer brew, say) owns the index at a version the bundled binary is too

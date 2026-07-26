@@ -208,7 +208,7 @@ The other half of what `crystalline install` wires: a `Stop` hook running `cryst
 
 ## Teach and learn
 
-The MCP server exposes 15 tools, 19 once team domains are turned on (see [Share knowledge with a team](#share-knowledge-with-a-team)); capturing knowledge as a byproduct of work is the core loop:
+The MCP server exposes 16 tools, 20 once team domains are turned on (see [Share knowledge with a team](#share-knowledge-with-a-team)); capturing knowledge as a byproduct of work is the core loop:
 
 - **`write_engram`** - capture a new engram. `domain` is always required (there is no default domain for writes, so an agent never writes into the wrong place). `permalink`, `status` and `recorded_at` are filled in for you.
 - **`search_engrams`** - search before writing, and search to recall what is already known. Defaults to hybrid text-plus-semantic ranking across every domain; pass `domains` to narrow it, or filter by `type`, `tags`, `status` or arbitrary `metadata_filters` with no query text at all.
@@ -306,7 +306,7 @@ From there, `crystalline origin` covers the team domain lifecycle:
 
 The same actions are MCP tools an agent calls directly: `update_domain`, `origin_status`, `share_changes` and `resolve_conflict`, plus `configure` for settings and connecting. These four only appear once `github.enabled` is true, so an install that never uses team domains carries no extra tool beyond `configure` itself. `add_domain` is not among them: it creates domains of every kind (local, virtual, team) and is always available, though its team-domain branch still needs `github.enabled`. Sharing always ends with the agent relaying the proposal's review URL to the person it is working with, since review and merging happen on GitHub, by a person, never by the agent.
 
-`crystalline config show`, `set <key> <value>` and `unset <key>` read and write the same settings registry the `configure` MCP tool exposes, today `domains_root` plus the `github.*`, `service.*`, `database.*` and `search.*` blocks. Every settings key also maps to a `CRYSTALLINE_*` environment variable, so a container never needs to mount this file at all - see [Configure through environment variables](docs/deployment.md#configure-through-environment-variables) for the full list. A domain's origin and the global `github` block look like this in `config.yaml`:
+`crystalline config show`, `set <key> <value>` and `unset <key>` read and write the same settings registry the `configure` MCP tool exposes, today `domains_root` plus the `github.*`, `service.*`, `skills.*`, `database.*` and `search.*` blocks. Every settings key also maps to a `CRYSTALLINE_*` environment variable, so a container never needs to mount this file at all - see [Configure through environment variables](docs/deployment.md#configure-through-environment-variables) for the full list. A domain's origin and the global `github` block look like this in `config.yaml`:
 
 ```yaml
 domains:
