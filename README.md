@@ -200,7 +200,7 @@ A remote service or a chat harness runs no session hooks, and most of them never
 This environment includes the Crystalline knowledge server over MCP. At the start of every session call its list_domains tool with include_routing set to true; the result is your onboarding: one routing line per knowledge domain plus the behavior rules for this server's tools. Follow it, search those domains before answering from memory and re-fetch the index mid-session with the same call whenever you need it again.
 ```
 
-`crystalline prompt connector` prints the same snippet, ready to copy.
+`crystalline prompt connector` prints the same snippet, ready to copy. The same text is also available in-client, with no copy-paste, as the `connector` MCP prompt; a harness that shows the model MCP prompts can insert the `onboarding` prompt directly instead, which carries the live routing block itself rather than the instruction to fetch it (see [Skills over MCP](#skills-over-mcp)).
 
 ### The learning loop
 
@@ -249,6 +249,10 @@ Installing from a release instead of a clone: download `crystalline-agent-skills
 Claude Desktop: download `crystalline-claude-desktop-skill-v<version>.zip` from the latest release, then open Settings > Capabilities > Skills (enable the Skills capability there if it is off) and upload the zip as-is (it contains the `crystalline-memory` folder; do not unpack it). Routing itself needs no skill - the server's instructions deliver it automatically; the skill adds capture and collaboration best practices.
 
 Other harnesses that support a similar skill or instruction-file convention can point at the same folders directly; the content only assumes the MCP tools documented in [Teach and learn](#teach-and-learn), never a specific harness.
+
+### Skills over MCP
+
+Installing the folders is not the only way in: every server also serves the same five skills to remote clients that never run the CLI at all. A chat surface calls the `skills` tool - with no arguments it lists all five, by name it returns one skill's full `SKILL.md`. A harness whose agents read MCP resources instead reaches the same content at `skill://<name>/SKILL.md`. And a harness that shows the model MCP prompts can insert the `onboarding` or `connector` prompt directly, the same text described in [Remote clients](#remote-clients) below. All three are on by default and switch off together with the `skills.serve` setting, for an operator who would rather ship skills only as zips.
 
 ## Ship tools with a domain
 
