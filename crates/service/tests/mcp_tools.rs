@@ -329,6 +329,45 @@ async fn tool_descriptions_teach_folders() {
     );
 }
 
+/// A remote client never sees the initialize instructions, so `list_domains`
+/// with `include_routing` has to carry the behavior rules itself: the response
+/// returns exactly the shared bullet set, read-write here and the read-only
+/// set in a read-only deployment.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn list_domains_routing_carries_the_behavior_rules() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    let plain = call(peer, "list_domains", json!({})).await.unwrap();
+    assert!(
+        plain.get("behavior").is_none(),
+        "behavior rides along with include_routing only: {plain}"
+    );
+
+    let routed = call(peer, "list_domains", json!({ "include_routing": true }))
+        .await
+        .unwrap();
+    assert_eq!(
+        routed["behavior"],
+        json!(crystalline_core::behavior_bullets(false))
+    );
+
+    let ro = Harness::new_read_only(&["eng"]).await;
+    let (ro_client, _ro_server) = ro.connect().await;
+    let ro_routed = call(
+        ro_client.peer(),
+        "list_domains",
+        json!({ "include_routing": true }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        ro_routed["behavior"],
+        json!(crystalline_core::behavior_bullets(true))
+    );
+}
+
 /// The `configure` tool's `set` and `unset` inputs must advertise the plain
 /// `object`/`array` JSON Schema `type` rather than a `["object", "null"]` or
 /// `["array", "null"]` union: some MCP clients (Claude Desktop) do not

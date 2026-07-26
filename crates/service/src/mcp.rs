@@ -327,7 +327,7 @@ impl McpServer {
     #[tool(
         name = "list_domains",
         title = "List domains",
-        description = "List the registered domains with their engram counts to see what the agent has been taught. Set include_routing to also get each domain's When to Use routing bullets from its MANIFEST - the routing source the server instructions summarize, with every bullet included.",
+        description = "List the registered domains with their engram counts to see what the agent has been taught. If no CRYSTALLINE KNOWLEDGE ROUTING block reached you this session, call this at session start with include_routing=true: it returns each domain's When to Use routing bullets plus the behavior rules for this server's tools; follow them and route searches through those domains before answering from memory. The same call re-fetches the index mid-session.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn list_domains(
