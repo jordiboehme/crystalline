@@ -72,6 +72,11 @@ pub struct GlobalConfig {
     /// existing config keeps working untouched.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search: Option<SearchConfig>,
+    /// Skill-serving settings. Absent means the shipped agent skills are
+    /// served over MCP, the default, so every existing config keeps working
+    /// untouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skills: Option<SkillsConfig>,
 }
 
 impl GlobalConfig {
@@ -133,6 +138,14 @@ impl GlobalConfig {
     /// store default.
     pub fn retired_weight(&self) -> Option<f64> {
         self.search.as_ref().and_then(|s| s.retired_weight)
+    }
+
+    /// Whether the shipped agent skills are served over MCP, from
+    /// `skills.serve`. Absent config or an absent key means on (true): the
+    /// skills are static public copy this binary already carries, so a remote
+    /// client that never runs the CLI can learn from them out of the box.
+    pub fn skills_serve(&self) -> bool {
+        self.skills.as_ref().and_then(|s| s.serve).unwrap_or(true)
     }
 }
 
@@ -322,6 +335,18 @@ pub struct GitHubConfig {
     /// Needed only for a GitHub Enterprise Server deployment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth_client_id: Option<String>,
+}
+
+/// The `skills` block: whether this server serves the agent skills it ships.
+/// Reads like a settings-page section - see the `configure` tool, which
+/// exposes exactly these keys.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SkillsConfig {
+    /// Serve the shipped agent skills over MCP: the `skills` tool, the
+    /// `skill://` resources and the onboarding and connector prompts. Absent
+    /// means on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serve: Option<bool>,
 }
 
 /// Service configuration.

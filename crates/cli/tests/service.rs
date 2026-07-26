@@ -417,9 +417,10 @@ fn read_only_daemon_reports_hides_and_refuses() {
     let status: Value = serde_json::from_str(&out).unwrap();
     assert_eq!(status["read_only"], json!(true), "status: {status}");
 
-    // tools/list hides the four content-mutating tools and keeps the nine reads.
+    // tools/list hides the four content-mutating tools and keeps the ten
+    // reads, `skills` among them: reading a skill is a read.
     let names = c1.list_tools();
-    assert_eq!(names.len(), 9, "read-only exposes 9 tools: {names:?}");
+    assert_eq!(names.len(), 10, "read-only exposes 10 tools: {names:?}");
     for hidden in [
         "write_engram",
         "edit_engram",
@@ -431,6 +432,7 @@ fn read_only_daemon_reports_hides_and_refuses() {
             "{hidden} hidden: {names:?}"
         );
     }
+    assert!(names.contains(&"skills".to_string()), "{names:?}");
 
     // Calling a hidden tool by name returns the read-only error, not a panic.
     c1.send_call(
@@ -900,7 +902,7 @@ fn http_smoke_initialize_list_and_search() {
     // is off by default, so the five collaboration tools stay hidden, but
     // `add_domain` is write-gated not collab-gated, so it is visible (see
     // crystalline-service's mcp_collab test suite for the full gating matrix).
-    assert_eq!(tools.len(), 15, "15 tools over HTTP");
+    assert_eq!(tools.len(), 16, "16 tools over HTTP");
     let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
     assert!(names.contains(&"configure"), "{names:?}");
     assert!(names.contains(&"add_domain"), "{names:?}");

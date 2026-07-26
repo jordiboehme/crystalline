@@ -647,6 +647,17 @@ mod tests {
     }
 
     #[test]
+    fn skills_serving_is_on_by_default_and_the_env_can_turn_it_off() {
+        assert!(
+            GlobalConfig::default().skills_serve(),
+            "an unconfigured install serves its skills"
+        );
+        let ov = overlay(&[("CRYSTALLINE_SKILLS_SERVE", "false")]).unwrap();
+        assert!(ov.overrides_key("skills.serve"));
+        assert!(!ov.apply(&GlobalConfig::default()).skills_serve());
+    }
+
+    #[test]
     fn domains_root_is_a_setting_not_an_env_domain() {
         // CRYSTALLINE_DOMAINS_ROOT must be read as the domains_root setting, and
         // never mistaken for a CRYSTALLINE_DOMAIN_<NAME> env-defined domain.

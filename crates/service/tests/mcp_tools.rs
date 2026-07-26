@@ -233,6 +233,7 @@ async fn list_tools_exposes_the_core_tools_plus_configure_and_add_domain() {
         "vocabulary",
         "configure",
         "add_domain",
+        "skills",
     ] {
         assert!(names.contains(&expected.to_string()), "missing {expected}");
     }
@@ -247,7 +248,7 @@ async fn list_tools_exposes_the_core_tools_plus_configure_and_add_domain() {
             "{hidden} must be hidden while github.enabled is off: {names:?}"
         );
     }
-    assert_eq!(names.len(), 15, "exactly 15 tools: {names:?}");
+    assert_eq!(names.len(), 16, "exactly 16 tools: {names:?}");
 }
 
 /// The salience prior (Tasks 1-4) is invisible to an agent unless the tool
@@ -420,7 +421,8 @@ async fn read_only_hides_the_write_gated_tools() {
             "{hidden} must be hidden in read-only mode: {names:?}"
         );
     }
-    // The nine read tools remain.
+    // The ten read tools remain, `skills` among them: reading a skill is a
+    // read, so the gate that hides it is `skills.serve`, never read-only.
     for expected in [
         "read_engram",
         "search_engrams",
@@ -431,6 +433,7 @@ async fn read_only_hides_the_write_gated_tools() {
         "validate_engrams",
         "infer_schema",
         "vocabulary",
+        "skills",
     ] {
         assert!(names.contains(&expected.to_string()), "missing {expected}");
     }
@@ -449,7 +452,7 @@ async fn read_only_hides_the_write_gated_tools() {
             "{hidden} must be hidden read-only: {names:?}"
         );
     }
-    assert_eq!(names.len(), 9, "exactly 9 tools in read-only: {names:?}");
+    assert_eq!(names.len(), 10, "exactly 10 tools in read-only: {names:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

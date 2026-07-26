@@ -188,6 +188,7 @@ An immutable image with no `config.yaml` to mount or edit configures purely thro
 | `CRYSTALLINE_SERVICE_HTTP` | `service.http` | `serve --http` wins over it |
 | `CRYSTALLINE_SERVICE_ALLOWED_HOSTS` | `service.allowed_hosts` | comma-separated `Host` allow-list; loopback is always allowed and a single `*` allows any Host; `serve --allowed-host` wins over it |
 | `CRYSTALLINE_SERVICE_RESPONSE_FORMAT` | `service.response_format` | `toon` (token-efficient list results, default) or `json` |
+| `CRYSTALLINE_SKILLS_SERVE` | `skills.serve` | `true` (default) serves the shipped agent skills over MCP: the `skills` tool, `skill://` resources and the onboarding and connector prompts |
 | `CRYSTALLINE_DATABASE_BACKEND` | `database.backend` | `turso` or `postgres` |
 | `CRYSTALLINE_DATABASE_URL` | `database.url` | |
 | `CRYSTALLINE_GITHUB_ENABLED` and the other `github.*` keys | `github.enabled`, `github.poll_secs`, `github.api_url`, `github.oauth_client_id` | |

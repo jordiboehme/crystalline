@@ -817,7 +817,7 @@ fn check_harnesses() -> Option<Vec<HarnessDoctor>> {
 /// One harness's diagnostics: read its settings/hooks file read-only, check
 /// both managed hooks via [`install::harness_hook_present`] (which knows
 /// each harness's file shape and session start command) and count how many
-/// of [`install::MANAGED_SKILLS`] are present (and, of those, how many were
+/// of [`install::managed_skills`] are present (and, of those, how many were
 /// locally modified against either the embedded copy or `entry`'s recorded
 /// hash) at its skills folder. `entry` is this harness's user-scope install
 /// receipt record, `None` when it was never installed or predates receipts.
@@ -854,7 +854,7 @@ fn check_one_harness(
 
     let mut skills_installed = 0;
     let mut skills_modified = 0;
-    for &(name, content) in install::MANAGED_SKILLS {
+    for &(name, content) in install::managed_skills().iter() {
         let path = paths.skills_dir.join(name).join("SKILL.md");
         if let Ok(existing) = std::fs::read(&path) {
             skills_installed += 1;
@@ -873,7 +873,7 @@ fn check_one_harness(
     // remembers, deduplicated, that is not a currently managed skill and
     // whose `SKILL.md` still sits on disk. Mirrors the retirement logic in
     // `install::reconcile_skill_set` without shelling out to it.
-    let managed: HashSet<&str> = install::MANAGED_SKILLS.iter().map(|&(n, _)| n).collect();
+    let managed: HashSet<&str> = install::managed_skills().iter().map(|&(n, _)| n).collect();
     let mut seen: HashSet<&str> = HashSet::new();
     let mut retired_leftovers = Vec::new();
     let candidate_names = entry
@@ -1376,7 +1376,7 @@ pub fn render_human(report: &DoctorReport) -> String {
                     out,
                     "    skills: {}/{} installed{modified}",
                     h.skills_installed,
-                    install::MANAGED_SKILLS.len()
+                    install::managed_skills().len()
                 );
             } else {
                 let _ = writeln!(out, "    skills: none installed");

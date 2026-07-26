@@ -19,7 +19,7 @@
 //!
 //! In read-only mode (the engine's `read_only` flag) the four content-mutating
 //! tools are filtered out of `list_tools` and `get_tool`, so the surface is the
-//! nine read tools; the routes stay registered so a client that calls a hidden
+//! ten read tools; the routes stay registered so a client that calls a hidden
 //! tool by name reaches the engine's read-only guard and gets a clean error.
 //!
 //! The collaboration tools (`configure`, `add_domain`, `share_changes`,
@@ -39,13 +39,31 @@
 //! name still reaches the engine: `status` answers for real even with no
 //! declaring domain, and a mutating action still hits the read-only guard.
 //!
+//! The shipped agent skills are served here too, so a remote client that never
+//! runs `crystalline install` can still learn how to use Crystalline well:
+//! the `skills` tool (an index with no arguments, one skill's full `SKILL.md`
+//! with `name`), five `skill://<name>/SKILL.md` resources and two prompts,
+//! `onboarding` (the live routing block) and `connector` (the static snippet
+//! that teaches a client to onboard itself). The whole surface shares one
+//! gate, the live `skills.serve` setting, on by default; when it is off the
+//! tool, the resource list and the prompt list are empty while direct reads
+//! keep answering, the same hidden-not-disabled doctrine the tool gates
+//! follow. The resource shape follows the converging skills-over-MCP proposal
+//! without advertising its extension id, which is not ratified yet. The
+//! prompts are declared with rmcp's `#[prompt_router]`/`#[prompt]` macros but
+//! `list_prompts` and `get_prompt` are hand-written, since
+//! `#[prompt_handler]` replaces any `list_prompts` in its impl block and the
+//! gate needs one it can empty.
+//!
 //! rmcp 2.1 supports a server pushing `notifications/tools/list_changed` to
 //! a connected client (`Peer::notify_tool_list_changed`, gated behind
 //! `ServerCapabilities::enable_tool_list_changed`); `configure` sends one
 //! whenever a `set`/`unset` call flips `github.enabled`, and `add_domain`/
 //! `update_domain` send one whenever they flip whether any domain declares
 //! provisioning, so a client that honours the notification refreshes its
-//! tool list immediately rather than waiting for its own next poll.
+//! tool list immediately rather than waiting for its own next poll. A
+//! `skills.serve` flip moves three lists at once, so `configure` sends the
+//! prompt and resource list-changed notifications alongside the tool one.
 //!
 //! Every tool also advertises MCP tool annotations: a display `title` plus the
 //! readOnly/destructive/idempotent/openWorld hints, so a client can tune its
@@ -60,15 +78,21 @@
 
 use std::sync::Arc;
 
+use rmcp::handler::server::prompt::PromptContext;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, ContentBlock, ErrorData, Implementation, ListToolsResult,
-    PaginatedRequestParams, ProgressNotificationParam, ServerCapabilities, ServerInfo, Tool,
+    CallToolResult, ContentBlock, ErrorData, GetPromptRequestParams, GetPromptResult,
+    Implementation, ListPromptsResult, ListResourcesResult, ListToolsResult,
+    PaginatedRequestParams, ProgressNotificationParam, PromptMessage, ReadResourceRequestParams,
+    ReadResourceResult, Resource, ResourceContents, Role, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::RequestContext;
-use rmcp::{Peer, RoleServer, ServerHandler, tool, tool_handler, tool_router};
-use serde_json::Value;
+use rmcp::{
+    Peer, RoleServer, ServerHandler, prompt, prompt_router, tool, tool_handler, tool_router,
+};
+use serde_json::{Value, json};
 
+use crystalline_core::SKILL_ASSETS;
 use crystalline_remote::RemoteError;
 
 /// The tools hidden in read-only mode: the four content-mutating engram tools
@@ -129,6 +153,53 @@ fn is_collab_tool(name: &str) -> bool {
 /// engine either way.
 fn hidden_provision_tool(read_only: bool, provisioning_declared: bool) -> bool {
     read_only || !provisioning_declared
+}
+
+/// The MIME type every shipped skill is served with, as a resource and in the
+/// `skills` tool's full read: a `SKILL.md` is plain markdown.
+const SKILL_MIME_TYPE: &str = "text/markdown";
+
+/// The resource uri one shipped skill is served under. The shape follows the
+/// converging skills-over-MCP proposal (`skill://<name>/SKILL.md`) without
+/// advertising its extension id, which is not ratified yet: a client that
+/// learns the shape reads the same bytes either way.
+fn skill_uri(name: &str) -> String {
+    format!("skill://{name}/SKILL.md")
+}
+
+/// The shipped skill a resource uri names, or `None` when the uri is not one
+/// of the five this server serves.
+fn skill_for_uri(uri: &str) -> Option<&'static crystalline_core::SkillAsset> {
+    let name = uri.strip_prefix("skill://")?.strip_suffix("/SKILL.md")?;
+    crystalline_core::skill(name)
+}
+
+/// The five shipped skill names, comma separated, for an error that names
+/// what the caller could have asked for instead.
+fn skill_names() -> String {
+    SKILL_ASSETS
+        .iter()
+        .map(|s| s.name)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The five skill resource uris, comma separated, for the same reason.
+fn skill_uris() -> String {
+    SKILL_ASSETS
+        .iter()
+        .map(|s| skill_uri(s.name))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Whether the `skills` tool is hidden given the engine's live `skills.serve`
+/// setting. The whole skill-serving surface (this tool, the `skill://`
+/// resources and the two prompts) shares that one gate, and it is read fresh
+/// on every call rather than cached, since `configure` can flip it
+/// mid-session. Read-only mode is not part of it: reading a skill is a read.
+fn hidden_skills_tool(skills_serve: bool) -> bool {
+    !skills_serve
 }
 
 /// Whether collaboration tool `name` is hidden given the engine's live
@@ -446,12 +517,27 @@ impl McpServer {
         }
 
         let before = self.engine.github_enabled();
+        let skills_before = self.engine.skills_serve();
         self.apply_settings(&p).await?;
         let after = self.engine.github_enabled();
-        if before != after
+        let skills_after = self.engine.skills_serve();
+        // A `skills.serve` flip moves three lists at once (the `skills` tool,
+        // the `skill://` resources and the two prompts), a `github.enabled`
+        // flip only the tool list; one call can do both, and the tool
+        // notification is sent once either way.
+        let skills_flipped = skills_before != skills_after;
+        if (before != after || skills_flipped)
             && let Err(e) = peer.notify_tool_list_changed().await
         {
             tracing::warn!("failed to send tools/list_changed after configure: {e}");
+        }
+        if skills_flipped {
+            if let Err(e) = peer.notify_prompt_list_changed().await {
+                tracing::warn!("failed to send prompts/list_changed after configure: {e}");
+            }
+            if let Err(e) = peer.notify_resource_list_changed().await {
+                tracing::warn!("failed to send resources/list_changed after configure: {e}");
+            }
         }
 
         self.engine
@@ -707,6 +793,84 @@ impl McpServer {
             .map_err(to_error)
             .and_then(|v| self.ok_list(v))
     }
+
+    #[tool(
+        name = "skills",
+        title = "Skills",
+        description = "List the agent skills this server ships and read any skill's full SKILL.md playbook: how to route, capture, model schemas and collaborate well with Crystalline. Call with no arguments for the index of names and descriptions; pass name to read one skill before its kind of task.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn skills(
+        &self,
+        Parameters(p): Parameters<SkillsParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let Some(name) = p.name.as_deref() else {
+            let index: Vec<Value> = SKILL_ASSETS
+                .iter()
+                .map(|s| json!({ "name": s.name, "description": s.description() }))
+                .collect();
+            return self.ok_list(json!({ "skills": index }));
+        };
+        match crystalline_core::skill(name) {
+            // The playbook is markdown a model reads directly, so it is the
+            // single text block verbatim rather than a JSON-wrapped string.
+            Some(asset) => Ok(CallToolResult::success(vec![ContentBlock::text(
+                asset.content,
+            )])),
+            None => Err(ErrorData::invalid_params(
+                format!(
+                    "skills: no skill named '{name}'; this server ships {}",
+                    skill_names()
+                ),
+                None,
+            )),
+        }
+    }
+}
+
+/// The two prompts a client can insert verbatim: the live routing block for
+/// this server and the static snippet that teaches any client to onboard
+/// itself. Declared with the rmcp prompt macros so each one's name,
+/// description and (absent) arguments live at its handler; `list_prompts` and
+/// `get_prompt` are hand-written in the `ServerHandler` impl instead of
+/// generated, so the `skills.serve` gate can empty the list. See the module
+/// docs.
+#[prompt_router]
+impl McpServer {
+    /// The routing block the initialize `instructions` also carry, re-rendered
+    /// per call: the cache refresh first is what makes a virtual domain's
+    /// bullets current, exactly as the daemon does before `get_info`.
+    #[prompt(
+        name = "onboarding",
+        title = "Knowledge routing",
+        description = "The live knowledge routing block for this server: one routing line per domain plus the behavior rules. Insert at session start."
+    )]
+    async fn onboarding_prompt(&self) -> Vec<PromptMessage> {
+        self.engine.refresh_routing_cache().await;
+        vec![PromptMessage::new_text(
+            Role::User,
+            self.engine.routing_text(),
+        )]
+    }
+
+    /// The static bootstrap snippet, identical to what `crystalline prompt
+    /// connector` prints: a client whose custom instructions carry it onboards
+    /// itself through `list_domains` even when nothing else reaches it.
+    #[prompt(
+        name = "connector",
+        title = "Connector instructions",
+        description = "A short static snippet to paste into a client's custom instructions so every session onboards itself through list_domains."
+    )]
+    async fn connector_prompt(&self) -> Vec<PromptMessage> {
+        vec![PromptMessage::new_text(
+            Role::User,
+            crystalline_core::CONNECTOR_SNIPPET,
+        )]
+    }
 }
 
 impl McpServer {
@@ -796,9 +960,19 @@ impl ServerHandler for McpServer {
             instructions.push_str(TOON_INSTRUCTIONS_NOTE);
         }
         info.instructions = Some(instructions);
+        // Capabilities are initialize facts a session cannot renegotiate, so
+        // resources and prompts stay advertised whatever `skills.serve` says;
+        // the gate empties the two lists instead of retracting the capability
+        // mid-session. Resource subscribe is deliberately not enabled: the
+        // shipped skills are static for a binary's lifetime, so there is
+        // nothing to subscribe to.
         info.capabilities = ServerCapabilities::builder()
             .enable_tools()
             .enable_tool_list_changed()
+            .enable_resources()
+            .enable_resources_list_changed()
+            .enable_prompts()
+            .enable_prompts_list_changed()
             .build();
         info
     }
@@ -822,6 +996,7 @@ impl ServerHandler for McpServer {
         let read_only = self.engine.read_only();
         let github_enabled = self.engine.github_enabled();
         let provisioning_declared = self.engine.provisioning_declared();
+        let skills_serve = self.engine.skills_serve();
         let mut tools = Self::tool_router().list_all();
         tools.retain(|t| {
             if is_write_tool(&t.name) && read_only {
@@ -831,6 +1006,9 @@ impl ServerHandler for McpServer {
                 return false;
             }
             if t.name == "provision" && hidden_provision_tool(read_only, provisioning_declared) {
+                return false;
+            }
+            if t.name == "skills" && hidden_skills_tool(skills_serve) {
                 return false;
             }
             true
@@ -864,9 +1042,98 @@ impl ServerHandler for McpServer {
         {
             return None;
         }
+        if name == "skills" && hidden_skills_tool(self.engine.skills_serve()) {
+            return None;
+        }
         let mut tool = Self::tool_router().get(name).cloned()?;
         crate::tool_schema::sanitize_tool(&mut tool);
         Some(tool)
+    }
+
+    /// List the shipped agent skills as `skill://<name>/SKILL.md` resources,
+    /// so a remote client that never runs the CLI can read the same playbooks
+    /// an installed harness gets. Empty while `skills.serve` is off, read
+    /// fresh here the way the tool gates are.
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, ErrorData> {
+        if !self.engine.skills_serve() {
+            return Ok(ListResourcesResult::with_all_items(Vec::new()));
+        }
+        let resources = SKILL_ASSETS
+            .iter()
+            .map(|s| {
+                Resource::new(skill_uri(s.name), s.name)
+                    .with_description(s.description())
+                    .with_mime_type(SKILL_MIME_TYPE)
+            })
+            .collect();
+        Ok(ListResourcesResult::with_all_items(resources))
+    }
+
+    /// Read one shipped skill by its resource uri. Like every hidden tool,
+    /// this answers even while `skills.serve` is off: the gate hides the
+    /// surface from a listing rather than disabling it, and a skill is static
+    /// public copy this binary already carries, so a client holding a uri from
+    /// an earlier listing gets the bytes rather than a puzzle.
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResult, ErrorData> {
+        match skill_for_uri(&request.uri) {
+            Some(asset) => Ok(ReadResourceResult::new(vec![
+                ResourceContents::text(asset.content, &request.uri).with_mime_type(SKILL_MIME_TYPE),
+            ])),
+            None => Err(ErrorData::invalid_params(
+                format!(
+                    "unknown resource '{}'; this server serves {}",
+                    request.uri,
+                    skill_uris()
+                ),
+                None,
+            )),
+        }
+    }
+
+    /// List the two onboarding prompts, empty while `skills.serve` is off.
+    /// Hand-written rather than `#[prompt_handler]`-generated for exactly that
+    /// gate: the macro replaces any `list_prompts` in the impl block it is
+    /// applied to, so a generated one could never be emptied.
+    async fn list_prompts(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListPromptsResult, ErrorData> {
+        let prompts = if self.engine.skills_serve() {
+            Self::prompt_router().list_all()
+        } else {
+            Vec::new()
+        };
+        Ok(ListPromptsResult {
+            prompts,
+            meta: None,
+            next_cursor: None,
+        })
+    }
+
+    /// Render one prompt through the macro-declared router. Answers while the
+    /// gate is off for the same reason `read_resource` does.
+    async fn get_prompt(
+        &self,
+        request: GetPromptRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<GetPromptResult, ErrorData> {
+        Self::prompt_router()
+            .get_prompt(PromptContext::new(
+                self,
+                request.name,
+                request.arguments,
+                context,
+            ))
+            .await
     }
 }
 
@@ -1012,6 +1279,24 @@ mod tests {
         assert!(is_write_tool("add_domain"));
         assert!(!is_collab_tool("write_engram"));
         assert!(!is_collab_tool("search_engrams"));
+    }
+
+    #[test]
+    fn hidden_skills_tool_follows_the_serve_setting_alone() {
+        assert!(!hidden_skills_tool(true), "on by default, so visible");
+        assert!(hidden_skills_tool(false));
+    }
+
+    #[test]
+    fn skill_uris_round_trip_to_their_assets() {
+        for asset in SKILL_ASSETS {
+            let uri = skill_uri(asset.name);
+            assert_eq!(uri, format!("skill://{}/SKILL.md", asset.name));
+            assert_eq!(skill_for_uri(&uri).map(|a| a.name), Some(asset.name));
+        }
+        assert!(skill_for_uri("skill://crystalline-routing").is_none());
+        assert!(skill_for_uri("skill://nonesuch/SKILL.md").is_none());
+        assert!(skill_for_uri("https://example.com/SKILL.md").is_none());
     }
 
     #[test]
