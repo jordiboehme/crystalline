@@ -381,6 +381,9 @@ fn render_routing_body(
             "- write_engram, edit_engram, move_engram and delete_engram always require an explicit domain; there is no default domain for writes.\n",
         );
         out.push_str(
+            "- Match the domain's folder layout when writing: write_engram's folder files an engram under a topic prefix that build_context can glob; start a subfolder when a topic clusters, keep singletons at the root.\n",
+        );
+        out.push_str(
             "- vocabulary lists tags and categories already in use; check it before inventing a new tag.\n",
         );
         out.push_str(

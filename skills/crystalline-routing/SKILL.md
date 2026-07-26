@@ -132,6 +132,10 @@ A `/*` suffix on the anchor globs a permalink prefix, useful for pulling in an e
 
 `read_engram` feeds this loop: it marks each relation and link `resolved` or not, summarizes `inbound` edges (capped at 5 refs) and, when inbound or resolved outbound edges exist, emits a `related` hint naming the `build_context` anchor to run - follow it when the neighbourhood would help. A `resolved: false` edge means the target is not written yet or sits in an unregistered domain, a signal not an error to chase.
 
+## Folders are topic prefixes
+
+Folders are not a navigation tree - search and the routing lines stay primary. A `folder` passed at write time becomes the engram's permalink prefix, which is what makes the `/*` glob above work and what `browse_domain` maps. So before writing or reorganizing inside a domain, `browse_domain` it and reuse the layout you find: start a subfolder once a topic clusters, leave singletons at the root.
+
 ## Quick reference
 
 - One domain obviously owns it (even if unnamed) -> `search_engrams` with `domains: ["that-domain"]`.
@@ -141,6 +145,7 @@ A `/*` suffix on the anchor globs a permalink prefix, useful for pulling in an e
 - "What is true now" -> `status: "current"`; add `valid_from`/`valid_to` filters only for a specific bounded-in-time question.
 - "Did we adopt X" -> search without a status filter and narrate each hit's status.
 - Need the shape of a domain, not its content -> `browse_domain` or its `MANIFEST.md`.
+- About to write or re-file -> `browse_domain` for the layout, then the `crystalline-capture` skill.
 - Need what surrounds a known engram -> `build_context`.
 - `read_engram` reports an `inbound` summary or a `related` hint -> more linked knowledge; follow the named `build_context` anchor.
 - Before writing anything, switch to the `crystalline-capture` skill.

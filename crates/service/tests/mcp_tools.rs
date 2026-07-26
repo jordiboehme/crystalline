@@ -284,6 +284,51 @@ async fn tool_descriptions_teach_salience() {
     );
 }
 
+/// Folder hierarchy inside a domain is invisible to an agent unless the tool
+/// copy teaches it: `write_engram` documents the `folder` argument and the
+/// `build_context` glob it unlocks, and `move_engram` says a destination
+/// inside the same domain is a normal re-filing move.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tool_descriptions_teach_folders() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let tools = client.peer().list_tools(Default::default()).await.unwrap();
+
+    let write = tools
+        .tools
+        .iter()
+        .find(|t| t.name == "write_engram")
+        .expect("write_engram tool present");
+    let write_description = write.description.as_deref().unwrap_or("").to_lowercase();
+    assert!(
+        write_description.contains("folder"),
+        "write_engram teaches the folder argument: {write_description}"
+    );
+    assert!(
+        write_description.contains("build_context"),
+        "write_engram names the build_context glob a folder unlocks: {write_description}"
+    );
+
+    let move_tool = tools
+        .tools
+        .iter()
+        .find(|t| t.name == "move_engram")
+        .expect("move_engram tool present");
+    let move_description = move_tool
+        .description
+        .as_deref()
+        .unwrap_or("")
+        .to_lowercase();
+    assert!(
+        move_description.contains("same domain"),
+        "move_engram teaches the same-domain re-file: {move_description}"
+    );
+    assert!(
+        move_description.contains("subfolder"),
+        "move_engram names the topic subfolder a cluster earns: {move_description}"
+    );
+}
+
 /// The `configure` tool's `set` and `unset` inputs must advertise the plain
 /// `object`/`array` JSON Schema `type` rather than a `["object", "null"]` or
 /// `["array", "null"]` union: some MCP clients (Claude Desktop) do not
