@@ -37,7 +37,10 @@ pub struct WriteParams {
     /// The markdown body. Observations `- [category] text` and relations
     /// `- rel_type [[Target]]` in the body are parsed and indexed.
     pub content: String,
-    /// A domain-relative subfolder to place the engram in. Defaults to the root.
+    /// A domain-relative subfolder to place the engram in. Defaults to the
+    /// root. The folder becomes the engram's permalink prefix, so a topic
+    /// filed under one is reachable as the `build_context` glob
+    /// `crystalline://domain/folder/*`.
     #[serde(default)]
     pub folder: Option<String>,
     /// The engram `type`. Defaults to `engram`. Recommended values: engram,

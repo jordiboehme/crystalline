@@ -76,6 +76,7 @@ A domain MANIFEST may carry a `## Tag Aliases` section of `- old-name -> canonic
   "tool": "write_engram",
   "arguments": {
     "domain": "payments",
+    "folder": "retry-queue",
     "title": "Retry queue gotcha",
     "type": "engram",
     "tags": ["gotcha", "payments"],
@@ -89,6 +90,8 @@ An engram needs at least 3 non-blank content lines to pass verification - a lone
 **Before every write or edit, check the exact `content` value you are about to send**: count its non-blank lines (fewer than 3 on a new engram fails) and confirm the bullets are separated by real newline characters. The most common failure is the two printable characters backslash and n between bullets - the string looks multi-line in your draft but lands as one long line and is rejected as thin. If you cannot tell by eye, rebuild the string bullet by bullet.
 
 `permalink`, `status` (defaults to `current`), `recorded_at` and `timestamp` are filled in for you; `valid_from`/`valid_to` are never auto-set. Recommended `type` values: `engram`, `guide`, `decision`, `architecture`, `runbook`, `reference`. Recommended `status` values: `current`, `implemented`, `draft`, `proposed`, `idea`, `poc`, `deprecated`, `superseded`, `archived`, `legacy` - this is guidance so you can tell an idea or draft apart from current fact, not a fixed enum a write is rejected for.
+
+The optional `folder` files the engram where its topic's neighbours already live, so check the domain's layout first and `browse_domain` it when the domain is unfamiliar. Start a subfolder once a topic cluster is forming; a singleton stays fine at the root. The folder becomes the permalink prefix `build_context` globs as `crystalline://domain/folder/*`.
 
 Exceptionally valuable knowledge - a hard-won debugging insight, the decision that keeps paying off - can carry a numeric `salience` key (0 to 10) in `metadata`. Hybrid search adds a small bounded lift for it, so a salient engram ranks above equally relevant unmarked ones while relevance still dominates and nothing is ever filtered out by it. Most engrams need none; reserve it for knowledge that clearly outranks its neighbours, and when an engram later proves to be the key to a task, raise its salience with a `find_replace` on the frontmatter line (the same mechanism `last_verified` uses).
 
@@ -145,4 +148,4 @@ Retiring knowledge is also the moment to learn from it. The superseded engram ke
 
 ## Confirm before destroying
 
-Always confirm with the user before calling `delete_engram` or `move_engram` - describe what will be removed or relocated and wait for a yes. Prefer setting `status` to `deprecated` or `superseded` over deleting when the history is still worth keeping; `move_engram` on a cross-domain move rewrites inbound bare links to the domain-prefixed form automatically unless `update_links` is set to `false`.
+Always confirm with the user before calling `delete_engram` or `move_engram` - describe what will be removed or relocated and wait for a yes. Prefer setting `status` to `deprecated` or `superseded` over deleting when the history is still worth keeping; `move_engram` on a cross-domain move rewrites inbound bare links to the domain-prefixed form automatically unless `update_links` is set to `false`. A destination inside the same domain is an ordinary move too: it is how a topic cluster gets its subfolder after the fact.

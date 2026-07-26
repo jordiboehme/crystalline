@@ -81,6 +81,7 @@ recorded_at: 2026-07-19
 ## Notes for Agents
 
 - Add guidance for agents working in this domain
+- Note the folder layout new engrams should reuse
 ```
 
 The placeholders are not yours to type either - describe the domain and let the

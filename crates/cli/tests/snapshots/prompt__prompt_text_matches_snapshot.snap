@@ -13,6 +13,7 @@ Behavior:
 - Narrow question, one domain clearly fits: search_engrams with domains=[that domain].
 - Broad or unclear question: search_engrams without domains is an all-domain sweep.
 - write_engram, edit_engram, move_engram and delete_engram always require an explicit domain; there is no default domain for writes.
+- Match the domain's folder layout when writing: write_engram's folder files an engram under a topic prefix that build_context can glob; start a subfolder when a topic clusters, keep singletons at the root.
 - vocabulary lists tags and categories already in use; check it before inventing a new tag.
 - Mark exceptionally valuable knowledge with a numeric salience (0-10) at write time; salient engrams rank higher in search. Raise the salience of an engram that turned out to be the key to a task.
 - build_context on a crystalline:// anchor assembles related knowledge around a task.

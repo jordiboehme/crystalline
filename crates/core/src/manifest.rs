@@ -40,7 +40,8 @@ recorded_at: {today}\n\
 ## When to Use\n\n\
 - Describe when an agent should route here\n\n\
 ## Notes for Agents\n\n\
-- Add guidance for agents working in this domain\n"
+- Add guidance for agents working in this domain\n\
+- Note the folder layout new engrams should reuse\n"
     )
 }
 
