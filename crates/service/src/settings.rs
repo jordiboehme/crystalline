@@ -10,8 +10,8 @@
 use std::path::PathBuf;
 
 use crystalline_core::config::{
-    DatabaseBackend, DatabaseConfig, GitHubConfig, GlobalConfig, HttpSetting, ResponseFormat,
-    SearchConfig, ServiceConfig, SkillsConfig,
+    DatabaseBackend, DatabaseConfig, GitHubConfig, GlobalConfig, HttpSetting, IndexConfig,
+    ResponseFormat, SearchConfig, ServiceConfig, SkillsConfig,
 };
 use crystalline_index::{DEFAULT_RETIRED_WEIGHT, DEFAULT_SALIENCE_WEIGHT};
 
@@ -233,6 +233,15 @@ pub fn registry() -> &'static [SettingSpec] {
             clear: clear_retired_weight,
             effective: retired_weight_effective,
         },
+        SettingSpec {
+            key: "index.files",
+            doc: "Keep a generated index.md in every folder of a file domain, so the knowledge navigates statically without Crystalline (default true)",
+            kind: SettingKind::Bool,
+            startup_effective: false,
+            apply: set_index_files,
+            clear: clear_index_files,
+            effective: index_files_effective,
+        },
     ]
 }
 
@@ -385,6 +394,15 @@ fn drop_skills_if_empty(config: &mut GlobalConfig) {
 fn drop_search_if_empty(config: &mut GlobalConfig) {
     if config.search.as_ref() == Some(&SearchConfig::default()) {
         config.search = None;
+    }
+}
+
+/// Drop the `index` block entirely once every field in it has been cleared,
+/// so an unset config round-trips to exactly the pre-feature shape (no empty
+/// `index: {}` line).
+fn drop_index_if_empty(config: &mut GlobalConfig) {
+    if config.index.as_ref() == Some(&IndexConfig::default()) {
+        config.index = None;
     }
 }
 
@@ -836,6 +854,28 @@ fn retired_weight_effective(config: &GlobalConfig) -> (String, bool) {
     }
 }
 
+// --- index.files ---------------------------------------------------------------
+
+fn set_index_files(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
+    let parsed: bool = value
+        .parse()
+        .map_err(|_| SettingsError(format!("index.files must be true or false, got '{value}'")))?;
+    config.index.get_or_insert_with(IndexConfig::default).files = Some(parsed);
+    Ok(())
+}
+
+fn clear_index_files(config: &mut GlobalConfig) {
+    if let Some(i) = config.index.as_mut() {
+        i.files = None;
+    }
+    drop_index_if_empty(config);
+}
+
+fn index_files_effective(config: &GlobalConfig) -> (String, bool) {
+    let is_default = config.index.as_ref().and_then(|i| i.files).is_none();
+    (config.index_files().to_string(), is_default)
+}
+
 // --- domains_root ----------------------------------------------------------
 
 fn set_domains_root(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
@@ -869,7 +909,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_lists_exactly_the_fourteen_keys_in_order() {
+    fn registry_lists_exactly_the_fifteen_keys_in_order() {
         assert_eq!(
             known_keys(),
             vec![
@@ -887,6 +927,7 @@ mod tests {
                 "database.url",
                 "search.salience_weight",
                 "search.retired_weight",
+                "index.files",
             ]
         );
     }
@@ -936,6 +977,7 @@ mod tests {
                     "search.retired_weight",
                     "CRYSTALLINE_SEARCH_RETIRED_WEIGHT".to_string()
                 ),
+                ("index.files", "CRYSTALLINE_INDEX_FILES".to_string()),
             ]
         );
     }
@@ -956,6 +998,7 @@ mod tests {
         assert!(change_note("database.url", &no_env).is_some());
         assert!(change_note("search.salience_weight", &no_env).is_none());
         assert!(change_note("search.retired_weight", &no_env).is_none());
+        assert!(change_note("index.files", &no_env).is_none());
         assert!(change_note("github.bogus", &no_env).is_none());
     }
 
@@ -1217,7 +1260,7 @@ mod tests {
         apply(&mut cfg, "github.enabled", "true").unwrap();
 
         let views = snapshot(&cfg, &EnvOverlay::default());
-        assert_eq!(views.len(), 14);
+        assert_eq!(views.len(), 15);
         assert_eq!(
             views.iter().map(|v| v.key.as_str()).collect::<Vec<_>>(),
             vec![
@@ -1235,6 +1278,7 @@ mod tests {
                 "database.url",
                 "search.salience_weight",
                 "search.retired_weight",
+                "index.files",
             ]
         );
 
@@ -1298,6 +1342,10 @@ mod tests {
         let retired_weight = &views[13];
         assert_eq!(retired_weight.value, "0.6");
         assert_eq!(retired_weight.source, SettingSource::Default);
+
+        let index_files = &views[14];
+        assert_eq!(index_files.value, "true");
+        assert_eq!(index_files.source, SettingSource::Default);
     }
 
     #[test]
@@ -1465,6 +1513,32 @@ mod tests {
             !yaml.contains("database"),
             "an emptied database block must not round-trip into the yaml: {yaml}"
         );
+    }
+
+    // --- index.files ----------------------------------------------------------
+
+    #[test]
+    fn apply_index_files_happy_path_and_unset_drops_the_block() {
+        let mut cfg = GlobalConfig::default();
+        assert!(cfg.index_files(), "generation is on by default");
+        apply(&mut cfg, "index.files", "false").unwrap();
+        assert!(!cfg.index_files());
+        assert_eq!(index_files_effective(&cfg), ("false".to_string(), false));
+
+        unset(&mut cfg, "index.files").unwrap();
+        assert!(cfg.index.is_none(), "the emptied index block must vanish");
+        assert!(cfg.index_files());
+
+        let yaml = serde_yaml_ng::to_string(&cfg).unwrap();
+        assert!(!yaml.contains("index"), "{yaml}");
+    }
+
+    #[test]
+    fn apply_index_files_rejects_non_bool() {
+        let mut cfg = GlobalConfig::default();
+        let err = apply(&mut cfg, "index.files", "sometimes").unwrap_err();
+        assert!(err.to_string().contains("index.files"), "{err}");
+        assert!(cfg.index.is_none(), "a rejected value must not be written");
     }
 
     // --- domains_root ----------------------------------------------------------

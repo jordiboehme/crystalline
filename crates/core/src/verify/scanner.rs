@@ -3,7 +3,8 @@
 //! Every path given to [`super::verify_paths`] directly is treated as one
 //! Domain root - never a directory to search for nested `MANIFEST.md`
 //! files. All `.md` files found recursively under a root are parsed;
-//! dotfiles and dot-directories are skipped.
+//! dotfiles, dot-directories and the OKF reserved filenames (`index.md` and
+//! `log.md`, which are never concept documents) are skipped.
 
 use std::collections::HashSet;
 use std::ffi::OsStr;
@@ -171,12 +172,23 @@ fn collect_markdown_files(root: &Path) -> Result<Vec<PathBuf>, ScanError> {
         })?;
         if entry.file_type().is_file()
             && entry.path().extension().and_then(OsStr::to_str) == Some("md")
+            && !is_reserved(entry.file_name())
         {
             out.push(entry.path().to_path_buf());
         }
     }
     out.sort();
     Ok(out)
+}
+
+/// Whether a directory entry carries one of the OKF reserved filenames. Those
+/// files are navigation surfaces, not concept documents: a spec-correct
+/// `index.md` carries no frontmatter at all, so verifying it would flag every
+/// missing-frontmatter rule against a perfectly valid file.
+fn is_reserved(name: &OsStr) -> bool {
+    name.to_str()
+        .map(crate::index::is_reserved_file)
+        .unwrap_or(false)
 }
 
 fn is_dotfile(name: &OsStr) -> bool {

@@ -399,6 +399,68 @@ parity!(
     composition_identical_uncontended
 );
 
+/// The OKF reserved filenames are never indexed: an `index.md` or a `log.md`
+/// dropped into a domain is invisible to the walk, and a row left over from
+/// before the exclusion disappears on the next scan (absent on disk means
+/// deleted).
+async fn reserved_filenames_stay_out_of_the_index(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "a.md", &engram("A", "a", "keepme body"));
+    write(root, "index.md", "# Contents\n\n* [A](a.md)\n");
+    write(root, "log.md", "# Log\n\nreservedlog entry\n");
+    write(root, "sub/index.md", "# Contents\n\n* [B](b.md)\n");
+    write(root, "sub/b.md", &engram("B", "sub/b", "second body"));
+
+    let report = sync_domain_with(store, "d", root, &params()).await.unwrap();
+    assert_eq!(report.added, 2, "only the two concepts index: {report:?}");
+    let domain = upsert_domain(store, "d", root).await;
+    let stamps = store.file_stamps(domain).await.unwrap();
+    let mut paths: Vec<&String> = stamps.keys().collect();
+    paths.sort();
+    assert_eq!(paths, vec!["a.md", "sub/b.md"]);
+    assert_eq!(
+        store
+            .search(&SearchQuery::text("reservedlog"))
+            .await
+            .unwrap()
+            .total,
+        0,
+        "a reserved file is never searchable"
+    );
+
+    // A row recorded before the exclusion (or by an older version) is dropped by
+    // the next scan, since the walk no longer sees the file.
+    store
+        .upsert_engram(
+            domain,
+            &record("index.md", "index", "legacyindex body", "sha-legacy"),
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .file_stamps(domain)
+            .await
+            .unwrap()
+            .contains_key("index.md"),
+        "the legacy row exists before the scan"
+    );
+    let second = sync_domain_with(store, "d", root, &params()).await.unwrap();
+    assert_eq!(second.deleted, 1, "the legacy row is dropped: {second:?}");
+    assert!(
+        !store
+            .file_stamps(domain)
+            .await
+            .unwrap()
+            .contains_key("index.md")
+    );
+}
+parity!(
+    reserved_filenames_are_never_indexed,
+    reserved_filenames_stay_out_of_the_index
+);
+
 /// A denied domain root is a loud per-domain error, not a silent empty scan: a
 /// full scan of an unreadable root returns an io error and the recorded rows
 /// survive, rather than the scan seeing zero files and the apply deleting them.

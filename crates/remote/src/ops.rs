@@ -1208,8 +1208,8 @@ fn stamp(content: &[u8]) -> BaseStamp {
 /// `None` when it lies outside the subtree or names a hidden path. Mirrors
 /// the prefix stripping [`crate::archive::extract_tarball`] applies, so the
 /// compare and tarball paths agree on which files belong to the domain, and
-/// applies the same [`crate::changes::is_hidden_path`] rule that function
-/// does: a hidden upstream change is dropped here, before the caller ever
+/// applies the same [`crate::changes::is_excluded_path`] rule that function
+/// does: a hidden or reserved upstream change is dropped here, before the caller ever
 /// fetches a blob for it or stamps it into
 /// [`crate::state::OriginState::files`], so a compare-driven pull can never
 /// disagree with a tarball-driven one about which files are hidden.
@@ -1221,7 +1221,7 @@ fn to_domain_relative(repo_rel: &str, subpath: Option<&str>) -> Option<String> {
             repo_rel.strip_prefix(&prefix).map(str::to_string)?
         }
     };
-    if crate::changes::is_hidden_path(&rel) {
+    if crate::changes::is_excluded_path(&rel) {
         return None;
     }
     Some(rel)

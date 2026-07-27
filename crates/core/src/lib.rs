@@ -19,6 +19,7 @@ pub mod emit;
 pub mod engram;
 pub mod harness;
 pub mod import;
+pub mod index;
 pub mod manifest;
 pub mod parse;
 pub mod prompt;
@@ -37,6 +38,9 @@ pub use engram::{
     Relation, SchemaDef, WikiLink,
 };
 pub use harness::{HarnessKind, HarnessPaths, artifact_base, harness_paths};
+pub use index::{
+    INDEX_FILE, IndexEntry, LOG_FILE, OKF_VERSION, is_reserved_file, is_reserved_path, render_index,
+};
 pub use manifest::{
     ArtifactType, Manifest, ProblemKind, ProvisioningDecl, ProvisioningProblem,
     ProvisioningSection, TagAliasDecl, TagAliasProblem, TagAliasProblemKind, TagAliasSection,

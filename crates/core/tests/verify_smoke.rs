@@ -45,6 +45,42 @@ fn good_domain_has_no_issues() {
 }
 
 #[test]
+fn reserved_index_and_log_files_are_skipped_entirely() {
+    let dir = tempdir().unwrap();
+    write(
+        dir.path(),
+        "MANIFEST.md",
+        "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\ntimestamp: 2026-01-01T00:00:00+00:00\n---\n\n## Scope\n\n- Facts about the solar system\n\n## When to Use\n\n- When asked about moons or planets\n",
+    );
+    // A spec-correct index file carries no frontmatter at all, and a log file
+    // is free prose: verifying either would flag a perfectly valid file, so
+    // both are skipped before any rule sees them.
+    write(
+        dir.path(),
+        "index.md",
+        "# Contents\n\n* [MANIFEST](MANIFEST.md)\n* [moons/](moons/)\n",
+    );
+    write(dir.path(), "moons/log.md", "# Log\n\n- Added Phobos\n");
+    write(
+        dir.path(),
+        "moons/phobos.md",
+        "---\ntype: engram\ntitle: Phobos\npermalink: moons/phobos\ntags:\n- moons\nstatus: current\nrecorded_at: 2026-01-01\ntimestamp: 2026-01-01T00:00:00+00:00\n---\n\n# Phobos\n\nThe larger and closer of the two small moons that orbit Mars. It completes\nan orbit in under eight hours.\n",
+    );
+
+    let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+    assert_eq!(
+        report.issues.iter().map(|i| i.rule).collect::<Vec<_>>(),
+        Vec::<&str>::new(),
+        "unexpected issues: {:#?}",
+        report.issues
+    );
+    assert_eq!(
+        report.summary.files_scanned, 2,
+        "only the two concept documents are scanned"
+    );
+}
+
+#[test]
 fn missing_manifest_is_m001_error() {
     let dir = tempdir().unwrap();
     write(

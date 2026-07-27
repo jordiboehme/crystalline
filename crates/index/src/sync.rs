@@ -258,7 +258,16 @@ pub async fn scan_domain(
             continue;
         }
         let fname = entry.file_name().to_string_lossy();
-        if is_hidden(&fname) || !fname.to_lowercase().ends_with(".md") {
+        // OKF reserves `index.md` and `log.md` at every level: they are
+        // navigation surfaces, never concept documents, so they are skipped
+        // here the way dot-files are. Nothing downstream needs a filter: they
+        // never reach a store row, an embedding or a search hit, and a row
+        // left over from before this exclusion disappears on the next scan
+        // (absent on disk means deleted).
+        if is_hidden(&fname)
+            || crystalline_core::is_reserved_file(&fname)
+            || !fname.to_lowercase().ends_with(".md")
+        {
             continue;
         }
         let Ok(meta) = entry.metadata() else { continue };
@@ -351,11 +360,20 @@ pub async fn scan_paths(
         }
         let abs = root.join(&rel);
         let hidden = rel.split('/').any(is_hidden);
+        // The OKF reserved names the full walk skips (see `scan_domain`), so a
+        // targeted pass indexes exactly what a full pass would.
+        let reserved = crystalline_core::is_reserved_path(&rel);
         let is_md = rel.to_lowercase().ends_with(".md");
         match std::fs::metadata(&abs) {
             // An existing markdown file, filtered exactly as the walk filters:
             // a change candidate, prefiltered against the stamps downstream.
-            Ok(meta) if meta.is_file() && is_md && !hidden && !is_excluded(&abs, &excluded) => {
+            Ok(meta)
+                if meta.is_file()
+                    && is_md
+                    && !hidden
+                    && !reserved
+                    && !is_excluded(&abs, &excluded) =>
+            {
                 let mtime = meta
                     .modified()
                     .ok()
@@ -682,7 +700,10 @@ async fn apply_changes<S: Store + ?Sized>(
         }
         // The file vanished during the scan but is back on disk now; the watcher
         // event for that recreation is already queued, so leave the row for it.
-        if root.join(&path).exists() {
+        // A reserved name is the exception: a file called `index.md` or `log.md`
+        // is never an engram, so its presence on disk must not resurrect a row
+        // recorded before the exclusion existed.
+        if !crystalline_core::is_reserved_path(&path) && root.join(&path).exists() {
             report.deferred += 1;
             tracing::debug!(path = %path, "sync: deferring a delete whose file reappeared on disk");
             continue;
