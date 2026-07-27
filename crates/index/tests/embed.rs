@@ -8,8 +8,9 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use crystalline_index::embed::estimate_tokens;
 use crystalline_index::{
-    ChunkJob, ChunkParams, EmbeddingProvider, IndexError, Result, SearchMode, SearchQuery, Store,
-    TursoStore, chunk_engram, order_jobs_for_batching, run_embedding_pass, sync_domain_with,
+    ChunkJob, ChunkParams, EMBED_PAGE_SIZE, EmbeddingProvider, IndexError, Result, SearchMode,
+    SearchQuery, Store, TursoStore, chunk_engram, order_jobs_for_batching, run_embedding_pass,
+    run_embedding_pass_with_page, sync_domain_with,
 };
 
 // --- chunking (no store) -----------------------------------------------------
@@ -51,21 +52,27 @@ fn code_fence_stays_one_unit() {
     assert!(joined.contains("line one"));
     assert!(joined.contains("line two after a blank"));
 
-    // With a tiny budget the fence is its own chunk and is never cut in half.
+    // A budget too small to hold the fence is the one case that cuts it: the
+    // pieces stay within the budget and every line survives, because one
+    // unbounded chunk is worse than an embedded fragment of a code block.
     let small = ChunkParams {
         model_id: "m".into(),
         max_tokens: 4,
     };
     let chunks = chunk_engram("", None, body, &small);
-    let fence_chunk = chunks
+    for c in &chunks {
+        assert!(
+            estimate_tokens(&c.text) <= 4,
+            "every chunk fits the budget: {:?}",
+            c.text
+        );
+    }
+    let joined = chunks
         .iter()
-        .find(|c| c.text.contains("line one"))
-        .expect("a chunk holds the fence");
-    assert!(
-        fence_chunk.text.contains("line two after a blank"),
-        "the fence is kept whole: {:?}",
-        fence_chunk.text
-    );
+        .map(|c| c.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert_eq!(squeezed(&joined), squeezed(body));
 }
 
 #[test]
@@ -94,6 +101,122 @@ fn fingerprints_are_stable_and_model_scoped() {
     assert_ne!(
         ca1[0].text_hash, cb[0].text_hash,
         "the model id namespaces the fingerprint"
+    );
+}
+
+/// The text with runs of whitespace collapsed to one space, so a chunk set can
+/// be compared against its source without caring where the cuts fell. Words
+/// survive the comparison only if no cut landed inside one.
+fn squeezed(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[test]
+fn an_oversized_paragraph_is_split_within_the_budget() {
+    // A body with no blank line anywhere (a log dump, a minified export) is one
+    // paragraph: without the cap it became a single chunk of the file's whole
+    // size and everything past the model's input limit went unembedded.
+    let body = "alpha bravo charlie delta ".repeat(400);
+    let params = ChunkParams {
+        model_id: "m".into(),
+        max_tokens: 50,
+    };
+    let chunks = chunk_engram("", None, &body, &params);
+    assert!(
+        chunks.len() > 10,
+        "the paragraph is cut into pieces: {}",
+        chunks.len()
+    );
+    for c in &chunks {
+        assert!(
+            estimate_tokens(&c.text) <= 50,
+            "every chunk fits the budget: {} tokens",
+            estimate_tokens(&c.text)
+        );
+    }
+    // Every word survives, in order and whole: the cuts prefer whitespace.
+    let joined = chunks
+        .iter()
+        .map(|c| c.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert_eq!(squeezed(&joined), squeezed(&body));
+}
+
+#[test]
+fn an_oversized_fence_is_split_within_the_budget() {
+    // A fence is kept whole only up to the budget: embedding parts of a huge
+    // code block beats holding it all in one chunk.
+    let inner = "let value = compute(alpha, bravo);\n".repeat(300);
+    let body = format!("intro paragraph\n\n```rust\n{inner}```\n");
+    let params = ChunkParams {
+        model_id: "m".into(),
+        max_tokens: 40,
+    };
+    let chunks = chunk_engram("", None, &body, &params);
+    assert!(chunks.len() > 10, "the fence is cut into pieces");
+    for c in &chunks {
+        assert!(
+            estimate_tokens(&c.text) <= 40,
+            "every chunk fits the budget: {} tokens",
+            estimate_tokens(&c.text)
+        );
+    }
+    let joined = chunks
+        .iter()
+        .map(|c| c.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert_eq!(squeezed(&joined), squeezed(&body));
+}
+
+#[test]
+fn a_cut_never_lands_inside_a_character() {
+    // Multi-byte text with no whitespace at all: the whitespace preference
+    // cannot apply, so every cut is a raw char-boundary cut. Slicing a byte
+    // index inside a character would panic, and the round trip proves nothing
+    // was dropped either.
+    let body = "漢字テスト".repeat(1000);
+    let params = ChunkParams {
+        model_id: "m".into(),
+        max_tokens: 30,
+    };
+    let chunks = chunk_engram("", None, &body, &params);
+    assert!(chunks.len() > 10, "the paragraph is cut into pieces");
+    for c in &chunks {
+        assert!(estimate_tokens(&c.text) <= 30);
+    }
+    let rejoined: String = chunks
+        .iter()
+        .flat_map(|c| c.text.chars())
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    assert_eq!(rejoined, body);
+}
+
+#[test]
+fn an_ordinary_document_chunks_exactly_as_it_always_has() {
+    // Pins the packing of a body whose every paragraph fits the budget: the
+    // oversize cut must not perturb it. Expected texts are spelled out rather
+    // than derived, so a change in packing fails here.
+    let body =
+        "alpha beta gamma\n\ndelta epsilon\n\n```\nfn main() {}\n```\n\nzeta eta theta iota\n";
+    let params = ChunkParams {
+        model_id: "m".into(),
+        max_tokens: 6,
+    };
+    let texts: Vec<String> = chunk_engram("", None, body, &params)
+        .into_iter()
+        .map(|c| c.text)
+        .collect();
+    assert_eq!(
+        texts,
+        vec![
+            "alpha beta gamma".to_string(),
+            "delta epsilon".to_string(),
+            "```\nfn main() {}\n```".to_string(),
+            "zeta eta theta iota".to_string(),
+        ]
     );
 }
 
@@ -261,7 +384,7 @@ async fn store_and_retrieve_roundtrip() {
     // Nothing left to embed.
     assert!(
         store
-            .chunks_needing_embedding("fake-8", None)
+            .chunks_needing_embedding("fake-8", None, EMBED_PAGE_SIZE, None)
             .await
             .unwrap()
             .is_empty()
@@ -497,7 +620,7 @@ async fn unchanged_files_do_zero_reembedding_work() {
     assert_eq!(report.unchanged, 5);
     assert!(
         store
-            .chunks_needing_embedding("fake-8", None)
+            .chunks_needing_embedding("fake-8", None, EMBED_PAGE_SIZE, None)
             .await
             .unwrap()
             .is_empty(),
@@ -524,7 +647,7 @@ async fn editing_one_paragraph_only_reembeds_that_chunk() {
     run_embedding_pass(&store, &fake, |_, _| {}).await.unwrap();
     assert!(
         store
-            .chunks_needing_embedding("fake-8", None)
+            .chunks_needing_embedding("fake-8", None, EMBED_PAGE_SIZE, None)
             .await
             .unwrap()
             .is_empty()
@@ -540,7 +663,7 @@ async fn editing_one_paragraph_only_reembeds_that_chunk() {
     // Only the changed chunk (and the title-bearing first chunk if it moved) lost
     // its embedding; the fingerprint carry-over kept the untouched ones.
     let pending = store
-        .chunks_needing_embedding("fake-8", None)
+        .chunks_needing_embedding("fake-8", None, EMBED_PAGE_SIZE, None)
         .await
         .unwrap();
     assert!(
@@ -629,4 +752,129 @@ async fn run_embedding_pass_batches_jobs_length_ordered() {
             "batches are length-ordered across the whole pass: {flattened:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn a_paged_embed_pass_embeds_every_chunk_exactly_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // Twenty-five one-chunk engrams driven with a page size of four, so the
+    // pass spans several full pages and ends on a short one.
+    for i in 0..25 {
+        write(
+            root,
+            &format!("e{i:02}.md"),
+            &engram(
+                &format!("E{i:02}"),
+                &format!("e{i:02}"),
+                "",
+                &format!("body of engram number {i:02}"),
+            ),
+        );
+    }
+    let store = open().await;
+    let provider = RecordingProvider::new("fake-8");
+    let params = ChunkParams::for_model(provider.model_id());
+    sync_domain_with(&store, "d", root, &params).await.unwrap();
+
+    let mut last_progress = (0usize, 0usize);
+    let report = run_embedding_pass_with_page(&store, &provider, 4, |done, total| {
+        last_progress = (done, total);
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(report.chunks, 25, "every chunk embedded");
+    assert_eq!(
+        last_progress,
+        (25, 25),
+        "the final progress call reports the true total"
+    );
+    // Every text went to the provider exactly once: paging neither skips a job
+    // nor hands one back on a later page.
+    let mut seen: Vec<String> = provider
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .flatten()
+        .cloned()
+        .collect();
+    assert_eq!(seen.len(), 25);
+    seen.sort();
+    seen.dedup();
+    assert_eq!(seen.len(), 25, "no chunk was embedded twice");
+    assert!(
+        store
+            .chunks_needing_embedding("fake-8", None, EMBED_PAGE_SIZE, None)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the paged pass drains the backlog"
+    );
+}
+
+/// A provider that rejects any batch holding a text with the poison marker, the
+/// shape of a chunk the real provider chokes on.
+struct PoisonProvider {
+    model: String,
+}
+
+#[async_trait]
+impl EmbeddingProvider for PoisonProvider {
+    async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        if texts.iter().any(|t| t.contains("POISON")) {
+            return Err(IndexError::Embedding("this batch is poisoned".into()));
+        }
+        Ok(texts.iter().map(|t| embed_one(t)).collect())
+    }
+    fn model_id(&self) -> &str {
+        &self.model
+    }
+    fn dims(&self) -> usize {
+        8
+    }
+    fn max_input_tokens(&self) -> usize {
+        512
+    }
+}
+
+#[tokio::test]
+async fn a_rejected_batch_is_skipped_and_the_pass_continues() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // Ten one-chunk engrams, one of them poisoned. A page size of one makes
+    // every batch a single chunk, so exactly the poisoned chunk is skipped.
+    for i in 0..10 {
+        let body = if i == 7 {
+            "body of engram POISON seven".to_string()
+        } else {
+            format!("body of engram number {i:02}")
+        };
+        write(
+            root,
+            &format!("e{i:02}.md"),
+            &engram(&format!("E{i:02}"), &format!("e{i:02}"), "", &body),
+        );
+    }
+    let store = open().await;
+    let provider = PoisonProvider {
+        model: "fake-8".to_string(),
+    };
+    let params = ChunkParams::for_model(provider.model_id());
+    sync_domain_with(&store, "d", root, &params).await.unwrap();
+
+    let report = run_embedding_pass_with_page(&store, &provider, 1, |_, _| {})
+        .await
+        .unwrap();
+    assert_eq!(report.chunks, 9, "every healthy chunk embedded");
+
+    // The poisoned chunk kept no embedding, so it stays in the backlog for a
+    // later pass rather than blocking the nine behind it.
+    let pending = store
+        .chunks_needing_embedding("fake-8", None, EMBED_PAGE_SIZE, None)
+        .await
+        .unwrap();
+    assert_eq!(pending.len(), 1, "exactly the poisoned chunk is left");
+    assert!(pending[0].text.contains("POISON"));
 }

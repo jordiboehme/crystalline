@@ -34,10 +34,11 @@ use crystalline_core::{
 };
 use crystalline_index::{
     ChunkParams, DEFAULT_RETIRED_WEIGHT, DEFAULT_SALIENCE_WEIGHT, DomainHost, DomainId, DomainKind,
-    EdgeKind, EmbeddingProvider, EngramDescriptor, EngramId, EngramRecord, FileStamp, GraphNode,
-    GraphSlice, HostClaim, RecentFilter, SearchMode, SearchQuery, Store, SyncReport, apply_scan,
-    chunk_engram, configured_model_id, order_jobs_for_batching, parse_metadata_filters,
-    provider_from_config, retired_factor, salience_prior, scan_domain, scan_paths,
+    EMBED_PAGE_SIZE, EdgeKind, EmbeddingProvider, EngramDescriptor, EngramId, EngramRecord,
+    FileStamp, GraphNode, GraphSlice, HostClaim, RecentFilter, SearchMode, SearchQuery, Store,
+    SyncReport, apply_scan, chunk_engram, configured_model_id, order_jobs_for_batching,
+    parse_metadata_filters, provider_from_config, retired_factor, salience_prior, scan_domain,
+    scan_paths,
 };
 use crystalline_remote::ops;
 use crystalline_remote::{
@@ -3262,54 +3263,98 @@ impl Engine {
     /// the store only to pull jobs and to store vectors so long embeds do not
     /// block searches. Returns the number of chunks embedded.
     pub async fn embed_pending(&self) -> Result<usize> {
+        self.embed_pending_with_page(EMBED_PAGE_SIZE).await
+    }
+
+    /// [`Self::embed_pending`] with an explicit backlog page size. Production
+    /// callers take [`EMBED_PAGE_SIZE`] through the wrapper; the parameter lets
+    /// a test drive several pages over a small corpus.
+    ///
+    /// A batch the provider rejects is logged and skipped, not fatal: its chunks
+    /// keep no embedding and stay in the backlog, visible in `status`, for a
+    /// later pass, so one poisoned batch cannot starve the whole queue. Only
+    /// store errors abort the pass.
+    pub async fn embed_pending_with_page(&self, page_size: usize) -> Result<usize> {
         let Some(provider) = self.provider() else {
             return Ok(0);
         };
         let model = self.model_id.clone();
-        // One snapshot of outstanding chunks; the store lock is held only to pull
-        // jobs and to write vectors, never across the embed call. In
-        // collaboration mode the scan is scoped to the file domains this instance
-        // hosts plus all virtual domains, so a non-host does not wastefully
-        // re-embed a chunk another instance owns; standalone it embeds everything.
-        let mut jobs = {
+        let page_size = page_size.max(1);
+        // In collaboration mode the scan is scoped to the file domains this
+        // instance hosts plus all virtual domains, so a non-host does not
+        // wastefully re-embed a chunk another instance owns; standalone it
+        // embeds everything. The scope holds for the whole pass.
+        let scope = {
             let store = self.store.lock().await;
-            let scope = self.embed_scope(&*store).await?;
-            store
-                .chunks_needing_embedding(&model, scope.as_deref())
-                .await?
+            self.embed_scope(&*store).await?
         };
-        if jobs.is_empty() {
-            return Ok(0);
-        }
-        // Length-sort so batches pay for their longest member once instead of
-        // padding every short chunk out to whatever long one happened to land
-        // in the same batch.
-        order_jobs_for_batching(&mut jobs);
-        let _activity = ActivityState::begin(&self.activity, "embed", None);
+        // The backlog is walked one keyset page at a time so a large first index
+        // never holds every chunk's text at once. The store lock is held only to
+        // pull a page and to write vectors, never across the embed call.
         let mut embedded = 0usize;
-        for batch in jobs.chunks(EMBED_BATCH) {
-            let texts: Vec<String> = batch.iter().map(|j| j.text.clone()).collect();
-            let vectors = provider
-                .embed(&texts)
-                .await
-                .map_err(|e| EngineError::Internal(e.to_string()))?;
-            if vectors.len() != batch.len() {
-                return Err(EngineError::Internal(
-                    "embedding provider returned a mismatched vector count".into(),
-                ));
+        let mut cursor: Option<(i64, i64)> = None;
+        let mut activity: Option<ActivityGuard> = None;
+        loop {
+            let mut jobs = {
+                let store = self.store.lock().await;
+                store
+                    .chunks_needing_embedding(&model, scope.as_deref(), page_size, cursor)
+                    .await?
+            };
+            if jobs.is_empty() {
+                break;
             }
-            let rows: Vec<crystalline_index::EmbeddingRow> = batch
-                .iter()
-                .zip(vectors)
-                .map(|(job, embedding)| crystalline_index::EmbeddingRow {
-                    chunk_id: job.chunk_id,
-                    dims: embedding.len(),
-                    embedding,
-                })
-                .collect();
-            let store = self.store.lock().await;
-            store.store_embeddings(&rows, &model).await?;
-            embedded += batch.len();
+            // A short page is the last one. The cursor is taken from the store's
+            // ordering, before the length sort reorders the page.
+            let last_page = jobs.len() < page_size;
+            cursor = jobs.last().map(|j| (j.engram_id, j.seq));
+            // Length-sort so batches pay for their longest member once instead
+            // of padding every short chunk out to whatever long one happened to
+            // land in the same batch.
+            order_jobs_for_batching(&mut jobs);
+            if activity.is_none() {
+                activity = Some(ActivityState::begin(&self.activity, "embed", None));
+            }
+            for batch in jobs.chunks(EMBED_BATCH) {
+                let texts: Vec<String> = batch.iter().map(|j| j.text.clone()).collect();
+                // A batch the provider cannot handle is logged and skipped: its
+                // chunks keep no embedding, so they stay in the backlog for a
+                // later pass instead of starving every batch behind them.
+                let vectors = match provider.embed(&texts).await {
+                    Ok(v) if v.len() == batch.len() => v,
+                    Ok(v) => {
+                        tracing::warn!(
+                            chunks = ?batch.iter().map(|j| j.chunk_id).collect::<Vec<_>>(),
+                            "skipping an embed batch: the provider returned {} vectors for {} inputs",
+                            v.len(),
+                            batch.len()
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            chunks = ?batch.iter().map(|j| j.chunk_id).collect::<Vec<_>>(),
+                            "skipping an embed batch the provider rejected: {e}"
+                        );
+                        continue;
+                    }
+                };
+                let rows: Vec<crystalline_index::EmbeddingRow> = batch
+                    .iter()
+                    .zip(vectors)
+                    .map(|(job, embedding)| crystalline_index::EmbeddingRow {
+                        chunk_id: job.chunk_id,
+                        dims: embedding.len(),
+                        embedding,
+                    })
+                    .collect();
+                let store = self.store.lock().await;
+                store.store_embeddings(&rows, &model).await?;
+                embedded += batch.len();
+            }
+            if last_page {
+                break;
+            }
         }
         Ok(embedded)
     }

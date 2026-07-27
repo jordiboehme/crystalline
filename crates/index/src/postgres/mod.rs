@@ -1457,21 +1457,25 @@ impl Store for PostgresStore {
         &self,
         model: &str,
         domains: Option<&[DomainId]>,
+        limit: usize,
+        after: Option<(i64, i64)>,
     ) -> Result<Vec<ChunkJob>> {
         // The base predicate is unchanged; an optional domain scope adds an
         // `engram_id IN (SELECT id FROM engram WHERE domain_id IN (...))` clause
         // so a non-host embeds only the chunks it owns. An empty scope matches
-        // nothing (this instance hosts nothing embeddable).
+        // nothing (this instance hosts nothing embeddable). The keyset cursor
+        // and the page limit ride on top of the same ordering the query always
+        // had, so a paged pass sees the same jobs in the same order.
         let mut sql = String::from(
             "SELECT id, engram_id, seq, text, text_hash FROM chunk \
              WHERE (embedding IS NULL OR model IS NULL OR model != $1)",
         );
         let mut params = vec![Param::Text(model.to_string())];
+        let mut n = 2;
         if let Some(ids) = domains {
             if ids.is_empty() {
                 return Ok(Vec::new());
             }
-            let mut n = 2;
             let placeholders: Vec<String> = ids
                 .iter()
                 .map(|id| {
@@ -1486,7 +1490,19 @@ impl Store for PostgresStore {
                 placeholders.join(",")
             ));
         }
-        sql.push_str(" ORDER BY engram_id, seq");
+        if let Some((engram_id, seq)) = after {
+            sql.push_str(&format!(
+                " AND (engram_id > ${n} OR (engram_id = ${} AND seq > ${}))",
+                n + 1,
+                n + 2
+            ));
+            params.push(Param::Int(engram_id));
+            params.push(Param::Int(engram_id));
+            params.push(Param::Int(seq));
+            n += 3;
+        }
+        sql.push_str(&format!(" ORDER BY engram_id, seq LIMIT ${n}"));
+        params.push(Param::Int(i64::try_from(limit).unwrap_or(i64::MAX)));
         let mut conn = self.acquire().await?;
         let rows = query_all(conn.as_mut(), &sql, params).await?;
         Ok(rows

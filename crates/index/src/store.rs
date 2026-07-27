@@ -1129,10 +1129,19 @@ pub trait Store: Send + Sync {
     /// standalone default). Duplicate embedding across instances is always safe
     /// (the chunk fingerprint folds in the model id, so two instances converge
     /// on the same vector), just wasteful, and this filter avoids the waste.
+    ///
+    /// The result is one page: at most `limit` jobs ordered by
+    /// `(engram_id, seq)`, starting past the `after` key when it is given. A
+    /// caller pages the backlog with the last row of the previous page as the
+    /// next cursor rather than holding every job's text at once, and stops when
+    /// a page comes back short. Rows that gain an embedding mid-pass drop out of
+    /// the predicate behind the cursor, so paging never skips or repeats a job.
     async fn chunks_needing_embedding(
         &self,
         model: &str,
         domains: Option<&[DomainId]>,
+        limit: usize,
+        after: Option<(i64, i64)>,
     ) -> Result<Vec<ChunkJob>>;
 
     /// Store a batch of embeddings against their chunks for the given model.

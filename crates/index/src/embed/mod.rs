@@ -35,6 +35,12 @@ pub const BGE_QUERY_PREFIX: &str = "Represent this sentence for searching releva
 /// How many chunks are embedded per provider call.
 pub const EMBED_BATCH_SIZE: usize = 16;
 
+/// How many outstanding chunks one backlog page pulls from the store. An embed
+/// pass loops pages instead of snapshotting the whole backlog, so a first index
+/// over a large corpus never holds every chunk's text at once. A multiple of
+/// [`EMBED_BATCH_SIZE`] so a full page splits into whole batches.
+pub const EMBED_PAGE_SIZE: usize = 512;
+
 /// Turns text into unit-normalized embedding vectors.
 ///
 /// `embed` is for documents (chunk text, embedded bare). `embed_queries` is for
@@ -155,54 +161,97 @@ pub fn order_jobs_for_batching(jobs: &mut [ChunkJob]) {
 
 /// Embed every chunk that needs it for the active provider's model, in batches,
 /// writing the vectors back through the store. `progress` is called after each
-/// batch with `(done, total)`.
+/// batch with `(done, total)`, where `total` is every chunk pulled so far: the
+/// backlog is paged, so the final call reports the true total and the earlier
+/// ones a lower bound.
+///
+/// A batch the provider rejects is logged and skipped, not fatal: its chunks
+/// keep no embedding and stay in the backlog for a later pass, so one poisoned
+/// batch cannot starve everything queued behind it. Only store errors abort.
 ///
 /// This is the synchronous fill used by `sync --embed` and `reindex --embed`.
 /// The M5 daemon reuses the same batching from its background queue.
 pub async fn run_embedding_pass(
     store: &dyn Store,
     provider: &dyn EmbeddingProvider,
+    progress: impl FnMut(usize, usize),
+) -> Result<EmbedReport> {
+    run_embedding_pass_with_page(store, provider, EMBED_PAGE_SIZE, progress).await
+}
+
+/// [`run_embedding_pass`] with an explicit backlog page size. Production callers
+/// take [`EMBED_PAGE_SIZE`] through the wrapper; the parameter lets a test drive
+/// several pages over a small corpus.
+pub async fn run_embedding_pass_with_page(
+    store: &dyn Store,
+    provider: &dyn EmbeddingProvider,
+    page_size: usize,
     mut progress: impl FnMut(usize, usize),
 ) -> Result<EmbedReport> {
-    // The standalone `sync --embed` / `reindex --embed` fill embeds every domain
-    // (`None`); the daemon's background queue scopes its own pass instead.
-    let mut jobs = store
-        .chunks_needing_embedding(provider.model_id(), None)
-        .await?;
-    order_jobs_for_batching(&mut jobs);
-    let total = jobs.len();
-    if total == 0 {
-        return Ok(EmbedReport::default());
-    }
-
+    let page_size = page_size.max(1);
     let mut done = 0usize;
     let mut batches = 0usize;
-    for batch in jobs.chunks(EMBED_BATCH_SIZE) {
-        let texts: Vec<String> = batch.iter().map(|j| j.text.clone()).collect();
-        let vectors = provider.embed(&texts).await?;
-        if vectors.len() != batch.len() {
-            return Err(IndexError::Embedding(format!(
-                "provider returned {} vectors for {} inputs",
-                vectors.len(),
-                batch.len()
-            )));
+    let mut cursor: Option<(i64, i64)> = None;
+    loop {
+        // The standalone `sync --embed` / `reindex --embed` fill embeds every
+        // domain (`None`); the daemon's background queue scopes its own pass.
+        let mut jobs = store
+            .chunks_needing_embedding(provider.model_id(), None, page_size, cursor)
+            .await?;
+        if jobs.is_empty() {
+            break;
         }
-        let rows: Vec<EmbeddingRow> = batch
-            .iter()
-            .zip(vectors)
-            .map(|(job, embedding)| EmbeddingRow {
-                chunk_id: job.chunk_id,
-                dims: embedding.len(),
-                embedding,
-            })
-            .collect();
-        store.store_embeddings(&rows, provider.model_id()).await?;
-        done += batch.len();
-        batches += 1;
-        progress(done, total);
+        // A short page is the last one. The cursor is taken from the store's
+        // ordering, before the length sort reorders the page.
+        let last_page = jobs.len() < page_size;
+        cursor = jobs.last().map(|j| (j.engram_id, j.seq));
+        order_jobs_for_batching(&mut jobs);
+        let total = done + jobs.len();
+
+        for batch in jobs.chunks(EMBED_BATCH_SIZE) {
+            let texts: Vec<String> = batch.iter().map(|j| j.text.clone()).collect();
+            // A batch the provider cannot handle is logged and skipped, never
+            // fatal: its chunks keep no embedding, so they stay in the backlog
+            // for a later pass instead of starving every batch behind them.
+            let vectors = match provider.embed(&texts).await {
+                Ok(v) if v.len() == batch.len() => v,
+                Ok(v) => {
+                    tracing::warn!(
+                        chunks = ?batch.iter().map(|j| j.chunk_id).collect::<Vec<_>>(),
+                        "skipping an embed batch: the provider returned {} vectors for {} inputs",
+                        v.len(),
+                        batch.len()
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        chunks = ?batch.iter().map(|j| j.chunk_id).collect::<Vec<_>>(),
+                        "skipping an embed batch the provider rejected: {e}"
+                    );
+                    continue;
+                }
+            };
+            let rows: Vec<EmbeddingRow> = batch
+                .iter()
+                .zip(vectors)
+                .map(|(job, embedding)| EmbeddingRow {
+                    chunk_id: job.chunk_id,
+                    dims: embedding.len(),
+                    embedding,
+                })
+                .collect();
+            store.store_embeddings(&rows, provider.model_id()).await?;
+            done += batch.len();
+            batches += 1;
+            progress(done, total);
+        }
+        if last_page {
+            break;
+        }
     }
     Ok(EmbedReport {
-        chunks: total,
+        chunks: done,
         batches,
     })
 }

@@ -14,7 +14,7 @@ use std::time::Instant;
 
 use crystalline_core::config::EmbeddingsConfig;
 use crystalline_index::{
-    ChunkParams, SearchMode, SearchQuery, Store, TursoStore, download_local_model,
+    ChunkParams, EMBED_PAGE_SIZE, SearchMode, SearchQuery, Store, TursoStore, download_local_model,
     provider_from_config, run_embedding_pass, sync_domain_with,
 };
 
@@ -172,7 +172,7 @@ async fn semantic_query_without_term_overlap_ranks_related_engram_top_three() {
     // Re-syncing the unchanged corpus embeds nothing.
     sync_domain_with(&store, "d", root, &params).await.unwrap();
     let pending = store
-        .chunks_needing_embedding(provider.model_id(), None)
+        .chunks_needing_embedding(provider.model_id(), None, EMBED_PAGE_SIZE, None)
         .await
         .unwrap();
     assert!(pending.is_empty(), "a warm resync re-embeds nothing");

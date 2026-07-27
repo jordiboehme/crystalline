@@ -1,7 +1,9 @@
 //! The daemon's embed self-heal tick. The embed worker is event-driven: a
 //! transient provider failure consumes its signal and strands the backlog until
 //! the next write. This periodic tick re-fires the worker while a backlog
-//! remains and stays silent when there is none, and exits on shutdown.
+//! remains and stays silent when there is none, and exits on shutdown. The
+//! engine's own pass is covered here too: it pages the backlog and skips a
+//! batch the provider rejects instead of stranding the rest.
 
 mod support;
 
@@ -212,5 +214,103 @@ async fn embed_worker_checkpoints_the_wal_after_a_pass() {
         "the embed worker never checkpointed the WAL after its pass: embed calls={}, wal={:?}",
         embedder.calls.load(std::sync::atomic::Ordering::SeqCst),
         std::fs::metadata(wal_path(&db)).map(|m| m.len())
+    );
+}
+
+#[tokio::test]
+async fn embed_pending_pages_the_backlog_and_embeds_each_chunk_once() {
+    // Ten one-chunk engrams driven with a page size of three, so the pass spans
+    // several full pages and ends on a short one. The backlog is walked by
+    // keyset cursor, so a paged pass must embed every chunk exactly once.
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let store: Arc<Mutex<dyn Store>> = Arc::new(Mutex::new(store));
+    let engine = Arc::new(virtual_engine(store));
+    let embedder = Arc::new(CountingEmbedder::new());
+    engine.set_provider(embedder.clone());
+
+    for i in 0..10 {
+        engine
+            .write_engram(&write_params(
+                &format!("Note {i:02}"),
+                &format!("the body of note number {i:02}"),
+            ))
+            .await
+            .unwrap();
+    }
+    let backlog = engine.embedding_backlog().await.unwrap();
+    assert_eq!(backlog, 10, "one chunk per note is outstanding");
+
+    let embedded = engine.embed_pending_with_page(3).await.unwrap();
+    assert_eq!(embedded, backlog, "every chunk embedded exactly once");
+    assert_eq!(
+        engine.embedding_backlog().await.unwrap(),
+        0,
+        "the paged pass drains the backlog"
+    );
+    // One provider call per page (a page is well under the batch size), so the
+    // pass really did span four pages rather than one snapshot.
+    assert_eq!(
+        embedder.calls.load(std::sync::atomic::Ordering::SeqCst),
+        4,
+        "ten chunks at a page size of three is four pages"
+    );
+    // A second pass has nothing left to do.
+    assert_eq!(engine.embed_pending_with_page(3).await.unwrap(), 0);
+}
+
+/// An embedder that rejects any batch holding a text with the poison marker,
+/// the shape of a chunk the real provider chokes on.
+struct PoisonEmbedder;
+
+#[async_trait::async_trait]
+impl crystalline_index::EmbeddingProvider for PoisonEmbedder {
+    async fn embed(&self, texts: &[String]) -> crystalline_index::Result<Vec<Vec<f32>>> {
+        if texts.iter().any(|t| t.contains("POISON")) {
+            return Err(crystalline_index::IndexError::Embedding(
+                "this batch is poisoned".into(),
+            ));
+        }
+        Ok(vec![vec![0.1_f32; 4]; texts.len()])
+    }
+    fn model_id(&self) -> &str {
+        "test-model"
+    }
+    fn dims(&self) -> usize {
+        4
+    }
+    fn max_input_tokens(&self) -> usize {
+        512
+    }
+}
+
+#[tokio::test]
+async fn a_rejected_batch_never_starves_the_backlog() {
+    // A chunk the provider chokes on must not strand everything queued behind
+    // it: the field symptom this guards is a backlog stuck at a handful of
+    // chunks for days. A page size of one makes every batch a single chunk, so
+    // exactly the poisoned chunk survives the pass unembedded.
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let store: Arc<Mutex<dyn Store>> = Arc::new(Mutex::new(store));
+    let engine = Arc::new(virtual_engine(store));
+    engine.set_provider(Arc::new(PoisonEmbedder));
+
+    for i in 0..6 {
+        let body = if i == 3 {
+            "a POISON body the provider rejects".to_string()
+        } else {
+            format!("the body of note number {i:02}")
+        };
+        engine
+            .write_engram(&write_params(&format!("Note {i:02}"), &body))
+            .await
+            .unwrap();
+    }
+
+    let embedded = engine.embed_pending_with_page(1).await.unwrap();
+    assert_eq!(embedded, 5, "every healthy chunk embedded");
+    assert_eq!(
+        engine.embedding_backlog().await.unwrap(),
+        1,
+        "the poisoned chunk stays in the backlog, visible for a later pass"
     );
 }

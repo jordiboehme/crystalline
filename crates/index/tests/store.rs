@@ -12,9 +12,9 @@
 use std::path::Path;
 
 use crystalline_index::{
-    DomainId, DomainKind, EdgeKind, EmbeddingCoverage, EmbeddingRow, EngramId, EngramRecord,
-    FileStamp, FilterOp, HostClaim, IndexError, MetadataFilter, NamedCount, NewChunk, RecentFilter,
-    SearchMode, SearchQuery, Store, TursoStore, Vocabulary, sync_domain,
+    DomainId, DomainKind, EMBED_PAGE_SIZE, EdgeKind, EmbeddingCoverage, EmbeddingRow, EngramId,
+    EngramRecord, FileStamp, FilterOp, HostClaim, IndexError, MetadataFilter, NamedCount, NewChunk,
+    RecentFilter, SearchMode, SearchQuery, Store, TursoStore, Vocabulary, sync_domain,
 };
 
 fn write(dir: &Path, rel: &str, content: &str) {
@@ -2469,7 +2469,7 @@ async fn embedding_width_follows_provider(store: &dyn Store) {
     // A narrow provider stores fine even though the column starts at 384: no
     // error surfaces on either backend.
     let jobs = store
-        .chunks_needing_embedding("narrow-8", None)
+        .chunks_needing_embedding("narrow-8", None, EMBED_PAGE_SIZE, None)
         .await
         .unwrap();
     assert!(!jobs.is_empty(), "chunks await embedding after sync");
@@ -2496,7 +2496,7 @@ async fn embedding_width_follows_provider(store: &dyn Store) {
     // A 384-dim provider resizes the column back and stores fine too. The
     // model swap makes every chunk pending again, dims aside.
     let jobs = store
-        .chunks_needing_embedding("wide-384", None)
+        .chunks_needing_embedding("wide-384", None, EMBED_PAGE_SIZE, None)
         .await
         .unwrap();
     assert_eq!(
@@ -2524,7 +2524,7 @@ async fn embedding_width_follows_provider(store: &dyn Store) {
     );
     assert!(
         store
-            .chunks_needing_embedding("wide-384", None)
+            .chunks_needing_embedding("wide-384", None, EMBED_PAGE_SIZE, None)
             .await
             .unwrap()
             .is_empty(),
@@ -2567,7 +2567,10 @@ async fn width_flip_survives_replace_chunks(store: &dyn Store) {
 
     // First width: 8 dims. Embeds every chunk, driving ensure_embedding_width's
     // ALTER for the first time.
-    let jobs = store.chunks_needing_embedding("m8", None).await.unwrap();
+    let jobs = store
+        .chunks_needing_embedding("m8", None, EMBED_PAGE_SIZE, None)
+        .await
+        .unwrap();
     assert!(
         !jobs.is_empty(),
         "chunks await embedding after the first sync"
@@ -2605,7 +2608,10 @@ async fn width_flip_survives_replace_chunks(store: &dyn Store) {
     // Second width: 16 dims, driving a second ALTER, then re-sync once more so
     // the carry SELECT runs again against a column that just changed shape a
     // second time.
-    let jobs = store.chunks_needing_embedding("m16", None).await.unwrap();
+    let jobs = store
+        .chunks_needing_embedding("m16", None, EMBED_PAGE_SIZE, None)
+        .await
+        .unwrap();
     let rows: Vec<EmbeddingRow> = jobs
         .iter()
         .map(|j| EmbeddingRow {
@@ -2655,7 +2661,10 @@ async fn store_embeddings_mid_batch_mismatch_leaves_nothing(store: &dyn Store) {
     );
     sync_domain(store, "d", root).await.unwrap();
 
-    let jobs = store.chunks_needing_embedding("m8", None).await.unwrap();
+    let jobs = store
+        .chunks_needing_embedding("m8", None, EMBED_PAGE_SIZE, None)
+        .await
+        .unwrap();
     assert!(
         jobs.len() >= 2,
         "need at least two chunks to exercise a mid-batch failure, got {}",
@@ -2713,12 +2722,12 @@ parity!(
 /// independent ground truth for a store whose only embeddings use `model`.
 async fn recomputed_coverage(store: &dyn Store, model: &str) -> (usize, usize) {
     let total = store
-        .chunks_needing_embedding("no-model-ever-embedded-this", None)
+        .chunks_needing_embedding("no-model-ever-embedded-this", None, EMBED_PAGE_SIZE, None)
         .await
         .unwrap()
         .len();
     let pending = store
-        .chunks_needing_embedding(model, None)
+        .chunks_needing_embedding(model, None, EMBED_PAGE_SIZE, None)
         .await
         .unwrap()
         .len();
@@ -2784,7 +2793,10 @@ async fn seed_two_chunks(store: &dyn Store) -> DomainId {
 
 /// Embed every currently-pending chunk with `model` at width 8.
 async fn embed_all(store: &dyn Store, model: &str) {
-    let jobs = store.chunks_needing_embedding(model, None).await.unwrap();
+    let jobs = store
+        .chunks_needing_embedding(model, None, EMBED_PAGE_SIZE, None)
+        .await
+        .unwrap();
     let rows: Vec<EmbeddingRow> = jobs
         .iter()
         .map(|j| EmbeddingRow {
