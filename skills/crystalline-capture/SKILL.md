@@ -53,6 +53,8 @@ Create a new engram only when no existing one owns the topic, or the existing ow
 
 The test for edit versus supersede: does the new information make a fact in the owner engram false going forward ("changed", "replaced", "no longer", "instead of")? Then it is a supersession however small the diff looks, even a one-word value swap - follow the recipe below instead of rewriting the old engram's content in place. A pure addition or clarification that contradicts nothing is a normal edit.
 
+Reading is also checking. When an engram you read states something the session now knows is false, or two hits disagree with each other, surface the conflict and propose the fix - reconcile in place or supersede per the test above - rather than appending the new fact beside the old. On a `find_replace` reconciliation, pass `expected_replacements` so a value appearing more times than you counted fails the edit instead of rewriting the wrong occurrence.
+
 ## Reconcile in place, not as an append log
 
 An engram is what is true now, including what is now known to be outdated - it is never a change log. When re-ingesting a source or updating a topic, edit the body until it reads as a current-state description again: replace changed facts where they stand, insert new facts into the sections they belong in and delete what the source no longer supports. Never add a dated update section - `## Update - <date>`, `## Re-verification - <date>`, `## Refresh`, `## Change History`, `## Delta since <date>` or any sibling of these - and never append `- [fact] As of <date> X is Y` when the body already states X is Y: either the body needs updating or the observation is redundant. The version layer (git, a team domain's origin history) carries how knowledge changed; a body that reads as running commentary is wrong even when every entry was true as written.
@@ -94,6 +96,10 @@ An engram needs at least 3 non-blank content lines to pass verification - a lone
 The optional `folder` files the engram where its topic's neighbours already live, so check the domain's layout first and `browse_domain` it when the domain is unfamiliar. Start a subfolder once a topic cluster is forming; a singleton stays fine at the root. The folder becomes the permalink prefix `build_context` globs as `crystalline://domain/folder/*`.
 
 Exceptionally valuable knowledge - a hard-won debugging insight, the decision that keeps paying off - can carry a numeric `salience` key (0 to 10) in `metadata`. Hybrid search adds a small bounded lift for it, so a salient engram ranks above equally relevant unmarked ones while relevance still dominates and nothing is ever filtered out by it. Most engrams need none; reserve it for knowledge that clearly outranks its neighbours, and when an engram later proves to be the key to a task, raise its salience with a `find_replace` on the frontmatter line (the same mechanism `last_verified` uses).
+
+## Splitting a large capture
+
+A transcript, a research document or a long specification splits by granularity, not by topic - the one sanctioned exception to one topic per engram. Write the distilled summary as a normal engram in the topic's usual folder, carrying the tags and any `salience`, and keep the full text as a `type: source` engram in a `sources/` subfolder. Link the pair both ways: `- summarizes [[Full Document]]` on the summary, `- summarized_by [[Summary]]` on the source. A full text over the verify token budget (2500 tokens by default) splits into sequential part engrams in the same folder, each linked back the same way. Verbatim retention is legitimate only alongside a distilled summary, never instead of one: the summary is what most recalls read, and the full text is pulled into context only when the summary falls short.
 
 ## Observation categories
 
@@ -145,6 +151,8 @@ Read the old engram back afterwards and confirm its status actually changed befo
 When the date the old fact stopped holding is known, close its validity window in the same edit: extend the status find_replace to also add a `valid_to: <date>` line. Use the real-world transition date, not the date you happened to notice - and when that date is unknown, leave the window open and let `status` alone mark the retirement. A closed window is what makes the past addressable later: a search with `metadata_filters` on `valid_from`/`valid_to` can then answer "what applied last June" with the engram that was true then, the way a person recalls how things worked at a past job without mistaking it for the present.
 
 Retiring knowledge is also the moment to learn from it. The superseded engram keeps the full experience; any insight that outlives it - why the old approach failed, what to watch for next time - is unbounded knowledge that belongs as a `[lesson]` or `[pattern]` bullet on the new engram or its own engram, linked back to the retired one. The experience stays time-scoped; what it taught carries forward without bounds.
+
+Not every retirement has a replacement. When nothing takes the old fact's place - a practice abandoned, a tool dropped, a caveat that stopped applying - skip step 1 and retire in place: flip `status` to a retirement value, close `valid_to` when the end date is known and carry any surviving insight forward as a `[lesson]`. Staleness you notice while reading earns the same treatment, proposed to the user first rather than done silently. The status words each mean one thing: `deprecated` says do not do this again, `superseded` says a newer engram replaced this one, `archived` says retired but kept for the record and `legacy` says still deployed and true of old installations but not to be built on.
 
 ## Confirm before destroying
 

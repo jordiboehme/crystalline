@@ -48,8 +48,10 @@ use crystalline_core::config;
 /// salience-feedback half of the learning loop, closing it directly (no
 /// propose-first) because that mirrors the routing prompt's own standing
 /// bullet to raise the salience of an engram that turned out to be the key
-/// to a task.
-pub const NUDGE_REASON: &str = "Review this conversation for durable learnings before finishing: new facts, decisions, patterns and antipatterns, gotchas, corrections from the user or researched answers worth keeping. If any are not yet captured, propose capturing each one as an engram into the fitting crystalline domain: name the insight, the domain and the folder when one fits and wait for a yes. If a recalled engram proved to be the key to the task, raise its salience. If nothing qualifies or everything is already captured, finish normally without mentioning this check.";
+/// to a task. It carries the reconcile half too: a correction that makes an
+/// already captured engram wrong is an edit or a supersession, not a second
+/// engram written beside the first.
+pub const NUDGE_REASON: &str = "Review this conversation for durable learnings before finishing: new facts, decisions, patterns and antipatterns, gotchas, corrections from the user or researched answers worth keeping. Corrections include ones that make an existing engram wrong - for those propose the reconciling edit or supersession, not a new capture beside the old. If any are not yet captured, propose capturing each one as an engram into the fitting crystalline domain: name the insight, the domain and the folder when one fits and wait for a yes. If a recalled engram proved to be the key to the task, raise its salience. If nothing qualifies or everything is already captured, finish normally without mentioning this check.";
 
 /// A transcript byte size at or above this is substantial on its own, no
 /// read required: `run_stop` stats the file first and only reads it when the

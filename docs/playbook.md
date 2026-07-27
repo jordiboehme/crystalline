@@ -341,9 +341,20 @@ The vendor recalls QX-114 motivators shipped before mid-2026. Ours is affected.
 ```
 
 Forty screens became two facts and a source link. That is distilling, not
-mirroring. A second pass over the vendor's install guide lands another engram, and
-you tag that one `hyper-drive` out of habit - a drift the next chapter cleans up.
-The other intake jobs follow the same shape, each a sentence you say:
+mirroring.
+
+One shape earns verbatim retention, and only alongside its distillation, never
+instead of it: a transcript or a long document whose exact words you may need to
+quote later. The summary stays an ordinary engram where its topic already lives,
+the full text goes in as a `type: source` engram under a `sources/` folder, the
+two are linked both ways with `summarizes` and `summarized_by`, and a full text
+over the verify token budget (2500 tokens by default) becomes sequential part
+engrams. The sin was never keeping the words; it is mirroring instead of
+distilling.
+
+A second pass over the vendor's install guide lands another engram, and you tag
+that one `hyper-drive` out of habit - a drift the next chapter cleans up. The
+other intake jobs follow the same shape, each a sentence you say:
 
 - **Local documents.** "Read the raptor-paddock containment PDFs in `./isla-nublar`
   and propose engrams for a new `containment` domain, the keepers only." The agent
@@ -493,9 +504,16 @@ relations. The old decision is still readable and still addressable by date, but
 can no longer read as current. Use the real transition date for `valid_to`, never
 a sentinel, and leave the window open when the date is unknown.
 
+Not every retirement has a successor. When a practice is simply abandoned - the
+tool is gone, the caveat stopped applying - there is no new engram to write: flip
+the old one's status to a retirement value, close its window when you know the
+date and carry any lesson worth keeping into a live engram. The retirement is the
+whole edit.
+
 The status words each mean one thing: `deprecated` says do not do this again,
-`superseded` says a newer engram replaced this one and `archived` says retired but
-kept for the record. `delete` is for mistakes, not history.
+`superseded` says a newer engram replaced this one, `archived` says retired but
+kept for the record and `legacy` says still deployed and true of old
+installations but not to be built on. `delete` is for mistakes, not history.
 
 ## Share
 
