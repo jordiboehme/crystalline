@@ -10,11 +10,11 @@ You are being onboarded to the knowledge accumulated in this workspace. It is se
 - astronomy: When asked about moons or planets; When comparing orbital periods
 
 Behavior:
-- Narrow question, one domain clearly fits: search_engrams with domains=[that domain].
-- Broad or unclear question: search_engrams without domains is an all-domain sweep.
-- write_engram, edit_engram, move_engram and delete_engram always require an explicit domain; there is no default domain for writes.
-- Match the domain's folder layout when writing: write_engram's folder files an engram under a topic prefix that build_context can glob; start a subfolder when a topic clusters, keep singletons at the root.
-- vocabulary lists tags and categories already in use; check it before inventing a new tag.
-- Mark exceptionally valuable knowledge with a numeric salience (0-10) at write time; salient engrams rank higher in search. Raise the salience of an engram that turned out to be the key to a task.
-- build_context on a crystalline:// anchor assembles related knowledge around a task.
-- Read a domain's MANIFEST via read_engram only when its routing line above is not enough; list_domains with include_routing=true re-fetches this index mid-session.
+- Narrow question, one domain fits: search_engrams with domains=[that domain].
+- Broad or unclear question: search_engrams with no domains sweeps them all.
+- write_engram, edit_engram, move_engram and delete_engram always need an explicit domain.
+- Pass write_engram a folder matching the domain's layout: a topic prefix build_context can glob, a subfolder once a topic clusters, the root for singletons.
+- Check vocabulary for tags and categories in use before inventing one.
+- Salience (0-10) lifts an engram in search: set it at write time on exceptionally valuable knowledge and raise it when one proves key to a task.
+- build_context on a crystalline:// anchor gathers knowledge around a task.
+- Read a MANIFEST with read_engram only when the domain's routing line is not enough; list_domains with include_routing=true re-fetches the index mid-session.

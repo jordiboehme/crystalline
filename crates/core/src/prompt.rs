@@ -329,13 +329,27 @@ pub fn render_text(output: &PromptOutput) -> String {
 /// the one place the workspace-scoped `render_text` and the workspace-free
 /// `render_instructions` word things differently.
 ///
-/// The Behavior block is identical across both renderers: it drops the
-/// write-tools line in read-only mode and always points at
-/// `list_domains include_routing=true` as the mid-session re-fetch, so neither
-/// caller has to restate either rule. A `bullet_cap` of [`usize::MAX`] shows
-/// every bullet (the CLI `prompt system` path), a small cap trims the routing
-/// lines for the token-lean MCP `instructions` channel.
+/// This is the CLI `prompt system` order (domains, then Behavior); the MCP
+/// `instructions` channel puts the Behavior block first, see
+/// [`render_instructions`]. Both share the same two halves so the rules can
+/// never drift between them.
 fn render_routing_body(
+    output: &PromptOutput,
+    bullet_cap: usize,
+    empty_line: &str,
+    out: &mut String,
+) {
+    render_domain_lines(output, bullet_cap, empty_line, out);
+    out.push('\n');
+    render_behavior_block(output, out);
+}
+
+/// One routing line per domain, bullets joined with `; ` and capped at
+/// `bullet_cap`; `empty_line` stands in when no domain is registered. A
+/// `bullet_cap` of [`usize::MAX`] shows every bullet (the CLI `prompt system`
+/// path), a small cap trims the routing lines for the token-lean MCP
+/// `instructions` channel. The caller adds any separating blank line.
+fn render_domain_lines(
     output: &PromptOutput,
     bullet_cap: usize,
     empty_line: &str,
@@ -343,26 +357,31 @@ fn render_routing_body(
 ) {
     if output.domains.is_empty() {
         out.push_str(empty_line);
-        out.push_str("\n\n");
-    } else {
-        for d in &output.domains {
-            let label = if d.preferred {
-                format!("{} (preferred)", d.name)
-            } else {
-                d.name.clone()
-            };
-            let bullets = d
-                .bullets
-                .iter()
-                .take(bullet_cap)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join("; ");
-            let _ = writeln!(out, "- {label}: {bullets}");
-        }
         out.push('\n');
+        return;
     }
+    for d in &output.domains {
+        let label = if d.preferred {
+            format!("{} (preferred)", d.name)
+        } else {
+            d.name.clone()
+        };
+        let bullets = d
+            .bullets
+            .iter()
+            .take(bullet_cap)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("; ");
+        let _ = writeln!(out, "- {label}: {bullets}");
+    }
+}
 
+/// The fixed `Behavior:` block, identical across both renderers: it drops the
+/// write-tools line in read-only mode and always points at
+/// `list_domains include_routing=true` as the mid-session re-fetch, so neither
+/// caller has to restate either rule.
+fn render_behavior_block(output: &PromptOutput, out: &mut String) {
     out.push_str("Behavior:\n");
     for bullet in behavior_bullets(output.read_only) {
         let _ = writeln!(out, "- {bullet}");
@@ -381,51 +400,60 @@ fn render_routing_body(
 /// same rules and the set can never drift between them.
 pub fn behavior_bullets(read_only: bool) -> Vec<String> {
     let mut bullets = vec![
-        "Narrow question, one domain clearly fits: search_engrams with domains=[that domain]."
-            .to_string(),
-        "Broad or unclear question: search_engrams without domains is an all-domain sweep."
-            .to_string(),
+        "Narrow question, one domain fits: search_engrams with domains=[that domain].".to_string(),
+        "Broad or unclear question: search_engrams with no domains sweeps them all.".to_string(),
     ];
     if read_only {
         // Read-only variant: no write-tools line and no capture language; the
         // knowledge is maintained outside this deployment.
         bullets.push(
-            "This deployment's knowledge is read-only and curated externally; search and read to learn and do not attempt to capture or change anything."
+            "This deployment's knowledge is read-only and curated externally; search and read to learn, never try to capture or change anything."
                 .to_string(),
         );
     } else {
         bullets.push(
-            "write_engram, edit_engram, move_engram and delete_engram always require an explicit domain; there is no default domain for writes."
+            "write_engram, edit_engram, move_engram and delete_engram always need an explicit domain."
                 .to_string(),
         );
         bullets.push(
-            "Match the domain's folder layout when writing: write_engram's folder files an engram under a topic prefix that build_context can glob; start a subfolder when a topic clusters, keep singletons at the root."
+            "Pass write_engram a folder matching the domain's layout: a topic prefix build_context can glob, a subfolder once a topic clusters, the root for singletons."
                 .to_string(),
         );
         bullets.push(
-            "vocabulary lists tags and categories already in use; check it before inventing a new tag."
-                .to_string(),
+            "Check vocabulary for tags and categories in use before inventing one.".to_string(),
         );
         bullets.push(
-            "Mark exceptionally valuable knowledge with a numeric salience (0-10) at write time; salient engrams rank higher in search. Raise the salience of an engram that turned out to be the key to a task."
+            "Salience (0-10) lifts an engram in search: set it at write time on exceptionally valuable knowledge and raise it when one proves key to a task."
                 .to_string(),
         );
     }
     bullets.push(
-        "build_context on a crystalline:// anchor assembles related knowledge around a task."
-            .to_string(),
+        "build_context on a crystalline:// anchor gathers knowledge around a task.".to_string(),
     );
     bullets.push(
-        "Read a domain's MANIFEST via read_engram only when its routing line above is not enough; list_domains with include_routing=true re-fetches this index mid-session."
+        "Read a MANIFEST with read_engram only when the domain's routing line is not enough; list_domains with include_routing=true re-fetches the index mid-session."
             .to_string(),
     );
     bullets
 }
 
+/// The size a rendered `instructions` block must stay inside, in bytes.
+///
+/// Claude Code's tool-search mode (on by default once a session's MCP tool
+/// descriptions grow past roughly a tenth of the context window) loads only
+/// tool names plus each server's initialize `instructions` at session start
+/// and truncates those instructions at about 2KB. Anything past the cut never
+/// reaches the model. 1900 leaves headroom under that 2048-byte cut for a
+/// client that measures slightly differently or appends a note of its own (the
+/// service does exactly that for the TOON response format), so the header, the
+/// intro and the whole Behavior block always survive.
+pub const INSTRUCTIONS_BUDGET: usize = 1900;
+
 /// Render the onboarding block for the MCP `instructions` channel: the same
-/// "CRYSTALLINE KNOWLEDGE ROUTING" header and shared Behavior body as
-/// [`render_text`], but with a workspace-free intro and each domain's routing
-/// line capped at three bullets to stay token-lean on every connect.
+/// "CRYSTALLINE KNOWLEDGE ROUTING" header and shared Behavior rules as
+/// [`render_text`], but with a workspace-free intro, the Behavior block hoisted
+/// above the domain lines and each domain's routing line capped at three
+/// bullets to stay token-lean on every connect.
 ///
 /// This is the block a server hands the model at initialize, so the intro
 /// frames the tools as this server's own (the harness may prefix their names)
@@ -437,22 +465,59 @@ pub fn behavior_bullets(read_only: bool) -> Vec<String> {
 /// memory and that `list_domains` with `include_routing=true` re-fetches the
 /// whole index and its behavior rules at any time. The read-write intro adds
 /// the write and refine language and the search-before-you-write rule; the
-/// read-only intro states the knowledge is curated and drops both. The shared
-/// body then handles read-only tool dropping and repeats the re-fetch rule.
+/// read-only intro states the knowledge is curated and drops both. The Behavior
+/// block then handles read-only tool dropping and repeats the re-fetch rule.
+///
+/// Order and degradation both serve [`INSTRUCTIONS_BUDGET`]. Header, intro and
+/// Behavior block are fixed-size and universally applicable, so they come
+/// first and are never degraded; the domain lines are the variable part and
+/// every one of them is re-fetchable with a single `list_domains
+/// include_routing=true` call, so a client that truncates the tail only ever
+/// loses re-fetchable content. When the full render would still exceed the
+/// budget the domain lines degrade in two deterministic steps: first every
+/// routing line drops to one bullet, then the whole list collapses to a single
+/// count line pointing at the same re-fetch call. Degradation is a pure
+/// function of the rendered sizes, so the determinism contract holds and the
+/// cost is at most three renders of the same small strings.
 pub fn render_instructions(output: &PromptOutput) -> String {
-    let mut out = String::new();
-    out.push_str("CRYSTALLINE KNOWLEDGE ROUTING\n\n");
+    let mut head = String::new();
+    head.push_str("CRYSTALLINE KNOWLEDGE ROUTING\n\n");
     if output.read_only {
-        out.push_str(
-            "Crystalline gives you durable memory across sessions: the domains below hold curated knowledge as engrams you search and read while you work (your harness may prefix tool names, for example mcp__crystalline__search_engrams). Search these domains before answering from memory; list_domains with include_routing=true returns this full index and its behavior rules at any time.\n\n",
+        head.push_str(
+            "Crystalline is your durable memory across sessions: the domains below hold curated knowledge as engrams you search and read (your harness may prefix tool names, for example mcp__crystalline__search_engrams). Search them before answering from memory; list_domains with include_routing=true returns this index and its behavior rules at any time.\n\n",
         );
     } else {
-        out.push_str(
-            "Crystalline gives you durable memory across sessions: the domains below hold knowledge as engrams you read, write and refine while you work (your harness may prefix tool names, for example mcp__crystalline__search_engrams). Search these domains before answering from memory and search before you write; list_domains with include_routing=true returns this full index and its behavior rules at any time.\n\n",
+        head.push_str(
+            "Crystalline is your durable memory across sessions: the domains below hold knowledge as engrams you read, write and refine (your harness may prefix tool names, for example mcp__crystalline__search_engrams). Search them before answering from memory and before writing; list_domains with include_routing=true returns this index and its behavior rules at any time.\n\n",
         );
     }
-    render_routing_body(output, 3, "(no domains are registered yet)", &mut out);
-    out
+    render_behavior_block(output, &mut head);
+    head.push('\n');
+    head.push_str("Domains:\n");
+
+    // Tier 1: every routing line, up to three bullets each.
+    let mut full = head.clone();
+    render_domain_lines(output, 3, "(no domains are registered yet)", &mut full);
+    if full.len() <= INSTRUCTIONS_BUDGET {
+        return full;
+    }
+
+    // Tier 2: one bullet per domain, still one line per domain.
+    let mut lean = head.clone();
+    render_domain_lines(output, 1, "(no domains are registered yet)", &mut lean);
+    if lean.len() <= INSTRUCTIONS_BUDGET {
+        return lean;
+    }
+
+    // Tier 3: a single count line; the index itself is one tool call away.
+    let mut counted = head;
+    let n = output.domains.len();
+    let noun = if n == 1 { "domain" } else { "domains" };
+    let _ = writeln!(
+        counted,
+        "{n} {noun} registered; list_domains with include_routing=true returns the full index and its behavior rules."
+    );
+    counted
 }
 
 /// The paste-able custom-instructions snippet for remote clients whose harness
@@ -463,7 +528,7 @@ pub fn render_instructions(output: &PromptOutput) -> String {
 /// It is deliberately static and content-free - it names no domain, no count
 /// and no setting - so it can never go stale in a place Crystalline cannot
 /// update. All dynamic routing comes from the `list_domains` call it points at.
-pub const CONNECTOR_SNIPPET: &str = "This environment includes the Crystalline knowledge server over MCP. At the start of every session call its list_domains tool with include_routing set to true; the result is your onboarding: one routing line per knowledge domain plus the behavior rules for this server's tools. Follow it, search those domains before answering from memory and re-fetch the index mid-session with the same call whenever you need it again.";
+pub const CONNECTOR_SNIPPET: &str = "This environment includes the Crystalline knowledge server over MCP. At the start of every session call its list_domains tool with include_routing set to true; the result is your onboarding: one routing line per domain plus the behavior rules for this server's tools. Follow it, search those domains before answering from memory and re-fetch it mid-session with the same call whenever you need it again.";
 
 #[derive(Serialize)]
 struct JsonPromptDomain<'a> {
@@ -777,6 +842,145 @@ mod tests {
                 "read_only={read_only}: include_routing=true expected in the first 512 bytes:\n{head}"
             );
         }
+    }
+
+    /// The instructions order is header, intro, Behavior block, domain lines,
+    /// so a client that truncates the tail only ever loses the re-fetchable
+    /// domain list.
+    #[test]
+    fn render_instructions_puts_the_behavior_block_above_the_domain_lines() {
+        let (_tmp, global) = fixture();
+        let text = render_instructions(&generate_prompt_unscoped(&global, &BTreeMap::new()));
+        let behavior = text.find("Behavior:").expect("a behavior block");
+        let domains = text.find("Domains:").expect("a domains section");
+        let alpha = text.find("- alpha:").expect("a routing line for alpha");
+        assert!(
+            behavior < domains && domains < alpha,
+            "expected Behavior before the domain lines:\n{text}"
+        );
+        // The CLI renderer keeps its own domains-first order.
+        let cli = render_text(&generate_prompt(&global, _tmp.path(), &BTreeMap::new()));
+        assert!(
+            cli.find("- alpha").unwrap() < cli.find("Behavior:").unwrap(),
+            "render_text keeps domains first:\n{cli}"
+        );
+    }
+
+    /// Scaffold `count` file domains, each with `bullets_per_domain` routing
+    /// bullets, the way the CLI latency test scaffolds a large registry.
+    fn many_domains(count: usize, bullets_per_domain: usize) -> (tempfile::TempDir, GlobalConfig) {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut domains = indexmap::IndexMap::new();
+        for i in 0..count {
+            let name = format!("domain{i:02}");
+            let dir = tmp.path().join(&name);
+            std::fs::create_dir_all(&dir).unwrap();
+            let bullets: Vec<String> = (0..bullets_per_domain)
+                .map(|b| format!("When a task touches {name} aspect {b}"))
+                .collect();
+            let refs: Vec<&str> = bullets.iter().map(|s| s.as_str()).collect();
+            std::fs::write(dir.join("MANIFEST.md"), manifest_source(&refs)).unwrap();
+            domains.insert(name, DomainEntry::file(dir));
+        }
+        let global = GlobalConfig {
+            domains,
+            ..GlobalConfig::default()
+        };
+        (tmp, global)
+    }
+
+    /// The budget contract: Claude Code's tool-search mode truncates a server's
+    /// initialize instructions at roughly 2KB, so the whole rendered block has
+    /// to fit under 2048 bytes however many domains are registered, in both
+    /// modes.
+    #[test]
+    fn render_instructions_stays_under_2kb_for_a_large_registry() {
+        for count in [0usize, 1, 2, 5, 30, 200] {
+            let (_tmp, global) = many_domains(count, 5);
+            let mut output = generate_prompt_unscoped(&global, &BTreeMap::new());
+            for read_only in [false, true] {
+                output.read_only = read_only;
+                let text = render_instructions(&output);
+                assert!(
+                    text.len() <= 2048,
+                    "count={count} read_only={read_only}: {} bytes rendered:\n{text}",
+                    text.len()
+                );
+                assert!(
+                    text.len() <= INSTRUCTIONS_BUDGET,
+                    "count={count} read_only={read_only}: {} bytes exceeds the budget",
+                    text.len()
+                );
+                // The fixed head survives at every size.
+                assert!(text.starts_with("CRYSTALLINE KNOWLEDGE ROUTING"));
+                assert!(text.contains("Behavior:"));
+                assert!(text.contains("include_routing=true"));
+            }
+        }
+    }
+
+    /// Degradation happens in two deterministic steps: full routing lines, then
+    /// one bullet per line, then a single count line. Each tier is reached by
+    /// growing the registry and every tier renders identically twice.
+    #[test]
+    fn render_instructions_degrades_deterministically_in_three_tiers() {
+        // Tier 1: a small registry keeps three bullets per routing line.
+        let (_t1, small) = many_domains(1, 5);
+        let tier1 = render_instructions(&generate_prompt_unscoped(&small, &BTreeMap::new()));
+        assert!(
+            tier1.contains("aspect 0; When a task touches domain00 aspect 1; When a task touches domain00 aspect 2"),
+            "three bullets kept:\n{tier1}"
+        );
+
+        // Tier 2: enough domains to blow the budget at three bullets each, but
+        // not at one - one routing line per domain survives, trimmed.
+        let (_t2, mid) = many_domains(12, 5);
+        let tier2 = render_instructions(&generate_prompt_unscoped(&mid, &BTreeMap::new()));
+        assert!(
+            tier2.contains("- domain11: When a task touches domain11 aspect 0\n"),
+            "one bullet per domain:\n{tier2}"
+        );
+        assert!(
+            !tier2.contains("aspect 1"),
+            "second bullet dropped:\n{tier2}"
+        );
+        assert!(
+            !tier2.contains("domains registered;"),
+            "not yet the count line:\n{tier2}"
+        );
+
+        // Tier 3: a registry too large for even one bullet per line collapses to
+        // the count line, which points back at the same re-fetch call.
+        let (_t3, big) = many_domains(200, 5);
+        let tier3 = render_instructions(&generate_prompt_unscoped(&big, &BTreeMap::new()));
+        assert!(
+            tier3.contains(
+                "200 domains registered; list_domains with include_routing=true returns the full index and its behavior rules."
+            ),
+            "count line:\n{tier3}"
+        );
+        assert!(!tier3.contains("- domain00:"), "no routing lines:\n{tier3}");
+
+        // Every tier is a pure function of its input.
+        for (global, rendered) in [(&small, &tier1), (&mid, &tier2), (&big, &tier3)] {
+            let again = render_instructions(&generate_prompt_unscoped(global, &BTreeMap::new()));
+            assert_eq!(again.as_bytes(), rendered.as_bytes());
+        }
+    }
+
+    /// The count line reads as a sentence for a single domain too.
+    #[test]
+    fn the_count_line_is_singular_for_one_domain() {
+        let (_tmp, global) = many_domains(1, 5);
+        let mut output = generate_prompt_unscoped(&global, &BTreeMap::new());
+        // Force the tier-3 shape by giving the one domain a bullet no budget
+        // could hold.
+        output.domains[0].bullets = vec!["x".repeat(INSTRUCTIONS_BUDGET)];
+        let text = render_instructions(&output);
+        assert!(
+            text.contains("1 domain registered; list_domains with include_routing=true"),
+            "singular count line:\n{text}"
+        );
     }
 
     #[test]
