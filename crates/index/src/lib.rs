@@ -42,8 +42,8 @@ pub use store::{
     TagAlias, TagCount, Vocabulary, parse_metadata_filters, retired_factor, salience_prior,
 };
 pub use sync::{
-    DomainScan, SyncReport, apply_scan, refresh_tag_aliases, scan_domain, scan_paths, sync_domain,
-    sync_domain_with,
+    DomainScan, SyncReport, apply_scan, apply_scan_with_slab, refresh_tag_aliases, scan_domain,
+    scan_paths, sync_domain, sync_domain_with,
 };
 pub use turso::TursoStore;
 pub use vocab::{TagCluster, tag_clusters, tag_clusters_with_aliases};
