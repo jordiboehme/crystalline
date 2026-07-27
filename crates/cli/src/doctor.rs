@@ -650,8 +650,9 @@ async fn check_domain(
 }
 
 /// Every `.md` file under `root`, relative and forward-slashed, skipping
-/// dot-directories and dot-files. Mirrors the sync engine's own walk so
-/// orphan and unindexed detection line up with what a sync would compute.
+/// dot-directories, dot-files and the OKF reserved filenames. Mirrors the sync
+/// engine's own walk so orphan and unindexed detection line up with what a sync
+/// would compute.
 fn markdown_rel_paths(root: &Path) -> Vec<String> {
     let mut out = Vec::new();
     let walker = walkdir::WalkDir::new(root)
@@ -662,7 +663,13 @@ fn markdown_rel_paths(root: &Path) -> Vec<String> {
             continue;
         }
         let fname = entry.file_name().to_string_lossy();
-        if is_hidden(&fname) || !fname.to_lowercase().ends_with(".md") {
+        // The OKF reserved names are never indexed (the sync walk skips them),
+        // so counting them here would report every generated index file as
+        // unindexed.
+        if is_hidden(&fname)
+            || crystalline_core::is_reserved_file(&fname)
+            || !fname.to_lowercase().ends_with(".md")
+        {
             continue;
         }
         let rel = entry

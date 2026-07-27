@@ -1195,6 +1195,9 @@ impl Engine {
         } else {
             format!("{}/{title_slug}.md", folder.trim_matches('/'))
         };
+        if crystalline_core::is_reserved_path(&rel) {
+            return Err(EngineError::Invalid(reserved_name_error(&rel)));
+        }
         let permalink = slugify(&rel);
 
         // Enforce overwrite semantics against the existing permalink.
@@ -1251,6 +1254,8 @@ impl Engine {
         if matches!(source, ContentSource::Virtual) {
             self.refresh_routing_cache().await;
         }
+        // The new engram belongs in its folder's generated index.
+        self.refresh_index_files(&p.domain).await;
 
         Ok(json!({
             "domain": p.domain,
@@ -1467,6 +1472,9 @@ impl Engine {
         if matches!(source, ContentSource::Virtual) {
             self.refresh_routing_cache().await;
         }
+        // An edit can change the title or the description the folder's
+        // generated index lists this engram under.
+        self.refresh_index_files(&desc.domain).await;
 
         Ok(json!({
             "domain": desc.domain,
@@ -1573,6 +1581,9 @@ impl Engine {
         let dest_rel = normalize_md(&p.destination);
         if dest_rel.is_empty() {
             return Err(EngineError::Invalid("destination path is empty".into()));
+        }
+        if crystalline_core::is_reserved_path(&dest_rel) {
+            return Err(EngineError::Invalid(reserved_name_error(&dest_rel)));
         }
         let cross = dest_domain != p.domain;
 
@@ -1710,6 +1721,12 @@ impl Engine {
             || matches!(dest_source, ContentSource::Virtual)
         {
             self.refresh_routing_cache().await;
+        }
+        // A move empties one folder and fills another, so both ends need their
+        // index files back in step; a same-domain move refreshes once.
+        self.refresh_index_files(&p.domain).await;
+        if cross {
+            self.refresh_index_files(&dest_domain).await;
         }
 
         Ok(json!({
@@ -2011,6 +2028,9 @@ impl Engine {
         if matches!(source, ContentSource::Virtual) {
             self.refresh_routing_cache().await;
         }
+        // The deleted engram must leave its folder's generated index, and an
+        // emptied folder loses the index file altogether.
+        self.refresh_index_files(&desc.domain).await;
 
         Ok(json!({
             "domain": desc.domain,
@@ -2350,6 +2370,43 @@ impl Engine {
             }
         }
         out
+    }
+
+    // --- generated index files -----------------------------------------------
+
+    /// Regenerate a file domain's OKF `index.md` files, so the knowledge on
+    /// disk keeps navigating statically after a mutation or a sync.
+    ///
+    /// Silently does nothing for a virtual domain (no files to navigate), for a
+    /// read-only engine (the curating side owns the index files) and while the
+    /// `index.files` setting is off. The pass itself is idempotent: a
+    /// regeneration that renders the same bytes writes nothing, so an unchanged
+    /// index file keeps its mtime and the watcher stays quiet. Failures are
+    /// logged, never propagated: a generated navigation file is a convenience,
+    /// and losing it must never fail the write, move, delete or sync that
+    /// triggered the pass.
+    async fn refresh_index_files(&self, domain: &str) {
+        if self.read_only || !self.config.read().unwrap().index_files() {
+            return;
+        }
+        let ContentSource::File { root } = self.read_source(domain) else {
+            return;
+        };
+        let name = domain.to_string();
+        // A full walk plus one read per engram is blocking IO, so it runs on the
+        // blocking pool rather than on a runtime worker.
+        let joined = tokio::task::spawn_blocking(move || crate::index_files::refresh(&root)).await;
+        match joined {
+            Ok(report) if report.written > 0 || report.removed > 0 => {
+                tracing::debug!(
+                    "refreshed index files of '{name}': {} written, {} removed",
+                    report.written,
+                    report.removed
+                );
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!("index refresh of '{name}' did not run: {e}"),
+        }
     }
 
     // --- routing instructions ------------------------------------------------
@@ -2972,6 +3029,10 @@ impl Engine {
                     .await
                     .map_err(|e| EngineError::Internal(format!("sync of '{name}' failed: {e}")))?
             };
+            // Files changed under us, so the generated index files follow.
+            if changed_anything(&report) {
+                self.refresh_index_files(name).await;
+            }
             reports.push(report);
         }
         Ok(json!({
@@ -3036,6 +3097,11 @@ impl Engine {
                 EngineError::Internal(format!("targeted sync of '{name}' failed: {e}"))
             })?
         };
+        // An out-of-band edit the watcher caught changes what the folder's
+        // generated index should say.
+        if changed_anything(&report) {
+            self.refresh_index_files(name).await;
+        }
         Ok(report)
     }
 
@@ -3088,6 +3154,9 @@ impl Engine {
                     EngineError::Internal(format!("reindex of '{name}' failed: {e}"))
                 })?
             };
+            if changed_anything(&report) {
+                self.refresh_index_files(&name).await;
+            }
             reports.push(report);
         }
         Ok(json!({
@@ -5836,6 +5905,24 @@ fn dir_is_nonempty(dir: &Path) -> bool {
     std::fs::read_dir(dir)
         .map(|mut it| it.next().is_some())
         .unwrap_or(false)
+}
+
+/// Whether a sync or reindex pass moved anything on disk, the gate on
+/// regenerating the domain's index files. A pass that classified every file as
+/// unchanged leaves the listing exactly as it is, so it must not pay for a
+/// second walk of the domain.
+fn changed_anything(report: &SyncReport) -> bool {
+    report.added > 0 || report.updated > 0 || report.deleted > 0 || report.moved > 0
+}
+
+/// The refusal for a path whose filename is one of the OKF reserved names.
+/// Actionable: it says which name is reserved, why, and what to do instead.
+fn reserved_name_error(rel: &str) -> String {
+    format!(
+        "'{rel}' would use the reserved filename {} or {}: OKF keeps both for the generated directory index and log, so they are never engrams. Choose another title or destination filename.",
+        crystalline_core::INDEX_FILE,
+        crystalline_core::LOG_FILE
+    )
 }
 
 /// Join a forward-slashed domain-relative path onto a root, per-segment so it is

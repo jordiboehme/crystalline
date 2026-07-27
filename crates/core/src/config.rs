@@ -77,6 +77,11 @@ pub struct GlobalConfig {
     /// untouched.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skills: Option<SkillsConfig>,
+    /// Generated index-file settings. Absent means every file domain keeps an
+    /// `index.md` per folder, the default, so every existing config keeps
+    /// working untouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index: Option<IndexConfig>,
 }
 
 impl GlobalConfig {
@@ -146,6 +151,15 @@ impl GlobalConfig {
     /// client that never runs the CLI can learn from them out of the box.
     pub fn skills_serve(&self) -> bool {
         self.skills.as_ref().and_then(|s| s.serve).unwrap_or(true)
+    }
+
+    /// Whether a file domain keeps a generated `index.md` in every folder that
+    /// holds knowledge, from `index.files`. Absent config or an absent key
+    /// means on (true): the index files let a domain be navigated statically,
+    /// without Crystalline running. Virtual domains have no files, so the
+    /// setting never applies to them.
+    pub fn index_files(&self) -> bool {
+        self.index.as_ref().and_then(|i| i.files).unwrap_or(true)
     }
 }
 
@@ -347,6 +361,18 @@ pub struct SkillsConfig {
     /// means on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub serve: Option<bool>,
+}
+
+/// The `index` block: whether Crystalline keeps a generated `index.md` in
+/// every folder of a file domain. Reads like a settings-page section - see the
+/// `configure` tool, which exposes exactly these keys.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct IndexConfig {
+    /// Keep a generated OKF `index.md` in every folder of a file domain, so
+    /// the knowledge navigates statically without Crystalline. Absent means
+    /// on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files: Option<bool>,
 }
 
 /// Service configuration.

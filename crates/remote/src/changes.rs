@@ -80,6 +80,9 @@ pub struct LocalChanges {
 ///
 /// - dot-files and dot-directories are skipped at any depth; the domain root
 ///   itself is never pruned, even if its own name starts with a dot.
+/// - the OKF reserved filenames (`index.md`, `log.md`) are skipped at any
+///   depth: the directory index is generated locally by whoever holds the
+///   files, so it is never shared.
 /// - every non-hidden file is included regardless of extension.
 /// - a file larger than [`MAX_SHARED_FILE_BYTES`] is reported in
 ///   `skipped_large` instead of being hashed or classified as a change.
@@ -112,7 +115,7 @@ pub fn detect_local_changes(
             continue;
         }
         let fname = entry.file_name().to_string_lossy();
-        if is_hidden(&fname) {
+        if is_hidden(&fname) || crystalline_core::is_reserved_file(&fname) {
             continue;
         }
 
@@ -232,6 +235,19 @@ fn is_hidden(name: &str) -> bool {
 /// before a blob is ever fetched for one).
 pub(crate) fn is_hidden_path(rel_path: &str) -> bool {
     rel_path.split('/').any(is_hidden)
+}
+
+/// The full "never travels with a domain" rule: a hidden path, or one of the
+/// OKF reserved filenames (`index.md`, `log.md`).
+///
+/// The reserved names are derived, not knowledge: Crystalline regenerates the
+/// directory index on every side that holds the files, so sharing one would
+/// put pure churn in a proposal and let a member whose working tree is a
+/// commit behind overwrite a listing that is already correct upstream. Both
+/// the walk here and every ingestion boundary apply this same rule, so a
+/// reserved file never lands in a base snapshot the walk cannot see again.
+pub(crate) fn is_excluded_path(rel_path: &str) -> bool {
+    is_hidden_path(rel_path) || crystalline_core::is_reserved_path(rel_path)
 }
 
 /// The forward-slash relative path of `path` under `root`.
@@ -420,6 +436,18 @@ mod tests {
             result.skipped_large,
             vec![("notes/huge.md".to_string(), oversized.len() as u64)]
         );
+    }
+
+    #[test]
+    fn is_excluded_path_covers_hidden_paths_and_the_okf_reserved_names() {
+        // A generated directory index never travels with a domain, at the root
+        // or anywhere below it; an ordinary engram beside it still does.
+        assert!(is_excluded_path("index.md"));
+        assert!(is_excluded_path("runbooks/index.md"));
+        assert!(is_excluded_path("runbooks/log.md"));
+        assert!(is_excluded_path(".github/workflows/ci.yml"));
+        assert!(!is_excluded_path("runbooks/restart.md"));
+        assert!(!is_excluded_path(".crystalline.yaml"));
     }
 
     #[test]

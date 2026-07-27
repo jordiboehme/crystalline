@@ -13,6 +13,7 @@ pub mod control;
 pub mod daemon;
 pub mod engine;
 pub mod harness_cli;
+mod index_files;
 pub mod instance;
 pub mod mcp;
 mod origin;
