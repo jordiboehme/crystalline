@@ -571,8 +571,26 @@ fn frontmatter_map(fm: &Frontmatter) -> IndexMap<String, YamlValue> {
     if let Some(d) = fm.last_verified {
         m.insert("last_verified".into(), date(d));
     }
+    if let Some(d) = fm.stale_after {
+        m.insert("stale_after".into(), date(d));
+    }
     if let Some(d) = fm.review_after {
         m.insert("review_after".into(), date(d));
+    }
+    if !fm.verified.is_empty() {
+        let entries = fm
+            .verified
+            .iter()
+            .map(|v| {
+                let mut inner = IndexMap::new();
+                inner.insert("by".to_string(), YamlValue::String(v.by.clone()));
+                if let Some(at) = v.at {
+                    inner.insert("at".to_string(), YamlValue::String(at.to_rfc3339()));
+                }
+                YamlValue::Mapping(inner)
+            })
+            .collect();
+        m.insert("verified".into(), YamlValue::Sequence(entries));
     }
     if let Some(g) = &fm.generated {
         let mut inner = IndexMap::new();

@@ -1,9 +1,10 @@
 //! The temporal write contract.
 //!
 //! A handful of frontmatter fields carry a date an agent or tool may set:
-//! `recorded_at`, `valid_from`, `valid_to`, `source_date`, `last_verified`
-//! and `review_after`. Every one is a plain ISO date (`YYYY-MM-DD`) and
-//! day-granular; there is no time-of-day component. Open-ended validity is
+//! `recorded_at`, `valid_from`, `valid_to`, `source_date`, `stale_after` (with
+//! its legacy spelling `review_after`) and the legacy `last_verified`. Every
+//! one is a plain ISO date (`YYYY-MM-DD`) and day-granular; there is no
+//! time-of-day component. Open-ended validity is
 //! never spelled out with a distant date, it is expressed by absence: an
 //! absent `valid_from` means the knowledge has always been valid and an
 //! absent `valid_to` means it is valid forever.
@@ -13,11 +14,12 @@
 //! [`DateFieldError`], drops an explicit null bound - other than on the
 //! required `recorded_at` - and a sentinel bound written by a foreign source,
 //! and promotes a valid date the parser parked in `extra` into its typed
-//! field.
+//! field. [`normalize_verified`] does the same for the shape of a `verified`
+//! entry, which is a trust record rather than a date.
 
 use chrono::{Datelike, NaiveDate};
 
-use crate::engram::Frontmatter;
+use crate::engram::{Frontmatter, Verified};
 use crate::import::{SENTINEL_FUTURE_YEAR, SENTINEL_PAST_YEAR};
 use crate::yaml::YamlValue;
 
@@ -31,6 +33,7 @@ pub const DATE_FIELDS: &[&str] = &[
     "valid_to",
     "source_date",
     "last_verified",
+    "stale_after",
     "review_after",
 ];
 
@@ -127,9 +130,43 @@ fn assign_date_field(fm: &mut Frontmatter, field: &str, date: NaiveDate) {
         "valid_to" => fm.valid_to = Some(date),
         "source_date" => fm.source_date = Some(date),
         "last_verified" => fm.last_verified = Some(date),
-        "review_after" => fm.review_after = Some(date),
+        // The legacy `review_after` spelling feeds the canonical field, so a
+        // date promoted out of `extra` lands where every consumer reads it.
+        "stale_after" | "review_after" => fm.stale_after = Some(date),
         _ => {}
     }
+}
+
+/// A `verified` value was set to something other than an OKF `{ by, at }` entry
+/// or a list of them.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "verified must be a {{ by, at }} entry or a list of them, got {value}; `by` names the actor and `at` is an RFC 3339 instant"
+)]
+pub struct VerifiedFieldError {
+    /// The offending value, rendered as [`describe`] renders it.
+    pub value: String,
+}
+
+/// Normalize the `verified` field of `fm` in place: a well-formed value the
+/// parser parked in `extra` (a bare `{ by, at }` mapping or a list of them) is
+/// promoted into the typed field and removed from `extra`, and anything else is
+/// a [`VerifiedFieldError`].
+///
+/// This is the shape contract for a `verified` a caller supplies as metadata,
+/// the counterpart of [`normalize_temporal_fields`] for the date keys: a write
+/// carrying a malformed verification is rejected rather than stored as a shape
+/// no OKF consumer can read.
+pub fn normalize_verified(fm: &mut Frontmatter) -> Result<(), VerifiedFieldError> {
+    let Some(value) = fm.extra.get("verified") else {
+        return Ok(());
+    };
+    let entries = Verified::parse_list(value).ok_or_else(|| VerifiedFieldError {
+        value: describe(value),
+    })?;
+    fm.extra.shift_remove("verified");
+    fm.verified = entries;
+    Ok(())
 }
 
 /// Render a YAML value for a human-readable message: a string is quoted, a
@@ -148,6 +185,8 @@ pub(crate) fn describe(value: &YamlValue) -> String {
 
 #[cfg(test)]
 mod tests {
+    use indexmap::IndexMap;
+
     use super::*;
 
     fn fm_with_extra(key: &str, value: YamlValue) -> Frontmatter {
@@ -250,6 +289,51 @@ mod tests {
             fm.extra.get("author"),
             Some(&YamlValue::String("Ada".to_string()))
         );
+    }
+
+    #[test]
+    fn a_legacy_review_after_is_promoted_into_stale_after() {
+        // The legacy spelling supplied as metadata lands in the canonical
+        // field, so the write emits `stale_after` and every consumer sees it.
+        let mut fm = fm_with_extra("review_after", YamlValue::String("2026-12-01".to_string()));
+        let dropped = normalize_temporal_fields(&mut fm).unwrap();
+        assert!(dropped.is_empty());
+        assert_eq!(fm.stale_after, NaiveDate::from_ymd_opt(2026, 12, 1));
+        assert!(fm.review_after.is_none());
+        assert!(!fm.extra.contains_key("review_after"));
+    }
+
+    #[test]
+    fn a_well_formed_verified_is_promoted_and_a_malformed_one_is_rejected() {
+        let entry = |by: &str| {
+            let mut m = IndexMap::new();
+            m.insert("by".to_string(), YamlValue::String(by.to_string()));
+            m.insert(
+                "at".to_string(),
+                YamlValue::String("2026-07-27T09:15:00+00:00".to_string()),
+            );
+            YamlValue::Mapping(m)
+        };
+
+        // A bare mapping is one entry, a list is many.
+        let mut fm = fm_with_extra("verified", entry("human:jordi"));
+        normalize_verified(&mut fm).unwrap();
+        assert_eq!(fm.verified.len(), 1);
+        assert_eq!(fm.verified[0].by, "human:jordi");
+        assert!(!fm.extra.contains_key("verified"));
+
+        let mut fm = fm_with_extra(
+            "verified",
+            YamlValue::Sequence(vec![entry("human:jordi"), entry("claude-code/1.0.5")]),
+        );
+        normalize_verified(&mut fm).unwrap();
+        assert_eq!(fm.verified.len(), 2);
+
+        // A bare date is the legacy shape, not a verification entry.
+        let mut fm = fm_with_extra("verified", YamlValue::String("2026-07-27".to_string()));
+        let err = normalize_verified(&mut fm).unwrap_err();
+        assert_eq!(err.value, "'2026-07-27'");
+        assert!(fm.verified.is_empty());
     }
 
     #[test]

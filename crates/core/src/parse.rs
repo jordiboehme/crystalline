@@ -16,7 +16,8 @@ use chrono::{DateTime, FixedOffset, NaiveDate};
 use indexmap::IndexMap;
 
 use crate::engram::{
-    Engram, Frontmatter, Generated, Heading, LinkTarget, Observation, Relation, SchemaDef, WikiLink,
+    Engram, Frontmatter, Generated, Heading, LinkTarget, Observation, Relation, SchemaDef,
+    Verified, WikiLink,
 };
 use crate::yaml::YamlValue;
 
@@ -212,7 +213,9 @@ fn parse_frontmatter(raw: &str) -> Result<Frontmatter, ParseError> {
             "valid_from" => set_date(&mut fm.valid_from, &mut extra, &key, value),
             "valid_to" => set_date(&mut fm.valid_to, &mut extra, &key, value),
             "source_date" => set_date(&mut fm.source_date, &mut extra, &key, value),
+            "verified" => set_verified(&mut fm.verified, &mut extra, &key, value),
             "last_verified" => set_date(&mut fm.last_verified, &mut extra, &key, value),
+            "stale_after" => set_date(&mut fm.stale_after, &mut extra, &key, value),
             "review_after" => set_date(&mut fm.review_after, &mut extra, &key, value),
             "timestamp" => set_timestamp(&mut fm.timestamp, &mut extra, &key, value),
             "generated" => set_generated(&mut fm.generated, &mut extra, &key, value),
@@ -347,6 +350,26 @@ fn set_generated(
         }
     }
     extra.insert(key.to_string(), YamlValue::from_backend(value));
+}
+
+/// Parse the OKF v0.2 `verified` family: a list of `{ by, at }` entries, with a
+/// bare mapping read as a one-element list per §11. A value that is not a
+/// well-formed entry or list of entries is kept verbatim in `extra` instead of
+/// being silently reshaped; verify flags it later, exactly as it does a
+/// malformed `generated`.
+fn set_verified(
+    field: &mut Vec<Verified>,
+    extra: &mut IndexMap<String, YamlValue>,
+    key: &str,
+    value: serde_yaml_ng::Value,
+) {
+    let yaml = YamlValue::from_backend(value);
+    match Verified::parse_list(&yaml) {
+        Some(entries) => *field = entries,
+        None => {
+            extra.insert(key.to_string(), yaml);
+        }
+    }
 }
 
 fn to_indexmap(value: serde_yaml_ng::Value) -> IndexMap<String, YamlValue> {

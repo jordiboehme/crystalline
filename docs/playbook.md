@@ -418,7 +418,7 @@ to
 
 An engram is what is true now, so a changed value is replaced where it stands, not
 stapled on as a dated `## Update` note. When you have only re-checked a source and
-nothing changed, that is one frontmatter field, `last_verified: <date>`, kept
+nothing changed, that is one frontmatter field, `verified: { by, at }`, kept
 current - never a heading.
 
 The test is simple: does the new fact make the old one false going forward? A
@@ -568,7 +568,8 @@ knowledge is worth the review.
 
 Recommended `status` values (guidance, not enforced): `current`, `implemented`,
 `draft`, `proposed`, `idea`, `poc`, `deprecated`, `superseded`, `archived`,
-`legacy`.
+`legacy`. `stable` means the same as `current` - it is the Open Knowledge Format
+word for that state, so both are recommended.
 
 Observation categories: `- [decision]`, `- [fact]`, `- [pattern]`, `-
 [gotcha]`, `- [convention]`, `- [lesson]`, `- [risk]`, `- [insight]`, `-
@@ -579,7 +580,8 @@ Relation syntax: `- rel_type [[Other Engram]]`, or quote a multi-word type,
 `- "relates to" [[Other Engram]]`. Aliases in a MANIFEST are `- old -> canonical`.
 
 Temporal rules: no `valid_from` means always valid, no `valid_to` means valid
-forever. Set a bound only when validity is genuinely limited, as a plain ISO date
+forever. `stale_after` (legacy spelling `review_after`) says when the knowledge
+is due a re-check, and `verified: { by, at }` records who last checked it. Set a bound only when validity is genuinely limited, as a plain ISO date
 (`YYYY-MM-DD`). Never write a sentinel far-future date to mean forever - absence
 already means it.
 

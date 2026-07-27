@@ -18,7 +18,9 @@ frontmatter:
   description: ~
   resource: ~
   source_date: ~
+  verified: []
   last_verified: ~
+  stale_after: ~
   review_after: ~
   temporal_confidence: ~
   schema_def: ~

@@ -9,10 +9,10 @@
 //! re-emission, so non-canonical files keep every untouched byte. Sections are
 //! addressed by heading path such as `## API > ### Auth`.
 
-use chrono::{DateTime, FixedOffset};
+use chrono::{DateTime, FixedOffset, NaiveDate};
 use serde_yaml_ng::{Mapping, Value};
 
-use crate::engram::{Engram, Frontmatter, Generated, SchemaDef};
+use crate::engram::{Engram, Frontmatter, Generated, SchemaDef, Verified};
 use crate::parse::{locate, parse_heading};
 
 /// The stand-in scalar the `generated` key carries through YAML serialization,
@@ -21,6 +21,11 @@ use crate::parse::{locate, parse_heading};
 /// replace it as a single line; the token is deliberately plain ASCII so
 /// serialization never wraps it in quotes.
 const GENERATED_PLACEHOLDER: &str = "crystalline-generated-placeholder";
+
+/// The stand-in scalar the `verified` key carries through YAML serialization,
+/// swapped for the flow form afterwards for the same reason as
+/// [`GENERATED_PLACEHOLDER`]: every entry stays on one line.
+const VERIFIED_PLACEHOLDER: &str = "crystalline-verified-placeholder";
 
 /// An error from a section-addressed editor.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -48,6 +53,15 @@ pub fn emit_engram(engram: &Engram) -> String {
         ),
         None => yaml,
     };
+    let yaml = if engram.frontmatter.verified.is_empty() {
+        yaml
+    } else {
+        yaml.replacen(
+            &format!("verified: {VERIFIED_PLACEHOLDER}"),
+            &verified_block(&engram.frontmatter.verified),
+            1,
+        )
+    };
     format!("---\n{}---\n{}", yaml, engram.body)
 }
 
@@ -58,6 +72,31 @@ pub fn emit_engram(engram: &Engram) -> String {
 fn generated_flow(g: &Generated) -> String {
     let mut out = format!("generated: {{ by: {}", flow_scalar(&g.by));
     if let Some(at) = g.at {
+        out.push_str(&format!(", at: {}", flow_scalar(&at.to_rfc3339())));
+    }
+    out.push_str(" }");
+    out
+}
+
+/// Render a whole `verified` frontmatter block, key included. A single entry
+/// stays on the key's own line, exactly like `generated`; several entries emit
+/// as a block sequence with one flow mapping per line, so the OKF list form
+/// stays as readable and as line-editable as the single form.
+fn verified_block(entries: &[Verified]) -> String {
+    if let [only] = entries {
+        return format!("verified: {}", verified_flow(only));
+    }
+    let mut out = String::from("verified:");
+    for entry in entries {
+        out.push_str(&format!("\n- {}", verified_flow(entry)));
+    }
+    out
+}
+
+/// Render one `verified` entry as an OKF flow mapping, without the key.
+fn verified_flow(v: &Verified) -> String {
+    let mut out = format!("{{ by: {}", flow_scalar(&v.by));
+    if let Some(at) = v.at {
         out.push_str(&format!(", at: {}", flow_scalar(&at.to_rfc3339())));
     }
     out.push_str(" }");
@@ -132,9 +171,22 @@ fn frontmatter_mapping(fm: &Frontmatter) -> Mapping {
             Value::String(d.format("%Y-%m-%d").to_string()),
         );
     }
+    // `verified` takes the canonical slot the legacy `last_verified` held and
+    // `stale_after` the one `review_after` held, so a file still carrying only
+    // a legacy key keeps emitting it in exactly that place and round-trips byte
+    // for byte until an edit migrates it.
+    if !fm.verified.is_empty() {
+        put("verified", Value::String(VERIFIED_PLACEHOLDER.to_string()));
+    }
     if let Some(d) = fm.last_verified {
         put(
             "last_verified",
+            Value::String(d.format("%Y-%m-%d").to_string()),
+        );
+    }
+    if let Some(d) = fm.stale_after {
+        put(
+            "stale_after",
             Value::String(d.format("%Y-%m-%d").to_string()),
         );
     }
@@ -308,6 +360,18 @@ pub fn touch_generated(source: &str, actor: &str, now: DateTime<FixedOffset>) ->
         at: Some(now),
     });
     set_frontmatter_line(source, &["generated", "timestamp"], line)
+}
+
+/// Set the staleness bound in the original source, leaving every other byte
+/// untouched.
+///
+/// An engram that still carries the legacy `review_after` key migrates here,
+/// lazily: that one line is replaced by the `stale_after` line, so a file only
+/// ever changes shape when it is actually edited and the frontmatter keeps its
+/// original order.
+pub fn set_stale_after(source: &str, date: NaiveDate) -> String {
+    let line = format!("stale_after: {}", date.format("%Y-%m-%d"));
+    set_frontmatter_line(source, &["stale_after", "review_after"], line)
 }
 
 fn format_scalar_line(key: &str, value: &str) -> String {

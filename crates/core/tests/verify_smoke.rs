@@ -148,6 +148,23 @@ fn a_timestamp_in_a_date_field_is_a_t003_error() {
 }
 
 #[test]
+fn check_temporal_reports_a_malformed_verified_entry() {
+    // An entry without a `by` actor cannot be read as an OKF verification, so
+    // it is flagged the same way a malformed `generated` block is.
+    let engram = parse_engram(
+        "---\ntype: engram\ntitle: Trusty\nstatus: current\nrecorded_at: 2026-01-01\ntimestamp: 2026-01-01T00:00:00+00:00\nverified:\n- at: 2026-07-27T09:15:00+00:00\n---\n\nBody.\n",
+    )
+    .unwrap();
+    let issues = verify::check_temporal(Path::new("trusty.md"), &engram);
+    let issue = issues
+        .iter()
+        .find(|i| i.rule == "T003")
+        .expect("T003 present");
+    assert_eq!(issue.severity, Severity::Error);
+    assert!(issue.message.contains("verified"), "{}", issue.message);
+}
+
+#[test]
 fn check_temporal_reports_timestamp_and_sentinel_together() {
     // `valid_from` carries a timestamp (T003) and `valid_to` a sentinel
     // far-future date (T008); the per-engram check surfaces both.
