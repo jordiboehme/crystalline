@@ -89,27 +89,83 @@ fn unique_schema() -> String {
     format!("cp_{}_{}", std::process::id(), n)
 }
 
+/// The failure signature of the one flake this harness has seen: a query
+/// that spills a sorter or a hash join asks the database engine for a
+/// scratch directory, which it creates fresh under the OS temp directory
+/// (`%TEMP%` on Windows) per spill. On a busy Windows runner that create can
+/// come back `permission denied` instead of succeeding, because a name a
+/// process just deleted stays delete-pending until the last handle on it
+/// closes and Windows answers a recreate of a delete-pending name with
+/// ACCESS_DENIED. It is transient, environmental and entirely outside this
+/// crate: nothing in the store or in a test's own tempdir is involved (every
+/// body here runs against an in-memory database).
+const TRANSIENT_TEMPDIR_FAILURE: &str = "I/O error (tempdir)";
+
+/// How many times a body is re-run after a [`TRANSIENT_TEMPDIR_FAILURE`],
+/// and how long to wait first: a delete-pending name clears as soon as the
+/// last handle closes, so a couple of short retries is plenty and a real
+/// failure still surfaces on the last attempt.
+const TRANSIENT_RETRIES: u32 = 3;
+const TRANSIENT_RETRY_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Runs one parity attempt, re-running it on a whole fresh store and
+/// tempdir when it failed on the transient scratch-directory create above.
+/// Every body is self-contained (its own tempdir, its own store), so a
+/// re-run is exactly the same test again; any other panic is re-raised
+/// unchanged, on the first attempt, with its original message.
+async fn run_attempt<F, Fut>(mut attempt: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    for remaining in (0..TRANSIENT_RETRIES).rev() {
+        let Err(join) = tokio::spawn(attempt()).await else {
+            return;
+        };
+        assert!(join.is_panic(), "the parity body was cancelled: {join}");
+        let panic = join.into_panic();
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        if remaining == 0 || !message.contains(TRANSIENT_TEMPDIR_FAILURE) {
+            std::panic::resume_unwind(panic);
+        }
+        eprintln!("note: retrying after a transient scratch-directory failure: {message}");
+        tokio::time::sleep(TRANSIENT_RETRY_WAIT).await;
+    }
+}
+
 /// Run a parity body against Turso (always) and Postgres (when configured).
 macro_rules! parity {
     ($name:ident, $body:path) => {
         #[tokio::test]
         async fn $name() {
-            {
+            run_attempt(|| async {
                 let store = TursoStore::open_in_memory().await.unwrap();
                 $body(&store).await;
-            }
+            })
+            .await;
             #[cfg(feature = "postgres")]
             {
                 if let Some(url) = pg_url() {
-                    let schema = unique_schema();
-                    let store = crystalline_index::PostgresStore::open_in_schema(&url, &schema)
-                        .await
-                        .expect("open the postgres test schema");
-                    $body(&store).await;
-                    store
-                        .drop_schema()
-                        .await
-                        .expect("drop the postgres test schema");
+                    run_attempt(|| {
+                        let url = url.clone();
+                        async move {
+                            let schema = unique_schema();
+                            let store =
+                                crystalline_index::PostgresStore::open_in_schema(&url, &schema)
+                                    .await
+                                    .expect("open the postgres test schema");
+                            $body(&store).await;
+                            store
+                                .drop_schema()
+                                .await
+                                .expect("drop the postgres test schema");
+                        }
+                    })
+                    .await;
                 }
             }
         }

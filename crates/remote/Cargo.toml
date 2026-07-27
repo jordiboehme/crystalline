@@ -32,3 +32,6 @@ walkdir = { workspace = true }
 [dev-dependencies]
 axum = { workspace = true }
 tempfile = { workspace = true }
+# `test-util` adds the paused clock the device flow's cadence tests run on;
+# a test-only feature on a dependency the crate already has.
+tokio = { workspace = true, features = ["test-util"] }
