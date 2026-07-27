@@ -5,9 +5,13 @@
 //! budget (bge accepts 512 tokens; the default budget of 450 leaves room for the
 //! special tokens and the title prepended to the first chunk). A fenced code
 //! block is kept intact as a single unit even when it contains blank lines, so a
-//! code sample is never cut in half. The first chunk gets the engram title and
-//! description prepended so a short engram still carries its heading into the
-//! vector space.
+//! code sample is never cut in half. A paragraph that exceeds the budget on its
+//! own is the one exception: it is hard-split into budget-sized pieces (a fence
+//! included, kept whole only up to the budget), because a body with no blank
+//! line would otherwise become a single chunk of unbounded size and every
+//! consumer downstream, the tokenizer first, would pay for it. The first chunk
+//! gets the engram title and description prepended so a short engram still
+//! carries its heading into the vector space.
 //!
 //! Each chunk carries a fingerprint `sha256(model_id + ":" + text)`. The sync
 //! engine hands the fingerprints to [`crate::Store::replace_chunks`], which
@@ -142,9 +146,10 @@ fn build_header(title: &str, description: Option<&str>) -> String {
     parts.join("\n\n")
 }
 
-/// Greedily pack consecutive paragraphs up to the token budget. A single
-/// paragraph larger than the budget becomes its own chunk (paragraphs are never
-/// split, so a fenced block stays whole).
+/// Greedily pack consecutive paragraphs up to the token budget. A paragraph
+/// that fits is never split, so a fenced block stays whole; one larger than the
+/// budget on its own is cut into budget-sized pieces first, so no chunk can
+/// exceed the budget however the body is written.
 fn pack(paragraphs: &[String], max_tokens: usize, count: &dyn Fn(&str) -> usize) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut current = String::new();
@@ -152,24 +157,135 @@ fn pack(paragraphs: &[String], max_tokens: usize, count: &dyn Fn(&str) -> usize)
 
     for p in paragraphs {
         let pt = count(p);
-        if !current.is_empty() && current_tokens + pt > max_tokens {
-            out.push(std::mem::take(&mut current));
-            current_tokens = 0;
+        // A paragraph within the budget takes the same path it always did; only
+        // an oversized one is cut, and only then is anything measured twice.
+        if pt <= max_tokens || max_tokens == 0 {
+            add_piece(
+                p,
+                pt,
+                max_tokens,
+                &mut out,
+                &mut current,
+                &mut current_tokens,
+            );
+            continue;
         }
-        if !current.is_empty() {
-            current.push_str("\n\n");
-        }
-        current.push_str(p);
-        current_tokens += pt;
-        if current_tokens >= max_tokens {
-            out.push(std::mem::take(&mut current));
-            current_tokens = 0;
+        for piece in split_to_budget(p, max_tokens, count) {
+            let piece_tokens = count(piece);
+            add_piece(
+                piece,
+                piece_tokens,
+                max_tokens,
+                &mut out,
+                &mut current,
+                &mut current_tokens,
+            );
         }
     }
     if !current.is_empty() {
         out.push(current);
     }
     out
+}
+
+/// Add one piece to the chunk being packed, flushing before it when it would
+/// overflow the budget and after it once the budget is reached.
+fn add_piece(
+    piece: &str,
+    piece_tokens: usize,
+    max_tokens: usize,
+    out: &mut Vec<String>,
+    current: &mut String,
+    current_tokens: &mut usize,
+) {
+    if !current.is_empty() && *current_tokens + piece_tokens > max_tokens {
+        out.push(std::mem::take(current));
+        *current_tokens = 0;
+    }
+    if !current.is_empty() {
+        current.push_str("\n\n");
+    }
+    current.push_str(piece);
+    *current_tokens += piece_tokens;
+    if *current_tokens >= max_tokens {
+        out.push(std::mem::take(current));
+        *current_tokens = 0;
+    }
+}
+
+/// Cut one paragraph into pieces that each fit the token budget. A paragraph
+/// within the budget is returned whole, so an ordinary body packs exactly as it
+/// did before the cap existed. Cuts land on char boundaries and prefer the last
+/// newline or space in the tail of a piece so words stay intact, and the pieces
+/// concatenate back to the input.
+fn split_to_budget<'a>(
+    text: &'a str,
+    max_tokens: usize,
+    count: &dyn Fn(&str) -> usize,
+) -> Vec<&'a str> {
+    if max_tokens == 0 || count(text) <= max_tokens {
+        return vec![text];
+    }
+    // Characters per token measured on this text, so both the built-in estimate
+    // and a real tokenizer land near the budget on the first cut. Only the
+    // candidate piece is measured after that: measuring the whole remainder on
+    // every cut would make splitting a huge paragraph quadratic.
+    let per_token = (text.chars().count() / count(text).max(1)).max(1);
+    let target_chars = max_tokens.saturating_mul(per_token).max(1);
+
+    let mut pieces: Vec<&str> = Vec::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        let mut take = target_chars;
+        let mut end = loop {
+            let end = char_boundary_at(rest, take);
+            if take <= 1 || count(&rest[..end]) <= max_tokens {
+                break end;
+            }
+            take = (take * 3 / 4).max(1);
+        };
+        if end == rest.len() {
+            pieces.push(rest);
+            break;
+        }
+        if let Some(cut) = whitespace_cut(&rest[..end]) {
+            end = cut;
+        }
+        let (head, tail) = rest.split_at(end);
+        pieces.push(head);
+        rest = tail;
+    }
+    pieces
+}
+
+/// The byte offset of the `chars`-th char boundary, or the end of the string.
+fn char_boundary_at(text: &str, chars: usize) -> usize {
+    text.char_indices()
+        .nth(chars)
+        .map(|(i, _)| i)
+        .unwrap_or(text.len())
+}
+
+/// A cut point just past the last newline (else the last space) in the final
+/// fifth of `head`, so a piece ends on a word rather than mid-word. `None` when
+/// the tail holds no whitespace to cut on. ASCII whitespace bytes never occur
+/// inside a multi-byte sequence, so the offset is always a char boundary.
+fn whitespace_cut(head: &str) -> Option<usize> {
+    let window = (head.len() / 5).max(1);
+    let bytes = head.as_bytes();
+    let mut newline: Option<usize> = None;
+    let mut space: Option<usize> = None;
+    for i in (head.len() - window..head.len()).rev() {
+        let b = bytes[i];
+        if b == b'\n' {
+            newline = Some(i + 1);
+            break;
+        }
+        if space.is_none() && b.is_ascii_whitespace() {
+            space = Some(i + 1);
+        }
+    }
+    newline.or(space).filter(|&cut| cut < head.len())
 }
 
 /// Split a body into paragraphs on blank lines, keeping fenced code blocks whole.

@@ -34,6 +34,13 @@ const HF_REPO: &str = "BAAI/bge-small-en-v1.5";
 const DIMS: usize = 384;
 /// The model's maximum input length in tokens.
 const MAX_INPUT_TOKENS: usize = 512;
+/// The hard character cap applied to every input before tokenization. The
+/// tokenizer materializes the full `Encoding` (ids, tokens, offsets and masks,
+/// tens of bytes per token) and only then truncates to [`MAX_INPUT_TOKENS`], so
+/// an oversized input costs memory proportional to its length. Six characters
+/// per token is well above any real ratio, so this never cuts a chunk the
+/// chunker produced; it only bounds a caller that skipped chunking.
+const MAX_INPUT_CHARS: usize = MAX_INPUT_TOKENS * 6;
 
 /// A locally hosted bge provider.
 pub struct LocalProvider {
@@ -77,7 +84,13 @@ impl EmbeddingProvider for LocalProvider {
             return Ok(Vec::new());
         }
         let inner = self.inner.clone();
-        let texts = texts.to_vec();
+        // Capped here, where the batch is first copied for the blocking task, so
+        // an oversized chunk row bounds every copy downstream. See
+        // MAX_INPUT_CHARS.
+        let texts: Vec<String> = texts
+            .iter()
+            .map(|t| cap_chars(t, MAX_INPUT_CHARS).to_string())
+            .collect();
         tokio::task::spawn_blocking(move || embed_texts(&inner, &texts))
             .await
             .map_err(|e| IndexError::Embedding(format!("embedding task failed: {e}")))?
@@ -315,10 +328,25 @@ fn build_bert(files: &ModelFiles) -> Result<Bert> {
     })
 }
 
+/// Truncate to at most `max_chars` characters on a char boundary.
+fn cap_chars(text: &str, max_chars: usize) -> &str {
+    match text.char_indices().nth(max_chars) {
+        Some((i, _)) => &text[..i],
+        None => text,
+    }
+}
+
 fn embed_texts(bert: &Bert, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+    // The last line of defense before `encode_batch`, a no-op on a batch the
+    // caller already capped. The batch is copied for `encode_batch` either way,
+    // so the cap costs nothing on top.
+    let inputs: Vec<String> = texts
+        .iter()
+        .map(|t| cap_chars(t, MAX_INPUT_CHARS).to_string())
+        .collect();
     let encodings = bert
         .tokenizer
-        .encode_batch(texts.to_vec(), true)
+        .encode_batch(inputs, true)
         .map_err(|e| IndexError::Embedding(format!("tokenizing: {e}")))?;
 
     let batch = encodings.len();
@@ -352,4 +380,24 @@ fn normalize_l2(v: &Tensor) -> candle_core::Result<Tensor> {
 fn wipe_model_dir(cache_dir: &Path) {
     let dir = cache_dir.join(format!("models--{}", HF_REPO.replace('/', "--")));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_INPUT_CHARS, cap_chars};
+
+    #[test]
+    fn cap_chars_bounds_input_on_a_char_boundary() {
+        // Short input passes through untouched.
+        assert_eq!(cap_chars("hello", MAX_INPUT_CHARS), "hello");
+        // A long input is cut to the character count, not the byte count, and
+        // never inside a multi-byte character.
+        let text = "aé漢".repeat(10);
+        let capped = cap_chars(&text, 5);
+        assert_eq!(capped.chars().count(), 5);
+        assert_eq!(capped, "aé漢aé");
+        // The cap is generous enough that no chunk-sized text is ever cut.
+        let chunk = "word ".repeat(crate::embed::DEFAULT_MAX_TOKENS);
+        assert_eq!(cap_chars(&chunk, MAX_INPUT_CHARS), chunk.as_str());
+    }
 }
