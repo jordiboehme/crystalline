@@ -12,6 +12,7 @@
 //! [`super::GitHubProvider::current_user`] instead of duplicating that
 //! request.
 
+use std::future::Future;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -240,23 +241,28 @@ pub async fn run_device_flow(
     client_id: &str,
     start: &DeviceFlowStart,
 ) -> Result<String, RemoteError> {
-    run_device_flow_with_backoff(auth_base, client_id, start, SLOW_DOWN_BACKOFF).await
+    poll_until_token(start, SLOW_DOWN_BACKOFF, move || {
+        poll_device_flow_once(auth_base, client_id, &start.device_code)
+    })
+    .await
 }
 
-/// The device flow loop behind [`run_device_flow`], with the slow-down
-/// backoff taken as a parameter instead of hardcoded, so the test suite can
-/// shrink it and keep its `slow_down` coverage sub-second without pausing
-/// the tokio clock (which races ahead of the real HTTP round-trips the
-/// mock-server tests make, once verified against this crate's suite).
-/// [`run_device_flow`] always calls this with the real
-/// [`SLOW_DOWN_BACKOFF`]; not meant to be called directly outside tests.
-#[doc(hidden)]
-pub async fn run_device_flow_with_backoff(
-    auth_base: &str,
-    client_id: &str,
+/// The waiting-and-backoff loop behind [`run_device_flow`], with the one
+/// poll taken as a parameter so the cadence (the initial interval, the
+/// `slow_down` backoff growth and the expiry deadline) can be tested on a
+/// paused tokio clock, without a socket or a real HTTP round-trip to race
+/// the auto-advanced time against. [`run_device_flow`] passes
+/// [`poll_device_flow_once`] and the real [`SLOW_DOWN_BACKOFF`], so the
+/// shipped flow is exactly this loop.
+async fn poll_until_token<P, F>(
     start: &DeviceFlowStart,
     slow_down_backoff: Duration,
-) -> Result<String, RemoteError> {
+    mut poll: P,
+) -> Result<String, RemoteError>
+where
+    P: FnMut() -> F,
+    F: Future<Output = Result<DevicePoll, RemoteError>>,
+{
     let started = tokio::time::Instant::now();
     let expires_in = Duration::from_secs(start.expires_in_secs);
     let mut interval = Duration::from_secs(start.interval_secs);
@@ -265,7 +271,7 @@ pub async fn run_device_flow_with_backoff(
         if started.elapsed() >= expires_in {
             return Err(RemoteError::AuthExpired);
         }
-        match poll_device_flow_once(auth_base, client_id, &start.device_code).await? {
+        match poll().await? {
             DevicePoll::Token(token) => return Ok(token),
             DevicePoll::Pending => {}
             DevicePoll::SlowDown => interval += slow_down_backoff,
@@ -317,7 +323,128 @@ async fn parse_auth_json<T: serde::de::DeserializeOwned>(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+
     use super::*;
+
+    /// A [`DeviceFlowStart`] with the polling cadence under test; the codes
+    /// and urls never matter to [`poll_until_token`], which only reads the
+    /// two timing fields.
+    fn start_with(interval_secs: u64, expires_in_secs: u64) -> DeviceFlowStart {
+        DeviceFlowStart {
+            device_code: "devicecode".to_string(),
+            user_code: "WDJB-MJHT".to_string(),
+            verification_url: "https://github.com/login/device".to_string(),
+            interval_secs,
+            expires_in_secs,
+        }
+    }
+
+    // The loop tests below run on a paused tokio clock, so every
+    // `sleep` resolves instantly and `Instant::now()` reports exactly the
+    // waits the loop asked for. Each records the virtual moment of every
+    // poll, which makes the assertion the interval SEQUENCE itself: no wall
+    // clock, no socket and no dependency on how loaded the machine is. The
+    // HTTP side of a poll is covered separately by the `poll_device_flow_once`
+    // tests in `tests/github_auth.rs`.
+
+    #[tokio::test(start_paused = true)]
+    async fn the_flow_polls_at_the_start_interval_until_a_token_arrives() {
+        let started = tokio::time::Instant::now();
+        let mut outcomes = VecDeque::from([
+            Ok(DevicePoll::Pending),
+            Ok(DevicePoll::Pending),
+            Ok(DevicePoll::Token("tok-final".to_string())),
+        ]);
+        let mut polled_at = Vec::new();
+        let start = start_with(5, 900);
+
+        let token = poll_until_token(&start, SLOW_DOWN_BACKOFF, || {
+            polled_at.push(started.elapsed());
+            std::future::ready(outcomes.pop_front().expect("one poll too many"))
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(token, "tok-final");
+        assert_eq!(
+            polled_at,
+            vec![
+                Duration::from_secs(5),
+                Duration::from_secs(10),
+                Duration::from_secs(15)
+            ],
+            "the loop waited the start interval before every poll"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_flow_grows_the_interval_on_every_slow_down() {
+        let started = tokio::time::Instant::now();
+        let mut outcomes = VecDeque::from([
+            Ok(DevicePoll::Pending),
+            Ok(DevicePoll::SlowDown),
+            Ok(DevicePoll::SlowDown),
+            Ok(DevicePoll::Token("tok-after-slowdown".to_string())),
+        ]);
+        let mut polled_at = Vec::new();
+        let start = start_with(5, 900);
+
+        let token = poll_until_token(&start, SLOW_DOWN_BACKOFF, || {
+            polled_at.push(started.elapsed());
+            std::future::ready(outcomes.pop_front().expect("one poll too many"))
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(token, "tok-after-slowdown");
+        // 5, then 5 again, then 10 once the first slow_down landed, then 15
+        // once the second did: five seconds added per slow_down.
+        assert_eq!(
+            polled_at,
+            vec![
+                Duration::from_secs(5),
+                Duration::from_secs(10),
+                Duration::from_secs(20),
+                Duration::from_secs(35)
+            ],
+            "each slow_down added the backoff to the interval"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_flow_reports_auth_expired_once_the_window_elapses() {
+        let started = tokio::time::Instant::now();
+        let mut polled_at = Vec::new();
+        let start = start_with(5, 12);
+
+        let err = poll_until_token(&start, SLOW_DOWN_BACKOFF, || {
+            polled_at.push(started.elapsed());
+            std::future::ready(Ok(DevicePoll::Pending))
+        })
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, RemoteError::AuthExpired), "{err:?}");
+        assert_eq!(
+            polled_at,
+            vec![Duration::from_secs(5), Duration::from_secs(10)],
+            "the wait that crossed the deadline expired instead of polling again"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failing_poll_ends_the_flow() {
+        let start = start_with(5, 900);
+
+        let err = poll_until_token(&start, SLOW_DOWN_BACKOFF, || {
+            std::future::ready(Err(RemoteError::Offline))
+        })
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, RemoteError::Offline), "{err:?}");
+    }
 
     #[test]
     fn auth_base_defaults_to_github_com_when_no_override_is_given() {

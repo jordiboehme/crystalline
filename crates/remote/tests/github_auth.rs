@@ -5,7 +5,6 @@
 //! never touches the real OS keychain.
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use axum::Json;
 use axum::Router;
@@ -14,8 +13,8 @@ use axum::http::HeaderMap;
 use axum::routing::{get, post};
 use crystalline_remote::RemoteError;
 use crystalline_remote::github::auth::{
-    DeviceFlowStart, DevicePoll, poll_device_flow_once, run_device_flow,
-    run_device_flow_with_backoff, start_device_flow, validate_token,
+    DeviceFlowStart, DevicePoll, poll_device_flow_once, run_device_flow, start_device_flow,
+    validate_token,
 };
 use tokio::net::TcpListener;
 
@@ -270,27 +269,30 @@ async fn poll_device_flow_once_maps_connection_refused_to_offline() {
 
 // --- run_device_flow ---------------------------------------------------------
 
-// These three tests keep `interval_secs: 0` so `run_device_flow`'s
-// between-poll sleeps cost no real wall time; the one test that also
-// exercises the `slow_down` backoff calls `run_device_flow_with_backoff`
-// with a near-zero backoff instead of the real, hardcoded five seconds, so
-// it stays sub-second too. A `#[tokio::test(start_paused = true)]` clock
-// was tried first, but the mock axum server and the client both run real
-// HTTP round-trips over loopback on the same runtime, and the auto-advanced
-// clock races ahead of those before they complete, turning two of the three
-// tests into spurious `RemoteError::Offline` failures.
+// One end-to-end test that the loop really drives the HTTP endpoint: it
+// polls repeatedly with the configured host, client id and device code
+// until the token arrives. The cadence itself (the start interval, the
+// `slow_down` backoff growth, the expiry deadline) is covered by the
+// paused-clock unit tests next to the loop in `github::auth`, so nothing
+// here races a wall-clock deadline: `interval_secs: 0` makes the waits
+// free and the expiry window is far larger than any round-trip a loaded
+// machine can produce. A paused clock cannot be used here, since the mock
+// axum server and the client run real loopback round-trips on the same
+// runtime and the auto-advanced clock fires the request timeout before they
+// complete.
 #[tokio::test]
-async fn run_device_flow_polls_until_a_token_arrives() {
-    let calls = Arc::new(Mutex::new(0u32));
+async fn run_device_flow_polls_the_endpoint_until_a_token_arrives() {
+    let seen = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+    let recorded = seen.clone();
 
     let app = Router::new().route(
         "/login/oauth/access_token",
-        post(move || {
-            let calls = calls.clone();
+        post(move |Json(body): Json<serde_json::Value>| {
+            let seen = seen.clone();
             async move {
-                let mut n = calls.lock().unwrap();
-                *n += 1;
-                if *n < 3 {
+                let mut seen = seen.lock().unwrap();
+                seen.push(body);
+                if seen.len() < 3 {
                     Json(serde_json::json!({"error": "authorization_pending"}))
                 } else {
                     Json(serde_json::json!({"access_token": "tok-final"}))
@@ -304,67 +306,18 @@ async fn run_device_flow_polls_until_a_token_arrives() {
         user_code: "WDJB-MJHT".to_string(),
         verification_url: "https://github.com/login/device".to_string(),
         interval_secs: 0,
-        expires_in_secs: 30,
+        expires_in_secs: 900,
     };
 
     let token = run_device_flow(&base, "client", &start).await.unwrap();
 
     assert_eq!(token, "tok-final");
-}
-
-#[tokio::test]
-async fn run_device_flow_backs_off_on_slow_down_then_succeeds() {
-    let calls = Arc::new(Mutex::new(0u32));
-
-    let app = Router::new().route(
-        "/login/oauth/access_token",
-        post(move || {
-            let calls = calls.clone();
-            async move {
-                let mut n = calls.lock().unwrap();
-                *n += 1;
-                match *n {
-                    1 => Json(serde_json::json!({"error": "authorization_pending"})),
-                    2 => Json(serde_json::json!({"error": "slow_down"})),
-                    _ => Json(serde_json::json!({"access_token": "tok-after-slowdown"})),
-                }
-            }
-        }),
-    );
-    let base = spawn(app).await;
-    let start = DeviceFlowStart {
-        device_code: "devicecode".to_string(),
-        user_code: "WDJB-MJHT".to_string(),
-        verification_url: "https://github.com/login/device".to_string(),
-        interval_secs: 0,
-        expires_in_secs: 30,
-    };
-
-    let token = run_device_flow_with_backoff(&base, "client", &start, Duration::from_millis(1))
-        .await
-        .unwrap();
-
-    assert_eq!(token, "tok-after-slowdown");
-}
-
-#[tokio::test]
-async fn run_device_flow_reports_auth_expired_once_the_window_elapses() {
-    let app = Router::new().route(
-        "/login/oauth/access_token",
-        post(|| async { Json(serde_json::json!({"error": "authorization_pending"})) }),
-    );
-    let base = spawn(app).await;
-    let start = DeviceFlowStart {
-        device_code: "devicecode".to_string(),
-        user_code: "WDJB-MJHT".to_string(),
-        verification_url: "https://github.com/login/device".to_string(),
-        interval_secs: 0,
-        expires_in_secs: 0,
-    };
-
-    let err = run_device_flow(&base, "client", &start).await.unwrap_err();
-
-    assert!(matches!(err, RemoteError::AuthExpired), "{err:?}");
+    let bodies = recorded.lock().unwrap();
+    assert_eq!(bodies.len(), 3, "it kept polling until the token arrived");
+    for body in bodies.iter() {
+        assert_eq!(body["client_id"], "client");
+        assert_eq!(body["device_code"], "devicecode");
+    }
 }
 
 // --- validate_token -----------------------------------------------------------
