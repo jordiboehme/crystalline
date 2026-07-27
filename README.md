@@ -171,6 +171,8 @@ Engrams written through Crystalline are indexed immediately; `crystalline sync` 
 
 Every MCP client is onboarded automatically: the crystalline server's instructions, returned when a client connects, carry a live routing block - one line per registered domain summarizing when to use it, plus the behavior rules (narrow question -> search that domain; broad question -> sweep all of them; writes always name a domain explicitly). The block names the exact crystalline tools each rule refers to (`search_engrams`, `write_engram` and the rest), so an agent with several MCP servers connected knows which tool on which server to call. Domain lists and file-domain MANIFESTs are read fresh for every new connection; virtual-domain routing lines follow the daemon's latest snapshot, refreshed on every stdio connection and on every local virtual write. Claude Desktop and any harness that shows the model its MCP server instructions need no further setup.
 
+The block is sized for clients that truncate server instructions: the intro and the behavior rules come first and always fit, and the domain lines that follow shrink to one bullet each, then to a single count line, rather than pushing the rules out of view. Nothing is lost either way, since `list_domains` with `include_routing=true` returns the whole index on demand.
+
 The same routing block is available outside MCP: `crystalline prompt system` renders it to stdout from every registered domain's `MANIFEST.md`, to feed to an agent as session context. Over MCP there is no workspace, so `prompt.rules` filters and repo-local `preferred_domains` apply only on this path - `crystalline prompt system --workspace .` scopes it to the current repository. `prompt` takes a subcommand naming the kind of prompt to generate: `system` for hook-driven harnesses, `connector` for the snippet below.
 
 The generic harness recipe: run `crystalline prompt system` at session start and inject its stdout as context before the agent does anything else. In Claude Code that is a `SessionStart` hook in `settings.json`, matched on `startup|clear|compact` so the routing block is re-injected after `/clear` and after a compaction as well as on a fresh start (a resumed session is deliberately excluded, since its transcript already carries the earlier routing block). [Get started](#get-started) covers `crystalline install`, which writes this hook for you; by hand it is:
@@ -197,10 +199,29 @@ Any harness with an equivalent session-start hook can run the same command the s
 A remote service or a chat harness runs no session hooks, and most of them never show the model an MCP server's instructions, so neither onboarding path above reaches the agent. Give it a standing instruction instead: paste this into the client's custom instructions and the agent onboards itself with one tool call at the start of every session.
 
 ```text
-This environment includes the Crystalline knowledge server over MCP. At the start of every session call its list_domains tool with include_routing set to true; the result is your onboarding: one routing line per knowledge domain plus the behavior rules for this server's tools. Follow it, search those domains before answering from memory and re-fetch the index mid-session with the same call whenever you need it again.
+This environment includes the Crystalline knowledge server over MCP. At the start of every session call its list_domains tool with include_routing set to true; the result is your onboarding: one routing line per domain plus the behavior rules for this server's tools. Follow it, search those domains before answering from memory and re-fetch it mid-session with the same call whenever you need it again.
 ```
 
 `crystalline prompt connector` prints the same snippet, ready to copy. The same text is also available in-client, with no copy-paste, as the `connector` MCP prompt; a harness that shows the model MCP prompts can insert the `onboarding` prompt directly instead, which carries the live routing block itself rather than the instruction to fetch it (see [Skills over MCP](#skills-over-mcp)).
+
+An agent built on the Messages API MCP connector can keep its context lean by deferring most of the tool surface: with `defer_loading` on, a tool is declared but its description and schema load only when the model searches for it. Defer everything by default and pin the three tools an agent needs before it can search for anything - `search_engrams`, `read_engram` and `list_domains`, the trio that carries session onboarding and recall:
+
+```json
+{
+  "mcp_toolset": {
+    "type": "mcp_toolset",
+    "mcp_server_name": "crystalline",
+    "default_config": { "defer_loading": true },
+    "configs": {
+      "search_engrams": { "defer_loading": false },
+      "read_engram": { "defer_loading": false },
+      "list_domains": { "defer_loading": false }
+    }
+  }
+}
+```
+
+Claude Code does this for you: it turns tool search on automatically once a session's MCP tool descriptions grow large, loading tool names plus each server's instructions up front and the rest on demand. The routing block is sized to survive that mode intact (see [Session onboarding](#session-onboarding)).
 
 ### The learning loop
 
