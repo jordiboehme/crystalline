@@ -1266,7 +1266,11 @@ impl Store for PostgresStore {
         Ok(rows.iter().map(outbound_ref_from_row).collect())
     }
 
-    async fn search(&self, query: &SearchQuery) -> Result<Page<SearchHit>> {
+    async fn search_with_candidate_cap(
+        &self,
+        query: &SearchQuery,
+        candidate_cap: usize,
+    ) -> Result<Page<SearchHit>> {
         // Compute the coverage snapshot for the semantic and hybrid modes (which
         // gate on embedding staleness) BEFORE acquiring the search connection:
         // embedding_coverage() acquires its own connection, and holding two
@@ -1289,7 +1293,14 @@ impl Store for PostgresStore {
             AliasMap::default()
         };
         let mut conn = self.acquire().await?;
-        search::run_search(conn.as_mut(), query, coverage.as_ref(), &aliases).await
+        search::run_search(
+            conn.as_mut(),
+            query,
+            coverage.as_ref(),
+            &aliases,
+            candidate_cap,
+        )
+        .await
     }
 
     async fn neighbors(&self, ids: &[EngramId], depth: u8) -> Result<GraphSlice> {

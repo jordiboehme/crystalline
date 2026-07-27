@@ -39,18 +39,30 @@ const SINGLE_SOURCE_PENALTY: f64 = 0.85;
 /// Run a search and return one page of hits plus the total match count. The
 /// `coverage` snapshot is supplied by the store for the semantic and hybrid modes
 /// (which gate on embedding staleness) and is `None` for the lexical modes.
+/// `candidate_cap` bounds the lexical prefilter; production passes
+/// [`crate::store::LEXICAL_CANDIDATE_CAP`].
 pub(super) async fn run_search(
     conn: &Connection,
     query: &SearchQuery,
     coverage: Option<&EmbeddingCoverage>,
     aliases: &AliasMap,
+    candidate_cap: usize,
 ) -> Result<Page<SearchHit>> {
     match query.mode {
         SearchMode::Semantic => {
             run_semantic(conn, query, require_coverage(coverage)?, aliases).await
         }
-        SearchMode::Hybrid => run_hybrid(conn, query, require_coverage(coverage)?, aliases).await,
-        _ => run_lexical(conn, query, aliases).await,
+        SearchMode::Hybrid => {
+            run_hybrid(
+                conn,
+                query,
+                require_coverage(coverage)?,
+                aliases,
+                candidate_cap,
+            )
+            .await
+        }
+        _ => run_lexical(conn, query, aliases, candidate_cap).await,
     }
 }
 
@@ -123,6 +135,7 @@ async fn run_lexical(
     conn: &Connection,
     query: &SearchQuery,
     aliases: &AliasMap,
+    candidate_cap: usize,
 ) -> Result<Page<SearchHit>> {
     let limit = if query.limit == 0 { 10 } else { query.limit };
     let page = query.page.max(1);
@@ -142,7 +155,7 @@ async fn run_lexical(
         return filter_only(conn, &where_sql, params, limit, page).await;
     }
 
-    let mut scored = scored_lexical(conn, query, &terms, aliases).await?;
+    let mut scored = scored_lexical(conn, query, &terms, aliases, candidate_cap).await?;
     let retired_weight = query.retired_weight.unwrap_or(DEFAULT_RETIRED_WEIGHT);
     for entry in &mut scored {
         entry.0 *= retired_factor(&entry.1.status, retired_weight);
@@ -167,11 +180,17 @@ async fn run_lexical(
 /// fade is applied by each of those callers exactly once, over this function's
 /// returned scores, never in here - applying it here would double-fade the
 /// hybrid path and distort its `max_text` normalization.
+///
+/// `candidate_cap` bounds how many candidate rows the prefilter loads: the query
+/// orders by engram id and takes at most that many, so a common term over a huge
+/// domain can never pull the whole matched corpus into memory. See
+/// [`crate::store::LEXICAL_CANDIDATE_CAP`] for what the cut means for ranking.
 async fn scored_lexical(
     conn: &Connection,
     query: &SearchQuery,
     terms: &[String],
     aliases: &AliasMap,
+    candidate_cap: usize,
 ) -> Result<Vec<(f64, Candidate)>> {
     let mut clauses: Vec<String> = Vec::new();
     let mut params: Vec<Value> = Vec::new();
@@ -201,13 +220,21 @@ async fn scored_lexical(
     let sql = format!(
         "SELECT e.id, d.name, e.permalink, e.title, e.engram_type, e.status, e.description, e.content, \
          CAST(json_extract(e.metadata, '$.salience') AS REAL) \
-         FROM engram e JOIN domain d ON d.id=e.domain_id {where_sql}"
+         FROM engram e JOIN domain d ON d.id=e.domain_id {where_sql} \
+         ORDER BY e.id LIMIT {candidate_cap}"
     );
     let rows = query_all(conn, &sql, params).await?;
 
+    // Consume the raw rows by value so each row's buffers are freed as its
+    // candidate is built: peak memory is one copy of the matched bytes in the
+    // candidates plus one lowered copy, never a third live copy in the rows.
+    // The lowered copy stays: snippets are cut from the original body and
+    // Unicode lowercasing can shift byte offsets, so scoring against a lowered
+    // copy is the only offset-safe way to keep snippets correct.
     let mut scored: Vec<(f64, Candidate)> = Vec::with_capacity(rows.len());
-    for r in &rows {
-        let mut c = Candidate::from_row(r);
+    for r in rows {
+        let mut c = Candidate::from_row(&r);
+        drop(r);
         c.lower();
         let score = c.score(terms);
         scored.push((score, c));
@@ -359,6 +386,7 @@ async fn run_hybrid(
     query: &SearchQuery,
     coverage: &EmbeddingCoverage,
     aliases: &AliasMap,
+    candidate_cap: usize,
 ) -> Result<Page<SearchHit>> {
     let qvec = query
         .query_embedding
@@ -381,7 +409,7 @@ async fn run_hybrid(
     let text_scored = if terms.is_empty() {
         Vec::new()
     } else {
-        scored_lexical(conn, query, &terms, aliases).await?
+        scored_lexical(conn, query, &terms, aliases, candidate_cap).await?
     };
     let mut sem = semantic_candidates(conn, query, qvec, active, dims, aliases).await?;
     sem.retain(|(sim, _)| *sim >= min_sim);

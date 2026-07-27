@@ -1060,7 +1060,11 @@ impl Store for TursoStore {
         Ok(rows.iter().map(outbound_ref_from_row).collect())
     }
 
-    async fn search(&self, query: &SearchQuery) -> Result<Page<SearchHit>> {
+    async fn search_with_candidate_cap(
+        &self,
+        query: &SearchQuery,
+        candidate_cap: usize,
+    ) -> Result<Page<SearchHit>> {
         // The semantic and hybrid modes gate on embedding staleness, which reads
         // the coverage snapshot; the cache makes that essentially free once
         // effective_mode has warmed it, and folds the old second aggregate scan
@@ -1078,7 +1082,14 @@ impl Store for TursoStore {
         } else {
             AliasMap::default()
         };
-        search::run_search(&self.conn, query, coverage.as_ref(), &aliases).await
+        search::run_search(
+            &self.conn,
+            query,
+            coverage.as_ref(),
+            &aliases,
+            candidate_cap,
+        )
+        .await
     }
 
     async fn neighbors(&self, ids: &[EngramId], depth: u8) -> Result<GraphSlice> {

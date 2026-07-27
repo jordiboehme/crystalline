@@ -3019,3 +3019,119 @@ fn metadata_filters_accept_a_json_encoded_object() {
         );
     }
 }
+
+/// The lexical candidate cap bounds how many LIKE matches the prefilter loads
+/// and ranks. Production uses `LEXICAL_CANDIDATE_CAP`; this drives the same code
+/// with a tiny injected cap over a corpus that exceeds it, so the boundary is
+/// exercised on a handful of engrams. The cut is by engram id, so which engrams
+/// land in the capped set is not asserted (the scan walks in filesystem order);
+/// what is asserted is that the cap holds, that the survivors are ranked
+/// correctly among themselves and that paging through them is consistent.
+async fn lexical_candidate_cap(store: &dyn Store) {
+    const CORPUS: usize = 12;
+    const CAP: usize = 5;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // Engram n mentions the term n+1 times, so a hit's score is recoverable from
+    // its permalink and any correctly ranked page is strictly descending in n.
+    for n in 0..CORPUS {
+        let body = std::iter::repeat_n("widgetterm", n + 1)
+            .collect::<Vec<_>>()
+            .join(" ");
+        write(
+            root,
+            &format!("e{n:02}.md"),
+            &engram(
+                &format!("Engram {n:02}"),
+                &format!("e{n:02}"),
+                "engram",
+                "",
+                &body,
+            ),
+        );
+    }
+    sync_domain(store, "d", root).await.unwrap();
+
+    /// The mention count encoded in a permalink like `e07`.
+    fn rank_key(permalink: &str) -> usize {
+        permalink.trim_start_matches('e').parse::<usize>().unwrap()
+    }
+
+    // Uncapped: every match is a candidate and the most-mentioning engram leads.
+    let all = store
+        .search(&SearchQuery {
+            limit: CORPUS,
+            ..SearchQuery::text("widgetterm")
+        })
+        .await
+        .unwrap();
+    assert_eq!(all.total, CORPUS, "no cap reached at the production value");
+    assert_eq!(all.items[0].permalink, format!("e{:02}", CORPUS - 1));
+
+    // Capped: the total and the returned set both stop at the cap.
+    let capped = store
+        .search_with_candidate_cap(
+            &SearchQuery {
+                limit: CORPUS,
+                ..SearchQuery::text("widgetterm")
+            },
+            CAP,
+        )
+        .await
+        .unwrap();
+    assert_eq!(capped.total, CAP, "the cap bounds the reported total");
+    assert_eq!(capped.items.len(), CAP);
+
+    // Ranking within the capped set is still by score, best first.
+    let keys: Vec<usize> = capped
+        .items
+        .iter()
+        .map(|h| rank_key(&h.permalink))
+        .collect();
+    assert!(
+        keys.windows(2).all(|w| w[0] > w[1]),
+        "the capped page is not ranked best first: {keys:?}"
+    );
+    assert!(
+        capped.items.windows(2).all(|w| w[0].score >= w[1].score),
+        "scores are not descending"
+    );
+
+    // The cut is deterministic: the same query yields the same candidates.
+    let again = store
+        .search_with_candidate_cap(
+            &SearchQuery {
+                limit: CORPUS,
+                ..SearchQuery::text("widgetterm")
+            },
+            CAP,
+        )
+        .await
+        .unwrap();
+    let again_keys: Vec<usize> = again.items.iter().map(|h| rank_key(&h.permalink)).collect();
+    assert_eq!(again_keys, keys, "the capped candidate set is not stable");
+
+    // Paging through the capped set walks the same ranking, page by page.
+    let mut paged: Vec<usize> = Vec::new();
+    for page in 1..=3 {
+        let p = store
+            .search_with_candidate_cap(
+                &SearchQuery {
+                    limit: 2,
+                    page,
+                    ..SearchQuery::text("widgetterm")
+                },
+                CAP,
+            )
+            .await
+            .unwrap();
+        assert_eq!(p.total, CAP, "every page reports the capped total");
+        paged.extend(p.items.iter().map(|h| rank_key(&h.permalink)));
+    }
+    assert_eq!(paged, keys, "paging does not reproduce the capped ranking");
+}
+parity!(
+    lexical_candidate_cap_bounds_and_ranks,
+    lexical_candidate_cap
+);
