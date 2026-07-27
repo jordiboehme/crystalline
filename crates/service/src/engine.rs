@@ -25,7 +25,7 @@ use crystalline_core::config::{
 };
 use crystalline_core::emit::{
     append_body, insert_after_section, insert_before_section, prepend_body,
-    remove_frontmatter_field, replace_section, touch_timestamp,
+    remove_frontmatter_field, replace_section, touch_generated,
 };
 use crystalline_core::schema::{self, Schema};
 use crystalline_core::{
@@ -56,6 +56,48 @@ use crate::settings;
 
 /// How many chunks are embedded per background batch.
 const EMBED_BATCH: usize = 16;
+
+/// The OKF actor recorded as `generated.by` when nothing else identifies the
+/// writer: no `identity.actor` setting and no client identity from the MCP
+/// handshake. Follows the spec's agent form, `name/version`.
+pub const DEFAULT_ACTOR: &str = "crystalline/mcp";
+
+/// The OKF actor a CLI-driven write records when `identity.actor` is unset.
+/// The CLI is an automated job from the knowledge's point of view, so it takes
+/// the spec's `process:name` form.
+pub const CLI_ACTOR: &str = "process:crystalline-cli";
+
+/// Normalize a client-supplied identity into an OKF actor token: whitespace
+/// runs collapse to a single hyphen, control characters and the flow-mapping
+/// punctuation that would need quoting are dropped and the result is capped, so
+/// a client that calls itself "Some Client (beta)" still yields a clean
+/// `generated.by`.
+fn sanitize_actor(raw: &str) -> String {
+    const MAX_CHARS: usize = 120;
+    let mut out = String::with_capacity(raw.len());
+    let mut kept = 0usize;
+    let mut pending_gap = false;
+    for c in raw.trim().chars() {
+        if kept >= MAX_CHARS {
+            break;
+        }
+        if c.is_whitespace() {
+            pending_gap = !out.is_empty();
+            continue;
+        }
+        if c.is_control() || matches!(c, '{' | '}' | '[' | ']' | ',' | '"' | '\'' | '\\') {
+            continue;
+        }
+        if pending_gap {
+            out.push('-');
+            kept += 1;
+            pending_gap = false;
+        }
+        out.push(c);
+        kept += 1;
+    }
+    out.trim_matches('-').to_string()
+}
 
 /// The default host-lock heartbeat interval, seconds. Overridable via
 /// `CRYSTALLINE_HEARTBEAT_SECS` (used to drive fast multi-instance verification).
@@ -705,6 +747,24 @@ impl Engine {
         self.config.read().unwrap().response_format()
     }
 
+    /// The OKF actor to record as `generated.by` for a write, resolved fresh
+    /// per call so a runtime `configure` of `identity.actor` applies from the
+    /// next write on.
+    ///
+    /// Resolution order: the `identity.actor` setting when set, then the
+    /// caller-supplied identity (`clientname/version` for an MCP client,
+    /// `process:crystalline-cli` for a CLI-driven write), then
+    /// [`DEFAULT_ACTOR`].
+    pub fn actor(&self, client: Option<&str>) -> String {
+        if let Some(configured) = self.config.read().unwrap().identity_actor() {
+            return configured.to_string();
+        }
+        client
+            .map(sanitize_actor)
+            .filter(|a| !a.is_empty())
+            .unwrap_or_else(|| DEFAULT_ACTOR.to_string())
+    }
+
     /// The active embedding model id.
     pub fn model_id(&self) -> &str {
         &self.model_id
@@ -1171,9 +1231,19 @@ impl Engine {
     /// virtual domain builds the markdown in memory and indexes it straight into
     /// the database, touching no filesystem.
     pub async fn write_engram(&self, p: &WriteParams) -> Result<Value> {
+        self.write_engram_as(p, None).await
+    }
+
+    /// [`Engine::write_engram`] with the writer's identity: `client` is the
+    /// caller's own idea of who is writing (an MCP client's
+    /// `clientname/version` from the initialize handshake, or the CLI's process
+    /// actor), which [`Engine::actor`] resolves against the `identity.actor`
+    /// setting before it lands in the engram's `generated.by`.
+    pub async fn write_engram_as(&self, p: &WriteParams, client: Option<&str>) -> Result<Value> {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
+        let actor = self.actor(client);
         let source = self.content_source(&p.domain)?;
         let engram_type = p
             .engram_type
@@ -1222,7 +1292,8 @@ impl Engine {
             &tags,
             &status,
             &today.format("%Y-%m-%d").to_string(),
-            &now.to_rfc3339(),
+            &actor,
+            now,
             p.metadata.as_ref(),
             &p.content,
         )?;
@@ -1408,9 +1479,18 @@ impl Engine {
     /// a compare-and-swap guard so a stale edit is refused rather than silently
     /// clobbering a concurrent change (see `expected_checksum`).
     pub async fn edit_engram(&self, p: &EditParams) -> Result<Value> {
+        self.edit_engram_as(p, None).await
+    }
+
+    /// [`Engine::edit_engram`] with the editor's identity, resolved by
+    /// [`Engine::actor`] and written into the engram's `generated` block. An
+    /// engram that still carries the legacy `timestamp` key migrates to
+    /// `generated` here, on its next edit.
+    pub async fn edit_engram_as(&self, p: &EditParams, client: Option<&str>) -> Result<Value> {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
+        let actor = self.actor(client);
         let (desc, source) = self.resolve(&p.identifier, Some(&p.domain)).await?;
 
         match &source {
@@ -1421,7 +1501,7 @@ impl Engine {
                     source,
                 })?;
                 let edited = self.apply_edit(&current, p, &desc.permalink)?;
-                let edited = touch_timestamp(&edited, now_offset());
+                let edited = touch_generated(&edited, &actor, now_offset());
                 let edited = Self::enforce_temporal(edited)?;
                 write_file(&abs, &edited)?;
                 let store = self.store.lock().await;
@@ -1450,7 +1530,7 @@ impl Engine {
                     .clone()
                     .unwrap_or_else(|| sha256_hex(current.as_bytes()));
                 let edited = self.apply_edit(&current, p, &desc.permalink)?;
-                let edited = touch_timestamp(&edited, now_offset());
+                let edited = touch_generated(&edited, &actor, now_offset());
                 let edited = Self::enforce_temporal(edited)?;
                 let stamp = virtual_stamp(&edited);
                 let store = self.store.lock().await;
@@ -1664,6 +1744,10 @@ impl Engine {
         }
 
         // Rewrite inbound bare links from other domains to the prefixed form.
+        // The linking engrams were not authored by whoever asked for the move,
+        // so their refreshed `generated.by` records Crystalline itself (or the
+        // configured `identity.actor`), not the moving client.
+        let actor = self.actor(None);
         let mut rewritten = 0usize;
         for r in inbound {
             if r.src_domain == dest_domain || r.to_target.contains(':') {
@@ -1680,7 +1764,8 @@ impl Engine {
                     if !text.contains(&needle) {
                         continue;
                     }
-                    let replaced = touch_timestamp(&text.replace(&needle, &prefixed), now_offset());
+                    let replaced =
+                        touch_generated(&text.replace(&needle, &prefixed), &actor, now_offset());
                     write_file(&linker_abs, &replaced)?;
                     let store = self.store.lock().await;
                     self.reindex_file(&*store, r.src_domain_id, &root, &r.src_path)
@@ -1696,7 +1781,8 @@ impl Engine {
                     if !text.contains(&needle) {
                         continue;
                     }
-                    let replaced = touch_timestamp(&text.replace(&needle, &prefixed), now_offset());
+                    let replaced =
+                        touch_generated(&text.replace(&needle, &prefixed), &actor, now_offset());
                     let stamp = virtual_stamp(&replaced);
                     let store = self.store.lock().await;
                     self.index_markdown(
@@ -1741,7 +1827,8 @@ impl Engine {
     /// across every engram that carries it, optionally scoped to one domain.
     /// Each affected file is rewritten string-surgically by
     /// [`crystalline_core::retag`]: only the tag tokens change, every other byte
-    /// (including the `timestamp`) is preserved, so a hygiene rename never
+    /// (including the `generated` provenance block) is preserved, so a hygiene
+    /// rename never
     /// reflows a file or looks like a fresh edit. Files are the source of truth,
     /// so each rewrite writes the file (or the virtual row) then reindexes it,
     /// which is where the index picks up the new tag identity.
@@ -6036,7 +6123,8 @@ fn build_markdown(
     tags: &[String],
     status: &str,
     recorded_at: &str,
-    timestamp: &str,
+    actor: &str,
+    now: DateTime<FixedOffset>,
     metadata: Option<&Value>,
     body: &str,
 ) -> Result<String> {
@@ -6049,7 +6137,10 @@ fn build_markdown(
         ..Frontmatter::default()
     };
     fm.recorded_at = chrono::NaiveDate::parse_from_str(recorded_at, "%Y-%m-%d").ok();
-    fm.timestamp = DateTime::parse_from_rfc3339(timestamp).ok();
+    fm.generated = Some(crystalline_core::Generated {
+        by: actor.to_string(),
+        at: Some(now),
+    });
     // Models routinely double-encode nested tool arguments, so an object
     // arriving as a JSON string is accepted by parsing it first.
     let decoded;
@@ -6093,7 +6184,14 @@ fn build_markdown(
 fn is_reserved_key(key: &str) -> bool {
     matches!(
         key,
-        "type" | "title" | "permalink" | "tags" | "status" | "recorded_at" | "timestamp"
+        "type"
+            | "title"
+            | "permalink"
+            | "tags"
+            | "status"
+            | "recorded_at"
+            | "timestamp"
+            | "generated"
     )
 }
 

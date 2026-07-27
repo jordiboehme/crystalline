@@ -223,6 +223,27 @@ use crystalline_core::config::ResponseFormat;
 use crate::engine::{ConfigureAction, Engine, EngineError, ProvisionAction};
 use crate::params::*;
 
+/// The connected client's identity in the OKF agent form `name/version`, read
+/// from the initialize handshake rmcp keeps on the peer.
+///
+/// The peer is per connection and the request context carries it into every
+/// tool call, so a write records who actually asked for it even when several
+/// HTTP sessions share one engine. `None` when the handshake carried no usable
+/// name; [`Engine::actor`] then falls back. A version of `0.0.0` (rmcp's
+/// stand-in for a client that sent none) is dropped rather than recorded.
+fn client_actor(ctx: &RequestContext<RoleServer>) -> Option<String> {
+    let info = ctx.peer.peer_info()?;
+    let name = info.client_info.name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let version = info.client_info.version.trim();
+    if version.is_empty() || version == "0.0.0" {
+        return Some(name.to_string());
+    }
+    Some(format!("{name}/{version}"))
+}
+
 /// The shared MCP server: one tool router over one engine. Cheap to clone; the
 /// HTTP transport builds one per session.
 #[derive(Clone)]
@@ -242,7 +263,7 @@ impl McpServer {
     #[tool(
         name = "write_engram",
         title = "Capture engram",
-        description = "Capture a new engram - a unit of knowledge - into a domain. Writes the markdown file and indexes it. Body bullets: '- [decision] we chose X #tag' become observations, '- rel_type [[Target]]' become relations. domain is required so an engram never lands in the wrong place. Pass folder to file the engram under a topic prefix: reuse the domain's existing layout (browse_domain shows it), start a subfolder when a topic cluster is forming and keep singletons at the root; the folder path becomes the permalink prefix build_context globs as crystalline://domain/folder/*. permalink, status, recorded_at and timestamp are filled in; valid_from/valid_to are never auto-set - absence means always valid; to bound validity pass them inside metadata as plain ISO dates (YYYY-MM-DD). Any other date format is rejected; a sentinel far-future valid_to and an explicit null are dropped, since absence already means valid forever. Recommended type values: engram, guide, decision, architecture, runbook, reference. Recommended status values (guidance, not enforced): current, implemented, draft, proposed, idea, poc, deprecated, superseded, archived, legacy. Of those, deprecated, superseded, archived and legacy are the recognized retirement set: a status inside it softly fades in search ranking, any other value ranks at full strength. Errors if the permalink exists unless overwrite is true, and refuses a title that would file the engram as the reserved index.md or log.md (Crystalline generates the folder index itself). The vocabulary tool lists tags already in use; reuse one before coining a new tag. Set an optional numeric salience metadata key (0-10) to mark exceptionally valuable knowledge; salient engrams are lifted in hybrid search ranking. Raise it later to elevate an engram that proved load-bearing.",
+        description = "Capture a new engram - a unit of knowledge - into a domain. Writes the markdown file and indexes it. Body bullets: '- [decision] we chose X #tag' become observations, '- rel_type [[Target]]' become relations. domain is required so an engram never lands in the wrong place. Pass folder to file the engram under a topic prefix: reuse the domain's existing layout (browse_domain shows it), start a subfolder when a topic cluster is forming and keep singletons at the root; the folder path becomes the permalink prefix build_context globs as crystalline://domain/folder/*. permalink, status, recorded_at and generated (who wrote it and when) are filled in; valid_from/valid_to are never auto-set - absence means always valid; to bound validity pass them inside metadata as plain ISO dates (YYYY-MM-DD). Any other date format is rejected; a sentinel far-future valid_to and an explicit null are dropped, since absence already means valid forever. Recommended type values: engram, guide, decision, architecture, runbook, reference. Recommended status values (guidance, not enforced): current, implemented, draft, proposed, idea, poc, deprecated, superseded, archived, legacy. Of those, deprecated, superseded, archived and legacy are the recognized retirement set: a status inside it softly fades in search ranking, any other value ranks at full strength. Errors if the permalink exists unless overwrite is true, and refuses a title that would file the engram as the reserved index.md or log.md (Crystalline generates the folder index itself). The vocabulary tool lists tags already in use; reuse one before coining a new tag. Set an optional numeric salience metadata key (0-10) to mark exceptionally valuable knowledge; salient engrams are lifted in hybrid search ranking. Raise it later to elevate an engram that proved load-bearing.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -253,9 +274,10 @@ impl McpServer {
     async fn write_engram(
         &self,
         Parameters(p): Parameters<WriteParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         self.engine
-            .write_engram(&p)
+            .write_engram_as(&p, client_actor(&ctx).as_deref())
             .await
             .map_err(to_error)
             .and_then(ok)
@@ -281,7 +303,7 @@ impl McpServer {
     #[tool(
         name = "edit_engram",
         title = "Edit engram",
-        description = "Refine an existing engram in place as understanding evolves. Sections are addressed by heading path such as '## API > ### Auth'; replace_section keeps deeper subsections unless include_subsections is set. operation is one of append, prepend, find_replace, replace_section, insert_before_section, insert_after_section. find_replace takes find_text and an optional expected_replacements guard that fails on a count mismatch. Pass expected_checksum (from read_engram) to guard a virtual-domain edit against a change since your read: a conflict is refused if it changed, so re-read and retry; omit it for last-write-wins. The timestamp is refreshed. Status values to reflect a changed lifecycle (recommended values: see write_engram). Temporal frontmatter fields (recorded_at, valid_from, valid_to, source_date, last_verified, review_after) must stay plain ISO dates (YYYY-MM-DD): an edit that leaves one malformed is rejected and a sentinel far-future valid_to or an explicit null is dropped, except recorded_at which is required and cannot be nulled.",
+        description = "Refine an existing engram in place as understanding evolves. Sections are addressed by heading path such as '## API > ### Auth'; replace_section keeps deeper subsections unless include_subsections is set. operation is one of append, prepend, find_replace, replace_section, insert_before_section, insert_after_section. find_replace takes find_text and an optional expected_replacements guard that fails on a count mismatch. Pass expected_checksum (from read_engram) to guard a virtual-domain edit against a change since your read: a conflict is refused if it changed, so re-read and retry; omit it for last-write-wins. The generated provenance block is refreshed with who edited it and when. Status values to reflect a changed lifecycle (recommended values: see write_engram). Temporal frontmatter fields (recorded_at, valid_from, valid_to, source_date, last_verified, review_after) must stay plain ISO dates (YYYY-MM-DD): an edit that leaves one malformed is rejected and a sentinel far-future valid_to or an explicit null is dropped, except recorded_at which is required and cannot be nulled.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -292,9 +314,10 @@ impl McpServer {
     async fn edit_engram(
         &self,
         Parameters(p): Parameters<EditParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         self.engine
-            .edit_engram(&p)
+            .edit_engram_as(&p, client_actor(&ctx).as_deref())
             .await
             .map_err(to_error)
             .and_then(ok)

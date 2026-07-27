@@ -90,6 +90,19 @@ pub(crate) fn check_engram(path: &Path, engram: &Engram, sink: &mut Sink) {
             None,
         );
     }
+    if let Some(raw) = fm.extra.get("generated") {
+        sink.emit(
+            path,
+            None,
+            "T003",
+            Severity::Error,
+            format!(
+                "field `generated` is not a mapping with a `by` actor ({})",
+                describe(raw)
+            ),
+            None,
+        );
+    }
 
     if let (Some(from), Some(to)) = (fm.valid_from, fm.valid_to)
         && from > to
@@ -125,13 +138,20 @@ pub(crate) fn check_engram(path: &Path, engram: &Engram, sink: &mut Sink) {
         }
     }
 
-    if fm.timestamp.is_none() && !fm.extra.contains_key("timestamp") {
+    // Write provenance is `generated` since OKF v0.2; the legacy `timestamp`
+    // key still satisfies the rule, so an engram written before the migration
+    // is not nagged about until something edits it.
+    let has_provenance = fm.generated.is_some()
+        || fm.extra.contains_key("generated")
+        || fm.timestamp.is_some()
+        || fm.extra.contains_key("timestamp");
+    if !has_provenance {
         sink.emit(
             path,
             None,
             "T006",
             Severity::Warning,
-            "missing `timestamp`",
+            "missing `generated`",
             None,
         );
     }

@@ -82,7 +82,12 @@ pub struct Frontmatter {
     pub valid_from: Option<NaiveDate>,
     /// End of the validity window; absent means valid forever.
     pub valid_to: Option<NaiveDate>,
-    /// Last write timestamp, RFC 3339 with offset.
+    /// Write provenance: who wrote the Engram last and when. The OKF v0.2
+    /// `generated` family, which supersedes the v0.1 `timestamp` key.
+    pub generated: Option<Generated>,
+    /// Last write timestamp, RFC 3339 with offset. The legacy OKF v0.1 key,
+    /// still read so an engram written before the `generated` migration keeps
+    /// its recency; new writes emit [`Frontmatter::generated`] instead.
     pub timestamp: Option<DateTime<FixedOffset>>,
     /// Short description; feeds search snippets.
     pub description: Option<String>,
@@ -100,6 +105,21 @@ pub struct Frontmatter {
     pub schema_def: Option<SchemaDef>,
     /// Unknown keys, preserved verbatim and in original order.
     pub extra: IndexMap<String, YamlValue>,
+}
+
+/// Write provenance, the OKF v0.2 `generated: { by, at }` mapping: the actor
+/// that produced this revision and when it did.
+///
+/// `by` follows the OKF actor convention: an agent is `name/version`, a person
+/// is `human:name` and an automated job is `process:name`. `at` is optional in
+/// the model so a hand-written `generated` block with only an actor still
+/// parses, but everything Crystalline writes carries both.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Generated {
+    /// The actor that wrote this revision.
+    pub by: String,
+    /// When it was written, RFC 3339 with offset.
+    pub at: Option<DateTime<FixedOffset>>,
 }
 
 /// The schema-defining frontmatter block of a `type: schema` Engram. The raw
@@ -197,6 +217,20 @@ pub struct Heading {
     pub text: String,
 }
 
+impl Frontmatter {
+    /// When this Engram was last written, for recency: `generated.at` when the
+    /// OKF v0.2 provenance block is present, falling back to the legacy
+    /// `timestamp` key otherwise (OKF v0.2 §13.1). Every recency consumer reads
+    /// this rather than either field directly, so a file that has not been
+    /// migrated yet ranks exactly as it did before.
+    pub fn written_at(&self) -> Option<DateTime<FixedOffset>> {
+        self.generated
+            .as_ref()
+            .and_then(|g| g.at)
+            .or(self.timestamp)
+    }
+}
+
 impl Engram {
     /// True when the frontmatter carries no representable field. Used by the
     /// emitter to decide whether to write a frontmatter block at all.
@@ -210,6 +244,7 @@ impl Engram {
             || f.recorded_at.is_some()
             || f.valid_from.is_some()
             || f.valid_to.is_some()
+            || f.generated.is_some()
             || f.timestamp.is_some()
             || f.description.is_some()
             || f.resource.is_some()

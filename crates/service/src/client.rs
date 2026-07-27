@@ -14,7 +14,7 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader, ReadBuf};
 
 use crate::daemon::{open_store, resolve_db};
-use crate::engine::{Engine, open_standalone};
+use crate::engine::{CLI_ACTOR, Engine, open_standalone};
 use crate::instance::{Connection, acquire_ownership, ensure_daemon, try_attach};
 use crate::mcp::McpServer;
 use crate::overlay;
@@ -1186,9 +1186,19 @@ pub(crate) async fn dispatch_engine(
     args: Value,
 ) -> anyhow::Result<Value> {
     let v = match tool {
-        "write_engram" => engine.write_engram(&decode::<WriteParams>(args)?).await?,
+        // A CLI-driven write is not an MCP client, so it identifies itself as
+        // the CLI process; `identity.actor` still wins when it is set.
+        "write_engram" => {
+            engine
+                .write_engram_as(&decode::<WriteParams>(args)?, Some(CLI_ACTOR))
+                .await?
+        }
         "read_engram" => engine.read_engram(&decode::<ReadParams>(args)?).await?,
-        "edit_engram" => engine.edit_engram(&decode::<EditParams>(args)?).await?,
+        "edit_engram" => {
+            engine
+                .edit_engram_as(&decode::<EditParams>(args)?, Some(CLI_ACTOR))
+                .await?
+        }
         "move_engram" => engine.move_engram(&decode::<MoveParams>(args)?).await?,
         "delete_engram" => engine.delete_engram(&decode::<DeleteParams>(args)?).await?,
         "search_engrams" => {

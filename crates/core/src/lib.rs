@@ -5,9 +5,11 @@
 //! `crystalline prompt system` can run without a service, a socket or a
 //! network connection.
 //!
-//! The format is Google OKF v0.1 (markdown plus YAML frontmatter, only
-//! `type` required, unknown keys preserved) extended with Crystalline
-//! observations, relations, cross-domain wikilinks and temporal metadata.
+//! The format is Google OKF v0.2 (markdown plus YAML frontmatter, only
+//! `type` required, unknown keys preserved, write provenance recorded as
+//! `generated: { by, at }` with the legacy v0.1 `timestamp` still read)
+//! extended with Crystalline observations, relations, cross-domain wikilinks
+//! and temporal metadata.
 
 /// The crate version, re-exported from the value Cargo embeds at build
 /// time so callers do not need to depend on `env!` directly.
@@ -34,8 +36,8 @@ pub mod yaml;
 pub use address::{CrystallineUrl, LinkResolver, LookupTable, Resolution, ResolvedRef, slugify};
 pub use emit::emit_engram;
 pub use engram::{
-    Engram, Frontmatter, Heading, LinkTarget, Observation, RECOMMENDED_STATUSES, RECOMMENDED_TYPES,
-    Relation, SchemaDef, WikiLink,
+    Engram, Frontmatter, Generated, Heading, LinkTarget, Observation, RECOMMENDED_STATUSES,
+    RECOMMENDED_TYPES, Relation, SchemaDef, WikiLink,
 };
 pub use harness::{HarnessKind, HarnessPaths, artifact_base, harness_paths};
 pub use index::{

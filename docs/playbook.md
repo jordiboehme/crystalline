@@ -138,7 +138,7 @@ tags:
 - clamps
 status: current
 recorded_at: 2026-07-19
-timestamp: 2026-07-19T09:12:00+00:00
+generated: { by: claude-code/1.0.5, at: 2026-07-19T09:12:00+00:00 }
 ---
 
 # Docking clamp cold-weather seating
@@ -154,8 +154,8 @@ Clamp 3 misreports its lock state when the aft bay is cold.
 The top-level `- [category] text #tag` bullets are observations, the atomic unit
 of an engram. Categories are free text but precise ones earn their keep (the
 appendix lists them); `type` and `status` have recommended values that are
-guidance, not a fixed enum. The stardate `recorded_at` and the `timestamp` are
-filled in for you.
+guidance, not a fixed enum. The stardate `recorded_at` and the `generated`
+block, which records who wrote the engram and when, are filled in for you.
 
 The agent proposes before it captures. Even unprompted it would raise the insight
 first - "I noticed clamp 3 misreads in the cold; should I record that in
@@ -182,7 +182,7 @@ tags:
 - firmware
 status: current
 recorded_at: 2026-07-19
-timestamp: 2026-07-19T11:47:00+00:00
+generated: { by: claude-code/1.0.5, at: 2026-07-19T11:47:00+00:00 }
 ---
 
 # Vent Driver Firmware
@@ -216,7 +216,7 @@ tags:
 - cooling
 status: current
 recorded_at: 2026-07-19
-timestamp: 2026-07-19T14:03:00+00:00
+generated: { by: claude-code/1.0.5, at: 2026-07-19T14:03:00+00:00 }
 ---
 
 # Coolant loop runs glycol mix B
@@ -327,7 +327,7 @@ status: current
 recorded_at: 2026-07-19
 source_date: 2026-06-30
 resource: https://vendor.example/notices/qx-114
-timestamp: 2026-07-19T16:20:00+00:00
+generated: { by: claude-code/1.0.5, at: 2026-07-19T16:20:00+00:00 }
 ---
 
 # Hyperdrive motivator recall QX-114
@@ -468,7 +468,7 @@ tags:
 - cooling
 status: current
 recorded_at: 2026-08-01
-timestamp: 2026-08-01T17:40:00+00:00
+generated: { by: claude-code/1.0.5, at: 2026-08-01T17:40:00+00:00 }
 ---
 
 # Coolant loop runs glycol mix C

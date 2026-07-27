@@ -4,7 +4,8 @@
 //! into canonical Engram shape: it ensures `type` is set (applying a legacy
 //! type mapping table and tagging the original value), backfills missing
 //! temporal metadata, drops sentinel open-ended dates, strips a leading
-//! source-tree permalink prefix and adds a missing `timestamp`. Every other
+//! source-tree permalink prefix and adds missing write provenance
+//! (`generated`). Every other
 //! frontmatter key and the body are preserved exactly: each file is read with
 //! [`crate::parse::parse_engram_lossless`], the typed frontmatter is edited in
 //! place and the result is written back with [`crate::emit::emit_engram`],
@@ -15,7 +16,7 @@
 //! registry lookup happens here, so the derived index never needs to exist
 //! for an import to run. Idempotency is a property of the rules themselves,
 //! not a marker: once a file carries an explicit `type`, temporal metadata, no
-//! sentinel dates, an already-stripped permalink and a `timestamp`, running
+//! sentinel dates, an already-stripped permalink and write provenance, running
 //! the importer again on it is a no-op.
 
 use std::collections::{HashMap, HashSet};
@@ -26,8 +27,12 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 use crate::emit::emit_engram;
-use crate::engram::Engram;
+use crate::engram::{Engram, Generated};
 use crate::parse::{ParseError, parse_engram, parse_engram_lossless};
+
+/// The OKF actor the importer records as the writer of the engrams it
+/// normalizes: an automated job, per the spec's `process:name` convention.
+pub const IMPORT_ACTOR: &str = "process:crystalline-import";
 
 /// The year at or above which a `valid_to` date is treated as the sentinel
 /// "valid forever" convention some source knowledge bases write literally
@@ -450,10 +455,18 @@ fn transform_engram(
         prefix_stripped = true;
     }
 
-    // e. Add `timestamp` only if absent.
-    if fm.timestamp.is_none() {
-        fm.timestamp = Some(now);
-        changes.push(format!("timestamp: missing -> `{}`", now.to_rfc3339()));
+    // e. Add write provenance only when the file carries none. A file that
+    // still has the legacy `timestamp` key is left alone: it already records
+    // when it was written, and its next edit migrates it to `generated`.
+    if fm.generated.is_none() && fm.timestamp.is_none() {
+        fm.generated = Some(Generated {
+            by: IMPORT_ACTOR.to_string(),
+            at: Some(now),
+        });
+        changes.push(format!(
+            "generated: missing -> `{{ by: {IMPORT_ACTOR}, at: {} }}`",
+            now.to_rfc3339()
+        ));
     }
 
     // f. Tags: `parse_engram_lossless` already normalizes a comma-separated
@@ -732,20 +745,36 @@ mod tests {
     }
 
     #[test]
-    fn timestamp_is_added_only_when_absent() {
+    fn generated_is_added_only_when_the_file_carries_no_provenance() {
         let r = t(
             "---\ntype: engram\ntitle: X\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nbody\n",
         );
-        assert!(r.engram.frontmatter.timestamp.is_some());
+        let g = r.engram.frontmatter.generated.as_ref().unwrap();
+        assert_eq!(g.by, IMPORT_ACTOR);
+        assert!(g.at.is_some());
+        assert!(r.changes.iter().any(|c| c.starts_with("generated")));
 
+        // A legacy `timestamp` already records when the file was written, so
+        // the import leaves it alone; its next edit migrates it.
         let r2 = t(
             "---\ntype: engram\ntitle: X\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-01-01\ntimestamp: 2020-01-01T00:00:00+00:00\n---\n\nbody\n",
         );
+        assert!(r2.engram.frontmatter.generated.is_none());
         assert_eq!(
             r2.engram.frontmatter.timestamp.unwrap().to_rfc3339(),
             "2020-01-01T00:00:00+00:00"
         );
-        assert!(!r2.changes.iter().any(|c| c.starts_with("timestamp")));
+        assert!(!r2.changes.iter().any(|c| c.starts_with("generated")));
+
+        // An existing `generated` block is equally untouched.
+        let r3 = t(
+            "---\ntype: engram\ntitle: X\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-01-01\ngenerated: { by: human:jordi, at: 2020-01-01T00:00:00+00:00 }\n---\n\nbody\n",
+        );
+        assert_eq!(
+            r3.engram.frontmatter.generated.as_ref().unwrap().by,
+            "human:jordi"
+        );
+        assert!(!r3.changes.iter().any(|c| c.starts_with("generated")));
     }
 
     #[test]
