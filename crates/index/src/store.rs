@@ -540,6 +540,17 @@ pub fn salience_prior(salience: Option<f64>, weight: f64) -> f64 {
     weight * (s / SALIENCE_SCALE).clamp(0.0, 1.0)
 }
 
+/// How many LIKE candidates the lexical prefilter loads before it ranks them in
+/// Rust, in both backends. The cut is deterministic: the candidate query orders
+/// by engram id, so the same corpus and the same query always yield the same
+/// candidate set. A term that matches more engrams than the cap is ranked within
+/// the first `LEXICAL_CANDIDATE_CAP` matches by id rather than over the whole
+/// match set, and the reported total is capped with it. The value is generous
+/// enough that a realistic corpus never reaches it; it exists so a filter-only
+/// or very common term over a huge domain cannot pull the whole matched corpus
+/// into memory at once.
+pub const LEXICAL_CANDIDATE_CAP: usize = 5000;
+
 /// Statuses that mark knowledge as retired. Exact lowercase match, the same
 /// stance as the canonical `e.status = 'current'` filter.
 const RETIRED_STATUSES: [&str; 4] = ["deprecated", "superseded", "archived", "legacy"];
@@ -1105,7 +1116,21 @@ pub trait Store: Send + Sync {
     async fn outbound_refs(&self, engram_id: EngramId) -> Result<Vec<OutboundRef>>;
 
     /// Run a search and return one page of hits plus the total match count.
-    async fn search(&self, query: &SearchQuery) -> Result<Page<SearchHit>>;
+    async fn search(&self, query: &SearchQuery) -> Result<Page<SearchHit>> {
+        self.search_with_candidate_cap(query, LEXICAL_CANDIDATE_CAP)
+            .await
+    }
+
+    /// [`Store::search`] with an explicit lexical candidate cap, so a test can
+    /// exercise the cap boundary over a handful of engrams. `candidate_cap` only
+    /// bounds how many LIKE candidates the lexical prefilter loads and ranks; it
+    /// never changes the shape of a hit. Production always goes through
+    /// [`Store::search`], which passes [`LEXICAL_CANDIDATE_CAP`].
+    async fn search_with_candidate_cap(
+        &self,
+        query: &SearchQuery,
+        candidate_cap: usize,
+    ) -> Result<Page<SearchHit>>;
 
     /// Return the neighborhood of a set of seed engrams up to `depth` hops
     /// (`1..=3`), following relations and links across domain boundaries.

@@ -307,6 +307,17 @@ impl RelayState {
             (Some("notifications/initialized"), _) => {
                 self.initialized_note = Some(line.to_string());
             }
+            // A cancellation settles its request as far as the client is
+            // concerned: the daemon may never answer it, so the entry is
+            // dropped here rather than waiting for a response that will not
+            // come. Without this a cancelled-and-unanswered request would keep
+            // its entry for the whole relay lifetime, and a restart would send
+            // an error answer for a request the client already abandoned.
+            (Some("notifications/cancelled"), _) => {
+                if let Some(id) = msg.get("params").and_then(|p| p.get("requestId")) {
+                    self.outstanding.remove(&id.to_string());
+                }
+            }
             (Some(_), Some(id)) => {
                 self.outstanding.insert(id.to_string(), id.clone());
             }
@@ -1305,6 +1316,37 @@ mod tests {
         assert!(
             relay.outstanding.contains_key("0"),
             "a server request never settles an id"
+        );
+    }
+
+    #[test]
+    fn relay_state_drops_a_cancelled_request() {
+        let mut relay = RelayState::default();
+        relay.note_client_line(r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}"#);
+        relay.note_client_line(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{}}"#);
+        relay.note_client_line(r#"{"jsonrpc":"2.0","id":"a2","method":"tools/call","params":{}}"#);
+        assert!(relay.outstanding.contains_key("1"));
+
+        relay.note_client_line(
+            r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1,"reason":"user"}}"#,
+        );
+        assert!(
+            !relay.outstanding.contains_key("1"),
+            "a cancelled request no longer waits for a response"
+        );
+        // A string id cancels the same way, and an unknown or malformed
+        // cancellation leaves the rest of the map alone.
+        relay.note_client_line(
+            r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"a2"}}"#,
+        );
+        assert!(!relay.outstanding.contains_key("\"a2\""));
+        relay.note_client_line(r#"{"jsonrpc":"2.0","method":"notifications/cancelled"}"#);
+        relay.note_client_line(
+            r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":42}}"#,
+        );
+        assert!(
+            relay.outstanding.contains_key("0"),
+            "the handshake id survives an unrelated cancellation"
         );
     }
 

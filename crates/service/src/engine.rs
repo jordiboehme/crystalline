@@ -4582,7 +4582,7 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
-        let lock = self.origin_lock(domain);
+        let lock = self.origin_lock_registered(domain)?;
         let _guard = lock.lock().await;
         let (spec, root, state_dir) = self.origin_spec_for_domain(domain)?;
         let provider = self.resolve_origin_provider()?;
@@ -4629,7 +4629,7 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
-        let lock = self.origin_lock(domain);
+        let lock = self.origin_lock_registered(domain)?;
         let _guard = lock.lock().await;
         let (_, root, state_dir) = self.origin_spec_for_domain(domain)?;
         let report = ops::discard(&root, &state_dir, proposal_number)?;
@@ -4672,7 +4672,7 @@ impl Engine {
             return Err(EngineError::ReadOnly);
         }
         let resolution = origin::resolution_from(keep, content)?;
-        let lock = self.origin_lock(domain);
+        let lock = self.origin_lock_registered(domain)?;
         let _guard = lock.lock().await;
         let (_, root, state_dir) = self.origin_spec_for_domain(domain)?;
         let report = ops::resolve(&root, &state_dir, path, resolution)?;
@@ -4762,8 +4762,22 @@ impl Engine {
         Ok((spec, root, state_dir))
     }
 
+    /// [`Engine::origin_lock`] for the single-domain operations whose next step
+    /// requires a registered domain: the name is checked first, so a lock entry
+    /// is never created for a name that is about to fail anyway. The error is
+    /// exactly the `UnknownDomain` [`Engine::origin_spec_for_domain`] would
+    /// raise a line later, so a registered name behaves identically and an
+    /// unregistered one answers the same, only without leaving an entry behind.
+    fn origin_lock_registered(&self, domain: &str) -> Result<Arc<tokio::sync::Mutex<()>>> {
+        self.domain_entry(domain)?;
+        Ok(self.origin_lock(domain))
+    }
+
     /// The per-domain lock serializing origin operations for one domain
-    /// name, created lazily on first use.
+    /// name, created lazily on first use. Callers that already hold a
+    /// `DomainEntry`, and `origin_add` (whose domain may not be registered
+    /// yet), use this directly; every other single-domain caller goes through
+    /// [`Engine::origin_lock_registered`].
     fn origin_lock(&self, domain: &str) -> Arc<tokio::sync::Mutex<()>> {
         let mut locks = self.origin_locks.lock().unwrap();
         locks
@@ -6188,5 +6202,49 @@ mod context_rank_tests {
         let first = context_rank(&forward, &seeds(&[1, 2]));
         let second = context_rank(&reversed, &seeds(&[1, 2]));
         assert_eq!(first, second);
+    }
+}
+
+#[cfg(test)]
+mod origin_lock_tests {
+    use super::*;
+    use crystalline_core::config::DomainEntry;
+    use crystalline_index::TursoStore;
+
+    /// An engine over an in-memory store whose config registers `domains`.
+    async fn engine_with_domains(domains: &[&str]) -> Engine {
+        let store = TursoStore::open_in_memory().await.unwrap();
+        let mut config = GlobalConfig::default();
+        for name in domains {
+            config.domains.insert(
+                (*name).to_string(),
+                DomainEntry::file(format!("/roots/{name}")),
+            );
+        }
+        Engine::new(Arc::new(Mutex::new(store)), config, None, None)
+    }
+
+    /// The single-domain origin operations take a caller-supplied name, so an
+    /// unregistered one must not leave a lock entry behind: the map is keyed by
+    /// name and never pruned, so every unchecked name would be retained for the
+    /// life of the process. The error is the same `UnknownDomain` the operation
+    /// answered before the check moved ahead of the lock.
+    #[tokio::test]
+    async fn an_unregistered_name_never_gets_a_lock_entry() {
+        let engine = engine_with_domains(&["known"]).await;
+
+        let err = engine.origin_lock_registered("nope").unwrap_err();
+        assert!(matches!(err, EngineError::UnknownDomain { .. }), "{err}");
+        assert!(
+            engine.origin_locks.lock().unwrap().is_empty(),
+            "a failing name must not be retained"
+        );
+
+        // A registered name behaves exactly as before: one lazily created entry,
+        // reused on the next call.
+        let first = engine.origin_lock_registered("known").unwrap();
+        let second = engine.origin_lock_registered("known").unwrap();
+        assert!(Arc::ptr_eq(&first, &second), "the lock is created once");
+        assert_eq!(engine.origin_locks.lock().unwrap().len(), 1);
     }
 }

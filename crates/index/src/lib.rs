@@ -37,9 +37,10 @@ pub use store::{
     ChunkJob, ChunkModelCount, DEFAULT_RETIRED_WEIGHT, DEFAULT_SALIENCE_WEIGHT, DomainHost,
     DomainId, DomainKind, DomainStats, EdgeKind, EmbeddingCoverage, EmbeddingRow, EngramDescriptor,
     EngramId, EngramRecord, EngramSummary, FileStamp, FilterOp, FtsMode, GraphEdge, GraphNode,
-    GraphSlice, HitKind, HostClaim, InboundRef, MetadataFilter, NamedCount, NewChunk, OutboundRef,
-    Page, RecentFilter, SearchHit, SearchMode, SearchQuery, Store, StoreInfo, StoredEngram,
-    TagAlias, TagCount, Vocabulary, parse_metadata_filters, retired_factor, salience_prior,
+    GraphSlice, HitKind, HostClaim, InboundRef, LEXICAL_CANDIDATE_CAP, MetadataFilter, NamedCount,
+    NewChunk, OutboundRef, Page, RecentFilter, SearchHit, SearchMode, SearchQuery, Store,
+    StoreInfo, StoredEngram, TagAlias, TagCount, Vocabulary, parse_metadata_filters,
+    retired_factor, salience_prior,
 };
 pub use sync::{
     DomainScan, SyncReport, apply_scan, apply_scan_with_slab, refresh_tag_aliases, scan_domain,

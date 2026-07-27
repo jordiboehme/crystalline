@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use crystalline_core::config::{self, GlobalConfig, HttpSetting};
@@ -462,6 +462,31 @@ enum WatchTick {
     Rescan,
 }
 
+/// How many watcher ticks may queue between debounce flushes. The notify
+/// callback is synchronous and must never block a notify thread, so it pushes
+/// with `try_send`; a burst larger than this sets the overflow flag instead of
+/// queueing without limit (see [`drain_overflow`]), which bounds what one churn
+/// storm during a slow sync can hold. Generous enough that an ordinary editor
+/// save storm never reaches it.
+const WATCH_TICK_CAPACITY: usize = 4096;
+
+/// Fold a set overflow flag into this flush: an overflowing burst means ticks
+/// were dropped and which paths they carried is unknown, exactly the situation
+/// the watcher's rescan signal already covers, so every watched domain escalates
+/// to a full rescan. The flag is cleared as it is read, so one overflow escalates
+/// one flush. Returns whether an escalation happened.
+fn drain_overflow(
+    overflow: &AtomicBool,
+    dirty: &mut HashMap<String, DirtyPaths>,
+    domains: &[(String, PathBuf)],
+) -> bool {
+    if !overflow.swap(false, Ordering::Relaxed) {
+        return false;
+    }
+    accumulate_tick(dirty, WatchTick::Rescan, domains);
+    true
+}
+
 /// Watch every domain root, debounce bursts by ~300ms and sync the touched
 /// domains, then schedule an embedding pass on the worker (falling back to an
 /// inline pass only if the worker channel is unwired or its receiver already
@@ -502,17 +527,24 @@ async fn run_watcher(
     mut new_roots: tokio::sync::mpsc::UnboundedReceiver<WatchEvent>,
     watches_ready: tokio::sync::oneshot::Sender<()>,
 ) -> anyhow::Result<()> {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<WatchTick>();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<WatchTick>(WATCH_TICK_CAPACITY);
+    // Set when a tick could not be queued. The callback never blocks and never
+    // drops a change silently: the flag escalates the next flush to a full
+    // rescan, so a full queue only costs coalescing, never a missed edit.
+    let overflow = Arc::new(AtomicBool::new(false));
+    let cb_overflow = overflow.clone();
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         if let Ok(event) = res {
             // A rescan/overflow notice (an inotify IN_Q_OVERFLOW, an fsevents
             // rescan) means events were dropped, so which paths changed is
             // unknown: signal a full rescan rather than trust a partial stream.
-            if event.need_rescan() {
-                let _ = tx.send(WatchTick::Rescan);
+            if event.need_rescan() && tx.try_send(WatchTick::Rescan).is_err() {
+                cb_overflow.store(true, Ordering::Relaxed);
             }
             for path in event.paths {
-                let _ = tx.send(WatchTick::Path(path));
+                if tx.try_send(WatchTick::Path(path)).is_err() {
+                    cb_overflow.store(true, Ordering::Relaxed);
+                }
             }
         }
     })?;
@@ -623,6 +655,14 @@ async fn run_watcher(
                     tokio::time::timeout(Duration::from_millis(300), rx.recv()).await
                 {
                     accumulate_tick(&mut dirty, tick, &domains);
+                }
+                // A burst that outran the channel escalates this flush to a full
+                // rescan of every watched domain, so nothing the callback could
+                // not queue is lost.
+                if drain_overflow(&overflow, &mut dirty, &domains) {
+                    tracing::warn!(
+                        "watcher event queue overflowed ({WATCH_TICK_CAPACITY} ticks); falling back to a full rescan"
+                    );
                 }
                 let touched = !dirty.is_empty();
                 for (name, work) in dirty {
@@ -1381,6 +1421,63 @@ mod tests {
         accumulate_tick(&mut dirty, WatchTick::Rescan, &domains);
         assert!(dirty["a"].full);
         assert!(dirty["b"].full);
+    }
+
+    // drain_overflow: a set flag escalates the flush to a full rescan of every
+    // watched domain and clears itself; an unset flag leaves the flush alone.
+
+    #[test]
+    fn overflow_escalates_the_flush_to_a_full_rescan() {
+        let domains = vec![
+            ("a".to_string(), PathBuf::from("/roots/a")),
+            ("b".to_string(), PathBuf::from("/roots/b")),
+        ];
+        let mut dirty: HashMap<String, DirtyPaths> = HashMap::new();
+        // One targeted path was queued before the burst overflowed.
+        accumulate_tick(
+            &mut dirty,
+            WatchTick::Path(PathBuf::from("/roots/a/note.md")),
+            &domains,
+        );
+        let overflow = AtomicBool::new(true);
+
+        assert!(drain_overflow(&overflow, &mut dirty, &domains));
+        assert!(dirty["a"].full, "the domain with queued paths goes full");
+        assert!(dirty["b"].full, "every watched domain goes full");
+        assert!(dirty["a"].paths.is_empty(), "targeted paths are dropped");
+        assert!(
+            !overflow.load(Ordering::Relaxed),
+            "the flag is cleared as it is read"
+        );
+
+        // A following flush with no new overflow stays targeted.
+        let mut next: HashMap<String, DirtyPaths> = HashMap::new();
+        accumulate_tick(
+            &mut next,
+            WatchTick::Path(PathBuf::from("/roots/a/note.md")),
+            &domains,
+        );
+        assert!(!drain_overflow(&overflow, &mut next, &domains));
+        assert!(!next["a"].full);
+        assert!(next["a"].paths.contains("note.md"));
+        assert!(!next.contains_key("b"), "untouched domains stay untouched");
+    }
+
+    #[test]
+    fn a_full_watch_channel_sets_the_overflow_flag() {
+        // The capacity is what the callback pushes into; a burst past it must set
+        // the flag rather than block a notify thread or drop a change silently.
+        let (tx, _rx) = tokio::sync::mpsc::channel::<WatchTick>(2);
+        let overflow = AtomicBool::new(false);
+        for i in 0..3 {
+            if tx
+                .try_send(WatchTick::Path(PathBuf::from(format!("/x/{i}.md"))))
+                .is_err()
+            {
+                overflow.store(true, Ordering::Relaxed);
+            }
+        }
+        assert!(overflow.load(Ordering::Relaxed), "the third push overflows");
     }
 
     #[test]
