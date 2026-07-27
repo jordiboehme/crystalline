@@ -76,6 +76,69 @@ fn a_generated_block_without_an_actor_is_kept_verbatim() {
 }
 
 #[test]
+fn trust_lifecycle_fields_are_typed() {
+    let e = parse_fixture("canonical/trust-lifecycle.md");
+    let fm = &e.frontmatter;
+    assert_eq!(fm.verified.len(), 2);
+    assert_eq!(fm.verified[0].by, "human:jordi");
+    assert_eq!(
+        fm.verified[1].at.unwrap().to_rfc3339(),
+        "2026-06-14T11:30:00+00:00"
+    );
+    // The newest entry wins whatever order the list is written in.
+    let latest = fm.latest_verified().expect("a verification is recorded");
+    assert_eq!(latest.by, Some("claude-code/1.0.5"));
+    assert_eq!(latest.at.to_rfc3339(), "2026-06-14T11:30:00+00:00");
+    assert_eq!(fm.stale_after.unwrap().to_string(), "2026-12-01");
+    assert_eq!(fm.stale_on().unwrap().to_string(), "2026-12-01");
+    assert!(fm.last_verified.is_none());
+    assert!(fm.review_after.is_none());
+    assert!(fm.extra.is_empty());
+}
+
+#[test]
+fn a_bare_verified_mapping_is_a_one_element_list() {
+    // OKF v0.2 §11 requires a bare mapping to read as a single-entry list.
+    let source = "---\ntype: engram\ntitle: X\nverified: { by: human:jordi, at: 2026-07-27T09:15:00+00:00 }\n---\n\nbody\n";
+    let e = parse_engram(source).unwrap();
+    let fm = &e.frontmatter;
+    assert_eq!(fm.verified.len(), 1);
+    assert_eq!(fm.verified[0].by, "human:jordi");
+    assert!(fm.extra.is_empty());
+}
+
+#[test]
+fn a_malformed_verified_entry_is_kept_verbatim() {
+    // A missing actor and an unparseable instant are both malformed, so the
+    // value is preserved as an unknown key rather than silently reshaped;
+    // verify reports it.
+    for value in [
+        "verified:\n- at: 2026-07-27T09:15:00+00:00",
+        "verified: { by: human:jordi, at: last tuesday }",
+    ] {
+        let source = format!("---\ntype: engram\ntitle: X\n{value}\n---\n\nbody\n");
+        let e = parse_engram(&source).unwrap();
+        assert!(e.frontmatter.verified.is_empty(), "{value}");
+        assert!(e.frontmatter.extra.contains_key("verified"), "{value}");
+        assert!(e.frontmatter.latest_verified().is_none(), "{value}");
+    }
+}
+
+#[test]
+fn the_legacy_trust_keys_feed_the_canonical_accessors() {
+    // An engram written before the migration keeps both its staleness bound
+    // and its verification date, read through the same accessors.
+    let e = parse_fixture("canonical/full-frontmatter.md");
+    let fm = &e.frontmatter;
+    assert!(fm.verified.is_empty());
+    assert!(fm.stale_after.is_none());
+    assert_eq!(fm.stale_on().unwrap().to_string(), "2026-08-01");
+    let latest = fm.latest_verified().expect("the legacy date still counts");
+    assert_eq!(latest.by, None);
+    assert_eq!(latest.at.to_rfc3339(), "2026-05-01T00:00:00+00:00");
+}
+
+#[test]
 fn unknown_keys_preserved_in_order() {
     let e = parse_fixture("canonical/unknown-keys-nested.md");
     let keys: Vec<&str> = e.frontmatter.extra.keys().map(String::as_str).collect();

@@ -7,7 +7,8 @@ use chrono::{DateTime, FixedOffset};
 use common::{fixtures_dir, read};
 use crystalline_core::emit::{
     append_body, insert_after_section, insert_before_section, prepend_body,
-    remove_frontmatter_field, replace_section, set_frontmatter_field, touch_generated,
+    remove_frontmatter_field, replace_section, set_frontmatter_field, set_stale_after,
+    touch_generated,
 };
 use crystalline_core::parse_engram;
 
@@ -172,6 +173,31 @@ body
         fm.written_at().unwrap().to_rfc3339(),
         "2026-07-02T10:00:00+00:00"
     );
+}
+
+#[test]
+fn set_stale_after_migrates_a_legacy_review_after_line_in_place() {
+    // A file written before the `stale_after` migration carries `review_after`.
+    // Setting the bound swaps that one line and leaves every other byte,
+    // including the frontmatter order, exactly where it was.
+    let source = read(&fixtures_dir().join("canonical/full-frontmatter.md"));
+    let date = chrono::NaiveDate::from_ymd_opt(2026, 12, 1).unwrap();
+    let out = set_stale_after(&source, date);
+    let expected = source.replace("review_after: 2026-08-01", "stale_after: 2026-12-01");
+    assert_eq!(out, expected);
+    let e = parse_engram(&out).unwrap();
+    assert!(e.frontmatter.review_after.is_none());
+    assert_eq!(e.frontmatter.stale_on().unwrap().to_string(), "2026-12-01");
+}
+
+#[test]
+fn set_stale_after_appends_when_neither_spelling_is_present() {
+    let source = read(&fixtures_dir().join("canonical/minimal-okf.md"));
+    let date = chrono::NaiveDate::from_ymd_opt(2026, 12, 1).unwrap();
+    let out = set_stale_after(&source, date);
+    assert!(out.contains("stale_after: 2026-12-01"), "{out}");
+    let e = parse_engram(&out).unwrap();
+    assert_eq!(e.frontmatter.stale_after.unwrap().to_string(), "2026-12-01");
 }
 
 #[test]

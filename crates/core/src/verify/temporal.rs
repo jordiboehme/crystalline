@@ -104,6 +104,20 @@ pub(crate) fn check_engram(path: &Path, engram: &Engram, sink: &mut Sink) {
         );
     }
 
+    if let Some(raw) = fm.extra.get("verified") {
+        sink.emit(
+            path,
+            None,
+            "T003",
+            Severity::Error,
+            format!(
+                "field `verified` is not a `{{ by, at }}` entry or a list of them ({})",
+                describe(raw)
+            ),
+            None,
+        );
+    }
+
     if let (Some(from), Some(to)) = (fm.valid_from, fm.valid_to)
         && from > to
     {

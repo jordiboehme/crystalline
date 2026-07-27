@@ -1623,7 +1623,8 @@ impl Engine {
     }
 
     /// Enforce the temporal write contract on post-edit markdown: reject a date
-    /// field left malformed and surgically drop sentinel or null bounds,
+    /// field or a `verified` entry left malformed and surgically drop sentinel
+    /// or null bounds,
     /// matching write_engram and import. Post-edit rather than per-argument
     /// because find_replace can rewrite frontmatter text directly. A parse
     /// failure passes through unchanged; indexing reports it.
@@ -1633,6 +1634,8 @@ impl Engine {
         };
         let mut fm = engram.frontmatter;
         let dropped = crystalline_core::temporal::normalize_temporal_fields(&mut fm)
+            .map_err(|e| EngineError::Invalid(e.to_string()))?;
+        crystalline_core::temporal::normalize_verified(&mut fm)
             .map_err(|e| EngineError::Invalid(e.to_string()))?;
         let mut out = edited;
         for field in dropped {
@@ -6114,7 +6117,9 @@ fn timeframe_cutoff(spec: &str) -> Option<String> {
 /// Build engram markdown with auto-filled frontmatter via the core emitter.
 /// Metadata date fields are validated against the temporal write contract: a
 /// valid ISO date lands in its typed frontmatter position, while a sentinel or
-/// null bound is dropped because open-ended validity is expressed by absence.
+/// null bound is dropped because open-ended validity is expressed by absence. A
+/// `verified` supplied as metadata is shape-checked the same way, so a
+/// verification is either recorded in the OKF form or the write is refused.
 #[allow(clippy::too_many_arguments)]
 fn build_markdown(
     engram_type: &str,
@@ -6166,6 +6171,8 @@ fn build_markdown(
     }
 
     crystalline_core::temporal::normalize_temporal_fields(&mut fm)
+        .map_err(|e| EngineError::Invalid(e.to_string()))?;
+    crystalline_core::temporal::normalize_verified(&mut fm)
         .map_err(|e| EngineError::Invalid(e.to_string()))?;
 
     let engram = Engram {

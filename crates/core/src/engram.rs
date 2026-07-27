@@ -27,8 +27,13 @@ pub const RECOMMENDED_TYPES: &[&str] = &[
 /// Recommended values for the `status` frontmatter field. Guidance only; the
 /// purpose of status is letting an agent tell an idea or draft apart from
 /// current fact, not taxonomy policing. Never used to reject an Engram.
+///
+/// `current` is what Crystalline writes and `stable` is the OKF v0.2 word for
+/// the same state (§5.4, where an absent status also means stable), so both are
+/// recommended and a foreign OKF bundle reads naturally without a rewrite.
 pub const RECOMMENDED_STATUSES: &[&str] = &[
     "current",
+    "stable",
     "implemented",
     "draft",
     "proposed",
@@ -95,9 +100,20 @@ pub struct Frontmatter {
     pub resource: Option<String>,
     /// Date the underlying source material carries.
     pub source_date: Option<NaiveDate>,
-    /// Date the knowledge was last verified.
+    /// The verification trail: who checked this knowledge and when. The OKF
+    /// v0.2 `verified` family, which supersedes the actorless `last_verified`
+    /// key. Empty when the Engram carries no verification.
+    pub verified: Vec<Verified>,
+    /// Date the knowledge was last verified. The legacy key, still read so an
+    /// Engram written before the `verified` migration keeps its trust record;
+    /// new verifications are recorded as [`Frontmatter::verified`] entries.
     pub last_verified: Option<NaiveDate>,
-    /// Date after which the knowledge should be reviewed.
+    /// Date at or after which the knowledge counts as stale. The OKF v0.2
+    /// `stale_after` family, which supersedes `review_after`.
+    pub stale_after: Option<NaiveDate>,
+    /// Date after which the knowledge should be reviewed. The legacy spelling
+    /// of [`Frontmatter::stale_after`], still read so an Engram written before
+    /// the migration keeps its staleness bound.
     pub review_after: Option<NaiveDate>,
     /// Whether temporal metadata was explicit or inferred.
     pub temporal_confidence: Option<String>,
@@ -120,6 +136,66 @@ pub struct Generated {
     pub by: String,
     /// When it was written, RFC 3339 with offset.
     pub at: Option<DateTime<FixedOffset>>,
+}
+
+/// One verification, the OKF v0.2 `verified` entry `{ by, at }`: the actor that
+/// checked this knowledge and when it did.
+///
+/// `by` follows the OKF actor convention, exactly like [`Generated::by`]. `at`
+/// is optional in the model so a hand-written entry naming only an actor still
+/// parses, but everything Crystalline writes carries both. A bare mapping in
+/// the frontmatter parses as a one-element list, as the spec requires.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Verified {
+    /// The actor that verified the knowledge.
+    pub by: String,
+    /// When it was verified, RFC 3339 with offset.
+    pub at: Option<DateTime<FixedOffset>>,
+}
+
+impl Verified {
+    /// Parse a `verified` frontmatter value into entries, accepting a bare
+    /// mapping as a one-element list (OKF v0.2 §11). Returns `None` when the
+    /// value is not a well-formed entry or list of entries: an entry needs a
+    /// non-empty `by`, and an `at` that is present must be a parseable RFC 3339
+    /// instant. A malformed value is kept verbatim instead, so nothing is lost
+    /// and verify can flag it.
+    pub fn parse_list(value: &YamlValue) -> Option<Vec<Verified>> {
+        match value {
+            YamlValue::Mapping(_) => Verified::parse_entry(value).map(|e| vec![e]),
+            YamlValue::Sequence(items) if !items.is_empty() => {
+                items.iter().map(Verified::parse_entry).collect()
+            }
+            _ => None,
+        }
+    }
+
+    fn parse_entry(value: &YamlValue) -> Option<Verified> {
+        let map = value.as_mapping()?;
+        let by = map.get("by")?.as_str()?.trim();
+        if by.is_empty() {
+            return None;
+        }
+        let at = match map.get("at") {
+            Some(raw) => Some(DateTime::parse_from_rfc3339(raw.as_str()?).ok()?),
+            None => None,
+        };
+        Some(Verified {
+            by: by.to_string(),
+            at,
+        })
+    }
+}
+
+/// The most recent verification recorded on an Engram: the actor when one is
+/// known and the instant it happened.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Verification<'a> {
+    /// The actor that verified the knowledge, absent for a legacy
+    /// `last_verified` date, which records no actor.
+    pub by: Option<&'a str>,
+    /// When the verification happened.
+    pub at: DateTime<FixedOffset>,
 }
 
 /// The schema-defining frontmatter block of a `type: schema` Engram. The raw
@@ -229,6 +305,34 @@ impl Frontmatter {
             .and_then(|g| g.at)
             .or(self.timestamp)
     }
+
+    /// The date at or after which this Engram counts as stale: `stale_after`,
+    /// falling back to the legacy `review_after` spelling. Every staleness
+    /// consumer reads this rather than either field directly, so a file that
+    /// has not been migrated yet behaves exactly as it did before.
+    pub fn stale_on(&self) -> Option<NaiveDate> {
+        self.stale_after.or(self.review_after)
+    }
+
+    /// The newest verification recorded on this Engram: the latest `verified`
+    /// entry that carries an instant, falling back to the legacy
+    /// `last_verified` date read as a verification at midnight UTC by an
+    /// unnamed actor. `None` when nothing has been verified.
+    pub fn latest_verified(&self) -> Option<Verification<'_>> {
+        let newest = self
+            .verified
+            .iter()
+            .filter_map(|v| v.at.map(|at| (at, v.by.as_str())))
+            .max_by_key(|(at, _)| *at);
+        if let Some((at, by)) = newest {
+            return Some(Verification { by: Some(by), at });
+        }
+        let at = self.last_verified?.and_hms_opt(0, 0, 0)?.and_utc();
+        Some(Verification {
+            by: None,
+            at: at.fixed_offset(),
+        })
+    }
 }
 
 impl Engram {
@@ -249,7 +353,9 @@ impl Engram {
             || f.description.is_some()
             || f.resource.is_some()
             || f.source_date.is_some()
+            || !f.verified.is_empty()
             || f.last_verified.is_some()
+            || f.stale_after.is_some()
             || f.review_after.is_some()
             || f.temporal_confidence.is_some()
             || f.schema_def.is_some()

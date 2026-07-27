@@ -37,7 +37,7 @@ pub use address::{CrystallineUrl, LinkResolver, LookupTable, Resolution, Resolve
 pub use emit::emit_engram;
 pub use engram::{
     Engram, Frontmatter, Generated, Heading, LinkTarget, Observation, RECOMMENDED_STATUSES,
-    RECOMMENDED_TYPES, Relation, SchemaDef, WikiLink,
+    RECOMMENDED_TYPES, Relation, SchemaDef, Verification, Verified, WikiLink,
 };
 pub use harness::{HarnessKind, HarnessPaths, artifact_base, harness_paths};
 pub use index::{
@@ -65,7 +65,9 @@ pub use schema::{
 };
 pub use skills::{SKILL_ASSETS, SkillAsset, skill};
 pub use tags::{is_lower_hyphen, retag};
-pub use temporal::{DATE_FIELDS, DateFieldError, normalize_temporal_fields};
+pub use temporal::{
+    DATE_FIELDS, DateFieldError, VerifiedFieldError, normalize_temporal_fields, normalize_verified,
+};
 pub use verify::{Issue, Severity, VerifyOptions, VerifyReport, verify_paths};
 pub use yaml::YamlValue;
 

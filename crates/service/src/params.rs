@@ -56,10 +56,11 @@ pub struct WriteParams {
     #[serde(default)]
     pub status: Option<String>,
     /// Extra frontmatter keys, preserved verbatim and filterable. Temporal
-    /// bounds go here: valid_from, valid_to, source_date, last_verified and
-    /// review_after must be plain ISO dates (YYYY-MM-DD); any other value
-    /// fails the write, while an explicit null or a sentinel far-future date
-    /// is dropped.
+    /// bounds go here: valid_from, valid_to, source_date and stale_after (when
+    /// the knowledge is due a re-check) must be plain ISO dates (YYYY-MM-DD);
+    /// any other value fails the write, while an explicit null or a sentinel
+    /// far-future date is dropped. A verification goes here too, as
+    /// verified: { by: <actor>, at: <RFC 3339 instant> } or a list of those.
     #[serde(default)]
     pub metadata: Option<serde_json::Value>,
     /// Overwrite an existing engram with the same permalink instead of erroring.

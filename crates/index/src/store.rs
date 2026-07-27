@@ -155,10 +155,23 @@ impl EngramRecord {
             }
         };
         add_str("source_date", date_str(fm.source_date));
-        add_str("last_verified", date_str(fm.last_verified));
-        add_str("review_after", date_str(fm.review_after));
+        // `last_verified` and `stale_after` carry the effective value whichever
+        // spelling recorded it, so a filter keeps working across an engram that
+        // has migrated to the OKF keys and one that has not.
+        add_str(
+            "last_verified",
+            fm.latest_verified()
+                .map(|v| v.at.date_naive().format("%Y-%m-%d").to_string()),
+        );
+        add_str("stale_after", date_str(fm.stale_on()));
         add_str("temporal_confidence", fm.temporal_confidence.clone());
         add_str("resource", fm.resource.clone());
+        // The verification trail itself stays filterable in its OKF shape.
+        if !fm.verified.is_empty()
+            && let Ok(jv) = serde_json::to_value(&fm.verified)
+        {
+            meta.insert("verified".to_string(), jv);
+        }
 
         let observations = engram
             .observations
