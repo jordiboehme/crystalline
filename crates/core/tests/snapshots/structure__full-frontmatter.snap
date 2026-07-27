@@ -14,6 +14,7 @@ frontmatter:
   recorded_at: 2026-05-01
   valid_from: 2026-05-01
   valid_to: 2026-09-30
+  generated: ~
   timestamp: "2026-05-01T09:15:00Z"
   description: How often to water raised tomato beds through the season.
   resource: "https://example.org/tomato-guide"

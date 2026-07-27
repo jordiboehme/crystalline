@@ -12,8 +12,15 @@
 use chrono::{DateTime, FixedOffset};
 use serde_yaml_ng::{Mapping, Value};
 
-use crate::engram::{Engram, Frontmatter, SchemaDef};
+use crate::engram::{Engram, Frontmatter, Generated, SchemaDef};
 use crate::parse::{locate, parse_heading};
+
+/// The stand-in scalar the `generated` key carries through YAML serialization,
+/// swapped for the flow mapping afterwards. The YAML crate only emits block
+/// mappings, and `generated` must stay on one line so the surgical editors can
+/// replace it as a single line; the token is deliberately plain ASCII so
+/// serialization never wraps it in quotes.
+const GENERATED_PLACEHOLDER: &str = "crystalline-generated-placeholder";
 
 /// An error from a section-addressed editor.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -33,7 +40,48 @@ pub fn emit_engram(engram: &Engram) -> String {
         return engram.body.clone();
     }
     let yaml = serde_yaml_ng::to_string(&Value::Mapping(map)).unwrap_or_default();
+    let yaml = match &engram.frontmatter.generated {
+        Some(g) => yaml.replacen(
+            &format!("generated: {GENERATED_PLACEHOLDER}"),
+            &generated_flow(g),
+            1,
+        ),
+        None => yaml,
+    };
     format!("---\n{}---\n{}", yaml, engram.body)
+}
+
+/// Render a whole `generated` frontmatter line as the OKF flow mapping, key
+/// included, so it occupies exactly one line. Values are quoted only when a
+/// plain scalar would be ambiguous inside a flow mapping, so the common actor
+/// and RFC 3339 forms read exactly like the spec's examples.
+fn generated_flow(g: &Generated) -> String {
+    let mut out = format!("generated: {{ by: {}", flow_scalar(&g.by));
+    if let Some(at) = g.at {
+        out.push_str(&format!(", at: {}", flow_scalar(&at.to_rfc3339())));
+    }
+    out.push_str(" }");
+    out
+}
+
+/// Quote a scalar for a YAML flow mapping unless it is unambiguously bare. A
+/// bare value is safe when it is non-empty, holds only characters that carry
+/// no meaning in flow context (so no whitespace, quote or flow punctuation)
+/// and neither opens nor closes with a character a parser would read as an
+/// indicator.
+fn flow_scalar(value: &str) -> String {
+    let plain = !value.is_empty()
+        && value.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/' | '+' | ':' | '@')
+        })
+        && !value.starts_with(':')
+        && !value.starts_with('-')
+        && !value.ends_with(':');
+    if plain {
+        return value.to_string();
+    }
+    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
 }
 
 fn frontmatter_mapping(fm: &Frontmatter) -> Mapping {
@@ -102,6 +150,16 @@ fn frontmatter_mapping(fm: &Frontmatter) -> Mapping {
     if let Some(v) = &fm.resource {
         put("resource", Value::String(v.clone()));
     }
+    // `generated` takes the canonical slot the legacy `timestamp` held, and a
+    // file that still carries only `timestamp` keeps emitting it in exactly
+    // that place, so a legacy engram round-trips byte for byte until an edit
+    // migrates it.
+    if fm.generated.is_some() {
+        put(
+            "generated",
+            Value::String(GENERATED_PLACEHOLDER.to_string()),
+        );
+    }
     if let Some(ts) = fm.timestamp {
         put("timestamp", Value::String(ts.to_rfc3339()));
     }
@@ -148,7 +206,15 @@ fn emit_schema_fields(map: &mut Mapping, schema: &SchemaDef) {
 /// Set or replace a single scalar frontmatter field in the original source,
 /// leaving everything else untouched. Creates a frontmatter block if absent.
 pub fn set_frontmatter_field(source: &str, key: &str, value: &str) -> String {
-    let new_line = format_scalar_line(key, value);
+    set_frontmatter_line(source, &[key], format_scalar_line(key, value))
+}
+
+/// Replace the first frontmatter line that sets any of `keys` with `new_line`,
+/// appending it when none of them is present. Creates a frontmatter block when
+/// the source has none. The keys are tried in order, so a caller can name a
+/// canonical key first and a legacy spelling second and have the legacy line
+/// rewritten in place.
+fn set_frontmatter_line(source: &str, keys: &[&str], new_line: String) -> String {
     let (has_fm, fm_span, _body_start) = locate(source);
 
     if !has_fm {
@@ -157,11 +223,18 @@ pub fn set_frontmatter_field(source: &str, key: &str, value: &str) -> String {
     }
 
     let raw = &source[fm_span.clone()];
+    // Which key actually appears decides which line is rewritten, so a file
+    // carrying both the canonical and the legacy spelling has the canonical one
+    // updated whatever order they sit in.
+    let target = keys.iter().copied().find(|k| {
+        raw.split_inclusive('\n')
+            .any(|l| line_sets_key(l.strip_suffix('\n').unwrap_or(l), k))
+    });
     let mut new_raw = String::with_capacity(raw.len() + new_line.len());
     let mut replaced = false;
     for line in raw.split_inclusive('\n') {
         let content = line.strip_suffix('\n').unwrap_or(line);
-        if !replaced && line_sets_key(content, key) {
+        if !replaced && target.is_some_and(|k| line_sets_key(content, k)) {
             new_raw.push_str(&new_line);
             if line.ends_with('\n') {
                 new_raw.push('\n');
@@ -222,9 +295,19 @@ pub fn remove_frontmatter_field(source: &str, key: &str) -> String {
     )
 }
 
-/// Set the `timestamp` field to `now` (RFC 3339) in the original source.
-pub fn touch_timestamp(source: &str, now: DateTime<FixedOffset>) -> String {
-    set_frontmatter_field(source, "timestamp", &now.to_rfc3339())
+/// Record a write in the original source: set `generated` to `actor` and `now`
+/// as the OKF v0.2 flow mapping, leaving every other byte untouched.
+///
+/// An engram that still carries the legacy `timestamp` key and no `generated`
+/// block migrates here, lazily: the `timestamp` line is replaced in place by
+/// the `generated` line, so a file only ever changes shape when it is actually
+/// edited and the frontmatter keeps its original order.
+pub fn touch_generated(source: &str, actor: &str, now: DateTime<FixedOffset>) -> String {
+    let line = generated_flow(&Generated {
+        by: actor.to_string(),
+        at: Some(now),
+    });
+    set_frontmatter_line(source, &["generated", "timestamp"], line)
 }
 
 fn format_scalar_line(key: &str, value: &str) -> String {
@@ -459,4 +542,58 @@ pub fn prepend_body(source: &str, content: &str) -> String {
         block,
         &source[body_start..]
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flow_scalar_leaves_the_common_actor_and_instant_forms_bare() {
+        for value in [
+            "claude-code/1.0.5",
+            "human:jordi",
+            "process:crystalline-import",
+            "2026-07-27T09:15:00+00:00",
+            "crystalline/mcp",
+        ] {
+            assert_eq!(flow_scalar(value), value);
+        }
+    }
+
+    #[test]
+    fn flow_scalar_quotes_anything_a_flow_mapping_could_misread() {
+        // Whitespace, flow punctuation, an empty value and a trailing colon all
+        // have to be quoted or the line stops parsing as one mapping.
+        assert_eq!(flow_scalar("Some Client"), "\"Some Client\"");
+        assert_eq!(flow_scalar("a,b"), "\"a,b\"");
+        assert_eq!(flow_scalar("{x}"), "\"{x}\"");
+        assert_eq!(flow_scalar(""), "\"\"");
+        assert_eq!(flow_scalar("trailing:"), "\"trailing:\"");
+        assert_eq!(flow_scalar("say \"hi\""), "\"say \\\"hi\\\"\"");
+    }
+
+    #[test]
+    fn a_quoted_actor_still_round_trips_through_the_parser() {
+        let source = format!(
+            "---\ntype: engram\n{}\n---\n\nbody\n",
+            generated_flow(&Generated {
+                by: "Some Client (beta), v2".to_string(),
+                at: DateTime::parse_from_rfc3339("2026-07-27T09:15:00+00:00").ok(),
+            })
+        );
+        let engram = crate::parse_engram(&source).unwrap();
+        let g = engram.frontmatter.generated.as_ref().unwrap();
+        assert_eq!(g.by, "Some Client (beta), v2");
+        assert_eq!(emit_engram(&engram), source);
+    }
+
+    #[test]
+    fn generated_flow_omits_an_absent_instant() {
+        let line = generated_flow(&Generated {
+            by: "human:jordi".to_string(),
+            at: None,
+        });
+        assert_eq!(line, "generated: { by: human:jordi }");
+    }
 }

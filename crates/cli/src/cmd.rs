@@ -1237,8 +1237,9 @@ pub async fn model_download(config_override: Option<&Path>, json: bool) -> Resul
 
 /// Import a markdown knowledge base with YAML frontmatter into a registered
 /// domain: normalize legacy `type` values, backfill temporal metadata, drop
-/// sentinel open-ended dates, strip a source permalink prefix and add a
-/// missing `timestamp`. Pure file transformation: never touches the index,
+/// sentinel open-ended dates, strip a source permalink prefix and record write
+/// provenance where a file carries none. Pure file transformation: never
+/// touches the index,
 /// the socket or the network.
 #[allow(clippy::too_many_arguments)]
 pub fn import(

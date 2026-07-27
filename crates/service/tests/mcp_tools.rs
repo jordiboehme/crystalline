@@ -2995,3 +2995,114 @@ async fn wire_list_tools_carries_sanitized_schemas() {
         "search_engrams.min_similarity must not advertise a format"
     );
 }
+
+// --- write provenance (OKF v0.2 `generated`) ---------------------------------
+
+/// A write records who asked for it. The actor comes from the MCP initialize
+/// handshake, formatted as the OKF agent form `name/version`, so an engram
+/// carries the identity of the client that captured it rather than a generic
+/// server label.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_engram_records_the_connected_client_as_generated_by() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Provenance", "content": "Who wrote this." }),
+    )
+    .await
+    .unwrap();
+
+    let expected = {
+        let info = rmcp::model::ClientInfo::default().client_info;
+        format!("{}/{}", info.name, info.version)
+    };
+    let text = std::fs::read_to_string(h.root.join("eng/provenance.md")).unwrap();
+    assert!(
+        text.contains(&format!("generated: {{ by: {expected}, at: ")),
+        "expected the handshake identity in generated.by: {text}"
+    );
+    assert!(
+        !text.contains("timestamp:"),
+        "a new engram must not carry the superseded v0.1 key: {text}"
+    );
+    // The recency the index reads comes from the provenance block.
+    let engram = crystalline_core::parse_engram(&text).unwrap();
+    assert!(engram.frontmatter.written_at().is_some());
+}
+
+/// The `identity.actor` setting wins over the client identity, so an operator
+/// can pin who a shared instance records as the writer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn identity_actor_setting_overrides_the_client_identity() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    call(
+        peer,
+        "configure",
+        json!({ "set": { "identity.actor": "team-bot/1.0" } }),
+    )
+    .await
+    .unwrap();
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Pinned actor", "content": "Written by the bot." }),
+    )
+    .await
+    .unwrap();
+
+    let text = std::fs::read_to_string(h.root.join("eng/pinned-actor.md")).unwrap();
+    assert!(
+        text.contains("generated: { by: team-bot/1.0, at: "),
+        "the configured actor must win: {text}"
+    );
+}
+
+/// An engram written before the migration carries the legacy `timestamp` key.
+/// Its next edit swaps that single line for the `generated` block, leaving
+/// every other byte in place.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edit_engram_migrates_a_legacy_timestamp_to_generated() {
+    let h = Harness::new(&["eng"]).await;
+    std::fs::write(
+        h.root.join("eng/legacy.md"),
+        "---\ntype: engram\ntitle: Legacy\npermalink: legacy\ntags:\n- old\nstatus: current\nrecorded_at: 2026-01-01\ntimestamp: 2026-01-01T00:00:00+00:00\n---\n\nA fact recorded before the provenance migration landed.\n",
+    )
+    .unwrap();
+    h.engine.sync(None).await.unwrap();
+
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+    call(
+        peer,
+        "edit_engram",
+        json!({
+            "identifier": "legacy",
+            "domain": "eng",
+            "operation": "append",
+            "content": "And a line added later.",
+        }),
+    )
+    .await
+    .unwrap();
+
+    let text = std::fs::read_to_string(h.root.join("eng/legacy.md")).unwrap();
+    assert!(
+        !text.contains("timestamp:"),
+        "the legacy key must be gone after the migrating edit: {text}"
+    );
+    assert!(text.contains("generated: { by: "), "{text}");
+    assert!(
+        text.contains("recorded_at: 2026-01-01\ngenerated: {"),
+        "the provenance block must take the legacy key's place in the order: {text}"
+    );
+    let engram = crystalline_core::parse_engram(&text).unwrap();
+    let generated = engram.frontmatter.generated.unwrap();
+    assert!(generated.at.unwrap().to_rfc3339().as_str() > "2026-01-01T00:00:00+00:00");
+}

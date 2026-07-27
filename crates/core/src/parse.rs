@@ -16,7 +16,7 @@ use chrono::{DateTime, FixedOffset, NaiveDate};
 use indexmap::IndexMap;
 
 use crate::engram::{
-    Engram, Frontmatter, Heading, LinkTarget, Observation, Relation, SchemaDef, WikiLink,
+    Engram, Frontmatter, Generated, Heading, LinkTarget, Observation, Relation, SchemaDef, WikiLink,
 };
 use crate::yaml::YamlValue;
 
@@ -215,6 +215,7 @@ fn parse_frontmatter(raw: &str) -> Result<Frontmatter, ParseError> {
             "last_verified" => set_date(&mut fm.last_verified, &mut extra, &key, value),
             "review_after" => set_date(&mut fm.review_after, &mut extra, &key, value),
             "timestamp" => set_timestamp(&mut fm.timestamp, &mut extra, &key, value),
+            "generated" => set_generated(&mut fm.generated, &mut extra, &key, value),
             "entity" if is_schema => {
                 saw_schema_key = true;
                 schema_def.entity = opt_scalar_string(&value);
@@ -317,6 +318,33 @@ fn set_timestamp(
     {
         *field = Some(ts);
         return;
+    }
+    extra.insert(key.to_string(), YamlValue::from_backend(value));
+}
+
+/// Parse the OKF v0.2 `generated: { by, at }` mapping. `by` is required by the
+/// spec, so a value that is not a mapping carrying a non-empty `by` is kept
+/// verbatim in `extra` instead of being silently reshaped; verify flags it
+/// later, exactly as it does a malformed `timestamp`.
+fn set_generated(
+    field: &mut Option<Generated>,
+    extra: &mut IndexMap<String, YamlValue>,
+    key: &str,
+    value: serde_yaml_ng::Value,
+) {
+    if let serde_yaml_ng::Value::Mapping(map) = &value {
+        let by = map
+            .get(serde_yaml_ng::Value::String("by".into()))
+            .and_then(scalar_string)
+            .filter(|s| !s.trim().is_empty());
+        if let Some(by) = by {
+            let at = map
+                .get(serde_yaml_ng::Value::String("at".into()))
+                .and_then(|v| v.as_str())
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok());
+            *field = Some(Generated { by, at });
+            return;
+        }
     }
     extra.insert(key.to_string(), YamlValue::from_backend(value));
 }

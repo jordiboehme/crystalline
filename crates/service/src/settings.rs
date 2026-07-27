@@ -10,8 +10,8 @@
 use std::path::PathBuf;
 
 use crystalline_core::config::{
-    DatabaseBackend, DatabaseConfig, GitHubConfig, GlobalConfig, HttpSetting, IndexConfig,
-    ResponseFormat, SearchConfig, ServiceConfig, SkillsConfig,
+    DatabaseBackend, DatabaseConfig, GitHubConfig, GlobalConfig, HttpSetting, IdentityConfig,
+    IndexConfig, ResponseFormat, SearchConfig, ServiceConfig, SkillsConfig,
 };
 use crystalline_index::{DEFAULT_RETIRED_WEIGHT, DEFAULT_SALIENCE_WEIGHT};
 
@@ -242,6 +242,15 @@ pub fn registry() -> &'static [SettingSpec] {
             clear: clear_index_files,
             effective: index_files_effective,
         },
+        SettingSpec {
+            key: "identity.actor",
+            doc: "Who is recorded as the writer of an engram (generated.by), for example team-bot/1.0 or human:jordi; unset means the connected client is used",
+            kind: SettingKind::String,
+            startup_effective: false,
+            apply: set_identity_actor,
+            clear: clear_identity_actor,
+            effective: identity_actor_effective,
+        },
     ]
 }
 
@@ -403,6 +412,15 @@ fn drop_search_if_empty(config: &mut GlobalConfig) {
 fn drop_index_if_empty(config: &mut GlobalConfig) {
     if config.index.as_ref() == Some(&IndexConfig::default()) {
         config.index = None;
+    }
+}
+
+/// Drop the `identity` block entirely once every field in it has been cleared,
+/// so an unset config round-trips to exactly the pre-feature shape (no empty
+/// `identity: {}` line).
+fn drop_identity_if_empty(config: &mut GlobalConfig) {
+    if config.identity.as_ref() == Some(&IdentityConfig::default()) {
+        config.identity = None;
     }
 }
 
@@ -876,6 +894,41 @@ fn index_files_effective(config: &GlobalConfig) -> (String, bool) {
     (config.index_files().to_string(), is_default)
 }
 
+// --- identity.actor ---------------------------------------------------------
+
+fn set_identity_actor(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(SettingsError(
+            "identity.actor must not be empty".to_string(),
+        ));
+    }
+    if trimmed.contains(char::is_whitespace) {
+        return Err(SettingsError(format!(
+            "identity.actor must not contain whitespace, got '{value}'"
+        )));
+    }
+    config
+        .identity
+        .get_or_insert_with(IdentityConfig::default)
+        .actor = Some(trimmed.to_string());
+    Ok(())
+}
+
+fn clear_identity_actor(config: &mut GlobalConfig) {
+    if let Some(i) = config.identity.as_mut() {
+        i.actor = None;
+    }
+    drop_identity_if_empty(config);
+}
+
+fn identity_actor_effective(config: &GlobalConfig) -> (String, bool) {
+    match config.identity_actor() {
+        Some(actor) => (actor.to_string(), false),
+        None => (String::new(), true),
+    }
+}
+
 // --- domains_root ----------------------------------------------------------
 
 fn set_domains_root(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
@@ -909,7 +962,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_lists_exactly_the_fifteen_keys_in_order() {
+    fn registry_lists_exactly_the_sixteen_keys_in_order() {
         assert_eq!(
             known_keys(),
             vec![
@@ -928,6 +981,7 @@ mod tests {
                 "search.salience_weight",
                 "search.retired_weight",
                 "index.files",
+                "identity.actor",
             ]
         );
     }
@@ -978,6 +1032,7 @@ mod tests {
                     "CRYSTALLINE_SEARCH_RETIRED_WEIGHT".to_string()
                 ),
                 ("index.files", "CRYSTALLINE_INDEX_FILES".to_string()),
+                ("identity.actor", "CRYSTALLINE_IDENTITY_ACTOR".to_string()),
             ]
         );
     }
@@ -999,6 +1054,7 @@ mod tests {
         assert!(change_note("search.salience_weight", &no_env).is_none());
         assert!(change_note("search.retired_weight", &no_env).is_none());
         assert!(change_note("index.files", &no_env).is_none());
+        assert!(change_note("identity.actor", &no_env).is_none());
         assert!(change_note("github.bogus", &no_env).is_none());
     }
 
@@ -1260,7 +1316,7 @@ mod tests {
         apply(&mut cfg, "github.enabled", "true").unwrap();
 
         let views = snapshot(&cfg, &EnvOverlay::default());
-        assert_eq!(views.len(), 15);
+        assert_eq!(views.len(), 16);
         assert_eq!(
             views.iter().map(|v| v.key.as_str()).collect::<Vec<_>>(),
             vec![
@@ -1279,6 +1335,7 @@ mod tests {
                 "search.salience_weight",
                 "search.retired_weight",
                 "index.files",
+                "identity.actor",
             ]
         );
 
@@ -1346,6 +1403,10 @@ mod tests {
         let index_files = &views[14];
         assert_eq!(index_files.value, "true");
         assert_eq!(index_files.source, SettingSource::Default);
+
+        let identity_actor = &views[15];
+        assert_eq!(identity_actor.value, "");
+        assert_eq!(identity_actor.source, SettingSource::Default);
     }
 
     #[test]

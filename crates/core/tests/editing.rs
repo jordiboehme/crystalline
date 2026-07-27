@@ -1,5 +1,5 @@
 //! Surgical editor tests: section editing (including the subsection-preserved
-//! regression), frontmatter field edits and timestamp touch.
+//! regression), frontmatter field edits and the `generated` provenance touch.
 
 mod common;
 
@@ -7,7 +7,7 @@ use chrono::{DateTime, FixedOffset};
 use common::{fixtures_dir, read};
 use crystalline_core::emit::{
     append_body, insert_after_section, insert_before_section, prepend_body,
-    remove_frontmatter_field, replace_section, set_frontmatter_field, touch_timestamp,
+    remove_frontmatter_field, replace_section, set_frontmatter_field, touch_generated,
 };
 use crystalline_core::parse_engram;
 
@@ -110,14 +110,66 @@ fn set_frontmatter_field_inserts_when_absent() {
 }
 
 #[test]
-fn touch_timestamp_sets_rfc3339() {
+fn touch_generated_records_the_actor_and_an_rfc3339_instant() {
     let source = read(&fixtures_dir().join("canonical/minimal-okf.md"));
     let now: DateTime<FixedOffset> =
         DateTime::parse_from_rfc3339("2026-07-02T10:00:00+00:00").unwrap();
-    let out = touch_timestamp(&source, now);
+    let out = touch_generated(&source, "claude-code/1.0.5", now);
+    assert!(
+        out.contains("generated: { by: claude-code/1.0.5, at: 2026-07-02T10:00:00+00:00 }"),
+        "{out}"
+    );
     let e = parse_engram(&out).unwrap();
+    let g = e.frontmatter.generated.unwrap();
+    assert_eq!(g.by, "claude-code/1.0.5");
+    assert_eq!(g.at.unwrap().to_rfc3339(), "2026-07-02T10:00:00+00:00");
+}
+
+#[test]
+fn touch_generated_migrates_a_legacy_timestamp_line_in_place() {
+    // A file written before the `generated` migration carries `timestamp`.
+    // Editing it swaps that one line for the provenance block and leaves every
+    // other byte, including the frontmatter order, exactly where it was.
+    let source = read(&fixtures_dir().join("canonical/full-frontmatter.md"));
+    let now: DateTime<FixedOffset> =
+        DateTime::parse_from_rfc3339("2026-07-02T10:00:00+00:00").unwrap();
+    let out = touch_generated(&source, "human:jordi", now);
+    let expected = source.replace(
+        "timestamp: 2026-05-01T09:15:00+00:00",
+        "generated: { by: human:jordi, at: 2026-07-02T10:00:00+00:00 }",
+    );
+    assert_eq!(out, expected);
+    let e = parse_engram(&out).unwrap();
+    assert!(e.frontmatter.timestamp.is_none());
+    assert_eq!(e.frontmatter.generated.unwrap().by, "human:jordi");
+}
+
+#[test]
+fn touch_generated_updates_the_generated_line_and_leaves_a_legacy_timestamp_alone() {
+    // Both keys present: the canonical one is refreshed and the legacy line is
+    // left where it is rather than a second provenance block appearing.
+    let source = "---
+type: engram
+timestamp: 2020-01-01T00:00:00+00:00
+generated: { by: old/1, at: 2021-01-01T00:00:00+00:00 }
+---
+
+body
+";
+    let now: DateTime<FixedOffset> =
+        DateTime::parse_from_rfc3339("2026-07-02T10:00:00+00:00").unwrap();
+    let out = touch_generated(source, "new/2", now);
+    assert!(
+        out.contains("timestamp: 2020-01-01T00:00:00+00:00"),
+        "{out}"
+    );
+    assert_eq!(out.matches("generated:").count(), 1, "{out}");
+    let e = parse_engram(&out).unwrap();
+    let fm = e.frontmatter;
+    assert_eq!(fm.generated.as_ref().unwrap().by, "new/2");
+    // Recency reads the provenance block, not the stale legacy key.
     assert_eq!(
-        e.frontmatter.timestamp.unwrap().to_rfc3339(),
+        fm.written_at().unwrap().to_rfc3339(),
         "2026-07-02T10:00:00+00:00"
     );
 }

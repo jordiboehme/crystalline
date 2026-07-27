@@ -34,7 +34,45 @@ fn full_frontmatter_fields_are_typed() {
         fm.timestamp.unwrap().to_rfc3339(),
         "2026-05-01T09:15:00+00:00"
     );
+    // The fixture predates the `generated` migration, so recency falls back to
+    // the legacy key (OKF v0.2 §13.1) and nothing is invented.
+    assert!(fm.generated.is_none());
+    assert_eq!(
+        fm.written_at().unwrap().to_rfc3339(),
+        "2026-05-01T09:15:00+00:00"
+    );
     assert!(fm.extra.is_empty());
+}
+
+#[test]
+fn generated_provenance_is_typed_and_drives_recency() {
+    let e = parse_fixture("canonical/generated-provenance.md");
+    let fm = &e.frontmatter;
+    let g = fm
+        .generated
+        .as_ref()
+        .expect("generated parses into the model");
+    assert_eq!(g.by, "claude-code/1.0.5");
+    assert_eq!(g.at.unwrap().to_rfc3339(), "2026-07-27T09:15:00+00:00");
+    assert!(fm.timestamp.is_none());
+    assert_eq!(
+        fm.written_at().unwrap().to_rfc3339(),
+        "2026-07-27T09:15:00+00:00"
+    );
+    // A recognized block never lands in the unknown-key bag.
+    assert!(fm.extra.is_empty());
+}
+
+#[test]
+fn a_generated_block_without_an_actor_is_kept_verbatim() {
+    // `by` is required by OKF v0.2, so a block without one is preserved as an
+    // unknown key rather than silently reshaped; verify reports it.
+    let source =
+        "---\ntype: engram\ntitle: X\ngenerated:\n  at: 2026-07-27T09:15:00+00:00\n---\n\nbody\n";
+    let e = parse_engram(source).unwrap();
+    assert!(e.frontmatter.generated.is_none());
+    assert!(e.frontmatter.extra.contains_key("generated"));
+    assert!(e.frontmatter.written_at().is_none());
 }
 
 #[test]

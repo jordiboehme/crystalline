@@ -82,6 +82,11 @@ pub struct GlobalConfig {
     /// working untouched.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub index: Option<IndexConfig>,
+    /// Write-provenance settings. Absent means the actor recorded on a write
+    /// is derived from the connected client, so every existing config keeps
+    /// working untouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<IdentityConfig>,
 }
 
 impl GlobalConfig {
@@ -160,6 +165,17 @@ impl GlobalConfig {
     /// setting never applies to them.
     pub fn index_files(&self) -> bool {
         self.index.as_ref().and_then(|i| i.files).unwrap_or(true)
+    }
+
+    /// The configured actor recorded as `generated.by` on every write, from
+    /// `identity.actor`. Absent means no override: the writer is identified
+    /// from the connected client instead.
+    pub fn identity_actor(&self) -> Option<&str> {
+        self.identity
+            .as_ref()
+            .and_then(|i| i.actor.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
     }
 }
 
@@ -373,6 +389,19 @@ pub struct IndexConfig {
     /// on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub files: Option<bool>,
+}
+
+/// The `identity` block: who Crystalline records as the writer of an engram.
+/// Reads like a settings-page section - see the `configure` tool, which
+/// exposes exactly these keys.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct IdentityConfig {
+    /// The OKF actor written as `generated.by` on every write, overriding the
+    /// identity derived from the connected client. Follows the OKF actor
+    /// convention: `name/version` for an agent, `human:name` for a person and
+    /// `process:name` for an automated job. Absent means no override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
 }
 
 /// Service configuration.

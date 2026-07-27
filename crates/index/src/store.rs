@@ -101,7 +101,9 @@ pub struct EngramRecord {
     pub valid_from: Option<String>,
     /// `valid_to` as an ISO date string; absent = valid forever.
     pub valid_to: Option<String>,
-    /// `timestamp` as an RFC 3339 string.
+    /// When the engram was last written, as an RFC 3339 string: `generated.at`
+    /// with the legacy `timestamp` key as the fallback. The column keeps its
+    /// `timestamp` name and wire format, so no migration or resync is needed.
     pub timestamp: Option<String>,
     /// `description`, feeds search snippets.
     pub description: Option<String>,
@@ -198,7 +200,7 @@ impl EngramRecord {
             recorded_at: date_str(fm.recorded_at),
             valid_from: date_str(fm.valid_from),
             valid_to: date_str(fm.valid_to),
-            timestamp: fm.timestamp.map(|t| t.to_rfc3339()),
+            timestamp: fm.written_at().map(|t| t.to_rfc3339()),
             description: fm.description.clone(),
             content: engram.body.clone(),
             metadata: serde_json::Value::Object(meta),
