@@ -844,14 +844,14 @@ pub async fn sync(
         let Some(path) = resolve_domain_path(&entry) else {
             continue;
         };
-        // A large domain's walk-hash-parse pass can take a while with no
+        // A large domain's walk-and-hash pass can take a while with no
         // other output in between; say which domain is in flight before it
         // starts, the same way `embed_pass` announces each batch.
         if !json {
             eprintln!("syncing {name}...");
         }
         // First lock window: snapshot the stamps; scan with no lock held so the
-        // walk-hash-parse pass does not block concurrent readers; second window:
+        // walk-and-hash pass does not block concurrent readers; second window:
         // apply transactionally with the TOCTOU guards.
         let (domain, snapshot) = {
             let store = store.lock().await;

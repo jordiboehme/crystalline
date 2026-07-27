@@ -2915,7 +2915,7 @@ impl Engine {
         let mut skipped = Vec::new();
         let mut failed = Vec::new();
         // Two short store-lock windows per domain with the scan in between, so the
-        // walk-hash-parse pass of a large domain no longer blocks every concurrent
+        // walk-and-hash pass of a large domain no longer blocks every concurrent
         // read behind the mutex. The first window claims the host, resolves the
         // domain id and snapshots its stamps; the second applies transactionally
         // with the TOCTOU guards. The claim stays live across the lock-free scan:
@@ -3051,7 +3051,7 @@ impl Engine {
         let collab = !self.instance_id.is_empty();
         let mut reports = Vec::new();
         // Two short store-lock windows per domain with the scan in between, the
-        // same shape as `sync_take_over`, so a large domain's walk-hash-parse pass
+        // same shape as `sync_take_over`, so a large domain's walk-and-hash pass
         // no longer holds the mutex. The first window claims the host, clears the
         // domain when `full` and snapshots the stamps; the snapshot is taken AFTER
         // the clear so the scan classifies every file as new against empty stamps -

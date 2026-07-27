@@ -13,12 +13,31 @@
 //!
 //! # Two phases, so the store lock only covers database work
 //!
-//! A sync is two phases: [`scan_domain`] is pure filesystem and CPU (walk, hash,
-//! parse, chunk) and takes the stamp snapshot as input rather than reading the
-//! store, so a caller runs it with no store lock held; [`apply_scan`] is the
-//! transactional apply and touches the store only. [`sync_domain_with`] composes
-//! the two for callers that do not manage the lock. Splitting them keeps the
-//! store mutex off the long walk-hash-parse pass of a large domain.
+//! A sync is two phases: [`scan_domain`] is pure filesystem and CPU (walk, stat,
+//! hash) and takes the stamp snapshot as input rather than reading the store, so
+//! a caller runs it with no store lock held; [`apply_scan`] is the transactional
+//! apply and touches the store only. [`sync_domain_with`] composes the two for
+//! callers that do not manage the lock. Splitting them keeps the store mutex off
+//! the long walk-and-hash pass of a large domain.
+//!
+//! # Bounded memory: the changed set is applied in slabs
+//!
+//! The scan classifies with checksums alone and keeps no file contents, so a
+//! [`DomainScan`] is metadata whatever the domain's size. The apply then works
+//! through the changed set in slabs of [`SYNC_SLAB_FILES`] files: each slab is
+//! read, parsed and chunked off-thread and every result is upserted as it
+//! arrives, so the pipeline never holds more than one slab of contents at a time.
+//! A full sync of a multi-gigabyte domain therefore peaks at slab size, not at a
+//! multiple of the domain.
+//!
+//! The price is that a changed file is read twice, once to hash it and once to
+//! parse it, and that the parse of each slab runs inside the apply's transaction.
+//! Both are deliberate: the checksums of the whole changed set must be known
+//! before the first write, because a vanished path is only a delete once no new
+//! file claims its checksum as a move, and deletes must land before the upserts
+//! so a file that moves and is edited in one pass frees its permalink for the new
+//! path. The second read is page-cache warm in practice, and the parse only ever
+//! covers a slab.
 //!
 //! [`scan_paths`] is a second front on the same classification machinery for the
 //! file watcher: its candidates come from a given list of relative paths instead
@@ -61,6 +80,11 @@ use crate::store::{DomainId, EngramRecord, FileStamp, NewChunk, Store};
 /// Maximum concurrent hashing or parsing tasks.
 const CONCURRENCY: usize = 8;
 
+/// Changed files read, parsed and upserted per slab of the apply phase. The
+/// pipeline holds one slab of contents at most, so this bounds a sync's peak
+/// memory independently of the domain's size.
+const SYNC_SLAB_FILES: usize = 256;
+
 /// The outcome of a sync over one domain.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SyncReport {
@@ -100,11 +124,13 @@ struct Scanned {
     size: u64,
 }
 
-/// The result of hashing (and reading) a candidate file.
-struct Hashed {
-    sha256: String,
-    /// The file contents, or `None` when the bytes are not valid UTF-8.
-    content: Option<String>,
+/// A classified change waiting for its slab: where the file is, the stat it was
+/// classified against and whether the path was already indexed (so the apply can
+/// tell an add from an update). The contents are deliberately absent - the slab
+/// reads them when it is its turn.
+struct PendingChange {
+    scanned: Scanned,
+    previously_indexed: bool,
 }
 
 /// Sync one domain: walk `root`, reconcile the index and resolve forward refs.
@@ -146,18 +172,24 @@ pub async fn sync_domain_with<S: Store + ?Sized>(
 /// The filesystem side of a sync, ready to apply against a store.
 ///
 /// [`scan_domain`] produces this with no store access at all. It carries the
-/// classified moves, deletes and parsed-with-chunks changes, the stamp snapshot
-/// they were classified against (so the apply can detect a concurrent writer),
-/// the walk root (so a delete can re-stat its file) and the partial report
-/// (`unchanged` and `failed` counts). [`apply_scan`] consumes it inside one
-/// transaction and fills in the remaining report fields.
+/// classified moves, deletes and changed files, the stamp snapshot they were
+/// classified against (so the apply can detect a concurrent writer), the walk
+/// root (so a delete can re-stat its file), the chunk parameters the apply
+/// chunks with and the partial report (`unchanged` and `failed` counts).
+/// [`apply_scan`] consumes it inside one transaction and fills in the remaining
+/// report fields.
+///
+/// It holds no file contents at any size of domain: the changed entries are the
+/// paths and stats alone, and each slab of the apply reads its own.
 pub struct DomainScan {
     /// Renames: `(from, to)`, identical content moved to a new path in place.
     moves: Vec<(String, String)>,
     /// Recorded paths whose file vanished from disk, to delete from the index.
     deletes: std::collections::HashSet<String>,
-    /// Parsed new and modified engrams with their chunks computed off-thread.
-    parsed: Vec<Parsed>,
+    /// New and modified files to read, parse and upsert, slab by slab.
+    changed: Vec<PendingChange>,
+    /// The chunk fingerprinting parameters the slabs chunk with.
+    chunk_params: ChunkParams,
     /// The stamp snapshot the scan classified against, keyed by relative path.
     /// The apply compares the live db stamps against these to spot a concurrent
     /// write and defer the stale change.
@@ -170,14 +202,14 @@ pub struct DomainScan {
     started: Instant,
 }
 
-/// Scan one domain against a stamp snapshot: walk, prefilter, hash, classify and
-/// parse, with no store access at all.
+/// Scan one domain against a stamp snapshot: walk, prefilter, hash and classify,
+/// with no store access at all.
 ///
 /// `stamps` is the recorded [`FileStamp`] per relative path the caller read from
 /// the store before releasing its lock; the scan classifies every file against
 /// it and hands it back inside the [`DomainScan`] so the apply can re-check it.
-/// The walk, hash and parse phases run off-thread and never fail fatally: a file
-/// that cannot be read or parsed lands in `report.failed`, not an error.
+/// The walk and hash phases run off-thread and never fail fatally: a file that
+/// cannot be read lands in `report.failed`, not an error.
 pub async fn scan_domain(
     name: &str,
     root: &Path,
@@ -256,7 +288,7 @@ pub async fn scan_domain(
         .cloned()
         .collect();
 
-    Ok(classify_and_parse(
+    Ok(classify_changes(
         name,
         root,
         stamps,
@@ -360,7 +392,7 @@ pub async fn scan_paths(
         }
     }
 
-    classify_and_parse(
+    classify_changes(
         name,
         root,
         stamps,
@@ -373,20 +405,24 @@ pub async fn scan_paths(
     .await
 }
 
-/// The classification and parse core shared by [`scan_domain`] and [`scan_paths`].
+/// The classification core shared by [`scan_domain`] and [`scan_paths`].
 ///
 /// Given the markdown files found on disk (`current`, keyed by relative path) and
 /// the recorded paths whose file is gone (`deleted_paths`), it prefilters against
 /// `stamps`, hashes the survivors, detects moves within this batch (a vanished
 /// path whose stored checksum matches a new file's hash is a rename, not a delete
-/// plus an add), parses the genuinely changed files off-thread and assembles the
-/// [`DomainScan`]. The walk front and the path-list front differ only in how they
-/// build `current` and `deleted_paths`; everything from here is identical, so the
-/// two stay in step by construction. `report.unchanged` counts only paths
-/// actually examined - the whole domain for a walk, only the given paths for a
-/// targeted scan - because it is only ever bumped for an entry in `current`.
+/// plus an add) and assembles the [`DomainScan`]. The walk front and the path-list
+/// front differ only in how they build `current` and `deleted_paths`; everything
+/// from here is identical, so the two stay in step by construction.
+/// `report.unchanged` counts only paths actually examined - the whole domain for a
+/// walk, only the given paths for a targeted scan - because it is only ever
+/// bumped for an entry in `current`.
+///
+/// Move detection and the delete set are whole-batch here, before a single row is
+/// written, which is what lets the apply slab the changed files afterwards
+/// without changing the end state.
 #[allow(clippy::too_many_arguments)]
-async fn classify_and_parse(
+async fn classify_changes(
     name: &str,
     root: &Path,
     stamps: HashMap<String, FileStamp>,
@@ -401,8 +437,8 @@ async fn classify_and_parse(
         domain: name.to_string(),
         // Paths that could not be stat'd (a denied parent, an io fault) are
         // failures the caller already collected: fold them in up front, then
-        // the hashing and parsing phases append their own read and parse
-        // failures to the same list.
+        // the hashing phase and the apply's slabs append their own read and
+        // parse failures to the same list.
         failed: unreadable,
         ..SyncReport::default()
     };
@@ -421,7 +457,9 @@ async fn classify_and_parse(
         }
     }
 
-    // Hash (and read) the survivors off-thread with bounded concurrency.
+    // Hash the survivors off-thread with bounded concurrency. Only the checksum
+    // comes back: classification needs nothing else, and holding every changed
+    // file's contents here is exactly the peak the slabbed apply removes.
     let hashed = hash_files(to_hash, &mut report).await;
 
     // Index deleted files by checksum for move detection.
@@ -439,12 +477,12 @@ async fn classify_and_parse(
     // Classify each hashed file. The bool records whether the engram was
     // already indexed, so the apply phase can tell added from updated.
     let mut moves: Vec<(String, String)> = Vec::new();
-    let mut changed: Vec<(Scanned, Hashed, bool)> = Vec::new();
-    for (scanned, hashed) in hashed {
+    let mut changed: Vec<PendingChange> = Vec::new();
+    for (scanned, sha256) in hashed {
         let is_new = !stamps.contains_key(&scanned.rel);
         if is_new {
             // A new file whose checksum matches a vanished file is a move.
-            if let Some(candidates) = deleted_by_hash.get_mut(&hashed.sha256)
+            if let Some(candidates) = deleted_by_hash.get_mut(&sha256)
                 && let Some(from) = candidates
                     .iter()
                     .find(|p| deleted_remaining.contains(*p))
@@ -454,28 +492,30 @@ async fn classify_and_parse(
                 moves.push((from, scanned.rel.clone()));
                 continue;
             }
-            changed.push((scanned, hashed, false));
+            changed.push(PendingChange {
+                scanned,
+                previously_indexed: false,
+            });
         } else {
             let stamp = stamps.get(&scanned.rel);
-            let same = stamp.map(|s| s.sha256 == hashed.sha256).unwrap_or(false);
+            let same = stamp.map(|s| s.sha256 == sha256).unwrap_or(false);
             if same {
                 // Touched but identical content: nothing to reindex.
                 report.unchanged += 1;
             } else {
-                changed.push((scanned, hashed, true));
+                changed.push(PendingChange {
+                    scanned,
+                    previously_indexed: true,
+                });
             }
         }
     }
 
-    // Parse the changed files off-thread, computing each engram's chunks in the
-    // same off-thread task so the write transaction never runs the chunker. Read
-    // failures and parse failures are reported, not fatal.
-    let parsed = parse_files(changed, chunk_params, &mut report).await;
-
     DomainScan {
         moves,
         deletes: deleted_remaining,
-        parsed,
+        changed,
+        chunk_params: chunk_params.clone(),
         snapshot: stamps,
         root: root.to_path_buf(),
         report,
@@ -490,6 +530,11 @@ async fn classify_and_parse(
 /// `failed` and do not abort the batch (they are pre-checked so no failing
 /// statement runs); any other error rolls the batch back.
 ///
+/// The changed files are read, parsed and upserted in slabs of
+/// [`SYNC_SLAB_FILES`], so the apply of a huge domain holds one slab of contents
+/// at a time - see the module-level memory note. Use [`apply_scan_with_slab`] to
+/// pick another slab size.
+///
 /// A concurrent writer can move the index between the scan's snapshot and this
 /// apply. The apply re-reads the live stamps once, inside the transaction, and
 /// defers any classified change whose live db stamp no longer matches the
@@ -499,10 +544,23 @@ pub async fn apply_scan<S: Store + ?Sized>(
     domain: DomainId,
     scan: DomainScan,
 ) -> Result<SyncReport> {
+    apply_scan_with_slab(store, domain, scan, SYNC_SLAB_FILES).await
+}
+
+/// [`apply_scan`] with an explicit slab size, for tests that want to exercise the
+/// slab boundaries on a handful of files. `slab_files` only changes how the work
+/// is cut up, never the end state; production uses [`SYNC_SLAB_FILES`].
+pub async fn apply_scan_with_slab<S: Store + ?Sized>(
+    store: &S,
+    domain: DomainId,
+    scan: DomainScan,
+    slab_files: usize,
+) -> Result<SyncReport> {
     let DomainScan {
         moves,
         deletes,
-        parsed,
+        changed,
+        chunk_params,
         snapshot,
         root,
         mut report,
@@ -515,10 +573,12 @@ pub async fn apply_scan<S: Store + ?Sized>(
         domain,
         moves,
         deletes,
-        parsed,
+        changed,
+        &chunk_params,
         &snapshot,
         &root,
         &mut report,
+        slab_files.max(1),
     )
     .await;
     if let Err(e) = apply {
@@ -584,15 +644,17 @@ async fn apply_changes<S: Store + ?Sized>(
     domain: DomainId,
     moves: Vec<(String, String)>,
     deletes: std::collections::HashSet<String>,
-    parsed: Vec<Parsed>,
+    changed: Vec<PendingChange>,
+    chunk_params: &ChunkParams,
     snapshot: &HashMap<String, FileStamp>,
     root: &Path,
     report: &mut SyncReport,
+    slab_files: usize,
 ) -> Result<()> {
     // The live stamps guard against a writer that moved the index between the
     // scan's snapshot and now. Read them once, inside the transaction and only
     // when there is something to apply, so the warm no-change pass adds no query.
-    let live = if moves.is_empty() && deletes.is_empty() && parsed.is_empty() {
+    let live = if moves.is_empty() && deletes.is_empty() && changed.is_empty() {
         HashMap::new()
     } else {
         store.file_stamps(domain).await?
@@ -628,52 +690,169 @@ async fn apply_changes<S: Store + ?Sized>(
         store.delete_engram(domain, &path).await?;
         report.deleted += 1;
     }
-    for p in parsed {
-        // The db stamp for this path moved since the snapshot: a concurrent
-        // writer indexed newer state, so the parsed content is stale. Applying it
-        // would clobber the newer state, so defer and let the next pass reconcile.
-        let path = p.record.path.as_str();
-        if live.get(path) != snapshot.get(path) {
-            report.deferred += 1;
-            tracing::debug!(path = %path, "sync: deferring a change whose db stamp moved mid-scan");
-            continue;
-        }
-        let existed = p.previously_indexed;
-        match store.upsert_engram(domain, &p.record).await {
-            Ok(id) => {
-                // Apply the chunk rows computed off-thread in parse_files, right
-                // after the upsert returns the id. replace_chunks keeps the
-                // embedding of any chunk whose fingerprint is unchanged, so an
-                // edit only re-embeds the paragraphs that changed; the fingerprint
-                // folds in only the model id and text, so computing the chunks
-                // before the transaction changes nothing about the carry-over.
-                store.replace_chunks(id, &p.chunks).await?;
-                if existed {
-                    report.updated += 1;
-                } else {
-                    report.added += 1;
+    // The changed files, slab by slab. The stale-stamp guard runs before a slab
+    // is read, so a deferred path costs no read and no parse at all.
+    let mut queue = changed;
+    while !queue.is_empty() {
+        let take = queue.len().min(slab_files);
+        let mut slab: Vec<PendingChange> = queue.drain(..take).collect();
+        slab.retain(|c| {
+            let path = c.scanned.rel.as_str();
+            // The db stamp for this path moved since the snapshot: a concurrent
+            // writer indexed newer state, so this change is stale. Applying it
+            // would clobber the newer state, so defer and let the next pass
+            // reconcile.
+            if live.get(path) != snapshot.get(path) {
+                report.deferred += 1;
+                tracing::debug!(path = %path, "sync: deferring a change whose db stamp moved mid-scan");
+                return false;
+            }
+            true
+        });
+        parse_and_apply_slab(store, domain, slab, chunk_params, report).await?;
+    }
+    Ok(())
+}
+
+/// Read, parse, chunk and upsert one slab of changed files.
+///
+/// Every file in the slab is read and parsed off-thread with the same bounded
+/// concurrency the hashing phase uses, and each result is upserted the moment it
+/// arrives, so the contents of at most one slab are ever live. Read and parse
+/// failures are reported, not fatal; a file that vanished between the scan and
+/// its slab is deferred, exactly as a change whose db stamp moved, because the
+/// pass that removed it has its own event queued.
+async fn parse_and_apply_slab<S: Store + ?Sized>(
+    store: &S,
+    domain: DomainId,
+    slab: Vec<PendingChange>,
+    chunk_params: &ChunkParams,
+    report: &mut SyncReport,
+) -> Result<()> {
+    let sem = Arc::new(Semaphore::new(CONCURRENCY));
+    let mut set: JoinSet<ParseOutcome> = JoinSet::new();
+    // The relative path moves into its task (it lands in the `ParseOutcome`), so
+    // a task that panics outright would lose it. Keep a task-id to path map so a
+    // panicked task is still attributable in `failed`.
+    let mut ids: HashMap<tokio::task::Id, String> = HashMap::new();
+    for change in slab {
+        let sem = sem.clone();
+        let rel = change.scanned.rel.clone();
+        // Chunking is two small fields, cloned per task so it moves into the
+        // blocking closure alongside the read and the parse.
+        let chunk_params = chunk_params.clone();
+        let handle = set.spawn(async move {
+            let _permit = sem.acquire_owned().await.expect("semaphore open");
+            let PendingChange {
+                scanned,
+                previously_indexed,
+            } = change;
+            // Read, parse and chunk in one blocking task. The checksum is taken
+            // from these very bytes, so the stored stamp always describes the
+            // content that landed, exactly as when the read fed the hash phase.
+            let parsed = tokio::task::spawn_blocking(move || {
+                let bytes = match std::fs::read(&scanned.abs) {
+                    Ok(b) => b,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        return ParseOutcome::Vanished(scanned.rel);
+                    }
+                    Err(e) => return ParseOutcome::Failed(scanned.rel, e.to_string()),
+                };
+                let mut hasher = Sha256::new();
+                hasher.update(&bytes);
+                let sha256 = crate::hex_lower(&hasher.finalize());
+                let Ok(content) = String::from_utf8(bytes) else {
+                    return ParseOutcome::Failed(
+                        scanned.rel,
+                        "file is not valid UTF-8".to_string(),
+                    );
+                };
+                let stamp = FileStamp {
+                    mtime: scanned.mtime,
+                    size: scanned.size,
+                    sha256,
+                };
+                match crystalline_core::parse_engram(&content) {
+                    Ok(engram) => {
+                        let record = EngramRecord::from_engram(&engram, &scanned.rel, stamp);
+                        let chunks = chunk_engram(
+                            &record.title,
+                            record.description.as_deref(),
+                            &record.content,
+                            &chunk_params,
+                        );
+                        ParseOutcome::Ok(Box::new(record), chunks, previously_indexed)
+                    }
+                    Err(e) => ParseOutcome::Failed(scanned.rel, e.to_string()),
+                }
+            })
+            .await;
+            match parsed {
+                Ok(outcome) => outcome,
+                Err(e) => ParseOutcome::Failed(String::new(), e.to_string()),
+            }
+        });
+        ids.insert(handle.id(), rel);
+    }
+
+    while let Some(joined) = set.join_next_with_id().await {
+        match joined {
+            Ok((id, ParseOutcome::Ok(record, chunks, previously_indexed))) => {
+                ids.remove(&id);
+                match store.upsert_engram(domain, &record).await {
+                    Ok(engram_id) => {
+                        // Apply the chunk rows computed in the same off-thread
+                        // task, right after the upsert returns the id.
+                        // replace_chunks keeps the embedding of any chunk whose
+                        // fingerprint is unchanged, so an edit only re-embeds the
+                        // paragraphs that changed; the fingerprint folds in only
+                        // the model id and text, so where the chunks were computed
+                        // changes nothing about the carry-over.
+                        store.replace_chunks(engram_id, &chunks).await?;
+                        if previously_indexed {
+                            report.updated += 1;
+                        } else {
+                            report.added += 1;
+                        }
+                    }
+                    Err(IndexError::Constraint(msg)) => {
+                        report.failed.push((record.path.clone(), msg));
+                    }
+                    Err(other) => return Err(other),
                 }
             }
-            Err(IndexError::Constraint(msg)) => {
-                report.failed.push((p.record.path.clone(), msg));
+            Ok((id, ParseOutcome::Vanished(path))) => {
+                ids.remove(&id);
+                report.deferred += 1;
+                tracing::debug!(path = %path, "sync: deferring a change whose file vanished mid-sync");
             }
-            Err(other) => return Err(other),
+            Ok((id, ParseOutcome::Failed(path, err))) => {
+                // A blocking task that panicked outright loses the path with it,
+                // so fall back to the task-id map to keep the failure attributable.
+                let mapped = ids.remove(&id);
+                let path = if path.is_empty() {
+                    mapped.unwrap_or_else(|| "unknown".to_string())
+                } else {
+                    path
+                };
+                report.failed.push((path, err));
+            }
+            Err(join_err) => {
+                let rel = ids
+                    .remove(&join_err.id())
+                    .unwrap_or_else(|| "unknown".to_string());
+                report
+                    .failed
+                    .push((rel, format!("task panicked: {join_err}")));
+            }
         }
     }
     Ok(())
 }
 
-/// A parsed change ready to upsert, with its embedding chunks already computed
-/// off-thread so the write transaction never runs the chunker.
-struct Parsed {
-    record: EngramRecord,
-    chunks: Vec<NewChunk>,
-    previously_indexed: bool,
-}
-
-async fn hash_files(files: Vec<Scanned>, report: &mut SyncReport) -> Vec<(Scanned, Hashed)> {
+async fn hash_files(files: Vec<Scanned>, report: &mut SyncReport) -> Vec<(Scanned, String)> {
     let sem = Arc::new(Semaphore::new(CONCURRENCY));
-    let mut set: JoinSet<(Scanned, std::io::Result<Hashed>)> = JoinSet::new();
+    let mut set: JoinSet<(Scanned, std::io::Result<String>)> = JoinSet::new();
     // The file identity moves into its task, so a task that panics outright
     // would otherwise vanish without a trace. Keep a task-id to relative-path
     // map so a panicked task is still attributable in `failed`.
@@ -694,21 +873,16 @@ async fn hash_files(files: Vec<Scanned>, report: &mut SyncReport) -> Vec<(Scanne
     let mut out = Vec::new();
     while let Some(joined) = set.join_next_with_id().await {
         match joined {
-            Ok((id, (scanned, Ok(hashed)))) => {
+            Ok((id, (scanned, Ok(sha256)))) => {
                 ids.remove(&id);
-                out.push((scanned, hashed));
+                out.push((scanned, sha256));
             }
-            Ok((id, (scanned, Err(_)))) => {
+            Ok((id, (scanned, Err(e)))) => {
                 ids.remove(&id);
-                // Unreadable file: surface it as a change with no content so the
-                // parse phase reports the failure.
-                out.push((
-                    scanned,
-                    Hashed {
-                        sha256: String::new(),
-                        content: None,
-                    },
-                ));
+                // Unreadable file: report the failure and leave the path out of
+                // the changed set, so its row (if any) stays untouched and the
+                // next pass retries it.
+                report.failed.push((scanned.rel, e.to_string()));
             }
             Err(join_err) => {
                 let rel = ids
@@ -723,103 +897,24 @@ async fn hash_files(files: Vec<Scanned>, report: &mut SyncReport) -> Vec<(Scanne
     out
 }
 
-fn read_and_hash(path: &Path) -> std::io::Result<Hashed> {
+/// Hash a candidate file, keeping nothing but its checksum: the contents are
+/// dropped here and read again by the slab that parses the file, which is what
+/// keeps a scan of a huge domain flat in memory.
+fn read_and_hash(path: &Path) -> std::io::Result<String> {
     let bytes = std::fs::read(path)?;
     let mut hasher = Sha256::new();
     hasher.update(&bytes);
-    let sha256 = crate::hex_lower(&hasher.finalize());
-    let content = String::from_utf8(bytes).ok();
-    Ok(Hashed { sha256, content })
+    Ok(crate::hex_lower(&hasher.finalize()))
 }
 
-async fn parse_files(
-    changed: Vec<(Scanned, Hashed, bool)>,
-    chunk_params: &ChunkParams,
-    report: &mut SyncReport,
-) -> Vec<Parsed> {
-    let sem = Arc::new(Semaphore::new(CONCURRENCY));
-    let mut set: JoinSet<ParseOutcome> = JoinSet::new();
-    // The relative path moves into its task (it lands in the `ParseOutcome`), so
-    // a task that panics outright would lose it. Keep a task-id to path map so a
-    // panicked task is still attributable in `failed`.
-    let mut ids: HashMap<tokio::task::Id, String> = HashMap::new();
-    for (scanned, hashed, previously_indexed) in changed {
-        let sem = sem.clone();
-        let rel = scanned.rel.clone();
-        // Chunking is two small fields, cloned per task so it moves into the
-        // blocking closure alongside the parse.
-        let chunk_params = chunk_params.clone();
-        let handle = set.spawn(async move {
-            let _permit = sem.acquire_owned().await.expect("semaphore open");
-            let Some(content) = hashed.content else {
-                return ParseOutcome::Failed(scanned.rel, "file is not valid UTF-8".to_string());
-            };
-            let rel = scanned.rel.clone();
-            let stamp = FileStamp {
-                mtime: scanned.mtime,
-                size: scanned.size,
-                sha256: hashed.sha256,
-            };
-            // Parse and chunk in one blocking task: both are pure CPU work, and
-            // computing the chunks here keeps the chunker out of the write
-            // transaction the apply phase holds.
-            let parsed = tokio::task::spawn_blocking(move || {
-                crystalline_core::parse_engram(&content)
-                    .map(|engram| {
-                        let record = EngramRecord::from_engram(&engram, &rel, stamp);
-                        let chunks = chunk_engram(
-                            &record.title,
-                            record.description.as_deref(),
-                            &record.content,
-                            &chunk_params,
-                        );
-                        (record, chunks)
-                    })
-                    .map_err(|e| e.to_string())
-            })
-            .await;
-            match parsed {
-                Ok(Ok((record, chunks))) => {
-                    ParseOutcome::Ok(Box::new(record), chunks, previously_indexed)
-                }
-                Ok(Err(e)) => ParseOutcome::Failed(scanned.rel, e),
-                Err(e) => ParseOutcome::Failed(scanned.rel, e.to_string()),
-            }
-        });
-        ids.insert(handle.id(), rel);
-    }
-
-    let mut out = Vec::new();
-    while let Some(joined) = set.join_next_with_id().await {
-        match joined {
-            Ok((id, ParseOutcome::Ok(record, chunks, previously_indexed))) => {
-                ids.remove(&id);
-                out.push(Parsed {
-                    previously_indexed,
-                    record: *record,
-                    chunks,
-                });
-            }
-            Ok((id, ParseOutcome::Failed(path, err))) => {
-                ids.remove(&id);
-                report.failed.push((path, err));
-            }
-            Err(join_err) => {
-                let rel = ids
-                    .remove(&join_err.id())
-                    .unwrap_or_else(|| "unknown".to_string());
-                report
-                    .failed
-                    .push((rel, format!("task panicked: {join_err}")));
-            }
-        }
-    }
-    out
-}
-
+/// What one slab task produced: a parsed record with its chunks and the
+/// added-versus-updated flag, a reported failure (an empty path means the
+/// blocking task itself panicked and the caller maps the task id back), or a file
+/// that vanished between the scan and its slab.
 enum ParseOutcome {
     Ok(Box<EngramRecord>, Vec<NewChunk>, bool),
     Failed(String, String),
+    Vanished(String),
 }
 
 fn is_hidden(name: &str) -> bool {
