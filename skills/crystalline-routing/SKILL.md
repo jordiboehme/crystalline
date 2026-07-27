@@ -63,6 +63,8 @@ For an overview or synthesis question - "what is X about", "summarize the strate
 
 Content read earlier in the session for a different task is not coverage for the current question. Re-ask what this question needs, search again when the earlier reads served another purpose and read what is missing - anchoring on the engram that happens to be in context produces answers that are accurate but thin. When something relevant stays unread, say so in the answer rather than presenting partial coverage as complete.
 
+A hit whose `type` is `source` is the full text of a captured document, not a distilled answer, and it often out-ranks its own summary in the hit list. Follow its `summarized_by` relation and read the summary first; pull the full text only when the summary does not answer the question. Preferring the summary that way is complete coverage, not an unread source to caveat.
+
 ## Temporal filtering: "what is true now"
 
 `status: current` is the primary, reliable signal for currency - filter on it directly:
@@ -141,6 +143,7 @@ Folders are not a navigation tree - search and the routing lines stay primary. A
 - One domain obviously owns it (even if unnamed) -> `search_engrams` with `domains: ["that-domain"]`.
 - Broad, unclear or cross-domain -> `search_engrams` with `domains` omitted (an all-domain sweep).
 - Overview or synthesis question ("what is X about") -> read every strong hit with `read_engram` before drafting; a snippet is never a source.
+- Hit with `type: source` -> read its summary first (follow `summarized_by`); pull the full text only when the summary falls short.
 - Scoped hits keep missing the point -> one unscoped sweep; the question's owner may not be the subject's owner.
 - "What is true now" -> `status: "current"`; add `valid_from`/`valid_to` filters only for a specific bounded-in-time question.
 - "Did we adopt X" -> search without a status filter and narrate each hit's status.
