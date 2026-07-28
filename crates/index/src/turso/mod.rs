@@ -696,13 +696,23 @@ impl Store for TursoStore {
     }
 
     async fn all_engram_contents(&self, domain: DomainId) -> Result<Vec<StoredEngram>> {
+        // Deliberately unordered in SQL and sorted by path in Rust. This
+        // projection carries every body in the domain, and an `ORDER BY path`
+        // pushes all of them through turso's sorter, which spills each body to
+        // a temp file and holds a read buffer per flushed chunk: linear in
+        // domain size, and catastrophic with multi-MB engrams. The caller's
+        // contract (a path-ordered listing) is unchanged - the whole result set
+        // is materialized here either way, so sorting it in memory moves
+        // pointers and touches no body. Sorting in Rust also makes the two
+        // backends agree byte for byte, where Postgres' locale collation could
+        // differ from turso's binary one.
         let rows = query_all(
             &self.conn,
-            "SELECT path, permalink, content, sha256 FROM engram WHERE domain_id=?1 ORDER BY path",
+            "SELECT path, permalink, content, sha256 FROM engram WHERE domain_id=?1",
             vec![Value::Integer(domain.0)],
         )
         .await?;
-        Ok(rows
+        let mut out: Vec<StoredEngram> = rows
             .iter()
             .map(|r| StoredEngram {
                 path: cell_text(r, 0).unwrap_or_default(),
@@ -710,7 +720,9 @@ impl Store for TursoStore {
                 content: cell_text(r, 2).unwrap_or_default(),
                 sha256: cell_text(r, 3).unwrap_or_default(),
             })
-            .collect())
+            .collect();
+        out.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(out)
     }
 
     async fn clear_domain(&self, domain: DomainId) -> Result<()> {
@@ -1252,6 +1264,12 @@ impl Store for TursoStore {
         // nothing (this instance hosts nothing embeddable). The keyset cursor
         // and the page limit ride on top of the same ordering the query always
         // had, so a paged pass sees the same jobs in the same order.
+        //
+        // This projection carries `text`, and the `ORDER BY` does open a sorter.
+        // It stays bounded because there is no `GROUP BY` and the `LIMIT` is
+        // always present, so turso keeps only `limit` records: one page of chunk
+        // texts, each capped by the chunker's token budget. Never add a
+        // `GROUP BY` here, and never drop the `LIMIT`.
         let mut sql = String::from(
             "SELECT id, engram_id, seq, text, text_hash FROM chunk \
              WHERE (embedding IS NULL OR model IS NULL OR model != ?1)",

@@ -22,6 +22,7 @@ pub mod params;
 mod poller;
 pub mod settings;
 pub mod stub;
+pub mod temp_store;
 mod tool_schema;
 mod toon;
 

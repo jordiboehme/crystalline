@@ -831,6 +831,16 @@ pub fn daemon_log_path() -> Result<PathBuf, ConfigError> {
     Ok(state_dir()?.join("daemon.log"))
 }
 
+/// The daemon's own scratch directory, `<state_dir>/tmp`. The daemon points the
+/// process temp location here at startup so a database engine's sorter spill
+/// lands somewhere identifiable and reclaimable instead of the user's shared
+/// system temp directory, where a killed process leaves it behind forever.
+/// Owned by the daemon: nothing else writes here, so it is the only directory
+/// the startup sweep is ever allowed to delete from.
+pub fn temp_store_dir() -> Result<PathBuf, ConfigError> {
+    Ok(state_dir()?.join("tmp"))
+}
+
 /// The directory holding every origin's on-disk state, `<state_dir>/origins`.
 pub fn origins_state_dir() -> Result<PathBuf, ConfigError> {
     Ok(state_dir()?.join("origins"))
