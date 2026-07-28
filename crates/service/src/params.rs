@@ -50,9 +50,11 @@ pub struct WriteParams {
     /// Tags, lowercase-with-hyphens. At least one is recommended.
     #[serde(default, deserialize_with = "null_as_default")]
     pub tags: Vec<String>,
-    /// Lifecycle `status`. Defaults to `current`. Recommended values: current,
+    /// Lifecycle `status`. Defaults to `stable`. Recommended values: stable,
     /// implemented, draft, proposed, idea, poc, deprecated, superseded, archived,
-    /// legacy (guidance so an agent can tell an idea apart from current fact).
+    /// legacy (guidance so an agent can tell an idea apart from settled fact).
+    /// `current` is the legacy alias for `stable` and means the same thing; a
+    /// status filter on either word matches engrams carrying either.
     #[serde(default)]
     pub status: Option<String>,
     /// Extra frontmatter keys, preserved verbatim and filterable. Temporal
@@ -61,6 +63,9 @@ pub struct WriteParams {
     /// any other value fails the write, while an explicit null or a sentinel
     /// far-future date is dropped. A verification goes here too, as
     /// verified: { by: <actor>, at: <RFC 3339 instant> } or a list of those.
+    /// The write provenance keys generated and timestamp are engine-owned and
+    /// are ignored when passed here, as are type, title, permalink, tags,
+    /// status and recorded_at, which have their own parameters.
     #[serde(default)]
     pub metadata: Option<serde_json::Value>,
     /// Overwrite an existing engram with the same permalink instead of erroring.
@@ -158,10 +163,21 @@ pub struct SearchParams {
     /// Require all of these tags.
     #[serde(default, deserialize_with = "null_as_default")]
     pub tags: Vec<String>,
-    /// Filter by `status`.
+    /// Filter by `status`. `stable` and `current` mean the same state, so a
+    /// filter on either word matches engrams carrying either; every other value
+    /// matches exactly.
     #[serde(default)]
     pub status: Option<String>,
-    /// Frontmatter filters, `{ key: value }` or `{ key: { $gt: n } }`.
+    /// Frontmatter filters, `{ key: value }` or `{ key: { $gt: n } }`. The
+    /// filterable keys are the promoted ones (type, status, title, permalink,
+    /// recorded_at, valid_from, valid_to, tags, plus timestamp for the write
+    /// instant), every custom frontmatter key an engram carries (salience among
+    /// them) and source_date, last_verified, stale_after, temporal_confidence,
+    /// resource and verified. last_verified and stale_after carry the effective
+    /// value whichever spelling an engram uses, so review_after is not a filter
+    /// key of its own; the generated block's by actor is not filterable either.
+    /// A status filter here matches exactly, so use the status parameter when
+    /// you want the stable and current spellings folded together.
     #[serde(default)]
     pub metadata_filters: Option<serde_json::Value>,
     /// Only engrams recorded on or after this ISO date.

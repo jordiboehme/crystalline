@@ -52,6 +52,11 @@ DISALLOWED_TOOLS = [
 
 TRANSIENT_API_STATUS = {401, 403, 429, 500, 502, 503, 529}
 
+# Filenames the Open Knowledge Format reserves for generated navigation.
+# Crystalline writes and refreshes them itself and never indexes them, so a
+# scored snapshot must not count them as agent-authored engrams.
+RESERVED_FILENAMES = {"index.md", "log.md"}
+
 PrepareFn = Callable[[dict, Path], Any]
 ScoreFn = Callable[[dict, Path, list[dict], str, Any], tuple[int, float, list[str]]]
 SetupFn = Callable[[dict, Path], tuple[Path, Any]]
@@ -467,6 +472,7 @@ def snapshot(sandbox: Path, crystalline_bin: str) -> dict:
     files = {
         str(p.relative_to(domains_root))
         for p in domains_root.rglob("*.md")
+        if p.name not in RESERVED_FILENAMES
     }
     return {"verify_errors": errors, "verify_issues": issues, "files": files}
 
@@ -491,6 +497,8 @@ def find_engram_file(sandbox: Path, domain: str, permalink: str) -> Path | None:
     domain_dir = sandbox / "domains" / domain
     slug = permalink.strip("/").split("/")[-1]
     for p in domain_dir.rglob("*.md"):
+        if p.name in RESERVED_FILENAMES:
+            continue
         if p.stem == slug:
             return p
     return None

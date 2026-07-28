@@ -28,12 +28,15 @@ pub const RECOMMENDED_TYPES: &[&str] = &[
 /// purpose of status is letting an agent tell an idea or draft apart from
 /// current fact, not taxonomy policing. Never used to reject an Engram.
 ///
-/// `current` is what Crystalline writes and `stable` is the OKF v0.2 word for
-/// the same state (§5.4, where an absent status also means stable), so both are
-/// recommended and a foreign OKF bundle reads naturally without a rewrite.
+/// `stable` is what Crystalline writes and the OKF v0.2 word for that state
+/// (§5.4, where an absent status also means stable), so a foreign OKF bundle
+/// reads naturally without a rewrite. `current` is the backward-compatible
+/// alias meaning exactly the same thing: everything written before the flip
+/// keeps its meaning, and search treats the two words as one class in both
+/// directions.
 pub const RECOMMENDED_STATUSES: &[&str] = &[
-    "current",
     "stable",
+    "current",
     "implemented",
     "draft",
     "proposed",

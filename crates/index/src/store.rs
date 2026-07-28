@@ -7,9 +7,12 @@
 //!
 //! Temporal semantics are open ended: an absent `valid_from` means always valid
 //! and an absent `valid_to` means valid forever. The canonical current filter is
-//! `status = 'current' AND (valid_from IS NULL OR valid_from <= :today) AND
-//! (valid_to IS NULL OR valid_to > :today)`; it maps onto the promoted, indexed
-//! `(status, valid_from, valid_to)` columns rather than the metadata JSON.
+//! `status IN ('stable', 'current') AND (valid_from IS NULL OR valid_from <=
+//! :today) AND (valid_to IS NULL OR valid_to > :today)`; it maps onto the
+//! promoted, indexed `(status, valid_from, valid_to)` columns rather than the
+//! metadata JSON. `stable` and `current` are one equivalence class throughout
+//! (see [`CURRENT_STATUS_CLASS`]), so a domain written before the vocabulary
+//! flip and a foreign OKF bundle both stay first-class.
 
 use std::collections::HashMap;
 
@@ -367,7 +370,9 @@ pub struct SearchQuery {
     pub domains: Option<Vec<String>>,
     /// Filter by `type`.
     pub engram_type: Option<String>,
-    /// Filter by `status`.
+    /// Filter by `status`. `stable` and `current` are one equivalence class in
+    /// both directions (see [`CURRENT_STATUS_CLASS`]); any other value is an
+    /// exact match.
     pub status: Option<String>,
     /// Require all of these tags.
     pub tags: Option<Vec<String>>,
@@ -376,7 +381,7 @@ pub struct SearchQuery {
     /// Only engrams with `recorded_at >= after`.
     pub after: Option<String>,
     /// Apply the canonical current filter as of `today` (or the real today when
-    /// `today` is `None`). Overrides `status` with `status = 'current'`.
+    /// `today` is `None`). Overrides `status` with the current status class.
     pub current_only: bool,
     /// The date used by `current_only`, ISO `YYYY-MM-DD`.
     pub today: Option<String>,
@@ -567,8 +572,22 @@ pub fn salience_prior(salience: Option<f64>, weight: f64) -> f64 {
 pub const LEXICAL_CANDIDATE_CAP: usize = 5000;
 
 /// Statuses that mark knowledge as retired. Exact lowercase match, the same
-/// stance as the canonical `e.status = 'current'` filter.
+/// stance as the canonical current filter.
 const RETIRED_STATUSES: [&str; 4] = ["deprecated", "superseded", "archived", "legacy"];
+
+/// The statuses that mean "this is what holds now", as one equivalence class.
+/// `stable` is the canonical word Crystalline writes and the OKF v0.2 spelling;
+/// `current` is what it wrote before the flip and is read as the same state
+/// forever. Both backends expand the class in the canonical current filter and
+/// in an explicit status filter, in both directions: filtering on either word
+/// matches engrams carrying either. Every other status stays an exact match.
+pub const CURRENT_STATUS_CLASS: [&str; 2] = ["stable", "current"];
+
+/// Whether a status belongs to the current equivalence class. Exact lowercase
+/// match, the same stance as the retirement set.
+pub fn is_current_status(status: &str) -> bool {
+    CURRENT_STATUS_CLASS.contains(&status)
+}
 
 /// The default retired-status fade when a query does not override it.
 pub const DEFAULT_RETIRED_WEIGHT: f64 = 0.6;

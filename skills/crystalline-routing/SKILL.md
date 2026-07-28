@@ -31,12 +31,12 @@ An ambiguous term is not grounds to ask the user for clarification before search
 }
 ```
 
-When the question is also about the present-day state, put `domains` and `status: "current"` in the same call - one round trip instead of a search plus a filtered retry:
+When the question is also about the present-day state, put `domains` and `status: "stable"` in the same call - one round trip instead of a search plus a filtered retry:
 
 ```json
 {
   "tool": "search_engrams",
-  "arguments": { "query": "standard plan price", "domains": ["policies"], "status": "current" }
+  "arguments": { "query": "standard plan price", "domains": ["policies"], "status": "stable" }
 }
 ```
 
@@ -67,12 +67,12 @@ A hit whose `type` is `source` is the full text of a captured document, not a di
 
 ## Temporal filtering: "what is true now"
 
-`status: current` is the primary, reliable signal for currency - filter on it directly:
+`status: stable` is the primary, reliable signal for currency - filter on it directly:
 
 ```json
 {
   "tool": "search_engrams",
-  "arguments": { "query": "deployment process", "status": "current" }
+  "arguments": { "query": "deployment process", "status": "stable" }
 }
 ```
 
@@ -88,12 +88,12 @@ Absence of `valid_from`/`valid_to` means unbounded validity (the write-side rule
 }
 ```
 
-For an ordinary present-day question, `status: current` alone is both correct and sufficient. When history matters - how something changed, why a decision was replaced - include `deprecated`, `superseded`, `draft`, `idea` and `poc` engrams too and narrate each one's status rather than presenting it as current fact.
+For an ordinary present-day question, `status: stable` alone is both correct and sufficient. `current` is the older word for the same state and a filter on either returns both, so an older domain needs no special handling. When history matters - how something changed, why a decision was replaced - include `deprecated`, `superseded`, `draft`, `idea` and `poc` engrams too and narrate each one's status rather than presenting it as current fact.
 
-Classify the question shape before dropping the `current` filter:
+Classify the question shape before dropping the currency filter:
 
-- **Binary adoption questions** - "are we running on X", "did we adopt Y", "is Z live". The yes/no itself is in doubt, so search without a status filter and read each hit's own `status`; a `current`-only filter would hide the draft or superseded engram that answers "no". Name the status in the answer ("proposed but never marked current").
-- **Attribute questions** - "how long does X live", "how much does Y cost", "how many stages". The thing exists; only its present value is unknown. Keep `status: "current"` even when the subject sounds operational.
+- **Binary adoption questions** - "are we running on X", "did we adopt Y", "is Z live". The yes/no itself is in doubt, so search without a status filter and read each hit's own `status`; a currency filter would hide the draft or superseded engram that answers "no". Name the status in the answer ("proposed but never marked stable").
+- **Attribute questions** - "how long does X live", "how much does Y cost", "how many stages". The thing exists; only its present value is unknown. Keep `status: "stable"` even when the subject sounds operational.
 
 When a window filter is not getting traction, the `supersedes`/`superseded_by` relations plus each hit's `status` tell the same temporal story: search by keyword (topic or year) and read which engram covers the period asked about.
 
@@ -145,7 +145,7 @@ Folders are not a navigation tree - search and the routing lines stay primary. A
 - Overview or synthesis question ("what is X about") -> read every strong hit with `read_engram` before drafting; a snippet is never a source.
 - Hit with `type: source` -> read its summary first (follow `summarized_by`); pull the full text only when the summary falls short.
 - Scoped hits keep missing the point -> one unscoped sweep; the question's owner may not be the subject's owner.
-- "What is true now" -> `status: "current"`; add `valid_from`/`valid_to` filters only for a specific bounded-in-time question.
+- "What is true now" -> `status: "stable"`; add `valid_from`/`valid_to` filters only for a specific bounded-in-time question.
 - "Did we adopt X" -> search without a status filter and narrate each hit's status.
 - Need the shape of a domain, not its content -> `browse_domain` or its `MANIFEST.md`.
 - About to write or re-file -> `browse_domain` for the layout, then the `crystalline-capture` skill.

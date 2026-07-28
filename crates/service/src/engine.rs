@@ -1249,7 +1249,7 @@ impl Engine {
             .engram_type
             .clone()
             .unwrap_or_else(|| "engram".to_string());
-        let status = p.status.clone().unwrap_or_else(|| "current".to_string());
+        let status = p.status.clone().unwrap_or_else(|| "stable".to_string());
         let tags = p.tags.clone();
 
         let folder = p.folder.clone().unwrap_or_default();

@@ -645,8 +645,16 @@ pub fn select_schema(engram: &Engram, schemas: &[Schema]) -> Option<Schema> {
 
 // --- inference and drift -----------------------------------------------------
 
+/// Frontmatter keys a suggestion never proposes as a schema field. `type` is
+/// the entity discriminator itself, while `generated` and `timestamp` are
+/// engine-owned provenance the write path fills in itself and ignores when
+/// passed as metadata, so suggesting them would hand back a draft a write can
+/// never satisfy.
+const SUGGESTION_SKIPPED_KEYS: [&str; 3] = ["type", "generated", "timestamp"];
+
 /// Infer a schema from a set of Engrams. Fields present in at least `threshold`
-/// of the Engrams become optional; at least 0.95 makes them required.
+/// of the Engrams become optional; at least 0.95 makes them required. Keys in
+/// [`SUGGESTION_SKIPPED_KEYS`] are never suggested.
 pub fn infer(engrams: &[Engram], threshold: f64) -> Schema {
     let total = engrams.len();
     let entity = common_type(engrams);
@@ -676,7 +684,7 @@ pub fn infer(engrams: &[Engram], threshold: f64) -> Schema {
             }
         }
         for key in frontmatter_map(&engram.frontmatter).keys() {
-            if key == "type" {
+            if SUGGESTION_SKIPPED_KEYS.contains(&key.as_str()) {
                 continue;
             }
             remember(&mut fm_order, key);

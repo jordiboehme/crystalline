@@ -31,7 +31,7 @@ type: manifest\n\
 title: {name}\n\
 permalink: manifest\n\
 tags:\n  - manifest\n\
-status: current\n\
+status: stable\n\
 recorded_at: {today}\n\
 ---\n\n\
 # {name}\n\n\
