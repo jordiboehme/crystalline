@@ -250,6 +250,17 @@ enum Command {
         #[arg(default_value = "127.0.0.1:7411")]
         addr: String,
     },
+    /// Test support: take the index lock, publish a service record and hold
+    /// both without ever binding the socket, which is exactly the shape of a
+    /// wedged daemon. Hidden, because it exists so the force-takeover path can
+    /// be proven against a real separate process instead of a simulation.
+    #[command(name = "hold-lock", hide = true)]
+    HoldLock {
+        /// Exit on its own after this many seconds, so a test that fails early
+        /// never leaves the lock held.
+        #[arg(long, default_value_t = 30)]
+        secs: u64,
+    },
     /// Run the single-instance daemon: watch domains, embed and serve MCP and ctl
     /// over the socket, optionally over HTTP.
     Serve {
@@ -1066,6 +1077,7 @@ fn main() -> anyhow::Result<()> {
             config,
         }) => on_runtime(move || run_doctor(domain, fix, config, cli.db, cli.json)),
         Some(Command::Healthcheck { addr }) => cmd::healthcheck(&addr),
+        Some(Command::HoldLock { secs }) => hold_lock(secs),
         Some(Command::Serve {
             http,
             allowed_host,
@@ -1142,6 +1154,29 @@ fn content_or_stdin(content: Option<String>) -> anyhow::Result<String> {
     }
 }
 
+/// Hold the index lock and a published service record without ever binding the
+/// socket, then exit. This is the wedged daemon of the 2026-07-28 incident in
+/// its smallest honest form: a real process, a real OS lock, a real record and
+/// nothing answering, so the dislodge path can be tested against something
+/// that actually blocks clients rather than a fabricated file. Signals are
+/// left on their default handling on purpose, so a `SIGTERM` ends this process
+/// without running the ownership drop, exactly as a killed daemon leaves its
+/// record and socket file behind.
+fn hold_lock(secs: u64) -> anyhow::Result<()> {
+    use std::io::Write;
+    let _ownership = {
+        let ownership = crystalline_service::instance::acquire_ownership()?;
+        ownership.publish()?;
+        ownership
+    };
+    // The readiness line: a caller waits for it before treating the lock as
+    // held, instead of guessing with a sleep.
+    println!("holding");
+    std::io::stdout().flush()?;
+    std::thread::sleep(std::time::Duration::from_secs(secs));
+    Ok(())
+}
+
 fn split_commas(s: Option<String>) -> Option<Vec<String>> {
     s.map(|s| {
         s.split(',')
@@ -1188,16 +1223,43 @@ async fn status_dispatch(
             }
             return Ok(());
         }
-        // A live daemon that did not answer means the numbers below come
-        // from a different index than the one agents are using; say so
-        // instead of silently reporting an empty view.
-        if let Some(info) = crystalline_service::instance::read_lock_info()
-            && crystalline_service::instance::process_alive(info.pid)
-        {
-            eprintln!(
-                "note: a daemon (pid {}, v{}) holds {} but did not answer; reporting from a direct index read instead",
-                info.pid, info.version, info.socket_path
-            );
+        // Nothing answered. Diagnose the lock holder before falling back:
+        // `status` is read-only and never signals anything, but a wedged
+        // daemon - alive, holding the lock, answering nothing - is exactly
+        // the state a person needs named, and it is also why the numbers
+        // below come from a different index than the one agents are using.
+        match crystalline_service::instance::diagnose_holder().await {
+            crystalline_service::instance::HolderState::Unresponsive { pid, .. } => {
+                let state = format!(
+                    "unresponsive (pid {pid} per its record); a connecting client will replace it, or run crystalline doctor --fix"
+                );
+                eprintln!("note: daemon {state}; reporting from a direct index read instead");
+                return cmd::status(
+                    config.as_deref(),
+                    db.as_deref(),
+                    json,
+                    &format!("{state}; reading the index directly"),
+                )
+                .await;
+            }
+            crystalline_service::instance::HolderState::Unknown { detail } => {
+                eprintln!(
+                    "note: {}; reporting from a direct index read instead",
+                    crystalline_service::instance::unknown_holder_error(&detail)
+                );
+            }
+            _ => {
+                // A live record with a free lock: no holder to name, but the
+                // daemon it describes is unreachable all the same.
+                if let Some(info) = crystalline_service::instance::read_lock_info()
+                    && crystalline_service::instance::process_alive(info.pid)
+                {
+                    eprintln!(
+                        "note: a daemon (pid {}, v{}) holds {} but did not answer; reporting from a direct index read instead",
+                        info.pid, info.version, info.socket_path
+                    );
+                }
+            }
         }
     }
     let note = if bypassed {
