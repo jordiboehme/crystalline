@@ -22,9 +22,26 @@
 [![Latest release](https://img.shields.io/github/v/release/jordiboehme/crystalline)](https://github.com/jordiboehme/crystalline/releases/latest)
 [![OKF BundleDex](https://bundledex.net/static-badge.svg)](https://bundledex.net)
 
-An AI agent starts every session as a stranger: no memory of yesterday's decisions, no sense of which conventions the team already settled on, everything re-derived from scratch via Markdown files, expensive exploration or re-explained by a person. Crystalline gives an agent a durable memory instead. It is onboarded with a routing prompt at session start, taught curated knowledge organized into Domains and captures what it learns while it works as Engrams - so it becomes a more useful and productive peer over time instead of a stranger every time.
+**Durable memory for AI agents. Plain markdown underneath.**
 
-Crystalline is a single Rust binary: a CLI for people, an MCP server for agents, and a local search index that sits on top of plain markdown files.
+An AI agent starts every session as a stranger: yesterday's decisions forgotten, the team's conventions unknown, everything re-derived or re-explained. Crystalline gives it durable memory instead - onboarded at session start, taught curated knowledge organized into domains, capturing what it learns as engrams while it works. Session by session it stops being a stranger and becomes a peer.
+
+The difference it makes, in one exchange:
+
+```text
+Yesterday
+  You:    The retry queue silently drops jobs older than 24h. That cost us an hour.
+  Agent:  Worth keeping. Captured "Retry queue gotcha" into engineering (#payments #gotcha).
+
+Today, a fresh session
+  You:    Why is the payments queue losing jobs again?
+  Agent:  Recalled from engineering: the retry queue drops jobs older than 24h,
+          captured yesterday. Check the stuck jobs' age before anything else.
+```
+
+Crystalline is a single Rust binary: a CLI for people, an MCP server for agents and a local search index on top of plain markdown files.
+
+[Why Crystalline](#why-crystalline) · [How it works](#how-it-works) · [Get started](#get-started) · [Session onboarding](#session-onboarding) · [The learning loop](#the-learning-loop) · [Teach and learn](#teach-and-learn) · [Skills](#skills) · [Share with a team](#share-knowledge-with-a-team) · [Deployment](#deployment) · [FAQ](#faq)
 
 ## Why Crystalline
 
@@ -39,14 +56,20 @@ Once knowledge grows into the thousands or tens of thousands of units, reading a
 - **Built on an open format.** The engram format extends [Google's Open Knowledge Format (OKF) v0.2](https://github.com/GoogleCloudPlatform/knowledge-catalog/tree/main/okf): plain markdown with YAML frontmatter, readable by any OKF tooling, with no lock-in. Unknown keys are always preserved, every engram records who wrote it and when and Crystalline layers its routing, temporal and knowledge-graph conventions on top - so OKF documents drop straight into a domain and your knowledge stays portable, diffable files whatever tools come next.
 - **Knowledge retires, it does not disappear.** When a fact stops holding, the old engram is superseded rather than overwritten: its `status` marks it as no longer current, `valid_from`/`valid_to` keep the past addressable by date ("what applied last June") and the lessons it taught carry forward as unbounded knowledge - the way a person still draws on a past job without mistaking it for the present. A retired engram stays in every search; it is only softly faded in ranking, so current knowledge surfaces first without the past ever going missing.
 - **MANIFEST routing** lets an agent (or a person) figure out which domain owns a task without reading every file: `crystalline prompt system` turns each domain's `## When to Use` bullets into a compact session-start briefing.
-- **One truth per domain.** By default files are truth: engrams on disk are the durable state and nothing lives only in the database.* The search index is always derived and disposable, whichever side holds the truth.
-
-  *Unless you ask for exactly that: a virtual domain keeps its engrams in the database instead of on disk, for deployments where a filesystem is baggage rather than a feature. The principle does not bend - it just lets you pick which side of it your domain lives on, and `crystalline domain export` hands the files back whenever you change your mind.
-- **The index is disposable.** Crystalline maintains a database for fast text, tag, temporal and semantic search. For a file domain it is fully derived from the markdown files and rebuilt on demand with `crystalline reindex --full`; for a virtual domain the same tables hold the source of truth, so `reindex --full` rebuilds the file domains around it and never touches it. Corruption or a schema change is never a data-loss event.
 
 ## Get started
 
-Install the binary, run one command to wire up your harness and give the agent a first domain to learn into. Claude Desktop skips the binary entirely - jump straight to [its subsection](#claude-desktop). Semantic search wants the local embedding model fetched once with `crystalline model download`; plain text search works before that.
+Sixty seconds on a Mac with [Homebrew](https://brew.sh) and Claude Code:
+
+```sh
+brew install jordiboehme/tap/crystalline
+crystalline install claude-code
+mkdir -p ~/knowledge/engineering
+crystalline domain init ~/knowledge/engineering --name engineering
+crystalline domain add engineering ~/knowledge/engineering
+```
+
+Start a session - the agent onboards itself and starts remembering. Everything below is the same three steps on other platforms and harnesses: install the binary, wire the harness, give the agent a domain. Claude Desktop skips the binary entirely - jump straight to [its subsection](#claude-desktop). Semantic search wants the local embedding model fetched once with `crystalline model download`; plain text search works before that.
 
 ### Install the binary
 
@@ -80,19 +103,16 @@ crystalline install claude-code
 
 One command wires the whole integration: MCP registration, the `SessionStart` onboarding hook, the `Stop` capture nudge (see [The learning loop](#the-learning-loop)) and the four topical skills. It is idempotent - rerun it any time and whatever is already correct is left untouched - and each part is skippable with `--skip-mcp`, `--skip-hooks` or `--skip-skills`; `--project` writes into the current repository's config instead of your global one, and `crystalline uninstall claude-code` reverses everything `install` did, leaving any hook, key or locally edited skill that is not Crystalline's own in place.
 
-Give the agent its first domain:
-
-```sh
-mkdir -p ~/knowledge/engineering
-crystalline domain init ~/knowledge/engineering --name engineering
-crystalline domain add engineering ~/knowledge/engineering
-```
-
-Start a session. The agent is onboarded automatically (see [Session onboarding](#session-onboarding)) and captures what it learns as engrams from there.
+The quick start above is exactly this path end to end; give the agent its first domain the same way and start a session.
 
 ### Claude Desktop
 
-No terminal needed. Download `crystalline-v<version>.mcpb` from the [latest release](https://github.com/jordiboehme/crystalline/releases/latest) - one universal bundle covering Apple Silicon Macs and Windows - then in Claude Desktop open Settings > Extensions > Advanced settings > Install Extension... and pick the file. Per-arch bundles remain for intel Macs and native windows-arm64. It starts with no domains: the agent creates one whenever it needs somewhere to capture knowledge, with the `add_domain` tool, as a folder of markdown files under your `Documents/Crystalline` folder, a database-backed domain or a GitHub team domain. Onboarding is automatic on every connection (see [Session onboarding](#session-onboarding)). The optional companion skill adds capture and collaboration best practices (see [Skills](#skills)); the [Claude Desktop extension scenario](docs/deployment.md#claude-desktop-extension) shows how it works underneath.
+No terminal needed:
+
+1. Download `crystalline-v<version>.mcpb` from the [latest release](https://github.com/jordiboehme/crystalline/releases/latest) - one universal bundle covering Apple Silicon Macs and Windows (per-arch bundles remain for Intel Macs and native windows-arm64).
+2. In Claude Desktop, open Settings > Extensions > Advanced settings > Install Extension... and pick the file.
+
+It starts with no domains: the agent creates one with the `add_domain` tool whenever it needs somewhere to capture knowledge - a folder of markdown files under your `Documents/Crystalline` folder, a database-backed domain or a GitHub team domain. Onboarding is automatic on every connection (see [Session onboarding](#session-onboarding)). The optional companion skill adds capture and collaboration best practices (see [Skills](#skills)); the [Claude Desktop extension scenario](docs/deployment.md#claude-desktop-extension) shows how it works underneath.
 
 ### Codex CLI
 
@@ -102,13 +122,7 @@ The same integration, one command (Codex keeps MCP registration user-level even 
 crystalline install codex
 ```
 
-Then give the agent its first domain:
-
-```sh
-mkdir -p ~/knowledge/engineering
-crystalline domain init ~/knowledge/engineering --name engineering
-crystalline domain add engineering ~/knowledge/engineering
-```
+Then give the agent its first domain as in the quick start.
 
 ### GitHub Copilot CLI
 
@@ -118,7 +132,7 @@ The same integration for the agentic Copilot CLI, one command (Copilot too keeps
 crystalline install copilot
 ```
 
-Hooks land in a dedicated `~/.copilot/hooks/crystalline.json` and skills in `~/.copilot/skills` (both honor `COPILOT_HOME`); with `--project` they go to `.github/hooks` and `.github/skills` instead, which Copilot loads once you trust the folder. Then give the agent its first domain as above.
+Hooks land in a dedicated `~/.copilot/hooks/crystalline.json` and skills in `~/.copilot/skills` (both honor `COPILOT_HOME`); with `--project` they go to `.github/hooks` and `.github/skills` instead, which Copilot loads once you trust the folder. Then give the agent its first domain as in the quick start.
 
 ### Any MCP harness
 
@@ -170,7 +184,9 @@ Engrams written through Crystalline are indexed immediately; `crystalline sync` 
 
 ## Session onboarding
 
-Every MCP client is onboarded automatically: the crystalline server's instructions, returned when a client connects, carry a live routing block - one line per registered domain summarizing when to use it, plus the behavior rules (narrow question -> search that domain; broad question -> sweep all of them; writes always name a domain explicitly). The block names the exact crystalline tools each rule refers to (`search_engrams`, `write_engram` and the rest), so an agent with several MCP servers connected knows which tool on which server to call. Domain lists and file-domain MANIFESTs are read fresh for every new connection; virtual-domain routing lines follow the daemon's latest snapshot, refreshed on every stdio connection and on every local virtual write. Claude Desktop and any harness that shows the model its MCP server instructions need no further setup.
+Every MCP client is onboarded automatically: the crystalline server's instructions, returned when a client connects, carry a live routing block - one line per registered domain summarizing when to use it, plus the behavior rules (narrow question -> search that domain; broad question -> sweep all of them; writes always name a domain explicitly). The block names the exact crystalline tools each rule refers to (`search_engrams`, `write_engram` and the rest), so an agent with several MCP servers connected knows which tool on which server to call.
+
+Domain lists and file-domain MANIFESTs are read fresh for every new connection; virtual-domain routing lines follow the daemon's latest snapshot, refreshed on every stdio connection and on every local virtual write. Claude Desktop and any harness that shows the model its MCP server instructions need no further setup.
 
 The block is sized for clients that truncate server instructions: the intro and the behavior rules come first and always fit, and the domain lines that follow shrink to one bullet each, then to a single count line, rather than pushing the rules out of view. Nothing is lost either way, since `list_domains` with `include_routing=true` returns the whole index on demand.
 
@@ -224,9 +240,13 @@ An agent built on the Messages API MCP connector can keep its context lean by de
 
 Claude Code does this for you: it turns tool search on automatically once a session's MCP tool descriptions grow large, loading tool names plus each server's instructions up front and the rest on demand. The routing block is sized to survive that mode intact (see [Session onboarding](#session-onboarding)).
 
-### The learning loop
+## The learning loop
 
-The other half of what `crystalline install` wires: a `Stop` hook running `crystalline hook stop` - a once-per-session, late nudge that closes the gap between an agent learning something mid-session and actually capturing it. It fires on the first `Stop` event a session reaches after real substance - a transcript past a size and line threshold, or the third `Stop` call in a row when a harness sends no transcript at all - and stays silent on every other call: below that threshold, once it has already fired for the session, when the effective mode is read-only or when no domain is registered at all. When it fires, it asks the agent to review the conversation for durable learnings and propose capturing each one into the fitting domain, the same propose-first, wait-for-a-yes shape the capture skill already follows - and to raise the salience of any recalled engram that proved to be the key to the task; the reminder costs about 120 tokens, at most once per session. Remove it with `crystalline uninstall <harness>`, or leave it out from the start with `--skip-hooks`.
+Memory only compounds when capture actually happens. The loop has three beats: the agent recalls what is known at session start, works with it and captures what it learned before the session ends. The last beat is the one agents skip when nothing reminds them - so `crystalline install` wires the reminder.
+
+It is a `Stop` hook running `crystalline hook stop`: a once-per-session, late nudge that fires on the first stop after a session gains real substance and stays silent otherwise - below the substance threshold, once it has already fired, in read-only mode or with no domain registered. When it fires, it asks the agent to review the conversation for durable learnings, propose capturing each one into the fitting domain (the same propose-first, wait-for-a-yes shape the capture skill follows) and raise the salience of any recalled engram that proved key to the task.
+
+The reminder costs about 120 tokens, at most once per session. Remove it with `crystalline uninstall <harness>`, or leave it out from the start with `--skip-hooks`.
 
 ## Teach and learn
 
@@ -246,7 +266,7 @@ Exceptionally valuable knowledge can carry a numeric `salience` key (0 to 10) in
 
 The CLI mirrors the mutating and read tools directly for scripting and quick edits outside an agent session: `crystalline write`, `read`, `edit`, `move`, `delete`, `search`, `context`, `recent` and `vocabulary` take the same parameters as their MCP counterparts.
 
-Tag identity is case-folded, so `Foo` and `foo` are the same tag; the files keep whatever case you wrote. For the rest of tag drift - a separator swap, a plural, a typo - `crystalline vocabulary` and `crystalline doctor` surface near-duplicate tag clusters, and two CLI-only commands consolidate them. `crystalline tags rename <old> <new>` renames a tag across every engram that carries it; `crystalline tags merge <old> <into>` folds one tag into an existing one, dropping duplicates. Both rewrite the affected files surgically - only the tag tokens change, every other byte is preserved - and both preview the affected engrams first, then ask before writing (pass `--yes` to skip the prompt, `--dry-run` to stop at the preview, `--domain` to scope it). They live on the CLI by design, not as an MCP tool: a bulk file rewrite is a deliberate maintenance step, not something an agent reaches for mid-task. A merge also records the fold as a tag alias: it appends `- old -> into` to each affected MANIFEST's `## Tag Aliases` section, and from then on a search for the old name folds into the canonical tag's class so nothing gets lost (pass `--no-alias` to skip recording). That section is plain MANIFEST content, hand-editable and travelling with a team domain like the rest of it.
+Tag identity is case-folded, so `Foo` and `foo` are the same tag; the files keep whatever case you wrote. For the rest of tag drift - a separator swap, a plural, a typo - `crystalline vocabulary` and `crystalline doctor` surface near-duplicate clusters, and two CLI-only commands consolidate them: `crystalline tags rename <old> <new>` and `crystalline tags merge <old> <into>`. Both rewrite only the tag tokens, preview before writing and take `--dry-run`, `--yes` and `--domain`; a merge also records the fold in the MANIFEST's `## Tag Aliases` section, so a search for the old name keeps resolving forever. Bulk rewrites are deliberate maintenance, which is why these live on the CLI rather than as MCP tools.
 
 ## Skills
 
@@ -427,7 +447,17 @@ crystalline (cli)    the one user-facing binary
 
 Exactly one process ever holds the database open: the first `crystalline mcp` or `crystalline serve` takes an advisory lock and becomes the daemon; every later CLI command or MCP connection attaches to it over a local socket, or opens the database directly for a brief operation when no daemon is running.
 
+One principle runs through the whole stack: every domain has exactly one source of truth - markdown files on disk by default, the database itself for a [virtual domain](#virtual-domains) - and the search index is always a derived, disposable layer. `crystalline reindex --full` rebuilds it from the files at any time, so index corruption or a schema change is never a data-loss event.
+
 ## FAQ
+
+**Why not just a folder of markdown files?**
+
+It is one - that is the point. Your knowledge stays plain markdown you can read, diff and back up with anything. Crystalline adds what a folder cannot: domain routing, hybrid text-plus-semantic search, a knowledge graph and temporal filtering, so the ten-thousandth engram is exactly as findable as the tenth. [Why Crystalline](#why-crystalline) walks the ladder that leads here.
+
+**Why not a vector database or a RAG framework?**
+
+Retrieval is the easy half of memory. A vector index finds similar text, but it does not know which domain owns a task, that a fact was superseded in March, who verified a claim or when something new is worth capturing. Crystalline treats embeddings as one ranking signal inside a memory system - routing, temporal semantics, provenance and a capture workflow on top of files you own, with no pipeline to operate.
 
 **When does the daemon start?**
 
@@ -452,6 +482,12 @@ In your domain folders, as plain markdown you can read, edit and back up with an
 **Do I need git to share knowledge with a team?**
 
 No. Team domains talk to GitHub directly over its API - no git, no gh, no local clones. Members connect once with a browser code and Crystalline handles the rest.
+
+## Go deeper
+
+- [The Crystalline Playbook](docs/playbook.md) - the whole workflow by example: one running dataset from first capture through querying, reconciling, retiring and team sharing.
+- [Deployment](docs/deployment.md) - every scenario from a laptop to an air-gapped server, one diagram each.
+- Found a rough edge or a missing piece? [Open an issue](https://github.com/jordiboehme/crystalline/issues) - and if Crystalline made your agent a better peer, a star helps others find it.
 
 ## Privacy Policy
 
