@@ -119,6 +119,16 @@ pub struct ServiceDoctor {
     pub socket_orphaned: bool,
     /// Whether `--fix` removed the orphaned socket file.
     pub socket_removed: bool,
+    /// Whether a live, verified crystalline daemon holds the index lock but
+    /// answers nothing on its socket: the wedge no client can attach to or
+    /// take over.
+    pub daemon_unresponsive: bool,
+    /// Whether `--fix` dislodged that wedged daemon.
+    pub daemon_dislodged: bool,
+    /// Set when the lock is held, nothing answers and the holder could not be
+    /// identified: the reason, for a message that tells a person where to
+    /// look. Nothing is ever signalled in this state, `--fix` included.
+    pub holder_unknown: Option<String>,
 }
 
 /// One team domain's origin diagnostics: whether its local origin state is
@@ -412,6 +422,15 @@ impl DoctorReport {
         if self.service.socket_orphaned && !self.service.socket_removed {
             n += 1;
         }
+        // A wedged daemon blocks every client until it is replaced, and a lock
+        // held by something unidentifiable blocks them with no automatic way
+        // out at all. Both are problems until they are gone.
+        if self.service.daemon_unresponsive && !self.service.daemon_dislodged {
+            n += 1;
+        }
+        if self.service.holder_unknown.is_some() {
+            n += 1;
+        }
         // Not being connected to GitHub is not itself a problem (an
         // unconnected machine is a normal, expected state); missing or
         // corrupt origin state for an already-connected team domain is.
@@ -462,11 +481,33 @@ pub async fn run(
     let targets = select_domains(cfg, domain_filter)?;
     let db = cmd::db_path(db_override)?;
 
+    // Ahead of the store, deliberately. A wedged daemon holds the index
+    // database as well as the service lock, so opening the store first would
+    // fail with a locking error before `--fix` ever got the chance to dislodge
+    // the process causing it - the one state where doctor matters most.
+    let service = check_service(fix).await?;
+
     let store = if db.is_file() {
         Some(
             crystalline_index::open_store(&cfg.database(), Some(&db), false)
                 .await
-                .map_err(|e| anyhow!("could not open the index at {}: {e}", db.display()))?,
+                .map_err(|e| {
+                    let hint = if service.daemon_unresponsive && !service.daemon_dislodged {
+                        let pid = service
+                            .lock_pid
+                            .map(|p| p.to_string())
+                            .unwrap_or_else(|| "unknown".to_string());
+                        format!(
+                            ". An unresponsive daemon (pid {pid}) holds the index and answers nothing; rerun with --fix to replace it"
+                        )
+                    } else {
+                        String::new()
+                    };
+                    anyhow!(
+                        "could not open the index at {}: {e}{hint}",
+                        db.display()
+                    )
+                })?,
         )
     } else {
         None
@@ -483,8 +524,6 @@ pub async fn run(
     for (name, entry) in &targets {
         domains.push(check_domain(name, entry, store_ref, fix).await?);
     }
-
-    let service = check_service(fix)?;
 
     let environment = check_environment(&loaded.overlay);
 
@@ -689,7 +728,7 @@ fn is_hidden(name: &str) -> bool {
     name.starts_with('.') && name != "." && name != ".."
 }
 
-fn check_service(fix: bool) -> Result<ServiceDoctor> {
+async fn check_service(fix: bool) -> Result<ServiceDoctor> {
     // The record's primary home is `service.json`; a still-present pre-split
     // daemon's record sitting in the lock file itself counts as present too
     // (see `instance::read_lock_info`'s legacy fallback), so an upgraded
@@ -712,6 +751,18 @@ fn check_service(fix: bool) -> Result<ServiceDoctor> {
     let socket_present = sock_path.exists();
     let socket_orphaned = socket_present && !(lock_present && alive);
 
+    // Who actually holds the lock, probed read-only: this is the check that
+    // sees the wedge (a live daemon holding the lock while its socket answers
+    // nothing), which every field above reads as a perfectly healthy service.
+    let holder = instance::diagnose_holder().await;
+    let daemon_unresponsive = matches!(holder, instance::HolderState::Unresponsive { .. });
+    let holder_unknown = match &holder {
+        instance::HolderState::Unknown { detail } => {
+            Some(instance::unknown_holder_error(detail).to_string())
+        }
+        _ => None,
+    };
+
     let mut s = ServiceDoctor {
         lock_present,
         lock_pid: pid,
@@ -720,9 +771,25 @@ fn check_service(fix: bool) -> Result<ServiceDoctor> {
         socket_present,
         socket_orphaned,
         socket_removed: false,
+        daemon_unresponsive,
+        daemon_dislodged: false,
+        holder_unknown,
     };
 
     if fix {
+        // The wedge goes first: dislodging it releases the lock and removes
+        // the record and socket file the checks below would otherwise trip
+        // over. This is the same bounded, identity-verified dislodge a
+        // connecting client performs, refusals included.
+        if s.daemon_unresponsive {
+            match instance::dislodge_unresponsive().await {
+                Ok(instance::DislodgeOutcome::Dislodged { .. }) => s.daemon_dislodged = true,
+                // The holder recovered between the diagnosis and the fix;
+                // nothing to dislodge and nothing to report as unresolved.
+                Ok(instance::DislodgeOutcome::NotNeeded) => s.daemon_unresponsive = false,
+                Err(e) => s.holder_unknown = Some(e.to_string()),
+            }
+        }
         if s.lock_stale {
             let info_removed = std::fs::remove_file(&info_path).is_ok();
             let legacy_removed = std::fs::remove_file(&legacy_path).is_ok();
@@ -1240,7 +1307,27 @@ pub fn render_human(report: &DoctorReport) -> String {
             );
         }
     }
-    if !s.lock_stale && !s.socket_orphaned {
+    if s.daemon_unresponsive {
+        let pid = s
+            .lock_pid
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        if s.daemon_dislodged {
+            let _ = writeln!(
+                out,
+                "  dislodged an unresponsive daemon (pid {pid}); the next client starts a fresh one"
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "  [problem] daemon unresponsive (pid {pid} per its record): it holds the index lock but answers nothing on its socket. A connecting client will replace it, or rerun with --fix"
+            );
+        }
+    }
+    if let Some(detail) = &s.holder_unknown {
+        let _ = writeln!(out, "  [problem] {detail}");
+    }
+    if !s.lock_stale && !s.socket_orphaned && !s.daemon_unresponsive && s.holder_unknown.is_none() {
         let _ = writeln!(out, "  ok");
     }
     if let Ok(log_path) = config::daemon_log_path() {

@@ -1132,3 +1132,262 @@ fn status_notes_an_unreachable_daemon_on_stderr() {
     let _ = stand_in.kill();
     let _ = stand_in.wait();
 }
+
+// --- the unresponsive lock holder -------------------------------------------
+//
+// The 2026-07-28 incident: a daemon alive, its lock held, its socket answering
+// nothing. No client could attach (nothing answered) and none could spawn (the
+// lock was held), so every session failed until the wedged process died on its
+// own, forty minutes later. The tests below drive that state with a real
+// separate process rather than a fabricated lock file, because the whole point
+// of the fix is what it does to a process.
+
+/// A real, separate process holding the index lock with a published record and
+/// no socket: the wedge. `crystalline hold-lock` is a hidden entry that exists
+/// for exactly this, so the holder is a genuine crystalline binary and passes
+/// the identity gate on the kill path, as the wedged daemon did.
+struct Wedge {
+    child: Child,
+}
+
+impl Wedge {
+    fn spawn(env: &Env) -> Wedge {
+        let mut cmd = Command::new(bin());
+        env.apply(&mut cmd);
+        let mut child = cmd
+            .args(["hold-lock", "--secs", "60"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        // The readiness line means the lock is taken and the record is
+        // published; no sleep-and-hope.
+        let mut out = BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        out.read_line(&mut line).unwrap();
+        assert_eq!(line.trim(), "holding", "hold-lock did not take the lock");
+        Wedge { child }
+    }
+
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Whether the holder left within `budget`. `try_wait` rather than a
+    /// signal probe: this holder is a child of the test process, so a killed
+    /// one stays visible as an unreaped zombie until it is waited for.
+    fn exited_within(&mut self, budget: Duration) -> bool {
+        let start = Instant::now();
+        loop {
+            if self.child.try_wait().unwrap().is_some() {
+                return true;
+            }
+            if start.elapsed() > budget {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn still_holding(&mut self) -> bool {
+        self.child.try_wait().unwrap().is_none()
+    }
+}
+
+impl Drop for Wedge {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// The incident, end to end: a connecting client finds the lock held and the
+/// socket silent, verifies the holder, dislodges it and serves from a fresh
+/// daemon. Before the fix this session failed outright.
+#[test]
+fn a_connecting_client_dislodges_a_wedged_lock_holder() {
+    let env = Env::new("wedge-mcp");
+    env.setup_domain("eng");
+
+    let mut wedge = Wedge::spawn(&env);
+    let wedge_pid = wedge.pid();
+    assert_eq!(
+        env.lock_pid(),
+        Some(u64::from(wedge_pid)),
+        "the wedge published its own record"
+    );
+
+    // The client attaches to nothing, cannot take the lock, dislodges the
+    // holder and starts a daemon that serves this session.
+    let mut client = Mcp::spawn(&env);
+    client.initialize();
+    env.wait_ready();
+
+    assert!(
+        wedge.exited_within(Duration::from_secs(10)),
+        "the wedged holder was dislodged"
+    );
+    let (ok, out) = env.run(&["ctl", "status", "--json"]);
+    assert!(ok, "a fresh daemon answers: {out}");
+    let status: Value = serde_json::from_str(&out).unwrap();
+    let pid = status["pid"].as_u64().unwrap();
+    assert_ne!(
+        pid,
+        u64::from(wedge_pid),
+        "the daemon serving now is a new process"
+    );
+    assert_eq!(env.lock_pid(), Some(pid), "the record names the successor");
+
+    // The session really works, which is what the incident cost.
+    client.send_call("search_engrams", json!({ "query": "token" }));
+    let found = client.read_tool_value();
+    assert!(found["total"].as_u64().unwrap() >= 1, "search: {found}");
+}
+
+/// The holder is unidentifiable (its record names a pid that cannot be alive,
+/// so nothing proves who owns the lock). Doubt refuses: no signal, and an
+/// error naming the lock file and how to look at the holder.
+#[test]
+fn an_unidentified_lock_holder_is_never_signalled() {
+    let env = Env::new("wedge-unknown");
+    let mut wedge = Wedge::spawn(&env);
+
+    // Rewrite the record to name a pid that cannot exist. The lock stays held
+    // by the live holder, so from the outside something owns the index and
+    // nothing says what.
+    std::fs::write(
+        env.info_path(),
+        serde_json::to_string(&json!({
+            "pid": 2147483647u32,
+            "socket_path": env.sock_path().display().to_string(),
+            "version": "99.0.0",
+            "started_at": "2026-01-01T00:00:00Z",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let mut cmd = Command::new(bin());
+    env.apply(&mut cmd);
+    let out = cmd.args(["doctor", "--fix"]).output().unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(text.contains("service.lock"), "names the lock path: {text}");
+    assert!(text.contains("lsof"), "suggests lsof: {text}");
+    assert!(
+        text.contains("nothing was signalled"),
+        "says nothing was signalled: {text}"
+    );
+    assert!(
+        wedge.still_holding(),
+        "an unidentified holder is left strictly alone"
+    );
+}
+
+/// `status` is a read-only diagnosis. It names the third state - neither
+/// running nor absent - and never touches the holder.
+#[test]
+fn status_reports_an_unresponsive_daemon_without_killing_it() {
+    let env = Env::new("wedge-status");
+    let mut wedge = Wedge::spawn(&env);
+    let pid = wedge.pid();
+
+    let mut cmd = Command::new(bin());
+    env.apply(&mut cmd);
+    let out = cmd.arg("status").output().unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.starts_with(&format!("Daemon: unresponsive (pid {pid} per its record)")),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("a connecting client will replace it, or run crystalline doctor --fix"),
+        "{stdout}"
+    );
+    assert!(
+        wedge.still_holding(),
+        "status diagnoses, it never signals anything"
+    );
+}
+
+/// `doctor` reports the wedge as a problem and `--fix` runs the same dislodge
+/// a connecting client would.
+#[test]
+fn doctor_reports_the_wedge_and_fix_dislodges_it() {
+    let env = Env::new("wedge-doctor");
+    let mut wedge = Wedge::spawn(&env);
+
+    let (ok, out) = env.run(&["--json", "doctor"]);
+    assert!(
+        !ok,
+        "a wedged daemon is a problem, so doctor exits 1: {out}"
+    );
+    let report: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(report["service"]["daemon_unresponsive"], json!(true));
+    assert_eq!(report["service"]["daemon_dislodged"], json!(false));
+    assert!(
+        wedge.still_holding(),
+        "doctor without --fix never signals anything"
+    );
+
+    let (ok, out) = env.run(&["--json", "doctor", "--fix"]);
+    assert!(ok, "the wedge is resolved, so doctor exits 0: {out}");
+    let report: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(report["service"]["daemon_dislodged"], json!(true));
+    assert!(
+        wedge.exited_within(Duration::from_secs(10)),
+        "doctor --fix dislodged the holder"
+    );
+    assert!(!env.info_path().exists(), "the stale record was cleaned up");
+}
+
+/// The safety property in the other direction: a daemon that answers its
+/// socket is never dislodged, not even by `doctor --fix`.
+#[test]
+fn a_responsive_daemon_survives_doctor_fix() {
+    let env = Env::new("wedge-live");
+    env.setup_domain("eng");
+    let mut client = Mcp::spawn(&env);
+    client.initialize();
+    env.wait_ready();
+    let before = env.lock_pid().expect("the daemon published its record");
+
+    // A scratch `--db` keeps doctor's own index read off the database the live
+    // daemon holds open (opening it would fail with a plain locking error,
+    // which has nothing to do with the service section under test here). The
+    // service checks read the state directory, never the `--db` path, so the
+    // holder diagnosis is the real one.
+    let mut cmd = Command::new(bin());
+    env.apply(&mut cmd);
+    let raw = cmd
+        .args(["--json", "--db"])
+        .arg(env.dir.join("side.db"))
+        .args(["doctor", "--fix"])
+        .output()
+        .unwrap();
+    let ok = raw.status.success();
+    let out = String::from_utf8_lossy(&raw.stdout).into_owned();
+    assert!(
+        ok,
+        "a healthy service is not a problem: {out}{}",
+        String::from_utf8_lossy(&raw.stderr)
+    );
+    let report: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(report["service"]["daemon_unresponsive"], json!(false));
+    assert_eq!(report["service"]["daemon_dislodged"], json!(false));
+    assert_eq!(report["service"]["holder_unknown"], Value::Null);
+
+    let (ok, out) = env.run(&["ctl", "status", "--json"]);
+    assert!(ok, "the daemon is still serving: {out}");
+    let status: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        status["pid"].as_u64(),
+        Some(before),
+        "the same daemon still owns the index"
+    );
+}

@@ -15,11 +15,21 @@
 //! manual daemon restart. The takeover is one-way on purpose - an older
 //! client attaches to a newer daemon as-is - which keeps lingering
 //! old-binary bridges from flip-flopping an upgraded daemon back.
+//!
+//! Attaching is also wedge aware. Version takeover travels over the socket,
+//! which is exactly what a wedged daemon kills: on 2026-07-28 a daemon stayed
+//! alive holding the lock while its socket answered nothing, so no client
+//! could attach (nothing answered) and none could spawn (the lock was held),
+//! and every session failed for forty minutes until the wedged process died on
+//! its own. [`diagnose_holder`] names that state and [`dislodge_unresponsive`]
+//! ends it: a bounded socket probe first, then, only for a holder whose
+//! recorded pid is alive and identifiably a crystalline binary, a graceful
+//! signal followed by a hard one. Every doubt refuses instead of signalling.
 
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use fs4::FileExt;
 #[cfg(not(windows))]
@@ -327,6 +337,427 @@ async fn displace(sock: &Path, pid: u32) -> bool {
     false
 }
 
+// --- unresponsive holders ---------------------------------------------------
+
+/// How long the holder of the index lock gets to answer a bounded `ctl`
+/// handshake before it counts as unresponsive. Generous on purpose: a healthy
+/// daemon answers `sessions` straight from in-memory counters, and the `ctl`
+/// branch of its accept loop skips the routing-cache refresh the `mcp` branch
+/// does, so its reply costs microseconds of work even under load. The wedged
+/// daemon in the 2026-07-28 incident answered nothing at all, for forty
+/// minutes, so any answer inside this window is proof of life.
+const HOLDER_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long a dislodged holder gets to exit and release the lock after the
+/// graceful signal. On unix that signal is `SIGTERM`, which the daemon handles
+/// as a clean shutdown (it drops its ownership, removing the record and the
+/// socket), so this window is the clean path's fair chance. A daemon wedged
+/// badly enough to ignore its socket may ignore this too, which is what the
+/// hard step below is for; three seconds keeps a connecting client moving.
+const DISLODGE_TERM_WAIT: Duration = Duration::from_secs(3);
+
+/// How long to wait after the hard signal before giving up. `SIGKILL` (and
+/// `TerminateProcess` on Windows) cannot be refused, so this covers only OS
+/// teardown of the process and its file locks. A lock still held after it
+/// means something other than the recorded process holds it, and the caller
+/// refuses rather than hunting for another victim.
+const DISLODGE_KILL_WAIT: Duration = Duration::from_secs(3);
+
+/// Poll granularity for both dislodge waits.
+const DISLODGE_POLL: Duration = Duration::from_millis(50);
+
+/// What currently owns the index lock, as far as a client can tell from the
+/// outside. The three actionable states drive the connect flow, `status` and
+/// `doctor`; [`HolderState::Unknown`] is the deliberate catch-all that never
+/// leads to a signal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HolderState {
+    /// Nothing holds the lock; ownership is takeable.
+    Free,
+    /// A holder answered the bounded `ctl` probe. Attach to it.
+    Responsive,
+    /// The lock is held, the socket answered nothing within
+    /// [`HOLDER_PROBE_TIMEOUT`] and the record names a live process that is
+    /// identifiably a crystalline binary. This is the wedge.
+    Unresponsive {
+        /// The recorded pid of the wedged daemon.
+        pid: u32,
+        /// How long the socket probe waited before giving up.
+        probe: Duration,
+    },
+    /// The lock is held, nothing answered, and who holds it could not be
+    /// established: no record, a record naming a dead pid, a pid whose
+    /// executable could not be read, or one that is not a crystalline binary.
+    /// Nothing is ever signalled in this state.
+    Unknown {
+        /// Why the holder could not be identified, for the refusal message.
+        detail: String,
+    },
+}
+
+/// The result of a dislodge attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DislodgeOutcome {
+    /// Nothing to do: the lock was free, or its holder answered the probe.
+    NotNeeded,
+    /// A verified unresponsive holder was signalled away and its stale record
+    /// and socket file cleaned up. Ownership is takeable again.
+    Dislodged {
+        /// The pid that was signalled.
+        pid: u32,
+    },
+}
+
+/// Whether the index lock is free right now, probed by taking it and letting
+/// it go again. `fs4` locks are `flock(2)` on unix and `LockFileEx` on
+/// Windows, both scoped to the open handle rather than the process, so this
+/// probe sees a same-process holder exactly as it sees another process's.
+/// A missing lock file means nobody can be holding it.
+fn lock_is_free(lock_path: &Path) -> io::Result<bool> {
+    let file = match OpenOptions::new().read(true).write(true).open(lock_path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(true),
+        Err(e) => return Err(e),
+    };
+    match FileExt::try_lock(&file) {
+        Ok(()) => {
+            let _ = FileExt::unlock(&file);
+            Ok(true)
+        }
+        Err(fs4::TryLockError::WouldBlock) => Ok(false),
+        Err(fs4::TryLockError::Error(e)) => Err(e),
+    }
+}
+
+/// Ask the daemon socket for a trivial `ctl` answer, bounded by
+/// [`HOLDER_PROBE_TIMEOUT`]. `sessions` is the cheapest real command: it reads
+/// in-memory counters and touches neither the store nor the routing cache, so
+/// a slow index can never make a healthy daemon look wedged. Any well-formed
+/// reply counts; the content is irrelevant, only that something served it.
+async fn probe_socket_responds() -> bool {
+    let Ok(sock) = config::service_sock_path() else {
+        return false;
+    };
+    let exchange = async {
+        let name = socket_name(&sock).ok()?;
+        let stream = IpcStream::connect(name).await.ok()?;
+        let mut stream = Connection { stream }.into_ctl().await.ok()?;
+        stream
+            .write_all(b"{\"v\":1,\"cmd\":\"sessions\"}\n")
+            .await
+            .ok()?;
+        stream.flush().await.ok()?;
+        let mut buf = [0u8; 1];
+        match stream.read(&mut buf).await {
+            Ok(n) if n > 0 => Some(()),
+            _ => None,
+        }
+    };
+    matches!(
+        tokio::time::timeout(HOLDER_PROBE_TIMEOUT, exchange).await,
+        Ok(Some(()))
+    )
+}
+
+/// The executable file name of a running process, lowercased and without any
+/// `.exe` suffix. `None` whenever the platform cannot answer - an unreadable
+/// `/proc` entry, a denied handle, an unsupported target - which the caller
+/// must treat as "unidentified", never as "not ours".
+fn process_exe_name(pid: u32) -> Option<String> {
+    let path = process_exe_path(pid)?;
+    let name = Path::new(&path).file_name()?.to_string_lossy().to_string();
+    let lower = name.to_ascii_lowercase();
+    Some(lower.strip_suffix(".exe").unwrap_or(&lower).to_string())
+}
+
+/// The executable path of a running process, per platform.
+fn process_exe_path(pid: u32) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        // The `exe` symlink is the real executable path; `comm` is the fallback
+        // for a process whose symlink cannot be read (a different user's
+        // process denies the readlink but still exposes `comm`). `comm` is
+        // truncated to 15 bytes, which "crystalline" fits inside.
+        if let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe")) {
+            return Some(exe.to_string_lossy().to_string());
+        }
+        let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+        let comm = comm.trim();
+        if comm.is_empty() {
+            return None;
+        }
+        Some(comm.to_string())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // libproc's `proc_pidpath` is the only portable way to a process path
+        // on macOS; there is no /proc. It returns the byte length written, or
+        // 0 on failure (a denied or departed pid).
+        // PROC_PIDPATHINFO_MAXSIZE, which libproc.h defines as 4 * MAXPATHLEN.
+        const PROC_PIDPATHINFO_MAXSIZE: usize = 4 * 1024;
+        let mut buf = vec![0u8; PROC_PIDPATHINFO_MAXSIZE];
+        let written = unsafe {
+            libc::proc_pidpath(
+                pid as libc::c_int,
+                buf.as_mut_ptr().cast(),
+                buf.len() as u32,
+            )
+        };
+        if written <= 0 {
+            return None;
+        }
+        buf.truncate(written as usize);
+        Some(String::from_utf8_lossy(&buf).to_string())
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+            QueryFullProcessImageNameW,
+        };
+        if pid == 0 {
+            return None;
+        }
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            return None;
+        }
+        let mut buf = vec![0u16; 32768];
+        let mut len = buf.len() as u32;
+        // The Win32 path form, not the native \Device\Harddisk one.
+        let ok = unsafe {
+            QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut len)
+        };
+        unsafe { CloseHandle(handle) };
+        if ok == 0 {
+            return None;
+        }
+        buf.truncate(len as usize);
+        Some(String::from_utf16_lossy(&buf))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// This binary's own executable file name, lowercased and without any `.exe`
+/// suffix.
+fn own_exe_name() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    let name = exe.file_name()?.to_string_lossy().to_string();
+    let lower = name.to_ascii_lowercase();
+    Some(lower.strip_suffix(".exe").unwrap_or(&lower).to_string())
+}
+
+/// Whether an executable file name identifies a crystalline binary. The
+/// canonical name is the gate; a binary installed under some other file name
+/// (a versioned release artifact, a renamed copy) spawns its daemon as its own
+/// executable, so a holder wearing exactly this client's file name is ours
+/// too. Anything else is a stranger and is never signalled.
+fn is_crystalline_exe_name(name: &str) -> bool {
+    if name == "crystalline" {
+        return true;
+    }
+    own_exe_name().is_some_and(|own| own == name)
+}
+
+/// Diagnose what owns the index lock. Read-only and side-effect free: it takes
+/// and immediately releases the lock to test it, opens one short-lived socket
+/// connection and reads the record. Nothing is signalled here.
+pub async fn diagnose_holder() -> HolderState {
+    let Ok(lock_path) = config::service_lock_path() else {
+        return HolderState::Unknown {
+            detail: "the state directory could not be resolved".to_string(),
+        };
+    };
+    match lock_is_free(&lock_path) {
+        Ok(true) => return HolderState::Free,
+        Ok(false) => {}
+        Err(e) => {
+            return HolderState::Unknown {
+                detail: format!("the lock file could not be tested: {e}"),
+            };
+        }
+    }
+
+    let started = Instant::now();
+    if probe_socket_responds().await {
+        return HolderState::Responsive;
+    }
+    let probe = started.elapsed();
+
+    let Some(info) = read_lock_info() else {
+        return HolderState::Unknown {
+            detail: "no service record names the holder".to_string(),
+        };
+    };
+    if !process_alive(info.pid) {
+        return HolderState::Unknown {
+            detail: format!(
+                "the recorded pid {} is gone but the lock is still held",
+                info.pid
+            ),
+        };
+    }
+    match process_exe_name(info.pid) {
+        Some(name) if is_crystalline_exe_name(&name) => HolderState::Unresponsive {
+            pid: info.pid,
+            probe,
+        },
+        Some(name) => HolderState::Unknown {
+            detail: format!("pid {} is '{name}', not a Crystalline process", info.pid),
+        },
+        None => HolderState::Unknown {
+            detail: format!("what pid {} is could not be verified", info.pid),
+        },
+    }
+}
+
+/// The refusal a caller reports when the lock is held by something that cannot
+/// be identified. It names the lock path and how to look at the holder,
+/// because the only safe next step is a person deciding what that process is.
+pub fn unknown_holder_error(detail: &str) -> anyhow::Error {
+    let lock = config::service_lock_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "the service lock file".to_string());
+    let inspect = if cfg!(windows) {
+        "Resource Monitor's CPU tab lists which process holds that handle".to_string()
+    } else {
+        format!("inspect it with `lsof {lock}`")
+    };
+    anyhow::anyhow!(
+        "something holds {lock} but no Crystalline daemon answers there ({detail}); nothing was signalled, {inspect} and stop it, then retry"
+    )
+}
+
+/// Signal a process: the graceful ask, or the hard kill. Returns whether the
+/// signal was delivered. Windows has no graceful equivalent, so both steps are
+/// the same `TerminateProcess` call there and the first wait simply succeeds.
+fn signal_process(pid: u32, hard: bool) -> bool {
+    // A zero pid means "every process in my group" to `kill(2)` and pid 1 is
+    // init. Neither is ever a Crystalline daemon, and the callers already
+    // refuse both; this is the last line of defense.
+    if pid <= 1 {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        let sig = if hard { libc::SIGKILL } else { libc::SIGTERM };
+        unsafe { libc::kill(pid as libc::pid_t, sig) == 0 }
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_TERMINATE, TerminateProcess,
+        };
+        let _ = hard;
+        let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+        if handle.is_null() {
+            return false;
+        }
+        let ok = unsafe { TerminateProcess(handle, 1) } != 0;
+        unsafe { CloseHandle(handle) };
+        ok
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (pid, hard);
+        false
+    }
+}
+
+/// Wait up to `budget` for the dislodge to take effect. Either half is enough
+/// to stop escalating. A free lock is the goal itself: the caller can spawn,
+/// and it is what a departing process releases first (the kernel drops its
+/// file locks during exit, before the process is reaped, so a not-yet-reaped
+/// child of a test harness counts as released here). A pid that is simply
+/// gone also ends the escalation, whatever holds the lock now: signalling a
+/// departed pid again could only ever hit a recycled one, and the caller's
+/// readiness poll handles a successor that legitimately took over.
+async fn wait_for_release(pid: u32, lock_path: &Path, budget: Duration) -> bool {
+    let deadline = Instant::now() + budget;
+    loop {
+        if lock_is_free(lock_path).unwrap_or(false) || !process_alive(pid) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(DISLODGE_POLL).await;
+    }
+}
+
+/// Remove the stale record and socket file a dislodged daemon left behind,
+/// guarded so a successor that already took over is never disturbed: the
+/// record goes only while it still names the dislodged pid, the socket file
+/// only while the lock is still free.
+fn clean_after_dislodge(pid: u32, _lock_path: &Path) {
+    if read_lock_info().is_some_and(|info| info.pid == pid)
+        && let Ok(path) = config::service_info_path()
+    {
+        let _ = std::fs::remove_file(path);
+    }
+    // Only unix leaves a socket file behind; a Windows named pipe disappears
+    // with the process that bound it.
+    #[cfg(unix)]
+    if lock_is_free(_lock_path).unwrap_or(false)
+        && let Ok(sock) = config::service_sock_path()
+    {
+        let _ = std::fs::remove_file(sock);
+    }
+}
+
+/// Dislodge an unresponsive lock holder, if that is what owns the index. The
+/// one implementation behind both the connect path and `doctor --fix`.
+///
+/// Diagnoses first and acts only on [`HolderState::Unresponsive`]: a free lock
+/// and a holder that answered its socket are both left alone, and an
+/// unidentified holder is an error, never a signal. The wedged holder gets the
+/// graceful signal, [`DISLODGE_TERM_WAIT`] to leave, then the hard signal and
+/// [`DISLODGE_KILL_WAIT`], after which its stale record and socket file go.
+pub async fn dislodge_unresponsive() -> anyhow::Result<DislodgeOutcome> {
+    let lock_path = config::service_lock_path()
+        .map_err(|e| anyhow::anyhow!("could not resolve the service lock path: {e}"))?;
+    match diagnose_holder().await {
+        HolderState::Free | HolderState::Responsive => Ok(DislodgeOutcome::NotNeeded),
+        HolderState::Unknown { detail } => Err(unknown_holder_error(&detail)),
+        HolderState::Unresponsive { pid, probe } => {
+            // Two last safety gates on the kill path itself, deliberately
+            // separate from the identity check above: never signal init and
+            // never signal ourselves (the embedded server holds this very lock
+            // in-process, and a client must not shoot its own foot).
+            if pid <= 1 || pid == std::process::id() {
+                return Err(unknown_holder_error(&format!(
+                    "pid {pid} is not a process this client may signal"
+                )));
+            }
+            if !signal_process(pid, false) {
+                return Err(unknown_holder_error(&format!(
+                    "pid {pid} could not be asked to stop"
+                )));
+            }
+            if !wait_for_release(pid, &lock_path, DISLODGE_TERM_WAIT).await {
+                signal_process(pid, true);
+                if !wait_for_release(pid, &lock_path, DISLODGE_KILL_WAIT).await {
+                    return Err(unknown_holder_error(&format!(
+                        "pid {pid} was stopped but the lock stayed held"
+                    )));
+                }
+            }
+            clean_after_dislodge(pid, &lock_path);
+            tracing::warn!(
+                "dislodged an unresponsive crystalline daemon (pid {pid}) that held the index lock without answering its socket for {:.1}s; starting a fresh daemon",
+                probe.as_secs_f64()
+            );
+            Ok(DislodgeOutcome::Dislodged { pid })
+        }
+    }
+}
+
 /// Attach to a daemon, spawning one detached and polling for readiness (up to
 /// ~15s) when none is running and `spawn` is set. The window is generous on
 /// purpose: a cold start on modest hardware or a loaded machine can take well
@@ -346,6 +777,39 @@ pub async fn ensure_daemon(
     if !spawn {
         anyhow::bail!("no Crystalline daemon is running; start one with `crystalline serve`");
     }
+
+    // Attaching failed. If the lock is already held at this point, a spawn
+    // would only lose the race, which is the 2026-07-28 wedge: nothing to
+    // attach to and nothing to take. Diagnosing here rather than after the
+    // spawn is what makes the lock loss observable at all - the daemon we
+    // spawn is detached, so its own lock failure is only ever a line in
+    // daemon.log. The lock probe is a single flock on the fast path, so a
+    // normal cold start (lock free) pays nothing and behaves exactly as
+    // before. Only one dislodge attempt per connect: `unknown_holder` carries
+    // the refusal into this call's own error rather than signalling anything.
+    let mut unknown_holder = None;
+    match diagnose_holder().await {
+        // A daemon just won the race and answers: attach, never dislodge.
+        HolderState::Responsive => {
+            if let Some(conn) = try_attach().await {
+                return Ok(conn);
+            }
+        }
+        HolderState::Unresponsive { .. } => match dislodge_unresponsive().await {
+            Ok(DislodgeOutcome::Dislodged { .. }) | Ok(DislodgeOutcome::NotNeeded) => {}
+            Err(e) => unknown_holder = Some(e),
+        },
+        HolderState::Unknown { detail } => {
+            // Doubt never signals. A daemon that is starting up right now
+            // looks exactly like this (lock taken, record not published yet),
+            // so fall through to the spawn and the readiness wait, which is
+            // what this call did before this branch existed, and keep the
+            // refusal for the error this call ends with if the wait runs out.
+            unknown_holder = Some(unknown_holder_error(&detail));
+        }
+        HolderState::Free => {}
+    }
+
     spawn_daemon(db, config_path, read_only)?;
     // Poll readiness: lock record present and socket connectable. Another
     // client's lingering old-binary bridge can be reconnecting during this
@@ -368,6 +832,12 @@ pub async fn ensure_daemon(
             spawn_daemon(db, config_path, read_only)?;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // A holder we refused to touch is the better explanation of the timeout
+    // than the generic one: it names the lock file and how to look at whoever
+    // owns it, instead of pointing at a daemon log the spawn never reached.
+    if let Some(e) = unknown_holder {
+        return Err(e);
     }
     anyhow::bail!(
         "spawned a daemon but it did not become ready within 15s (see daemon.log in the state directory)"
@@ -978,6 +1448,203 @@ mod tests {
             read_lock_info().is_none(),
             "no service.json and the legacy bytes are gone"
         );
+        drop(ownership);
+        drop(home);
+    }
+
+    /// The identity gate on the kill path. The canonical name always counts;
+    /// this test binary's own file name counts (a differently named binary
+    /// spawns its daemon as itself); anything else is a stranger and must
+    /// never be signalled.
+    #[test]
+    fn only_a_crystalline_executable_name_passes_the_identity_gate() {
+        assert!(is_crystalline_exe_name("crystalline"));
+        assert!(
+            is_crystalline_exe_name(&own_exe_name().unwrap()),
+            "a holder wearing this binary's own file name is ours"
+        );
+        assert!(!is_crystalline_exe_name("sleep"));
+        assert!(!is_crystalline_exe_name("postgres"));
+        assert!(
+            !is_crystalline_exe_name("crystalline-backup"),
+            "a merely similar name is a stranger"
+        );
+        assert!(!is_crystalline_exe_name(""));
+    }
+
+    /// The exe lookup answers for a live process on the platforms that
+    /// support it, and never claims a name for a pid that cannot exist.
+    #[test]
+    fn process_exe_name_reads_this_process_and_not_a_bogus_pid() {
+        let own = process_exe_name(std::process::id());
+        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+        assert!(
+            own.as_deref().is_some_and(|n| !n.is_empty()),
+            "this process's own executable name must be readable"
+        );
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+        assert!(own.is_none(), "an unsupported platform never guesses");
+        assert!(
+            process_exe_name(0).is_none(),
+            "pid 0 is never a real process to identify"
+        );
+    }
+
+    /// The lock probe: free while nobody holds it, held while ownership
+    /// lives, free again once it drops. `fs4` locks the open handle, not the
+    /// process, so this sees a same-process holder exactly as it sees another
+    /// process's - which is what the diagnose tests below rely on.
+    #[tokio::test]
+    async fn lock_is_free_tracks_the_held_lock() {
+        let home = ScratchHome::new("lock-free");
+        let lock_path = config::service_lock_path().unwrap();
+        assert!(
+            lock_is_free(&lock_path).unwrap(),
+            "no lock file yet means nothing holds it"
+        );
+        let ownership = acquire_ownership().unwrap();
+        assert!(
+            !lock_is_free(&lock_path).unwrap(),
+            "a held lock reads as held"
+        );
+        drop(ownership);
+        assert!(
+            lock_is_free(&lock_path).unwrap(),
+            "the lock frees when ownership drops"
+        );
+        drop(home);
+    }
+
+    /// Nothing holds the lock: there is no holder to diagnose.
+    #[tokio::test]
+    async fn diagnose_holder_reports_a_free_lock() {
+        let home = ScratchHome::new("diag-free");
+        assert_eq!(diagnose_holder().await, HolderState::Free);
+        drop(home);
+    }
+
+    /// A holder whose socket answers is responsive, whatever else is true of
+    /// it. This is the scenario that must never lead to a signal: the probe
+    /// answers, so the caller attaches.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn diagnose_holder_reports_a_responsive_holder() {
+        let home = ScratchHome::new("diag-live");
+        let ownership = acquire_ownership().unwrap();
+        let listener = ownership.bind_listener().unwrap();
+        ownership.publish().unwrap();
+        let server = tokio::spawn(async move {
+            let mut stream = listener.accept().await.unwrap();
+            let _ = read_mode_line(&mut stream).await;
+            let mut sink = [0u8; 64];
+            let _ = stream.read(&mut sink).await;
+            stream.write_all(b"{\"v\":1,\"ok\":true}\n").await.unwrap();
+            stream.flush().await.unwrap();
+        });
+
+        assert_eq!(diagnose_holder().await, HolderState::Responsive);
+
+        server.await.unwrap();
+        drop(ownership);
+        drop(home);
+    }
+
+    /// The wedge: the lock is held, no socket answers and the record names a
+    /// live process whose executable is a crystalline binary (this test
+    /// process itself, which the identity gate accepts by its own file name).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn diagnose_holder_names_a_verified_live_holder_as_unresponsive() {
+        let home = ScratchHome::new("diag-wedge");
+        let ownership = acquire_ownership().unwrap();
+        // Deliberately no listener: this is the wedge, a held lock with
+        // nothing serving the socket.
+        ownership.publish().unwrap();
+
+        match diagnose_holder().await {
+            HolderState::Unresponsive { pid, .. } => assert_eq!(pid, std::process::id()),
+            other => panic!("expected an unresponsive holder, got {other:?}"),
+        }
+
+        drop(ownership);
+        drop(home);
+    }
+
+    /// Even a verified unresponsive holder is never signalled when it is this
+    /// very process: the kill path's own guard, independent of the identity
+    /// check, and the refusal names the lock file and how to look at it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dislodge_refuses_to_signal_this_process() {
+        let home = ScratchHome::new("diag-self");
+        let ownership = acquire_ownership().unwrap();
+        ownership.publish().unwrap();
+
+        let err = dislodge_unresponsive()
+            .await
+            .expect_err("a client must never signal itself");
+        let message = err.to_string();
+        assert!(message.contains("service.lock"), "{message}");
+        assert!(message.contains("lsof"), "{message}");
+        assert!(message.contains("nothing was signalled"), "{message}");
+        assert!(
+            process_alive(std::process::id()),
+            "the refusal left this process alone"
+        );
+
+        drop(ownership);
+        drop(home);
+    }
+
+    /// A held lock whose record names a dead pid is the classic doubt case:
+    /// something owns the index and it is not what the record describes.
+    /// Refuse and say where to look, never hunt for another victim.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn diagnose_holder_refuses_a_record_naming_a_dead_pid() {
+        let home = ScratchHome::new("diag-dead");
+        let ownership = acquire_ownership().unwrap();
+        // The lock stays held by this process while the record claims a pid
+        // that cannot be alive.
+        let info = LockInfo {
+            pid: 2_147_483_647,
+            socket_path: config::service_sock_path().unwrap().display().to_string(),
+            version: crystalline_core::VERSION.to_string(),
+            started_at: chrono::Utc::now().to_rfc3339(),
+        };
+        std::fs::write(
+            config::service_info_path().unwrap(),
+            serde_json::to_string(&info).unwrap(),
+        )
+        .unwrap();
+
+        match diagnose_holder().await {
+            HolderState::Unknown { detail } => assert!(detail.contains("2147483647"), "{detail}"),
+            other => panic!("expected an unidentified holder, got {other:?}"),
+        }
+        assert!(
+            dislodge_unresponsive().await.is_err(),
+            "an unidentified holder is refused, never signalled"
+        );
+
+        drop(ownership);
+        drop(home);
+    }
+
+    /// A held lock with no record at all is equally unidentified. This is
+    /// also the shape of a daemon that has taken the lock and not published
+    /// yet, which is precisely why it must never be signalled.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn diagnose_holder_refuses_a_lock_with_no_record() {
+        let home = ScratchHome::new("diag-norecord");
+        let ownership = acquire_ownership().unwrap();
+        match diagnose_holder().await {
+            HolderState::Unknown { detail } => {
+                assert!(detail.contains("no service record"), "{detail}")
+            }
+            other => panic!("expected an unidentified holder, got {other:?}"),
+        }
         drop(ownership);
         drop(home);
     }

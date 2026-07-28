@@ -303,3 +303,70 @@ fn a_second_serve_fails_fast_naming_the_owner() {
 
     drop(daemon);
 }
+
+/// The Windows leg of the force-takeover path: a real process holds the lock
+/// and publishes a record without ever binding the pipe (the wedge of the
+/// 2026-07-28 incident), and `doctor --fix` verifies its identity through
+/// `QueryFullProcessImageNameW` and ends it through `TerminateProcess`. The
+/// unix twin of this scenario lives in service.rs; this is the only place the
+/// Windows signalling path runs at all.
+#[test]
+fn doctor_fix_dislodges_an_unresponsive_holder() {
+    let env = Env::new("win-wedge");
+
+    let mut hold = Command::new(bin());
+    env.apply(&mut hold);
+    let mut holder = hold
+        .args(["hold-lock", "--secs", "60"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    // The readiness line means the lock is taken and the record is published.
+    let mut out = BufReader::new(holder.stdout.take().unwrap());
+    let mut line = String::new();
+    out.read_line(&mut line).unwrap();
+    assert_eq!(line.trim(), "holding", "hold-lock did not take the lock");
+    let holder_pid = u64::from(holder.id());
+    let record = wait_for_record(&env);
+    assert_eq!(record["pid"].as_u64(), Some(holder_pid));
+
+    let mut doctor = Command::new(bin());
+    env.apply(&mut doctor);
+    let report = doctor
+        .args(["--json", "doctor", "--fix"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&report.stdout);
+    let parsed: Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!(
+            "doctor did not print a report ({e}): {stdout}{}",
+            String::from_utf8_lossy(&report.stderr)
+        )
+    });
+    assert_eq!(
+        parsed["service"]["daemon_dislodged"],
+        json!(true),
+        "{stdout}"
+    );
+
+    // `try_wait` rather than a liveness probe: the holder is this test's own
+    // child, so it must be reaped to be seen as gone.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if holder.try_wait().unwrap().is_some() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the wedged holder was not dislodged"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !env.info_path().exists(),
+        "the dislodged holder's stale record was cleaned up"
+    );
+}
