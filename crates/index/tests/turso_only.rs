@@ -78,7 +78,7 @@ async fn temporal_current_filter_uses_the_promoted_index() {
 
     let plan = store
         .explain_query_plan(
-            "SELECT id FROM engram WHERE status='current' AND (valid_from IS NULL OR valid_from <= '2026-07-02') AND (valid_to IS NULL OR valid_to > '2026-07-02')",
+            "SELECT id FROM engram WHERE status IN ('stable', 'current') AND (valid_from IS NULL OR valid_from <= '2026-07-02') AND (valid_to IS NULL OR valid_to > '2026-07-02')",
         )
         .await
         .unwrap();

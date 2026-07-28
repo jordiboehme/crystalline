@@ -1985,7 +1985,7 @@ async fn edit_engram_rejects_an_injected_timestamp_bound() {
     let path = h.root.join("eng/editable.md");
     let before = std::fs::read_to_string(&path).unwrap();
     assert!(
-        before.contains("status: current"),
+        before.contains("status: stable"),
         "the edit anchor is missing: {before}"
     );
 
@@ -1996,8 +1996,8 @@ async fn edit_engram_rejects_an_injected_timestamp_bound() {
             "domain": "eng",
             "identifier": "editable",
             "operation": "find_replace",
-            "find_text": "status: current",
-            "content": "status: current\nvalid_to: 2026-07-15T10:30:00Z",
+            "find_text": "status: stable",
+            "content": "status: stable\nvalid_to: 2026-07-15T10:30:00Z",
         }),
     )
     .await
@@ -2035,8 +2035,8 @@ async fn edit_engram_drops_an_injected_sentinel_bound() {
             "domain": "eng",
             "identifier": "sentinel-edit",
             "operation": "find_replace",
-            "find_text": "status: current",
-            "content": "status: current\nvalid_to: 9999-12-30",
+            "find_text": "status: stable",
+            "content": "status: stable\nvalid_to: 9999-12-30",
         }),
     )
     .await

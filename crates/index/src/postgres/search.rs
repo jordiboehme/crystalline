@@ -17,9 +17,10 @@ use sqlx::PgConnection;
 use crate::alias::AliasMap;
 use crate::error::{IndexError, Result};
 use crate::store::{
-    DEFAULT_RETIRED_WEIGHT, DEFAULT_SALIENCE_WEIGHT, EdgeKind, EmbeddingCoverage, EngramId,
-    FilterOp, GraphEdge, GraphNode, GraphSlice, HitKind, MetadataFilter, Page, SearchHit,
-    SearchMode, SearchQuery, retired_factor, salience_prior,
+    CURRENT_STATUS_CLASS, DEFAULT_RETIRED_WEIGHT, DEFAULT_SALIENCE_WEIGHT, EdgeKind,
+    EmbeddingCoverage, EngramId, FilterOp, GraphEdge, GraphNode, GraphSlice, HitKind,
+    MetadataFilter, Page, SearchHit, SearchMode, SearchQuery, is_current_status, retired_factor,
+    salience_prior,
 };
 
 use super::{Param, cell_i64, cell_real, cell_text, query_all, query_first, scalar_i64};
@@ -591,16 +592,32 @@ fn build_scalar_filters(
                 .to_string()
         });
         clauses.push(format!(
-            "e.status = 'current' AND (e.valid_from IS NULL OR e.valid_from <= ${n}) AND (e.valid_to IS NULL OR e.valid_to > ${})",
+            "e.status IN ('stable', 'current') AND (e.valid_from IS NULL OR e.valid_from <= ${n}) AND (e.valid_to IS NULL OR e.valid_to > ${})",
             *n + 1
         ));
         params.push(Param::Text(today.clone()));
         params.push(Param::Text(today));
         *n += 2;
     } else if let Some(s) = &query.status {
-        clauses.push(format!("e.status = ${n}"));
-        params.push(Param::Text(s.clone()));
-        *n += 1;
+        // `stable` and `current` are one equivalence class in both directions,
+        // so a pre-flip domain and a foreign OKF bundle both answer either
+        // spelling. Every other status stays an exact match.
+        if is_current_status(s) {
+            let ph: Vec<String> = CURRENT_STATUS_CLASS
+                .iter()
+                .map(|member| {
+                    params.push(Param::Text((*member).to_string()));
+                    let p = format!("${n}");
+                    *n += 1;
+                    p
+                })
+                .collect();
+            clauses.push(format!("e.status IN ({})", ph.join(",")));
+        } else {
+            clauses.push(format!("e.status = ${n}"));
+            params.push(Param::Text(s.clone()));
+            *n += 1;
+        }
     }
 
     if let Some(after) = &query.after {

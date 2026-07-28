@@ -20,7 +20,7 @@ title: Decision Schema
 tags:
   - schema
   - engineering
-status: current
+status: stable
 entity: decision
 version: 1
 schema:
@@ -36,7 +36,7 @@ settings:
   validation: warn
   frontmatter:
     status(enum):
-      - current
+      - stable
       - proposed
       - superseded
     owner: string
@@ -95,7 +95,7 @@ Rather than guessing a shape from scratch, generalize one from engrams already c
 
 `threshold` is the frequency at or above which a field is suggested at all (0.25 by default: present in at least a quarter of the engrams); a field present in 95% or more is suggested as required rather than optional. Lower the threshold to surface more of a domain's organic vocabulary, or raise it to keep the suggested schema to only its strongest patterns.
 
-The result is a draft in the tool's own JSON shape, not finished Picoschema. Translate it into declarations - plain `name: type` lines, `?` for optional, `(enum)` and `(array)` modifiers - before saving through `metadata`; pasting the raw draft in produces malformed declarations that fail verification. While translating, apply judgment the heuristic lacks: trim fields that do not deserve to be required, promote a field the strong majority shares when the outliers are a different kind of engram, and turn any inferred relation target into a properly Capitalized type name.
+The draft never suggests the engine-owned provenance keys `generated` and `timestamp`, nor `type` itself, since a write fills those in and ignores them when passed as metadata. The result is a draft in the tool's own JSON shape, not finished Picoschema. Translate it into declarations - plain `name: type` lines, `?` for optional, `(enum)` and `(array)` modifiers - before saving through `metadata`; pasting the raw draft in produces malformed declarations that fail verification. While translating, apply judgment the heuristic lacks: trim fields that do not deserve to be required, promote a field the strong majority shares when the outliers are a different kind of engram, and turn any inferred relation target into a properly Capitalized type name.
 
 ## Checking conformance
 

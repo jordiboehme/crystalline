@@ -32,7 +32,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from envs.common import read_frontmatter, snapshot
+from envs.common import RESERVED_FILENAMES, read_frontmatter, snapshot
 from envs.crystalline_capture.scoring import (
     MCP_PREFIX,
     MUTATING_TOOLS,
@@ -48,6 +48,8 @@ __all__ = ["score_item", "snapshot", "describe_expectations"]
 def _find_schema_file(sandbox: Path, domain: str, entity: str) -> Path | None:
     domain_dir = sandbox / "domains" / domain
     for p in sorted(domain_dir.rglob("*.md")):
+        if p.name in RESERVED_FILENAMES:
+            continue
         fm = read_frontmatter(p)
         if str(fm.get("type", "")) == "schema" and str(fm.get("entity", "")) == entity:
             return p

@@ -318,7 +318,7 @@ enum Command {
         /// Comma-separated tags.
         #[arg(long)]
         tags: Option<String>,
-        /// The status. Defaults to current.
+        /// The status. Defaults to stable.
         #[arg(long)]
         status: Option<String>,
         /// Extra frontmatter as a JSON object.

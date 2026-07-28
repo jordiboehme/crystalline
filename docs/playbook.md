@@ -64,7 +64,7 @@ title: ship-ops
 permalink: manifest
 tags:
   - manifest
-status: current
+status: stable
 recorded_at: 2026-07-19
 ---
 
@@ -109,8 +109,12 @@ question about those systems should route here.
 
 From then on every session opens with the agent reading
 those bullets as a routing brief, so it knows `ship-ops` owns them without being
-told. A healthy archive keeps its sync ratio: what the agent sees and what is on
-disk track one to one, and everything below drifts them apart then back.
+told. A healthy archive keeps its sync ratio: every engram the agent can see is a
+file on disk and every engram file is in the index, and everything below drifts
+them apart then back. One kind of file sits outside that count by design - the
+`index.md` Crystalline writes into each folder, a plain markdown table of
+contents that makes the domain navigable without any tooling. It is generated,
+never indexed and never an engram, so it costs the ratio nothing.
 
 ## Record
 
@@ -136,7 +140,7 @@ permalink: docking-clamp-cold-weather-seating
 tags:
 - docking
 - clamps
-status: current
+status: stable
 recorded_at: 2026-07-19
 generated: { by: claude-code/1.0.5, at: 2026-07-19T09:12:00+00:00 }
 ---
@@ -180,7 +184,7 @@ permalink: vent-driver-firmware
 tags:
 - vents
 - firmware
-status: current
+status: stable
 recorded_at: 2026-07-19
 generated: { by: claude-code/1.0.5, at: 2026-07-19T11:47:00+00:00 }
 ---
@@ -214,7 +218,7 @@ permalink: coolant-loop-runs-glycol-mix-b
 tags:
 - coolant
 - cooling
-status: current
+status: stable
 recorded_at: 2026-07-19
 generated: { by: claude-code/1.0.5, at: 2026-07-19T14:03:00+00:00 }
 ---
@@ -323,7 +327,7 @@ tags:
 - hyperdrive
 - vendor
 - recall
-status: current
+status: stable
 recorded_at: 2026-07-19
 source_date: 2026-06-30
 resource: https://vendor.example/notices/qx-114
@@ -455,7 +459,7 @@ load. Retire the old decision but keep why it changed.
 ```
 
 *The agent runs the full recipe.* First it writes the replacement as a new engram
-with `status: current`, carrying the lesson forward so it outlives the retired
+with `status: stable`, carrying the lesson forward so it outlives the retired
 fact:
 
 ```markdown
@@ -466,7 +470,7 @@ permalink: coolant-loop-runs-glycol-mix-c
 tags:
 - coolant
 - cooling
-status: current
+status: stable
 recorded_at: 2026-08-01
 generated: { by: claude-code/1.0.5, at: 2026-08-01T17:40:00+00:00 }
 ---
@@ -489,7 +493,7 @@ Then it edits the old engram - flipping its status and closing its validity wind
 in one edit, and adding the back-relation. The old frontmatter goes from
 
 ```markdown
-status: current
+status: stable
 ```
 
 to
@@ -566,10 +570,12 @@ knowledge is worth the review.
 
 ### Reference blocks
 
-Recommended `status` values (guidance, not enforced): `current`, `implemented`,
+Recommended `status` values (guidance, not enforced): `stable`, `implemented`,
 `draft`, `proposed`, `idea`, `poc`, `deprecated`, `superseded`, `archived`,
-`legacy`. `stable` means the same as `current` - it is the Open Knowledge Format
-word for that state, so both are recommended.
+`legacy`. `stable` is the default a write fills in and the Open Knowledge Format
+word for knowledge that holds now; `current` is the older Crystalline word for
+the same state, still written by hand and read forever, and a search filtered on
+either word returns engrams carrying either.
 
 Observation categories: `- [decision]`, `- [fact]`, `- [pattern]`, `-
 [gotcha]`, `- [convention]`, `- [lesson]`, `- [risk]`, `- [insight]`, `-
@@ -609,7 +615,8 @@ crystalline reindex --full                          # rebuild the derived index 
 
 The index is disposable and the files are the truth, so `reindex --full` is never
 a data-loss event - it is the clean-room reset that syncs the index back to the
-files, ratio restored.
+engram files, ratio restored (the generated `index.md` files stay outside it, as
+they always are).
 
 ---
 

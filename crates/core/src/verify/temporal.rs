@@ -1,12 +1,21 @@
 //! T-family rules: temporal metadata.
 //!
-//! `status` and `recorded_at` are required (`T001`); `valid_from`/`valid_to`
-//! stay optional and open-ended (absence means unbounded, per the format
-//! spec), so the only hard checks on them are that a present value parses as
-//! an ISO date (`T003`) and that `valid_from <= valid_to` when both are
-//! present (`T004`). A sentinel far-future `valid_to` (`T008`) is flagged
-//! rather than treated as valid input, since Crystalline expresses "valid
-//! forever" by omitting the field, never by writing a distant date.
+//! `status` and `recorded_at` are required (`T001`) and a status outside the
+//! recommended set is noted (`T002`, Info only, since status is free form).
+//! `valid_from`/`valid_to` stay optional and open-ended (absence means
+//! unbounded, per the format spec), so the only hard checks on them are that a
+//! present value parses as an ISO date (`T003`) and that `valid_from <=
+//! valid_to` when both are present (`T004`). `T003` covers every field whose
+//! typed parse failed and left the raw value in `extra`: the date fields, a
+//! `timestamp` that is not RFC 3339, a `generated` that is not a mapping with a
+//! `by` actor and a `verified` that is neither a `{ by, at }` entry nor a list
+//! of them. The rest are lifecycle and provenance warnings: a `superseded`
+//! status without a `superseded_by` relation (`T005`), missing write provenance
+//! (`T006`, satisfied by the legacy `timestamp` too) and a `temporal_confidence`
+//! outside `explicit`/`inferred` (`T007`). A sentinel far-future `valid_to`
+//! (`T008`) is flagged rather than treated as valid input, since Crystalline
+//! expresses "valid forever" by omitting the field, never by writing a distant
+//! date.
 
 use std::path::Path;
 

@@ -1537,6 +1537,52 @@ parity!(
     canonical_temporal_filter
 );
 
+async fn status_class_folds_stable_and_current(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let with_status = |title: &str, permalink: &str, status: &str| {
+        format!(
+            "---\ntype: engram\ntitle: {title}\npermalink: {permalink}\ntags:\n  - t\nstatus: {status}\nrecorded_at: 2026-01-01\n---\n\n# {title}\n\nbody\n"
+        )
+    };
+    write(root, "new.md", &with_status("New", "new", "stable"));
+    write(root, "old.md", &with_status("Old", "old", "current"));
+    write(root, "draft.md", &with_status("Draft", "draft", "draft"));
+    sync_domain(store, "d", root).await.unwrap();
+
+    let hits = |page: crystalline_index::Page<crystalline_index::SearchHit>| {
+        let mut perms: Vec<String> = page.items.iter().map(|h| h.permalink.clone()).collect();
+        perms.sort();
+        perms
+    };
+    let query = |status: Option<&str>, current_only: bool| SearchQuery {
+        status: status.map(str::to_string),
+        current_only,
+        today: Some("2026-07-02".into()),
+        limit: 10,
+        page: 1,
+        ..SearchQuery::default()
+    };
+
+    // Both directions of the equivalence class see both spellings.
+    let by_stable = store.search(&query(Some("stable"), false)).await.unwrap();
+    assert_eq!(hits(by_stable), vec!["new".to_string(), "old".to_string()]);
+    let by_current = store.search(&query(Some("current"), false)).await.unwrap();
+    assert_eq!(hits(by_current), vec!["new".to_string(), "old".to_string()]);
+
+    // Any other status stays an exact match.
+    let by_draft = store.search(&query(Some("draft"), false)).await.unwrap();
+    assert_eq!(hits(by_draft), vec!["draft".to_string()]);
+
+    // The as-of filter covers the class too.
+    let as_of = store.search(&query(None, true)).await.unwrap();
+    assert_eq!(hits(as_of), vec!["new".to_string(), "old".to_string()]);
+}
+parity!(
+    status_filter_treats_stable_and_current_as_one_class,
+    status_class_folds_stable_and_current
+);
+
 async fn search_pages(store: &dyn Store) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
