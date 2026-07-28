@@ -223,10 +223,11 @@ async fn scored_lexical(
     } else {
         format!("WHERE {}", clauses.join(" AND "))
     };
+    // `ORDER BY e.id` is answered from the primary key, so this wide projection
+    // never reaches a sort node. Keep it that way: any other ordering here would
+    // sort every matched body.
     let sql = format!(
-        "SELECT e.id, d.name, e.permalink, e.title, e.engram_type, e.status, e.description, e.content, \
-         CASE WHEN jsonb_typeof(e.metadata -> 'salience') = 'number' THEN (e.metadata ->> 'salience')::double precision END \
-         FROM engram e JOIN domain d ON d.id=e.domain_id {where_sql} \
+        "SELECT {CANDIDATE_COLUMNS} FROM engram e JOIN domain d ON d.id=e.domain_id {where_sql} \
          ORDER BY e.id LIMIT {candidate_cap}"
     );
     let rows = query_all(conn, &sql, params).await?;
@@ -269,10 +270,11 @@ async fn filter_only(
     .max(0) as usize;
 
     let offset = (page - 1) * limit;
+    // This one sorts, but with a `LIMIT` and no `GROUP BY` Postgres runs a
+    // bounded top-N heapsort, so the wide projection costs one page of bodies
+    // rather than the whole match set.
     let sql = format!(
-        "SELECT e.id, d.name, e.permalink, e.title, e.engram_type, e.status, e.description, e.content, \
-         CASE WHEN jsonb_typeof(e.metadata -> 'salience') = 'number' THEN (e.metadata ->> 'salience')::double precision END \
-         FROM engram e JOIN domain d ON d.id=e.domain_id {where_sql} \
+        "SELECT {CANDIDATE_COLUMNS} FROM engram e JOIN domain d ON d.id=e.domain_id {where_sql} \
          ORDER BY e.recorded_at DESC, e.permalink ASC LIMIT {limit} OFFSET {offset}"
     );
     let rows = query_all(conn, &sql, params).await?;
@@ -475,11 +477,54 @@ async fn run_hybrid(
     finish_page(conn, items, page, limit, total).await
 }
 
+/// The projection every candidate row carries, in the column order
+/// [`Candidate::from_row`] reads. Shared by the lexical scan, the filter-only
+/// listing and the semantic hydrate so all three decode identically.
+const CANDIDATE_COLUMNS: &str = "e.id, d.name, e.permalink, e.title, e.engram_type, e.status, e.description, e.content, \
+     CASE WHEN jsonb_typeof(e.metadata -> 'salience') = 'number' \
+     THEN (e.metadata ->> 'salience')::double precision END";
+
+/// Phase 1 of the semantic scan: the narrow top-k, mirroring
+/// [`crate::turso::search`]'s split exactly. Groups the matching chunk rows by
+/// their parent engram, keeps each engram's closest chunk and projects nothing
+/// but the id and the distance.
+///
+/// Postgres does not spill the way turso's sorter does, but the projection was
+/// equally wasteful: the aggregate carried every parent engram's body once per
+/// chunk row through the grouping and the sort. The split is kept identical
+/// across backends so the ranking parity suite compares like with like.
+///
+/// Ties. `dist` alone leaves engrams at an equal distance in an unspecified
+/// order, which decides arbitrarily which of them survives the `LIMIT` cut. The
+/// `c.engram_id ASC` tiebreak makes that cut deterministic (the lower id wins).
+fn semantic_phase1_sql(where_sql: &str) -> String {
+    format!(
+        "SELECT c.engram_id, min(c.embedding <=> $1) AS dist \
+         FROM chunk c JOIN engram e ON e.id=c.engram_id JOIN domain d ON d.id=e.domain_id \
+         {where_sql} GROUP BY c.engram_id ORDER BY dist ASC, c.engram_id ASC LIMIT {SEMANTIC_TOPK}"
+    )
+}
+
+/// Phase 2 of the semantic scan: hydrate the at most [`SEMANTIC_TOPK`] winners
+/// by primary key. No `ORDER BY` and no `GROUP BY`; the phase-1 order is
+/// reapplied in Rust. The id list is interpolated because every id is an `i64`
+/// read out of this same database.
+fn semantic_hydrate_sql(ids: &str) -> String {
+    format!(
+        "SELECT {CANDIDATE_COLUMNS} FROM engram e JOIN domain d ON d.id=e.domain_id \
+         WHERE e.id IN ({ids})"
+    )
+}
+
 /// The nearest engrams to the query vector, as `(similarity, candidate)` pairs.
 /// One row per engram (the closest of its chunks), filtered by every scalar
 /// filter on the query, ordered by distance and capped at the top-k. This is an
 /// exact scan (a `GROUP BY min(distance)`), identical in result to Turso's exact
 /// scan; the HNSW index is present for a future top-k rewrite.
+///
+/// Two queries, not one: a narrow top-k ([`semantic_phase1_sql`]) and a
+/// hydrate-by-id ([`semantic_hydrate_sql`]), the same split the Turso backend
+/// runs.
 async fn semantic_candidates(
     conn: &mut PgConnection,
     query: &SearchQuery,
@@ -504,18 +549,40 @@ async fn semantic_candidates(
     ));
 
     let where_sql = format!("WHERE {}", clauses.join(" AND "));
-    let sql = format!(
-        "SELECT e.id, d.name, e.permalink, e.title, e.engram_type, e.status, e.description, e.content, \
-         CASE WHEN jsonb_typeof(e.metadata -> 'salience') = 'number' THEN (e.metadata ->> 'salience')::double precision END, \
-         min(c.embedding <=> $1) AS dist \
-         FROM chunk c JOIN engram e ON e.id=c.engram_id JOIN domain d ON d.id=e.domain_id \
-         {where_sql} GROUP BY e.id, d.name ORDER BY dist ASC LIMIT {SEMANTIC_TOPK}"
-    );
-    let rows = query_all(conn, &sql, params).await?;
-    let mut out = Vec::with_capacity(rows.len());
-    for r in &rows {
-        let dist = cell_real(r, 9).unwrap_or(1.0);
-        out.push((1.0 - dist, Candidate::from_row(r)));
+    let rows = query_all(conn, &semantic_phase1_sql(&where_sql), params).await?;
+    let winners: Vec<(i64, f64)> = rows
+        .iter()
+        .map(|r| (cell_i64(r, 0).unwrap_or(0), cell_real(r, 1).unwrap_or(1.0)))
+        .collect();
+    drop(rows);
+    if winners.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let ids = winners
+        .iter()
+        .map(|(id, _)| id.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let rows = query_all(conn, &semantic_hydrate_sql(&ids), vec![]).await?;
+    // Consume the rows by value so each engram body is moved into its candidate
+    // rather than copied beside it, the same discipline `scored_lexical` uses.
+    let mut by_id: std::collections::HashMap<i64, Candidate> =
+        std::collections::HashMap::with_capacity(rows.len());
+    for r in rows {
+        let c = Candidate::from_row(&r);
+        drop(r);
+        by_id.insert(c.id, c);
+    }
+
+    // Reapply the phase-1 order in Rust: distance ascending, then engram id.
+    // A winner missing from the hydrate is impossible under the foreign key and
+    // is skipped rather than faked into a hit.
+    let mut out = Vec::with_capacity(winners.len());
+    for (id, dist) in winners {
+        if let Some(c) = by_id.remove(&id) {
+            out.push((1.0 - dist, c));
+        }
     }
     Ok(out)
 }
@@ -1192,4 +1259,88 @@ fn eq_ci(a: char, b: char) -> bool {
 
 fn collapse_ws(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The column list a statement projects: everything between `SELECT` and the
+    /// first top-level ` FROM `. The queries under test have no subquery in
+    /// their projection, so the first ` FROM ` is the right one.
+    fn projection_of(sql: &str) -> &str {
+        let rest = sql.strip_prefix("SELECT ").expect("a SELECT statement");
+        let end = rest.find(" FROM ").expect("a FROM clause");
+        &rest[..end]
+    }
+
+    /// The Postgres half of the 2026-07-28 spill guard. Postgres does not spill
+    /// the way turso's sorter does, but the split is mirrored exactly so the two
+    /// backends group, cut and tiebreak identically and the ranking parity suite
+    /// stays honest.
+    #[test]
+    fn the_semantic_phase_one_projection_carries_no_engram_columns() {
+        let sql = semantic_phase1_sql("WHERE c.embedding IS NOT NULL AND c.model = $2");
+        let projection = projection_of(&sql);
+        assert_eq!(
+            projection, "c.engram_id, min(c.embedding <=> $1) AS dist",
+            "phase 1 projects the grouping key and the distance, nothing else"
+        );
+        for wide in ["e.content", "e.description", "e.title", "e.metadata"] {
+            assert!(
+                !projection.contains(wide),
+                "phase 1 must not carry {wide} through the aggregate, projection was: {projection}"
+            );
+        }
+        assert!(
+            sql.contains("GROUP BY c.engram_id ORDER BY dist ASC, c.engram_id ASC"),
+            "the LIMIT cut stays deterministic on a distance tie: {sql}"
+        );
+        assert!(sql.ends_with(&format!("LIMIT {SEMANTIC_TOPK}")));
+    }
+
+    /// The wide columns live in phase 2, which is a primary-key lookup: no
+    /// grouping and no ordering.
+    #[test]
+    fn the_semantic_hydrate_never_sorts() {
+        let sql = semantic_hydrate_sql("1,2,3");
+        assert!(
+            !sql.contains("ORDER BY"),
+            "no ordering in the hydrate: {sql}"
+        );
+        assert!(
+            !sql.contains("GROUP BY"),
+            "no grouping in the hydrate: {sql}"
+        );
+        assert!(
+            projection_of(&sql).contains("e.content"),
+            "the hydrate is where the bodies are read: {sql}"
+        );
+    }
+
+    /// Both backends decode a candidate row by position, so the two projections
+    /// must list the same nine columns in the same order.
+    #[test]
+    fn the_candidate_column_order_matches_the_turso_backend() {
+        let ours: Vec<&str> = CANDIDATE_COLUMNS.split(',').map(str::trim).collect();
+        assert_eq!(ours.len(), 9, "nine columns, matching Candidate::from_row");
+        assert_eq!(
+            &ours[..8],
+            &[
+                "e.id",
+                "d.name",
+                "e.permalink",
+                "e.title",
+                "e.engram_type",
+                "e.status",
+                "e.description",
+                "e.content",
+            ]
+        );
+        assert!(
+            ours[8].contains("salience"),
+            "the ninth column is the salience prior, got {}",
+            ours[8]
+        );
+    }
 }

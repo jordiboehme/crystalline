@@ -1085,17 +1085,30 @@ fn main() -> anyhow::Result<()> {
             read_only,
             take_over,
             config,
-        }) => on_runtime(move || {
-            crystalline_service::run_serve(
-                daemon,
-                http,
-                allowed_host,
-                cli.db,
-                config,
-                read_only,
-                take_over,
-            )
-        }),
+        }) => {
+            // Point this process's temp location at the daemon's own scratch
+            // directory before the runtime starts. It has to happen here, on the
+            // only thread this process has so far: setting an environment
+            // variable is unsound once a second thread exists. It happens for
+            // `serve` alone - the daemon owns its state directory, while several
+            // CLI one-shots can run against it at once and would race each
+            // other's startup sweep. A failure is not fatal: the daemon then
+            // spills to the system temp directory exactly as it did before.
+            if let Err(e) = crystalline_service::temp_store::point_at_state_dir() {
+                eprintln!("crystalline: could not claim a scratch directory: {e}");
+            }
+            on_runtime(move || {
+                crystalline_service::run_serve(
+                    daemon,
+                    http,
+                    allowed_host,
+                    cli.db,
+                    config,
+                    read_only,
+                    take_over,
+                )
+            })
+        }
         Some(Command::Mcp {
             embedded,
             read_only,

@@ -195,6 +195,12 @@ pub async fn run_serve(
     // Take ownership first so a second daemon fails fast with the live pid.
     let ownership = acquire_ownership()?;
 
+    // The lock is held, so this daemon is the only writer of the scratch
+    // directory: reclaim whatever a killed predecessor left spilled there. The
+    // directory itself was pointed at by the CLI before the runtime started
+    // (see `temp_store::point_at_state_dir`).
+    crate::temp_store::sweep_at_startup();
+
     let store = open_store(&loaded.effective, Some(&db_path)).await?;
     // A channel the engine uses to tell the watcher (spawned below) about a
     // domain registered after this daemon started, so it starts watching that
