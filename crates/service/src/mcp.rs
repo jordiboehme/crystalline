@@ -45,10 +45,22 @@
 //! with `name`), five `skill://<name>/SKILL.md` resources and two prompts,
 //! `onboarding` (the live routing block) and `connector` (the static snippet
 //! that teaches a client to onboard itself). The whole surface shares one
-//! gate, the live `skills.serve` setting, on by default; when it is off the
-//! tool, the resource list and the prompt list are empty while direct reads
-//! keep answering, the same hidden-not-disabled doctrine the tool gates
-//! follow. The resource shape follows the converging skills-over-MCP proposal
+//! gate, the live `skills.serve` setting; when it hides the surface the tool,
+//! the resource list and the prompt list are empty while direct reads keep
+//! answering, the same hidden-not-disabled doctrine the tool gates follow.
+//!
+//! That gate is tri-state and its default, `auto`, is decided per connection:
+//! a stdio client whose `initialize` name maps to a harness this machine's
+//! install receipt onboarded with session hooks already carries those skills
+//! as files and gets the routing block from its own hook, so it is served
+//! neither the surface nor the full instructions block (see
+//! `hidden_skills_surface`, `minimal_instructions` and the `initialize`
+//! override, which is the only place a server can see who is connecting).
+//! `true` and `false` force the old always and never behaviour. An HTTP
+//! session is never suppressed: a remote client is exactly who the served
+//! surface is for.
+//!
+//! The resource shape follows the converging skills-over-MCP proposal
 //! without advertising its extension id, which is not ratified yet. The
 //! prompts are declared with rmcp's `#[prompt_router]`/`#[prompt]` macros but
 //! `list_prompts` and `get_prompt` are hand-written, since
@@ -76,15 +88,18 @@
 //! `add_domain` through team mode, `share_changes`, `update_domain` and
 //! `origin_status`.
 
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use rmcp::handler::server::prompt::PromptContext;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     CallToolResult, ContentBlock, ErrorData, GetPromptRequestParams, GetPromptResult,
-    Implementation, ListPromptsResult, ListResourcesResult, ListToolsResult,
-    PaginatedRequestParams, ProgressNotificationParam, PromptMessage, ReadResourceRequestParams,
-    ReadResourceResult, Resource, ResourceContents, Role, ServerCapabilities, ServerInfo, Tool,
+    Implementation, InitializeRequestParams, InitializeResult, ListPromptsResult,
+    ListResourcesResult, ListToolsResult, PaginatedRequestParams, ProgressNotificationParam,
+    PromptMessage, ProtocolVersion, ReadResourceRequestParams, ReadResourceResult, Resource,
+    ResourceContents, Role, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::{
@@ -193,13 +208,53 @@ fn skill_uris() -> String {
         .join(", ")
 }
 
-/// Whether the `skills` tool is hidden given the engine's live `skills.serve`
-/// setting. The whole skill-serving surface (this tool, the `skill://`
-/// resources and the two prompts) shares that one gate, and it is read fresh
-/// on every call rather than cached, since `configure` can flip it
-/// mid-session. Read-only mode is not part of it: reading a skill is a read.
-fn hidden_skills_tool(skills_serve: bool) -> bool {
-    !skills_serve
+/// Whether the whole skill-serving surface (the `skills` tool, the `skill://`
+/// resources and the two prompts) is hidden for one connection.
+///
+/// `skills_serve` is the engine's live setting, read fresh on every call
+/// rather than cached, since `configure` can flip it mid-session.
+/// `receipt_matched` is the connection fact [`McpServer::initialize`] decided
+/// once at handshake time: a local (stdio) client this machine's install
+/// receipt knows as an onboarded harness with session hooks wired. The three
+/// rows are exactly the setting's value set:
+///
+/// - `true`: never hidden, whoever connects.
+/// - `false`: always hidden, whoever connects.
+/// - `auto`: hidden for a receipt-matched connection only, since that client
+///   already carries the same skills as files.
+///
+/// Hidden means hidden, not disabled: the lists come back empty while the
+/// tool, the resources and the prompts all keep answering a direct call.
+/// Read-only mode is not part of it either: reading a skill is a read.
+fn hidden_skills_surface(skills_serve: SkillsServe, receipt_matched: bool) -> bool {
+    match skills_serve {
+        SkillsServe::Always => false,
+        SkillsServe::Never => true,
+        SkillsServe::Auto => receipt_matched,
+    }
+}
+
+/// Whether one connection gets the minimal `instructions` block instead of the
+/// full routing block: only under `auto`, and only for a receipt-matched
+/// client, whose own session hook has already delivered the full block.
+///
+/// `false` deliberately does not shrink the instructions. That setting gates
+/// serving skills, not onboarding: an operator who turns the skill surface off
+/// still wants a connecting agent to learn which domains exist.
+fn minimal_instructions(skills_serve: SkillsServe, receipt_matched: bool) -> bool {
+    skills_serve == SkillsServe::Auto && receipt_matched
+}
+
+/// Whether the client that sent `client_name` in its `initialize` handshake is
+/// a harness this machine has onboarded with session hooks wired, given
+/// `hooked` (the receipt's hooks-installed harnesses). An unrecognized client
+/// name never matches, and a harness whose install skipped hooks is not in
+/// `hooked`, so it does not match either.
+fn receipt_matches_client(client_name: &str, hooked: &[crystalline_core::HarnessKind]) -> bool {
+    match crystalline_core::HarnessKind::from_mcp_client_name(client_name) {
+        Some(kind) => hooked.contains(&kind),
+        None => false,
+    }
 }
 
 /// Whether collaboration tool `name` is hidden given the engine's live
@@ -218,7 +273,7 @@ fn hidden_collab_tool(name: &str, github_enabled: bool, read_only: bool) -> bool
     false
 }
 
-use crystalline_core::config::ResponseFormat;
+use crystalline_core::config::{ResponseFormat, SkillsServe};
 
 use crate::engine::{ConfigureAction, Engine, EngineError, ProvisionAction};
 use crate::params::*;
@@ -244,17 +299,76 @@ fn client_actor(ctx: &RequestContext<RoleServer>) -> Option<String> {
     Some(format!("{name}/{version}"))
 }
 
-/// The shared MCP server: one tool router over one engine. Cheap to clone; the
-/// HTTP transport builds one per session.
+/// Which transport a server instance serves, the one distinction the `auto`
+/// value of `skills.serve` turns on.
+///
+/// A stdio connection is by construction same-machine: the client is a process
+/// this machine's harness started, so this machine's install receipt is
+/// authoritative about what that client already has on disk. An HTTP session
+/// says nothing of the kind, so it is never suppressed - a remote client is
+/// exactly the case the served skill surface exists for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transport {
+    /// Served over stdio: the `crystalline mcp` bridge, its daemon relay and
+    /// the embedded in-process stack.
+    Stdio,
+    /// Served over the streamable HTTP transport.
+    Http,
+}
+
+/// The MCP server for one connection: one tool router over one shared engine.
+/// Cheap to clone; every serving path builds one per connection (the daemon
+/// per accepted `mcp` socket, the HTTP transport per session, the stdio bridge
+/// once for its single session), which is what lets it hold the per-connection
+/// handshake decision below.
 #[derive(Clone)]
 pub struct McpServer {
     engine: Arc<Engine>,
+    transport: Transport,
+    /// Where to read this machine's install receipt. `None` when the state
+    /// directory could not be resolved at all, which reads as "no receipt".
+    install_receipt: Option<PathBuf>,
+    /// Whether the client that completed this connection's `initialize` is a
+    /// locally installed harness with session hooks wired. Decided once in
+    /// [`McpServer::initialize`] and read by every gate afterwards, so the
+    /// receipt is read once per connection rather than once per list call.
+    /// Shared through the clone rmcp keeps, hence the atomic.
+    receipt_matched: Arc<AtomicBool>,
 }
 
 impl McpServer {
-    /// Build a server around a shared engine.
+    /// Build a server around a shared engine for a stdio connection.
     pub fn new(engine: Arc<Engine>) -> McpServer {
-        McpServer { engine }
+        McpServer::with_transport(engine, Transport::Stdio)
+    }
+
+    /// Build a server around a shared engine for one HTTP session.
+    pub fn new_http(engine: Arc<Engine>) -> McpServer {
+        McpServer::with_transport(engine, Transport::Http)
+    }
+
+    fn with_transport(engine: Arc<Engine>, transport: Transport) -> McpServer {
+        McpServer {
+            engine,
+            transport,
+            install_receipt: crystalline_core::provision::install_receipt_path().ok(),
+            receipt_matched: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Point this server at an explicit install receipt instead of the one
+    /// under this machine's state directory. Tests use it to exercise the
+    /// `auto` matching without touching the developer's real receipt.
+    pub fn with_install_receipt(mut self, path: PathBuf) -> McpServer {
+        self.install_receipt = Some(path);
+        self
+    }
+
+    /// Whether this connection's client matched the install receipt, the fact
+    /// [`hidden_skills_surface`] and [`minimal_instructions`] gate on. Always
+    /// `false` before `initialize` has run and always `false` on HTTP.
+    fn receipt_matched(&self) -> bool {
+        self.receipt_matched.load(Ordering::Relaxed)
     }
 }
 
@@ -540,10 +654,16 @@ impl McpServer {
         }
 
         let before = self.engine.github_enabled();
-        let skills_before = self.engine.skills_serve();
+        // Compare the surface this connection actually sees, not the raw
+        // setting: under `auto` the same value can mean hidden for a
+        // receipt-matched client and visible for everyone else, so a flip
+        // between `auto` and `true` moves nothing for a client that was never
+        // matched and must not claim otherwise.
+        let matched = self.receipt_matched();
+        let skills_before = hidden_skills_surface(self.engine.skills_serve(), matched);
         self.apply_settings(&p).await?;
         let after = self.engine.github_enabled();
-        let skills_after = self.engine.skills_serve();
+        let skills_after = hidden_skills_surface(self.engine.skills_serve(), matched);
         // A `skills.serve` flip moves three lists at once (the `skills` tool,
         // the `skill://` resources and the two prompts), a `github.enabled`
         // flip only the tool list; one call can do both, and the tool
@@ -1000,6 +1120,70 @@ impl ServerHandler for McpServer {
         info
     }
 
+    /// Complete the handshake, and decide there and then whether this
+    /// connection is one Crystalline has already onboarded by other means.
+    ///
+    /// This is where the receipt-aware `auto` behaviour lives, for one blunt
+    /// reason: `get_info` takes `&self` and no request, so a server cannot see
+    /// who is connecting from inside it, while rmcp's `ServerHandler::
+    /// initialize` receives the client's own `InitializeRequestParams`. It is
+    /// therefore the earliest and the only point at which the instructions
+    /// this connection receives can depend on who asked, and it is a plain
+    /// trait override rather than a transport-level rewrite: the daemon relay,
+    /// the embedded stdio stack and the HTTP transport all serve through this
+    /// same handler, so all three behave identically without the raw
+    /// JSON-RPC interception in `crate::client` growing a second job.
+    ///
+    /// The two things rmcp's default implementation does are done here too and
+    /// must stay: publishing the peer info (which is what `client_actor` and
+    /// every `generated.by` write read afterwards) and echoing a client's
+    /// protocol version when it is one rmcp knows.
+    async fn initialize(
+        &self,
+        request: InitializeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<InitializeResult, ErrorData> {
+        let requested = request.protocol_version.clone();
+        let client_name = request.client_info.name.clone();
+        context.peer.set_peer_info(request);
+
+        // Only a stdio client is same-machine, so only there does this
+        // machine's receipt say anything about what the client already has.
+        let matched = self.transport == Transport::Stdio
+            && match &self.install_receipt {
+                Some(path) => receipt_matches_client(
+                    &client_name,
+                    &crystalline_core::harnesses_with_hooks(path),
+                ),
+                None => false,
+            };
+        self.receipt_matched.store(matched, Ordering::Relaxed);
+
+        let mut info = self.get_info();
+        if minimal_instructions(self.engine.skills_serve(), matched) {
+            // The client's own session hook delivers the full routing block at
+            // session start, so repeating it here would spend the tokens twice.
+            // The TOON note is appended all the same: no hook carries it, it
+            // describes this connection's wire format rather than the
+            // knowledge, and a client that cannot read a tool result is worse
+            // off than one that read the routing block twice.
+            let mut instructions = crystalline_core::render_minimal_instructions();
+            if self.engine.response_format() == ResponseFormat::Toon {
+                instructions.push_str(TOON_INSTRUCTIONS_NOTE);
+            }
+            info.instructions = Some(instructions);
+        }
+        if !ProtocolVersion::KNOWN_VERSIONS.contains(&requested) {
+            tracing::warn!(
+                "client requested unsupported protocol version {requested}; serving {}",
+                info.protocol_version
+            );
+        } else {
+            info.protocol_version = requested;
+        }
+        Ok(info)
+    }
+
     /// List the exposed tools. In read-only mode the write-gated tools (the
     /// four content-mutating engram tools plus `add_domain`) are filtered out so
     /// they are absent from `tools/list`, while their routes stay registered for
@@ -1019,7 +1203,8 @@ impl ServerHandler for McpServer {
         let read_only = self.engine.read_only();
         let github_enabled = self.engine.github_enabled();
         let provisioning_declared = self.engine.provisioning_declared();
-        let skills_serve = self.engine.skills_serve();
+        let skills_hidden =
+            hidden_skills_surface(self.engine.skills_serve(), self.receipt_matched());
         let mut tools = Self::tool_router().list_all();
         tools.retain(|t| {
             if is_write_tool(&t.name) && read_only {
@@ -1031,7 +1216,7 @@ impl ServerHandler for McpServer {
             if t.name == "provision" && hidden_provision_tool(read_only, provisioning_declared) {
                 return false;
             }
-            if t.name == "skills" && hidden_skills_tool(skills_serve) {
+            if t.name == "skills" && skills_hidden {
                 return false;
             }
             true
@@ -1065,7 +1250,9 @@ impl ServerHandler for McpServer {
         {
             return None;
         }
-        if name == "skills" && hidden_skills_tool(self.engine.skills_serve()) {
+        if name == "skills"
+            && hidden_skills_surface(self.engine.skills_serve(), self.receipt_matched())
+        {
             return None;
         }
         let mut tool = Self::tool_router().get(name).cloned()?;
@@ -1082,7 +1269,7 @@ impl ServerHandler for McpServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, ErrorData> {
-        if !self.engine.skills_serve() {
+        if hidden_skills_surface(self.engine.skills_serve(), self.receipt_matched()) {
             return Ok(ListResourcesResult::with_all_items(Vec::new()));
         }
         let resources = SKILL_ASSETS
@@ -1130,10 +1317,10 @@ impl ServerHandler for McpServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListPromptsResult, ErrorData> {
-        let prompts = if self.engine.skills_serve() {
-            Self::prompt_router().list_all()
-        } else {
+        let prompts = if hidden_skills_surface(self.engine.skills_serve(), self.receipt_matched()) {
             Vec::new()
+        } else {
+            Self::prompt_router().list_all()
         };
         Ok(ListPromptsResult {
             prompts,
@@ -1304,10 +1491,72 @@ mod tests {
         assert!(!is_collab_tool("search_engrams"));
     }
 
+    /// The whole per-connection decision, one assertion per row of the value
+    /// set: `true` and `false` ignore the connection entirely, `auto` follows
+    /// it.
     #[test]
-    fn hidden_skills_tool_follows_the_serve_setting_alone() {
-        assert!(!hidden_skills_tool(true), "on by default, so visible");
-        assert!(hidden_skills_tool(false));
+    fn hidden_skills_surface_covers_every_setting_and_connection_pair() {
+        assert!(!hidden_skills_surface(SkillsServe::Always, false));
+        assert!(
+            !hidden_skills_surface(SkillsServe::Always, true),
+            "true serves an installed harness too, on purpose"
+        );
+        assert!(hidden_skills_surface(SkillsServe::Never, false));
+        assert!(hidden_skills_surface(SkillsServe::Never, true));
+        assert!(
+            !hidden_skills_surface(SkillsServe::Auto, false),
+            "the default serves everyone the receipt does not know"
+        );
+        assert!(
+            hidden_skills_surface(SkillsServe::Auto, true),
+            "the default hides the surface from a harness that has it on disk"
+        );
+    }
+
+    /// Only `auto` plus a match shrinks the instructions: `false` gates skill
+    /// serving, never onboarding.
+    #[test]
+    fn minimal_instructions_are_auto_and_matched_only() {
+        assert!(minimal_instructions(SkillsServe::Auto, true));
+        assert!(!minimal_instructions(SkillsServe::Auto, false));
+        assert!(!minimal_instructions(SkillsServe::Always, true));
+        assert!(
+            !minimal_instructions(SkillsServe::Never, true),
+            "turning the skill surface off must not cost a client its routing block"
+        );
+        assert!(!minimal_instructions(SkillsServe::Never, false));
+    }
+
+    /// The client-name table: the three verified harness names match when the
+    /// receipt has them with hooks, every other name never matches.
+    #[test]
+    fn receipt_matching_is_by_verified_client_name_and_hooked_harness() {
+        use crystalline_core::HarnessKind;
+        let all = [
+            HarnessKind::ClaudeCode,
+            HarnessKind::Codex,
+            HarnessKind::Copilot,
+        ];
+        assert!(receipt_matches_client("claude-code", &all));
+        assert!(receipt_matches_client("codex-mcp-client", &all));
+        assert!(receipt_matches_client("github-copilot-developer", &all));
+        // Case-insensitive on the name.
+        assert!(receipt_matches_client("Claude-Code", &all));
+
+        // A harness the receipt does not list with hooks never matches.
+        assert!(!receipt_matches_client(
+            "claude-code",
+            &[HarnessKind::Codex]
+        ));
+        assert!(!receipt_matches_client("claude-code", &[]));
+
+        // An unknown client name never matches, whatever is installed.
+        for name in ["", "cursor", "claude", "codex", "copilot", "crystalline"] {
+            assert!(
+                !receipt_matches_client(name, &all),
+                "'{name}' is not a name any onboarded harness sends"
+            );
+        }
     }
 
     #[test]

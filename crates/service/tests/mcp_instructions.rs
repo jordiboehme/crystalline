@@ -11,6 +11,11 @@
 //! The harness deliberately does not refresh the routing cache in `connect`:
 //! the virtual-domain bullets appear only because `scaffold_virtual_manifest`
 //! refreshes the cache itself, which is exactly the write-side hook under test.
+//!
+//! The last section covers the receipt-aware variant: `connect_as` drives the
+//! handshake with a chosen `clientInfo.name` over a chosen transport, against
+//! a server pointed at a stand-in install receipt, which is exactly the three
+//! inputs the `auto` value of `skills.serve` decides on.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -20,6 +25,7 @@ use crystalline_index::TursoStore;
 use crystalline_service::Engine;
 use crystalline_service::mcp::McpServer;
 use rmcp::RoleClient;
+use rmcp::model::{ClientInfo, Implementation};
 use rmcp::service::RunningService;
 use tokio::sync::Mutex;
 
@@ -108,10 +114,66 @@ impl Harness {
         let server = server_task.await.unwrap().unwrap();
         (client, server)
     }
+
+    /// Open one connection whose client announces itself as `client_name` in
+    /// the `initialize` handshake, against a server built for `transport` and
+    /// pointed at this harness's own install receipt. That is everything the
+    /// receipt-aware `auto` behaviour reads.
+    async fn connect_as(
+        &self,
+        client_name: &str,
+        transport: ServedTransport,
+    ) -> (
+        RunningService<RoleClient, ClientInfo>,
+        RunningService<rmcp::RoleServer, McpServer>,
+    ) {
+        let (client_io, server_io) = tokio::io::duplex(1 << 16);
+        let engine = self.engine.clone();
+        let receipt = self.receipt_path();
+        let server_task = tokio::spawn(async move {
+            let server = match transport {
+                ServedTransport::Stdio => McpServer::new(engine),
+                ServedTransport::Http => McpServer::new_http(engine),
+            };
+            rmcp::serve_server(server.with_install_receipt(receipt), server_io).await
+        });
+        let mut info = ClientInfo::default();
+        info.client_info = Implementation::new(client_name, "1.2.3");
+        let client = rmcp::serve_client(info, client_io).await.unwrap();
+        let server = server_task.await.unwrap().unwrap();
+        (client, server)
+    }
+
+    /// Where this harness's stand-in install receipt lives.
+    fn receipt_path(&self) -> PathBuf {
+        self.root.join("installs.json")
+    }
+
+    /// Write an install receipt in exactly the shape `crystalline install`
+    /// writes, recording `harness` with `hooks` either wired or skipped.
+    fn write_receipt(&self, harness: &str, hooks: bool) {
+        std::fs::write(
+            self.receipt_path(),
+            format!(
+                r#"{{"format":1,"installs":[{{"harness":"{harness}","scope":"user","version":"0.11.0","parts":{{"mcp":true,"hooks":{hooks},"skills":true}},"skills":[]}}]}}"#
+            ),
+        )
+        .unwrap();
+    }
+}
+
+/// Which transport a test wants its server built for. The `auto` gate applies
+/// to stdio only.
+#[derive(Clone, Copy)]
+enum ServedTransport {
+    Stdio,
+    Http,
 }
 
 /// The `instructions` string the server handed this client at initialize.
-fn instructions(client: &RunningService<RoleClient, ()>) -> String {
+fn instructions<H: rmcp::handler::client::ClientHandler>(
+    client: &RunningService<RoleClient, H>,
+) -> String {
     client
         .peer()
         .peer_info()
@@ -314,4 +376,123 @@ async fn routing_lines_cap_at_three_bullets() {
         !line.contains("four") && !line.contains("five"),
         "bullets past three dropped:\n{line}"
     );
+}
+
+// --- receipt-aware instructions ---------------------------------------------
+//
+// One test per row of the `skills.serve` decision table. The full block runs
+// to roughly 475 tokens of routing prose a locally installed harness has
+// already received from its own SessionStart hook; the minimal block is the
+// header plus one pointer sentence.
+
+/// The row the whole feature exists for: a stdio client whose `initialize`
+/// name is a harness this machine's receipt onboarded with hooks gets the
+/// minimal block instead of the full routing prose.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_receipt_matched_stdio_client_gets_the_minimal_block() {
+    let h = Harness::build(&[("eng", &["Route here for eng questions"])], &[], false).await;
+    h.write_receipt("claude-code", true);
+
+    let (client, _server) = h.connect_as("claude-code", ServedTransport::Stdio).await;
+    let text = instructions(&client);
+
+    assert!(
+        text.starts_with("CRYSTALLINE KNOWLEDGE ROUTING"),
+        "the header still names what the server is:\n{text}"
+    );
+    assert!(
+        text.contains("list_domains with include_routing=true"),
+        "the pointer makes the full block one call away:\n{text}"
+    );
+    assert!(
+        !text.contains("Behavior:") && !text.contains("- eng:"),
+        "neither the behavior rules nor the routing lines are repeated:\n{text}"
+    );
+    assert!(
+        text.contains("TOON"),
+        "the wire-format note is not onboarding and stays:\n{text}"
+    );
+}
+
+/// The same client over HTTP is never suppressed: a remote session says
+/// nothing about what the machine running the client has on disk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_same_client_over_http_gets_the_full_block() {
+    let h = Harness::build(&[("eng", &["Route here for eng questions"])], &[], false).await;
+    h.write_receipt("claude-code", true);
+
+    let (client, _server) = h.connect_as("claude-code", ServedTransport::Http).await;
+    let text = instructions(&client);
+    assert!(
+        text.contains("Behavior:") && text.contains("- eng: Route here for eng questions"),
+        "an HTTP session always gets the full routing block:\n{text}"
+    );
+}
+
+/// A harness installed with `--skip-hooks` never receives the routing block at
+/// session start, so the instructions must still carry it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hooks_skipped_install_still_gets_the_full_block() {
+    let h = Harness::build(&[("eng", &["Route here for eng questions"])], &[], false).await;
+    h.write_receipt("claude-code", false);
+
+    let (client, _server) = h.connect_as("claude-code", ServedTransport::Stdio).await;
+    let text = instructions(&client);
+    assert!(
+        text.contains("Behavior:") && text.contains("- eng: Route here for eng questions"),
+        "no hooks means no other onboarding, so the block stays:\n{text}"
+    );
+}
+
+/// An unrecognized client name and a machine with no receipt at all are both
+/// misses, and a miss always means the full block.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unknown_client_or_a_missing_receipt_gets_the_full_block() {
+    let h = Harness::build(&[("eng", &["Route here for eng questions"])], &[], false).await;
+
+    // No receipt on disk yet.
+    let (client, _server) = h.connect_as("claude-code", ServedTransport::Stdio).await;
+    assert!(
+        instructions(&client).contains("Behavior:"),
+        "no receipt is no match"
+    );
+    drop(client);
+
+    // A receipt that knows claude-code, but a different client connecting.
+    h.write_receipt("claude-code", true);
+    for name in ["mcp-inspector", "codex", "claude"] {
+        let (client, _server) = h.connect_as(name, ServedTransport::Stdio).await;
+        let text = instructions(&client);
+        assert!(
+            text.contains("Behavior:") && text.contains("- eng:"),
+            "'{name}' is not a name an onboarded harness sends:\n{text}"
+        );
+    }
+}
+
+/// `skills.serve` forces the decision in both directions: `true` restores the
+/// full block for a matched client, `false` leaves it alone entirely, since it
+/// gates skill serving rather than onboarding.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_setting_overrides_the_receipt_in_both_directions() {
+    let h = Harness::build(&[("eng", &["Route here for eng questions"])], &[], false).await;
+    h.write_receipt("claude-code", true);
+
+    for (value, expect_full) in [("true", true), ("false", true), ("auto", false)] {
+        h.engine
+            .configure(&crystalline_service::engine::ConfigureAction::Set {
+                key: "skills.serve".to_string(),
+                value: value.to_string(),
+            })
+            .await
+            .unwrap();
+        let (client, _server) = h.connect_as("claude-code", ServedTransport::Stdio).await;
+        let text = instructions(&client);
+        assert_eq!(
+            text.contains("Behavior:"),
+            expect_full,
+            "skills.serve={value} should{} carry the full block:\n{text}",
+            if expect_full { "" } else { " not" }
+        );
+    }
 }

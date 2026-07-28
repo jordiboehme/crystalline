@@ -73,8 +73,9 @@ pub struct GlobalConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search: Option<SearchConfig>,
     /// Skill-serving settings. Absent means the shipped agent skills are
-    /// served over MCP, the default, so every existing config keeps working
-    /// untouched.
+    /// served over MCP to every client except a local harness this machine
+    /// already onboarded, the [`SkillsServe::Auto`] default, so every existing
+    /// config keeps working untouched.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skills: Option<SkillsConfig>,
     /// Generated index-file settings. Absent means every file domain keeps an
@@ -150,12 +151,15 @@ impl GlobalConfig {
         self.search.as_ref().and_then(|s| s.retired_weight)
     }
 
-    /// Whether the shipped agent skills are served over MCP, from
-    /// `skills.serve`. Absent config or an absent key means on (true): the
-    /// skills are static public copy this binary already carries, so a remote
-    /// client that never runs the CLI can learn from them out of the box.
-    pub fn skills_serve(&self) -> bool {
-        self.skills.as_ref().and_then(|s| s.serve).unwrap_or(true)
+    /// How the shipped agent skills are served over MCP, from `skills.serve`.
+    /// Absent config or an absent key means [`SkillsServe::Auto`]: a locally
+    /// installed harness that already carries the skills as files is served
+    /// the lean surface, everyone else the full one. See [`SkillsServe`].
+    pub fn skills_serve(&self) -> SkillsServe {
+        self.skills
+            .as_ref()
+            .and_then(|s| s.serve)
+            .unwrap_or(SkillsServe::Auto)
     }
 
     /// Whether a file domain keeps a generated `index.md` in every folder that
@@ -374,9 +378,89 @@ pub struct GitHubConfig {
 pub struct SkillsConfig {
     /// Serve the shipped agent skills over MCP: the `skills` tool, the
     /// `skill://` resources and the onboarding and connector prompts. Absent
-    /// means on.
+    /// means [`SkillsServe::Auto`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub serve: Option<bool>,
+    pub serve: Option<SkillsServe>,
+}
+
+/// How a server decides whether to serve its shipped agent skills over MCP,
+/// the value set of the `skills.serve` setting.
+///
+/// The setting used to be a plain boolean and every existing config still
+/// parses: `true` deserializes to [`SkillsServe::Always`] and `false` to
+/// [`SkillsServe::Never`], and both serialize back as the booleans they came
+/// in as, so a round trip never rewrites a config that was never changed.
+/// Only [`SkillsServe::Auto`], the new default, is written as a string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkillsServe {
+    /// Decide per connection: a local (stdio) client that this machine's
+    /// install receipt knows as an onboarded harness with session hooks wired
+    /// already carries the skills as files and gets the routing block from its
+    /// own hook, so the served surface and the full instructions block would
+    /// duplicate what it has. Every other client (an HTTP session, an
+    /// unrecognized client, a harness installed with hooks skipped, a machine
+    /// with no receipt) gets the full surface.
+    Auto,
+    /// Always serve the full surface, whoever connects.
+    Always,
+    /// Never serve it: the `skills` tool, the `skill://` resource list and the
+    /// prompt list stay empty for every connection, while direct reads keep
+    /// answering (hidden, not disabled). Onboarding instructions are
+    /// unaffected: this setting gates skill serving, not the routing block.
+    Never,
+}
+
+impl SkillsServe {
+    /// The setting's canonical spelling, `auto`, `true` or `false`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SkillsServe::Auto => "auto",
+            SkillsServe::Always => "true",
+            SkillsServe::Never => "false",
+        }
+    }
+
+    /// Parse the canonical spelling, or `None` for anything else. Booleans are
+    /// accepted as their own spellings, which is what keeps a config written
+    /// before the setting became tri-state working unchanged.
+    pub fn parse(value: &str) -> Option<SkillsServe> {
+        match value {
+            "auto" => Some(SkillsServe::Auto),
+            "true" => Some(SkillsServe::Always),
+            "false" => Some(SkillsServe::Never),
+            _ => None,
+        }
+    }
+}
+
+impl Serialize for SkillsServe {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            SkillsServe::Auto => serializer.serialize_str("auto"),
+            SkillsServe::Always => serializer.serialize_bool(true),
+            SkillsServe::Never => serializer.serialize_bool(false),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for SkillsServe {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<SkillsServe, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Bool(bool),
+            Text(String),
+        }
+        match Raw::deserialize(deserializer)? {
+            Raw::Bool(true) => Ok(SkillsServe::Always),
+            Raw::Bool(false) => Ok(SkillsServe::Never),
+            Raw::Text(text) => SkillsServe::parse(text.trim()).ok_or_else(|| {
+                serde::de::Error::custom(format!(
+                    "skills.serve must be auto, true or false, got '{text}'"
+                ))
+            }),
+        }
+    }
 }
 
 /// The `index` block: whether Crystalline keeps a generated `index.md` in
@@ -818,6 +902,58 @@ pub fn models_dir() -> Result<PathBuf, ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The tri-state parses from every spelling it can arrive in, and the two
+    /// booleans survive a round trip as booleans, so an existing config that
+    /// set `skills.serve` before the setting grew its third value is neither
+    /// rejected nor silently rewritten.
+    #[test]
+    fn skills_serve_accepts_booleans_and_auto_in_both_directions() {
+        for (yaml, expected) in [
+            ("skills:\n  serve: false\n", SkillsServe::Never),
+            ("skills:\n  serve: true\n", SkillsServe::Always),
+            ("skills:\n  serve: auto\n", SkillsServe::Auto),
+            ("skills:\n  serve: \"true\"\n", SkillsServe::Always),
+            ("skills:\n  serve: \"false\"\n", SkillsServe::Never),
+        ] {
+            let config: GlobalConfig = serde_yaml_ng::from_str(yaml).unwrap();
+            assert_eq!(config.skills_serve(), expected, "parsing {yaml:?}");
+        }
+
+        assert_eq!(
+            GlobalConfig::default().skills_serve(),
+            SkillsServe::Auto,
+            "an absent block decides per connection"
+        );
+        assert_eq!(
+            serde_yaml_ng::from_str::<GlobalConfig>("skills: {}\n")
+                .unwrap()
+                .skills_serve(),
+            SkillsServe::Auto,
+            "an absent key decides per connection"
+        );
+        assert!(
+            serde_yaml_ng::from_str::<GlobalConfig>("skills:\n  serve: sometimes\n").is_err(),
+            "an unknown value is rejected rather than silently defaulted"
+        );
+
+        // Booleans serialize back as booleans, only auto as a string.
+        for (value, expected) in [
+            (SkillsServe::Never, "serve: false"),
+            (SkillsServe::Always, "serve: true"),
+            (SkillsServe::Auto, "serve: auto"),
+        ] {
+            let config = GlobalConfig {
+                skills: Some(SkillsConfig { serve: Some(value) }),
+                ..GlobalConfig::default()
+            };
+            let yaml = serde_yaml_ng::to_string(&config).unwrap();
+            assert!(
+                yaml.contains(expected),
+                "{value:?} renders as {expected}:\n{yaml}"
+            );
+        }
+    }
 
     #[test]
     fn protected_folder_detection_is_prefix_scoped() {

@@ -646,15 +646,34 @@ mod tests {
         );
     }
 
+    /// The env variable carries the whole tri-state value set, booleans
+    /// included, so an existing `CRYSTALLINE_SKILLS_SERVE=false` deployment
+    /// keeps its behaviour and `auto` is reachable without a config file.
     #[test]
-    fn skills_serving_is_on_by_default_and_the_env_can_turn_it_off() {
-        assert!(
+    fn skills_serving_defaults_to_auto_and_the_env_carries_all_three_values() {
+        use crystalline_core::config::SkillsServe;
+        assert_eq!(
             GlobalConfig::default().skills_serve(),
-            "an unconfigured install serves its skills"
+            SkillsServe::Auto,
+            "an unconfigured install decides per connection"
         );
-        let ov = overlay(&[("CRYSTALLINE_SKILLS_SERVE", "false")]).unwrap();
-        assert!(ov.overrides_key("skills.serve"));
-        assert!(!ov.apply(&GlobalConfig::default()).skills_serve());
+        for (value, expected) in [
+            ("false", SkillsServe::Never),
+            ("true", SkillsServe::Always),
+            ("auto", SkillsServe::Auto),
+        ] {
+            let ov = overlay(&[("CRYSTALLINE_SKILLS_SERVE", value)]).unwrap();
+            assert!(ov.overrides_key("skills.serve"));
+            assert_eq!(
+                ov.apply(&GlobalConfig::default()).skills_serve(),
+                expected,
+                "CRYSTALLINE_SKILLS_SERVE={value}"
+            );
+        }
+        assert!(
+            overlay(&[("CRYSTALLINE_SKILLS_SERVE", "sometimes")]).is_err(),
+            "an unknown value is rejected rather than silently defaulted"
+        );
     }
 
     #[test]

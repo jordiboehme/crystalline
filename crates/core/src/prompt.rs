@@ -309,7 +309,7 @@ fn placeholder(reason: &str) -> String {
 /// refers to.
 pub fn render_text(output: &PromptOutput) -> String {
     let mut out = String::new();
-    out.push_str("CRYSTALLINE KNOWLEDGE ROUTING\n\n");
+    out.push_str(ROUTING_HEADER);
     out.push_str(
         "You are being onboarded to the knowledge accumulated in this workspace. It is served by the crystalline MCP server; these instructions govern its tools (your harness may prefix tool names, for example mcp__crystalline__search_engrams). The domains below are registered and ready to use; route searches and reads through them instead of starting from zero.\n\n",
     );
@@ -481,7 +481,7 @@ pub const INSTRUCTIONS_BUDGET: usize = 1900;
 /// cost is at most three renders of the same small strings.
 pub fn render_instructions(output: &PromptOutput) -> String {
     let mut head = String::new();
-    head.push_str("CRYSTALLINE KNOWLEDGE ROUTING\n\n");
+    head.push_str(ROUTING_HEADER);
     if output.read_only {
         head.push_str(
             "Crystalline is your durable memory across sessions: the domains below hold curated knowledge as engrams you search and read (your harness may prefix tool names, for example mcp__crystalline__search_engrams). Search them before answering from memory; list_domains with include_routing=true returns this index and its behavior rules at any time.\n\n",
@@ -519,6 +519,32 @@ pub fn render_instructions(output: &PromptOutput) -> String {
     );
     counted
 }
+
+/// Render the minimal `instructions` variant: the same "CRYSTALLINE KNOWLEDGE
+/// ROUTING" header [`render_instructions`] opens with, plus one sentence
+/// pointing at the call that returns the whole index and its behavior rules.
+///
+/// This is what a server hands a client that has already been onboarded by
+/// something else on the same machine: a locally installed harness runs
+/// Crystalline's own session hook, which delivers the full routing block at
+/// session start, and a resumed session still carries that block in its
+/// transcript. Repeating it in the initialize instructions would spend roughly
+/// 475 tokens restating what the model has already read, so this variant keeps
+/// only the header (which names what the server is) and the re-fetch pointer
+/// (which makes the full block one tool call away at any time).
+///
+/// It takes no arguments and reads nothing: the output is a fixed string, so
+/// the determinism contract [`render_instructions`] holds itself to is trivial
+/// here, and there is no domain content that could go stale.
+pub fn render_minimal_instructions() -> String {
+    format!("{ROUTING_HEADER}{MINIMAL_INSTRUCTIONS_POINTER}\n")
+}
+
+/// The header both instruction variants open with, so the two can never drift.
+const ROUTING_HEADER: &str = "CRYSTALLINE KNOWLEDGE ROUTING\n\n";
+
+/// The one sentence [`render_minimal_instructions`] carries under the header.
+const MINIMAL_INSTRUCTIONS_POINTER: &str = "Crystalline is your durable memory across sessions and your session hook has already delivered its full routing block; call list_domains with include_routing=true to fetch the domain index and its behavior rules again at any time.";
 
 /// The paste-able custom-instructions snippet for remote clients whose harness
 /// runs no session hooks and never shows the model a server's initialize
@@ -989,5 +1015,44 @@ mod tests {
         let first = render_instructions(&generate_prompt_unscoped(&global, &BTreeMap::new()));
         let second = render_instructions(&generate_prompt_unscoped(&global, &BTreeMap::new()));
         assert_eq!(first.as_bytes(), second.as_bytes());
+    }
+
+    /// The minimal variant is the header plus exactly one sentence, shares the
+    /// header with the full renderer and points at the same re-fetch call, so a
+    /// client that gets it can still reach everything the full block carries.
+    #[test]
+    fn minimal_instructions_are_the_header_and_one_pointer_sentence() {
+        let text = render_minimal_instructions();
+        assert_eq!(
+            text,
+            "CRYSTALLINE KNOWLEDGE ROUTING\n\nCrystalline is your durable memory across sessions and your session hook has already delivered its full routing block; call list_domains with include_routing=true to fetch the domain index and its behavior rules again at any time.\n"
+        );
+
+        let (_tmp, global) = fixture();
+        let full = render_instructions(&generate_prompt_unscoped(&global, &BTreeMap::new()));
+        assert!(
+            full.starts_with("CRYSTALLINE KNOWLEDGE ROUTING\n\n")
+                && text.starts_with("CRYSTALLINE KNOWLEDGE ROUTING\n\n"),
+            "both variants open with the same header"
+        );
+        assert!(
+            text.contains("list_domains with include_routing=true"),
+            "the pointer names the re-fetch call:\n{text}"
+        );
+        assert!(
+            !text.contains("Behavior:") && !text.contains("Domains:"),
+            "the minimal variant carries neither block:\n{text}"
+        );
+        assert!(
+            text.len() * 4 < full.len(),
+            "the point is that it is far smaller: {} vs {}",
+            text.len(),
+            full.len()
+        );
+        assert_eq!(
+            render_minimal_instructions(),
+            text,
+            "deterministic, like every other renderer here"
+        );
     }
 }

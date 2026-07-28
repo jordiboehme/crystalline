@@ -732,11 +732,11 @@ impl Engine {
         self.config.read().unwrap().github_enabled()
     }
 
-    /// Whether the shipped agent skills are served over MCP, read fresh under
+    /// How the shipped agent skills are served over MCP, read fresh under
     /// the config guard the same way [`Engine::github_enabled`] is, so a
     /// runtime `configure` flip of `skills.serve` applies from the next call
     /// on rather than at the next daemon start.
-    pub fn skills_serve(&self) -> bool {
+    pub fn skills_serve(&self) -> crystalline_core::config::SkillsServe {
         self.config.read().unwrap().skills_serve()
     }
 

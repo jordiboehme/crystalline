@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use crystalline_core::config::{
     DatabaseBackend, DatabaseConfig, GitHubConfig, GlobalConfig, HttpSetting, IdentityConfig,
-    IndexConfig, ResponseFormat, SearchConfig, ServiceConfig, SkillsConfig,
+    IndexConfig, ResponseFormat, SearchConfig, ServiceConfig, SkillsConfig, SkillsServe,
 };
 use crystalline_index::{DEFAULT_RETIRED_WEIGHT, DEFAULT_SALIENCE_WEIGHT};
 
@@ -190,8 +190,8 @@ pub fn registry() -> &'static [SettingSpec] {
         },
         SettingSpec {
             key: "skills.serve",
-            doc: "Serve the shipped agent skills over MCP: the skills tool, skill:// resources and the onboarding and connector prompts (default true)",
-            kind: SettingKind::Bool,
+            doc: "Serve the shipped agent skills over MCP: the skills tool, skill:// resources and the onboarding and connector prompts. auto (default) serves them to every client except a local harness this machine's install receipt already onboarded with session hooks, true always serves them, false never does",
+            kind: SettingKind::String,
             startup_effective: false,
             apply: set_skills_serve,
             clear: clear_skills_serve,
@@ -682,10 +682,16 @@ fn allowed_hosts_effective(config: &GlobalConfig) -> (String, bool) {
 
 // --- skills.serve -------------------------------------------------------------
 
+/// Accepts the tri-state `auto`, `true` and `false`. The two booleans are the
+/// setting's own spelling rather than a compatibility shim, so a config, a
+/// `configure set` call and `CRYSTALLINE_SKILLS_SERVE` written before the
+/// setting grew its third value all keep working unchanged.
 fn set_skills_serve(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
-    let parsed: bool = value
-        .parse()
-        .map_err(|_| SettingsError(format!("skills.serve must be true or false, got '{value}'")))?;
+    let parsed = SkillsServe::parse(value.trim()).ok_or_else(|| {
+        SettingsError(format!(
+            "skills.serve must be auto, true or false, got '{value}'"
+        ))
+    })?;
     config
         .skills
         .get_or_insert_with(SkillsConfig::default)
@@ -702,7 +708,7 @@ fn clear_skills_serve(config: &mut GlobalConfig) {
 
 fn skills_serve_effective(config: &GlobalConfig) -> (String, bool) {
     let is_default = config.skills.as_ref().and_then(|s| s.serve).is_none();
-    (config.skills_serve().to_string(), is_default)
+    (config.skills_serve().as_str().to_string(), is_default)
 }
 
 // --- service.response_format ------------------------------------------------
@@ -1130,6 +1136,43 @@ mod tests {
         assert_eq!(allowed_hosts_effective(&cfg), (String::new(), true));
     }
 
+    /// The tri-state applies, reports and clears through the registry, and the
+    /// two boolean spellings stay accepted so a config, a `configure set` call
+    /// or an env override written before the third value existed keeps working.
+    #[test]
+    fn skills_serve_applies_all_three_values_clears_and_rejects() {
+        let mut config = GlobalConfig::default();
+        assert_eq!(
+            skills_serve_effective(&config),
+            ("auto".to_string(), true),
+            "the default decides per connection"
+        );
+
+        for (value, expected) in [
+            ("false", SkillsServe::Never),
+            ("true", SkillsServe::Always),
+            ("auto", SkillsServe::Auto),
+        ] {
+            apply(&mut config, "skills.serve", value).unwrap();
+            assert_eq!(config.skills_serve(), expected, "set {value}");
+            assert_eq!(
+                skills_serve_effective(&config),
+                (value.to_string(), false),
+                "reported back as {value}, no longer the default"
+            );
+        }
+
+        let err = apply(&mut config, "skills.serve", "yes").unwrap_err();
+        assert!(err.to_string().contains("auto, true or false"), "{err}");
+
+        unset(&mut config, "skills.serve").unwrap();
+        assert_eq!(skills_serve_effective(&config), ("auto".to_string(), true));
+        assert!(
+            config.skills.is_none(),
+            "clearing the only key in the block drops the block"
+        );
+    }
+
     #[test]
     fn response_format_applies_clears_and_rejects() {
         let mut config = GlobalConfig::default();
@@ -1381,7 +1424,7 @@ mod tests {
         assert_eq!(response_format.source, SettingSource::Default);
 
         let skills_serve = &views[9];
-        assert_eq!(skills_serve.value, "true");
+        assert_eq!(skills_serve.value, "auto");
         assert_eq!(skills_serve.source, SettingSource::Default);
 
         let backend = &views[10];
