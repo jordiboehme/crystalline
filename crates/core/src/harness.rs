@@ -57,6 +57,38 @@ impl HarnessKind {
         }
     }
 
+    /// The harness behind an MCP `initialize` handshake's `clientInfo.name`,
+    /// or `None` for a name this binary does not recognize. Matching is
+    /// case-insensitive on the name alone; the client's version is never part
+    /// of it, so a harness upgrade cannot silently stop matching.
+    ///
+    /// The table is deliberately small and conservative, because an unknown
+    /// name must never match: a false match would cost a client the onboarding
+    /// it depends on, while a missed match only costs some duplicated context.
+    /// The three names, and how each was established:
+    ///
+    /// - `claude-code`: observed directly from Claude Code 2.1.220's own
+    ///   `initialize` request against a probe stdio server.
+    /// - `codex-mcp-client`: the constant the Codex CLI sends from
+    ///   `codex-rs/core/src/mcp_connection_manager.rs`, quoted in
+    ///   openai/codex#16485.
+    /// - `github-copilot-developer`: the name every GitHub Copilot host sends,
+    ///   quoted in github/copilot-cli#2107. That issue exists precisely
+    ///   because the name does not distinguish the Copilot CLI from the other
+    ///   Copilot hosts, so a non-CLI Copilot client connecting over stdio on a
+    ///   machine where the Copilot CLI is installed matches too. Accepted:
+    ///   both share Copilot's own skills folder, so the receipt's claim that
+    ///   the skills are already on disk holds for either. Narrow this arm to a
+    ///   CLI-specific signal once Copilot ships one.
+    pub fn from_mcp_client_name(name: &str) -> Option<HarnessKind> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "claude-code" => Some(HarnessKind::ClaudeCode),
+            "codex-mcp-client" => Some(HarnessKind::Codex),
+            "github-copilot-developer" => Some(HarnessKind::Copilot),
+            _ => None,
+        }
+    }
+
     /// The human-facing product name.
     pub fn display_name(self) -> &'static str {
         match self {
@@ -200,6 +232,50 @@ fn copilot_home() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `initialize` client names the three harnesses actually send, and
+    /// the rule that everything else is a miss. Each name's provenance is on
+    /// [`HarnessKind::from_mcp_client_name`].
+    #[test]
+    fn mcp_client_names_map_only_the_three_known_harnesses() {
+        assert_eq!(
+            HarnessKind::from_mcp_client_name("claude-code"),
+            Some(HarnessKind::ClaudeCode)
+        );
+        assert_eq!(
+            HarnessKind::from_mcp_client_name("codex-mcp-client"),
+            Some(HarnessKind::Codex)
+        );
+        assert_eq!(
+            HarnessKind::from_mcp_client_name("github-copilot-developer"),
+            Some(HarnessKind::Copilot)
+        );
+
+        // Case-insensitive, and surrounding whitespace is not a miss.
+        assert_eq!(
+            HarnessKind::from_mcp_client_name("  Claude-Code "),
+            Some(HarnessKind::ClaudeCode)
+        );
+
+        // A harness id is not a client name: the two vocabularies are
+        // deliberately separate, so `from_id` spellings do not match here.
+        for name in [
+            "",
+            "codex",
+            "copilot",
+            "claude",
+            "claude-desktop",
+            "cursor-vscode",
+            "mcp-inspector",
+            "crystalline",
+        ] {
+            assert_eq!(
+                HarnessKind::from_mcp_client_name(name),
+                None,
+                "'{name}' must never match a harness"
+            );
+        }
+    }
 
     #[test]
     fn harness_paths_resolve_user_and_project_scopes() {

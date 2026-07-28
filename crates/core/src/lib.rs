@@ -51,14 +51,15 @@ pub use manifest::{
 pub use parse::{LosslessEngram, ParseError, parse_engram, parse_engram_lossless};
 pub use prompt::{
     CONNECTOR_SNIPPET, INSTRUCTIONS_BUDGET, PromptDomain, PromptOutput, behavior_bullets,
-    generate_prompt, generate_prompt_unscoped, render_instructions, render_json, render_text,
+    generate_prompt, generate_prompt_unscoped, render_instructions, render_json,
+    render_minimal_instructions, render_text,
 };
 pub use provision::{
     ActionStatus, Agent, ArtifactAction, ArtifactFile, Command, DeferringMcpRunner, DesiredFile,
     DesiredMcp, DesiredPayload, DesiredSet, DomainArtifacts, DomainSources, HarnessState,
     InstalledFile, InstalledMcp, McpArtifact, McpOutcome, McpRunner, ProvisionReceipt, SourceStamp,
-    desired_set, harness_supports, is_plain_component, reconcile_harness, resolve_source_roots,
-    scan_domain,
+    desired_set, harness_supports, harnesses_with_hooks, is_plain_component, reconcile_harness,
+    resolve_source_roots, scan_domain,
 };
 pub use schema::{
     FieldDecl, FieldType, ScalarType, Schema, SchemaDrift, SchemaIssue, ValidationMode,

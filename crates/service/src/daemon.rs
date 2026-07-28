@@ -734,7 +734,7 @@ pub fn http_router(
     let service = StreamableHttpService::new(
         move || {
             http_sessions.fetch_add(1, Ordering::Relaxed);
-            Ok(McpServer::new(engine.clone()))
+            Ok(McpServer::new_http(engine.clone()))
         },
         session_manager,
         http_config(allowed_hosts),

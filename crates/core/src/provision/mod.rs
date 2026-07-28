@@ -110,6 +110,56 @@ pub fn installed_harnesses(path: &Path) -> Vec<HarnessKind> {
     .collect()
 }
 
+/// Harnesses recorded in the install receipt at `path` whose install actually
+/// wired session hooks (`installs[].parts.hooks == true`), the subset of
+/// [`installed_harnesses`] that onboards itself at session start without the
+/// MCP server having to. An install run with `--skip-hooks` records `hooks:
+/// false` and is therefore absent here, and an uninstalled target has no
+/// record at all.
+///
+/// Reads the same file just as shallowly and just as tolerantly: a missing,
+/// unreadable or unparseable receipt is an empty list, never an error, and an
+/// unrecognized harness id is skipped. The result is ordered by
+/// [`HarnessKind`]'s own declaration order, so it never depends on the row
+/// order `install` happened to leave behind.
+pub fn harnesses_with_hooks(path: &Path) -> Vec<HarnessKind> {
+    let Ok(bytes) = std::fs::read(path) else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return Vec::new();
+    };
+    let Some(installs) = value.get("installs").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+
+    let mut present: HashSet<&'static str> = HashSet::new();
+    for install in installs {
+        let hooks = install
+            .get("parts")
+            .and_then(|p| p.get("hooks"))
+            .and_then(|h| h.as_bool())
+            .unwrap_or(false);
+        if !hooks {
+            continue;
+        }
+        if let Some(id) = install.get("harness").and_then(|v| v.as_str())
+            && let Some(kind) = HarnessKind::from_id(id)
+        {
+            present.insert(kind.id());
+        }
+    }
+
+    [
+        HarnessKind::ClaudeCode,
+        HarnessKind::Codex,
+        HarnessKind::Copilot,
+    ]
+    .into_iter()
+    .filter(|k| present.contains(k.id()))
+    .collect()
+}
+
 // --- shared manifest and artifact helpers ---------------------------------
 
 /// Parse `entry`'s `MANIFEST.md` into a [`Manifest`], or `None` when the
@@ -1323,6 +1373,81 @@ mod tests {
 
         let harnesses = installed_harnesses(&path);
         assert_eq!(harnesses, vec![HarnessKind::ClaudeCode, HarnessKind::Codex]);
+    }
+
+    // --- harnesses_with_hooks -------------------------------------------------
+
+    #[test]
+    fn a_missing_or_corrupt_receipt_is_no_hooked_harnesses() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(harnesses_with_hooks(&dir.path().join("missing.json")).is_empty());
+        let path = dir.path().join("installs.json");
+        std::fs::write(&path, "{ nope").unwrap();
+        assert!(harnesses_with_hooks(&path).is_empty());
+    }
+
+    #[test]
+    fn only_records_that_actually_wired_hooks_count_as_hooked() {
+        // codex was installed with --skip-hooks and copilot's record carries no
+        // parts block at all, so neither onboards itself at session start;
+        // claude-code did wire hooks, at project scope only, and counts.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("installs.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "format": 1,
+                "installs": [
+                    {
+                        "harness": "codex",
+                        "scope": "user",
+                        "version": "0.11.0",
+                        "parts": {"mcp": true, "hooks": false, "skills": true},
+                        "skills": []
+                    },
+                    {
+                        "harness": "copilot",
+                        "scope": "user",
+                        "version": "0.11.0",
+                        "skills": []
+                    },
+                    {
+                        "harness": "claude-code",
+                        "scope": "project",
+                        "project_path": "/repo",
+                        "version": "0.11.0",
+                        "parts": {"mcp": true, "hooks": true, "skills": true},
+                        "skills": []
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            installed_harnesses(&path),
+            vec![
+                HarnessKind::ClaudeCode,
+                HarnessKind::Codex,
+                HarnessKind::Copilot
+            ],
+            "all three are installed"
+        );
+        assert_eq!(
+            harnesses_with_hooks(&path),
+            vec![HarnessKind::ClaudeCode],
+            "only the one whose install wired hooks"
+        );
+    }
+
+    #[test]
+    fn an_uninstalled_harness_leaves_no_hooked_record() {
+        // `uninstall` removes the row outright, so the receipt that remains
+        // simply does not mention the harness.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("installs.json");
+        std::fs::write(&path, r#"{ "format": 1, "installs": [] }"#).unwrap();
+        assert!(harnesses_with_hooks(&path).is_empty());
     }
 
     // --- any_domain_declares ---------------------------------------------------

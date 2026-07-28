@@ -4,7 +4,10 @@
 //! Same harness shape as `mcp_tools.rs` (a `tokio::io::duplex` pair driving
 //! the real `McpServer` over JSON-RPC), narrowed to what a remote client that
 //! never runs the CLI can read, and to the one `skills.serve` gate all three
-//! surfaces share.
+//! surfaces share. The last three tests cover that gate's `auto` default,
+//! which is decided per connection from the client's `initialize` name and
+//! this machine's install receipt: `connect_as` drives a handshake under a
+//! chosen client name against a stand-in receipt.
 
 use std::sync::Arc;
 
@@ -91,6 +94,50 @@ impl Harness {
         let client = rmcp::serve_client((), client_io).await.unwrap();
         let server = server_task.await.unwrap().unwrap();
         (client, server)
+    }
+
+    /// Open a stdio connection whose client announces itself as `client_name`,
+    /// against a server reading this harness's stand-in install receipt. This
+    /// is how the per-connection `auto` gate is exercised.
+    async fn connect_as(
+        &self,
+        client_name: &str,
+    ) -> (
+        RunningService<RoleClient, rmcp::model::ClientInfo>,
+        RunningService<rmcp::RoleServer, McpServer>,
+    ) {
+        let (client_io, server_io) = tokio::io::duplex(1 << 16);
+        let engine = self.engine.clone();
+        let receipt = self.receipt_path();
+        let server_task = tokio::spawn(async move {
+            rmcp::serve_server(
+                McpServer::new(engine).with_install_receipt(receipt),
+                server_io,
+            )
+            .await
+        });
+        let mut info = rmcp::model::ClientInfo::default();
+        info.client_info = rmcp::model::Implementation::new(client_name, "1.2.3");
+        let client = rmcp::serve_client(info, client_io).await.unwrap();
+        let server = server_task.await.unwrap().unwrap();
+        (client, server)
+    }
+
+    /// Where this harness's stand-in install receipt lives.
+    fn receipt_path(&self) -> std::path::PathBuf {
+        self._tmp.path().join("installs.json")
+    }
+
+    /// Write an install receipt in the shape `crystalline install` writes,
+    /// recording `harness` with its session hooks wired.
+    fn write_hooked_receipt(&self, harness: &str) {
+        std::fs::write(
+            self.receipt_path(),
+            format!(
+                r#"{{"format":1,"installs":[{{"harness":"{harness}","scope":"user","version":"0.11.0","parts":{{"mcp":true,"hooks":true,"skills":true}},"skills":[]}}]}}"#
+            ),
+        )
+        .unwrap();
     }
 }
 
@@ -374,4 +421,137 @@ async fn read_only_serving_still_teaches_the_skills() {
             .len(),
         SKILL_NAMES.len()
     );
+}
+
+/// The default `auto` gate, decided per connection: a stdio client the install
+/// receipt knows as an onboarded harness with hooks already has these five
+/// skills as files, so its three lists come back empty while every direct read
+/// still answers - the same hidden-not-disabled doctrine `false` follows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_receipt_matched_connection_is_served_no_skill_surface() {
+    let h = Harness::new(&["eng"]).await;
+    h.write_hooked_receipt("claude-code");
+
+    let (client, _server) = h.connect_as("claude-code").await;
+    let peer = client.peer();
+
+    assert!(
+        !tool_names(peer).await.contains(&"skills".to_string()),
+        "the tool is hidden for a harness that carries the skills already"
+    );
+    assert!(
+        peer.list_resources(Default::default())
+            .await
+            .unwrap()
+            .resources
+            .is_empty(),
+        "no skill resources are advertised"
+    );
+    assert!(
+        peer.list_prompts(Default::default())
+            .await
+            .unwrap()
+            .prompts
+            .is_empty(),
+        "no prompts are advertised"
+    );
+
+    // Hidden, not disabled.
+    let routing = call_text(peer, "skills", json!({ "name": "crystalline-routing" }))
+        .await
+        .unwrap();
+    assert_eq!(
+        routing,
+        crystalline_core::skill("crystalline-routing")
+            .unwrap()
+            .content
+    );
+    let read = peer
+        .read_resource(ReadResourceRequestParams::new(
+            "skill://crystalline-routing/SKILL.md",
+        ))
+        .await
+        .expect("a direct resource read answers for a matched connection");
+    assert!(!read.contents.is_empty());
+    let connector = peer
+        .get_prompt(GetPromptRequestParams::new("connector"))
+        .await
+        .expect("a direct prompt read answers for a matched connection");
+    assert_eq!(prompt_text(&connector), crystalline_core::CONNECTOR_SNIPPET);
+}
+
+/// The decision is per connection, not per server: an unrecognized client on
+/// the same machine, with the same receipt, keeps the whole surface.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unmatched_connection_keeps_the_whole_surface() {
+    let h = Harness::new(&["eng"]).await;
+    h.write_hooked_receipt("claude-code");
+
+    let (client, _server) = h.connect_as("mcp-inspector").await;
+    let peer = client.peer();
+
+    assert!(tool_names(peer).await.contains(&"skills".to_string()));
+    assert_eq!(
+        peer.list_resources(Default::default())
+            .await
+            .unwrap()
+            .resources
+            .len(),
+        SKILL_NAMES.len()
+    );
+    assert_eq!(
+        peer.list_prompts(Default::default())
+            .await
+            .unwrap()
+            .prompts
+            .len(),
+        2
+    );
+}
+
+/// `skills.serve` forces the decision either way, mid-session: `true` restores
+/// the surface for a matched connection, `false` takes it from everyone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_setting_overrides_the_receipt_match_mid_session() {
+    let h = Harness::new(&["eng"]).await;
+    h.write_hooked_receipt("claude-code");
+
+    let (client, _server) = h.connect_as("claude-code").await;
+    let peer = client.peer();
+    assert!(!tool_names(peer).await.contains(&"skills".to_string()));
+
+    call_text(
+        peer,
+        "configure",
+        json!({ "set": { "skills.serve": "true" } }),
+    )
+    .await
+    .unwrap();
+    assert!(
+        tool_names(peer).await.contains(&"skills".to_string()),
+        "true serves an installed harness too, on purpose"
+    );
+    assert_eq!(
+        peer.list_prompts(Default::default())
+            .await
+            .unwrap()
+            .prompts
+            .len(),
+        2
+    );
+
+    call_text(
+        peer,
+        "configure",
+        json!({ "set": { "skills.serve": "false" } }),
+    )
+    .await
+    .unwrap();
+    assert!(!tool_names(peer).await.contains(&"skills".to_string()));
+
+    // Back to the default: the receipt decides again, and it says hide.
+    call_text(peer, "configure", json!({ "unset": ["skills.serve"] }))
+        .await
+        .unwrap();
+    assert!(!tool_names(peer).await.contains(&"skills".to_string()));
 }
