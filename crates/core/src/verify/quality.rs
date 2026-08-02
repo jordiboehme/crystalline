@@ -3,13 +3,15 @@
 //! `Q004`'s similarity ratio is a bigram Dice coefficient
 //! (`2 * |intersection| / (|bigrams(a)| + |bigrams(b)|)`, multiset
 //! intersection), chosen over a longest-common-subsequence ratio for its
-//! O(n) simplicity and stability under paragraph reordering; see
-//! [`dice_coefficient`].
+//! O(n) simplicity and stability under paragraph reordering. The fold and the
+//! coefficient live in [`crate::similarity`] so the index crate's
+//! near-duplicate sweep scores text with the exact same arithmetic.
 
 use std::collections::HashMap;
 
 use crate::engram::{Engram, Heading};
 use crate::parse::BodyLine;
+use crate::similarity::{dice_coefficient, normalize};
 
 use super::scanner::{Domain, ScannedFile};
 use super::{Severity, Sink};
@@ -187,53 +189,6 @@ fn h2_section_texts(engram: &Engram, lines: &[BodyLine]) -> Vec<(usize, String, 
         result.push((h.line, h.text.clone(), normalize(&buf)));
     }
     result
-}
-
-fn normalize(s: &str) -> String {
-    let filtered: String = s
-        .chars()
-        .map(|c| {
-            let c = c.to_ascii_lowercase();
-            if c.is_alphanumeric() || c.is_whitespace() {
-                c
-            } else {
-                ' '
-            }
-        })
-        .collect();
-    filtered.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-/// Bigram Dice coefficient: `2 * |intersection| / (|bigrams(a)| +
-/// |bigrams(b)|)`, using multiset (count-aware) bigram intersection.
-fn dice_coefficient(a: &str, b: &str) -> f64 {
-    let ba = bigrams(a);
-    let bb = bigrams(b);
-    if ba.is_empty() || bb.is_empty() {
-        return 0.0;
-    }
-    let mut counts: HashMap<(char, char), i32> = HashMap::new();
-    for bg in &ba {
-        *counts.entry(*bg).or_insert(0) += 1;
-    }
-    let mut intersection = 0usize;
-    for bg in &bb {
-        if let Some(c) = counts.get_mut(bg)
-            && *c > 0
-        {
-            *c -= 1;
-            intersection += 1;
-        }
-    }
-    2.0 * intersection as f64 / (ba.len() + bb.len()) as f64
-}
-
-fn bigrams(s: &str) -> Vec<(char, char)> {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() < 2 {
-        return Vec::new();
-    }
-    chars.windows(2).map(|w| (w[0], w[1])).collect()
 }
 
 /// Q005: a top-level bullet that almost, but does not quite, match the

@@ -573,7 +573,15 @@ pub const LEXICAL_CANDIDATE_CAP: usize = 5000;
 
 /// Statuses that mark knowledge as retired. Exact lowercase match, the same
 /// stance as the canonical current filter.
-const RETIRED_STATUSES: [&str; 4] = ["deprecated", "superseded", "archived", "legacy"];
+pub const RETIRED_STATUSES: [&str; 4] = ["deprecated", "superseded", "archived", "legacy"];
+
+/// Whether a status belongs to the retired set. Exact lowercase match, the
+/// counterpart of [`is_current_status`]. Retirement is terminal: the
+/// consolidation sweep never flags a retired engram for being old, unverified
+/// or unlinked.
+pub fn is_retired_status(status: &str) -> bool {
+    RETIRED_STATUSES.contains(&status)
+}
 
 /// The statuses that mean "this is what holds now", as one equivalence class.
 /// `stable` is the canonical word Crystalline writes and the OKF v0.2 spelling;
@@ -597,7 +605,7 @@ pub const DEFAULT_RETIRED_WEIGHT: f64 = 0.6;
 /// value keeps full rank. Never a filter - it reorders scores and can never
 /// exclude a result.
 pub fn retired_factor(status: &str, weight: f64) -> f64 {
-    if RETIRED_STATUSES.contains(&status) {
+    if is_retired_status(status) {
         weight.clamp(0.0, 1.0)
     } else {
         1.0

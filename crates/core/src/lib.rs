@@ -27,6 +27,7 @@ pub mod parse;
 pub mod prompt;
 pub mod provision;
 pub mod schema;
+pub mod similarity;
 pub mod skills;
 pub mod tags;
 pub mod temporal;
@@ -64,6 +65,7 @@ pub use provision::{
 pub use schema::{
     FieldDecl, FieldType, ScalarType, Schema, SchemaDrift, SchemaIssue, ValidationMode,
 };
+pub use similarity::{dice_coefficient, normalize};
 pub use skills::{SKILL_ASSETS, SkillAsset, skill};
 pub use tags::{is_lower_hyphen, retag};
 pub use temporal::{
