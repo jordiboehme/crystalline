@@ -30,6 +30,7 @@ use crate::store::{
     RecentFilter, SearchHit, SearchMode, SearchQuery, Store, StoreInfo, StoredEngram, Vocabulary,
     build_vocabulary,
 };
+use crate::sweep::UnresolvedRef;
 
 /// A Turso-backed store. Open one with [`TursoStore::open`].
 pub struct TursoStore {
@@ -310,6 +311,25 @@ fn outbound_ref_from_row(r: &Row) -> OutboundRef {
         to_target: cell_text(r, 3).unwrap_or_default(),
         to_domain: cell_text(r, 4),
         resolved: cell_i64(r, 5).unwrap_or(0) != 0,
+    }
+}
+
+/// Decode one row of the unresolved-reference query. Column 6 is the source
+/// path, selected only to order by, so it is not read back.
+fn unresolved_ref_from_row(r: &Row) -> UnresolvedRef {
+    UnresolvedRef {
+        from: EngramId(cell_i64(r, 0).unwrap_or(0)),
+        kind: if cell_i64(r, 1).unwrap_or(0) == 0 {
+            EdgeKind::Relation
+        } else {
+            EdgeKind::Link
+        },
+        rel_type: cell_text(r, 2).unwrap_or_default(),
+        target_domain: cell_text(r, 3),
+        target: cell_text(r, 4).unwrap_or_default(),
+        // The parser writes 0 when it has no line to report, which the sweep
+        // reads as "no line" rather than as line zero.
+        line: cell_i64(r, 5).filter(|l| *l > 0).map(|l| l as usize),
     }
 }
 
@@ -1070,6 +1090,31 @@ impl Store for TursoStore {
         )
         .await?;
         Ok(rows.iter().map(outbound_ref_from_row).collect())
+    }
+
+    async fn unresolved_refs(&self, domain: DomainId) -> Result<Vec<UnresolvedRef>> {
+        // Relation rows then link rows, both filtered on `to_id IS NULL` and the
+        // source domain so the pair of partial unresolved indexes carries the
+        // scan. A prose link reports `links_to`, the same relation type the graph
+        // gives a wikilink edge. The source path is selected as the last column
+        // purely to order by: the sort is (path, line, kind, target), positional
+        // because a compound select cannot name a column of a later arm. TEXT
+        // sorts byte-wise here, which is the order the Postgres implementation
+        // pins itself to with an explicit `COLLATE "C"`.
+        let rows = query_all(
+            &self.conn,
+            "SELECT r.engram_id, 0 AS kind, r.rel_type, r.to_domain, r.to_target, r.line, e.path \
+             FROM relation r JOIN engram e ON e.id=r.engram_id \
+             WHERE r.to_id IS NULL AND r.domain_id=?1 \
+             UNION ALL \
+             SELECT l.engram_id, 1, 'links_to', l.to_domain, l.to_target, l.line, e.path \
+             FROM link l JOIN engram e ON e.id=l.engram_id \
+             WHERE l.to_id IS NULL AND l.domain_id=?1 \
+             ORDER BY 7, 6, 2, 5",
+            vec![Value::Integer(domain.0)],
+        )
+        .await?;
+        Ok(rows.iter().map(unresolved_ref_from_row).collect())
     }
 
     async fn search_with_candidate_cap(

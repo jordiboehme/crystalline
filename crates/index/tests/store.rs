@@ -702,6 +702,189 @@ async fn inbound_refs_kinds(store: &dyn Store) {
 }
 parity!(inbound_refs_report_ref_kinds, inbound_refs_kinds);
 
+/// `unresolved_refs` reports every dangling relation and prose link in a domain,
+/// and nothing else: a relation that resolves never appears, a reference in
+/// another domain never leaks in and a domain with no engrams reports none. Each
+/// row carries the relation type (`links_to` for a prose link), the
+/// `[[domain:...]]` prefix when the reference named one and the target text
+/// exactly as it was written, case and inner spacing intact, because the sweep
+/// quotes it verbatim for the repair. Ordered by source path then line, so
+/// relation and link rows interleave rather than arriving as two blocks, and two
+/// calls return the same queue.
+async fn unresolved_refs_dangling(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "target.md",
+        &engram("Target", "target", "engram", "", "target body\n"),
+    );
+    // A resolving relation, then a dangling one whose target keeps a capital and
+    // a double space, then a dangling prose link and a dangling prose link into a
+    // domain that was never registered.
+    write(
+        root,
+        "alpha.md",
+        &engram(
+            "Alpha",
+            "alpha",
+            "engram",
+            "",
+            "- depends_on [[Target]]\n- blocks [[Old  Deploy Pipeline]]\n\nProse about [[Ghost Title]] here.\n\nMore prose [[ghosts:Remote Thing]] here.\n",
+        ),
+    );
+    // A dangling relation carrying a domain prefix, in a file that sorts after
+    // alpha.md so the ordering is observable.
+    write(
+        root,
+        "beta.md",
+        &engram(
+            "Beta",
+            "beta",
+            "engram",
+            "",
+            "- supersedes [[archive:Old Note]]\n",
+        ),
+    );
+    // A capitalized path, which sorts first byte-wise and last under a locale
+    // collation. This is the row that catches the two backends disagreeing about
+    // text ordering.
+    write(
+        root,
+        "Capital.md",
+        &engram("Capital", "capital", "engram", "", "- cites [[Absent]]\n"),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+
+    // A second domain with its own dangling reference, so a missing domain
+    // filter would show up as an extra row.
+    let other_dir = tempfile::tempdir().unwrap();
+    let other = other_dir.path();
+    write(
+        other,
+        "solo.md",
+        &engram("Solo", "solo", "engram", "", "- cites [[Nowhere]]\n"),
+    );
+    sync_domain(store, "o", other).await.unwrap();
+
+    let d = store
+        .upsert_domain("d", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+    let alpha = store.lookup_id("d", "alpha").await.unwrap().unwrap();
+    let beta = store.lookup_id("d", "beta").await.unwrap().unwrap();
+    let capital = store.lookup_id("d", "capital").await.unwrap().unwrap();
+    let refs = store.unresolved_refs(d).await.unwrap();
+
+    let name = |id: EngramId| {
+        if id == alpha {
+            "alpha"
+        } else if id == beta {
+            "beta"
+        } else if id == capital {
+            "capital"
+        } else {
+            "unexpected"
+        }
+    };
+    let shape: Vec<_> = refs
+        .iter()
+        .map(|r| {
+            (
+                name(r.from),
+                r.kind,
+                r.rel_type.as_str(),
+                r.target_domain.as_deref(),
+                r.target.as_str(),
+                r.line,
+            )
+        })
+        .collect();
+    assert_eq!(
+        shape,
+        vec![
+            // Capital.md first: text sorts byte-wise on both backends, so an
+            // uppercase path precedes every lowercase one.
+            (
+                "capital",
+                EdgeKind::Relation,
+                "cites",
+                None,
+                "Absent",
+                Some(13)
+            ),
+            (
+                "alpha",
+                EdgeKind::Relation,
+                "blocks",
+                None,
+                "Old  Deploy Pipeline",
+                Some(14)
+            ),
+            (
+                "alpha",
+                EdgeKind::Link,
+                "links_to",
+                None,
+                "Ghost Title",
+                Some(16)
+            ),
+            (
+                "alpha",
+                EdgeKind::Link,
+                "links_to",
+                Some("ghosts"),
+                "Remote Thing",
+                Some(18)
+            ),
+            (
+                "beta",
+                EdgeKind::Relation,
+                "supersedes",
+                Some("archive"),
+                "Old Note",
+                Some(13)
+            ),
+        ],
+        "unresolved refs are ordered by (path, line) and carry the target verbatim: {refs:?}"
+    );
+    assert!(
+        !refs.iter().any(|r| r.target == "Target"),
+        "the relation that resolves is not an unresolved ref: {refs:?}"
+    );
+
+    // Deterministic: the same call over the same corpus returns the same queue.
+    let again = store.unresolved_refs(d).await.unwrap();
+    assert_eq!(again, refs, "two calls return the same order");
+
+    // Scoped to one domain, and a domain with no engrams reports none.
+    let o = store
+        .upsert_domain("o", Some(&other.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+    let other_refs = store.unresolved_refs(o).await.unwrap();
+    assert_eq!(
+        other_refs
+            .iter()
+            .map(|r| r.target.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Nowhere"],
+        "the second domain reports only its own dangling reference: {other_refs:?}"
+    );
+    let empty = store
+        .upsert_domain("empty", None, DomainKind::Virtual)
+        .await
+        .unwrap();
+    assert!(
+        store.unresolved_refs(empty).await.unwrap().is_empty(),
+        "a domain with no engrams has no unresolved references"
+    );
+}
+parity!(
+    unresolved_refs_report_dangling_targets,
+    unresolved_refs_dangling
+);
+
 async fn duplicate_permalink_fails(store: &dyn Store) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();

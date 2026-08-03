@@ -23,6 +23,7 @@ use crystalline_core::{Engram, slugify};
 use serde::Serialize;
 
 use crate::error::Result;
+use crate::sweep::UnresolvedRef;
 
 /// A domain's primary key in the index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
@@ -1156,6 +1157,29 @@ pub trait Store: Send + Sync {
     /// carrying whether it currently resolves to a target in the index. Ordered
     /// by source line. Backs the `read_engram` resolution flags.
     async fn outbound_refs(&self, engram_id: EngramId) -> Result<Vec<OutboundRef>>;
+
+    /// Every relation and prose link written in a domain whose target the index
+    /// could not bind, as the consolidation sweep's `V102` input.
+    ///
+    /// One row per dangling reference, never one per engram: an engram that
+    /// names three missing targets yields three. The domain is the *source*
+    /// domain, so a bare `[[Ghost]]` and a `[[other:Ghost]]` written in the same
+    /// engram both come back here, the second carrying its prefix in
+    /// [`UnresolvedRef::target_domain`] so a caller can tell an unregistered
+    /// target domain apart from a target that simply does not exist.
+    ///
+    /// [`UnresolvedRef::target`] is the text exactly as the author wrote it
+    /// inside the brackets, case and spacing intact, because a finding quotes it
+    /// verbatim for the repair. A prose wikilink reports `links_to` as its
+    /// `rel_type`, matching [`GraphEdge`]. A line of `0` (the parser's unknown)
+    /// reads back as `None`.
+    ///
+    /// Ordered by source path then line, then kind and target for rows that tie,
+    /// so the queue is stable across runs and identical on both backends. Rides
+    /// the `idx_relation_unresolved` and `idx_link_unresolved` partial indexes,
+    /// so the cost tracks the number of dangling references rather than the size
+    /// of the domain.
+    async fn unresolved_refs(&self, domain: DomainId) -> Result<Vec<UnresolvedRef>>;
 
     /// Run a search and return one page of hits plus the total match count.
     async fn search(&self, query: &SearchQuery) -> Result<Page<SearchHit>> {
