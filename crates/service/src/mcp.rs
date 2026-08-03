@@ -31,7 +31,14 @@
 //! `resolve_conflict` additionally disappear read-only. See `COLLAB_TOOLS`,
 //! `COLLAB_WRITE_TOOLS` and `hidden_collab_tool`.
 //!
-//! One more tool, `provision`, is gated a third way: hidden whenever no
+//! `evolve_engrams` is gated a third way, on the read-only flag alone. It is a
+//! pure read, so it is not one of the `WRITE_TOOLS`, but every finding it
+//! returns prescribes a mutation and a queue of work that cannot be worked is
+//! noise where mutation is impossible. See `hidden_evolve_tool`; the route
+//! stays registered like every other hidden tool, so a call by name still
+//! sweeps and answers.
+//!
+//! One more tool, `provision`, is gated a fourth way: hidden whenever no
 //! registered domain's MANIFEST declares a `## Provisioning` section (see
 //! [`Engine::provisioning_declared`]) or the instance is read-only, so an
 //! install with nothing to provision never carries the tool's context cost.
@@ -158,6 +165,17 @@ const TOON_INSTRUCTIONS_NOTE: &str = "\n\nList-shaped tool results (search hits,
 /// Whether `name` is one of the five collaboration tools.
 fn is_collab_tool(name: &str) -> bool {
     COLLAB_TOOLS.contains(&name)
+}
+
+/// Whether the consolidation sweep is hidden given the engine's live read-only
+/// state. The tool is a pure read, so it is not one of the `WRITE_TOOLS`, but
+/// every finding it returns prescribes a mutation: a queue of work that cannot
+/// be worked is noise on an instance where mutation is impossible. Its route
+/// stays registered like every other hidden tool (see `list_tools` and
+/// `get_tool`), so a call by name still reaches the engine and comes back with
+/// a real sweep rather than a bare "tool not found".
+fn hidden_evolve_tool(read_only: bool) -> bool {
+    read_only
 }
 
 /// Whether the `provision` tool is hidden given the engine's live read-only
@@ -417,7 +435,7 @@ impl McpServer {
     #[tool(
         name = "edit_engram",
         title = "Edit engram",
-        description = "Refine an existing engram in place as understanding evolves. Sections are addressed by heading path such as '## API > ### Auth'; replace_section keeps deeper subsections unless include_subsections is set. operation is one of append, prepend, find_replace, replace_section, insert_before_section, insert_after_section. find_replace takes find_text and an optional expected_replacements guard that fails on a count mismatch. Pass expected_checksum (from read_engram) to guard a virtual-domain edit against a change since your read: a conflict is refused if it changed, so re-read and retry; omit it for last-write-wins. The generated provenance block is refreshed with who edited it and when. Status values to reflect a changed lifecycle (recommended values: see write_engram). Temporal frontmatter fields (recorded_at, valid_from, valid_to, source_date, stale_after, plus the legacy last_verified and review_after spellings) must stay plain ISO dates (YYYY-MM-DD): an edit that leaves one malformed is rejected and a sentinel far-future valid_to or an explicit null is dropped, except recorded_at which is required and cannot be nulled.",
+        description = "Refine an existing engram in place as understanding evolves. Sections are addressed by heading path such as '## API > ### Auth'; replace_section keeps deeper subsections unless include_subsections is set. operation is one of append, prepend, find_replace, replace_section, insert_before_section, insert_after_section, set_frontmatter. find_replace takes find_text and an optional expected_replacements guard that fails on a count mismatch. set_frontmatter assigns one lifecycle field by key and value instead of text-substituting a frontmatter line: the settable keys are status, valid_from, valid_to, stale_after, source_date, salience and verified, and nothing else (identity, tags, recorded_at and the generated block are refused). Use it to retire an engram, close or reopen a validity window, push a review date forward, mark knowledge salient or record that you re-checked something. Omit value to remove the field (that is how a valid_to that should never have been set is cleared); status cannot be removed. The four date keys take a plain ISO date (YYYY-MM-DD) and salience a number from 0 to 10. verified never removes: it stamps { by, at } with the current instant, taking value as the verifying actor and falling back to your own identity when value is omitted. Pass expected_checksum (from read_engram) to guard a virtual-domain edit against a change since your read: a conflict is refused if it changed, so re-read and retry; omit it for last-write-wins. The generated provenance block is refreshed with who edited it and when. Status values to reflect a changed lifecycle (recommended values: see write_engram). Temporal frontmatter fields (recorded_at, valid_from, valid_to, source_date, stale_after, plus the legacy last_verified and review_after spellings) must stay plain ISO dates (YYYY-MM-DD): an edit that leaves one malformed is rejected and a sentinel far-future valid_to or an explicit null is dropped, except recorded_at which is required and cannot be nulled.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -612,6 +630,23 @@ impl McpServer {
     ) -> Result<CallToolResult, ErrorData> {
         self.engine
             .vocabulary(&p)
+            .await
+            .map_err(to_error)
+            .and_then(|v| self.ok_list(v))
+    }
+
+    #[tool(
+        name = "evolve_engrams",
+        title = "Evolve engrams",
+        description = "Sweep one domain or every domain for the maintenance the knowledge needs and return a ranked work queue: a to-do list that walks you through tidying, cleaning up, auditing, reviewing or health-checking what has been taught. Detects temporal and lifecycle debt (an elapsed valid_to still marked stable, stale_after past due, long-unverified knowledge, a superseded engram with no successor relation and the half-finished converse, a retired engram still cited as current by live ones), structural gaps (unresolved [[links]], one-sided supersedes or summarizes pairs, orphans, an engram over the split budget, near-empty stubs) and redundancy (near-duplicate clusters, drifted tags). It detects by dates, links and graph shape only, never by meaning, so it cannot find or confirm a contradiction between what two engrams say. Read-only: it changes nothing itself. Each finding names the engram, the evidence and the exact next action with the tool that performs it, and a finding marked mechanical completes intent the archive already records while one marked judgment changes what the archive claims and needs a yes from the user first. Work the queue with the write tools and re-run the same scope to confirm it shrank. Call it when the user asks whether knowledge is still accurate, what needs attention or review, or to tidy, audit, consolidate or spring-clean a domain; after a large ingest lands many engrams at once; and when a search returns hits that disagree, since a half-finished retirement often explains the disagreement. Do not call it at session start, after routine captures or before ordinary recall - it is deliberate maintenance, on demand. limit caps the queue (default 10), families narrows to one detector family, domains narrows the sweep.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn evolve_engrams(
+        &self,
+        Parameters(p): Parameters<EvolveParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.engine
+            .evolve_engrams(&p)
             .await
             .map_err(to_error)
             .and_then(|v| self.ok_list(v))
@@ -1213,6 +1248,9 @@ impl ServerHandler for McpServer {
             if is_collab_tool(&t.name) && hidden_collab_tool(&t.name, github_enabled, read_only) {
                 return false;
             }
+            if t.name == crate::EVOLVE_TOOL_NAME && hidden_evolve_tool(read_only) {
+                return false;
+            }
             if t.name == "provision" && hidden_provision_tool(read_only, provisioning_declared) {
                 return false;
             }
@@ -1244,6 +1282,9 @@ impl ServerHandler for McpServer {
             if hidden_collab_tool(name, github_enabled, read_only) {
                 return None;
             }
+        }
+        if name == crate::EVOLVE_TOOL_NAME && hidden_evolve_tool(read_only) {
+            return None;
         }
         if name == "provision"
             && hidden_provision_tool(read_only, self.engine.provisioning_declared())

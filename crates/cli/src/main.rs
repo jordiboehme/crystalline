@@ -364,12 +364,22 @@ enum Command {
         /// The engram's domain.
         domain: String,
         /// One of append, prepend, find_replace, replace_section,
-        /// insert_before_section, insert_after_section.
+        /// insert_before_section, insert_after_section, set_frontmatter.
         operation: String,
-        /// The content to add or the replacement. Read from stdin when omitted.
+        /// The content to add or the replacement. Read from stdin when omitted,
+        /// except for set_frontmatter, which takes --key and --value instead.
         /// Accepts a value that begins with `-`.
         #[arg(long, allow_hyphen_values = true)]
         content: Option<String>,
+        /// The frontmatter field to assign, for set_frontmatter: status,
+        /// valid_from, valid_to, stale_after, source_date, salience or
+        /// verified.
+        #[arg(long)]
+        key: Option<String>,
+        /// The value to assign, for set_frontmatter. Omit to remove the field;
+        /// omit on verified to stamp a verification as yourself.
+        #[arg(long, allow_hyphen_values = true)]
+        value: Option<String>,
         /// The heading path for the *_section operations.
         #[arg(long)]
         section: Option<String>,
@@ -490,6 +500,41 @@ enum Command {
         /// Restrict to these types (repeatable).
         #[arg(long = "type")]
         types: Vec<String>,
+        /// Load the global config from this file instead of the default path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Sweep for the maintenance the knowledge needs and print a ranked queue.
+    ///
+    /// Read-only: it detects temporal and lifecycle debt, structural gaps and
+    /// redundancy by dates, links and graph shape, never by meaning, and
+    /// changes nothing itself. Work the queue with the write verbs and re-run
+    /// the same scope to confirm it shrank.
+    Evolve {
+        /// Restrict the sweep to these domains (repeatable). Omit to sweep
+        /// every registered domain.
+        #[arg(long)]
+        domain: Vec<String>,
+        /// Restrict to these detector families (repeatable): temporal,
+        /// structure or redundancy.
+        #[arg(long = "family")]
+        families: Vec<String>,
+        /// Restrict to these rule ids (repeatable), for example V001 or V201.
+        #[arg(long = "rule")]
+        rules: Vec<String>,
+        /// Drop findings scoring under this priority, 0 to 100.
+        #[arg(long)]
+        min_priority: Option<u8>,
+        /// Page size. Defaults to 10, capped at 100.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// One-based page number.
+        #[arg(long)]
+        page: Option<usize>,
+        /// Evaluate the temporal rules as of this ISO date (YYYY-MM-DD)
+        /// instead of today, so a run is reproducible.
+        #[arg(long)]
+        today: Option<String>,
         /// Load the global config from this file instead of the default path.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -1120,6 +1165,7 @@ fn main() -> anyhow::Result<()> {
             | Command::Search { .. }
             | Command::Context { .. }
             | Command::Recent { .. }
+            | Command::Evolve { .. }
             | Command::Vocabulary { .. }),
         ) => on_runtime_current_thread(move || run_data(cmd, cli.db, cli.json)),
         Some(cmd @ (Command::Write { .. } | Command::Edit { .. } | Command::Move { .. })) => {
@@ -1801,6 +1847,8 @@ async fn run_data(command: Command, db: Option<PathBuf>, json: bool) -> anyhow::
             domain,
             operation,
             content,
+            key,
+            value,
             section,
             find_text,
             expected_replacements,
@@ -1808,7 +1856,13 @@ async fn run_data(command: Command, db: Option<PathBuf>, json: bool) -> anyhow::
             expected_checksum,
             config,
         } => {
-            let body = content_or_stdin(content)?;
+            // set_frontmatter takes a key and a value, so it must never block
+            // on stdin waiting for content it does not use.
+            let body = if operation == "set_frontmatter" {
+                content
+            } else {
+                Some(content_or_stdin(content)?)
+            };
             (
                 "edit_engram",
                 json!({
@@ -1816,6 +1870,8 @@ async fn run_data(command: Command, db: Option<PathBuf>, json: bool) -> anyhow::
                     "domain": domain,
                     "operation": operation,
                     "content": body,
+                    "key": key,
+                    "value": value,
                     "section": section,
                     "find_text": find_text,
                     "expected_replacements": expected_replacements,
@@ -1901,6 +1957,28 @@ async fn run_data(command: Command, db: Option<PathBuf>, json: bool) -> anyhow::
             }),
             config,
         ),
+        Command::Evolve {
+            domain,
+            families,
+            rules,
+            min_priority,
+            limit,
+            page,
+            today,
+            config,
+        } => (
+            crystalline_service::EVOLVE_TOOL_NAME,
+            json!({
+                "domains": opt_vec(domain),
+                "families": opt_vec(families),
+                "rules": opt_vec(rules),
+                "min_priority": min_priority,
+                "limit": limit,
+                "page": page,
+                "today": today,
+            }),
+            config,
+        ),
         Command::Vocabulary { domain, config } => {
             ("vocabulary", json!({ "domain": domain }), config)
         }
@@ -1926,6 +2004,7 @@ async fn run_data(command: Command, db: Option<PathBuf>, json: bool) -> anyhow::
         "build_context" => render::render_context(&value, &mut out)?,
         "write_engram" => render::render_write(&value, &mut out)?,
         "vocabulary" => render::render_vocabulary(&value, &mut out)?,
+        t if t == crystalline_service::EVOLVE_TOOL_NAME => render::render_evolve(&value, &mut out)?,
         _ => {
             let text = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
             writeln!(out, "{text}")?;

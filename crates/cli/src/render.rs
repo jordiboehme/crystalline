@@ -235,6 +235,164 @@ fn render_named_counts(items: &[Value], out: &mut impl Write) -> io::Result<()> 
     Ok(())
 }
 
+/// `evolve`: a scope-and-total summary, the family counts, then one numbered
+/// block per finding carrying its evidence and the exact next action, followed
+/// by the per-rule instruction legend, any truncation notes and the fixed
+/// guidance, printed from `engine::EVOLVE_GUIDANCE` rather than from the
+/// response key so the CLI and the tool can never state different authority.
+///
+/// The number is the finding's rank across the whole result, not its position
+/// on the page, so an item keeps its number as the reader pages. The class is
+/// printed uppercase in the header line of every block, which is what keeps a
+/// `MECHANICAL` item (complete intent the archive already records) visually
+/// apart from a `JUDGMENT` one (change what the archive claims, propose first)
+/// without colour.
+pub fn render_evolve(v: &Value, out: &mut impl Write) -> io::Result<()> {
+    let (Some(queue), Some(total)) = (
+        v.get("queue").and_then(Value::as_array),
+        v.get("total").and_then(Value::as_u64),
+    ) else {
+        return pretty_fallback(v, out);
+    };
+    let scanned = v
+        .get("engrams_scanned")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let page = v.get("page").and_then(Value::as_u64).unwrap_or(1);
+    let count = v
+        .get("count")
+        .and_then(Value::as_u64)
+        .unwrap_or(queue.len() as u64);
+    let domains: Vec<&str> = v
+        .get("scope")
+        .and_then(|s| s.get("domains"))
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let today = v
+        .get("scope")
+        .and_then(|s| s.get("today"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+
+    let scope = if domains.is_empty() {
+        "no domains".to_string()
+    } else {
+        domains.join(", ")
+    };
+    let engram_word = if scanned == 1 { "engram" } else { "engrams" };
+    let finding_word = if total == 1 { "finding" } else { "findings" };
+    writeln!(out, "Sweep of {scope} as of {today}")?;
+    writeln!(
+        out,
+        "{scanned} {engram_word} scanned, {total} {finding_word} (showing {count}, page {page})"
+    )?;
+    if let Some(unparsed) = v.get("unparsed").and_then(Value::as_u64)
+        && unparsed > 0
+    {
+        let word = if unparsed == 1 { "engram" } else { "engrams" };
+        writeln!(out, "{unparsed} unreadable {word} skipped")?;
+    }
+
+    let families: Vec<String> = v
+        .get("families")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .map(|f| {
+                    let name = f.get("family").and_then(Value::as_str).unwrap_or("");
+                    let n = f.get("findings").and_then(Value::as_u64).unwrap_or(0);
+                    format!("{name} {n}")
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if !families.is_empty() {
+        writeln!(out, "{}", families.join(", "))?;
+    }
+
+    if queue.is_empty() {
+        writeln!(out)?;
+        writeln!(out, "nothing to work in this scope")?;
+        return Ok(());
+    }
+
+    for item in queue {
+        let n = item.get("n").and_then(Value::as_u64).unwrap_or(0);
+        let priority = item.get("priority").and_then(Value::as_u64).unwrap_or(0);
+        let rule = item.get("rule").and_then(Value::as_str).unwrap_or("");
+        let class = item
+            .get("class")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_uppercase();
+        let domain = item.get("domain").and_then(Value::as_str).unwrap_or("");
+        let permalink = item.get("permalink").and_then(Value::as_str).unwrap_or("");
+        let title = item
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or("(untitled)");
+        writeln!(out)?;
+        writeln!(out, "{n}. [{priority}] {rule} {class}")?;
+        // A domain-level finding (`V203` is the one today) carries neither
+        // permalink nor title, so it addresses the whole domain rather than
+        // printing a trailing slash and a blank title where an engram's would
+        // be.
+        if permalink.is_empty() {
+            writeln!(out, "   crystalline://{domain}")?;
+        } else if title.is_empty() {
+            writeln!(out, "   crystalline://{domain}/{permalink}")?;
+        } else {
+            writeln!(out, "   {title}  crystalline://{domain}/{permalink}")?;
+        }
+        if let Some(finding) = item.get("finding").and_then(Value::as_str)
+            && !finding.is_empty()
+        {
+            writeln!(out, "   {finding}")?;
+        }
+        if let Some(evidence) = item.get("evidence").and_then(Value::as_str)
+            && !evidence.is_empty()
+        {
+            writeln!(out, "   evidence: {evidence}")?;
+        }
+        if let Some(fix) = item.get("fix").and_then(Value::as_str)
+            && !fix.is_empty()
+        {
+            writeln!(out, "   fix: {fix}")?;
+        }
+    }
+
+    // The prose instruction is per rule, so it rides a legend rather than
+    // repeating under ten findings that share one rule.
+    if let Some(actions) = v.get("actions").and_then(Value::as_array)
+        && !actions.is_empty()
+    {
+        writeln!(out)?;
+        writeln!(out, "Actions:")?;
+        for a in actions {
+            let rule = a.get("rule").and_then(Value::as_str).unwrap_or("");
+            let instruction = a.get("instruction").and_then(Value::as_str).unwrap_or("");
+            writeln!(out, "  {rule}  {instruction}")?;
+        }
+    }
+
+    if let Some(truncations) = v.get("truncations").and_then(Value::as_array)
+        && !truncations.is_empty()
+    {
+        writeln!(out)?;
+        writeln!(out, "Truncated:")?;
+        for t in truncations.iter().filter_map(Value::as_str) {
+            writeln!(out, "  {t}")?;
+        }
+    }
+
+    // The one fixed string the engine returns on every call, printed from the
+    // constant rather than re-typed here so the CLI and the tool can never
+    // state different authority.
+    writeln!(out)?;
+    writeln!(out, "{}", crystalline_service::engine::EVOLVE_GUIDANCE)
+}
+
 /// `write`: a single confirmation line carrying the new engram's address.
 pub fn render_write(v: &Value, out: &mut impl Write) -> io::Result<()> {
     let (Some(domain), Some(permalink)) = (
@@ -427,6 +585,134 @@ mod tests {
     fn vocabulary_falls_back_when_shape_is_wrong() {
         let v = json!({ "domain": "eng" });
         let out = render_to_string(render_vocabulary, &v);
+        assert_eq!(
+            out,
+            format!("{}\n", serde_json::to_string_pretty(&v).unwrap())
+        );
+    }
+
+    /// A two-finding queue, one of each class, with a legend and a truncation
+    /// note: the whole shape in one assertion so the layout is pinned.
+    #[test]
+    fn evolve_numbers_by_rank_and_marks_the_class() {
+        let v = json!({
+            "scope": { "domains": ["eng"], "families": [], "rules": [], "min_priority": null, "today": "2026-08-02" },
+            "engrams_scanned": 17,
+            "unparsed": 0,
+            "total": 12,
+            "page": 2,
+            "limit": 2,
+            "count": 2,
+            "families": [
+                { "family": "temporal", "findings": 5 },
+                { "family": "structure", "findings": 7 },
+            ],
+            "queue": [
+                {
+                    "n": 3, "priority": 90, "rule": "V005", "class": "mechanical",
+                    "domain": "eng", "permalink": "old-pipeline", "title": "Old pipeline",
+                    "line": null, "finding": "still stable but superseded",
+                    "evidence": "status=stable", "fix": "set_frontmatter status=superseded",
+                },
+                {
+                    "n": 4, "priority": 85, "rule": "V001", "class": "judgment",
+                    "domain": "eng", "permalink": "old-window", "title": "Old window",
+                    "line": null, "finding": "valid_to elapsed", "evidence": "valid_to=2026-01-01",
+                    "fix": "",
+                },
+            ],
+            "actions": [{ "rule": "V005", "instruction": "Finish the retirement." }],
+            "guidance": "ignored: the CLI prints the constant",
+            "truncations": ["eng - V003 capped at 10 oldest of 57"],
+        });
+        let out = render_to_string(render_evolve, &v);
+        let expected = format!(
+            "Sweep of eng as of 2026-08-02\n\
+             17 engrams scanned, 12 findings (showing 2, page 2)\n\
+             temporal 5, structure 7\n\
+             \n\
+             3. [90] V005 MECHANICAL\n\
+             \x20  Old pipeline  crystalline://eng/old-pipeline\n\
+             \x20  still stable but superseded\n\
+             \x20  evidence: status=stable\n\
+             \x20  fix: set_frontmatter status=superseded\n\
+             \n\
+             4. [85] V001 JUDGMENT\n\
+             \x20  Old window  crystalline://eng/old-window\n\
+             \x20  valid_to elapsed\n\
+             \x20  evidence: valid_to=2026-01-01\n\
+             \n\
+             Actions:\n\
+             \x20 V005  Finish the retirement.\n\
+             \n\
+             Truncated:\n\
+             \x20 eng - V003 capped at 10 oldest of 57\n\
+             \n\
+             {}\n",
+            crystalline_service::engine::EVOLVE_GUIDANCE
+        );
+        assert_eq!(out, expected);
+    }
+
+    /// A finding about the whole domain rather than one engram (`V203`) has no
+    /// permalink and no title, so it addresses the domain instead of printing a
+    /// dangling slash where an engram's permalink would be.
+    #[test]
+    fn evolve_domain_level_finding_addresses_the_domain() {
+        let v = json!({
+            "scope": { "domains": ["eng"], "today": "2026-08-02" },
+            "engrams_scanned": 6,
+            "total": 1, "page": 1, "limit": 10, "count": 1,
+            "families": [{ "family": "redundancy", "findings": 1 }],
+            "queue": [{
+                "n": 1, "priority": 30, "rule": "V203", "class": "judgment",
+                "domain": "eng", "permalink": "", "title": "", "line": null,
+                "finding": "2 tag spellings look like one tag (plural variants)",
+                "evidence": "#vent on 1 engram(s); #vents on 5 engram(s)",
+                "fix": "crystalline tags merge vent vents",
+            }],
+            "actions": [], "truncations": [],
+        });
+        let out = render_to_string(render_evolve, &v);
+        assert!(out.contains("\n   crystalline://eng\n"), "{out}");
+        assert!(!out.contains("crystalline://eng/"), "{out}");
+    }
+
+    /// A clean sweep says so rather than printing an empty list, and still
+    /// reports what it scanned.
+    #[test]
+    fn evolve_empty_queue_says_nothing_to_work() {
+        let v = json!({
+            "scope": { "domains": ["eng", "ops"], "today": "2026-08-02" },
+            "engrams_scanned": 1,
+            "total": 0, "page": 1, "limit": 10, "count": 0,
+            "families": [], "queue": [], "actions": [], "truncations": [],
+        });
+        let out = render_to_string(render_evolve, &v);
+        assert_eq!(
+            out,
+            "Sweep of eng, ops as of 2026-08-02\n1 engram scanned, 0 findings (showing 0, page 1)\n\nnothing to work in this scope\n"
+        );
+    }
+
+    /// An engram the sweep could not read is reported rather than silently
+    /// dropped from the scanned count.
+    #[test]
+    fn evolve_reports_unparsed_engrams() {
+        let v = json!({
+            "scope": { "domains": ["eng"], "today": "2026-08-02" },
+            "engrams_scanned": 4, "unparsed": 1,
+            "total": 0, "page": 1, "limit": 10, "count": 0,
+            "families": [], "queue": [], "actions": [], "truncations": [],
+        });
+        let out = render_to_string(render_evolve, &v);
+        assert!(out.contains("1 unreadable engram skipped"), "{out}");
+    }
+
+    #[test]
+    fn evolve_falls_back_when_shape_is_wrong() {
+        let v = json!({ "scope": { "domains": ["eng"] } });
+        let out = render_to_string(render_evolve, &v);
         assert_eq!(
             out,
             format!("{}\n", serde_json::to_string_pretty(&v).unwrap())

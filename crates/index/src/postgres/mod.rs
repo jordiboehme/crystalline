@@ -86,6 +86,7 @@ use crate::store::{
     RecentFilter, SearchHit, SearchMode, SearchQuery, Store, StoreInfo, StoredEngram, Vocabulary,
     build_vocabulary,
 };
+use crate::sweep::UnresolvedRef;
 
 /// A PostgreSQL-backed store. Open one with [`PostgresStore::open`].
 pub struct PostgresStore {
@@ -538,6 +539,26 @@ fn outbound_ref_from_row(r: &PgRow) -> OutboundRef {
         to_target: cell_text(r, 3).unwrap_or_default(),
         to_domain: cell_text(r, 4),
         resolved: cell_i64(r, 5).unwrap_or(0) != 0,
+    }
+}
+
+/// Decode one row of the unresolved-reference query. The column layout is
+/// identical across both backends; column 6 is the source path, selected only to
+/// order by, so it is not read back.
+fn unresolved_ref_from_row(r: &PgRow) -> UnresolvedRef {
+    UnresolvedRef {
+        from: EngramId(cell_i64(r, 0).unwrap_or(0)),
+        kind: if cell_i64(r, 1).unwrap_or(0) == 0 {
+            EdgeKind::Relation
+        } else {
+            EdgeKind::Link
+        },
+        rel_type: cell_text(r, 2).unwrap_or_default(),
+        target_domain: cell_text(r, 3),
+        target: cell_text(r, 4).unwrap_or_default(),
+        // The parser writes 0 when it has no line to report, which the sweep
+        // reads as "no line" rather than as line zero.
+        line: cell_i64(r, 5).filter(|l| *l > 0).map(|l| l as usize),
     }
 }
 
@@ -1271,6 +1292,43 @@ impl Store for PostgresStore {
         .await
         .map_err(IndexError::from)?;
         Ok(rows.iter().map(outbound_ref_from_row).collect())
+    }
+
+    async fn unresolved_refs(&self, domain: DomainId) -> Result<Vec<UnresolvedRef>> {
+        // The Turso query, column for column. The kind discriminator is cast to
+        // `int8` so `cell_i64` decodes it (a bare integer literal is `int4`), and
+        // the prose arm reports `links_to`, the same relation type the graph gives
+        // a wikilink edge. Both arms filter on `to_id IS NULL` and the source
+        // domain, which is exactly the pair of partial unresolved indexes. The
+        // source path is selected as the last column purely to order by.
+        //
+        // The compound select is wrapped so the sort keys can carry an explicit
+        // `COLLATE "C"`: Turso sorts TEXT byte-wise, while a Postgres database
+        // created under a locale collation sorts `Beta.md` after `alpha.md`, so
+        // without the pin the two backends would return the same rows in
+        // different orders on any domain with a mixed-case path. Turso keeps the
+        // flat form because BINARY is already its default. The sort is (path,
+        // line, kind, target) on both.
+        let mut conn = self.acquire().await?;
+        let rows = sqlx::query(
+            "SELECT u.engram_id, u.kind, u.rel_type, u.to_domain, u.to_target, u.line, u.path \
+             FROM ( \
+               SELECT r.engram_id, 0::int8 AS kind, r.rel_type, r.to_domain, r.to_target, \
+                      r.line, e.path \
+               FROM relation r JOIN engram e ON e.id=r.engram_id \
+               WHERE r.to_id IS NULL AND r.domain_id=$1 \
+               UNION ALL \
+               SELECT l.engram_id, 1::int8, 'links_to', l.to_domain, l.to_target, l.line, e.path \
+               FROM link l JOIN engram e ON e.id=l.engram_id \
+               WHERE l.to_id IS NULL AND l.domain_id=$1 \
+             ) u \
+             ORDER BY u.path COLLATE \"C\", u.line, u.kind, u.to_target COLLATE \"C\"",
+        )
+        .bind(domain.0)
+        .fetch_all(conn.as_mut())
+        .await
+        .map_err(IndexError::from)?;
+        Ok(rows.iter().map(unresolved_ref_from_row).collect())
     }
 
     async fn search_with_candidate_cap(

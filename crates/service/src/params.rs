@@ -93,10 +93,29 @@ pub struct EditParams {
     /// The engram's domain.
     pub domain: String,
     /// One of append, prepend, find_replace, replace_section,
-    /// insert_before_section, insert_after_section.
+    /// insert_before_section, insert_after_section, set_frontmatter.
     pub operation: String,
-    /// The content to add or the replacement text.
-    pub content: String,
+    /// The content to add or the replacement text. Required by every operation
+    /// except set_frontmatter, which takes key and value instead.
+    #[serde(default)]
+    pub content: Option<String>,
+    /// The frontmatter field to assign, for set_frontmatter. One of status,
+    /// valid_from, valid_to, stale_after, source_date, salience or verified.
+    /// No other key is settable here: type, title, permalink, tags,
+    /// recorded_at and the generated provenance block carry identity and
+    /// provenance and are owned by their own tools.
+    #[serde(default)]
+    pub key: Option<String>,
+    /// The value to assign, for set_frontmatter. Omit it (or pass null) to
+    /// remove the field, which is how a valid_to that should never have been
+    /// set is cleared; status cannot be removed, since every engram needs one.
+    /// The four date keys take a plain ISO date (YYYY-MM-DD), salience a number
+    /// from 0 to 10. verified is the exception: it never removes, it stamps a
+    /// verification record `{ by, at }` with the current instant, taking the
+    /// value as the verifying actor and falling back to the caller's own
+    /// identity when it is omitted.
+    #[serde(default)]
+    pub value: Option<String>,
     /// The section heading path for the *_section operations, for example
     /// `## API > ### Auth`. Subsections are kept unless include_subsections.
     #[serde(default)]
@@ -291,6 +310,40 @@ pub struct VocabularyParams {
     /// Restrict to one domain. Omit for a vocabulary across every domain.
     #[serde(default)]
     pub domain: Option<String>,
+}
+
+/// Parameters for `evolve_engrams`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+pub struct EvolveParams {
+    /// Restrict the sweep to these domains. Omit to sweep every registered
+    /// domain.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub domains: Vec<String>,
+    /// Restrict the sweep to these detector families: temporal (validity
+    /// windows, staleness and the supersede lifecycle), structure (references,
+    /// reciprocity, orphans, stubs and size) or redundancy (duplicate content,
+    /// colliding titles and tag drift). Omit for all three.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub families: Vec<String>,
+    /// Restrict the sweep to these rule ids, for example V001 or V201. Omit for
+    /// every rule in the requested families.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub rules: Vec<String>,
+    /// Drop findings scoring under this priority, 0 to 100. Useful to see only
+    /// what matters most on a large archive.
+    #[serde(default)]
+    pub min_priority: Option<u8>,
+    /// Page size. Defaults to 10, capped at 100.
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// One-based page number. Defaults to 1.
+    #[serde(default)]
+    pub page: Option<usize>,
+    /// Evaluate the temporal rules as of this ISO date (YYYY-MM-DD) instead of
+    /// today, so a run is reproducible. Only the date comparisons move; nothing
+    /// else about the sweep changes.
+    #[serde(default)]
+    pub today: Option<String>,
 }
 
 /// Parameters for `configure`. Omit everything to see the current settings

@@ -21,6 +21,7 @@ from scripts import train as skillopt_train
 
 from envs.crystalline_capture.adapter import CrystallineCaptureAdapter
 from envs.crystalline_collaboration.adapter import CrystallineCollaborationAdapter
+from envs.crystalline_evolve.adapter import CrystallineEvolveAdapter
 from envs.crystalline_memory.adapter import CrystallineMemoryAdapter
 from envs.crystalline_routing.adapter import CrystallineRoutingAdapter
 from envs.crystalline_schema.adapter import CrystallineSchemaAdapter
@@ -34,6 +35,7 @@ def main() -> None:
     skillopt_train._ENV_REGISTRY["crystalline_capture"] = CrystallineCaptureAdapter
     skillopt_train._ENV_REGISTRY["crystalline_schema"] = CrystallineSchemaAdapter
     skillopt_train._ENV_REGISTRY["crystalline_memory"] = CrystallineMemoryAdapter
+    skillopt_train._ENV_REGISTRY["crystalline_evolve"] = CrystallineEvolveAdapter
     skillopt_train._ENV_REGISTRY["crystalline_collaboration"] = (
         CrystallineCollaborationAdapter
     )

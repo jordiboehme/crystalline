@@ -231,6 +231,7 @@ async fn list_tools_exposes_the_core_tools_plus_configure_and_add_domain() {
         "validate_engrams",
         "infer_schema",
         "vocabulary",
+        "evolve_engrams",
         "configure",
         "add_domain",
         "skills",
@@ -248,7 +249,7 @@ async fn list_tools_exposes_the_core_tools_plus_configure_and_add_domain() {
             "{hidden} must be hidden while github.enabled is off: {names:?}"
         );
     }
-    assert_eq!(names.len(), 16, "exactly 16 tools: {names:?}");
+    assert_eq!(names.len(), 17, "exactly 17 tools: {names:?}");
 }
 
 /// The salience prior (Tasks 1-4) is invisible to an agent unless the tool
@@ -439,13 +440,16 @@ async fn read_only_hides_the_write_gated_tools() {
     }
     // Read-only and GitHub collaboration off together hide all five
     // collaboration tools too (the full gating matrix lives in
-    // tests/mcp_collab.rs).
+    // tests/mcp_collab.rs). `evolve_engrams` is hidden on its own gate: it is a
+    // read, but every finding it returns prescribes a mutation, so the queue is
+    // noise where mutation is impossible.
     for hidden in [
         "configure",
         "share_changes",
         "update_domain",
         "origin_status",
         "resolve_conflict",
+        "evolve_engrams",
     ] {
         assert!(
             !names.contains(&hidden.to_string()),
@@ -2099,6 +2103,600 @@ async fn edit_engram_rejects_a_nulled_recorded_at() {
     );
 }
 
+/// Write an engram straight to disk and sync it, for the set_frontmatter tests
+/// that need a specific legacy frontmatter shape rather than what a write
+/// produces. `fields` are extra frontmatter lines.
+async fn plant(h: &Harness, domain: &str, slug: &str, fields: &str) -> std::path::PathBuf {
+    let md = format!(
+        "---\ntype: engram\ntitle: {slug}\npermalink: {slug}\ntags:\n  - eng\nrecorded_at: 2026-01-01\n{fields}---\n\n# {slug}\n\nA rule.\n"
+    );
+    let path = h.root.join(domain).join(format!("{slug}.md"));
+    std::fs::write(&path, md).unwrap();
+    h.engine.sync(None).await.unwrap();
+    path
+}
+
+/// set_frontmatter flips a status by field assignment rather than text
+/// substitution, so it lands whichever spelling the file carries: the current
+/// `stable` a write produces and the legacy `current` an older file holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edit_engram_set_frontmatter_flips_either_status_spelling() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Fresh", "content": "A rule." }),
+    )
+    .await
+    .unwrap();
+    let legacy = plant(&h, "eng", "legacy", "status: current\n").await;
+
+    for slug in ["fresh", "legacy"] {
+        call(
+            peer,
+            "edit_engram",
+            json!({
+                "domain": "eng",
+                "identifier": slug,
+                "operation": "set_frontmatter",
+                "key": "status",
+                "value": "superseded",
+            }),
+        )
+        .await
+        .unwrap();
+    }
+
+    let fresh_text = std::fs::read_to_string(h.root.join("eng/fresh.md")).unwrap();
+    assert!(fresh_text.contains("status: superseded"), "{fresh_text}");
+    assert!(!fresh_text.contains("status: stable"), "{fresh_text}");
+    let legacy_text = std::fs::read_to_string(&legacy).unwrap();
+    assert!(legacy_text.contains("status: superseded"), "{legacy_text}");
+    assert!(!legacy_text.contains("status: current"), "{legacy_text}");
+    // Exactly one status line either way: an assignment never appends a second.
+    assert_eq!(legacy_text.matches("status:").count(), 1, "{legacy_text}");
+
+    // The file still parses and the index carries the new status, so a read
+    // (which resolves through the store) reports it.
+    let out = call(
+        peer,
+        "read_engram",
+        json!({ "domain": "eng", "identifier": "legacy" }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out["status"], json!("superseded"), "{out}");
+    assert_eq!(
+        out["frontmatter"]["status"],
+        json!("superseded"),
+        "the edited file must re-parse: {out}"
+    );
+}
+
+/// A valid_to is set as a plain date and cleared by omitting the value, which
+/// is how a bound that should never have been set is removed - absence is what
+/// expresses valid forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edit_engram_set_frontmatter_sets_then_clears_a_valid_to() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Windowed", "content": "A rule." }),
+    )
+    .await
+    .unwrap();
+    let path = h.root.join("eng/windowed.md");
+
+    call(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng",
+            "identifier": "windowed",
+            "operation": "set_frontmatter",
+            "key": "valid_to",
+            "value": "2026-09-30",
+        }),
+    )
+    .await
+    .unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("valid_to: 2026-09-30"), "{text}");
+    let out = call(
+        peer,
+        "read_engram",
+        json!({ "domain": "eng", "identifier": "windowed" }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out["frontmatter"]["valid_to"], json!("2026-09-30"), "{out}");
+
+    call(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng",
+            "identifier": "windowed",
+            "operation": "set_frontmatter",
+            "key": "valid_to",
+        }),
+    )
+    .await
+    .unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(!text.contains("valid_to"), "the bound must be gone: {text}");
+    let out = call(
+        peer,
+        "read_engram",
+        json!({ "domain": "eng", "identifier": "windowed" }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out["frontmatter"]["valid_to"], Value::Null, "{out}");
+}
+
+/// status is required (verify rule T001), so it is the one settable key a
+/// missing value must not remove.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edit_engram_set_frontmatter_refuses_to_remove_status() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Statused", "content": "A rule." }),
+    )
+    .await
+    .unwrap();
+    let path = h.root.join("eng/statused.md");
+    let before = std::fs::read_to_string(&path).unwrap();
+
+    let err = call(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng",
+            "identifier": "statused",
+            "operation": "set_frontmatter",
+            "key": "status",
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("status cannot be removed"), "{err}");
+    assert_eq!(
+        before,
+        std::fs::read_to_string(&path).unwrap(),
+        "the file must be unchanged after a refused edit"
+    );
+}
+
+/// The keyset is a safe list: identity, classification and provenance keys are
+/// refused by name, and the error states what is settable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edit_engram_set_frontmatter_refuses_a_key_outside_the_safe_set() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Identity", "content": "A rule." }),
+    )
+    .await
+    .unwrap();
+    let path = h.root.join("eng/identity.md");
+    let before = std::fs::read_to_string(&path).unwrap();
+
+    for key in [
+        "permalink",
+        "title",
+        "type",
+        "tags",
+        "recorded_at",
+        "generated",
+    ] {
+        let err = call(
+            peer,
+            "edit_engram",
+            json!({
+                "domain": "eng",
+                "identifier": "identity",
+                "operation": "set_frontmatter",
+                "key": key,
+                "value": "whatever",
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.contains(&format!("cannot set '{key}'")) && err.contains("status, valid_from"),
+            "unexpected error for {key}: {err}"
+        );
+    }
+    assert_eq!(
+        before,
+        std::fs::read_to_string(&path).unwrap(),
+        "the file must be unchanged after a refused edit"
+    );
+
+    // A missing key names the same set rather than guessing one.
+    let err = call(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng",
+            "identifier": "identity",
+            "operation": "set_frontmatter",
+            "value": "stable",
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("set_frontmatter requires key"), "{err}");
+}
+
+/// A date key goes through the temporal write contract, so a timestamp is
+/// rejected with the standard message and a sentinel bound is dropped rather
+/// than written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edit_engram_set_frontmatter_enforces_the_date_contract() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Dated", "content": "A rule." }),
+    )
+    .await
+    .unwrap();
+    let path = h.root.join("eng/dated.md");
+    let before = std::fs::read_to_string(&path).unwrap();
+
+    let err = call(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng",
+            "identifier": "dated",
+            "operation": "set_frontmatter",
+            "key": "valid_to",
+            "value": "2026-07-15T10:30:00Z",
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.contains(
+            "valid_to must be a plain ISO date (YYYY-MM-DD), got '2026-07-15T10:30:00Z'; temporal fields are day-granular"
+        ),
+        "unexpected error: {err}"
+    );
+    assert_eq!(
+        before,
+        std::fs::read_to_string(&path).unwrap(),
+        "the file must be unchanged after a rejected edit"
+    );
+
+    // A sentinel far-future bound is dropped, matching write_engram: absence is
+    // how open-ended validity is expressed.
+    call(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng",
+            "identifier": "dated",
+            "operation": "set_frontmatter",
+            "key": "valid_to",
+            "value": "9999-12-31",
+        }),
+    )
+    .await
+    .unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(!text.contains("valid_to"), "{text}");
+    assert!(!text.contains("9999"), "{text}");
+}
+
+/// Setting stale_after on a file that still carries the legacy `review_after`
+/// spelling migrates that one line in place rather than leaving two bounds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edit_engram_set_frontmatter_migrates_a_legacy_review_after() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    let path = plant(
+        &h,
+        "eng",
+        "reviewed",
+        "status: current\nreview_after: 2026-08-01\n",
+    )
+    .await;
+
+    call(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng",
+            "identifier": "reviewed",
+            "operation": "set_frontmatter",
+            "key": "stale_after",
+            "value": "2027-01-15",
+        }),
+    )
+    .await
+    .unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("stale_after: 2027-01-15"), "{text}");
+    assert!(
+        !text.contains("review_after"),
+        "the legacy line must be migrated, not duplicated: {text}"
+    );
+
+    // Clearing the bound removes it whichever spelling the file used.
+    call(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng",
+            "identifier": "reviewed",
+            "operation": "set_frontmatter",
+            "key": "stale_after",
+        }),
+    )
+    .await
+    .unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(!text.contains("stale_after"), "{text}");
+}
+
+/// verified stamps an OKF `{ by, at }` entry that re-parses: with no value it
+/// names the caller, with a value it names the actor given, and a second stamp
+/// by the same actor refreshes the entry instead of adding a line.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edit_engram_set_frontmatter_stamps_a_verification() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Checked", "content": "A rule." }),
+    )
+    .await
+    .unwrap();
+    let path = h.root.join("eng/checked.md");
+
+    call(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng",
+            "identifier": "checked",
+            "operation": "set_frontmatter",
+            "key": "verified",
+        }),
+    )
+    .await
+    .unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("verified: { by: "), "{text}");
+    let out = call(
+        peer,
+        "read_engram",
+        json!({ "domain": "eng", "identifier": "checked" }),
+    )
+    .await
+    .unwrap();
+    let entries = out["frontmatter"]["verified"].as_array().unwrap().clone();
+    assert_eq!(entries.len(), 1, "{out}");
+    // With no value the verifier is the same resolved identity the write path
+    // records as the editor, and the instant is real.
+    assert_eq!(
+        entries[0]["by"], out["frontmatter"]["generated"]["by"],
+        "the stamp must carry the caller's own identity: {out}"
+    );
+    assert!(entries[0]["at"].as_str().unwrap().contains('T'), "{out}");
+
+    // A named actor is recorded as given, alongside the first.
+    call(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng",
+            "identifier": "checked",
+            "operation": "set_frontmatter",
+            "key": "verified",
+            "value": "human:jordi",
+        }),
+    )
+    .await
+    .unwrap();
+    let out = call(
+        peer,
+        "read_engram",
+        json!({ "domain": "eng", "identifier": "checked" }),
+    )
+    .await
+    .unwrap();
+    let entries = out["frontmatter"]["verified"].as_array().unwrap().clone();
+    assert_eq!(entries.len(), 2, "both actors are kept: {out}");
+    assert_eq!(entries[1]["by"], json!("human:jordi"), "{out}");
+
+    // The same actor again refreshes its own entry rather than appending one.
+    call(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng",
+            "identifier": "checked",
+            "operation": "set_frontmatter",
+            "key": "verified",
+            "value": "human:jordi",
+        }),
+    )
+    .await
+    .unwrap();
+    let out = call(
+        peer,
+        "read_engram",
+        json!({ "domain": "eng", "identifier": "checked" }),
+    )
+    .await
+    .unwrap();
+    let entries = out["frontmatter"]["verified"].as_array().unwrap().clone();
+    assert_eq!(entries.len(), 2, "{out}");
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(text.matches("verified:").count(), 1, "{text}");
+}
+
+/// salience is a number from 0 to 10 in the metadata: the range is validated,
+/// a non-numeric value is refused and the value lands as a YAML number.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edit_engram_set_frontmatter_validates_the_salience_range() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Salient", "content": "A rule." }),
+    )
+    .await
+    .unwrap();
+    let path = h.root.join("eng/salient.md");
+
+    for bad in ["high", "11", "-1"] {
+        let err = call(
+            peer,
+            "edit_engram",
+            json!({
+                "domain": "eng",
+                "identifier": "salient",
+                "operation": "set_frontmatter",
+                "key": "salience",
+                "value": bad,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.contains("salience must be a number from 0 to 10"),
+            "unexpected error for {bad}: {err}"
+        );
+    }
+
+    call(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng",
+            "identifier": "salient",
+            "operation": "set_frontmatter",
+            "key": "salience",
+            "value": "8",
+        }),
+    )
+    .await
+    .unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        text.contains("salience: 8"),
+        "salience must stay a number: {text}"
+    );
+    let out = call(
+        peer,
+        "read_engram",
+        json!({ "domain": "eng", "identifier": "salient" }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out["frontmatter"]["extra"]["salience"], json!(8), "{out}");
+
+    // Omitting the value clears it again.
+    call(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng",
+            "identifier": "salient",
+            "operation": "set_frontmatter",
+            "key": "salience",
+        }),
+    )
+    .await
+    .unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(!text.contains("salience"), "{text}");
+}
+
+/// The fix cell an evolve finding carries is a `key=value` pair, so a lifecycle
+/// fix is one call with that pair split across key and value, and the edit
+/// leaves a file that re-parses and an index that agrees with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edit_engram_set_frontmatter_round_trips_into_the_index() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Old Pipeline", "content": "How deploys used to run." }),
+    )
+    .await
+    .unwrap();
+
+    // "set_frontmatter status=superseded", the way a queue row states it.
+    let (key, value) = "status=superseded".split_once('=').unwrap();
+    call(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng",
+            "identifier": "old-pipeline",
+            "operation": "set_frontmatter",
+            "key": key,
+            "value": value,
+        }),
+    )
+    .await
+    .unwrap();
+
+    let text = std::fs::read_to_string(h.root.join("eng/old-pipeline.md")).unwrap();
+    let engram = crystalline_core::parse_engram(&text).unwrap();
+    assert_eq!(engram.frontmatter.status.as_deref(), Some("superseded"));
+    // The provenance block is refreshed like any other edit.
+    assert!(engram.frontmatter.generated.is_some(), "{text}");
+
+    // The index agrees: a status-filtered search finds it under the new value.
+    let out = call(
+        peer,
+        "search_engrams",
+        json!({ "domains": ["eng"], "status": "superseded" }),
+    )
+    .await
+    .unwrap();
+    let hits = out["hits"].as_array().unwrap();
+    assert_eq!(hits.len(), 1, "{out}");
+    assert_eq!(hits[0]["permalink"], json!("old-pipeline"), "{out}");
+}
+
 /// validate_engrams runs the temporal checks: a date field written straight to
 /// disk with a time-of-day component is reported as a T003 issue.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2138,7 +2736,7 @@ type AnnotationRow = (
     Option<bool>,
 );
 
-const EXPECTED_ANNOTATIONS: [AnnotationRow; 19] = [
+const EXPECTED_ANNOTATIONS: [AnnotationRow; 20] = [
     (
         "write_engram",
         "Capture engram",
@@ -2243,6 +2841,17 @@ const EXPECTED_ANNOTATIONS: [AnnotationRow; 19] = [
         None,
         Some(false),
     ),
+    // The one read tool that states idempotent explicitly: a sweep over an
+    // unchanged archive returns the same queue, which is what makes "re-run the
+    // same scope to confirm it shrank" a meaningful instruction.
+    (
+        "evolve_engrams",
+        "Evolve engrams",
+        Some(true),
+        None,
+        Some(true),
+        Some(false),
+    ),
     (
         "configure",
         "Configure Crystalline",
@@ -2294,7 +2903,7 @@ const EXPECTED_ANNOTATIONS: [AnnotationRow; 19] = [
 ];
 
 /// A GitHub-enabled server with no domains, built solely to inspect the tool
-/// surface and its annotations. GitHub on plus read-write makes all 19 tools
+/// surface and its annotations. GitHub on plus read-write makes all 20 tools
 /// visible through `get_tool`; read-only narrows it to the read tools plus
 /// `update_domain` and `origin_status`.
 async fn annotation_server(read_only: bool) -> McpServer {
@@ -2314,7 +2923,7 @@ async fn annotation_server(read_only: bool) -> McpServer {
 
 /// Every tool advertises exactly the title and the four annotation hints from
 /// the locked table, and never the annotation-level title (only the top-level
-/// `Tool.title`). GitHub is enabled and the engine read-write so all 19 tools
+/// `Tool.title`). GitHub is enabled and the engine read-write so all 20 tools
 /// are visible.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tool_annotations_match_the_locked_table() {
@@ -2894,9 +3503,9 @@ fn assert_conservative(schema: &Value, context: &str) {
     }
 }
 
-/// Every one of the 19 tools in `EXPECTED_ANNOTATIONS` advertises an input
+/// Every one of the 20 tools in `EXPECTED_ANNOTATIONS` advertises an input
 /// schema that passes the naive conservative-shape sweep, both on the
-/// read-write server where all 19 are visible and on the read-only one where
+/// read-write server where all 20 are visible and on the read-only one where
 /// only a subset resolves through `get_tool`. Also locks down the two
 /// type-less `serde_json::Value` params in this codebase to their documented
 /// object shape.
@@ -3105,4 +3714,193 @@ async fn edit_engram_migrates_a_legacy_timestamp_to_generated() {
     let engram = crystalline_core::parse_engram(&text).unwrap();
     let generated = engram.frontmatter.generated.unwrap();
     assert!(generated.at.unwrap().to_rfc3339().as_str() > "2026-01-01T00:00:00+00:00");
+}
+
+// --- evolve_engrams: name, gating and the encoded queue -----------------------
+
+/// The router advertises the sweep under exactly `EVOLVE_TOOL_NAME`.
+///
+/// The name is written three times - the `#[tool(name = ...)]` literal, the
+/// `dispatch_engine` guard and the CLI verb - and only the literal is invisible
+/// to the compiler. Asserting it from both directions (the constant resolves,
+/// and the tool carrying the sweep's title carries that name) is what turns a
+/// partial rename into a CI failure rather than a silently unrouted tool.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_router_advertises_exactly_the_evolve_tool_name_constant() {
+    use rmcp::ServerHandler;
+
+    let server = annotation_server(false).await;
+    assert!(
+        server
+            .get_tool(crystalline_service::EVOLVE_TOOL_NAME)
+            .is_some(),
+        "the router must advertise a tool named '{}'",
+        crystalline_service::EVOLVE_TOOL_NAME
+    );
+
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let tools = client
+        .peer()
+        .list_tools(Default::default())
+        .await
+        .unwrap()
+        .tools;
+    let titled: Vec<&str> = tools
+        .iter()
+        .filter(|t| t.title.as_deref() == Some("Evolve engrams"))
+        .map(|t| t.name.as_ref())
+        .collect();
+    assert_eq!(
+        titled,
+        vec![crystalline_service::EVOLVE_TOOL_NAME],
+        "exactly one tool is the sweep and its name is the constant"
+    );
+}
+
+/// `evolve_engrams` is hidden from a read-only surface - a queue whose every
+/// finding prescribes a mutation is noise where mutation is impossible - while
+/// its route stays registered, so a client that calls it by name still gets a
+/// real sweep rather than "tool not found". Hidden, never disabled: the same
+/// doctrine every other gated tool follows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn read_only_hides_evolve_but_still_routes_it_by_name() {
+    use rmcp::ServerHandler;
+
+    let ro = annotation_server(true).await;
+    assert!(
+        ro.get_tool(crystalline_service::EVOLVE_TOOL_NAME).is_none(),
+        "evolve_engrams must not resolve through get_tool read-only"
+    );
+
+    let h = Harness::new_read_only(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+    let names: Vec<String> = client
+        .peer()
+        .list_tools(Default::default())
+        .await
+        .unwrap()
+        .tools
+        .iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    assert!(
+        !names.contains(&crystalline_service::EVOLVE_TOOL_NAME.to_string()),
+        "evolve_engrams must be absent from a read-only tools/list: {names:?}"
+    );
+
+    // The call by name reaches the engine and answers for real.
+    let out = call(
+        peer,
+        crystalline_service::EVOLVE_TOOL_NAME,
+        json!({ "domains": ["eng"], "today": "2026-08-02" }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out["scope"]["today"], json!("2026-08-02"), "{out}");
+    assert!(out["queue"].is_array(), "{out}");
+    assert_eq!(
+        out["guidance"],
+        json!(crystalline_service::engine::EVOLVE_GUIDANCE),
+        "{out}"
+    );
+}
+
+/// The encoded queue is one TOON tabular block: a `queue[N]{...}:` header
+/// followed by exactly N single-line rows.
+///
+/// M3 could only assert the predicate over the JSON value, since `toon::render`
+/// is crate-private and no tool reached it yet; this asserts the bytes a client
+/// actually receives. The column order is alphabetical rather than the order
+/// the engine writes the keys in, because a `serde_json::Map` is a `BTreeMap`
+/// here: this repo bans the `preserve_order` dependency, so alphabetical is the
+/// contract every TOON table in the surface follows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn evolve_engrams_renders_the_queue_as_one_toon_table() {
+    let h = Harness::new_toon(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    // Two findings from two rules: a retirement with no named successor (V004)
+    // and a near-empty body (V106).
+    call_text(
+        peer,
+        "write_engram",
+        json!({
+            "domain": "eng",
+            "title": "Old Pipeline",
+            "content": "How deploys used to run.\n\nJenkins drove every release.\n\nThe tags triggered it.",
+            "status": "superseded",
+        }),
+    )
+    .await
+    .unwrap();
+    call_text(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Thin Note", "content": "One line." }),
+    )
+    .await
+    .unwrap();
+
+    let text = call_text(
+        peer,
+        crystalline_service::EVOLVE_TOOL_NAME,
+        json!({ "domains": ["eng"], "today": "2026-08-02", "limit": 100 }),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        !text.trim_start().starts_with('{'),
+        "TOON expected, got JSON: {text}"
+    );
+    let lines: Vec<&str> = text.lines().collect();
+    let header_at = lines
+        .iter()
+        .position(|l| l.trim_start().starts_with("queue["))
+        .unwrap_or_else(|| panic!("no tabular queue header: {text}"));
+    let header = lines[header_at].trim_start();
+
+    // The full alphabetical column list, verbatim: the order M6 documents.
+    let rows: usize = header
+        .trim_start_matches("queue[")
+        .split(']')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        rows >= 2,
+        "fixture must plant at least two findings: {text}"
+    );
+    assert_eq!(
+        header,
+        format!(
+            "queue[{rows}]{{class,domain,evidence,finding,fix,line,n,permalink,priority,rule,title}}:"
+        ),
+        "the queue header must be one alphabetical column list: {text}"
+    );
+
+    // Exactly `rows` row lines follow, each a single indented comma-separated
+    // record rather than a nested `key: value` block.
+    for i in 1..=rows {
+        let row = lines
+            .get(header_at + i)
+            .unwrap_or_else(|| panic!("row {i} missing: {text}"));
+        assert!(
+            row.starts_with("  ") && !row.trim_start().contains(": "),
+            "row {i} is not a flat table row: {row}"
+        );
+    }
+    let after = lines.get(header_at + rows + 1).copied().unwrap_or("");
+    assert!(
+        !after.starts_with("  ") || after.trim_start().contains(": "),
+        "the table must end after {rows} rows, got another row: {after}"
+    );
+
+    // The legend and the guidance ride the same response.
+    assert!(text.contains("actions["), "{text}");
+    assert!(text.contains("guidance:"), "{text}");
 }

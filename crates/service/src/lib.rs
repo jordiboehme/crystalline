@@ -26,6 +26,15 @@ pub mod temp_store;
 mod tool_schema;
 mod toon;
 
+/// The name the consolidation sweep is advertised and dispatched under.
+///
+/// The router literal in [`mcp`], the `dispatch_engine` arm behind the ctl
+/// `tool` command and the CLI's `evolve` verb all resolve through this one
+/// constant, and a test in `crates/service/tests/mcp_tools.rs` asserts the
+/// router advertises exactly it. A rename that misses the `#[tool(name = ...)]`
+/// literal therefore fails CI instead of silently leaving the tool unrouted.
+pub const EVOLVE_TOOL_NAME: &str = "evolve_engrams";
+
 pub use client::{
     configure, ctl_if_running, ctl_required, domain_export, domain_import, origin_add,
     origin_discard, origin_resolve, origin_share, origin_status, origin_update, run_mcp, run_tool,

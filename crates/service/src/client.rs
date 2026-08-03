@@ -1233,6 +1233,13 @@ pub(crate) async fn dispatch_engine(
                 .vocabulary(&decode::<VocabularyParams>(args)?)
                 .await?
         }
+        // Matched through the constant rather than a literal so the CLI verb,
+        // this arm and the router name can never drift apart.
+        t if t == crate::EVOLVE_TOOL_NAME => {
+            engine
+                .evolve_engrams(&decode::<EvolveParams>(args)?)
+                .await?
+        }
         other => anyhow::bail!("unknown tool '{other}'"),
     };
     Ok(v)

@@ -7,10 +7,10 @@ use chrono::{DateTime, FixedOffset};
 use common::{fixtures_dir, read};
 use crystalline_core::emit::{
     append_body, insert_after_section, insert_before_section, prepend_body,
-    remove_frontmatter_field, replace_section, set_frontmatter_field, set_stale_after,
-    touch_generated,
+    remove_frontmatter_field, replace_section, set_frontmatter_field, set_frontmatter_number,
+    set_stale_after, set_verified, touch_generated,
 };
-use crystalline_core::parse_engram;
+use crystalline_core::{Verified, parse_engram};
 
 fn nested_headings() -> String {
     read(&fixtures_dir().join("canonical/nested-headings.md"))
@@ -228,6 +228,98 @@ fn remove_frontmatter_field_without_a_block_is_a_noop() {
     let source = "# Just a body\n\nNo frontmatter here at all.\n";
     let out = remove_frontmatter_field(source, "valid_to");
     assert_eq!(out, source);
+}
+
+#[test]
+fn set_frontmatter_number_writes_a_bare_yaml_number() {
+    let source = read(&fixtures_dir().join("canonical/minimal-okf.md"));
+    let out = set_frontmatter_number(&source, "salience", 7.0);
+    // A whole value carries no fractional part and no quotes, so the index
+    // reads it as a number rather than a string.
+    assert!(out.contains("salience: 7"), "{out}");
+    let e = parse_engram(&out).unwrap();
+    assert_eq!(
+        e.frontmatter.extra.get("salience"),
+        Some(&crystalline_core::YamlValue::Int(7))
+    );
+
+    // Replacing keeps one line, and a fractional value survives as a float.
+    let out = set_frontmatter_number(&out, "salience", 7.5);
+    assert_eq!(out.matches("salience:").count(), 1, "{out}");
+    let e = parse_engram(&out).unwrap();
+    assert_eq!(
+        e.frontmatter.extra.get("salience"),
+        Some(&crystalline_core::YamlValue::Float(7.5))
+    );
+}
+
+fn verification(by: &str, at: &str) -> Verified {
+    Verified {
+        by: by.to_string(),
+        at: DateTime::parse_from_rfc3339(at).ok(),
+    }
+}
+
+#[test]
+fn set_verified_replaces_a_single_entry_in_place() {
+    let source = "---\ntype: engram\nverified: { by: old/1, at: 2025-01-01T00:00:00+00:00 }\nstatus: stable\n---\n\nbody\n";
+    let out = set_verified(
+        source,
+        &[verification("human:jordi", "2026-08-02T09:00:00+00:00")],
+    );
+    assert_eq!(out.matches("verified:").count(), 1, "{out}");
+    // The following key keeps its place, so only the one line moved.
+    assert!(out.contains("\nstatus: stable\n"), "{out}");
+    let e = parse_engram(&out).unwrap();
+    assert_eq!(e.frontmatter.verified.len(), 1);
+    assert_eq!(e.frontmatter.verified[0].by, "human:jordi");
+}
+
+#[test]
+fn set_verified_replaces_a_block_sequence_without_orphaning_items() {
+    // The multi-entry form is a block sequence, so the old items have to go
+    // with the key line or the frontmatter stops parsing.
+    let source = "---\ntype: engram\nverified:\n- { by: a/1, at: 2025-01-01T00:00:00+00:00 }\n- { by: b/2, at: 2025-02-01T00:00:00+00:00 }\nstatus: stable\n---\n\nbody\n";
+    let out = set_verified(
+        source,
+        &[
+            verification("a/1", "2026-01-01T00:00:00+00:00"),
+            verification("c/3", "2026-02-01T00:00:00+00:00"),
+        ],
+    );
+    assert!(!out.contains("b/2"), "the old entries must be gone: {out}");
+    assert!(out.contains("\nstatus: stable\n"), "{out}");
+    let e = parse_engram(&out).unwrap();
+    assert_eq!(e.frontmatter.verified.len(), 2);
+    assert_eq!(e.frontmatter.verified[1].by, "c/3");
+    assert_eq!(
+        e.frontmatter.latest_verified().unwrap().at.to_rfc3339(),
+        "2026-02-01T00:00:00+00:00"
+    );
+}
+
+#[test]
+fn set_verified_appends_and_leaves_a_legacy_last_verified_alone() {
+    // `last_verified` is a bare date with no actor, so it is left exactly where
+    // it is rather than being overwritten by a record it cannot express.
+    let source = read(&fixtures_dir().join("canonical/full-frontmatter.md"));
+    let out = set_verified(
+        &source,
+        &[verification("human:jordi", "2026-08-02T09:00:00+00:00")],
+    );
+    assert!(out.contains("last_verified: 2026-05-01"), "{out}");
+    let e = parse_engram(&out).unwrap();
+    assert_eq!(e.frontmatter.verified.len(), 1);
+    // The newer typed entry is what recency reads.
+    let latest = e.frontmatter.latest_verified().unwrap();
+    assert_eq!(latest.by, Some("human:jordi"));
+    assert_eq!(latest.at.to_rfc3339(), "2026-08-02T09:00:00+00:00");
+}
+
+#[test]
+fn set_verified_with_no_entries_is_a_noop() {
+    let source = read(&fixtures_dir().join("canonical/minimal-okf.md"));
+    assert_eq!(set_verified(&source, &[]), source);
 }
 
 #[test]
