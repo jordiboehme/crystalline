@@ -418,7 +418,9 @@ fn read_only_daemon_reports_hides_and_refuses() {
     assert_eq!(status["read_only"], json!(true), "status: {status}");
 
     // tools/list hides the four content-mutating tools and keeps the ten
-    // reads, `skills` among them: reading a skill is a read.
+    // reads, `skills` among them: reading a skill is a read. `evolve_engrams`
+    // is hidden too, on its own gate: it reads, but every finding it returns
+    // prescribes a mutation.
     let names = c1.list_tools();
     assert_eq!(names.len(), 10, "read-only exposes 10 tools: {names:?}");
     for hidden in [
@@ -426,6 +428,7 @@ fn read_only_daemon_reports_hides_and_refuses() {
         "edit_engram",
         "move_engram",
         "delete_engram",
+        "evolve_engrams",
     ] {
         assert!(
             !names.contains(&hidden.to_string()),
@@ -929,10 +932,11 @@ fn http_smoke_initialize_list_and_search() {
     // is off by default, so the five collaboration tools stay hidden, but
     // `add_domain` is write-gated not collab-gated, so it is visible (see
     // crystalline-service's mcp_collab test suite for the full gating matrix).
-    assert_eq!(tools.len(), 16, "16 tools over HTTP");
+    assert_eq!(tools.len(), 17, "17 tools over HTTP");
     let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
     assert!(names.contains(&"configure"), "{names:?}");
     assert!(names.contains(&"add_domain"), "{names:?}");
+    assert!(names.contains(&"evolve_engrams"), "{names:?}");
 
     // one search
     let search = parse_jsonrpc(
@@ -1417,4 +1421,82 @@ fn a_responsive_daemon_survives_doctor_fix() {
         Some(before),
         "the same daemon still owns the index"
     );
+}
+
+/// End to end: `crystalline evolve` against a running daemon routes over the
+/// ctl `tool` command like every other data verb, so `--json` hands back the
+/// engine's structured queue rather than a TOON string, and the human view
+/// numbers each finding, marks its class and closes with the fixed guidance.
+///
+/// The finding is planted through the CLI itself: flipping the seed engram to
+/// `superseded` without naming a successor is exactly the half-finished
+/// retirement `V004` exists to catch, and the edit goes through the daemon's
+/// engine so the index agrees before the sweep runs.
+#[test]
+fn evolve_reports_a_planted_finding_over_the_daemon() {
+    let env = Env::new("evolve");
+    env.setup_domain("eng");
+
+    let mut c1 = Mcp::spawn(&env);
+    c1.initialize();
+    env.wait_ready();
+
+    let (ok, out) = env.run(&[
+        "edit",
+        "seed",
+        "eng",
+        "set_frontmatter",
+        "--key",
+        "status",
+        "--value",
+        "superseded",
+        "--json",
+    ]);
+    assert!(ok, "edit set_frontmatter: {out}");
+
+    // `--json` keeps the raw engine value.
+    let (ok, out) = env.run(&[
+        "--json",
+        "evolve",
+        "--domain",
+        "eng",
+        "--today",
+        "2026-08-02",
+        "--limit",
+        "50",
+    ]);
+    assert!(ok, "evolve --json: {out}");
+    let value: Value = serde_json::from_str(out.trim())
+        .expect("evolve --json returns structured JSON even over the daemon");
+    assert_eq!(value["scope"]["today"], json!("2026-08-02"), "{value}");
+    let rules: Vec<&str> = value["queue"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|row| row["rule"].as_str())
+        .collect();
+    assert!(
+        rules.contains(&"V004"),
+        "the planted retirement without a successor must be found: {value}"
+    );
+
+    // The human view: a numbered block with the class marked, the address, the
+    // per-rule legend and the guidance the constant carries.
+    let (ok, out) = env.run(&["evolve", "--domain", "eng", "--today", "2026-08-02"]);
+    assert!(ok, "evolve: {out}");
+    assert!(out.contains("Sweep of eng as of 2026-08-02"), "{out}");
+    assert!(out.contains("V004"), "{out}");
+    assert!(
+        out.contains("JUDGMENT") || out.contains("MECHANICAL"),
+        "the class must be marked on every finding: {out}"
+    );
+    assert!(out.contains("crystalline://eng/seed"), "{out}");
+    assert!(out.contains("Actions:"), "{out}");
+    assert!(
+        out.contains("This queue changes nothing by itself."),
+        "the fixed guidance must close the human view: {out}"
+    );
+
+    drop(c1);
+    let _ = env.run(&["ctl", "shutdown"]);
 }

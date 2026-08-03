@@ -231,6 +231,7 @@ async fn list_tools_exposes_the_core_tools_plus_configure_and_add_domain() {
         "validate_engrams",
         "infer_schema",
         "vocabulary",
+        "evolve_engrams",
         "configure",
         "add_domain",
         "skills",
@@ -248,7 +249,7 @@ async fn list_tools_exposes_the_core_tools_plus_configure_and_add_domain() {
             "{hidden} must be hidden while github.enabled is off: {names:?}"
         );
     }
-    assert_eq!(names.len(), 16, "exactly 16 tools: {names:?}");
+    assert_eq!(names.len(), 17, "exactly 17 tools: {names:?}");
 }
 
 /// The salience prior (Tasks 1-4) is invisible to an agent unless the tool
@@ -439,13 +440,16 @@ async fn read_only_hides_the_write_gated_tools() {
     }
     // Read-only and GitHub collaboration off together hide all five
     // collaboration tools too (the full gating matrix lives in
-    // tests/mcp_collab.rs).
+    // tests/mcp_collab.rs). `evolve_engrams` is hidden on its own gate: it is a
+    // read, but every finding it returns prescribes a mutation, so the queue is
+    // noise where mutation is impossible.
     for hidden in [
         "configure",
         "share_changes",
         "update_domain",
         "origin_status",
         "resolve_conflict",
+        "evolve_engrams",
     ] {
         assert!(
             !names.contains(&hidden.to_string()),
@@ -2732,7 +2736,7 @@ type AnnotationRow = (
     Option<bool>,
 );
 
-const EXPECTED_ANNOTATIONS: [AnnotationRow; 19] = [
+const EXPECTED_ANNOTATIONS: [AnnotationRow; 20] = [
     (
         "write_engram",
         "Capture engram",
@@ -2837,6 +2841,17 @@ const EXPECTED_ANNOTATIONS: [AnnotationRow; 19] = [
         None,
         Some(false),
     ),
+    // The one read tool that states idempotent explicitly: a sweep over an
+    // unchanged archive returns the same queue, which is what makes "re-run the
+    // same scope to confirm it shrank" a meaningful instruction.
+    (
+        "evolve_engrams",
+        "Evolve engrams",
+        Some(true),
+        None,
+        Some(true),
+        Some(false),
+    ),
     (
         "configure",
         "Configure Crystalline",
@@ -2888,7 +2903,7 @@ const EXPECTED_ANNOTATIONS: [AnnotationRow; 19] = [
 ];
 
 /// A GitHub-enabled server with no domains, built solely to inspect the tool
-/// surface and its annotations. GitHub on plus read-write makes all 19 tools
+/// surface and its annotations. GitHub on plus read-write makes all 20 tools
 /// visible through `get_tool`; read-only narrows it to the read tools plus
 /// `update_domain` and `origin_status`.
 async fn annotation_server(read_only: bool) -> McpServer {
@@ -2908,7 +2923,7 @@ async fn annotation_server(read_only: bool) -> McpServer {
 
 /// Every tool advertises exactly the title and the four annotation hints from
 /// the locked table, and never the annotation-level title (only the top-level
-/// `Tool.title`). GitHub is enabled and the engine read-write so all 19 tools
+/// `Tool.title`). GitHub is enabled and the engine read-write so all 20 tools
 /// are visible.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tool_annotations_match_the_locked_table() {
@@ -3488,9 +3503,9 @@ fn assert_conservative(schema: &Value, context: &str) {
     }
 }
 
-/// Every one of the 19 tools in `EXPECTED_ANNOTATIONS` advertises an input
+/// Every one of the 20 tools in `EXPECTED_ANNOTATIONS` advertises an input
 /// schema that passes the naive conservative-shape sweep, both on the
-/// read-write server where all 19 are visible and on the read-only one where
+/// read-write server where all 20 are visible and on the read-only one where
 /// only a subset resolves through `get_tool`. Also locks down the two
 /// type-less `serde_json::Value` params in this codebase to their documented
 /// object shape.
@@ -3699,4 +3714,193 @@ async fn edit_engram_migrates_a_legacy_timestamp_to_generated() {
     let engram = crystalline_core::parse_engram(&text).unwrap();
     let generated = engram.frontmatter.generated.unwrap();
     assert!(generated.at.unwrap().to_rfc3339().as_str() > "2026-01-01T00:00:00+00:00");
+}
+
+// --- evolve_engrams: name, gating and the encoded queue -----------------------
+
+/// The router advertises the sweep under exactly `EVOLVE_TOOL_NAME`.
+///
+/// The name is written three times - the `#[tool(name = ...)]` literal, the
+/// `dispatch_engine` guard and the CLI verb - and only the literal is invisible
+/// to the compiler. Asserting it from both directions (the constant resolves,
+/// and the tool carrying the sweep's title carries that name) is what turns a
+/// partial rename into a CI failure rather than a silently unrouted tool.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_router_advertises_exactly_the_evolve_tool_name_constant() {
+    use rmcp::ServerHandler;
+
+    let server = annotation_server(false).await;
+    assert!(
+        server
+            .get_tool(crystalline_service::EVOLVE_TOOL_NAME)
+            .is_some(),
+        "the router must advertise a tool named '{}'",
+        crystalline_service::EVOLVE_TOOL_NAME
+    );
+
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let tools = client
+        .peer()
+        .list_tools(Default::default())
+        .await
+        .unwrap()
+        .tools;
+    let titled: Vec<&str> = tools
+        .iter()
+        .filter(|t| t.title.as_deref() == Some("Evolve engrams"))
+        .map(|t| t.name.as_ref())
+        .collect();
+    assert_eq!(
+        titled,
+        vec![crystalline_service::EVOLVE_TOOL_NAME],
+        "exactly one tool is the sweep and its name is the constant"
+    );
+}
+
+/// `evolve_engrams` is hidden from a read-only surface - a queue whose every
+/// finding prescribes a mutation is noise where mutation is impossible - while
+/// its route stays registered, so a client that calls it by name still gets a
+/// real sweep rather than "tool not found". Hidden, never disabled: the same
+/// doctrine every other gated tool follows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn read_only_hides_evolve_but_still_routes_it_by_name() {
+    use rmcp::ServerHandler;
+
+    let ro = annotation_server(true).await;
+    assert!(
+        ro.get_tool(crystalline_service::EVOLVE_TOOL_NAME).is_none(),
+        "evolve_engrams must not resolve through get_tool read-only"
+    );
+
+    let h = Harness::new_read_only(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+    let names: Vec<String> = client
+        .peer()
+        .list_tools(Default::default())
+        .await
+        .unwrap()
+        .tools
+        .iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    assert!(
+        !names.contains(&crystalline_service::EVOLVE_TOOL_NAME.to_string()),
+        "evolve_engrams must be absent from a read-only tools/list: {names:?}"
+    );
+
+    // The call by name reaches the engine and answers for real.
+    let out = call(
+        peer,
+        crystalline_service::EVOLVE_TOOL_NAME,
+        json!({ "domains": ["eng"], "today": "2026-08-02" }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out["scope"]["today"], json!("2026-08-02"), "{out}");
+    assert!(out["queue"].is_array(), "{out}");
+    assert_eq!(
+        out["guidance"],
+        json!(crystalline_service::engine::EVOLVE_GUIDANCE),
+        "{out}"
+    );
+}
+
+/// The encoded queue is one TOON tabular block: a `queue[N]{...}:` header
+/// followed by exactly N single-line rows.
+///
+/// M3 could only assert the predicate over the JSON value, since `toon::render`
+/// is crate-private and no tool reached it yet; this asserts the bytes a client
+/// actually receives. The column order is alphabetical rather than the order
+/// the engine writes the keys in, because a `serde_json::Map` is a `BTreeMap`
+/// here: this repo bans the `preserve_order` dependency, so alphabetical is the
+/// contract every TOON table in the surface follows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn evolve_engrams_renders_the_queue_as_one_toon_table() {
+    let h = Harness::new_toon(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    // Two findings from two rules: a retirement with no named successor (V004)
+    // and a near-empty body (V106).
+    call_text(
+        peer,
+        "write_engram",
+        json!({
+            "domain": "eng",
+            "title": "Old Pipeline",
+            "content": "How deploys used to run.\n\nJenkins drove every release.\n\nThe tags triggered it.",
+            "status": "superseded",
+        }),
+    )
+    .await
+    .unwrap();
+    call_text(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Thin Note", "content": "One line." }),
+    )
+    .await
+    .unwrap();
+
+    let text = call_text(
+        peer,
+        crystalline_service::EVOLVE_TOOL_NAME,
+        json!({ "domains": ["eng"], "today": "2026-08-02", "limit": 100 }),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        !text.trim_start().starts_with('{'),
+        "TOON expected, got JSON: {text}"
+    );
+    let lines: Vec<&str> = text.lines().collect();
+    let header_at = lines
+        .iter()
+        .position(|l| l.trim_start().starts_with("queue["))
+        .unwrap_or_else(|| panic!("no tabular queue header: {text}"));
+    let header = lines[header_at].trim_start();
+
+    // The full alphabetical column list, verbatim: the order M6 documents.
+    let rows: usize = header
+        .trim_start_matches("queue[")
+        .split(']')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        rows >= 2,
+        "fixture must plant at least two findings: {text}"
+    );
+    assert_eq!(
+        header,
+        format!(
+            "queue[{rows}]{{class,domain,evidence,finding,fix,line,n,permalink,priority,rule,title}}:"
+        ),
+        "the queue header must be one alphabetical column list: {text}"
+    );
+
+    // Exactly `rows` row lines follow, each a single indented comma-separated
+    // record rather than a nested `key: value` block.
+    for i in 1..=rows {
+        let row = lines
+            .get(header_at + i)
+            .unwrap_or_else(|| panic!("row {i} missing: {text}"));
+        assert!(
+            row.starts_with("  ") && !row.trim_start().contains(": "),
+            "row {i} is not a flat table row: {row}"
+        );
+    }
+    let after = lines.get(header_at + rows + 1).copied().unwrap_or("");
+    assert!(
+        !after.starts_with("  ") || after.trim_start().contains(": "),
+        "the table must end after {rows} rows, got another row: {after}"
+    );
+
+    // The legend and the guidance ride the same response.
+    assert!(text.contains("actions["), "{text}");
+    assert!(text.contains("guidance:"), "{text}");
 }

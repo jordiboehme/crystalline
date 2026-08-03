@@ -189,6 +189,10 @@ cat >"$manifest_path" <<JSON
       "description": "List the tags, observation categories and relation types already in use, with counts, so existing terms are reused."
     },
     {
+      "name": "evolve_engrams",
+      "description": "Sweep a domain for the maintenance the knowledge needs and return a ranked read-only work queue: lifecycle debt, structural gaps and near-duplicates, each with its evidence and the exact next action."
+    },
+    {
       "name": "configure",
       "description": "View and adjust Crystalline's settings, like connecting a GitHub account for team collaboration."
     },
