@@ -10,6 +10,16 @@
 //! - Temporal columns are TEXT ISO strings and `metadata` is JSONB, so the
 //!   canonical current filter and every lexical comparison are byte-identical to
 //!   Turso and the shared parity suite ports directly.
+//! - Every text sort key carries an explicit `COLLATE "C"`, and no `ORDER BY`
+//!   here is positional. Turso sorts TEXT byte-wise; a Postgres database created
+//!   under a locale collation does not (`Beta.md` sorts after `alpha.md`, and
+//!   `multi_word` before `multi-word`), so an unpinned text `ORDER BY` returns
+//!   the same rows in a different order on the two backends - and several
+//!   callers cap the result, so a different order is a different answer. A
+//!   positional key cannot carry a collation, so a compound select is wrapped in
+//!   a subselect and its keys named. `every_text_order_by_is_collation_pinned`
+//!   in this module's tests enforces both halves against the source of this file
+//!   and of [`search`].
 //! - Full-text search is the same LIKE-candidate scan plus the identical Rust
 //!   weighted scorer Turso uses (see [`search`]), not tsvector, so hybrid
 //!   ranking and every search test match across backends. `store_info().fts_mode`
@@ -1066,12 +1076,15 @@ impl Store for PostgresStore {
     }
 
     async fn find_engram(&self, domain: &str, key: &str) -> Result<Option<EngramDescriptor>> {
+        // A permalink hit wins over a title hit; among title hits the lowest path
+        // wins, and `LIMIT 1` makes that tie-break the whole answer, so the path
+        // key is pinned to `COLLATE "C"` to match Turso's byte order.
         let mut conn = self.acquire().await?;
         let row = sqlx::query(
             "SELECT e.id, e.domain_id, d.name, e.path, e.permalink, e.title, e.engram_type, e.status \
              FROM engram e JOIN domain d ON d.id=e.domain_id \
              WHERE d.name=$1 AND (e.permalink=$2 OR lower(e.title)=lower($2)) \
-             ORDER BY CASE WHEN e.permalink=$2 THEN 0 ELSE 1 END, e.path LIMIT 1",
+             ORDER BY CASE WHEN e.permalink=$2 THEN 0 ELSE 1 END, e.path COLLATE \"C\" LIMIT 1",
         )
         .bind(domain)
         .bind(key)
@@ -1087,7 +1100,8 @@ impl Store for PostgresStore {
             "SELECT e.id, e.domain_id, d.name, e.path, e.permalink, e.title, e.engram_type, e.status \
              FROM engram e JOIN domain d ON d.id=e.domain_id \
              WHERE e.permalink=$1 OR lower(e.title)=lower($1) \
-             ORDER BY CASE WHEN e.permalink=$1 THEN 0 ELSE 1 END, d.name, e.path",
+             ORDER BY CASE WHEN e.permalink=$1 THEN 0 ELSE 1 END, \
+                      d.name COLLATE \"C\", e.path COLLATE \"C\"",
         )
         .bind(key)
         .fetch_all(conn.as_mut())
@@ -1116,7 +1130,8 @@ impl Store for PostgresStore {
         }
         let sql = format!(
             "SELECT e.id, e.domain_id, d.name, e.path, e.permalink, e.title, e.engram_type, e.status \
-             FROM engram e JOIN domain d ON d.id=e.domain_id WHERE {} ORDER BY e.path",
+             FROM engram e JOIN domain d ON d.id=e.domain_id WHERE {} \
+             ORDER BY e.path COLLATE \"C\"",
             clauses.join(" AND ")
         );
         let mut conn = self.acquire().await?;
@@ -1143,7 +1158,7 @@ impl Store for PostgresStore {
                  OR EXISTS (SELECT 1 FROM observation_tag ot JOIN tag t ON t.id=ot.tag_id \
                             JOIN observation o ON o.id=ot.observation_id \
                             WHERE o.engram_id=e.id AND t.name=$1)){where_domain} \
-             ORDER BY d.name, e.path"
+             ORDER BY d.name COLLATE \"C\", e.path COLLATE \"C\""
         );
         let mut conn = self.acquire().await?;
         let rows = query_all(conn.as_mut(), &sql, params).await?;
@@ -1183,8 +1198,14 @@ impl Store for PostgresStore {
 
     async fn tag_aliases(&self, domains: Option<&[String]>) -> Result<Vec<(String, String)>> {
         // SELECT DISTINCT so an all-domain sweep unions duplicate pairs across
-        // domains into one; the positional ORDER BY makes the binding order
-        // deterministic for expansion and the vocabulary surface.
+        // domains into one; the ORDER BY makes the binding order deterministic
+        // for expansion and the vocabulary surface.
+        //
+        // The distinct select is wrapped so both sort keys can carry an explicit
+        // `COLLATE "C"`: Postgres refuses an ORDER BY expression that is not in a
+        // DISTINCT select list, and a positional key cannot carry a collation at
+        // all. Turso keeps the flat positional form because BINARY is already its
+        // default.
         let mut params: Vec<Param> = Vec::new();
         let where_domain = match domains {
             Some(names) if !names.is_empty() => {
@@ -1204,7 +1225,9 @@ impl Store for PostgresStore {
             _ => String::new(),
         };
         let sql = format!(
-            "SELECT DISTINCT ta.alias, ta.canonical FROM tag_alias ta{where_domain} ORDER BY 1, 2"
+            "SELECT a.alias, a.canonical FROM ( \
+               SELECT DISTINCT ta.alias, ta.canonical FROM tag_alias ta{where_domain} \
+             ) a ORDER BY a.alias COLLATE \"C\", a.canonical COLLATE \"C\""
         );
         let mut conn = self.acquire().await?;
         let rows = query_all(conn.as_mut(), &sql, params).await?;
@@ -1230,22 +1253,32 @@ impl Store for PostgresStore {
         // The kind discriminator is cast to `int8`: a bare Postgres integer
         // literal is `int4`, which `cell_i64` (`try_get::<Option<i64>>`) fails to
         // decode, collapsing every ref to kind 0 (relation). The cast matches
-        // `outbound_refs`. Ordered by source domain then path (positional
-        // `1, 3`) so `read_engram`'s capped sample is deterministic across both
-        // backends.
+        // `outbound_refs`. Ordered by source domain then path so
+        // `read_engram`'s capped sample is deterministic across both backends.
+        //
+        // The compound select is wrapped so both text sort keys can carry an
+        // explicit `COLLATE "C"`, which a positional key cannot: `read_engram`
+        // shows only the first five of these, so a locale collation would not
+        // just reorder the list, it would hand the user a different five than
+        // Turso does. Turso keeps the flat positional form because BINARY is
+        // already its default.
         let rows = sqlx::query(
-            "SELECT d.name, r.domain_id, e.path, r.to_target, 0::int8 AS kind \
-             FROM relation r JOIN engram e ON e.id=r.engram_id JOIN domain d ON d.id=e.domain_id \
-             WHERE r.to_id=$1 \
-                OR (r.to_id IS NULL AND r.domain_id=$2 AND r.to_domain IS NULL \
-                    AND (r.to_target=$3 OR lower(r.to_target)=lower($4))) \
-             UNION ALL \
-             SELECT d.name, l.domain_id, e.path, l.to_target, 1::int8 AS kind \
-             FROM link l JOIN engram e ON e.id=l.engram_id JOIN domain d ON d.id=e.domain_id \
-             WHERE l.to_id=$1 \
-                OR (l.to_id IS NULL AND l.domain_id=$2 AND l.to_domain IS NULL \
-                    AND (l.to_target=$3 OR lower(l.to_target)=lower($4))) \
-             ORDER BY 1, 3",
+            "SELECT i.name, i.domain_id, i.path, i.to_target, i.kind FROM ( \
+               SELECT d.name AS name, r.domain_id AS domain_id, e.path AS path, \
+                      r.to_target AS to_target, 0::int8 AS kind \
+               FROM relation r JOIN engram e ON e.id=r.engram_id \
+                    JOIN domain d ON d.id=e.domain_id \
+               WHERE r.to_id=$1 \
+                  OR (r.to_id IS NULL AND r.domain_id=$2 AND r.to_domain IS NULL \
+                      AND (r.to_target=$3 OR lower(r.to_target)=lower($4))) \
+               UNION ALL \
+               SELECT d.name, l.domain_id, e.path, l.to_target, 1::int8 \
+               FROM link l JOIN engram e ON e.id=l.engram_id \
+                    JOIN domain d ON d.id=e.domain_id \
+               WHERE l.to_id=$1 \
+                  OR (l.to_id IS NULL AND l.domain_id=$2 AND l.to_domain IS NULL \
+                      AND (l.to_target=$3 OR lower(l.to_target)=lower($4))) \
+             ) i ORDER BY i.name COLLATE \"C\", i.path COLLATE \"C\"",
         )
         .bind(engram_id.0)
         .bind(domain_id.0)
@@ -1418,11 +1451,15 @@ impl Store for PostgresStore {
             format!("WHERE {}", where_clauses.join(" AND "))
         };
         let limit = if filter.limit == 0 { 20 } else { filter.limit };
+        // Both sort keys are TEXT, and the `LIMIT` makes their order decide which
+        // rows come back at all, so both are pinned to `COLLATE "C"` to match
+        // Turso's byte order: engrams recorded on the same day are separated by
+        // the permalink tie-break alone.
         let sql = format!(
             "SELECT d.name, e.permalink, e.title, e.engram_type, e.status, e.recorded_at, \
              (SELECT string_agg(t.name, ',') FROM engram_tag et JOIN tag t ON t.id=et.tag_id WHERE et.engram_id=e.id) \
              FROM engram e JOIN domain d ON d.id=e.domain_id {where_sql} \
-             ORDER BY e.recorded_at DESC, e.permalink ASC LIMIT {limit}"
+             ORDER BY e.recorded_at COLLATE \"C\" DESC, e.permalink COLLATE \"C\" ASC LIMIT {limit}"
         );
         let mut conn = self.acquire().await?;
         let rows = query_all(conn.as_mut(), &sql, params).await?;
@@ -1982,5 +2019,141 @@ impl Store for PostgresStore {
         // snapshot recomputed mid-transaction must not survive it.
         self.invalidate_coverage();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// The text columns this backend can sort on. A sort key that names one of
+    /// these has to carry an explicit collation, because a Postgres database
+    /// created under a locale collation orders text differently from Turso's
+    /// byte order. Numeric and expression keys are unaffected and are not listed.
+    const TEXT_COLUMNS: &[&str] = &[
+        "acquired_at",
+        "alias",
+        "canonical",
+        "category",
+        "content",
+        "context",
+        "description",
+        "engram_type",
+        "heartbeat_at",
+        "holder_instance_id",
+        "holder_label",
+        "last_sync",
+        "model",
+        "name",
+        "path",
+        "permalink",
+        "recorded_at",
+        "rel_type",
+        "sha256",
+        "status",
+        "text_hash",
+        "timestamp",
+        "title",
+        "to_domain",
+        "to_target",
+        "valid_from",
+        "valid_to",
+    ];
+
+    /// One `ORDER BY` clause's sort keys, taken from the rest of the source line
+    /// (every clause in this backend is written as the tail of its line). The
+    /// trailing `LIMIT`/`OFFSET`, the closing string literal and the line
+    /// continuation are cut off first, then the keys are split on commas.
+    ///
+    /// The trailing trim also nibbles the escaped quotes off a final
+    /// `COLLATE \"C\"`, leaving `COLLATE \"C`. That is deliberate slack: the
+    /// caller only asks whether a key is collated, never for the collation's
+    /// name, and unpicking escaped from literal-terminating quotes here would
+    /// buy nothing.
+    fn sort_keys(tail: &str) -> Vec<String> {
+        let mut tail = tail.trim();
+        for cut in [" LIMIT ", " OFFSET "] {
+            if let Some(i) = tail.find(cut) {
+                tail = &tail[..i];
+            }
+        }
+        tail.trim_end_matches(['\\', ' ', ',', ')', ';', '"'])
+            .split(',')
+            .map(|k| {
+                k.trim()
+                    .trim_end_matches(" ASC")
+                    .trim_end_matches(" DESC")
+                    .trim()
+                    .to_string()
+            })
+            .filter(|k| !k.is_empty())
+            .collect()
+    }
+
+    /// Every `ORDER BY` in this backend names its sort keys, and every key that
+    /// is a text column carries `COLLATE "C"`.
+    ///
+    /// This is the convention the module doc states, checked against the source
+    /// rather than left to review: an unpinned text key silently returns the
+    /// same rows in a different order than Turso, and because `read_engram`,
+    /// `recent` and the filter-only search page all cap their results, a
+    /// different order is a different answer rather than a cosmetic difference.
+    /// A positional key is rejected outright because it cannot carry a collation
+    /// at all, so a compound select or a `SELECT DISTINCT` has to be wrapped in a
+    /// subselect and its keys named.
+    ///
+    /// Only bare column keys are classified; an expression key (a `CASE`, a
+    /// `count(*)`, a distance) is left alone, which is what every expression key
+    /// here needs. Comment lines are skipped so the prose about these queries can
+    /// quote them.
+    #[test]
+    fn every_text_order_by_is_collation_pinned() {
+        let sources = [
+            ("postgres/mod.rs", include_str!("mod.rs")),
+            ("postgres/search.rs", include_str!("search.rs")),
+        ];
+        for (file, src) in sources {
+            for (n, line) in src.lines().enumerate() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                let Some(pos) = line.find("ORDER BY ") else {
+                    continue;
+                };
+                for key in sort_keys(&line[pos + "ORDER BY ".len()..]) {
+                    assert!(
+                        !key.chars().all(|c| c.is_ascii_digit()),
+                        "{file}:{} orders by the positional key `{key}`, which cannot carry a \
+                         collation. Wrap the select and name the key instead.",
+                        n + 1
+                    );
+                    let column = key.rsplit('.').next().unwrap_or(&key);
+                    if TEXT_COLUMNS.contains(&column) {
+                        assert!(
+                            key.contains("COLLATE"),
+                            "{file}:{} orders by the text column `{key}` without a collation. \
+                             Pin it with COLLATE \"C\" so it matches Turso's byte order.",
+                            n + 1
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sort_keys_splits_a_clause_into_its_keys() {
+        assert_eq!(
+            sort_keys("e.recorded_at DESC, e.permalink ASC LIMIT {limit} OFFSET {offset}\""),
+            vec!["e.recorded_at".to_string(), "e.permalink".to_string()]
+        );
+        assert_eq!(
+            sort_keys(
+                "CASE WHEN e.permalink=$2 THEN 0 ELSE 1 END, e.path COLLATE \\\"C\\\" LIMIT 1\","
+            ),
+            vec![
+                "CASE WHEN e.permalink=$2 THEN 0 ELSE 1 END".to_string(),
+                "e.path COLLATE \\\"C".to_string(),
+            ]
+        );
+        assert_eq!(sort_keys("1, 2\""), vec!["1".to_string(), "2".to_string()]);
     }
 }

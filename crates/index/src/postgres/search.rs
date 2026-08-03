@@ -114,9 +114,13 @@ async fn attach_tags(conn: &mut PgConnection, hits: &mut [(i64, SearchHit)]) -> 
         .map(|(id, _)| id.to_string())
         .collect::<Vec<_>>()
         .join(",");
+    // The tag name is a text sort key, so it is pinned to `COLLATE "C"`: without
+    // it a locale collation would order `multi_word` before `multi-word` where
+    // Turso's byte order puts the hyphen first, and the two backends would hand
+    // the same hit a differently ordered tag list.
     let sql = format!(
         "SELECT et.engram_id, t.name FROM engram_tag et JOIN tag t ON t.id=et.tag_id \
-         WHERE et.engram_id IN ({ids}) ORDER BY et.engram_id, t.name"
+         WHERE et.engram_id IN ({ids}) ORDER BY et.engram_id, t.name COLLATE \"C\""
     );
     let rows = query_all(conn, &sql, vec![]).await?;
     let mut by_id: std::collections::HashMap<i64, Vec<String>> = std::collections::HashMap::new();
@@ -272,10 +276,13 @@ async fn filter_only(
     let offset = (page - 1) * limit;
     // This one sorts, but with a `LIMIT` and no `GROUP BY` Postgres runs a
     // bounded top-N heapsort, so the wide projection costs one page of bodies
-    // rather than the whole match set.
+    // rather than the whole match set. Both sort keys are TEXT and pinned to
+    // `COLLATE "C"` to match Turso's byte order: the sort decides which rows land
+    // on the requested page, so an unpinned key would page differently here.
     let sql = format!(
         "SELECT {CANDIDATE_COLUMNS} FROM engram e JOIN domain d ON d.id=e.domain_id {where_sql} \
-         ORDER BY e.recorded_at DESC, e.permalink ASC LIMIT {limit} OFFSET {offset}"
+         ORDER BY e.recorded_at COLLATE \"C\" DESC, e.permalink COLLATE \"C\" ASC \
+         LIMIT {limit} OFFSET {offset}"
     );
     let rows = query_all(conn, &sql, params).await?;
     let items: Vec<(i64, SearchHit)> = rows

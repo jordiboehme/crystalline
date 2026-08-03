@@ -634,6 +634,13 @@ parity!(outbound_refs_report_resolution_status, outbound_refs_status);
 /// an engram, each carrying the correct `kind`. This guards the kind
 /// discriminator decoding identically on both backends: a bare integer literal
 /// does not decode as `i64` on Postgres, so the column must be cast.
+///
+/// It also guards the ordering, which `read_engram` truncates to the first five
+/// refs: both sort keys are text, so the fixture plants a capitalized source
+/// path (`Capital.md`) and a capitalized source domain (`Zed`), each of which
+/// sorts first byte-wise and last under a locale collation. Without the
+/// Postgres side pinning both keys to `COLLATE "C"` the two backends hand a
+/// caller a different order, and with a cap, a different set.
 async fn inbound_refs_kinds(store: &dyn Store) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
@@ -660,7 +667,26 @@ async fn inbound_refs_kinds(store: &dyn Store) {
             "See [[Hub]] for the details.\n",
         ),
     );
+    // A capitalized path in the same domain: byte-wise it sorts before both
+    // lowercase paths, under a locale collation it sorts after them.
+    write(
+        root,
+        "Capital.md",
+        &engram("Capital", "capital", "engram", "", "- cites [[Hub]]\n"),
+    );
     sync_domain(store, "d", root).await.unwrap();
+
+    // A capitalized second domain pointing across at Hub, so the domain key is
+    // exercised the same way: `Zed` sorts before `d` byte-wise and after it
+    // under a locale collation.
+    let other_dir = tempfile::tempdir().unwrap();
+    let other = other_dir.path();
+    write(
+        other,
+        "cross.md",
+        &engram("Cross", "cross", "engram", "", "- cites [[d:Hub]]\n"),
+    );
+    sync_domain(store, "Zed", other).await.unwrap();
 
     let hub = store.lookup_id("d", "hub").await.unwrap().unwrap();
     let domain = store
@@ -671,15 +697,22 @@ async fn inbound_refs_kinds(store: &dyn Store) {
 
     assert_eq!(
         refs.len(),
-        2,
-        "one relation and one link point at Hub: {refs:?}"
+        4,
+        "two relations, one link and one cross-domain relation point at Hub: {refs:?}"
     );
-    // Ordered by source domain then path, so a capped sample is deterministic:
-    // both linkers are in domain `d`, so `link.md` sorts before `rel.md`.
+    // Ordered by source domain then path, byte-wise on both backends, so a
+    // capped sample is deterministic.
     assert_eq!(
-        refs.iter().map(|r| r.src_path.as_str()).collect::<Vec<_>>(),
-        vec!["link.md", "rel.md"],
-        "inbound refs are ordered by (domain, path): {refs:?}"
+        refs.iter()
+            .map(|r| (r.src_domain.as_str(), r.src_path.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("Zed", "cross.md"),
+            ("d", "Capital.md"),
+            ("d", "link.md"),
+            ("d", "rel.md"),
+        ],
+        "inbound refs are ordered by (domain, path) in byte order: {refs:?}"
     );
     let relation = refs
         .iter()
@@ -1036,13 +1069,18 @@ async fn search_hits_carry_tags(store: &dyn Store) {
     // Every search hit teaches the querying agent the engram's tags: alphabetical
     // and folded to lowercase, an empty vec when untagged, present on filter-only
     // and observation-kind hits alike (keyed by the engram id either way).
+    //
+    // "Alphabetical" means byte order on both backends, which is why the tagged
+    // engram carries both `multi-word` and `multi_word`: a locale collation
+    // weighs `_` below `-` and would list them the other way round, so this pair
+    // catches an unpinned tag sort even though every tag here is lowercase.
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     // A tagged engram whose title matches: an engram-kind text hit.
     write(
         root,
         "photo.md",
-        "---\ntype: engram\ntitle: Photosynthesis primer\npermalink: photo\ntags:\n  - Zebra\n  - apple\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Photosynthesis primer\n\ngeneric body\n",
+        "---\ntype: engram\ntitle: Photosynthesis primer\npermalink: photo\ntags:\n  - Zebra\n  - apple\n  - multi_word\n  - multi-word\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Photosynthesis primer\n\ngeneric body\n",
     );
     // An untagged engram whose title also matches: an empty tag vec.
     write(
@@ -1074,8 +1112,13 @@ async fn search_hits_carry_tags(store: &dyn Store) {
         .expect("the photo hit is present");
     assert_eq!(
         photo.tags,
-        vec!["apple".to_string(), "zebra".to_string()],
-        "frontmatter tags, alphabetical and folded to lowercase"
+        vec![
+            "apple".to_string(),
+            "multi-word".to_string(),
+            "multi_word".to_string(),
+            "zebra".to_string(),
+        ],
+        "frontmatter tags, byte-order alphabetical and folded to lowercase"
     );
     let plain = text
         .items
@@ -1101,7 +1144,12 @@ async fn search_hits_carry_tags(store: &dyn Store) {
     assert_eq!(filtered.items[0].permalink, "photo");
     assert_eq!(
         filtered.items[0].tags,
-        vec!["apple".to_string(), "zebra".to_string()]
+        vec![
+            "apple".to_string(),
+            "multi-word".to_string(),
+            "multi_word".to_string(),
+            "zebra".to_string(),
+        ]
     );
 
     // An observation-kind hit carries its engram's frontmatter tags, not the
@@ -1277,19 +1325,27 @@ async fn replace_tag_aliases_roundtrip(store: &dyn Store) {
         .await
         .unwrap();
 
+    // The `multi_word`/`multi-word` pair is deliberate: a locale collation weighs
+    // `_` below `-` and would order those two aliases the other way round, so
+    // this fixture catches an unpinned text sort on the Postgres side even though
+    // every alias here is already lowercase.
     let pairs_a = vec![
         ("old".to_string(), "new".to_string()),
         ("legacy".to_string(), "modern".to_string()),
+        ("multi_word".to_string(), "multi-word".to_string()),
+        ("multi-word".to_string(), "multiword".to_string()),
     ];
     store.replace_tag_aliases(a, &pairs_a).await.unwrap();
     // Idempotent: replacing again with the same pairs leaves the same rows.
     store.replace_tag_aliases(a, &pairs_a).await.unwrap();
 
-    // A scoped read is sorted by alias then canonical.
+    // A scoped read is sorted by alias then canonical, in byte order.
     assert_eq!(
         store.tag_aliases(Some(&["a".to_string()])).await.unwrap(),
         vec![
             ("legacy".to_string(), "modern".to_string()),
+            ("multi-word".to_string(), "multiword".to_string()),
+            ("multi_word".to_string(), "multi-word".to_string()),
             ("old".to_string(), "new".to_string()),
         ]
     );
@@ -1304,6 +1360,8 @@ async fn replace_tag_aliases_roundtrip(store: &dyn Store) {
         store.tag_aliases(None).await.unwrap(),
         vec![
             ("legacy".to_string(), "modern".to_string()),
+            ("multi-word".to_string(), "multiword".to_string()),
+            ("multi_word".to_string(), "multi-word".to_string()),
             ("old".to_string(), "new".to_string()),
         ]
     );
@@ -1806,6 +1864,36 @@ async fn search_pages(store: &dyn Store) {
         .await
         .unwrap();
     assert_eq!(page3.items.len(), 1, "7 items, page 3 of size 3 has 1");
+
+    // The filter-only path (no query text) pages in SQL instead, ordered by
+    // recorded_at then permalink. Both keys are text and every fixture shares a
+    // date, so the permalink tie-break alone decides who lands on the page:
+    // `Zeta` sorts before `e0` byte-wise and after `e6` under a locale
+    // collation, which would silently change the first page on Postgres.
+    write(
+        root,
+        "zeta.md",
+        &engram("Zeta", "Zeta", "engram", "", "shared_term here\n"),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+    let filtered = store
+        .search(&SearchQuery {
+            limit: 2,
+            page: 1,
+            ..SearchQuery::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(filtered.total, 8);
+    assert_eq!(
+        filtered
+            .items
+            .iter()
+            .map(|h| h.permalink.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Zeta", "e0"],
+        "the filter-only page is ordered by permalink in byte order"
+    );
 }
 parity!(search_paginates, search_pages);
 
@@ -1994,6 +2082,12 @@ async fn neighbors_carries_status(store: &dyn Store) {
 }
 parity!(neighbors_carries_status_prior, neighbors_carries_status);
 
+/// `recent` returns the newest first, and separates engrams recorded on the same
+/// day by permalink alone. That tie-break is a text sort under a `LIMIT`, so the
+/// fixture gives two same-day engrams a capitalized and a lowercase permalink:
+/// `Zeta` sorts first byte-wise and last under a locale collation, so an
+/// unpinned Postgres sort would not merely reorder the page, it would return a
+/// different engram at `limit: 1`.
 async fn recent_newest_first(store: &dyn Store) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
@@ -2003,6 +2097,11 @@ async fn recent_newest_first(store: &dyn Store) {
         "new.md",
         "---\ntype: engram\ntitle: New\npermalink: new\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-06-01\n---\n\nb\n",
     );
+    write(
+        root,
+        "zeta.md",
+        "---\ntype: engram\ntitle: Zeta\npermalink: Zeta\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-06-01\n---\n\nb\n",
+    );
     sync_domain(store, "d", root).await.unwrap();
     let recent = store
         .recent(&RecentFilter {
@@ -2011,7 +2110,31 @@ async fn recent_newest_first(store: &dyn Store) {
         })
         .await
         .unwrap();
-    assert_eq!(recent[0].permalink, "new", "2026-06-01 before 2026-01-01");
+    assert_eq!(
+        recent
+            .iter()
+            .map(|e| e.permalink.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Zeta", "new", "old"],
+        "2026-06-01 before 2026-01-01, same-day ties broken by permalink in byte order"
+    );
+
+    // The tie-break decides what a capped read sees at all.
+    let capped = store
+        .recent(&RecentFilter {
+            limit: 1,
+            ..RecentFilter::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        capped
+            .iter()
+            .map(|e| e.permalink.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Zeta"],
+        "the first of the two same-day engrams in byte order"
+    );
 }
 parity!(recent_returns_newest_first, recent_newest_first);
 
@@ -2198,8 +2321,13 @@ parity!(tag_identity_folds_case, tag_identity_folds);
 async fn engrams_with_tag_finds_both_places(store: &dyn Store) {
     // Alpha carries `topic` on its frontmatter, Beta only on an observation,
     // Gamma (a second domain) carries a different-cased `Topic` on frontmatter,
-    // and Delta carries no such tag. The lookup finds all three tagged engrams
+    // and Delta carries no such tag. The lookup finds every tagged engram
     // (folded), ordered by domain then path, and the domain filter scopes it.
+    //
+    // Both sort keys are text, so the fixture plants a capitalized path
+    // (`Zeta.md`) and a capitalized domain (`Zed`): each sorts first byte-wise
+    // and last under a locale collation, so an unpinned Postgres sort would hand
+    // back the same engrams in a different order.
     let eng = tempfile::tempdir().unwrap();
     write(
         eng.path(),
@@ -2216,7 +2344,20 @@ async fn engrams_with_tag_finds_both_places(store: &dyn Store) {
         "delta.md",
         "---\ntype: engram\ntitle: Delta\npermalink: delta\ntags:\n  - other\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nbody\n",
     );
+    write(
+        eng.path(),
+        "Zeta.md",
+        "---\ntype: engram\ntitle: Zeta\npermalink: zeta\ntags:\n  - topic\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nbody\n",
+    );
     sync_domain(store, "eng", eng.path()).await.unwrap();
+
+    let zed = tempfile::tempdir().unwrap();
+    write(
+        zed.path(),
+        "note.md",
+        "---\ntype: engram\ntitle: Note\npermalink: note\ntags:\n  - topic\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nbody\n",
+    );
+    sync_domain(store, "Zed", zed.path()).await.unwrap();
 
     let ops = tempfile::tempdir().unwrap();
     write(
@@ -2226,8 +2367,9 @@ async fn engrams_with_tag_finds_both_places(store: &dyn Store) {
     );
     sync_domain(store, "ops", ops.path()).await.unwrap();
 
-    // All domains: three engrams carry the folded `topic`, ordered by domain
-    // then path (eng/alpha, eng/beta, ops/gamma).
+    // All domains: five engrams carry the folded `topic`, ordered by domain then
+    // path in byte order, so the capitalized domain and the capitalized path
+    // both come first.
     let all = store.engrams_with_tag("topic", None).await.unwrap();
     let shape: Vec<(&str, &str)> = all
         .iter()
@@ -2235,13 +2377,19 @@ async fn engrams_with_tag_finds_both_places(store: &dyn Store) {
         .collect();
     assert_eq!(
         shape,
-        vec![("eng", "alpha"), ("eng", "beta"), ("ops", "gamma")],
+        vec![
+            ("Zed", "note"),
+            ("eng", "zeta"),
+            ("eng", "alpha"),
+            ("eng", "beta"),
+            ("ops", "gamma"),
+        ],
         "found on frontmatter and observations, both cases, ordered by domain then path"
     );
 
     // A mixed-case query folds identically.
     let upper = store.engrams_with_tag("Topic", None).await.unwrap();
-    assert_eq!(upper.len(), 3, "the query tag folds too");
+    assert_eq!(upper.len(), 5, "the query tag folds too");
 
     // The domain filter scopes the result to one domain.
     let scoped = store.engrams_with_tag("topic", Some("ops")).await.unwrap();
@@ -2251,6 +2399,87 @@ async fn engrams_with_tag_finds_both_places(store: &dyn Store) {
 parity!(
     engrams_with_tag_finds_frontmatter_and_observations,
     engrams_with_tag_finds_both_places
+);
+
+/// The three descriptor lookups agree on a text ordering across both backends.
+///
+/// `list_engrams` is ordered by path, `find_engram_any` by domain then path and
+/// `find_engram` by path under a `LIMIT 1`, so on that last one the ordering is
+/// the entire answer: a title shared by two engrams resolves to whichever path
+/// sorts first. Every fixture path and domain here mixes case on purpose - a
+/// capitalized name sorts first byte-wise and last under a locale collation, so
+/// each of these three would answer differently on Postgres without its text
+/// sort keys pinned to `COLLATE "C"`.
+async fn descriptor_lookups_order_by_bytes(store: &dyn Store) {
+    let eng = tempfile::tempdir().unwrap();
+    write(
+        eng.path(),
+        "Zeta.md",
+        &engram("Shared Title", "zeta", "engram", "", "body\n"),
+    );
+    write(
+        eng.path(),
+        "alpha.md",
+        &engram("Shared Title", "alpha", "engram", "", "body\n"),
+    );
+    write(
+        eng.path(),
+        "beta.md",
+        &engram("Beta", "beta", "note", "", "body\n"),
+    );
+    sync_domain(store, "eng", eng.path()).await.unwrap();
+
+    let zed = tempfile::tempdir().unwrap();
+    write(
+        zed.path(),
+        "note.md",
+        &engram("Shared Title", "note", "engram", "", "body\n"),
+    );
+    sync_domain(store, "Zed", zed.path()).await.unwrap();
+
+    // Ordered by path: the capitalized one first.
+    let listed = store.list_engrams("eng", None, None).await.unwrap();
+    assert_eq!(
+        listed.iter().map(|d| d.path.as_str()).collect::<Vec<_>>(),
+        vec!["Zeta.md", "alpha.md", "beta.md"],
+        "list_engrams orders by path in byte order"
+    );
+    // The type filter narrows the same ordered listing.
+    let typed = store
+        .list_engrams("eng", None, Some("engram"))
+        .await
+        .unwrap();
+    assert_eq!(
+        typed.iter().map(|d| d.path.as_str()).collect::<Vec<_>>(),
+        vec!["Zeta.md", "alpha.md"],
+        "the type filter keeps the byte ordering"
+    );
+
+    // Ordered by domain then path across every domain.
+    let any = store.find_engram_any("Shared Title").await.unwrap();
+    assert_eq!(
+        any.iter()
+            .map(|d| (d.domain.as_str(), d.path.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("Zed", "note.md"), ("eng", "Zeta.md"), ("eng", "alpha.md"),],
+        "find_engram_any orders by domain then path in byte order"
+    );
+
+    // One domain, two engrams under the same title: the ordering picks the
+    // single answer, so this is the sharpest case of the three.
+    let found = store
+        .find_engram("eng", "Shared Title")
+        .await
+        .unwrap()
+        .expect("a title match is found");
+    assert_eq!(
+        found.path, "Zeta.md",
+        "the lowest path in byte order wins the title tie"
+    );
+}
+parity!(
+    descriptor_lookups_order_by_byte_value,
+    descriptor_lookups_order_by_bytes
 );
 
 async fn wipe_clears(store: &dyn Store) {

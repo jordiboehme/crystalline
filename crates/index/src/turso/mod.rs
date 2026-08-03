@@ -6,6 +6,13 @@
 //! same `search()` signature; foreign-key cascade is not trusted so child rows
 //! are deleted explicitly; `RETURNING` only works through the query path.
 //!
+//! TEXT sorts byte-wise here, which is what the whole store's ordering contract
+//! is defined as, so an `ORDER BY` on a text column needs nothing and may be
+//! positional. That is exactly what the [`crate::postgres`] twin has to pin with
+//! an explicit `COLLATE "C"` on every text sort key, because a Postgres database
+//! created under a locale collation orders text differently; the queries there
+//! are otherwise column for column the ones here.
+//!
 //! A single [`Connection`] is used from a single task. The M5 daemon will own
 //! this store; other processes never open the database concurrently, so Turso's
 //! young multi-process path is never exercised. The socket dispatch that the
@@ -1030,8 +1037,11 @@ impl Store for TursoStore {
         // engram's permalink or title. Prose wikilinks are never assigned a
         // `to_id`, so the text match is what catches them; `to_domain IS NULL`
         // restricts the rewrite to bare links that would otherwise dangle after
-        // the move. Ordered by source domain then path (positional `1, 3`) so
-        // `read_engram`'s capped sample is deterministic across both backends.
+        // the move. Ordered by source domain then path (positional `1, 3`, which
+        // a compound select needs) so `read_engram`'s capped sample is
+        // deterministic across both backends: TEXT sorts byte-wise here, the
+        // order the Postgres twin pins itself to with an explicit `COLLATE "C"`
+        // over a wrapped subselect, since a positional key cannot carry one.
         let params = vec![
             Value::Integer(engram_id.0),
             Value::Integer(domain_id.0),
