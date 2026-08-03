@@ -311,6 +311,94 @@ fn set_frontmatter_line(source: &str, keys: &[&str], new_line: String) -> String
     )
 }
 
+/// Set or replace a single numeric frontmatter field in the original source,
+/// leaving everything else untouched. Creates a frontmatter block if absent.
+///
+/// The counterpart of [`set_frontmatter_field`] for a key whose value must stay
+/// a YAML number rather than a quoted string, `salience` being the one the
+/// index reads that way. A whole value emits without a fractional part, so a
+/// salience of 7 reads `salience: 7`.
+pub fn set_frontmatter_number(source: &str, key: &str, value: f64) -> String {
+    let rendered = if value.fract() == 0.0 && value.abs() < 1e15 {
+        format!("{}", value as i64)
+    } else {
+        format!("{value}")
+    };
+    set_frontmatter_line(source, &[key], format!("{key}: {rendered}"))
+}
+
+/// Record a trust history in the original source: replace the `verified` value
+/// with `entries`, leaving every other byte untouched. An empty `entries` is a
+/// no-op, since a verification is never cleared through this path.
+///
+/// Unlike [`set_frontmatter_field`] this replaces a value that may span several
+/// lines: one entry emits as a single flow mapping on the key's own line, and
+/// several emit as a block sequence, so the existing block sequence has to go
+/// with the key line rather than be orphaned under the new value.
+pub fn set_verified(source: &str, entries: &[Verified]) -> String {
+    if entries.is_empty() {
+        return source.to_string();
+    }
+    set_frontmatter_block(source, "verified", verified_block(entries))
+}
+
+/// Replace the frontmatter value of `key` with `new_block`, which may span
+/// several lines and carries the key itself. Continuation lines belonging to
+/// the old value - a block sequence item or an indented nested mapping - are
+/// removed with the key line. Appends when the key is absent and creates a
+/// frontmatter block when the source has none.
+fn set_frontmatter_block(source: &str, key: &str, new_block: String) -> String {
+    let (has_fm, fm_span, _body_start) = locate(source);
+    if !has_fm {
+        return format!("---\n{new_block}\n---\n{source}");
+    }
+
+    let raw = &source[fm_span.clone()];
+    let mut new_raw = String::with_capacity(raw.len() + new_block.len());
+    // 0: the key has not been seen; 1: it was just replaced and continuation
+    // lines are being dropped; 2: the old value is fully behind us.
+    let mut phase = 0u8;
+    for line in raw.split_inclusive('\n') {
+        let content = line.strip_suffix('\n').unwrap_or(line);
+        match phase {
+            0 if line_sets_key(content, key) => {
+                new_raw.push_str(&new_block);
+                new_raw.push('\n');
+                phase = 1;
+            }
+            1 if is_value_continuation(content) => {}
+            1 => {
+                phase = 2;
+                new_raw.push_str(line);
+            }
+            _ => new_raw.push_str(line),
+        }
+    }
+    if phase == 0 {
+        if !new_raw.is_empty() && !new_raw.ends_with('\n') {
+            new_raw.push('\n');
+        }
+        new_raw.push_str(&new_block);
+        new_raw.push('\n');
+    }
+    format!(
+        "{}{}{}",
+        &source[..fm_span.start],
+        new_raw,
+        &source[fm_span.end..]
+    )
+}
+
+/// True when a frontmatter line continues the value of the key above it rather
+/// than starting a new one: an indented line or a block sequence item.
+fn is_value_continuation(line: &str) -> bool {
+    line.starts_with(' ')
+        || line.starts_with('\t')
+        || line == "-"
+        || line.starts_with("- ")
+        || line.starts_with("-\t")
+}
+
 /// Remove a single frontmatter field from the original source, leaving every
 /// other byte untouched. A no-op returning the source unchanged when the key
 /// or the frontmatter block is absent.

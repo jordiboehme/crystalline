@@ -26,7 +26,8 @@ use crystalline_core::config::{
 };
 use crystalline_core::emit::{
     append_body, insert_after_section, insert_before_section, prepend_body,
-    remove_frontmatter_field, replace_section, touch_generated,
+    remove_frontmatter_field, replace_section, set_frontmatter_field, set_frontmatter_number,
+    set_stale_after, set_verified, touch_generated,
 };
 use crystalline_core::schema::{self, Schema};
 use crystalline_core::{
@@ -81,6 +82,28 @@ pub const EVOLVE_GUIDANCE: &str = "This queue changes nothing by itself. Present
      A lifecycle finding never knows whether a change is a correction or a replacement; read and decide with the edit-versus-supersede test. \
      Act only on the evidence stated: this sweep detects by dates, links and graph shape, never by meaning, so it cannot confirm a contradiction. \
      Re-run the same scope when done.";
+
+/// The frontmatter keys `edit_engram`'s `set_frontmatter` operation may write:
+/// the lifecycle surface an agent tends while keeping knowledge honest. Every
+/// other key is refused there, because identity (`permalink`, `title`, `type`),
+/// classification (`tags`), the record of when knowledge was captured
+/// (`recorded_at`) and the write provenance (`generated`) are owned by the
+/// tools that maintain them and a blind assignment would corrupt an address, a
+/// history or the index.
+pub const SETTABLE_FRONTMATTER_KEYS: &[&str] = &[
+    "status",
+    "valid_from",
+    "valid_to",
+    "stale_after",
+    "source_date",
+    "salience",
+    "verified",
+];
+
+/// [`SETTABLE_FRONTMATTER_KEYS`] rendered for an error message.
+fn settable_keys() -> String {
+    SETTABLE_FRONTMATTER_KEYS.join(", ")
+}
 
 /// The OKF actor recorded as `generated.by` when nothing else identifies the
 /// writer: no `identity.actor` setting and no client identity from the MCP
@@ -1525,7 +1548,7 @@ impl Engine {
                     path: abs.display().to_string(),
                     source,
                 })?;
-                let edited = self.apply_edit(&current, p, &desc.permalink)?;
+                let edited = self.apply_edit(&current, p, &desc.permalink, &actor)?;
                 let edited = touch_generated(&edited, &actor, now_offset());
                 let edited = Self::enforce_temporal(edited)?;
                 write_file(&abs, &edited)?;
@@ -1554,7 +1577,7 @@ impl Engine {
                     .expected_checksum
                     .clone()
                     .unwrap_or_else(|| sha256_hex(current.as_bytes()));
-                let edited = self.apply_edit(&current, p, &desc.permalink)?;
+                let edited = self.apply_edit(&current, p, &desc.permalink, &actor)?;
                 let edited = touch_generated(&edited, &actor, now_offset());
                 let edited = Self::enforce_temporal(edited)?;
                 let stamp = virtual_stamp(&edited);
@@ -1591,11 +1614,20 @@ impl Engine {
 
     /// Apply one edit operation to an engram's markdown, returning the edited
     /// text. Content-agnostic: the same logic serves file and virtual edits.
-    fn apply_edit(&self, source: &str, p: &EditParams, permalink: &str) -> Result<String> {
+    /// `actor` is the resolved editor identity, which `set_frontmatter` stamps
+    /// into a verification when the caller names no other one.
+    fn apply_edit(
+        &self,
+        source: &str,
+        p: &EditParams,
+        permalink: &str,
+        actor: &str,
+    ) -> Result<String> {
         Ok(match p.operation.as_str() {
-            "append" => append_body(source, &p.content),
-            "prepend" => prepend_body(source, &p.content),
+            "append" => append_body(source, self.require_content(p)?),
+            "prepend" => prepend_body(source, self.require_content(p)?),
             "find_replace" => {
+                let content = self.require_content(p)?;
                 let find = p.find_text.as_deref().ok_or_else(|| {
                     EngineError::Invalid("find_replace requires find_text".into())
                 })?;
@@ -1615,26 +1647,154 @@ impl Engine {
                         "expected {expected} replacements of '{find}' but found {count}"
                     )));
                 }
-                source.replace(find, &p.content)
+                source.replace(find, content)
             }
             "replace_section" => {
+                let content = self.require_content(p)?;
                 let section = self.require_section(p)?;
-                replace_section(source, section, &p.content, p.include_subsections)
+                replace_section(source, section, content, p.include_subsections)
                     .map_err(section_err)?
             }
             "insert_before_section" => {
+                let content = self.require_content(p)?;
                 let section = self.require_section(p)?;
-                insert_before_section(source, section, &p.content).map_err(section_err)?
+                insert_before_section(source, section, content).map_err(section_err)?
             }
             "insert_after_section" => {
+                let content = self.require_content(p)?;
                 let section = self.require_section(p)?;
-                insert_after_section(source, section, &p.content).map_err(section_err)?
+                insert_after_section(source, section, content).map_err(section_err)?
             }
+            "set_frontmatter" => Self::apply_set_frontmatter(source, p, actor)?,
             other => {
                 return Err(EngineError::Invalid(format!(
-                    "unknown edit operation '{other}'; expected append, prepend, find_replace, replace_section, insert_before_section or insert_after_section"
+                    "unknown edit operation '{other}'; expected append, prepend, find_replace, replace_section, insert_before_section, insert_after_section or set_frontmatter"
                 )));
             }
+        })
+    }
+
+    /// Assign or clear one lifecycle frontmatter field, the `set_frontmatter`
+    /// operation. Restricted to [`SETTABLE_FRONTMATTER_KEYS`]: identity,
+    /// provenance and index keys are owned by the tools that maintain them, so
+    /// rewriting one here is refused rather than silently corrupting the
+    /// engram's address or its write history.
+    ///
+    /// An absent or empty value clears the field, except on `status`, which is
+    /// required, and on `verified`, which stamps a verification instead.
+    fn apply_set_frontmatter(source: &str, p: &EditParams, actor: &str) -> Result<String> {
+        let key = p
+            .key
+            .as_deref()
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+            .ok_or_else(|| {
+                EngineError::Invalid(format!(
+                    "set_frontmatter requires key, one of {}",
+                    settable_keys()
+                ))
+            })?;
+        let value = p.value.as_deref().map(str::trim).filter(|v| !v.is_empty());
+
+        match key {
+            "status" => {
+                let status = value.ok_or_else(|| {
+                    EngineError::Invalid(
+                        "status cannot be removed: every engram needs one (verify rule T001). Set a retirement status such as deprecated or superseded instead".into(),
+                    )
+                })?;
+                Ok(set_frontmatter_field(source, "status", status))
+            }
+            "valid_from" | "valid_to" | "stale_after" | "source_date" => {
+                let Some(raw) = value else {
+                    // Clearing a bound is how absence - always valid, valid
+                    // forever, no review due - is restored. The legacy
+                    // `review_after` spelling goes with `stale_after` so the
+                    // bound is really gone whichever spelling the file used.
+                    let out = remove_frontmatter_field(source, key);
+                    return Ok(if key == "stale_after" {
+                        remove_frontmatter_field(&out, "review_after")
+                    } else {
+                        out
+                    });
+                };
+                // Validate through the write contract itself rather than a
+                // second parser, so a timestamp, an int or a sentinel bound is
+                // answered here exactly as write_engram answers it.
+                let mut probe = Frontmatter::default();
+                probe
+                    .extra
+                    .insert(key.to_string(), YamlValue::String(raw.to_string()));
+                let dropped = crystalline_core::temporal::normalize_temporal_fields(&mut probe)
+                    .map_err(|e| EngineError::Invalid(e.to_string()))?;
+                if !dropped.is_empty() {
+                    // A sentinel bound: absence is how open-ended validity is
+                    // expressed, so the field is cleared rather than written.
+                    return Ok(remove_frontmatter_field(source, key));
+                }
+                let date = match key {
+                    "valid_from" => probe.valid_from,
+                    "valid_to" => probe.valid_to,
+                    "source_date" => probe.source_date,
+                    _ => probe.stale_after,
+                }
+                .expect("a normalized date field is promoted into its typed slot");
+                Ok(if key == "stale_after" {
+                    // Migrates a legacy `review_after` line in place.
+                    set_stale_after(source, date)
+                } else {
+                    set_frontmatter_field(source, key, &date.format("%Y-%m-%d").to_string())
+                })
+            }
+            "salience" => {
+                let Some(raw) = value else {
+                    return Ok(remove_frontmatter_field(source, "salience"));
+                };
+                let n: f64 = raw.parse().map_err(|_| {
+                    EngineError::Invalid(format!(
+                        "salience must be a number from 0 to 10, got '{raw}'"
+                    ))
+                })?;
+                if !n.is_finite() || !(0.0..=10.0).contains(&n) {
+                    return Err(EngineError::Invalid(format!(
+                        "salience must be a number from 0 to 10, got {raw}"
+                    )));
+                }
+                Ok(set_frontmatter_number(source, "salience", n))
+            }
+            "verified" => {
+                // A verification is a record of a check that happened, so it is
+                // never cleared here: an omitted value names the caller as the
+                // verifier instead, which is the common "I re-checked this and
+                // it still holds" case.
+                let by = value
+                    .map(sanitize_actor)
+                    .filter(|a| !a.is_empty())
+                    .unwrap_or_else(|| actor.to_string());
+                let entry = crystalline_core::Verified {
+                    by,
+                    at: Some(now_offset()),
+                };
+                // Keep other actors' verifications and replace this actor's, so
+                // the trust record stays a history without growing a line on
+                // every sweep.
+                let mut entries = parse_engram(source)
+                    .map(|e| e.frontmatter.verified)
+                    .unwrap_or_default();
+                entries.retain(|e| e.by != entry.by);
+                entries.push(entry);
+                Ok(set_verified(source, &entries))
+            }
+            other => Err(EngineError::Invalid(format!(
+                "set_frontmatter cannot set '{other}'; the settable keys are {}",
+                settable_keys()
+            ))),
+        }
+    }
+
+    fn require_content<'a>(&self, p: &'a EditParams) -> Result<&'a str> {
+        p.content.as_deref().ok_or_else(|| {
+            EngineError::Invalid(format!("operation '{}' requires content", p.operation))
         })
     }
 

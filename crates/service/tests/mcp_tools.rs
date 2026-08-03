@@ -2099,6 +2099,600 @@ async fn edit_engram_rejects_a_nulled_recorded_at() {
     );
 }
 
+/// Write an engram straight to disk and sync it, for the set_frontmatter tests
+/// that need a specific legacy frontmatter shape rather than what a write
+/// produces. `fields` are extra frontmatter lines.
+async fn plant(h: &Harness, domain: &str, slug: &str, fields: &str) -> std::path::PathBuf {
+    let md = format!(
+        "---\ntype: engram\ntitle: {slug}\npermalink: {slug}\ntags:\n  - eng\nrecorded_at: 2026-01-01\n{fields}---\n\n# {slug}\n\nA rule.\n"
+    );
+    let path = h.root.join(domain).join(format!("{slug}.md"));
+    std::fs::write(&path, md).unwrap();
+    h.engine.sync(None).await.unwrap();
+    path
+}
+
+/// set_frontmatter flips a status by field assignment rather than text
+/// substitution, so it lands whichever spelling the file carries: the current
+/// `stable` a write produces and the legacy `current` an older file holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edit_engram_set_frontmatter_flips_either_status_spelling() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Fresh", "content": "A rule." }),
+    )
+    .await
+    .unwrap();
+    let legacy = plant(&h, "eng", "legacy", "status: current\n").await;
+
+    for slug in ["fresh", "legacy"] {
+        call(
+            peer,
+            "edit_engram",
+            json!({
+                "domain": "eng",
+                "identifier": slug,
+                "operation": "set_frontmatter",
+                "key": "status",
+                "value": "superseded",
+            }),
+        )
+        .await
+        .unwrap();
+    }
+
+    let fresh_text = std::fs::read_to_string(h.root.join("eng/fresh.md")).unwrap();
+    assert!(fresh_text.contains("status: superseded"), "{fresh_text}");
+    assert!(!fresh_text.contains("status: stable"), "{fresh_text}");
+    let legacy_text = std::fs::read_to_string(&legacy).unwrap();
+    assert!(legacy_text.contains("status: superseded"), "{legacy_text}");
+    assert!(!legacy_text.contains("status: current"), "{legacy_text}");
+    // Exactly one status line either way: an assignment never appends a second.
+    assert_eq!(legacy_text.matches("status:").count(), 1, "{legacy_text}");
+
+    // The file still parses and the index carries the new status, so a read
+    // (which resolves through the store) reports it.
+    let out = call(
+        peer,
+        "read_engram",
+        json!({ "domain": "eng", "identifier": "legacy" }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out["status"], json!("superseded"), "{out}");
+    assert_eq!(
+        out["frontmatter"]["status"],
+        json!("superseded"),
+        "the edited file must re-parse: {out}"
+    );
+}
+
+/// A valid_to is set as a plain date and cleared by omitting the value, which
+/// is how a bound that should never have been set is removed - absence is what
+/// expresses valid forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edit_engram_set_frontmatter_sets_then_clears_a_valid_to() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Windowed", "content": "A rule." }),
+    )
+    .await
+    .unwrap();
+    let path = h.root.join("eng/windowed.md");
+
+    call(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng",
+            "identifier": "windowed",
+            "operation": "set_frontmatter",
+            "key": "valid_to",
+            "value": "2026-09-30",
+        }),
+    )
+    .await
+    .unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("valid_to: 2026-09-30"), "{text}");
+    let out = call(
+        peer,
+        "read_engram",
+        json!({ "domain": "eng", "identifier": "windowed" }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out["frontmatter"]["valid_to"], json!("2026-09-30"), "{out}");
+
+    call(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng",
+            "identifier": "windowed",
+            "operation": "set_frontmatter",
+            "key": "valid_to",
+        }),
+    )
+    .await
+    .unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(!text.contains("valid_to"), "the bound must be gone: {text}");
+    let out = call(
+        peer,
+        "read_engram",
+        json!({ "domain": "eng", "identifier": "windowed" }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out["frontmatter"]["valid_to"], Value::Null, "{out}");
+}
+
+/// status is required (verify rule T001), so it is the one settable key a
+/// missing value must not remove.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edit_engram_set_frontmatter_refuses_to_remove_status() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Statused", "content": "A rule." }),
+    )
+    .await
+    .unwrap();
+    let path = h.root.join("eng/statused.md");
+    let before = std::fs::read_to_string(&path).unwrap();
+
+    let err = call(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng",
+            "identifier": "statused",
+            "operation": "set_frontmatter",
+            "key": "status",
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("status cannot be removed"), "{err}");
+    assert_eq!(
+        before,
+        std::fs::read_to_string(&path).unwrap(),
+        "the file must be unchanged after a refused edit"
+    );
+}
+
+/// The keyset is a safe list: identity, classification and provenance keys are
+/// refused by name, and the error states what is settable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edit_engram_set_frontmatter_refuses_a_key_outside_the_safe_set() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Identity", "content": "A rule." }),
+    )
+    .await
+    .unwrap();
+    let path = h.root.join("eng/identity.md");
+    let before = std::fs::read_to_string(&path).unwrap();
+
+    for key in [
+        "permalink",
+        "title",
+        "type",
+        "tags",
+        "recorded_at",
+        "generated",
+    ] {
+        let err = call(
+            peer,
+            "edit_engram",
+            json!({
+                "domain": "eng",
+                "identifier": "identity",
+                "operation": "set_frontmatter",
+                "key": key,
+                "value": "whatever",
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.contains(&format!("cannot set '{key}'")) && err.contains("status, valid_from"),
+            "unexpected error for {key}: {err}"
+        );
+    }
+    assert_eq!(
+        before,
+        std::fs::read_to_string(&path).unwrap(),
+        "the file must be unchanged after a refused edit"
+    );
+
+    // A missing key names the same set rather than guessing one.
+    let err = call(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng",
+            "identifier": "identity",
+            "operation": "set_frontmatter",
+            "value": "stable",
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("set_frontmatter requires key"), "{err}");
+}
+
+/// A date key goes through the temporal write contract, so a timestamp is
+/// rejected with the standard message and a sentinel bound is dropped rather
+/// than written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edit_engram_set_frontmatter_enforces_the_date_contract() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Dated", "content": "A rule." }),
+    )
+    .await
+    .unwrap();
+    let path = h.root.join("eng/dated.md");
+    let before = std::fs::read_to_string(&path).unwrap();
+
+    let err = call(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng",
+            "identifier": "dated",
+            "operation": "set_frontmatter",
+            "key": "valid_to",
+            "value": "2026-07-15T10:30:00Z",
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.contains(
+            "valid_to must be a plain ISO date (YYYY-MM-DD), got '2026-07-15T10:30:00Z'; temporal fields are day-granular"
+        ),
+        "unexpected error: {err}"
+    );
+    assert_eq!(
+        before,
+        std::fs::read_to_string(&path).unwrap(),
+        "the file must be unchanged after a rejected edit"
+    );
+
+    // A sentinel far-future bound is dropped, matching write_engram: absence is
+    // how open-ended validity is expressed.
+    call(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng",
+            "identifier": "dated",
+            "operation": "set_frontmatter",
+            "key": "valid_to",
+            "value": "9999-12-31",
+        }),
+    )
+    .await
+    .unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(!text.contains("valid_to"), "{text}");
+    assert!(!text.contains("9999"), "{text}");
+}
+
+/// Setting stale_after on a file that still carries the legacy `review_after`
+/// spelling migrates that one line in place rather than leaving two bounds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edit_engram_set_frontmatter_migrates_a_legacy_review_after() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    let path = plant(
+        &h,
+        "eng",
+        "reviewed",
+        "status: current\nreview_after: 2026-08-01\n",
+    )
+    .await;
+
+    call(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng",
+            "identifier": "reviewed",
+            "operation": "set_frontmatter",
+            "key": "stale_after",
+            "value": "2027-01-15",
+        }),
+    )
+    .await
+    .unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("stale_after: 2027-01-15"), "{text}");
+    assert!(
+        !text.contains("review_after"),
+        "the legacy line must be migrated, not duplicated: {text}"
+    );
+
+    // Clearing the bound removes it whichever spelling the file used.
+    call(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng",
+            "identifier": "reviewed",
+            "operation": "set_frontmatter",
+            "key": "stale_after",
+        }),
+    )
+    .await
+    .unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(!text.contains("stale_after"), "{text}");
+}
+
+/// verified stamps an OKF `{ by, at }` entry that re-parses: with no value it
+/// names the caller, with a value it names the actor given, and a second stamp
+/// by the same actor refreshes the entry instead of adding a line.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edit_engram_set_frontmatter_stamps_a_verification() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Checked", "content": "A rule." }),
+    )
+    .await
+    .unwrap();
+    let path = h.root.join("eng/checked.md");
+
+    call(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng",
+            "identifier": "checked",
+            "operation": "set_frontmatter",
+            "key": "verified",
+        }),
+    )
+    .await
+    .unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("verified: { by: "), "{text}");
+    let out = call(
+        peer,
+        "read_engram",
+        json!({ "domain": "eng", "identifier": "checked" }),
+    )
+    .await
+    .unwrap();
+    let entries = out["frontmatter"]["verified"].as_array().unwrap().clone();
+    assert_eq!(entries.len(), 1, "{out}");
+    // With no value the verifier is the same resolved identity the write path
+    // records as the editor, and the instant is real.
+    assert_eq!(
+        entries[0]["by"], out["frontmatter"]["generated"]["by"],
+        "the stamp must carry the caller's own identity: {out}"
+    );
+    assert!(entries[0]["at"].as_str().unwrap().contains('T'), "{out}");
+
+    // A named actor is recorded as given, alongside the first.
+    call(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng",
+            "identifier": "checked",
+            "operation": "set_frontmatter",
+            "key": "verified",
+            "value": "human:jordi",
+        }),
+    )
+    .await
+    .unwrap();
+    let out = call(
+        peer,
+        "read_engram",
+        json!({ "domain": "eng", "identifier": "checked" }),
+    )
+    .await
+    .unwrap();
+    let entries = out["frontmatter"]["verified"].as_array().unwrap().clone();
+    assert_eq!(entries.len(), 2, "both actors are kept: {out}");
+    assert_eq!(entries[1]["by"], json!("human:jordi"), "{out}");
+
+    // The same actor again refreshes its own entry rather than appending one.
+    call(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng",
+            "identifier": "checked",
+            "operation": "set_frontmatter",
+            "key": "verified",
+            "value": "human:jordi",
+        }),
+    )
+    .await
+    .unwrap();
+    let out = call(
+        peer,
+        "read_engram",
+        json!({ "domain": "eng", "identifier": "checked" }),
+    )
+    .await
+    .unwrap();
+    let entries = out["frontmatter"]["verified"].as_array().unwrap().clone();
+    assert_eq!(entries.len(), 2, "{out}");
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(text.matches("verified:").count(), 1, "{text}");
+}
+
+/// salience is a number from 0 to 10 in the metadata: the range is validated,
+/// a non-numeric value is refused and the value lands as a YAML number.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edit_engram_set_frontmatter_validates_the_salience_range() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Salient", "content": "A rule." }),
+    )
+    .await
+    .unwrap();
+    let path = h.root.join("eng/salient.md");
+
+    for bad in ["high", "11", "-1"] {
+        let err = call(
+            peer,
+            "edit_engram",
+            json!({
+                "domain": "eng",
+                "identifier": "salient",
+                "operation": "set_frontmatter",
+                "key": "salience",
+                "value": bad,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.contains("salience must be a number from 0 to 10"),
+            "unexpected error for {bad}: {err}"
+        );
+    }
+
+    call(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng",
+            "identifier": "salient",
+            "operation": "set_frontmatter",
+            "key": "salience",
+            "value": "8",
+        }),
+    )
+    .await
+    .unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        text.contains("salience: 8"),
+        "salience must stay a number: {text}"
+    );
+    let out = call(
+        peer,
+        "read_engram",
+        json!({ "domain": "eng", "identifier": "salient" }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out["frontmatter"]["extra"]["salience"], json!(8), "{out}");
+
+    // Omitting the value clears it again.
+    call(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng",
+            "identifier": "salient",
+            "operation": "set_frontmatter",
+            "key": "salience",
+        }),
+    )
+    .await
+    .unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(!text.contains("salience"), "{text}");
+}
+
+/// The fix cell an evolve finding carries is a `key=value` pair, so a lifecycle
+/// fix is one call with that pair split across key and value, and the edit
+/// leaves a file that re-parses and an index that agrees with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edit_engram_set_frontmatter_round_trips_into_the_index() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Old Pipeline", "content": "How deploys used to run." }),
+    )
+    .await
+    .unwrap();
+
+    // "set_frontmatter status=superseded", the way a queue row states it.
+    let (key, value) = "status=superseded".split_once('=').unwrap();
+    call(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng",
+            "identifier": "old-pipeline",
+            "operation": "set_frontmatter",
+            "key": key,
+            "value": value,
+        }),
+    )
+    .await
+    .unwrap();
+
+    let text = std::fs::read_to_string(h.root.join("eng/old-pipeline.md")).unwrap();
+    let engram = crystalline_core::parse_engram(&text).unwrap();
+    assert_eq!(engram.frontmatter.status.as_deref(), Some("superseded"));
+    // The provenance block is refreshed like any other edit.
+    assert!(engram.frontmatter.generated.is_some(), "{text}");
+
+    // The index agrees: a status-filtered search finds it under the new value.
+    let out = call(
+        peer,
+        "search_engrams",
+        json!({ "domains": ["eng"], "status": "superseded" }),
+    )
+    .await
+    .unwrap();
+    let hits = out["hits"].as_array().unwrap();
+    assert_eq!(hits.len(), 1, "{out}");
+    assert_eq!(hits[0]["permalink"], json!("old-pipeline"), "{out}");
+}
+
 /// validate_engrams runs the temporal checks: a date field written straight to
 /// disk with a time-of-day component is reported as a T003 issue.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

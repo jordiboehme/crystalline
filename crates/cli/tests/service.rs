@@ -758,6 +758,33 @@ fn explicit_overrides_bypass_a_running_daemon() {
     let _ = env.run(&["ctl", "shutdown"]);
 }
 
+/// `crystalline edit ... set_frontmatter` assigns a lifecycle field from
+/// --key/--value and never waits on stdin for content it does not use, so the
+/// same one-call fix an evolve queue prescribes works from the command line.
+#[test]
+fn edit_set_frontmatter_assigns_a_field_without_reading_stdin() {
+    let env = Env::new("set-fm");
+    env.setup_domain("eng");
+
+    let (ok, out) = env.run(&[
+        "edit",
+        "seed",
+        "eng",
+        "set_frontmatter",
+        "--key",
+        "status",
+        "--value",
+        "deprecated",
+        "--json",
+    ]);
+    assert!(ok, "edit set_frontmatter: {out}");
+    let text = std::fs::read_to_string(env.dir.join("kb-eng/seed.md")).unwrap();
+    assert!(text.contains("status: deprecated"), "{text}");
+    assert!(!text.contains("status: current"), "{text}");
+
+    let _ = env.run(&["ctl", "shutdown"]);
+}
+
 /// The CLI-daemon seam must stay format-independent. A daemon on the TOON
 /// response-format default still answers a CLI data command with structured
 /// engine JSON, because the command routes over the ctl `tool` command rather

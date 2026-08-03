@@ -364,12 +364,22 @@ enum Command {
         /// The engram's domain.
         domain: String,
         /// One of append, prepend, find_replace, replace_section,
-        /// insert_before_section, insert_after_section.
+        /// insert_before_section, insert_after_section, set_frontmatter.
         operation: String,
-        /// The content to add or the replacement. Read from stdin when omitted.
+        /// The content to add or the replacement. Read from stdin when omitted,
+        /// except for set_frontmatter, which takes --key and --value instead.
         /// Accepts a value that begins with `-`.
         #[arg(long, allow_hyphen_values = true)]
         content: Option<String>,
+        /// The frontmatter field to assign, for set_frontmatter: status,
+        /// valid_from, valid_to, stale_after, source_date, salience or
+        /// verified.
+        #[arg(long)]
+        key: Option<String>,
+        /// The value to assign, for set_frontmatter. Omit to remove the field;
+        /// omit on verified to stamp a verification as yourself.
+        #[arg(long, allow_hyphen_values = true)]
+        value: Option<String>,
         /// The heading path for the *_section operations.
         #[arg(long)]
         section: Option<String>,
@@ -1801,6 +1811,8 @@ async fn run_data(command: Command, db: Option<PathBuf>, json: bool) -> anyhow::
             domain,
             operation,
             content,
+            key,
+            value,
             section,
             find_text,
             expected_replacements,
@@ -1808,7 +1820,13 @@ async fn run_data(command: Command, db: Option<PathBuf>, json: bool) -> anyhow::
             expected_checksum,
             config,
         } => {
-            let body = content_or_stdin(content)?;
+            // set_frontmatter takes a key and a value, so it must never block
+            // on stdin waiting for content it does not use.
+            let body = if operation == "set_frontmatter" {
+                content
+            } else {
+                Some(content_or_stdin(content)?)
+            };
             (
                 "edit_engram",
                 json!({
@@ -1816,6 +1834,8 @@ async fn run_data(command: Command, db: Option<PathBuf>, json: bool) -> anyhow::
                     "domain": domain,
                     "operation": operation,
                     "content": body,
+                    "key": key,
+                    "value": value,
                     "section": section,
                     "find_text": find_text,
                     "expected_replacements": expected_replacements,

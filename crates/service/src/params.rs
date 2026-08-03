@@ -93,10 +93,29 @@ pub struct EditParams {
     /// The engram's domain.
     pub domain: String,
     /// One of append, prepend, find_replace, replace_section,
-    /// insert_before_section, insert_after_section.
+    /// insert_before_section, insert_after_section, set_frontmatter.
     pub operation: String,
-    /// The content to add or the replacement text.
-    pub content: String,
+    /// The content to add or the replacement text. Required by every operation
+    /// except set_frontmatter, which takes key and value instead.
+    #[serde(default)]
+    pub content: Option<String>,
+    /// The frontmatter field to assign, for set_frontmatter. One of status,
+    /// valid_from, valid_to, stale_after, source_date, salience or verified.
+    /// No other key is settable here: type, title, permalink, tags,
+    /// recorded_at and the generated provenance block carry identity and
+    /// provenance and are owned by their own tools.
+    #[serde(default)]
+    pub key: Option<String>,
+    /// The value to assign, for set_frontmatter. Omit it (or pass null) to
+    /// remove the field, which is how a valid_to that should never have been
+    /// set is cleared; status cannot be removed, since every engram needs one.
+    /// The four date keys take a plain ISO date (YYYY-MM-DD), salience a number
+    /// from 0 to 10. verified is the exception: it never removes, it stamps a
+    /// verification record `{ by, at }` with the current instant, taking the
+    /// value as the verifying actor and falling back to the caller's own
+    /// identity when it is omitted.
+    #[serde(default)]
+    pub value: Option<String>,
     /// The section heading path for the *_section operations, for example
     /// `## API > ### Auth`. Subsections are kept unless include_subsections.
     #[serde(default)]
