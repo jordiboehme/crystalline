@@ -519,6 +519,152 @@ The status words each mean one thing: `deprecated` says do not do this again,
 kept for the record and `legacy` says still deployed and true of old
 installations but not to be built on. `delete` is for mistakes, not history.
 
+## Evolve
+
+Every chapter so far began with you noticing something: a clamp that misreads, a
+mix that ran hot, a tag you typed two ways. That works while you still remember
+what you touched. A few weeks into the run the archive has outgrown your memory
+of it, and the useful question turns around. Instead of telling the ship what
+changed, you ask the ship what it needs:
+
+```text
+Sweep ship-ops and tell me what the archive needs - what has gone stale, what is
+half-finished, what looks duplicated.
+```
+
+*The agent runs a read-only sweep of the whole domain. Nothing is written: what
+comes back is a ranked queue where every item carries the evidence it fired on
+and the one action that clears it.*
+
+```text
+Sweep of ship-ops as of 2026-09-14
+23 engrams scanned, 6 findings (showing 6, page 1)
+temporal 3, structure 2, redundancy 1
+
+1. [90] V005 MECHANICAL
+   Hyperdrive motivator recall QX-114  crystalline://ship-ops/hyperdrive-motivator-recall-qx-114
+   still stable but already superseded by ship-ops/hyperdrive-motivator-swap-qx-114b
+   evidence: status=stable; superseded by ship-ops/hyperdrive-motivator-swap-qx-114b; inbound refs 2
+   fix: set_frontmatter status=superseded
+
+2. [85] V001 JUDGMENT
+   Bay 3 clamp bypass  crystalline://ship-ops/bay-3-clamp-bypass
+   validity window ended 2026-08-31 but the status is still stable
+   evidence: valid_to=2026-08-31; today=2026-09-14; status=stable; inbound refs 0
+   fix: set_frontmatter valid_to=<later date> or status=superseded
+
+3. [70] V002 JUDGMENT
+   Vent Driver Firmware  crystalline://ship-ops/vent-driver-firmware
+   stale since 2026-09-01 with no verification recorded since
+   evidence: stale_after=2026-09-01; today=2026-09-14; never verified
+   fix: set_frontmatter verified=<actor> or stale_after=<later date>
+
+4. [50] V102 MECHANICAL
+   Cold-bay docking checklist  crystalline://ship-ops/cold-bay-docking-checklist
+   unresolved reference [[Vent Drive Firmware]]
+   evidence: rel_type=depends_on; nothing titled `Vent Drive Firmware` in ship-ops; nearest is `Vent Driver Firmware`
+   fix: [[Vent Drive Firmware]] -> [[Vent Driver Firmware]]
+
+5. [35] V103 MECHANICAL
+   Hyperdrive install summary  crystalline://ship-ops/hyperdrive-install-summary
+   ship-ops/sources/qx-114-install-guide declares summarizes but the summarized_by back-link is missing
+   evidence: ship-ops/sources/qx-114-install-guide -summarizes-> ship-ops/hyperdrive-install-summary; no summarized_by pointing back
+   fix: append `- summarized_by [[QX-114 install guide]]`
+
+6. [30] V203 JUDGMENT
+   crystalline://ship-ops
+   2 tag spellings look like one tag (plural variants)
+   evidence: #vent on 1 engram(s); #vents on 5 engram(s)
+   fix: crystalline tags merge vent vents
+```
+
+That is the queue itself. Below it the sweep prints an `Actions:` legend, one
+line per rule spelling out the prescribed fix in full, any `Truncated:` note
+where a rule capped its own output and one standing reminder that the queue
+changes nothing by itself. A clean domain prints `nothing to work in this
+scope`, which is a perfectly good answer to have asked for.
+
+The number in brackets is the priority: how much the ship gains by fixing this
+one first. The word beside it is the one that decides who acts. `MECHANICAL`
+means the finding completes intent the archive already records - the swap engram
+already declares it supersedes the recall, so flipping the recall's status
+invents nothing. `JUDGMENT` means acting would change what the archive claims,
+and that is yours to approve. So the work splits in two, and the agent handles
+each half differently:
+
+```text
+Do the mechanical ones.
+```
+
+*Three items, one pass, one summary at the end - no item-by-item permission for
+work that only finishes what was already decided.* The recall gets
+`status: superseded` and a `- superseded_by` relation, the misspelled link
+becomes `[[Vent Driver Firmware]]` and the summary gets its `- summarized_by`
+back-link. The queue is not a script, though, so the agent still reports what it
+did rather than going quiet.
+
+The other three arrive one at a time, each as a proposal:
+
+```text
+The bay 3 clamp bypass expired on 31 August. Bay 3 was re-shimmed on the 12th,
+so I read this as ended rather than extended: retire it, close the window on the
+12th and carry the shim lesson onto the clamp engram? (y / n)
+```
+
+You say yes, and only then does it write. The firmware one you send away: the
+sweep says nobody has confirmed the shared-image fact since the review date came
+up, and confirming it means walking to the vent bay, so it stays in the queue
+until you have. The tag drift comes with a command rather than an edit, because
+folding tags is a bulk rewrite the agent never does on its own: it hands you
+`crystalline tags merge vent vents` for the
+[terminal corner](#the-terminal-corner) and leaves it there.
+
+Two things are missing from that queue, and both are the point. The
+`hyper-drive` spelling you folded back in Reconcile is gone for good: the sweep
+reads the `## Tag Aliases` section that the merge wrote into the MANIFEST, so a
+fold done once never comes back as a finding. And the glycol mix B retirement
+from Retire is not there either - you did all three steps that day, so there is
+nothing left to find. Item 1 is simply what that same edit looks like when a
+shift ends between step two and step three.
+
+Which is the honest limit of the whole thing. The sweep reads dates, links and
+graph shape: a status, a validity window, an edge that resolves or does not, a
+tag spelled two ways. It never reads for meaning. It found item 1 because a
+`supersedes` edge points at an engram still marked stable, not because it
+compared the recall with the swap and formed a view about which one is right. It
+will hand you a half-finished retirement every time and it will never tell you
+that two engrams contradict each other - even the duplicate detection is
+lexical, so two engrams saying the same thing in different words stay invisible
+to it. It finds the work; you still decide it.
+
+When the queue is worked, ask again:
+
+```text
+Run that sweep again.
+```
+
+*Same scope, same day, and the sweep re-derives the answer from scratch - nothing
+about the first run was stored, so "what is left" is only ever what is still
+true:*
+
+```text
+Sweep of ship-ops as of 2026-09-14
+23 engrams scanned, 2 findings (showing 2, page 1)
+temporal 1, redundancy 1
+```
+
+Six down to two, and the two still standing are the firmware re-check and the tag
+merge: both are waiting on you rather than on the archive, one for a walk to the
+vent bay and one for a command only you should run. That shrinking number is the
+whole feedback loop: it is how you
+know the pass landed, and it is why the sweep is worth running on a cadence
+rather than once. Ask for it after a big ingest drops a dozen engrams at once,
+when two search hits disagree and a half-finished retirement is the likely
+reason, or on the first shift of a month. Leave the domain out and it sweeps
+everything you have; ask for one family and it sticks to the temporal, structural
+or redundancy findings alone. What it is not is a session-start ritual: this is
+deliberate maintenance you ask for, never a chore the ship nags you about.
+
 ## Share
 
 A team domain is an ordinary domain whose files also live in a GitHub repository:
@@ -566,6 +712,7 @@ knowledge is worth the review.
 | Correct a fact | "Update the clamp threshold, do not start a new note." |
 | Retire a fact | "The old coolant mix is retired - supersede it, keep why." |
 | Tidy vocabulary | "Have our hyperdrive tags drifted?" |
+| Ask what needs work | "Sweep ship-ops and tell me what the archive needs." |
 | Share with the team | "Share the clamp findings as a proposal for review." |
 
 ### Reference blocks
@@ -599,8 +746,8 @@ name the domain separately.
 
 Optional power-user territory - a reader who never opens a terminal can skip it.
 But like the quarantine protocol on a certain other freighter, the checks earn
-their keep: run `verify` and `doctor` before you trust a shared branch. These are
-the only commands the chapters did not hand to the agent:
+their keep: run `verify` and `doctor` before you trust a shared branch. Most of
+these are commands the chapters never handed to the agent:
 
 ```sh
 crystalline install claude-code                     # wire up a harness (Setup)
@@ -610,6 +757,7 @@ crystalline tags merge <old> <into>                 # fold one tag into another
 crystalline origin discard fleet-ops --proposal 4   # abandon a declined proposal
 crystalline verify                                  # static check: frontmatter, links, schema
 crystalline doctor                                  # diagnose index and service; add --fix to repair
+crystalline evolve --domain ship-ops                # the Evolve sweep, run by hand
 crystalline reindex --full                          # rebuild the derived index from the files
 ```
 
@@ -621,6 +769,7 @@ they always are).
 ---
 
 That is the whole flight: record what you learn, query it back, ingest by
-distilling, reconcile in place, retire without forgetting and share for review.
+distilling, reconcile in place, retire without forgetting, sweep for what the
+archive needs and share for review.
 Keep the log honest and the ship stops being a stranger to itself. See you around,
 space cowboy.

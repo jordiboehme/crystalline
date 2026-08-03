@@ -334,7 +334,17 @@ pub fn render_evolve(v: &Value, out: &mut impl Write) -> io::Result<()> {
             .unwrap_or("(untitled)");
         writeln!(out)?;
         writeln!(out, "{n}. [{priority}] {rule} {class}")?;
-        writeln!(out, "   {title}  crystalline://{domain}/{permalink}")?;
+        // A domain-level finding (`V203` is the one today) carries neither
+        // permalink nor title, so it addresses the whole domain rather than
+        // printing a trailing slash and a blank title where an engram's would
+        // be.
+        if permalink.is_empty() {
+            writeln!(out, "   crystalline://{domain}")?;
+        } else if title.is_empty() {
+            writeln!(out, "   crystalline://{domain}/{permalink}")?;
+        } else {
+            writeln!(out, "   {title}  crystalline://{domain}/{permalink}")?;
+        }
         if let Some(finding) = item.get("finding").and_then(Value::as_str)
             && !finding.is_empty()
         {
@@ -642,6 +652,30 @@ mod tests {
             crystalline_service::engine::EVOLVE_GUIDANCE
         );
         assert_eq!(out, expected);
+    }
+
+    /// A finding about the whole domain rather than one engram (`V203`) has no
+    /// permalink and no title, so it addresses the domain instead of printing a
+    /// dangling slash where an engram's permalink would be.
+    #[test]
+    fn evolve_domain_level_finding_addresses_the_domain() {
+        let v = json!({
+            "scope": { "domains": ["eng"], "today": "2026-08-02" },
+            "engrams_scanned": 6,
+            "total": 1, "page": 1, "limit": 10, "count": 1,
+            "families": [{ "family": "redundancy", "findings": 1 }],
+            "queue": [{
+                "n": 1, "priority": 30, "rule": "V203", "class": "judgment",
+                "domain": "eng", "permalink": "", "title": "", "line": null,
+                "finding": "2 tag spellings look like one tag (plural variants)",
+                "evidence": "#vent on 1 engram(s); #vents on 5 engram(s)",
+                "fix": "crystalline tags merge vent vents",
+            }],
+            "actions": [], "truncations": [],
+        });
+        let out = render_to_string(render_evolve, &v);
+        assert!(out.contains("\n   crystalline://eng\n"), "{out}");
+        assert!(!out.contains("crystalline://eng/"), "{out}");
     }
 
     /// A clean sweep says so rather than printing an empty list, and still
