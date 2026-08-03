@@ -293,6 +293,40 @@ pub struct VocabularyParams {
     pub domain: Option<String>,
 }
 
+/// Parameters for `evolve_engrams`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+pub struct EvolveParams {
+    /// Restrict the sweep to these domains. Omit to sweep every registered
+    /// domain.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub domains: Vec<String>,
+    /// Restrict the sweep to these detector families: temporal (validity
+    /// windows, staleness and the supersede lifecycle), structure (references,
+    /// reciprocity, orphans, stubs and size) or redundancy (duplicate content,
+    /// colliding titles and tag drift). Omit for all three.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub families: Vec<String>,
+    /// Restrict the sweep to these rule ids, for example V001 or V201. Omit for
+    /// every rule in the requested families.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub rules: Vec<String>,
+    /// Drop findings scoring under this priority, 0 to 100. Useful to see only
+    /// what matters most on a large archive.
+    #[serde(default)]
+    pub min_priority: Option<u8>,
+    /// Page size. Defaults to 10, capped at 100.
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// One-based page number. Defaults to 1.
+    #[serde(default)]
+    pub page: Option<usize>,
+    /// Evaluate the temporal rules as of this ISO date (YYYY-MM-DD) instead of
+    /// today, so a run is reproducible. Only the date comparisons move; nothing
+    /// else about the sweep changes.
+    #[serde(default)]
+    pub today: Option<String>,
+}
+
 /// Parameters for `configure`. Omit everything to see the current settings
 /// and GitHub connection. `token` or `connect` handle a GitHub connect
 /// action on their own and ignore `set`/`unset` in the same call; give them

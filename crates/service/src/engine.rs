@@ -19,9 +19,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use chrono::{DateTime, Duration, FixedOffset, Utc};
+use chrono::{DateTime, Duration, FixedOffset, NaiveDate, Utc};
 use crystalline_core::config::{
-    DomainEntry, DomainKind as CoreDomainKind, GlobalConfig, OriginConfig, ResponseFormat,
+    DomainConfig, DomainEntry, DomainKind as CoreDomainKind, GlobalConfig, OriginConfig,
+    ResponseFormat, VerifyConfig,
 };
 use crystalline_core::emit::{
     append_body, insert_after_section, insert_before_section, prepend_body,
@@ -34,11 +35,11 @@ use crystalline_core::{
 };
 use crystalline_index::{
     ChunkParams, DEFAULT_RETIRED_WEIGHT, DEFAULT_SALIENCE_WEIGHT, DomainHost, DomainId, DomainKind,
-    EMBED_PAGE_SIZE, EdgeKind, EmbeddingProvider, EngramDescriptor, EngramId, EngramRecord,
-    FileStamp, GraphNode, GraphSlice, HostClaim, RecentFilter, SearchMode, SearchQuery, Store,
-    SyncReport, apply_scan, chunk_engram, configured_model_id, order_jobs_for_batching,
-    parse_metadata_filters, provider_from_config, retired_factor, salience_prior, scan_domain,
-    scan_paths,
+    EMBED_PAGE_SIZE, EdgeKind, EmbeddingProvider, EngramDescriptor, EngramFacts, EngramId,
+    EngramRecord, Family, FileStamp, Finding, GraphNode, GraphSlice, HostClaim, RULES,
+    RecentFilter, SearchMode, SearchQuery, Store, SweepInput, SweepOptions, SyncReport, apply_scan,
+    chunk_engram, configured_model_id, detect, order_jobs_for_batching, parse_metadata_filters,
+    provider_from_config, rank, retired_factor, rule_info, salience_prior, scan_domain, scan_paths,
 };
 use crystalline_remote::ops;
 use crystalline_remote::{
@@ -56,6 +57,30 @@ use crate::settings;
 
 /// How many chunks are embedded per background batch.
 const EMBED_BATCH: usize = 16;
+
+/// How many seed ids one [`Store::neighbors`] call takes during a consolidation
+/// sweep. The backends inline the seed list into an SQL `IN (...)`, so a whole
+/// domain in one call would build a statement proportional to its size. The
+/// slices are merged afterwards, which is what keeps the resolved degrees
+/// whole-index correct rather than per-chunk.
+const NEIGHBOR_CHUNK: usize = 5_000;
+
+/// The default `evolve_engrams` page size. Small on purpose: the queue is meant
+/// to be worked top-down and agreed item by item, not read in bulk.
+const EVOLVE_DEFAULT_LIMIT: usize = 10;
+
+/// The largest `evolve_engrams` page size.
+const EVOLVE_MAX_LIMIT: usize = 100;
+
+/// The fixed instruction every `evolve_engrams` response carries. It states the
+/// authority the queue does and does not have, so an agent working it never
+/// treats detection as permission to rewrite the archive.
+pub const EVOLVE_GUIDANCE: &str = "This queue changes nothing by itself. Present it and agree what to work before any write. \
+     Items marked mechanical complete intent the archive already records - fix those directly and summarize once. \
+     Items marked judgment change what the archive claims - read the engram, propose and wait for a yes, one at a time. \
+     A lifecycle finding never knows whether a change is a correction or a replacement; read and decide with the edit-versus-supersede test. \
+     Act only on the evidence stated: this sweep detects by dates, links and graph shape, never by meaning, so it cannot confirm a contradiction. \
+     Re-run the same scope when done.";
 
 /// The OKF actor recorded as `generated.by` when nothing else identifies the
 /// writer: no `identity.actor` setting and no client identity from the MCP
@@ -2766,6 +2791,291 @@ impl Engine {
             response["drift"] = Value::Array(drift);
         }
         Ok(response)
+    }
+
+    // --- evolve --------------------------------------------------------------
+
+    /// Run the consolidation sweep over a scope and return one page of its
+    /// ranked queue.
+    ///
+    /// Read-only end to end: it resolves the scope, assembles the facts every
+    /// detector reads, runs [`crystalline_index::detect`] once per domain and
+    /// shapes the merged result. Nothing is written and nothing is remembered,
+    /// so "what is left" is re-derived by calling again with the same scope.
+    ///
+    /// Five details of the assembly are load-bearing, each guarding a class of
+    /// silently wrong finding:
+    ///
+    /// - the resolved degrees are counted over the **merged** graph slices, so
+    ///   chunking the `neighbors` seed list never turns a linked engram into a
+    ///   `V104` orphan. The merge dedupes edges on the same key the backends
+    ///   use, because an edge whose ends land in two different chunks comes
+    ///   back from both calls;
+    /// - `stale_on` and `verified_on` come from the [`Frontmatter`] accessors,
+    ///   never the raw keys, so the legacy `review_after` and `last_verified`
+    ///   spellings fold in exactly as they do for search and verify;
+    /// - the token budget is resolved the way verify's `Q002` resolves it - a
+    ///   per-file override, then the domain default, then 2500 - so `V105` and
+    ///   `Q002` never disagree about what oversized means;
+    /// - `status` and `engram_type` arrive lowercased, because the status sets
+    ///   the rules test against are exact matches;
+    /// - `known_domains` is every registered domain, so `V102` can tell an
+    ///   unregistered target domain apart from a target that does not exist,
+    ///   and the graph is taken at depth 1 so cross-domain targets carry a
+    ///   status for `V101` to read.
+    pub async fn evolve_engrams(&self, p: &EvolveParams) -> Result<Value> {
+        let today = match p.today.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(s) => NaiveDate::parse_from_str(s, "%Y-%m-%d").map_err(|_| {
+                EngineError::Invalid(format!("today '{s}' is not an ISO date (YYYY-MM-DD)"))
+            })?,
+            None => Utc::now().date_naive(),
+        };
+        let families = parse_families(&p.families)?;
+        let rules = parse_rules(&p.rules)?;
+
+        // Every registered domain, both as the default scope and as `V102`'s
+        // idea of which `[[domain:Target]]` prefixes name a real domain.
+        let mut known_domains = self.known_domain_names();
+        known_domains.sort();
+        known_domains.dedup();
+
+        let mut scope: Vec<String> = Vec::new();
+        if p.domains.is_empty() {
+            scope = known_domains.clone();
+        } else {
+            for name in &p.domains {
+                // The same resolution every other tool uses, so an unknown name
+                // errors identically and a domain registered after startup is
+                // still found.
+                self.domain_entry(name)?;
+                if !scope.contains(name) {
+                    scope.push(name.clone());
+                }
+            }
+        }
+
+        let mut findings: Vec<Finding> = Vec::new();
+        let mut truncations: Vec<String> = Vec::new();
+        let mut engrams_scanned = 0usize;
+        let mut unparsed = 0usize;
+
+        // One domain at a time: `SweepInput` is domain-scoped (two rules are
+        // domain-relative) and processing them in turn bounds the memory an
+        // unscoped sweep needs to whatever the largest domain costs.
+        for name in &scope {
+            let source = self.content_source(name)?;
+            let store = self.store.lock().await;
+            let descs = store.list_engrams(name, None, None).await?;
+            drop(store);
+            // No engrams means no domain row to query against and nothing to
+            // detect. An empty domain is quiet, not an error.
+            let Some(domain_id) = descs.first().map(|d| d.domain_id) else {
+                continue;
+            };
+
+            let graph = self.sweep_graph(&descs).await?;
+            let mut inbound: HashMap<i64, usize> = HashMap::new();
+            let mut outbound: HashMap<i64, usize> = HashMap::new();
+            for edge in &graph.edges {
+                *outbound.entry(edge.from.0).or_default() += 1;
+                *inbound.entry(edge.to.0).or_default() += 1;
+            }
+
+            let store = self.store.lock().await;
+            let unresolved = store.unresolved_refs(domain_id).await?;
+            let vocab = store.vocabulary(Some(name)).await?;
+            drop(store);
+
+            let verify_config = domain_verify_config(&source);
+            let mut facts: Vec<EngramFacts> = Vec::with_capacity(descs.len());
+            for d in &descs {
+                // Files-are-truth for a file domain, the stored content for a
+                // virtual one. An engram that no longer parses is counted and
+                // skipped rather than failing the whole sweep, since one broken
+                // file must not hide every finding behind it.
+                let Some(engram) = self.load_engram(&source, d.domain_id, &d.path).await else {
+                    unparsed += 1;
+                    continue;
+                };
+                let fm = &engram.frontmatter;
+                let status = match fm
+                    .status
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    Some(s) => s.to_ascii_lowercase(),
+                    None => d.status.trim().to_ascii_lowercase(),
+                };
+                let title = if fm.title.trim().is_empty() {
+                    d.title.clone()
+                } else {
+                    fm.title.clone()
+                };
+                let tokens = engram.body.chars().count() / 4;
+                facts.push(EngramFacts {
+                    id: d.id,
+                    domain: d.domain.clone(),
+                    permalink: d.permalink.clone(),
+                    title,
+                    path: d.path.clone(),
+                    status,
+                    engram_type: fm.engram_type.trim().to_ascii_lowercase(),
+                    tags: fm.tags.clone(),
+                    salience: yaml_number(fm.extra.get("salience")),
+                    recorded_at: fm.recorded_at,
+                    valid_from: fm.valid_from,
+                    valid_to: fm.valid_to,
+                    stale_on: fm.stale_on(),
+                    verified_on: fm.latest_verified().map(|v| v.at.date_naive()),
+                    tokens,
+                    token_budget: resolve_token_budget(verify_config.as_ref(), &d.path),
+                    inbound: inbound.get(&d.id.0).copied().unwrap_or(0),
+                    outbound: outbound.get(&d.id.0).copied().unwrap_or(0),
+                    body: engram.body,
+                });
+            }
+
+            let input = SweepInput {
+                domain: name.clone(),
+                today,
+                engrams: facts,
+                graph,
+                unresolved,
+                tags: vocab.tags,
+                tag_aliases: vocab.aliases,
+                known_domains: known_domains.clone(),
+                options: SweepOptions::default(),
+            };
+            let report = detect(&input);
+            engrams_scanned += report.engrams_scanned;
+            // A cap that fired is domain-local, so the merged list names the
+            // domain it fired in.
+            truncations.extend(report.truncations.iter().map(|t| format!("{name} - {t}")));
+            findings.extend(report.findings);
+        }
+
+        findings.retain(|f| {
+            (families.is_empty() || families.contains(&f.family))
+                && (rules.is_empty() || rules.contains(&f.rule))
+                && p.min_priority.is_none_or(|min| f.priority >= min)
+        });
+        // Re-ranked after the merge: each domain's report is ranked on its own,
+        // and the sort is total and deterministic, so consecutive pages of an
+        // unscoped sweep stay coherent.
+        rank(&mut findings);
+
+        let total = findings.len();
+        let limit = p
+            .limit
+            .unwrap_or(EVOLVE_DEFAULT_LIMIT)
+            .clamp(1, EVOLVE_MAX_LIMIT);
+        let page = p.page.unwrap_or(1).max(1);
+        let offset = (page - 1).saturating_mul(limit);
+        let shown: &[Finding] = match findings.get(offset..) {
+            Some(rest) => &rest[..rest.len().min(limit)],
+            None => &[],
+        };
+
+        // Family counts are over the whole filtered result, not the page, so a
+        // reader on page 1 sees the shape of everything waiting.
+        let family_counts: Vec<Value> = Family::ALL
+            .iter()
+            .filter_map(|family| {
+                let count = findings.iter().filter(|f| f.family == *family).count();
+                (count > 0).then(|| json!({ "family": family.as_str(), "findings": count }))
+            })
+            .collect();
+
+        // Every row flat with scalar-only cells, so the queue renders as one
+        // tabular block. `n` is the rank across the whole result, not within the
+        // page, so an item keeps its number as the reader pages.
+        let queue: Vec<Value> = shown
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                json!({
+                    "n": offset + i + 1,
+                    "priority": f.priority,
+                    "rule": f.rule,
+                    "class": f.class.as_str(),
+                    "domain": f.domain,
+                    "permalink": f.permalink,
+                    "title": f.title,
+                    "line": f.line,
+                    "finding": f.finding,
+                    "evidence": f.evidence,
+                    "fix": f.fix,
+                })
+            })
+            .collect();
+
+        // The prose instruction rides a per-rule legend rather than a column, so
+        // a page of ten findings from one rule carries it once. Only the rules
+        // on this page appear.
+        let actions: Vec<Value> = RULES
+            .iter()
+            .filter(|info| shown.iter().any(|f| f.rule == info.id))
+            .map(|info| json!({ "rule": info.id, "instruction": info.instruction }))
+            .collect();
+
+        Ok(json!({
+            "scope": {
+                "domains": scope,
+                "families": families.iter().map(|f| f.as_str()).collect::<Vec<_>>(),
+                "rules": rules,
+                "min_priority": p.min_priority,
+                "today": today.to_string(),
+            },
+            "engrams_scanned": engrams_scanned,
+            "unparsed": unparsed,
+            "total": total,
+            "page": page,
+            "limit": limit,
+            "count": queue.len(),
+            "families": family_counts,
+            "queue": queue,
+            "actions": actions,
+            "guidance": EVOLVE_GUIDANCE,
+            "truncations": truncations,
+        }))
+    }
+
+    /// The resolved graph around a whole domain, at depth 1 so every
+    /// cross-domain target carries a status.
+    ///
+    /// The seed list is chunked because both backends inline it into an SQL
+    /// `IN (...)`. Every edge incident on a seed has its other end inside that
+    /// chunk's slice, so merging the slices yields exactly the whole-index edge
+    /// set for the domain. Nodes and edges are deduped on the merge: a node
+    /// reached from two chunks, and an edge whose two ends sit in different
+    /// chunks, both come back more than once, and a double-counted edge would
+    /// inflate the degrees the ranking and the orphan rule read.
+    async fn sweep_graph(&self, descs: &[EngramDescriptor]) -> Result<GraphSlice> {
+        let ids: Vec<EngramId> = descs.iter().map(|d| d.id).collect();
+        let mut graph = GraphSlice::default();
+        let mut seen_nodes: HashSet<i64> = HashSet::new();
+        let mut seen_edges: HashSet<(i64, i64, String, u8)> = HashSet::new();
+        for chunk in ids.chunks(NEIGHBOR_CHUNK) {
+            let store = self.store.lock().await;
+            let slice = store.neighbors(chunk, 1).await?;
+            drop(store);
+            for node in slice.nodes {
+                if seen_nodes.insert(node.id.0) {
+                    graph.nodes.push(node);
+                }
+            }
+            for edge in slice.edges {
+                let kind = match edge.kind {
+                    EdgeKind::Relation => 0u8,
+                    EdgeKind::Link => 1u8,
+                };
+                if seen_edges.insert((edge.from.0, edge.to.0, edge.rel_type.clone(), kind)) {
+                    graph.edges.push(edge);
+                }
+            }
+        }
+        Ok(graph)
     }
 
     // --- infer schema --------------------------------------------------------
@@ -5825,6 +6135,91 @@ fn mode_str(m: SearchMode) -> &'static str {
         SearchMode::Semantic => "semantic",
         SearchMode::Title => "title",
         SearchMode::Permalink => "permalink",
+    }
+}
+
+/// Parse the requested detector families, erroring on an unknown value with the
+/// valid set named so a caller recovers in one step.
+fn parse_families(requested: &[String]) -> Result<Vec<Family>> {
+    let mut out: Vec<Family> = Vec::new();
+    for raw in requested {
+        let family = Family::parse(raw).ok_or_else(|| {
+            let valid: Vec<&str> = Family::ALL.iter().map(|f| f.as_str()).collect();
+            EngineError::Invalid(format!(
+                "unknown family '{raw}'; valid families: {}",
+                valid.join(", ")
+            ))
+        })?;
+        if !out.contains(&family) {
+            out.push(family);
+        }
+    }
+    Ok(out)
+}
+
+/// Parse the requested rule ids into their catalog spellings, erroring on an
+/// unknown id with the whole catalog named. The reserved `V3xx` range is not in
+/// the catalog, so asking for it errors here rather than returning silence.
+fn parse_rules(requested: &[String]) -> Result<Vec<&'static str>> {
+    let mut out: Vec<&'static str> = Vec::new();
+    for raw in requested {
+        let key = raw.trim().to_ascii_uppercase();
+        let info = rule_info(&key).ok_or_else(|| {
+            let valid: Vec<&str> = RULES.iter().map(|r| r.id).collect();
+            EngineError::Invalid(format!(
+                "unknown rule '{raw}'; valid rules: {}",
+                valid.join(", ")
+            ))
+        })?;
+        if !out.contains(&info.id) {
+            out.push(info.id);
+        }
+    }
+    Ok(out)
+}
+
+/// A domain's verify overrides, read from the `.crystalline.yaml` at its root.
+/// A virtual domain has no root and therefore no overrides, so its engrams take
+/// the default budget.
+fn domain_verify_config(source: &ContentSource) -> Option<VerifyConfig> {
+    let ContentSource::File { root } = source else {
+        return None;
+    };
+    let path = root.join(".crystalline.yaml");
+    if !path.is_file() {
+        return None;
+    }
+    crystalline_core::config::load_yaml::<DomainConfig>(&path)
+        .ok()
+        .and_then(|c| c.verify)
+}
+
+/// The approximate token budget for one engram, resolved exactly the way
+/// verify's `Q002` resolves it: a per-file override, then the domain default,
+/// then [`crystalline_index::sweep::DEFAULT_TOKEN_BUDGET`]. A budget of `0`
+/// disables the size rule for that engram. `rel` is the domain-relative,
+/// forward-slashed path the override map is keyed by.
+fn resolve_token_budget(verify: Option<&VerifyConfig>, rel: &str) -> usize {
+    if let Some(v) = verify {
+        if let Some(&b) = v.token_budgets.get(rel) {
+            return b;
+        }
+        if let Some(b) = v.token_budget {
+            return b;
+        }
+    }
+    crystalline_index::sweep::DEFAULT_TOKEN_BUDGET
+}
+
+/// A frontmatter value read as a number, for the `salience` ranking input. An
+/// integer, a float and a numeric string all count; anything else is absent, the
+/// same neutral reading the index gives a non-numeric salience.
+fn yaml_number(value: Option<&YamlValue>) -> Option<f64> {
+    match value? {
+        YamlValue::Int(i) => Some(*i as f64),
+        YamlValue::Float(f) => Some(*f),
+        YamlValue::String(s) => s.trim().parse::<f64>().ok(),
+        _ => None,
     }
 }
 
