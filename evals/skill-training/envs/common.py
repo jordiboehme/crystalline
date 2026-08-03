@@ -31,6 +31,13 @@ in the MCP config) passes ``setup(item, sandbox)`` returning
 optional ``teardown(prepared)`` that runs after scoring even on
 failure.
 
+An env whose expectations are about transcript *order* between what the
+agent said and what it did (the evolve benchmark: a proposal has to
+precede a judgment-class mutation) passes ``score_wants_conversation``,
+which appends the parsed conversation - assistant text and tool calls
+interleaved in the order they happened - as a sixth argument to
+``score``. Every other env keeps the five-argument signature.
+
 Results are resume-aware per out_root: a task whose result.json already
 exists is loaded, not re-run, matching the built-in envs' behavior.
 """
@@ -58,7 +65,9 @@ TRANSIENT_API_STATUS = {401, 403, 429, 500, 502, 503, 529}
 RESERVED_FILENAMES = {"index.md", "log.md"}
 
 PrepareFn = Callable[[dict, Path], Any]
-ScoreFn = Callable[[dict, Path, list[dict], str, Any], tuple[int, float, list[str]]]
+# Five positional arguments, plus the conversation as a sixth when the env
+# passes score_wants_conversation.
+ScoreFn = Callable[..., tuple[int, float, list[str]]]
 SetupFn = Callable[[dict, Path], tuple[Path, Any]]
 TeardownFn = Callable[[Any], None]
 
@@ -270,6 +279,7 @@ def rollout_one(
     prepare: PrepareFn | None = None,
     setup: SetupFn | None = None,
     teardown: TeardownFn | None = None,
+    score_wants_conversation: bool = False,
     default_task_type: str,
     sandbox_prefix: str,
 ) -> dict:
@@ -355,7 +365,10 @@ def rollout_one(
 
         # Score while the sandbox is alive so post-state checks can read
         # the domain files the agent may have written.
-        hard, soft, failed_checks = score(item, sandbox, tool_calls, answer, prepared)
+        extra = (conversation,) if score_wants_conversation else ()
+        hard, soft, failed_checks = score(
+            item, sandbox, tool_calls, answer, prepared, *extra
+        )
     finally:
         if teardown is not None:
             teardown(prepared)
@@ -402,6 +415,7 @@ def run_batch(
     prepare: PrepareFn | None = None,
     setup: SetupFn | None = None,
     teardown: TeardownFn | None = None,
+    score_wants_conversation: bool = False,
     default_task_type: str,
     sandbox_prefix: str,
 ) -> list[dict]:
@@ -423,6 +437,7 @@ def run_batch(
             prepare=prepare,
             setup=setup,
             teardown=teardown,
+            score_wants_conversation=score_wants_conversation,
             default_task_type=default_task_type,
             sandbox_prefix=sandbox_prefix,
         )

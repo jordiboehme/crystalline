@@ -15,12 +15,22 @@ domain spec (scope, when, notes, engrams), scaffolded fresh, or
 `{"mirror": "<local_domain>"}`, a byte-for-byte copy of an already-built
 local domain so a preconnect adopts it with no spurious local changes.
 
+A workspace may also carry an `options` table beside its domains, for a
+fixture whose whole point is knowledge that has gone off. `recorded_at`
+pins that key on every generated file so age-based rules measure a
+constant instead of the days since this script last ran (an engram may
+override it with its own `recorded` date), `manifest_verified` stamps
+each MANIFEST as verified so the aging rule never speaks about it, and
+`allow_verify_errors` lets a deliberately derelict workspace generate
+with verify errors standing rather than failing the build.
+
 Regenerate after editing the content tables below (name workspaces to
 rebuild only those and leave the rest untouched):
 
     bash fixtures/generate.sh
     bash fixtures/generate.sh aurora
     bash fixtures/generate.sh harbor
+    bash fixtures/generate.sh derelict
 """
 from __future__ import annotations
 
@@ -49,6 +59,7 @@ def engram(
     status: str = "",
     engram_type: str = "",
     metadata: dict | None = None,
+    recorded: str = "",
 ) -> dict:
     return {
         "title": title,
@@ -57,7 +68,39 @@ def engram(
         "status": status,
         "type": engram_type,
         "metadata": metadata or {},
+        "recorded": recorded,
     }
+
+
+# One `verified` stamp, reused by every engram in the derelict workspace that
+# must stay out of the aging rule's way. A recorded verification is the only
+# date-stable way to silence `V003`: a future `stale_after` would itself elapse
+# one day and turn into a `V002` finding nobody planted.
+ARCHIVIST_VERIFIED = {"verified": {"by": "archivist", "at": "2026-02-10T09:00:00Z"}}
+
+
+def control_room_log(nights: int = 64) -> str:
+    """A deliberately oversized body for the `V105` fixture: a verbatim night
+    log that was never distilled, comfortably past the 2500 token budget the
+    sweep and verify's `Q002` share."""
+    seeing = [0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.6]
+    lines = [
+        "The raw control room log for the winter run, pasted in whole and "
+        "never distilled into a summary. Every night carries its own line "
+        "with the conditions the observer wrote down at the end of the "
+        "shift, which is why this engram keeps growing instead of settling.",
+        "",
+    ]
+    for n in range(1, nights + 1):
+        arcsec = seeing[n % len(seeing)]
+        lines.append(
+            f"- [fact] Night {n:02d} of the winter run opened with seeing near "
+            f"{arcsec} arcseconds and humidity in the {40 + (n * 3) % 50}s, the "
+            f"dome stayed open for {4 + n % 6} hours and the observer logged "
+            f"{n % 4} interruptions before dawn #observatory"
+        )
+    lines.append('- "relates to" [[Nightly calibration checklist]]')
+    return "\n".join(lines)
 
 
 WORKSPACES: dict[str, dict] = {
@@ -889,6 +932,284 @@ WORKSPACES: dict[str, dict] = {
             },
         },
     },
+    # A run-down archive for the crystalline-evolve benchmark: `observatory`
+    # plants exactly one instance of each of the fourteen V rules the
+    # consolidation sweep detects, and `outreach` is the tidy control domain
+    # that must stay silent so a scoped sweep and an all-domain sweep differ.
+    #
+    # Date stability is the whole trick here. The temporal rules compare
+    # against today, so a fixture whose dates were merely "recent at
+    # generation time" would decay: an elapsed window would still be elapsed,
+    # but every engram would drift past the 180-day aging floor and the queue
+    # would fill with V003 findings nobody planted. Three rules together keep
+    # the queue identical whenever the fixture is generated and whenever it is
+    # run:
+    #
+    # 1. every planted bound sits in the past for good (`valid_to` 2025-06-30,
+    #    `stale_after` 2025-09-15), so V001 and V002 can never un-fire;
+    # 2. `options.recorded_at` pins `recorded_at` on every file after
+    #    generation, so the ages V003 and V104 measure are fixed constants
+    #    rather than "days since somebody ran generate.sh";
+    # 3. every engram that must not draw an aging finding carries a recorded
+    #    `verified` stamp, which suppresses V003 forever, where a future
+    #    `stale_after` would eventually elapse and invent a V002 finding.
+    #
+    # The workspace is deliberately not verify-clean: the planted stub (V106)
+    # and the planted oversized engram (V105) are the same shapes verify's
+    # Q001 and Q002 call errors. The eval's verify gate only fails an item on
+    # a NEW error, so the pre-existing ones are the point.
+    "derelict": {
+        "options": {
+            "recorded_at": "2024-03-01",
+            "manifest_verified": "2026-02-10T09:00:00+00:00",
+            "allow_verify_errors": True,
+        },
+        "observatory": {
+            "scope": [
+                "Observatory operations: dome, optics, calibration and the nightly routine",
+                "Years of accumulated notes that nobody has tidied since the last director left",
+            ],
+            "when": [
+                "Questions about how the telescope is run, calibrated or maintained",
+            ],
+            "notes": [
+                "Much of this is overdue a review; check status and dates before trusting an entry",
+            ],
+            "engrams": [
+                # V005: the replacement landed, the retirement never happened.
+                # This one stays stable while `Dome shutter automation`
+                # already declares it supersedes it.
+                engram(
+                    "Dome shutter procedure",
+                    "How the dome shutter is opened and closed by hand.\n\n"
+                    "- [fact] The shutter is driven from the control room with the hand paddle #observatory\n"
+                    "- [convention] The shutter is parked closed whenever humidity passes eighty percent #observatory",
+                    tags="observatory,dome",
+                    engram_type="runbook",
+                    metadata=ARCHIVIST_VERIFIED,
+                ),
+                engram(
+                    "Dome shutter automation",
+                    "The automated shutter control that took over from the hand paddle.\n\n"
+                    "- [fact] The shutter follows the roof controller and closes itself on a humidity trip #observatory\n"
+                    "- supersedes [[Dome shutter procedure]]",
+                    tags="observatory,dome",
+                    engram_type="runbook",
+                    metadata=ARCHIVIST_VERIFIED,
+                ),
+                # V001: the validity window closed years ago and the status
+                # never moved. No inbound supersedes, so V005 does not own it.
+                engram(
+                    "Filter wheel calibration window",
+                    "The filter wheel offsets that applied through the 2024 season.\n\n"
+                    "- [fact] The filter wheel offsets were measured against the 2024 flat field set #observatory\n"
+                    '- "relates to" [[Nightly calibration checklist]]',
+                    tags="observatory,calibration",
+                    metadata={
+                        "valid_from": "2024-01-01",
+                        "valid_to": "2025-06-30",
+                        **ARCHIVIST_VERIFIED,
+                    },
+                ),
+                # V002: the review date elapsed and nobody ever recorded a
+                # check, so this one deliberately carries no verified stamp.
+                engram(
+                    "Mirror recoating schedule",
+                    "When the primary mirror is due for a fresh aluminium coat.\n\n"
+                    "- [fact] The primary is recoated every four years and was last done in the 2022 shutdown #observatory\n"
+                    '- "relates to" [[Nightly calibration checklist]]',
+                    tags="observatory,mirror",
+                    metadata={"stale_after": "2025-09-15"},
+                ),
+                # V003: the one engram left with no verification and no
+                # staleness bound at all, so the aging rule has exactly one
+                # candidate.
+                engram(
+                    "Site seeing conditions",
+                    "What the site typically delivers on a good night.\n\n"
+                    "- [fact] Median seeing at the site is one point one arcseconds #observatory\n"
+                    '- "relates to" [[Nightly calibration checklist]]',
+                    tags="observatory,site",
+                ),
+                # V004: retired as superseded, and the successor it names does
+                # not resolve - the case verify's T005 cannot see.
+                engram(
+                    "Guiding camera driver notes",
+                    "Notes on the old guiding camera driver build.\n\n"
+                    "- [fact] The driver was pinned to the vendor build from the 2023 season #observatory\n"
+                    "- superseded_by [[Guiding camera driver rebuild]]",
+                    tags="observatory,guiding",
+                    status="superseded",
+                ),
+                # V101 needs a properly retired engram with a known successor
+                # for a live engram to point at.
+                engram(
+                    "Photometry pipeline v1",
+                    "The first photometry pipeline, kept so nobody rebuilds it.\n\n"
+                    "- [lesson] The v1 pipeline mis-handled saturated stars and was retired for it #observatory\n"
+                    "- superseded_by [[Photometry pipeline v2]]",
+                    tags="observatory,photometry",
+                    status="deprecated",
+                ),
+                engram(
+                    "Photometry pipeline v2",
+                    "The photometry pipeline in use now.\n\n"
+                    "- [fact] The v2 pipeline masks saturated pixels before it fits a profile #observatory\n"
+                    "- supersedes [[Photometry pipeline v1]]",
+                    tags="observatory,photometry",
+                    metadata=ARCHIVIST_VERIFIED,
+                ),
+                # V101: a current engram still depending on the retired v1.
+                engram(
+                    "Nightly calibration checklist",
+                    "The checklist the observer works through before the first exposure.\n\n"
+                    "- [convention] The observer runs bias frames then flats then a focus sweep #observatory\n"
+                    "- depends_on [[Photometry pipeline v1]]",
+                    tags="observatory,calibration",
+                    engram_type="runbook",
+                    metadata=ARCHIVIST_VERIFIED,
+                ),
+                # V102: one word off a real title, so the sweep can name the
+                # intended target and call the repair mechanical.
+                engram(
+                    "Focus sweep routine",
+                    "How the focus sweep is run at the start of the night.\n\n"
+                    "- [convention] The focus sweep steps through eleven positions and fits a parabola #observatory\n"
+                    '- "relates to" [[Nightly calibration checklists]]\n'
+                    "- depends_on [[Dome shutter automation]]",
+                    tags="observatory,calibration",
+                    engram_type="runbook",
+                    metadata=ARCHIVIST_VERIFIED,
+                ),
+                # V103: the summarizes half is wired, the summarized_by half
+                # is not. The finding attaches to the review, not the digest.
+                engram(
+                    "Optics review digest",
+                    "The short read of the adaptive optics review.\n\n"
+                    "- [insight] Loop gain turned out to be the single biggest lever on delivered image quality #observatory\n"
+                    "- summarizes [[Adaptive optics review 2025]]",
+                    tags="observatory,optics",
+                    metadata=ARCHIVIST_VERIFIED,
+                ),
+                engram(
+                    "Adaptive optics review 2025",
+                    "The full write-up of the 2025 adaptive optics review, covering loop gain, actuator health and the wavefront sensor budget.\n\n"
+                    "- [fact] The review measured loop gain across four nights and the delivered image quality tracked it closely #observatory\n"
+                    "- [fact] Two actuators in the outer ring were found stuck and were replaced during the review #observatory",
+                    tags="observatory,optics",
+                    engram_type="reference",
+                    metadata=ARCHIVIST_VERIFIED,
+                ),
+                # V104: the only engram in the domain with no resolved edge in
+                # either direction, and old enough that the capture session is
+                # long over.
+                engram(
+                    "Cable trench survey",
+                    "What the trench survey found between the dome and the plant room.\n\n"
+                    "- [fact] The trench carries the fibre run and the mains feed in one duct #observatory\n"
+                    "- [risk] A single duct means one dig can take out both the network and the power #observatory",
+                    tags="observatory,site",
+                    metadata=ARCHIVIST_VERIFIED,
+                ),
+                # V105: a verbatim log that was never distilled, well past the
+                # 2500 token budget.
+                engram(
+                    "Control room log transcript",
+                    control_room_log(),
+                    tags="observatory,logs",
+                    engram_type="source",
+                    metadata=ARCHIVIST_VERIFIED,
+                ),
+                # V106: two body lines where verify's Q001 wants three.
+                engram(
+                    "Spectrograph slit width",
+                    "- [fact] The slit is set to one point five arcseconds #observatory\n"
+                    '- "relates to" [[Nightly calibration checklist]]',
+                    tags="observatory,calibrations",
+                    metadata=ARCHIVIST_VERIFIED,
+                ),
+                # V201: two bodies that differ by a handful of characters, so
+                # the Dice verification lands well over the 0.80 threshold.
+                engram(
+                    "Dew heater settings",
+                    "How the dew heaters are set for a normal winter night on the corrector plate and the finder.\n\n"
+                    "- [fact] The corrector plate heater runs at forty percent duty through the whole night #observatory\n"
+                    "- [fact] The finder heater runs at twenty percent duty and is switched off at dawn #observatory\n"
+                    '- "relates to" [[Nightly calibration checklist]]',
+                    tags="observatory,dew",
+                    metadata=ARCHIVIST_VERIFIED,
+                ),
+                engram(
+                    "Dew heater notes",
+                    "How the dew heaters are set for a normal winter night on the corrector plate and the finder scope.\n\n"
+                    "- [fact] The corrector plate heater runs at forty percent duty through the whole night #observatory\n"
+                    "- [fact] The finder heater runs at twenty percent duty and is switched off at dawn #observatory\n"
+                    '- "relates to" [[Nightly calibration checklist]]',
+                    tags="observatory,dew",
+                    metadata=ARCHIVIST_VERIFIED,
+                ),
+                # V202: a plural apart in the title with genuinely different
+                # bodies, so the title rule fires without the content rule.
+                engram(
+                    "Telescope drive belt check",
+                    "The fortnightly belt inspection on the right ascension drive.\n\n"
+                    "- [convention] The right ascension belt is checked every fortnight for glazing and tension #observatory\n"
+                    '- "relates to" [[Nightly calibration checklist]]',
+                    tags="observatory,drive",
+                    metadata=ARCHIVIST_VERIFIED,
+                ),
+                engram(
+                    "Telescope drive belt checks",
+                    "What the maintenance crew writes down after an inspection.\n\n"
+                    "- [fact] Belt tension is logged in newtons against the date and the crew initials #observatory\n"
+                    '- "relates to" [[Nightly calibration checklist]]',
+                    tags="observatory,drive",
+                    metadata=ARCHIVIST_VERIFIED,
+                ),
+                # V203 rides the #calibration / #calibrations pair planted
+                # across the calibration engrams and the slit width stub.
+            ],
+        },
+        "outreach": {
+            "scope": [
+                "Public outreach: open nights, visitor safety and school bookings",
+                "Kept tidy on purpose, so a sweep of this domain finds nothing",
+            ],
+            "when": [
+                "Questions about open nights, visitor safety or school group bookings",
+            ],
+            "notes": ["Everything here is linked, verified and current"],
+            "engrams": [
+                engram(
+                    "Public open night format",
+                    "How a public open night runs from gate to close.\n\n"
+                    "- [convention] Open nights run in two ninety minute sessions with a fixed dome slot each #outreach\n"
+                    "- [fact] Sessions cap at forty visitors so everyone reaches the eyepiece #outreach\n"
+                    '- "relates to" [[Visitor safety briefing]]',
+                    tags="outreach,events",
+                    metadata=ARCHIVIST_VERIFIED,
+                ),
+                engram(
+                    "Visitor safety briefing",
+                    "What every visitor hears before they go up to the dome.\n\n"
+                    "- [convention] The briefing covers the stair rail the dark adaptation rule and the dome slit exclusion zone #outreach\n"
+                    "- [fact] Nobody goes onto the observing floor without the briefing #outreach\n"
+                    '- "relates to" [[Public open night format]]',
+                    tags="outreach,safety",
+                    metadata=ARCHIVIST_VERIFIED,
+                ),
+                engram(
+                    "School group booking",
+                    "How a school books a daytime visit.\n\n"
+                    "- [convention] Schools book a term ahead and bring one adult for every eight pupils #outreach\n"
+                    "- [fact] Daytime visits use the solar scope rather than the main telescope #outreach\n"
+                    '- "relates to" [[Public open night format]]',
+                    tags="outreach,schools",
+                    metadata=ARCHIVIST_VERIFIED,
+                ),
+            ],
+        },
+    },
 }
 
 
@@ -918,12 +1239,74 @@ def patch_manifest(path: Path, name: str, spec: dict) -> None:
     path.write_text(front + body, encoding="utf-8")
 
 
-def verify_domain(domain_dir: Path, label: str, env: dict) -> None:
+def patch_frontmatter(path: Path, updates: dict[str, str]) -> None:
+    """Set frontmatter keys on an already-written file, replacing a key that
+    is there and appending one that is not. The emitter owns `recorded_at`
+    and refuses it through `metadata`, so a fixture that needs a fixed age
+    has to reach the file after the write."""
+    text = path.read_text(encoding="utf-8")
+    lines = text.split("\n")
+    if not lines or lines[0].strip() != "---":
+        raise SystemExit(f"no frontmatter to patch in {path}")
+    end = next(
+        (i for i, line in enumerate(lines[1:], start=1) if line.strip() == "---"),
+        -1,
+    )
+    if end < 0:
+        raise SystemExit(f"unterminated frontmatter in {path}")
+    front = lines[1:end]
+    for key, value in updates.items():
+        replacement = f"{key}: {value}"
+        for i, existing in enumerate(front):
+            if existing.startswith(f"{key}:"):
+                front[i] = replacement
+                break
+        else:
+            front.append(replacement)
+    path.write_text(
+        "\n".join(["---", *front, "---", *lines[end + 1:]]), encoding="utf-8"
+    )
+
+
+def pin_dates(domain_dir: Path, spec: dict, options: dict) -> None:
+    """Pin every file's `recorded_at` so the sweep's age-based rules measure a
+    constant rather than the days since somebody last ran this script, and
+    stamp the manifest as verified so the aging rule never speaks about it.
+
+    An engram may override the workspace default with its own `recorded`
+    date; everything else takes the default.
+    """
+    default = options.get("recorded_at")
+    if not default:
+        return
+    by_title = {}
+    for path in sorted(domain_dir.rglob("*.md")):
+        if path.name in ("index.md", "log.md"):
+            continue
+        for line in path.read_text(encoding="utf-8").split("\n"):
+            if line.startswith("title: "):
+                by_title[line.removeprefix("title: ").strip()] = path
+                break
+    overrides = {
+        item["title"]: item["recorded"]
+        for item in spec["engrams"]
+        if item.get("recorded")
+    }
+    for title, path in by_title.items():
+        updates = {"recorded_at": overrides.get(title, default)}
+        if path.name == "MANIFEST.md" and options.get("manifest_verified"):
+            updates["verified"] = (
+                "{ by: archivist, at: " + options["manifest_verified"] + " }"
+            )
+        patch_frontmatter(path, updates)
+
+
+def verify_domain(domain_dir: Path, label: str, env: dict, allow_errors: bool = False) -> None:
     verify = subprocess.run(
         [CRYSTALLINE_BIN, "verify", str(domain_dir)],
         capture_output=True, text=True, encoding="utf-8", env=env,
     )
-    if verify.returncode != 0:
+    if verify.returncode != 0 and not allow_errors:
         raise SystemExit(
             f"crystalline verify failed for {label}:\n"
             f"{verify.stdout}\n{verify.stderr}"
@@ -939,6 +1322,7 @@ def build_domain_folder(
     db: Path,
     config: Path,
     label: str,
+    options: dict | None = None,
 ) -> None:
     """Scaffold one domain-shaped folder with the real binary: init,
     stamp its manifest, register it, write every engram, then verify.
@@ -973,7 +1357,9 @@ def build_domain_folder(
         if item["metadata"]:
             cmd.extend(["--metadata", json.dumps(item["metadata"])])
         run(cmd, env)
-    verify_domain(domain_dir, label, env)
+    options = options or {}
+    pin_dates(domain_dir, spec, options)
+    verify_domain(domain_dir, label, env, bool(options.get("allow_verify_errors")))
 
 
 def build_workspace(name: str, workspace: dict, state_root: Path) -> None:
@@ -988,16 +1374,25 @@ def build_workspace(name: str, workspace: dict, state_root: Path) -> None:
     config = build / "config.yaml"
     db = build / "index.db"
 
-    domains = {k: v for k, v in workspace.items() if k != "origins"}
+    domains = {
+        k: v for k, v in workspace.items() if k not in ("origins", "options")
+    }
     origins = workspace.get("origins") or {}
+    options = workspace.get("options") or {}
 
     for domain_name, spec in domains.items():
         build_domain_folder(
             ws_dir / "domains" / domain_name, domain_name, spec,
             env=env, db=db, config=config,
             label=f"{name}/{domain_name}",
+            options=options,
         )
-        print(f"  {name}/{domain_name}: {len(spec['engrams'])} engrams, verify clean")
+        state = (
+            "verify errors tolerated"
+            if options.get("allow_verify_errors")
+            else "verify clean"
+        )
+        print(f"  {name}/{domain_name}: {len(spec['engrams'])} engrams, {state}")
 
     for tree_name, tree_spec in origins.items():
         tree_dir = ws_dir / "origins" / tree_name

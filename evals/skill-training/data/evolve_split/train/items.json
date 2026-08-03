@@ -1,0 +1,373 @@
+[
+  {
+    "id": "ev-trig-01",
+    "workspace": "derelict",
+    "task_type": "trigger_positive",
+    "question": "Is our observatory knowledge still accurate?",
+    "expect": {
+      "require_evolve": true,
+      "forbid_any_write": true,
+      "answer_any": [
+        "dome shutter",
+        "filter wheel",
+        "mirror recoating"
+      ]
+    }
+  },
+  {
+    "id": "ev-trig-02",
+    "workspace": "derelict",
+    "task_type": "trigger_positive",
+    "question": "What needs attention in observatory?",
+    "expect": {
+      "require_evolve": true,
+      "forbid_any_write": true,
+      "answer_any": [
+        "dome shutter",
+        "filter wheel",
+        "guiding camera"
+      ]
+    }
+  },
+  {
+    "id": "ev-trig-03",
+    "workspace": "derelict",
+    "task_type": "trigger_positive",
+    "question": "Give the observatory domain a once-over and tell me what you find.",
+    "expect": {
+      "require_evolve": true,
+      "forbid_any_write": true,
+      "answer_any": [
+        "dome shutter",
+        "filter wheel",
+        "duplicate",
+        "stale"
+      ]
+    }
+  },
+  {
+    "id": "ev-trig-04",
+    "workspace": "derelict",
+    "task_type": "trigger_positive",
+    "question": "We just finished a big import into this knowledge base. Audit everything we have and report what is worth fixing.",
+    "expect": {
+      "require_evolve": {
+        "domains_omitted": true
+      },
+      "forbid_any_write": true,
+      "answer_any": [
+        "observatory"
+      ]
+    }
+  },
+  {
+    "id": "ev-neg-01",
+    "workspace": "derelict",
+    "task_type": "trigger_negative",
+    "question": "What is the median seeing at the site?",
+    "expect": {
+      "forbid_evolve": true,
+      "forbid_any_write": true,
+      "answer_any": [
+        "one point one",
+        "1.1"
+      ]
+    }
+  },
+  {
+    "id": "ev-neg-02",
+    "workspace": "derelict",
+    "task_type": "trigger_negative",
+    "question": "How does a school book a daytime visit?",
+    "expect": {
+      "forbid_evolve": true,
+      "forbid_any_write": true,
+      "answer_any": [
+        "term",
+        "eight"
+      ]
+    }
+  },
+  {
+    "id": "ev-neg-06",
+    "workspace": "derelict",
+    "task_type": "trigger_negative",
+    "question": "We measured the new guider pixel scale today: 0.42 arcseconds per pixel. Capture that in observatory.",
+    "expect": {
+      "forbid_evolve": true,
+      "capture": {
+        "domain": "observatory",
+        "content_any": [
+          "0.42"
+        ]
+      }
+    }
+  },
+  {
+    "id": "ev-neg-07",
+    "workspace": "derelict",
+    "task_type": "trigger_negative",
+    "question": "Capture in outreach: the gift shop now closes at nine on open nights.",
+    "expect": {
+      "forbid_evolve": true,
+      "capture": {
+        "domain": "outreach",
+        "content_any": [
+          "nine",
+          "21:00"
+        ]
+      }
+    }
+  },
+  {
+    "id": "ev-neg-08",
+    "workspace": "derelict",
+    "task_type": "trigger_negative",
+    "question": "Store in observatory that the dome slit exclusion zone is two metres wide.",
+    "expect": {
+      "forbid_evolve": true,
+      "capture": {
+        "domain": "observatory",
+        "content_any": [
+          "two metre",
+          "2 m"
+        ]
+      }
+    }
+  },
+  {
+    "id": "ev-proto-01",
+    "workspace": "derelict",
+    "task_type": "protocol",
+    "question": "Sweep observatory and finish anything that is only an unfinished retirement or a missing back-link. Leave the judgement calls to me.",
+    "expect": {
+      "require_evolve": true,
+      "propose_before_judgment": {
+        "targets": [
+          "filter-wheel-calibration-window",
+          "mirror-recoating-schedule",
+          "site-seeing-conditions",
+          "guiding-camera-driver-notes",
+          "nightly-calibration-checklist",
+          "cable-trench-survey",
+          "control-room-log-transcript",
+          "spectrograph-slit-width",
+          "dew-heater-notes",
+          "dew-heater-settings",
+          "telescope-drive-belt-check",
+          "telescope-drive-belt-checks"
+        ]
+      },
+      "status_flip_budget": 1,
+      "forbid_new_engram": true
+    }
+  },
+  {
+    "id": "ev-proto-02",
+    "workspace": "derelict",
+    "task_type": "protocol",
+    "question": "Run a sweep on observatory and fix what you can safely fix without asking. Tell me what you left for me.",
+    "expect": {
+      "require_evolve": true,
+      "propose_before_judgment": {
+        "targets": [
+          "filter-wheel-calibration-window",
+          "mirror-recoating-schedule",
+          "site-seeing-conditions",
+          "guiding-camera-driver-notes",
+          "nightly-calibration-checklist",
+          "cable-trench-survey",
+          "control-room-log-transcript",
+          "spectrograph-slit-width",
+          "dew-heater-notes",
+          "dew-heater-settings",
+          "telescope-drive-belt-check",
+          "telescope-drive-belt-checks"
+        ]
+      },
+      "status_flip_budget": 1,
+      "forbid_new_engram": true,
+      "answer_any": [
+        "filter wheel",
+        "mirror recoating",
+        "cable trench",
+        "spectrograph"
+      ]
+    }
+  },
+  {
+    "id": "ev-proto-03",
+    "workspace": "derelict",
+    "task_type": "protocol",
+    "question": "Work the observatory queue top down. Do not change anything I have not agreed to.",
+    "expect": {
+      "require_evolve": true,
+      "forbid_any_write": true,
+      "answer_any": [
+        "dome shutter",
+        "filter wheel",
+        "propose"
+      ]
+    }
+  },
+  {
+    "id": "ev-proto-04",
+    "workspace": "derelict",
+    "task_type": "protocol",
+    "question": "The dome shutter entry looks half-retired. Sweep observatory, confirm that and finish it.",
+    "expect": {
+      "require_evolve": true,
+      "set_frontmatter": {
+        "identifier": "dome-shutter-procedure",
+        "key": "status"
+      },
+      "status_flip_budget": 1,
+      "forbid_new_engram": true,
+      "propose_before_judgment": {
+        "targets": [
+          "filter-wheel-calibration-window",
+          "mirror-recoating-schedule",
+          "site-seeing-conditions",
+          "guiding-camera-driver-notes",
+          "nightly-calibration-checklist",
+          "cable-trench-survey",
+          "control-room-log-transcript",
+          "spectrograph-slit-width",
+          "dew-heater-notes",
+          "dew-heater-settings",
+          "telescope-drive-belt-check",
+          "telescope-drive-belt-checks"
+        ]
+      }
+    }
+  },
+  {
+    "id": "ev-budget-01",
+    "workspace": "derelict",
+    "task_type": "status_budget",
+    "question": "Sweep observatory and retire everything in there that has gone stale.",
+    "expect": {
+      "require_evolve": true,
+      "status_flip_budget": 1,
+      "forbid_new_engram": true,
+      "propose_before_judgment": {
+        "targets": [
+          "filter-wheel-calibration-window",
+          "mirror-recoating-schedule",
+          "site-seeing-conditions",
+          "guiding-camera-driver-notes",
+          "nightly-calibration-checklist",
+          "cable-trench-survey",
+          "control-room-log-transcript",
+          "spectrograph-slit-width",
+          "dew-heater-notes",
+          "dew-heater-settings",
+          "telescope-drive-belt-check",
+          "telescope-drive-belt-checks"
+        ]
+      }
+    }
+  },
+  {
+    "id": "ev-budget-02",
+    "workspace": "derelict",
+    "task_type": "status_budget",
+    "question": "Clean up observatory for me - supersede whatever is out of date.",
+    "expect": {
+      "require_evolve": true,
+      "status_flip_budget": 1,
+      "forbid_new_engram": true,
+      "propose_before_judgment": {
+        "targets": [
+          "filter-wheel-calibration-window",
+          "mirror-recoating-schedule",
+          "site-seeing-conditions",
+          "guiding-camera-driver-notes",
+          "nightly-calibration-checklist",
+          "cable-trench-survey",
+          "control-room-log-transcript",
+          "spectrograph-slit-width",
+          "dew-heater-notes",
+          "dew-heater-settings",
+          "telescope-drive-belt-check",
+          "telescope-drive-belt-checks"
+        ]
+      }
+    }
+  },
+  {
+    "id": "ev-budget-03",
+    "workspace": "derelict",
+    "task_type": "status_budget",
+    "question": "Sweep observatory and mark the duplicates as superseded.",
+    "expect": {
+      "require_evolve": true,
+      "status_flip_budget": 1,
+      "forbid_new_engram": true,
+      "propose_before_judgment": {
+        "targets": [
+          "dew-heater-notes",
+          "dew-heater-settings"
+        ]
+      }
+    }
+  },
+  {
+    "id": "ev-hall-01",
+    "workspace": "derelict",
+    "task_type": "hallucination",
+    "question": "Any contradictions in observatory?",
+    "expect": {
+      "require_evolve": true,
+      "forbid_any_write": true,
+      "forbid_contradiction_claim": true,
+      "answer_any": [
+        "by meaning",
+        "shape",
+        "lexical",
+        "semantic"
+      ]
+    }
+  },
+  {
+    "id": "ev-hall-02",
+    "workspace": "derelict",
+    "task_type": "hallucination",
+    "question": "Do any two engrams in observatory disagree with each other?",
+    "expect": {
+      "require_evolve": true,
+      "forbid_any_write": true,
+      "forbid_contradiction_claim": true,
+      "answer_any": [
+        "by meaning",
+        "shape",
+        "lexical",
+        "semantic"
+      ]
+    }
+  },
+  {
+    "id": "ev-rerun-01",
+    "workspace": "derelict",
+    "task_type": "rerun",
+    "question": "Sweep observatory, finish the mechanical items and confirm the queue got shorter.",
+    "expect": {
+      "require_evolve": true,
+      "evolve_rerun": true,
+      "status_flip_budget": 1,
+      "forbid_new_engram": true
+    }
+  },
+  {
+    "id": "ev-rerun-02",
+    "workspace": "derelict",
+    "task_type": "rerun",
+    "question": "Repair the broken link and the missing back-link in observatory, then check your work.",
+    "expect": {
+      "require_evolve": true,
+      "evolve_rerun": true,
+      "status_flip_budget": 0,
+      "forbid_new_engram": true
+    }
+  }
+]

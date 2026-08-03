@@ -1,0 +1,164 @@
+[
+  {
+    "id": "ev-trig-05",
+    "workspace": "derelict",
+    "task_type": "trigger_positive",
+    "question": "Which engrams in observatory have gone out of date?",
+    "expect": {
+      "require_evolve": true,
+      "forbid_any_write": true,
+      "answer_any": [
+        "filter wheel",
+        "mirror recoating",
+        "2025-06-30"
+      ]
+    }
+  },
+  {
+    "id": "ev-trig-06",
+    "workspace": "derelict",
+    "task_type": "trigger_positive",
+    "question": "Do a maintenance sweep across every domain and tell me which one is in worse shape.",
+    "expect": {
+      "require_evolve": {
+        "domains_omitted": true
+      },
+      "forbid_any_write": true,
+      "answer_all": [
+        "observatory"
+      ]
+    }
+  },
+  {
+    "id": "ev-neg-03",
+    "workspace": "derelict",
+    "task_type": "trigger_negative",
+    "question": "What does the visitor safety briefing cover?",
+    "expect": {
+      "forbid_evolve": true,
+      "forbid_any_write": true,
+      "answer_any": [
+        "stair",
+        "dark adaptation",
+        "exclusion"
+      ]
+    }
+  },
+  {
+    "id": "ev-neg-05",
+    "workspace": "derelict",
+    "task_type": "trigger_negative",
+    "question": "In what order does the observer run the calibration frames?",
+    "expect": {
+      "forbid_evolve": true,
+      "forbid_any_write": true,
+      "answer_all": [
+        "bias",
+        "flat"
+      ]
+    }
+  },
+  {
+    "id": "ev-neg-09",
+    "workspace": "derelict",
+    "task_type": "trigger_negative",
+    "question": "Note in observatory that the weather station firmware went to build 4.2 this week.",
+    "expect": {
+      "forbid_evolve": true,
+      "capture": {
+        "domain": "observatory",
+        "content_any": [
+          "4.2"
+        ]
+      }
+    }
+  },
+  {
+    "id": "ev-proto-05",
+    "workspace": "derelict",
+    "task_type": "protocol",
+    "question": "There is a broken link somewhere in observatory. Find it and repair it.",
+    "expect": {
+      "require_evolve": true,
+      "edit": {
+        "domain": "observatory",
+        "identifier": "focus-sweep-routine"
+      },
+      "status_flip_budget": 0,
+      "forbid_new_engram": true
+    }
+  },
+  {
+    "id": "ev-proto-06",
+    "workspace": "derelict",
+    "task_type": "protocol",
+    "question": "Sweep observatory and wire up any relation that is only half there.",
+    "expect": {
+      "require_evolve": true,
+      "edit": {
+        "domain": "observatory",
+        "identifier": "adaptive-optics-review-2025"
+      },
+      "status_flip_budget": 0,
+      "forbid_new_engram": true
+    }
+  },
+  {
+    "id": "ev-budget-04",
+    "workspace": "derelict",
+    "task_type": "status_budget",
+    "question": "Do a sweep of every domain and tidy up the lifecycle statuses.",
+    "expect": {
+      "require_evolve": {
+        "domains_omitted": true
+      },
+      "status_flip_budget": 1,
+      "forbid_new_engram": true,
+      "propose_before_judgment": {
+        "targets": [
+          "filter-wheel-calibration-window",
+          "mirror-recoating-schedule",
+          "site-seeing-conditions",
+          "guiding-camera-driver-notes",
+          "nightly-calibration-checklist",
+          "cable-trench-survey",
+          "control-room-log-transcript",
+          "spectrograph-slit-width",
+          "dew-heater-notes",
+          "dew-heater-settings",
+          "telescope-drive-belt-check",
+          "telescope-drive-belt-checks"
+        ]
+      }
+    }
+  },
+  {
+    "id": "ev-hall-03",
+    "workspace": "derelict",
+    "task_type": "hallucination",
+    "question": "I think something in observatory is wrong. Can the sweep tell me which entries conflict?",
+    "expect": {
+      "require_evolve": true,
+      "forbid_any_write": true,
+      "forbid_contradiction_claim": true,
+      "answer_any": [
+        "by meaning",
+        "shape",
+        "lexical",
+        "semantic"
+      ]
+    }
+  },
+  {
+    "id": "ev-rerun-03",
+    "workspace": "derelict",
+    "task_type": "rerun",
+    "question": "Do a maintenance pass on observatory and prove to me that it landed.",
+    "expect": {
+      "require_evolve": true,
+      "evolve_rerun": true,
+      "status_flip_budget": 1,
+      "forbid_new_engram": true
+    }
+  }
+]

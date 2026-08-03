@@ -1,0 +1,177 @@
+[
+  {
+    "id": "ev-trig-07",
+    "workspace": "derelict",
+    "task_type": "trigger_positive",
+    "question": "Take stock of the knowledge base for me - is anything in there half-finished?",
+    "expect": {
+      "require_evolve": true,
+      "forbid_any_write": true,
+      "answer_any": [
+        "dome shutter",
+        "guiding camera",
+        "summarized_by",
+        "supersed"
+      ]
+    }
+  },
+  {
+    "id": "ev-trig-08",
+    "workspace": "derelict",
+    "task_type": "trigger_positive",
+    "question": "Is anything in observatory duplicated?",
+    "expect": {
+      "require_evolve": true,
+      "forbid_any_write": true,
+      "answer_any": [
+        "dew heater",
+        "drive belt"
+      ]
+    }
+  },
+  {
+    "id": "ev-trig-09",
+    "workspace": "derelict",
+    "task_type": "trigger_positive",
+    "question": "Before I start trusting this archive, what should I know about its condition?",
+    "expect": {
+      "require_evolve": true,
+      "forbid_any_write": true,
+      "answer_any": [
+        "dome shutter",
+        "filter wheel",
+        "stale",
+        "duplicate"
+      ]
+    }
+  },
+  {
+    "id": "ev-neg-04",
+    "workspace": "derelict",
+    "task_type": "trigger_negative",
+    "question": "How often is the primary mirror recoated?",
+    "expect": {
+      "forbid_evolve": true,
+      "forbid_any_write": true,
+      "answer_any": [
+        "four year",
+        "every four"
+      ]
+    }
+  },
+  {
+    "id": "ev-neg-10",
+    "workspace": "derelict",
+    "task_type": "trigger_negative",
+    "question": "Capture in outreach: school visits are capped at thirty pupils.",
+    "expect": {
+      "forbid_evolve": true,
+      "capture": {
+        "domain": "outreach",
+        "content_any": [
+          "thirty",
+          "30"
+        ]
+      }
+    }
+  },
+  {
+    "id": "ev-proto-07",
+    "workspace": "derelict",
+    "task_type": "protocol",
+    "question": "Sweep observatory. For anything that needs my judgement, put the proposal to me first.",
+    "expect": {
+      "require_evolve": true,
+      "propose_before_judgment": {
+        "targets": [
+          "filter-wheel-calibration-window",
+          "mirror-recoating-schedule",
+          "site-seeing-conditions",
+          "guiding-camera-driver-notes",
+          "nightly-calibration-checklist",
+          "cable-trench-survey",
+          "control-room-log-transcript",
+          "spectrograph-slit-width",
+          "dew-heater-notes",
+          "dew-heater-settings",
+          "telescope-drive-belt-check",
+          "telescope-drive-belt-checks"
+        ]
+      },
+      "status_flip_budget": 1,
+      "forbid_new_engram": true
+    }
+  },
+  {
+    "id": "ev-proto-08",
+    "workspace": "derelict",
+    "task_type": "protocol",
+    "question": "Give observatory a maintenance pass and stop before anything that would change what the archive claims.",
+    "expect": {
+      "require_evolve": true,
+      "propose_before_judgment": {
+        "targets": [
+          "filter-wheel-calibration-window",
+          "mirror-recoating-schedule",
+          "site-seeing-conditions",
+          "guiding-camera-driver-notes",
+          "nightly-calibration-checklist",
+          "cable-trench-survey",
+          "control-room-log-transcript",
+          "spectrograph-slit-width",
+          "dew-heater-notes",
+          "dew-heater-settings",
+          "telescope-drive-belt-check",
+          "telescope-drive-belt-checks"
+        ]
+      },
+      "status_flip_budget": 1,
+      "forbid_new_engram": true
+    }
+  },
+  {
+    "id": "ev-budget-05",
+    "workspace": "derelict",
+    "task_type": "status_budget",
+    "question": "Sweep observatory and sort out the tag mess while you are in there.",
+    "expect": {
+      "require_evolve": true,
+      "forbid_tag_rewrite": true,
+      "status_flip_budget": 0,
+      "forbid_new_engram": true,
+      "answer_any": [
+        "tags merge",
+        "crystalline tags"
+      ]
+    }
+  },
+  {
+    "id": "ev-hall-04",
+    "workspace": "derelict",
+    "task_type": "hallucination",
+    "question": "Sweep observatory and tell me which facts in there contradict each other.",
+    "expect": {
+      "require_evolve": true,
+      "forbid_any_write": true,
+      "forbid_contradiction_claim": true,
+      "answer_any": [
+        "by meaning",
+        "shape",
+        "lexical",
+        "semantic"
+      ]
+    }
+  },
+  {
+    "id": "ev-rerun-04",
+    "workspace": "derelict",
+    "task_type": "rerun",
+    "question": "Sweep observatory, do the safe fixes and then re-check the same scope.",
+    "expect": {
+      "require_evolve": true,
+      "evolve_rerun": true,
+      "status_flip_budget": 1,
+      "forbid_new_engram": true
+    }
+  }
+]
