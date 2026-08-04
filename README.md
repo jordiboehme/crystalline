@@ -376,14 +376,14 @@ github:
 `crystalline verify` statically checks one or more domains against the full rule catalog - malformed frontmatter, broken links, missing MANIFEST sections, schema drift - with no database, service or network connection involved. Its usual home is CI/CD on the GitHub repositories that hold a team's knowledge: every proposal is verified before the team merges it, so nothing malformed ever lands on the branch everyone pulls from. The bundled GitHub Action wires that up:
 
 ```yaml
-- uses: jordiboehme/crystalline/action@v0.11.2
+- uses: jordiboehme/crystalline/action@v0.12.0
   with:
     paths: knowledge/       # space-separated domain roots, default '.'
     strict: 'false'         # promote Warning rules to Error
-    version: v0.11.2        # crystalline binary tag to download, or 'latest'
+    version: v0.12.0        # crystalline binary tag to download, or 'latest'
 ```
 
-The action ref (`@v0.11.2`) pins the action's own code; `version` pins the crystalline binary it downloads, so pinning both gives a fully reproducible check. The binary is checksum-verified, then the action runs `crystalline verify`, annotates the run and, on a pull request, posts a single summary comment kept up to date in place.
+The action ref (`@v0.12.0`) pins the action's own code; `version` pins the crystalline binary it downloads, so pinning both gives a fully reproducible check. The binary is checksum-verified, then the action runs `crystalline verify`, annotates the run and, on a pull request, posts a single summary comment kept up to date in place.
 
 Verify is one of three checks, and each asks a different question. `crystalline verify` asks whether the format holds. `crystalline doctor` asks whether the machinery around it - the index, the registered domains, the service - is healthy. `crystalline evolve` asks the question neither of the other two can: is the knowledge itself still true, and is it still well organized? A fourth command, the importer, brings an existing knowledge base under Crystalline in the first place:
 
