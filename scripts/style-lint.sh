@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# Style lint: rejects em dashes, en dashes and Oxford-comma-style lists
-# ("a, b and c" is fine, "a, b, and c" is not) in tracked markdown and
-# Rust source. Keeps prose and CLI output in the plain-hyphen, no
-# trailing-comma-before-and house style.
+# Style lint: rejects em dashes and en dashes in tracked markdown and Rust
+# source, keeping prose and CLI output in the plain-hyphen house style.
+#
+# The Oxford comma was banned here until 2026-08-04 and is now allowed, so
+# that check is gone. Existing text was left as written rather than
+# rewritten, so both list styles appear in the tree.
 set -euo pipefail
 
 # Paths from git ls-files are relative to the working directory; run from
@@ -31,32 +33,6 @@ for f in $files; do
     if [ -n "$hits" ]; then
         echo "$hits" | while IFS= read -r line; do
             echo "style-lint: em dash or en dash (use '-' instead): $f:$line"
-        done
-        fail=1
-    fi
-done
-
-# Oxford-comma heuristic: "word, word, and " / "word, word, or ".
-# Checked in markdown prose, and inside Rust string literals only (a
-# quoted run containing the pattern) so normal Rust syntax is untouched.
-oxford_pattern='[A-Za-z0-9_]+, [A-Za-z0-9_]+, (and|or) '
-oxford_in_string_pattern='"[^"]*'"$oxford_pattern"'[^"]*"'
-
-for f in $files; do
-    case "$f" in
-        *.md)
-            hits=$(grep -nE "$oxford_pattern" "$f" 2>/dev/null || true)
-            ;;
-        *.rs)
-            hits=$(grep -nE "$oxford_in_string_pattern" "$f" 2>/dev/null || true)
-            ;;
-        *)
-            hits=""
-            ;;
-    esac
-    if [ -n "$hits" ]; then
-        echo "$hits" | while IFS= read -r line; do
-            echo "style-lint: Oxford-comma style list (write 'a, b and c' instead): $f:$line"
         done
         fail=1
     fi

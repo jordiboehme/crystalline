@@ -48,7 +48,7 @@ rustup enforces the `rust-toolchain.toml` pin: inside this repo every proxy reso
 - Commit messages: plain, human style. No AI attribution of any kind - no co-author trailers, no generated-with lines
 - AI harnesses may be named in user-facing docs (README, skills) only where Crystalline integration is documented
 - No emdashes or en dashes in any file - use a plain '-'
-- No Oxford comma in markdown files or in application strings
+- The Oxford comma is allowed (the ban was lifted on 2026-08-04); existing text was not rewritten, so both list styles appear in the tree
 - Temporal semantics: absent `valid_from` = has always been valid, absent `valid_to` = valid forever. Never write sentinel dates like 9999-12-31
 - `status` and `type` frontmatter fields are required and non-empty but free form - recommended value sets are guidance, never enforced globally
 - Commit after each completed milestone or task

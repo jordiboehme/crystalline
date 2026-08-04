@@ -364,7 +364,7 @@ mod tests {
     #[test]
     fn no_style_lint_violations_in_messages() {
         // A cheap in-process guard mirroring scripts/style-lint.sh: no em
-        // dash, no en dash and no Oxford-comma list in any rendered message.
+        // dash and no en dash in any rendered message.
         let em_dash = '\u{2014}';
         let en_dash = '\u{2013}';
         let samples = [
