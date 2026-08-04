@@ -156,16 +156,7 @@ Not every retirement has a replacement. When nothing takes the old fact's place 
 
 ## Working a maintenance queue
 
-When the user asks what knowledge needs attention - stale, half-finished, duplicated, worth an audit or a tidy - `evolve_engrams` sweeps a domain or every domain and returns a ranked queue. It is read-only and changes nothing: each finding names the engram, the evidence it fired on and the next action with the tool that performs it. It detects by dates, links and graph shape only, never by meaning, so it can hand you a retirement that was left half-finished but it can never establish that two engrams disagree about a fact. Present a finding as what it is and never dress it up as a contradiction in meaning.
-
-Each finding carries a class, and the class decides how much authority the fix needs:
-
-- **`mechanical`** completes intent the archive already records - flipping the status of an engram something else already declares it supersedes, appending a missing inverse relation, repairing a link to the near-exact title named in the evidence. Do these directly and summarize once at the end rather than asking per item.
-- **`judgment`** changes what the archive claims - an elapsed `valid_to`, an overdue re-check, a near-duplicate cluster, a stub, an orphan. Read the engram first, decide with the edit-versus-supersede test above, then propose the specific edit and wait for a yes. One at a time.
-
-Two hard limits. Never mass-flip statuses off a queue: a supersession needs a successor and a reason each time, so a run of findings never becomes a bulk retirement. And a tag drift finding hands you a `crystalline tags rename`/`tags merge` command for the user to run, never an engram-by-engram tag rewrite. When the agreed items are done, re-run the same scope: nothing is stored between runs, so a shrinking queue is the only confirmation the pass landed.
-
-This is deliberate maintenance, on demand. Call it when the user asks for it, after a large ingest lands many engrams at once, or when search hits disagree and a half-finished retirement is a likely reason - not at session start, not after an ordinary capture and never before a plain recall.
+When the user asks what the archive itself needs - what has gone stale, what is half-finished, what looks duplicated - `evolve_engrams` sweeps a domain or every domain read-only and returns a ranked queue where each finding carries its evidence and its next action: work the items marked `mechanical` directly and summarize once, propose each `judgment` item and wait for a yes one at a time, and never read a finding as proof that two engrams disagree, since the sweep detects by dates, links and graph shape rather than by meaning. A tag drift finding is the one fix you never apply yourself: hand the user the `crystalline tags merge` command it names and let them run it.
 
 ## Confirm before destroying
 

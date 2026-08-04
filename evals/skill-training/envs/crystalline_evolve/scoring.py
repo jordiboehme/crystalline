@@ -130,6 +130,24 @@ HEDGES = (
     "instead of",
     "if ",
     "whether",
+    # Likelihood and generality qualifiers. A sentence about what a class of
+    # findings *tends* to mean is not a claim that two named engrams
+    # contradict, and reading it as one is a false positive: an agent that
+    # correctly said the sweep cannot compare meanings still failed this
+    # check for adding "two engrams saying similar things often contain
+    # contradictory claims". Only a confident assertion should fail.
+    "often",
+    "may ",
+    "might",
+    "can ",
+    "could ",
+    "typically",
+    "usually",
+    "sometimes",
+    "likely",
+    "possibly",
+    "tend to",
+    "worth checking",
 )
 
 
