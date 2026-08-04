@@ -691,42 +691,42 @@ async fn manifest_alias_edit_folds_search_and_suppresses_the_cluster() {
     let (client, _server) = h.connect().await;
     let peer = client.peer();
 
-    // Two engrams whose tags are a near-duplicate pair (a one-character edit).
+    // Two engrams whose tags are a near-duplicate pair (a plural).
     call(
         peer,
         "write_engram",
-        json!({ "domain": "eng", "title": "Alpha", "content": "alpha body", "tags": ["colour"] }),
+        json!({ "domain": "eng", "title": "Alpha", "content": "alpha body", "tags": ["colours"] }),
     )
     .await
     .unwrap();
     call(
         peer,
         "write_engram",
-        json!({ "domain": "eng", "title": "Beta", "content": "beta body", "tags": ["color"] }),
+        json!({ "domain": "eng", "title": "Beta", "content": "beta body", "tags": ["colour"] }),
     )
     .await
     .unwrap();
 
-    // Before any alias: colour and color surface as a cluster, no aliases are
-    // listed and a tag filter on `colour` finds only the colour-tagged engram.
+    // Before any alias: colours and colour surface as a cluster, no aliases are
+    // listed and a tag filter on `colours` finds only the colours-tagged engram.
     let vocab = call(peer, "vocabulary", json!({ "domain": "eng" }))
         .await
         .unwrap();
     assert!(
-        cluster_contains(&vocab, &["color", "colour"]),
-        "colour and color cluster before the alias: {vocab}"
+        cluster_contains(&vocab, &["colour", "colours"]),
+        "colours and colour cluster before the alias: {vocab}"
     );
     assert!(vocab.get("aliases").is_none(), "no aliases yet: {vocab}");
     let before = call(
         peer,
         "search_engrams",
-        json!({ "domains": ["eng"], "tags": ["colour"] }),
+        json!({ "domains": ["eng"], "tags": ["colours"] }),
     )
     .await
     .unwrap();
     assert_eq!(
         before["total"], 1,
-        "only the colour-tagged engram before the alias"
+        "only the colours-tagged engram before the alias"
     );
 
     // Declare the alias by editing the MANIFEST: the index_markdown hook refreshes
@@ -736,7 +736,7 @@ async fn manifest_alias_edit_folds_search_and_suppresses_the_cluster() {
         "edit_engram",
         json!({
             "identifier": "manifest", "domain": "eng", "operation": "append",
-            "content": "## Tag Aliases\n\n- colour -> color",
+            "content": "## Tag Aliases\n\n- colours -> colour",
         }),
     )
     .await
@@ -746,7 +746,7 @@ async fn manifest_alias_edit_folds_search_and_suppresses_the_cluster() {
     let after = call(
         peer,
         "search_engrams",
-        json!({ "domains": ["eng"], "tags": ["colour"] }),
+        json!({ "domains": ["eng"], "tags": ["colours"] }),
     )
     .await
     .unwrap();
@@ -761,10 +761,10 @@ async fn manifest_alias_edit_folds_search_and_suppresses_the_cluster() {
         .unwrap();
     let aliases = vocab2["aliases"].as_array().expect("aliases present");
     assert_eq!(aliases.len(), 1);
-    assert_eq!(aliases[0]["alias"], "colour");
-    assert_eq!(aliases[0]["canonical"], "color");
+    assert_eq!(aliases[0]["alias"], "colours");
+    assert_eq!(aliases[0]["canonical"], "colour");
     assert!(
-        !cluster_contains(&vocab2, &["color", "colour"]),
+        !cluster_contains(&vocab2, &["colour", "colours"]),
         "the alias-explained cluster is suppressed: {vocab2}"
     );
 }

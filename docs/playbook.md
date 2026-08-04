@@ -574,7 +574,7 @@ temporal 3, structure 2, redundancy 1
 6. [30] V203 JUDGMENT
    crystalline://ship-ops
    2 tag spellings look like one tag (plural variants)
-   evidence: #vent on 1 engram(s); #vents on 5 engram(s)
+   evidence: #vent used 1 time(s); #vents used 5 time(s)
    fix: crystalline tags merge vent vents
 ```
 

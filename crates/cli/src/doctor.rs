@@ -1597,12 +1597,12 @@ mod tests {
         .unwrap();
         std::fs::write(
             root.join("a.md"),
-            "---\ntype: engram\ntitle: A\npermalink: a\ntags:\n  - colour\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nbody a\n",
+            "---\ntype: engram\ntitle: A\npermalink: a\ntags:\n  - colours\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nbody a\n",
         )
         .unwrap();
         std::fs::write(
             root.join("b.md"),
-            "---\ntype: engram\ntitle: B\npermalink: b\ntags:\n  - color\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nbody b\n",
+            "---\ntype: engram\ntitle: B\npermalink: b\ntags:\n  - colour\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nbody b\n",
         )
         .unwrap();
         let store = TursoStore::open_in_memory().await.unwrap();
@@ -1616,22 +1616,22 @@ mod tests {
         let doctor = tags_doctor_over("").await;
         assert!(
             doctor.clusters.iter().any(|c| {
-                c.tags.contains(&"colour".to_string()) && c.tags.contains(&"color".to_string())
+                c.tags.contains(&"colours".to_string()) && c.tags.contains(&"colour".to_string())
             }),
-            "colour and color cluster when no alias explains them: {:?}",
+            "colours and colour cluster when no alias explains them: {:?}",
             doctor.clusters
         );
     }
 
     #[tokio::test]
     async fn a_declared_alias_suppresses_its_cluster() {
-        let doctor = tags_doctor_over("\n## Tag Aliases\n\n- colour -> color\n").await;
+        let doctor = tags_doctor_over("\n## Tag Aliases\n\n- colours -> colour\n").await;
         assert!(
             !doctor
                 .clusters
                 .iter()
-                .any(|c| c.tags.contains(&"colour".to_string())),
-            "the alias folds colour onto color, so the cluster is suppressed: {:?}",
+                .any(|c| c.tags.contains(&"colours".to_string())),
+            "the alias folds colours onto colour, so the cluster is suppressed: {:?}",
             doctor.clusters
         );
     }

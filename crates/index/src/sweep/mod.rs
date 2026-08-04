@@ -1381,9 +1381,9 @@ fn detect_title_collisions(
         by_title.entry(key).or_default().push(i);
     }
 
-    // Then run the same separator, plural and one-edit fold the tag vocabulary
-    // uses over the distinct titles, so `Deploy pipeline` and `Deploy
-    // pipelines` join one group too.
+    // Then run the same separator and plural fold the tag vocabulary uses over
+    // the distinct titles, so `Deploy pipeline` and `Deploy pipelines` join one
+    // group too.
     let names: Vec<String> = by_title.keys().cloned().collect();
     let counts: Vec<TagCount> = names
         .iter()
@@ -1446,11 +1446,17 @@ fn detect_title_collisions(
 
 /// `V203`: tag spellings that drifted apart, straight from the vocabulary
 /// clusterer the `vocabulary` tool and `crystalline doctor` already use.
+///
+/// Usage is the tag's total: the engrams carrying it on their frontmatter plus
+/// the observations carrying it inline. A tag used only on observations has an
+/// engram count of zero, and counting only engrams would both print evidence
+/// reading `on 0 engram(s)` and hand the canonical pick to an arbitrary member,
+/// pointing the prescribed merge the wrong way.
 fn detect_tag_drift(input: &SweepInput, report: &mut SweepReport) {
     let usage: HashMap<&str, i64> = input
         .tags
         .iter()
-        .map(|t| (t.name.as_str(), t.engrams))
+        .map(|t| (t.name.as_str(), t.engrams + t.observations))
         .collect();
     for cluster in tag_clusters_with_aliases(&input.tags, &input.tag_aliases) {
         // The most used spelling wins; ties go to the lexicographically first,
@@ -1482,7 +1488,7 @@ fn detect_tag_drift(input: &SweepInput, report: &mut SweepReport) {
                 ),
                 join_semis(cluster.tags.iter().map(|t| {
                     format!(
-                        "#{t} on {} engram(s)",
+                        "#{t} used {} time(s)",
                         usage.get(t.as_str()).copied().unwrap_or(0)
                     )
                 })),

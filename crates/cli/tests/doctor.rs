@@ -118,7 +118,7 @@ fn reports_near_duplicate_tag_clusters_without_failing() {
     let config = work.path().join("config.yaml");
     let db = work.path().join("index.db");
     let domain_dir = setup_domain(work.path(), "eng", &config);
-    // Two engrams whose tags are one edit apart: `database` and `databse`.
+    // Two engrams whose tags are a plural apart: `database` and `databases`.
     write(
         &domain_dir,
         "a.md",
@@ -127,7 +127,7 @@ fn reports_near_duplicate_tag_clusters_without_failing() {
     write(
         &domain_dir,
         "b.md",
-        "---\ntype: engram\ntitle: B\npermalink: b\ntags:\n  - databse\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nBody with enough content.\n\nSecond line.\n",
+        "---\ntype: engram\ntitle: B\npermalink: b\ntags:\n  - databases\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nBody with enough content.\n\nSecond line.\n",
     );
     bin()
         .args(["sync", "--config"])
@@ -162,7 +162,7 @@ fn reports_near_duplicate_tag_clusters_without_failing() {
         .map(|t| t.as_str().unwrap())
         .collect();
     assert!(
-        tags.contains(&"database") && tags.contains(&"databse"),
+        tags.contains(&"database") && tags.contains(&"databases"),
         "the cluster groups the two spellings: {report}"
     );
 }

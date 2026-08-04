@@ -2,11 +2,17 @@
 //!
 //! Case folding (the tag interner lowercases every tag) collapses `Foo` and
 //! `foo`, but it does not catch the other ways one concept ends up spelled two
-//! ways: a separator swap (`multi-word` vs `multi_word`), a plural (`deploy` vs
-//! `deploys`) or a one-character typo (`database` vs `databse`). This module
-//! groups the tags already in use into clusters of likely-the-same-thing so the
-//! `vocabulary` tool and `crystalline doctor` can surface them for a
-//! `crystalline tags merge`.
+//! ways: a separator swap (`multi-word` vs `multi_word` vs `multiword`) or a
+//! plural (`deploy` vs `deploys`). This module groups the tags already in use
+//! into clusters of likely-the-same-thing so the `vocabulary` tool and
+//! `crystalline doctor` can surface them for a `crystalline tags merge`.
+//!
+//! A one-character edit is deliberately *not* a relation. It reads plausible as
+//! a typo catcher and is destructive in practice: against a real archive it
+//! joined unrelated concepts (`audio`/`audit`, `preference`/`reference`) and
+//! numbered variants (`reactor-0`/`reactor-2`), and the merge each cluster
+//! prescribes would have collapsed distinctions the archive relies on. Only
+//! relations that are mechanically the same word survive here.
 //!
 //! Pure Rust with no store dependency: it works off the [`TagCount`] list the
 //! vocabulary already computes.
@@ -28,7 +34,6 @@ pub struct TagCluster {
 enum Reason {
     Separator = 0,
     Plural = 1,
-    Edit = 2,
 }
 
 impl Reason {
@@ -36,7 +41,6 @@ impl Reason {
         match self {
             Reason::Separator => "separator variants",
             Reason::Plural => "plural variants",
-            Reason::Edit => "one-character edit",
         }
     }
 }
@@ -44,12 +48,13 @@ impl Reason {
 /// Group the tags in use into near-duplicate clusters. Each returned cluster has
 /// two or more members; a singleton (a tag with no near-duplicate) is omitted.
 ///
-/// Three relations join a pair of tags, strongest first:
-/// 1. **separator variants** - equal once `_` and spaces are folded to `-`, so
-///    `multi-word`, `multi_word` and `multi word` are one cluster;
-/// 2. **plural variants** - one is the other plus a trailing `s` or `es`;
-/// 3. **one-character edit** - Levenshtein distance 1, only when the longer name
-///    is at least five characters so short tags are not over-clustered.
+/// Two relations join a pair of tags, strongest first:
+/// 1. **separator variants** - equal once `-`, `_` and spaces are dropped, so
+///    `multi-word`, `multi_word`, `multi word` and `multiword` are one cluster;
+/// 2. **plural variants** - one is the other plus a trailing `s` or `es`.
+///
+/// Both are mechanical rewrites of one word. A near-miss spelling is not a
+/// relation: two tags one character apart stay two tags.
 ///
 /// Pairs are unioned, so a chain (`a`-`b`, `b`-`c`) forms one cluster, and each
 /// cluster reports the strongest relation that joined any of its members.
@@ -172,17 +177,16 @@ fn relation(a: &str, b: &str) -> Option<Reason> {
     if is_plural_pair(a, b) {
         return Some(Reason::Plural);
     }
-    if a.chars().count().max(b.chars().count()) >= 5 && levenshtein_is_one(a, b) {
-        return Some(Reason::Edit);
-    }
     None
 }
 
-/// Fold the separator class: `_` and spaces become `-`, so the three separators
-/// are interchangeable but a name with no separator is left untouched.
+/// Fold the separator class: `-`, `_` and spaces are dropped, so every way of
+/// separating one name's words compares equal, including writing it with no
+/// separator at all - `multi-word`, `multi_word`, `multi word` and `multiword`
+/// are one name.
 fn separator_fold(s: &str) -> String {
     s.chars()
-        .map(|c| if c == '_' || c == ' ' { '-' } else { c })
+        .filter(|c| !matches!(c, '-' | '_' | ' '))
         .collect()
 }
 
@@ -193,41 +197,6 @@ fn is_plural_pair(a: &str, b: &str) -> bool {
         return false;
     }
     long == format!("{short}s") || long == format!("{short}es")
-}
-
-/// Whether the Levenshtein distance between two strings is exactly one. Cheap:
-/// a length gap above one already rules it out, and the single shared scan stops
-/// at the second difference.
-fn levenshtein_is_one(a: &str, b: &str) -> bool {
-    let ac: Vec<char> = a.chars().collect();
-    let bc: Vec<char> = b.chars().collect();
-    let (la, lb) = (ac.len(), bc.len());
-    if la.abs_diff(lb) > 1 {
-        return false;
-    }
-    if la == lb {
-        // Exactly one substitution.
-        let diffs = ac.iter().zip(&bc).filter(|(x, y)| x != y).count();
-        return diffs == 1;
-    }
-    // Lengths differ by one: exactly one insertion/deletion. Walk both, allowing
-    // a single skip in the longer string.
-    let (short, long) = if la < lb { (&ac, &bc) } else { (&bc, &ac) };
-    let mut i = 0;
-    let mut j = 0;
-    let mut skipped = false;
-    while i < short.len() && j < long.len() {
-        if short[i] == long[j] {
-            i += 1;
-            j += 1;
-        } else if skipped {
-            return false;
-        } else {
-            skipped = true;
-            j += 1;
-        }
-    }
-    true
 }
 
 /// A minimal union-find over tag indices.
@@ -315,44 +284,55 @@ mod tests {
     }
 
     #[test]
-    fn one_edit_clusters_only_when_long_enough() {
-        // database/databse differ by one and are long: they cluster.
-        let long = clusters(&["database", "databse"]);
-        assert_eq!(long.len(), 1);
-        assert_eq!(long[0].reason, "one-character edit");
-
-        // api/apo differ by one but are short (< 5): no cluster.
-        let short = clusters(&["api", "apo"]);
-        assert!(short.is_empty(), "short one-edit pairs are not clustered");
+    fn dropping_a_separator_is_a_separator_variant() {
+        // Writing one name with no separator at all is the same drift as
+        // swapping one separator for another, so `e-bike` and `ebike` cluster.
+        // `bike` is a different name and stays out of it.
+        let out = clusters(&["e-bike", "ebike", "bike"]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].tags, vec!["e-bike".to_string(), "ebike".to_string()]);
+        assert_eq!(out[0].reason, "separator variants");
     }
 
     #[test]
-    fn union_find_chains_three_into_one_cluster() {
-        // databases -> database (plural), database -> databse (edit): all three
-        // form one cluster, reported with the strongest reason (plural).
-        let out = clusters(&["database", "databases", "databse"]);
+    fn one_edit_apart_is_not_a_relation() {
+        // Regression pin: a one-character edit used to cluster, and against a
+        // real archive every such cluster was wrong. These pairs are different
+        // words, or numbered variants of one name, and merging either way
+        // destroys a distinction the archive keeps on purpose.
+        for pair in [
+            ["audio", "audit"],
+            ["preference", "reference"],
+            ["reactor-0", "reactor-2"],
+            ["database", "databse"],
+        ] {
+            let out = clusters(&pair);
+            assert!(
+                out.is_empty(),
+                "{pair:?} are one edit apart and must not cluster: {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn union_find_chains_three_into_one_cluster_with_the_strongest_reason() {
+        // multi_word -> multi-word (separator), multi-word -> multi-words
+        // (plural): all three form one cluster, reported with the strongest
+        // reason (separator).
+        let out = clusters(&["multi-word", "multi_word", "multi-words"]);
         assert_eq!(out.len(), 1);
         assert_eq!(
             out[0].tags,
             vec![
-                "database".to_string(),
-                "databases".to_string(),
-                "databse".to_string()
+                "multi-word".to_string(),
+                "multi-words".to_string(),
+                "multi_word".to_string()
             ]
         );
         assert_eq!(
-            out[0].reason, "plural variants",
+            out[0].reason, "separator variants",
             "the strongest joining reason wins"
         );
-    }
-
-    #[test]
-    fn strongest_reason_wins_separator_over_edit() {
-        // multi-word/multi_word are both separator variants (strongest) and one
-        // edit apart; separator wins.
-        let out = clusters(&["multi-word", "multi_word"]);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].reason, "separator variants");
     }
 
     #[test]
@@ -368,38 +348,44 @@ mod tests {
 
     #[test]
     fn aliases_suppress_the_pairs_they_explain() {
-        let tags: Vec<TagCount> = ["deploy", "deploys", "database", "databse"]
+        let tags: Vec<TagCount> = ["deploy", "deploys", "multi-word", "multi_word"]
             .iter()
             .map(|n| tc(n))
             .collect();
 
         // Empty aliases: byte-identical to tag_clusters, both near-dup pairs
-        // cluster (a plural and a one-edit).
+        // cluster (a plural and a separator swap).
         let plain = tag_clusters(&tags);
         assert_eq!(plain.len(), 2);
         assert_eq!(tag_clusters_with_aliases(&tags, &[]), plain);
 
         // deploys -> deploy is a declared alias: that pair canonicalizes onto the
         // single name `deploy`, collapses to a singleton and drops out. The
-        // unrelated database/databse edit cluster survives untouched.
+        // unrelated separator cluster survives untouched.
         let with = tag_clusters_with_aliases(&tags, &[ta("deploys", "deploy")]);
         assert_eq!(with.len(), 1);
         assert_eq!(
             with[0].tags,
-            vec!["database".to_string(), "databse".to_string()]
+            vec!["multi-word".to_string(), "multi_word".to_string()]
         );
-        assert_eq!(with[0].reason, "one-character edit");
+        assert_eq!(with[0].reason, "separator variants");
     }
 
     #[test]
     fn surviving_members_are_reported_under_their_canonical_name() {
-        // colour -> color folds the alias out; `color` and `colr` then cluster
-        // (one edit apart, long enough), reported under the canonical `color`,
-        // never the aliased `colour`.
-        let tags: Vec<TagCount> = ["colour", "colr"].iter().map(|n| tc(n)).collect();
-        let with = tag_clusters_with_aliases(&tags, &[ta("colour", "color")]);
+        // multi_word -> multi-word folds the alias out; `multi-word` and
+        // `multi-words` then cluster as a plural pair, reported under the
+        // canonical `multi-word`, never the aliased `multi_word`.
+        let tags: Vec<TagCount> = ["multi_word", "multi-words"]
+            .iter()
+            .map(|n| tc(n))
+            .collect();
+        let with = tag_clusters_with_aliases(&tags, &[ta("multi_word", "multi-word")]);
         assert_eq!(with.len(), 1);
-        assert_eq!(with[0].tags, vec!["color".to_string(), "colr".to_string()]);
-        assert_eq!(with[0].reason, "one-character edit");
+        assert_eq!(
+            with[0].tags,
+            vec!["multi-word".to_string(), "multi-words".to_string()]
+        );
+        assert_eq!(with[0].reason, "plural variants");
     }
 }

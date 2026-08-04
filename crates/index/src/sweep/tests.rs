@@ -87,6 +87,15 @@ fn tag(name: &str, engrams: i64) -> TagCount {
     }
 }
 
+/// A tag carried on observations as well as on frontmatter.
+fn tag_used(name: &str, engrams: i64, observations: i64) -> TagCount {
+    TagCount {
+        name: name.to_string(),
+        engrams,
+        observations,
+    }
+}
+
 /// A sweep input over `facts`, with one graph node per fact and the sweep's own
 /// domain registered.
 fn input(facts: Vec<EngramFacts>) -> SweepInput {
@@ -723,7 +732,24 @@ fn v203_hands_over_the_exact_merge_command() {
     assert_eq!(finding.domain, DOMAIN);
     assert_eq!(finding.priority, 30);
     assert_eq!(finding.fix, "crystalline tags merge deploys deploy");
-    assert!(finding.evidence.contains("#deploy on 9 engram(s)"));
+    assert!(finding.evidence.contains("#deploy used 9 time(s)"));
+}
+
+#[test]
+fn v203_counts_observation_tags_too() {
+    // `guardrail` is carried only by observations, `guardrails` only by one
+    // engram's frontmatter. Counting frontmatter alone would report the more
+    // used spelling as `on 0 engram(s)` and merge the wrong way round.
+    let mut sweep = input(vec![fact(1, "alpha")]);
+    sweep.tags = vec![tag_used("guardrail", 0, 7), tag_used("guardrails", 1, 0)];
+
+    let report = detect(&sweep);
+    let finding = only(&report, "V203");
+    assert_eq!(finding.fix, "crystalline tags merge guardrails guardrail");
+    assert_eq!(
+        finding.evidence,
+        "#guardrail used 7 time(s); #guardrails used 1 time(s)"
+    );
 }
 
 #[test]
