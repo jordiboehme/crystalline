@@ -718,7 +718,9 @@ async fn run_http(
 }
 
 /// Build the router `serve --http` mounts: the tool router behind rmcp's
-/// streamable-HTTP service, plus the `/health` probe. Public and
+/// streamable-HTTP service, plus the `/health` probe and the JSON API nested
+/// at `/api/v1`. Both routes are declared ahead of the fallback service, so
+/// the MCP transport only ever sees paths the API does not claim. Public and
 /// doc-commented on purpose (not `pub(crate)`) so an integration test can
 /// drive the exact production construction over a real `TcpListener` instead
 /// of reimplementing it; `run_http` is the only other caller.
@@ -737,6 +739,9 @@ pub fn http_router(
     let mut session_manager = LocalSessionManager::default();
     session_manager.session_config.sse_retry = None;
     let session_manager = Arc::new(session_manager);
+    let rest = crate::rest::router(crate::rest::RestState {
+        engine: engine.clone(),
+    });
     let service = StreamableHttpService::new(
         move || {
             http_sessions.fetch_add(1, Ordering::Relaxed);
@@ -747,6 +752,7 @@ pub fn http_router(
     );
     axum::Router::new()
         .route("/health", axum::routing::get(health))
+        .nest("/api/v1", rest)
         .fallback_service(service)
 }
 

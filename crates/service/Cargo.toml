@@ -61,6 +61,7 @@ windows-sys = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+reqwest = { workspace = true }
 serde_yaml_ng = { workspace = true }
 flate2 = { workspace = true }
 tar = { workspace = true }

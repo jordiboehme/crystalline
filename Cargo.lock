@@ -1251,6 +1251,7 @@ dependencies = [
  "interprocess",
  "libc",
  "notify",
+ "reqwest 0.13.4",
  "rmcp",
  "schemars",
  "serde",
