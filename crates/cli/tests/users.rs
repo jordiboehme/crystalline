@@ -161,6 +161,27 @@ fn the_last_admin_cannot_be_removed() {
 }
 
 #[test]
+fn adding_the_same_name_twice_says_so_in_words() {
+    let home = tempfile::tempdir().unwrap();
+    users_ok(
+        home.path(),
+        &["add", "ada", "--password-stdin"],
+        Some("s3cret\n"),
+    );
+    // Any casing of the same name is the same account.
+    let err = users_err(
+        home.path(),
+        &["add", "ADA", "--password-stdin"],
+        Some("other\n"),
+    );
+    assert!(err.contains("already exists"), "{err}");
+    assert!(
+        !err.contains("UNIQUE constraint"),
+        "the raw constraint violation must not reach the operator: {err}"
+    );
+}
+
+#[test]
 fn a_mistyped_name_is_reported() {
     let home = tempfile::tempdir().unwrap();
     let err = users_err(home.path(), &["role", "ghost", "admin"], None);

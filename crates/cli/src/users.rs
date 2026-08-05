@@ -38,9 +38,23 @@ pub async fn run(command: UsersCommand, json: bool) -> Result<()> {
             // the store folds the login name but keeps this one as given.
             let display = display.unwrap_or_else(|| name.trim().to_string());
             let role: Role = role.into();
-            store
+            if let Err(e) = store
                 .add_user(&name, &display, email.as_deref(), role, &password)
-                .await?;
+                .await
+            {
+                // The store's primary key is what actually refuses a duplicate
+                // (and it is the only thing that can, without racing a second
+                // invocation); this only turns its constraint violation into a
+                // sentence, and re-raises anything else untouched.
+                if format!("{e:#}").contains("UNIQUE constraint") {
+                    bail!(
+                        "a user named '{}' already exists; \
+                         change it with `crystalline users passwd` or `crystalline users role`",
+                        stored_name(&name)
+                    );
+                }
+                return Err(e);
+            }
             println!("Added user '{}' with role {role}.", stored_name(&name));
         }
         UsersCommand::List => {
