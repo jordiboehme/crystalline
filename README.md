@@ -41,6 +41,8 @@ Today, a fresh session
 
 Crystalline is a single Rust binary: a CLI for people, an MCP server for agents and a local search index on top of plain markdown files.
 
+The name is borrowed from psychology: crystallized intelligence is the knowledge a mind accumulates through experience, the counterpart of fluid, in-the-moment reasoning. Models have the fluid kind in abundance; Crystalline gives them the other half.
+
 [Why Crystalline](#why-crystalline) · [How it works](#how-it-works) · [Get started](#get-started) · [Session onboarding](#session-onboarding) · [The learning loop](#the-learning-loop) · [Teach and learn](#teach-and-learn) · [Skills](#skills) · [Share with a team](#share-knowledge-with-a-team) · [Deployment](#deployment) · [FAQ](#faq)
 
 ## Why Crystalline
@@ -460,6 +462,10 @@ It is one - that is the point. Your knowledge stays plain markdown you can read,
 **Why not a vector database or a RAG framework?**
 
 Retrieval is the easy half of memory. A vector index finds similar text, but it does not know which domain owns a task, that a fact was superseded in March, who verified a claim or when something new is worth capturing. Crystalline treats embeddings as one ranking signal inside a memory system - routing, temporal semantics, provenance and a capture workflow on top of files you own, with no pipeline to operate.
+
+**Where does the name come from?**
+
+From psychology. Crystallized intelligence is the knowledge and skill a person accumulates through education and experience; its counterpart, fluid intelligence, is the on-the-spot reasoning applied to problems never seen before. A model ships with fluid intelligence in abundance and none of your crystallized kind - every session starts as a brilliant stranger. Crystalline is the crystallized half: the store of what an agent has learned, so experience compounds instead of evaporating. (An engram, fittingly, is neuroscience's word for the physical trace a memory leaves.)
 
 **When does the daemon start?**
 
