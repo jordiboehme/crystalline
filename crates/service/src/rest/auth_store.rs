@@ -8,6 +8,23 @@
 //! [`AuthStore`], every statement its own short autocommit transaction, and a
 //! busy timeout so the two writers wait for each other instead of failing.
 //!
+//! **This database is opened by more than one process at a time, and that is a
+//! deliberate deviation from the assumption the index store is built on.**
+//! [`crystalline_index::TursoStore`]'s module comment states that "a single
+//! [`Connection`] is used from a single task [...] other processes never open
+//! the database concurrently, so Turso's young multi-process path is never
+//! exercised". That holds for the index, which the daemon alone owns. It does
+//! not hold here: `crystalline users ...` opens this file while `serve` has it
+//! open, so this module does exercise that path, on purpose. What that costs
+//! us in return: `PRAGMA busy_timeout` is set on every connection so a writer
+//! waits instead of failing, no transaction spans more than the two statements
+//! of [`AuthStore::remove_user`], and the two multi-statement operations
+//! ([`AuthStore::remove_user`] and [`AuthStore::create_session`]) take
+//! `BEGIN IMMEDIATE` so they serialize against each other rather than
+//! interleaving. `two_stores_on_one_file_interleave_writes` in this module's
+//! tests is the covering test; if turso's multi-process behavior ever proves
+//! unreliable, that test is where it will show up first.
+//!
 //! Two secrets are stored, neither in the clear. Passwords are argon2id at the
 //! [`argon2`] crate's own recommended defaults, so the cost parameters follow
 //! the crate rather than a number frozen here. Session tokens are 32 random
@@ -76,6 +93,27 @@ impl std::str::FromStr for Role {
 /// never fail open.
 fn role_from_db(s: &str) -> Role {
     s.parse().unwrap_or(Role::Viewer)
+}
+
+/// Fold a supplied user name to the one form this store keys on: trimmed of
+/// surrounding whitespace and lowercased. Empty is rejected.
+///
+/// This is enforced here rather than left to callers because the store is the
+/// only place every path meets. `name TEXT PRIMARY KEY` byte-compares, so
+/// without folding a trusted-header value of `Ada` would provision a second
+/// account beside an admin-created `ada` - at the default role, handing back
+/// access to someone who had just been disabled or demoted. There is no caller
+/// that can be trusted to remember this, so the store does it once for all of
+/// them.
+///
+/// `to_lowercase` is full Unicode case folding, matching the convention
+/// `crates/index` already uses for domain and tag names.
+fn normalize_name(name: &str) -> Result<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        bail!("a user name cannot be empty");
+    }
+    Ok(trimmed.to_lowercase())
 }
 
 /// One account. Carries no password material, so it is safe to hand to a
@@ -173,8 +211,10 @@ impl AuthStore {
         Ok(AuthStore { _db: db, conn })
     }
 
-    /// Add an account with a password. Errors if the name is already taken;
-    /// the primary key is the guard, so two racing writers cannot both win.
+    /// Add an account with a password. The name is folded by
+    /// [`normalize_name`], so `Ada` and `ada` are the same account. Errors if
+    /// the name is already taken; the primary key is the guard, so two racing
+    /// writers cannot both win.
     pub async fn add_user(
         &self,
         name: &str,
@@ -183,13 +223,14 @@ impl AuthStore {
         role: Role,
         password: &str,
     ) -> Result<()> {
+        let name = normalize_name(name)?;
         let hash = hash_password(password).await?;
         self.conn
             .execute(
                 "INSERT INTO users (name, display, email, role, pass_hash, disabled, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)",
                 vec![
-                    Value::Text(name.to_string()),
+                    Value::Text(name.clone()),
                     Value::Text(display.to_string()),
                     match email {
                         Some(e) => Value::Text(e.to_string()),
@@ -206,14 +247,18 @@ impl AuthStore {
     }
 
     /// Check a password. `None` covers every way this can fail to produce a
-    /// login - unknown name, wrong password, a disabled account, or an account
-    /// with no password at all (one provisioned by [`AuthStore::ensure_user`])
-    /// - so a caller cannot accidentally distinguish them in its response.
+    /// login: unknown name, wrong password, a disabled account, an account
+    /// with no password at all (one provisioned by [`AuthStore::ensure_user`]),
+    /// and a name that will not normalize. They are deliberately
+    /// indistinguishable, so a caller cannot leak which one it was.
     pub async fn verify_password(&self, name: &str, password: &str) -> Result<Option<User>> {
+        let Ok(name) = normalize_name(name) else {
+            return Ok(None);
+        };
         let Some(row) = self
             .query_first(
                 &format!("SELECT {USER_COLUMNS}, pass_hash FROM users WHERE name = ?1"),
-                vec![Value::Text(name.to_string())],
+                vec![Value::Text(name)],
             )
             .await?
         else {
@@ -269,21 +314,44 @@ impl AuthStore {
 
     /// Delete an account and every session it holds. Errors if there is no
     /// such account.
+    ///
+    /// The two deletes are one `BEGIN IMMEDIATE` transaction, sessions first.
+    /// Both details are load-bearing, because a session row that outlives its
+    /// account is not merely garbage: `session_user` resolves a token by
+    /// joining `sessions` to `users`, so once a new account claims the freed
+    /// name, the old holder's token starts resolving to it. `users remove ada`
+    /// followed by `users add ada` would hand the new account to whoever still
+    /// held the old cookie.
+    ///
+    /// Deleting sessions first means a crash between the statements leaves
+    /// sessions gone and the account present - recoverable by retrying, and
+    /// safe in the meantime. The transaction closes the remaining window
+    /// against a concurrent [`AuthStore::create_session`] in the daemon, which
+    /// takes `BEGIN IMMEDIATE` too and therefore cannot land an insert between
+    /// these two statements.
     pub async fn remove_user(&self, name: &str) -> Result<()> {
-        let key = vec![Value::Text(name.to_string())];
-        let changed = self
-            .conn
-            .execute("DELETE FROM users WHERE name = ?1", key.clone())
+        let name = normalize_name(name)?;
+        let key = vec![Value::Text(name.clone())];
+        self.begin_immediate()
             .await
             .with_context(|| format!("removing user '{name}'"))?;
-        if changed == 0 {
-            bail!("no such user: '{name}'");
+        let result = async {
+            self.conn
+                .execute("DELETE FROM sessions WHERE user_name = ?1", key.clone())
+                .await
+                .with_context(|| format!("removing sessions for user '{name}'"))?;
+            let changed = self
+                .conn
+                .execute("DELETE FROM users WHERE name = ?1", key)
+                .await
+                .with_context(|| format!("removing user '{name}'"))?;
+            if changed == 0 {
+                bail!("no such user: '{name}'");
+            }
+            Ok(())
         }
-        self.conn
-            .execute("DELETE FROM sessions WHERE user_name = ?1", key)
-            .await
-            .with_context(|| format!("removing sessions for user '{name}'"))?;
-        Ok(())
+        .await;
+        self.finish(result).await
     }
 
     /// Every account, by name. Names sort byte-wise, which is the ordering
@@ -311,14 +379,22 @@ impl AuthStore {
     ///
     /// `role` applies at creation only. A later [`AuthStore::set_role`] by an
     /// admin sticks instead of being reverted on the account's next request.
+    ///
+    /// The name is folded by [`normalize_name`], which matters most here: a
+    /// header value of `Ada` must resolve to the existing `ada` rather than
+    /// mint a second account at the default role, which would silently undo a
+    /// disable or a demotion. The display name keeps the casing as sent.
     pub async fn ensure_user(&self, name: &str, role: Role) -> Result<User> {
+        let display = name.trim().to_string();
+        let name = normalize_name(name)?;
         self.conn
             .execute(
                 "INSERT OR IGNORE INTO users
                      (name, display, email, role, pass_hash, disabled, created_at)
-                 VALUES (?1, ?1, NULL, ?2, NULL, 0, ?3)",
+                 VALUES (?1, ?2, NULL, ?3, NULL, 0, ?4)",
                 vec![
-                    Value::Text(name.to_string()),
+                    Value::Text(name.clone()),
+                    Value::Text(display),
                     Value::Text(role.as_str().to_string()),
                     Value::Text(chrono::Utc::now().to_rfc3339()),
                 ],
@@ -327,7 +403,7 @@ impl AuthStore {
             .with_context(|| format!("provisioning user '{name}'"))?;
         self.query_first(
             &format!("SELECT {USER_COLUMNS} FROM users WHERE name = ?1"),
-            vec![Value::Text(name.to_string())],
+            vec![Value::Text(name.clone())],
         )
         .await?
         .map(|row| user_from_row(&row))
@@ -338,32 +414,46 @@ impl AuthStore {
     /// The returned token is the only unhashed copy; only its sha256 is
     /// written. A non-positive `ttl_secs` produces an already-expired session,
     /// which is how the expiry path is exercised without waiting.
+    ///
+    /// The existence check and the insert are one `BEGIN IMMEDIATE`
+    /// transaction. Without it, a [`AuthStore::remove_user`] running in the
+    /// CLI could delete the account between the two and leave this session
+    /// stranded, to be inherited by the next account to claim the name.
     pub async fn create_session(&self, name: &str, ttl_secs: i64) -> Result<Session> {
-        let exists = self
-            .query_first(
-                "SELECT 1 FROM users WHERE name = ?1",
-                vec![Value::Text(name.to_string())],
-            )
-            .await?;
-        if exists.is_none() {
-            bail!("no such user: '{name}'");
-        }
+        let name = normalize_name(name)?;
         let token = random_hex();
         let csrf = random_hex();
         let expires_at = chrono::Utc::now().timestamp().saturating_add(ttl_secs);
-        self.conn
-            .execute(
-                "INSERT INTO sessions (token_hash, user_name, csrf, expires_at)
-                 VALUES (?1, ?2, ?3, ?4)",
-                vec![
-                    Value::Text(token_hash(&token)),
-                    Value::Text(name.to_string()),
-                    Value::Text(csrf.clone()),
-                    Value::Integer(expires_at),
-                ],
-            )
+        self.begin_immediate()
             .await
             .with_context(|| format!("creating a session for user '{name}'"))?;
+        let result = async {
+            let exists = self
+                .query_first(
+                    "SELECT 1 FROM users WHERE name = ?1",
+                    vec![Value::Text(name.clone())],
+                )
+                .await?;
+            if exists.is_none() {
+                bail!("no such user: '{name}'");
+            }
+            self.conn
+                .execute(
+                    "INSERT INTO sessions (token_hash, user_name, csrf, expires_at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    vec![
+                        Value::Text(token_hash(&token)),
+                        Value::Text(name.clone()),
+                        Value::Text(csrf.clone()),
+                        Value::Integer(expires_at),
+                    ],
+                )
+                .await
+                .with_context(|| format!("creating a session for user '{name}'"))?;
+            Ok(())
+        }
+        .await;
+        self.finish(result).await?;
         Ok(Session {
             token,
             csrf,
@@ -377,15 +467,24 @@ impl AuthStore {
     /// Expired rows are pruned here rather than by a timer: every lookup is
     /// already a write-capable moment, sessions are only read on request, and
     /// a daemon that is never asked has no session rows worth reclaiming.
+    ///
+    /// The same sweep drops any session whose account no longer exists.
+    /// [`AuthStore::remove_user`] is transactional so it cannot create one,
+    /// but a file written by an older build could contain them, and an orphan
+    /// is exactly what would be inherited by the next account to take the
+    /// name. Clearing them on sight makes that unrecoverable rather than
+    /// dormant.
     pub async fn session_user(&self, token: &str) -> Result<Option<(User, String)>> {
         let now = chrono::Utc::now().timestamp();
         self.conn
             .execute(
-                "DELETE FROM sessions WHERE expires_at <= ?1",
+                "DELETE FROM sessions
+                 WHERE expires_at <= ?1
+                    OR NOT EXISTS (SELECT 1 FROM users u WHERE u.name = sessions.user_name)",
                 vec![Value::Integer(now)],
             )
             .await
-            .context("pruning expired sessions")?;
+            .context("pruning expired and orphaned sessions")?;
         let Some(row) = self
             .query_first(
                 &format!(
@@ -424,15 +523,48 @@ impl AuthStore {
     /// Run a single-column update against one account, failing when the
     /// account does not exist.
     async fn update_user(&self, sql: &str, name: &str, value: Value) -> Result<()> {
+        let name = normalize_name(name)?;
         let changed = self
             .conn
-            .execute(sql, vec![Value::Text(name.to_string()), value])
+            .execute(sql, vec![Value::Text(name.clone()), value])
             .await
             .with_context(|| format!("updating user '{name}'"))?;
         if changed == 0 {
             bail!("no such user: '{name}'");
         }
         Ok(())
+    }
+
+    /// Open a write transaction that takes the write lock immediately rather
+    /// than on first write. Deferred would let two processes both start, both
+    /// read, and only then discover they conflict; immediate makes the two
+    /// multi-statement operations here serialize cleanly, which is the whole
+    /// point of using one.
+    async fn begin_immediate(&self) -> Result<()> {
+        self.conn
+            .execute("BEGIN IMMEDIATE", ())
+            .await
+            .context("opening an auth database transaction")?;
+        Ok(())
+    }
+
+    /// Commit when the body succeeded, roll back when it did not. The rollback
+    /// is best-effort: the body's error is what the caller needs to see, and
+    /// an abandoned transaction is released when the connection drops anyway.
+    async fn finish(&self, result: Result<()>) -> Result<()> {
+        match result {
+            Ok(()) => {
+                self.conn
+                    .execute("COMMIT", ())
+                    .await
+                    .context("committing an auth database transaction")?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute("ROLLBACK", ()).await;
+                Err(e)
+            }
+        }
     }
 
     /// First row of a query, draining the rest so the statement finishes
@@ -673,8 +805,28 @@ mod tests {
             .await
             .unwrap();
         assert!(stored.is_some(), "the session is stored by its hash");
-        let raw = std::fs::read(&path).unwrap();
-        let haystack = String::from_utf8_lossy(&raw);
+
+        // Read the main database *and* its sidecars. A freshly written row
+        // lives in `-wal` until a checkpoint moves it, so scanning only
+        // `web-auth.db` would pass without proving anything.
+        let mut haystack = String::new();
+        let mut files_read = 0;
+        for suffix in ["", "-wal", "-shm"] {
+            let mut p = path.as_os_str().to_os_string();
+            p.push(suffix);
+            if let Ok(bytes) = std::fs::read(std::path::PathBuf::from(p)) {
+                files_read += 1;
+                haystack.push_str(&String::from_utf8_lossy(&bytes));
+            }
+        }
+        assert!(files_read > 0, "at least the main database file must exist");
+        // The hash is what proves the sweep can actually see session bytes; if
+        // this fails the search covered no live data and the assertions below
+        // would be vacuous.
+        assert!(
+            haystack.contains(&token_hash(&s.token)),
+            "the sweep must reach the bytes the session was written into"
+        );
         assert!(
             !haystack.contains(&s.token),
             "the raw token is never stored"
@@ -683,6 +835,114 @@ mod tests {
             !haystack.contains("hunter2"),
             "the password is never stored"
         );
+    }
+
+    /// The resurrection bug: a session row that outlived its account is
+    /// inherited by the next account to claim the freed name.
+    #[tokio::test]
+    async fn a_readded_name_does_not_inherit_the_old_holders_session() {
+        let (_dir, store) = store().await;
+        store
+            .add_user("ada", "Ada", None, Role::Admin, "pw")
+            .await
+            .unwrap();
+        let old = store.create_session("ada", 3600).await.unwrap();
+        store.remove_user("ada").await.unwrap();
+        store
+            .add_user("ada", "Ada The Second", None, Role::Viewer, "pw2")
+            .await
+            .unwrap();
+        assert!(
+            store.session_user(&old.token).await.unwrap().is_none(),
+            "the previous holder's token must not resolve to the new account"
+        );
+    }
+
+    /// A session row left behind by an older build (or any other route) must
+    /// not become live again when the name is re-registered.
+    #[tokio::test]
+    async fn an_orphaned_session_row_is_swept_rather_than_inherited() {
+        let (_dir, store) = store().await;
+        store
+            .add_user("ada", "Ada", None, Role::Admin, "pw")
+            .await
+            .unwrap();
+        let old = store.create_session("ada", 3600).await.unwrap();
+        // Delete only the user row, exactly what the pre-fix ordering could
+        // leave behind if it crashed between its two statements.
+        store
+            .conn
+            .execute(
+                "DELETE FROM users WHERE name = ?1",
+                vec![Value::Text("ada".to_string())],
+            )
+            .await
+            .unwrap();
+        assert!(store.session_user(&old.token).await.unwrap().is_none());
+        store
+            .add_user("ada", "Ada The Second", None, Role::Viewer, "pw2")
+            .await
+            .unwrap();
+        assert!(
+            store.session_user(&old.token).await.unwrap().is_none(),
+            "the orphan must have been swept, not left dormant"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_user_reports_a_missing_account_without_touching_anything() {
+        let (_dir, store) = store().await;
+        store
+            .add_user("ada", "Ada", None, Role::Admin, "pw")
+            .await
+            .unwrap();
+        let live = store.create_session("ada", 3600).await.unwrap();
+        assert!(store.remove_user("ghost").await.is_err());
+        // The rollback left the unrelated account and its session intact.
+        assert!(store.session_user(&live.token).await.unwrap().is_some());
+        assert_eq!(store.list_users().await.unwrap().len(), 1);
+    }
+
+    /// The brief's central concurrency requirement: the `crystalline users`
+    /// CLI edits this file while the daemon serves from it. That is two
+    /// processes on one database, which is the case `crystalline_index`'s
+    /// turso store explicitly does not exercise (see this module's docs), so
+    /// it gets a test of its own. Two `AuthStore` instances stand in for the
+    /// two processes; each has its own `Database` and `Connection`.
+    #[tokio::test]
+    async fn two_stores_on_one_file_interleave_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("web-auth.db");
+        let daemon = AuthStore::open(&path).await.unwrap();
+        let cli = AuthStore::open(&path).await.unwrap();
+
+        // The CLI adds an account; the daemon sees it without reopening.
+        cli.add_user("ada", "Ada", None, Role::Viewer, "pw")
+            .await
+            .unwrap();
+        let session = daemon.create_session("ada", 3600).await.unwrap();
+        let (user, _) = daemon.session_user(&session.token).await.unwrap().unwrap();
+        assert_eq!(user.role, Role::Viewer);
+
+        // The CLI promotes; the daemon's next lookup reflects it.
+        cli.set_role("ada", Role::Admin).await.unwrap();
+        let (user, _) = daemon.session_user(&session.token).await.unwrap().unwrap();
+        assert_eq!(user.role, Role::Admin, "the daemon sees the CLI's write");
+
+        // The daemon writes; the CLI reads it back.
+        let second = daemon.create_session("ada", 3600).await.unwrap();
+        assert!(cli.session_user(&second.token).await.unwrap().is_some());
+
+        // The CLI disables; the daemon stops honoring the live session.
+        cli.set_disabled("ada", true).await.unwrap();
+        assert!(daemon.session_user(&session.token).await.unwrap().is_none());
+
+        // The CLI removes the account entirely, sessions and all, while the
+        // daemon still holds its own handle open.
+        cli.set_disabled("ada", false).await.unwrap();
+        cli.remove_user("ada").await.unwrap();
+        assert!(daemon.session_user(&second.token).await.unwrap().is_none());
+        assert!(daemon.list_users().await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -726,6 +986,94 @@ mod tests {
         assert!(store.verify_password("ada", "").await.unwrap().is_none());
         store.set_password("ada", "pw").await.unwrap();
         assert!(store.verify_password("ada", "pw").await.unwrap().is_some());
+    }
+
+    /// The privilege-restoration path: a trusted header carrying a case
+    /// variant must resolve to the existing account, not provision a fresh one
+    /// at the default role.
+    #[tokio::test]
+    async fn ensure_user_folds_case_instead_of_minting_a_second_account() {
+        let (_dir, store) = store().await;
+        store
+            .add_user("ada", "Ada", None, Role::Admin, "pw")
+            .await
+            .unwrap();
+        store.set_disabled("ada", true).await.unwrap();
+
+        let same = store.ensure_user("Ada", Role::Viewer).await.unwrap();
+        assert_eq!(same.name, "ada");
+        assert!(same.disabled, "the disable must not have been undone");
+        assert_eq!(same.role, Role::Admin, "the role must not have been reset");
+        assert_eq!(
+            store.list_users().await.unwrap().len(),
+            1,
+            "no second account may exist for a case variant"
+        );
+    }
+
+    #[tokio::test]
+    async fn names_are_folded_and_trimmed_on_every_path() {
+        let (_dir, store) = store().await;
+        store
+            .add_user("  AdA  ", "Ada", None, Role::Viewer, "pw")
+            .await
+            .unwrap();
+        let users = store.list_users().await.unwrap();
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].name, "ada", "stored folded and trimmed");
+
+        // Every read and write path accepts any casing of the same name.
+        assert!(store.verify_password("ADA", "pw").await.unwrap().is_some());
+        store.set_role(" Ada ", Role::Admin).await.unwrap();
+        let session = store.create_session("aDa", 3600).await.unwrap();
+        let (user, _) = store.session_user(&session.token).await.unwrap().unwrap();
+        assert_eq!(user.role, Role::Admin);
+        store.set_password("ADA", "pw2").await.unwrap();
+        assert!(store.verify_password("ada", "pw2").await.unwrap().is_some());
+        store.remove_user("  ADA  ").await.unwrap();
+        assert!(store.list_users().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_case_variant_cannot_be_added_twice() {
+        let (_dir, store) = store().await;
+        store
+            .add_user("ada", "Ada", None, Role::Viewer, "pw")
+            .await
+            .unwrap();
+        assert!(
+            store
+                .add_user("ADA", "Impostor", None, Role::Admin, "pw2")
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_or_blank_name_is_rejected() {
+        let (_dir, store) = store().await;
+        for blank in ["", "   ", "\t\n"] {
+            assert!(
+                store
+                    .add_user(blank, "Nobody", None, Role::Viewer, "pw")
+                    .await
+                    .is_err(),
+                "add_user must reject {blank:?}"
+            );
+            assert!(store.ensure_user(blank, Role::Viewer).await.is_err());
+            // A login attempt is a `None`, not an error, like every other bad
+            // credential.
+            assert!(store.verify_password(blank, "pw").await.unwrap().is_none());
+        }
+        assert!(store.list_users().await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn normalize_name_trims_folds_and_rejects_empty() {
+        assert_eq!(normalize_name("  AdA  ").unwrap(), "ada");
+        assert_eq!(normalize_name("Ada").unwrap(), "ada");
+        assert!(normalize_name("").is_err());
+        assert!(normalize_name("   ").is_err());
     }
 
     #[tokio::test]
