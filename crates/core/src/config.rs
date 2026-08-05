@@ -842,6 +842,17 @@ pub fn index_db_path() -> Result<PathBuf, ConfigError> {
     Ok(state_dir()?.join("index.db"))
 }
 
+/// The web API's users and sessions database, `<state_dir>/web-auth.db`.
+///
+/// Deliberately not derived from the index database path: credentials are not
+/// knowledge, they must survive a `reindex --full` that discards the index,
+/// and `--db` names a scratch index rather than a second set of accounts. The
+/// `crystalline users` CLI and the daemon both resolve the file here, so the
+/// two always meet on one path.
+pub fn web_auth_db_path() -> Result<PathBuf, ConfigError> {
+    Ok(state_dir()?.join("web-auth.db"))
+}
+
 /// The single-instance lock path, `<state_dir>/service.lock`. Lock only: the
 /// owner holds an exclusive OS lock on this file for its lifetime and the
 /// contents are meaningless. The owner's record lives at [`service_info_path`],

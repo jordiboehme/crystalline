@@ -20,6 +20,7 @@ mod hook;
 mod install;
 mod receipt;
 mod render;
+mod users;
 
 /// Local-first knowledge management for humans and AI agents.
 #[derive(Parser, Debug)]
@@ -309,6 +310,15 @@ enum Command {
     Ctl {
         #[command(subcommand)]
         command: CtlCommand,
+    },
+    /// Manage the accounts that may sign in to the web API served by
+    /// `serve --http`. The accounts live in their own small database in the
+    /// state directory, beside the index but never inside it, so a
+    /// `reindex --full` cannot take them with it. Safe to run while a daemon
+    /// is serving: it picks the change up without a restart.
+    Users {
+        #[command(subcommand)]
+        command: UsersCommand,
     },
     /// Capture a new engram into a domain (the body is read from --content or stdin).
     Write {
@@ -660,6 +670,89 @@ enum CtlCommand {
     },
     /// Ask the daemon to shut down cleanly.
     Shutdown,
+}
+
+#[derive(Subcommand, Debug)]
+enum UsersCommand {
+    /// Create an account. The name is the login name; it is stored trimmed
+    /// and lowercased, so `Ada` and `ada` are one account.
+    Add {
+        /// The login name.
+        name: String,
+        /// Human-readable name for the UI. Defaults to the login name as
+        /// typed, casing kept.
+        #[arg(long)]
+        display: Option<String>,
+        /// Contact address. Never used to sign in.
+        #[arg(long)]
+        email: Option<String>,
+        /// What the account may do. Defaults to viewer (read only).
+        #[arg(long, value_enum, default_value_t = RoleArg::Viewer)]
+        role: RoleArg,
+        /// Read the password from stdin instead of prompting, for scripts and
+        /// container provisioning. A single trailing newline is stripped.
+        #[arg(long)]
+        password_stdin: bool,
+    },
+    /// List every account with its role and whether it is disabled.
+    List,
+    /// Replace an account's password.
+    Passwd {
+        /// The account to change.
+        name: String,
+        /// Read the new password from stdin instead of prompting.
+        #[arg(long)]
+        password_stdin: bool,
+    },
+    /// Change what an account may do. Demoting the last enabled admin is
+    /// refused, so an installation cannot lock itself out.
+    Role {
+        /// The account to change.
+        name: String,
+        /// The new role.
+        #[arg(value_enum)]
+        role: RoleArg,
+    },
+    /// Turn an account off: it can neither sign in nor keep using a session it
+    /// already holds. Its rows are kept, so `enable` brings it back. Disabling
+    /// the last enabled admin is refused.
+    Disable {
+        /// The account to disable.
+        name: String,
+    },
+    /// Turn a disabled account back on.
+    Enable {
+        /// The account to enable.
+        name: String,
+    },
+    /// Delete an account and every session it holds. Removing the last
+    /// enabled admin is refused.
+    Remove {
+        /// The account to delete.
+        name: String,
+    },
+}
+
+/// The roles `users` accepts, mirroring `crystalline_service::rest::Role` so
+/// clap can validate the value and list it in `--help`.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum RoleArg {
+    /// Read only: search, read, browse.
+    Viewer,
+    /// Everything a viewer may do, plus writing and editing engrams.
+    Editor,
+    /// Everything an editor may do, plus managing domains and users.
+    Admin,
+}
+
+impl From<RoleArg> for crystalline_service::rest::Role {
+    fn from(arg: RoleArg) -> crystalline_service::rest::Role {
+        match arg {
+            RoleArg::Viewer => crystalline_service::rest::Role::Viewer,
+            RoleArg::Editor => crystalline_service::rest::Role::Editor,
+            RoleArg::Admin => crystalline_service::rest::Role::Admin,
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -1160,6 +1253,7 @@ fn main() -> anyhow::Result<()> {
             config,
         }) => on_runtime(move || mcp_dispatch(embedded, read_only, config, cli.db)),
         Some(Command::Ctl { command }) => on_runtime(move || run_ctl(command, cli.json)),
+        Some(Command::Users { command }) => on_runtime(move || users::run(command, cli.json)),
         Some(
             cmd @ (Command::Read { .. }
             | Command::Search { .. }
