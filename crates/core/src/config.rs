@@ -88,6 +88,11 @@ pub struct GlobalConfig {
     /// working untouched.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<IdentityConfig>,
+    /// Authentication settings for the served API. Absent means no trusted
+    /// header is honoured and anonymous access stays off, so every existing
+    /// config keeps working untouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<AuthConfig>,
 }
 
 impl GlobalConfig {
@@ -180,6 +185,26 @@ impl GlobalConfig {
             .and_then(|i| i.actor.as_deref())
             .map(str::trim)
             .filter(|s| !s.is_empty())
+    }
+
+    /// The request header naming the authenticated user, from
+    /// `auth.trusted_header`. Absent config or an absent key means the trusted
+    /// header is off: no header is believed, whatever a proxy sends.
+    pub fn auth_trusted_header(&self) -> Option<&str> {
+        self.auth
+            .as_ref()
+            .and_then(|a| a.trusted_header.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Whether a request that carries no identity is served anyway, from
+    /// `auth.anonymous`. Absent config or an absent key means off (false).
+    pub fn auth_anonymous(&self) -> bool {
+        self.auth
+            .as_ref()
+            .and_then(|a| a.anonymous)
+            .unwrap_or(false)
     }
 }
 
@@ -486,6 +511,22 @@ pub struct IdentityConfig {
     /// `process:name` for an automated job. Absent means no override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actor: Option<String>,
+}
+
+/// The `auth` block: how the served API identifies a caller. Reads like a
+/// settings-page section - see the `configure` tool, which exposes exactly
+/// these keys.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AuthConfig {
+    /// The request header a trusted reverse proxy sets to name the
+    /// authenticated user. Absent means the trusted-header path is off and no
+    /// header is believed. Only safe when a proxy in front of Crystalline
+    /// strips the header from client requests and sets it itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trusted_header: Option<String>,
+    /// Serve requests that carry no identity at all. Absent means off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anonymous: Option<bool>,
 }
 
 /// Service configuration.
