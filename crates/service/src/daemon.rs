@@ -709,7 +709,10 @@ async fn run_http(
     http_sessions: Arc<AtomicUsize>,
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
-    let router = http_router(engine, http_sessions, &allowed_hosts);
+    let auth = Arc::new(
+        crate::rest::AuthStore::open(&crystalline_core::config::web_auth_db_path()?).await?,
+    );
+    let router = http_router(engine, http_sessions, &allowed_hosts, auth)?;
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, router)
         .with_graceful_shutdown(async move { wait_true(&mut shutdown).await })
@@ -728,7 +731,8 @@ pub fn http_router(
     engine: Arc<Engine>,
     http_sessions: Arc<AtomicUsize>,
     allowed_hosts: &[String],
-) -> axum::Router {
+    auth: Arc<crate::rest::AuthStore>,
+) -> anyhow::Result<axum::Router> {
     use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
     use rmcp::transport::streamable_http_server::tower::StreamableHttpService;
 
@@ -739,9 +743,7 @@ pub fn http_router(
     let mut session_manager = LocalSessionManager::default();
     session_manager.session_config.sse_retry = None;
     let session_manager = Arc::new(session_manager);
-    let rest = crate::rest::router(crate::rest::RestState {
-        engine: engine.clone(),
-    });
+    let rest = crate::rest::router(crate::rest::RestState::new(engine.clone(), auth)?);
     let service = StreamableHttpService::new(
         move || {
             http_sessions.fetch_add(1, Ordering::Relaxed);
@@ -750,10 +752,10 @@ pub fn http_router(
         session_manager,
         http_config(allowed_hosts),
     );
-    axum::Router::new()
+    Ok(axum::Router::new()
         .route("/health", axum::routing::get(health))
         .nest("/api/v1", rest)
-        .fallback_service(service)
+        .fallback_service(service))
 }
 
 /// Liveness probe for load balancers and uptime monitors: a static payload

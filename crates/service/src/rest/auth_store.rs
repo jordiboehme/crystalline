@@ -783,6 +783,28 @@ async fn hash_password(password: &str) -> Result<String> {
     .context("the password hashing task failed")?
 }
 
+/// Verify `password` against a hash no account has, and throw the answer away.
+///
+/// The point is the time it takes, not the result.
+/// [`AuthStore::verify_password`] returns before any hashing when there is no
+/// hash to check against - an unknown name, a disabled account, an account
+/// provisioned without a password - so a caller that answers as soon as it
+/// hears `None` answers a miss faster than a wrong password. Running this on
+/// those paths costs the same argon2id work a real check costs, which is what
+/// removes the difference. See `rest::auth::check_password`, the caller that
+/// owes it.
+///
+/// The hash is derived once per process from random bytes, so it is a real
+/// hash at the crate's current cost parameters (a frozen constant here would
+/// drift from them) and no password can match it.
+pub(crate) async fn dummy_verify(password: &str) -> Result<bool> {
+    static DUMMY: tokio::sync::OnceCell<String> = tokio::sync::OnceCell::const_new();
+    let hash = DUMMY
+        .get_or_try_init(|| async { hash_password(&random_hex()).await })
+        .await?;
+    verify_hash(hash.clone(), password.to_string()).await
+}
+
 /// Verify a password against a stored PHC string, on the blocking pool for the
 /// same reason as [`hash_password`]. A hash this cannot parse verifies as
 /// false rather than erroring: a corrupt row must fail closed.

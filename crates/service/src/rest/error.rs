@@ -28,6 +28,33 @@ impl ApiError {
             detail: detail.into(),
         }
     }
+
+    /// A 401 for a request that carries no identity the server accepts. The
+    /// browser client reads this as "show the login form".
+    pub fn unauthorized(detail: impl Into<String>) -> ApiError {
+        ApiError {
+            status: StatusCode::UNAUTHORIZED,
+            title: "unauthorized",
+            detail: detail.into(),
+        }
+    }
+
+    /// A 403 for a caller the server knows and will not serve this to: an
+    /// account without the role, a disabled account, or a mutating request
+    /// missing its CSRF token. Logging in again cannot help, which is what
+    /// separates it from [`ApiError::unauthorized`].
+    pub fn forbidden(detail: impl Into<String>) -> ApiError {
+        ApiError {
+            status: StatusCode::FORBIDDEN,
+            title: "forbidden",
+            detail: detail.into(),
+        }
+    }
+
+    /// A 500 for a failure that is not the caller's fault.
+    pub fn internal(detail: impl Into<String>) -> ApiError {
+        internal_error(detail.into())
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -70,7 +97,7 @@ impl From<EngineError> for ApiError {
             | EngineError::ReadOnly
             | EngineError::EnvTokenConnect => unprocessable(detail),
             EngineError::Remote(remote) => remote_to_api_error(remote, detail),
-            EngineError::Io { .. } | EngineError::Internal(_) => internal(detail),
+            EngineError::Io { .. } | EngineError::Internal(_) => internal_error(detail),
         }
     }
 }
@@ -82,7 +109,7 @@ impl From<anyhow::Error> for ApiError {
     fn from(e: anyhow::Error) -> ApiError {
         match e.downcast::<EngineError>() {
             Ok(engine) => engine.into(),
-            Err(other) => internal(other.to_string()),
+            Err(other) => internal_error(other.to_string()),
         }
     }
 }
@@ -102,7 +129,7 @@ fn remote_to_api_error(e: crystalline_remote::RemoteError, detail: String) -> Ap
         | RemoteError::Io(_)
         | RemoteError::State(_)
         | RemoteError::Credential { .. }
-        | RemoteError::BaseUnavailable => internal(detail),
+        | RemoteError::BaseUnavailable => internal_error(detail),
         RemoteError::RepoNotFound { .. }
         | RemoteError::NotADomain { .. }
         | RemoteError::ProposalNotFound { .. }
@@ -123,7 +150,7 @@ fn unprocessable(detail: String) -> ApiError {
 }
 
 /// A 500 for a failure that is not the caller's fault.
-fn internal(detail: String) -> ApiError {
+fn internal_error(detail: String) -> ApiError {
     ApiError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
         title: "internal error",

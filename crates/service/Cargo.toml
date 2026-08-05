@@ -42,6 +42,8 @@ interprocess = { workspace = true, features = ["tokio"] }
 fs4 = { workspace = true }
 notify = { workspace = true }
 axum = { workspace = true }
+axum-extra = { workspace = true }
+time = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
