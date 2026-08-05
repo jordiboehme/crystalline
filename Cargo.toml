@@ -89,6 +89,11 @@ keyring = { version = "4.1.6", default-features = false, features = ["v1"] }
 tar = "0.4.46"
 flate2 = "1.1.9"
 base64 = "0.22.1"
+# Password hashing for the REST auth store (crates/service). Default features
+# already pull `password-hash` and its `rand_core`, so the salt and the session
+# token both draw from `password_hash::rand_core::OsRng` and no separate `rand`
+# dependency is needed; `std` is on so hashing errors carry `std::error::Error`.
+argon2 = { version = "0.5.3", features = ["std"] }
 
 insta = { version = "1.48.0", features = ["yaml"] }
 assert_cmd = "2.2.2"

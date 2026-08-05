@@ -3,6 +3,7 @@
 //! the MCP tools and this API stay one source of truth, and every failure is
 //! an [`ApiError`] rendered as RFC 9457 problem detail.
 
+mod auth_store;
 mod error;
 
 use std::sync::Arc;
@@ -12,6 +13,7 @@ use axum::extract::State;
 use axum::routing::get;
 use serde_json::Value;
 
+pub use auth_store::*;
 pub use error::ApiError;
 
 use crate::engine::Engine;
