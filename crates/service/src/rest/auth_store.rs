@@ -227,6 +227,34 @@ const USER_COLUMNS: &str = "name, display, email, role, disabled";
 /// `u`. Same columns in the same order, so [`user_from_row`] decodes both.
 const USER_COLUMNS_JOINED: &str = "u.name, u.display, u.email, u.role, u.disabled";
 
+/// A `WHERE` fragment that is true unless the row it matches is the last
+/// *enabled* admin: either this account is not an enabled admin, or another
+/// enabled admin exists. `?1` is the target name, so it composes with every
+/// statement here that already keys on `?1`.
+///
+/// Losing the last enabled admin locks the installation out of its own user
+/// management, with no way back short of editing the database by hand. The
+/// check lives in the statement rather than in the `crystalline users` CLI on
+/// purpose: a read-then-write in the CLI would race a second invocation (or
+/// the daemon's own writes) and two concurrent demotions could each see the
+/// other admin and both go through. As part of the statement it is decided by
+/// the one writer that holds the write lock.
+///
+/// A *disabled* admin deliberately does not count as a remaining admin: it
+/// cannot log in, so it is not a way back in.
+const NOT_LAST_ADMIN: &str = "(role <> 'admin' OR disabled <> 0 OR EXISTS (
+         SELECT 1 FROM users other
+         WHERE other.name <> ?1 AND other.role = 'admin' AND other.disabled = 0
+     ))";
+
+/// What a refused edit tells the operator. `{verb}` is filled per call site.
+fn last_admin_error(verb: &str, name: &str) -> anyhow::Error {
+    anyhow!(
+        "refusing to {verb} the last admin ('{name}'): \
+         add or enable another admin first"
+    )
+}
+
 impl AuthStore {
     /// Open (creating if absent) the auth database at `path`, applying the
     /// schema. The parent directory is created too, so a first run against a
@@ -342,12 +370,17 @@ impl AuthStore {
         .await
     }
 
-    /// Change an account's role.
+    /// Change an account's role. Demoting the last enabled admin is refused
+    /// (see [`NOT_LAST_ADMIN`]); promoting anyone never is, so the `?2 =
+    /// 'admin'` arm short-circuits the guard.
     pub async fn set_role(&self, name: &str, role: Role) -> Result<()> {
-        self.update_user(
-            "UPDATE users SET role = ?2 WHERE name = ?1",
+        self.update_guarded(
+            &format!(
+                "UPDATE users SET role = ?2 WHERE name = ?1 AND (?2 = 'admin' OR {NOT_LAST_ADMIN})"
+            ),
             name,
             Value::Text(role.as_str().to_string()),
+            "demote",
         )
         .await
     }
@@ -355,11 +388,17 @@ impl AuthStore {
     /// Disable or re-enable an account. Disabling leaves existing sessions in
     /// place but [`AuthStore::session_user`] stops honoring them, so the effect
     /// is immediate without having to hunt the session rows down.
+    ///
+    /// Disabling the last enabled admin is refused (see [`NOT_LAST_ADMIN`]);
+    /// re-enabling never is, so the `?2 = 0` arm short-circuits the guard.
     pub async fn set_disabled(&self, name: &str, disabled: bool) -> Result<()> {
-        self.update_user(
-            "UPDATE users SET disabled = ?2 WHERE name = ?1",
+        self.update_guarded(
+            &format!(
+                "UPDATE users SET disabled = ?2 WHERE name = ?1 AND (?2 = 0 OR {NOT_LAST_ADMIN})"
+            ),
             name,
             Value::Integer(i64::from(disabled)),
+            "disable",
         )
         .await
     }
@@ -381,6 +420,11 @@ impl AuthStore {
     /// against a concurrent [`AuthStore::create_session`] in the daemon, which
     /// takes `BEGIN IMMEDIATE` too and therefore cannot land an insert between
     /// these two statements.
+    ///
+    /// Removing the last enabled admin is refused (see [`NOT_LAST_ADMIN`]).
+    /// The guard rides on the `DELETE` itself, inside the same transaction, so
+    /// two concurrent removals cannot both observe the other admin and both
+    /// succeed. A refusal rolls the session delete back with everything else.
     pub async fn remove_user(&self, name: &str) -> Result<()> {
         let name = normalize_name(name)?;
         let key = vec![Value::Text(name.clone())];
@@ -395,10 +439,22 @@ impl AuthStore {
                 .with_context(|| format!("removing sessions for user '{name}'"))?;
             let changed = self
                 .conn
-                .execute("DELETE FROM users WHERE name = ?1", key)
+                .execute(
+                    &format!("DELETE FROM users WHERE name = ?1 AND {NOT_LAST_ADMIN}"),
+                    key.clone(),
+                )
                 .await
                 .with_context(|| format!("removing user '{name}'"))?;
             if changed == 0 {
+                // Zero rows means one of two things, and the operator needs to
+                // be told which. The probe is inside the transaction, so it
+                // sees exactly what the delete saw.
+                let exists = self
+                    .query_first("SELECT 1 FROM users WHERE name = ?1", key)
+                    .await?;
+                if exists.is_some() {
+                    return Err(last_admin_error("remove", &name));
+                }
                 bail!("no such user: '{name}'");
             }
             Ok(())
@@ -589,6 +645,37 @@ impl AuthStore {
             .await
             .with_context(|| format!("updating user '{name}'"))?;
         if changed == 0 {
+            bail!("no such user: '{name}'");
+        }
+        Ok(())
+    }
+
+    /// [`AuthStore::update_user`] for a statement carrying the
+    /// [`NOT_LAST_ADMIN`] guard, where zero rows changed has a second possible
+    /// meaning: the edit was refused because it would have left no enabled
+    /// admin. `verb` names the refused operation in that message.
+    ///
+    /// The follow-up existence probe only picks between the two messages -
+    /// nothing was written either way - so it does not need to share the
+    /// statement's transaction.
+    async fn update_guarded(&self, sql: &str, name: &str, value: Value, verb: &str) -> Result<()> {
+        let name = normalize_name(name)?;
+        let _guard = self.guard.lock().await;
+        let changed = self
+            .conn
+            .execute(sql, vec![Value::Text(name.clone()), value])
+            .await
+            .with_context(|| format!("updating user '{name}'"))?;
+        if changed == 0 {
+            let exists = self
+                .query_first(
+                    "SELECT 1 FROM users WHERE name = ?1",
+                    vec![Value::Text(name.clone())],
+                )
+                .await?;
+            if exists.is_some() {
+                return Err(last_admin_error(verb, &name));
+            }
             bail!("no such user: '{name}'");
         }
         Ok(())
@@ -837,8 +924,10 @@ mod tests {
     #[tokio::test]
     async fn a_disabled_user_loses_a_live_session() {
         let (_dir, store) = store().await;
+        // Editor rather than admin: the role is incidental here, and the last
+        // enabled admin cannot be disabled (see [`NOT_LAST_ADMIN`]).
         store
-            .add_user("ada", "Ada", None, Role::Admin, "pw")
+            .add_user("ada", "Ada", None, Role::Editor, "pw")
             .await
             .unwrap();
         let s = store.create_session("ada", 3600).await.unwrap();
@@ -901,8 +990,10 @@ mod tests {
     #[tokio::test]
     async fn a_readded_name_does_not_inherit_the_old_holders_session() {
         let (_dir, store) = store().await;
+        // Editor rather than admin: the role is incidental, and the last
+        // enabled admin cannot be removed (see [`NOT_LAST_ADMIN`]).
         store
-            .add_user("ada", "Ada", None, Role::Admin, "pw")
+            .add_user("ada", "Ada", None, Role::Editor, "pw")
             .await
             .unwrap();
         let old = store.create_session("ada", 3600).await.unwrap();
@@ -983,10 +1074,12 @@ mod tests {
         let (user, _) = daemon.session_user(&session.token).await.unwrap().unwrap();
         assert_eq!(user.role, Role::Viewer);
 
-        // The CLI promotes; the daemon's next lookup reflects it.
-        cli.set_role("ada", Role::Admin).await.unwrap();
+        // The CLI promotes; the daemon's next lookup reflects it. Editor, not
+        // admin: this account is disabled and removed below, which the
+        // last-admin guard would refuse (see [`NOT_LAST_ADMIN`]).
+        cli.set_role("ada", Role::Editor).await.unwrap();
         let (user, _) = daemon.session_user(&session.token).await.unwrap().unwrap();
-        assert_eq!(user.role, Role::Admin, "the daemon sees the CLI's write");
+        assert_eq!(user.role, Role::Editor, "the daemon sees the CLI's write");
 
         // The daemon writes; the CLI reads it back.
         let second = daemon.create_session("ada", 3600).await.unwrap();
@@ -1052,6 +1145,13 @@ mod tests {
                 .await
                 .unwrap(),
         );
+        // One admin nobody touches, so every task's promote-then-remove is
+        // allowed: the last-admin guard's `EXISTS` subquery is thereby also
+        // exercised under concurrency rather than short-circuited away.
+        store
+            .add_user("keeper", "Keeper", None, Role::Admin, "pw")
+            .await
+            .unwrap();
         for i in 0..8 {
             store
                 .add_user(&format!("u{i}"), "U", None, Role::Editor, "pw")
@@ -1077,7 +1177,14 @@ mod tests {
                 .expect("the task must not panic")
                 .expect("no call may fail under concurrency");
         }
-        assert!(store.list_users().await.unwrap().is_empty());
+        let left: Vec<String> = store
+            .list_users()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|u| u.name)
+            .collect();
+        assert_eq!(left, vec!["keeper".to_string()]);
     }
 
     #[tokio::test]
@@ -1129,8 +1236,11 @@ mod tests {
     #[tokio::test]
     async fn ensure_user_folds_case_instead_of_minting_a_second_account() {
         let (_dir, store) = store().await;
+        // Editor rather than admin: what matters is that a privileged, then
+        // disabled, account is not restored by a case variant, and the last
+        // enabled admin could not be disabled here (see [`NOT_LAST_ADMIN`]).
         store
-            .add_user("ada", "Ada", None, Role::Admin, "pw")
+            .add_user("ada", "Ada", None, Role::Editor, "pw")
             .await
             .unwrap();
         store.set_disabled("ada", true).await.unwrap();
@@ -1138,7 +1248,7 @@ mod tests {
         let same = store.ensure_user("Ada", Role::Viewer).await.unwrap();
         assert_eq!(same.name, "ada");
         assert!(same.disabled, "the disable must not have been undone");
-        assert_eq!(same.role, Role::Admin, "the role must not have been reset");
+        assert_eq!(same.role, Role::Editor, "the role must not have been reset");
         assert_eq!(
             store.list_users().await.unwrap().len(),
             1,
@@ -1157,12 +1267,14 @@ mod tests {
         assert_eq!(users.len(), 1);
         assert_eq!(users[0].name, "ada", "stored folded and trimmed");
 
-        // Every read and write path accepts any casing of the same name.
+        // Every read and write path accepts any casing of the same name. The
+        // role moves to editor rather than admin so the removal below is not
+        // refused as a lockout (see [`NOT_LAST_ADMIN`]).
         assert!(store.verify_password("ADA", "pw").await.unwrap().is_some());
-        store.set_role(" Ada ", Role::Admin).await.unwrap();
+        store.set_role(" Ada ", Role::Editor).await.unwrap();
         let session = store.create_session("aDa", 3600).await.unwrap();
         let (user, _) = store.session_user(&session.token).await.unwrap().unwrap();
-        assert_eq!(user.role, Role::Admin);
+        assert_eq!(user.role, Role::Editor);
         store.set_password("ADA", "pw2").await.unwrap();
         assert!(store.verify_password("ada", "pw2").await.unwrap().is_some());
         store.remove_user("  ADA  ").await.unwrap();
@@ -1239,8 +1351,10 @@ mod tests {
     #[tokio::test]
     async fn remove_user_takes_its_sessions_with_it() {
         let (_dir, store) = store().await;
+        // Editor rather than admin: the role is incidental, and the last
+        // enabled admin cannot be removed (see [`NOT_LAST_ADMIN`]).
         store
-            .add_user("ada", "Ada", None, Role::Admin, "pw")
+            .add_user("ada", "Ada", None, Role::Editor, "pw")
             .await
             .unwrap();
         let s = store.create_session("ada", 3600).await.unwrap();
@@ -1273,6 +1387,160 @@ mod tests {
             .map(|u| u.name)
             .collect();
         assert_eq!(names, vec!["ada".to_string(), "zoe".to_string()]);
+    }
+
+    /// The lockout guard: the last enabled admin cannot be removed, disabled
+    /// or demoted, so an installation cannot lose its last way in. Enforced in
+    /// the store rather than in the `crystalline users` CLI because a
+    /// check-then-act in the CLI would race a second invocation.
+    #[tokio::test]
+    async fn the_last_admin_cannot_be_removed_disabled_or_demoted() {
+        let (_dir, store) = store().await;
+        store
+            .add_user("ada", "Ada", None, Role::Admin, "pw")
+            .await
+            .unwrap();
+        // A non-admin account is no help: it cannot administer anything.
+        store
+            .add_user("bob", "Bob", None, Role::Editor, "pw")
+            .await
+            .unwrap();
+
+        for err in [
+            store.remove_user("ada").await.unwrap_err(),
+            store.set_disabled("ada", true).await.unwrap_err(),
+            store.set_role("ada", Role::Viewer).await.unwrap_err(),
+        ] {
+            assert!(
+                err.to_string().contains("last admin"),
+                "expected a last-admin refusal, got: {err}"
+            );
+        }
+
+        // Nothing was applied: the account is still an enabled admin.
+        let users = store.list_users().await.unwrap();
+        let ada = users.iter().find(|u| u.name == "ada").unwrap();
+        assert_eq!(ada.role, Role::Admin);
+        assert!(!ada.disabled);
+    }
+
+    /// With a second enabled admin in place, all three operations go through.
+    #[tokio::test]
+    async fn an_admin_can_be_removed_disabled_and_demoted_beside_another_admin() {
+        let (_dir, store) = store().await;
+        store
+            .add_user("ada", "Ada", None, Role::Admin, "pw")
+            .await
+            .unwrap();
+        store
+            .add_user("bob", "Bob", None, Role::Admin, "pw")
+            .await
+            .unwrap();
+        store
+            .add_user("cyd", "Cyd", None, Role::Admin, "pw")
+            .await
+            .unwrap();
+        store
+            .add_user("dee", "Dee", None, Role::Admin, "pw")
+            .await
+            .unwrap();
+
+        // Each edit leaves at least one enabled admin behind, so each is
+        // allowed: four admins, then a disable, a demotion and a removal.
+        store.set_disabled("ada", true).await.unwrap();
+        store.set_role("bob", Role::Viewer).await.unwrap();
+        store.remove_user("cyd").await.unwrap();
+
+        // Re-enabling the disabled admin is never refused.
+        store.set_disabled("ada", false).await.unwrap();
+        let users = store.list_users().await.unwrap();
+        assert_eq!(users.len(), 3);
+        assert!(users.iter().any(|u| u.name == "ada" && !u.disabled));
+    }
+
+    /// A disabled admin cannot log in, so it is not a way back in and must not
+    /// satisfy the guard for the one admin that still works.
+    #[tokio::test]
+    async fn a_disabled_admin_does_not_count_as_a_remaining_admin() {
+        let (_dir, store) = store().await;
+        store
+            .add_user("ada", "Ada", None, Role::Admin, "pw")
+            .await
+            .unwrap();
+        store
+            .add_user("bob", "Bob", None, Role::Admin, "pw")
+            .await
+            .unwrap();
+        store.set_disabled("bob", true).await.unwrap();
+
+        assert!(store.remove_user("ada").await.is_err());
+        assert!(store.set_disabled("ada", true).await.is_err());
+        assert!(store.set_role("ada", Role::Editor).await.is_err());
+
+        // The already-disabled admin is not the last *enabled* one, so it is
+        // not itself protected.
+        store.remove_user("bob").await.unwrap();
+    }
+
+    /// The guard only applies to enabled admins. Every other account, and
+    /// every promotion, is untouched by it.
+    #[tokio::test]
+    async fn the_guard_leaves_non_admins_and_promotions_alone() {
+        let (_dir, store) = store().await;
+        store
+            .add_user("ada", "Ada", None, Role::Admin, "pw")
+            .await
+            .unwrap();
+        store
+            .add_user("bob", "Bob", None, Role::Viewer, "pw")
+            .await
+            .unwrap();
+        // The one and only viewer is not an admin: no protection.
+        store.set_disabled("bob", true).await.unwrap();
+        store.set_disabled("bob", false).await.unwrap();
+        // Promoting is always allowed, even for the last admin itself.
+        store.set_role("ada", Role::Admin).await.unwrap();
+        store.set_role("bob", Role::Admin).await.unwrap();
+        // Now that there are two, the first may go.
+        store.remove_user("ada").await.unwrap();
+    }
+
+    /// A refused removal must not take the account's sessions with it: the
+    /// whole operation rolls back, not just the delete that was refused.
+    #[tokio::test]
+    async fn a_refused_removal_keeps_the_admins_sessions() {
+        let (_dir, store) = store().await;
+        store
+            .add_user("ada", "Ada", None, Role::Admin, "pw")
+            .await
+            .unwrap();
+        let live = store.create_session("ada", 3600).await.unwrap();
+        assert!(store.remove_user("ada").await.is_err());
+        assert!(
+            store.session_user(&live.token).await.unwrap().is_some(),
+            "the rolled-back removal must leave the live session in place"
+        );
+    }
+
+    /// The guard must not swallow a plain typo: an unknown name still reports
+    /// itself as unknown rather than as a lockout refusal.
+    #[tokio::test]
+    async fn an_unknown_name_still_reports_itself_as_unknown() {
+        let (_dir, store) = store().await;
+        store
+            .add_user("ada", "Ada", None, Role::Admin, "pw")
+            .await
+            .unwrap();
+        for err in [
+            store.remove_user("ghost").await.unwrap_err(),
+            store.set_disabled("ghost", true).await.unwrap_err(),
+            store.set_role("ghost", Role::Viewer).await.unwrap_err(),
+        ] {
+            assert!(
+                err.to_string().contains("no such user"),
+                "expected an unknown-user error, got: {err}"
+            );
+        }
     }
 
     #[test]
