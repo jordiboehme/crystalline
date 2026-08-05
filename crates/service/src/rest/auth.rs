@@ -38,7 +38,7 @@ use crystalline_core::config::GlobalConfig;
 use serde_json::Value;
 use tokio::sync::Semaphore;
 
-use super::auth_store::{AuthStore, Role, User, dummy_verify};
+use super::auth_store::{AuthStore, PasswordCheck, Role, User, dummy_verify};
 use super::{ApiError, RestState};
 
 /// The session cookie. Named for the UI it serves so it never collides with a
@@ -284,6 +284,17 @@ fn check_csrf(identity: &Identity, req: &Request) -> Result<(), ApiError> {
     let Some(expected) = identity.csrf.as_deref() else {
         return Ok(());
     };
+    // An empty expected token is not a token: it would match an absent header
+    // and wave every mutating request through. `create_session` always writes
+    // one, so this is unreachable today - but a check that fails open when its
+    // own input is missing is the wrong shape to leave lying around, and the
+    // read that produces it (`session_user`'s `unwrap_or_default`) is one
+    // column rename away from returning it for real.
+    if expected.is_empty() {
+        return Err(ApiError::forbidden(
+            "this session carries no CSRF token: log in again",
+        ));
+    }
     let got = req
         .headers()
         .get(CSRF_HEADER)
@@ -329,12 +340,19 @@ pub async fn login(
     axum::Json(body): axum::Json<LoginBody>,
 ) -> Result<(CookieJar, axum::Json<Value>), ApiError> {
     let Some(user) =
-        check_password(&state.auth, &state.login_slots, &body.name, &body.password).await?
+        authenticate(&state.auth, &state.login_slots, &body.name, &body.password).await?
     else {
         // One message for every way this can fail, so the response says only
         // that the pair was wrong, never which half.
         return Err(ApiError::unauthorized("the name or password is wrong"));
     };
+    // Whatever session the caller arrived holding is retired rather than left
+    // live beside the new one. A session fixation attack works by planting a
+    // token the victim then logs in under, so the token that was presented is
+    // exactly the one that must not survive a successful login.
+    if let Some(presented) = jar.get(SESSION_COOKIE) {
+        state.auth.delete_session(presented.value()).await?;
+    }
     let session = state
         .auth
         .create_session(&user.name, SESSION_TTL_SECS)
@@ -343,7 +361,7 @@ pub async fn login(
         .path("/")
         .http_only(true)
         .same_site(SameSite::Lax)
-        .secure(!is_loopback_request(&headers))
+        .secure(cookie_needs_secure(&headers))
         .max_age(time::Duration::seconds(SESSION_TTL_SECS))
         .build();
     Ok((
@@ -352,36 +370,43 @@ pub async fn login(
     ))
 }
 
-/// Check a password, costing the same argon2 work whether or not the account
-/// exists.
+/// Check a password at a cost that does not depend on which account it names.
 ///
-/// [`AuthStore::verify_password`] returns early, before any hashing, for an
-/// unknown name, a disabled account and an account provisioned without a
-/// password. That is the right shape for the store, but over HTTP the
-/// difference is measurable: a fast refusal would say "no such account" and a
-/// slow one "wrong password", which is a user enumeration oracle. The dummy
-/// verification puts a real argon2id verification on every miss path so all of
-/// them cost the same.
+/// Every login attempt runs exactly one argon2id verification, whatever it
+/// finds. [`AuthStore::check_password`] runs one for the two outcomes that have
+/// a hash to check ([`PasswordCheck::Verified`] and [`PasswordCheck::Mismatch`])
+/// and none for [`PasswordCheck::NoHash`] - an unknown name, a disabled
+/// account, an account provisioned without a password - so this pays the
+/// missing one itself, against a hash nobody can match.
+///
+/// The balance is the whole point, and it is easy to get backwards: verifying
+/// on top of a real check would make a wrong password cost two verifications
+/// and an unknown name one, which is the same oracle with its sign flipped.
+/// `one_argon2_verification_per_login_attempt` asserts the cost rather than the
+/// shape of the code, so an inversion fails the test instead of reading fine.
 ///
 /// Chosen over a login rate limiter, the other way to close this: a per-name
 /// limiter hands an attacker a lockout lever against a known account, needs
 /// eviction and a clock, and would still leak the difference within its own
 /// window. This is stateless and closes the channel itself rather than
 /// rationing access to it.
-async fn check_password(
+async fn authenticate(
     auth: &AuthStore,
     slots: &Semaphore,
     name: &str,
     password: &str,
 ) -> Result<Option<User>, ApiError> {
     with_login_slot(slots, async {
-        let found = auth.verify_password(name, password).await?;
-        if found.is_none() {
-            dummy_verify(password).await?;
-            #[cfg(test)]
-            DUMMY_VERIFIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        match auth.check_password(name, password).await? {
+            PasswordCheck::Verified(user) => Ok(Some(user)),
+            // A verification already ran against the stored hash.
+            PasswordCheck::Mismatch => Ok(None),
+            // Nothing was hashed, so buy the same amount of time here.
+            PasswordCheck::NoHash => {
+                dummy_verify(password).await?;
+                Ok(None)
+            }
         }
-        Ok(found)
     })
     .await?
 }
@@ -394,12 +419,6 @@ async fn with_login_slot<F: Future>(slots: &Semaphore, work: F) -> Result<F::Out
     })?;
     Ok(work.await)
 }
-
-/// Counts the miss paths that paid for a dummy verification, so the tests can
-/// prove the enumeration closure is actually on the path rather than merely
-/// present. Test-only: nothing in a served binary touches it.
-#[cfg(test)]
-static DUMMY_VERIFIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Revoke the session and clear its cookie. Not an error without one: a browser
 /// logging out twice, or with a cookie this server has already forgotten, is
@@ -438,15 +457,55 @@ pub async fn me(State(state): State<RestState>, identity: Identity) -> axum::Jso
     }))
 }
 
-/// Whether the client reached this instance over loopback, which decides
-/// whether the session cookie is marked `Secure`.
+/// Whether the session cookie is marked `Secure`, which is to say: is there any
+/// sign this request did not come straight from a browser on this machine?
 ///
-/// Read from `Host` rather than from the peer address on purpose: behind a
-/// reverse proxy the peer is the proxy, usually on loopback itself, while the
-/// browser is remote and on TLS, and a cookie left un-`Secure` there would be
-/// the one case that matters. `Host` is what the browser asked for, so it stays
-/// right on both sides of a proxy. A request with no `Host` is treated as
-/// remote: HTTP/1.1 requires the header, so its absence is not a local browser.
+/// The flag is dropped only when both signals agree that it is local. `Host`
+/// rather than the peer address, because behind a reverse proxy the peer is the
+/// proxy - usually loopback itself - while the browser is remote and on TLS,
+/// and that is the one case where a missing `Secure` matters; `Host` is what
+/// the browser asked for, so it stays right on both sides of a proxy. But
+/// `Host` alone is not enough either: nginx's default when `proxy_set_header
+/// Host` is left unconfigured is `Host $proxy_host`, literally the upstream's
+/// `127.0.0.1:port`, so a plain `proxy_pass` in front of TLS would look local
+/// and hand out a cookie that a downgrade could then read. A forwarded-protocol
+/// header saying `https` therefore overrides the `Host` reading outright.
+///
+/// A request with no `Host` is treated as remote: HTTP/1.1 requires the header,
+/// so its absence is not a local browser.
+fn cookie_needs_secure(headers: &HeaderMap) -> bool {
+    forwarded_https(headers) || !is_loopback_request(headers)
+}
+
+/// Whether a proxy in front of this instance says it terminated TLS, by either
+/// the de-facto `X-Forwarded-Proto` or RFC 7239's `Forwarded: proto=`.
+///
+/// Any `proto=https` anywhere in the chain counts. The error that matters here
+/// is dropping `Secure` from a cookie that travels over the internet, so an
+/// ambiguous header resolves towards setting the flag.
+fn forwarded_https(headers: &HeaderMap) -> bool {
+    let x_forwarded = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        // A chain of proxies appends, so the first element is the one that
+        // spoke to the client.
+        .and_then(|v| v.split(',').next())
+        .is_some_and(|proto| proto.trim().eq_ignore_ascii_case("https"));
+    x_forwarded
+        || headers
+            .get(header::FORWARDED)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|raw| {
+                raw.split([',', ';']).any(|part| {
+                    part.split_once('=').is_some_and(|(key, value)| {
+                        key.trim().eq_ignore_ascii_case("proto")
+                            && value.trim().trim_matches('"').eq_ignore_ascii_case("https")
+                    })
+                })
+            })
+}
+
+/// Whether the `Host` the client asked for names this machine.
 fn is_loopback_request(headers: &HeaderMap) -> bool {
     headers
         .get(header::HOST)
@@ -481,6 +540,7 @@ pub(super) fn login_slots() -> Arc<Semaphore> {
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use super::super::auth_store;
     use super::*;
 
     async fn store() -> (tempfile::TempDir, AuthStore) {
@@ -499,15 +559,21 @@ mod tests {
         headers
     }
 
-    /// Every way a login can miss pays for an argon2 verification, so the
-    /// response time cannot be read as "no such account".
+    /// The enumeration closure, asserted as the property that matters: a login
+    /// attempt costs exactly one argon2 verification wherever it lands.
+    ///
+    /// Counting only the *dummy* verifications would pass just as happily on a
+    /// version that runs the dummy on top of a real check, which costs an
+    /// existing account two and an unknown one - the same oracle, inverted.
+    /// Counting every verification is what pins the balance.
     #[tokio::test]
-    async fn every_miss_path_pays_for_a_dummy_verification() {
+    async fn one_argon2_verification_per_login_attempt() {
         let (_dir, store) = store().await;
         store
             .add_user("ada", "Ada", None, Role::Editor, "s3cret")
             .await
             .unwrap();
+        // Provisioned by a trusted header, so it has no password at all.
         store.ensure_user("bob", Role::Viewer).await.unwrap();
         store
             .add_user("cyd", "Cyd", None, Role::Editor, "pw")
@@ -516,38 +582,30 @@ mod tests {
         store.set_disabled("cyd", true).await.unwrap();
         let slots = Semaphore::new(LOGIN_SLOTS);
 
-        let before = DUMMY_VERIFIES.load(Ordering::Relaxed);
-        // An unknown name, a name with no password at all, a disabled account,
-        // a name that cannot even be normalized, and a wrong password.
-        for (name, password) in [
-            ("ghost", "s3cret"),
-            ("bob", ""),
-            ("cyd", "pw"),
-            ("   ", "s3cret"),
-            ("ada", "wrong"),
+        // An unknown name, a passwordless account, a disabled account, a name
+        // that will not normalize, a wrong password, and the right one.
+        for (name, password, expected) in [
+            ("ghost", "s3cret", None),
+            ("bob", "", None),
+            ("cyd", "pw", None),
+            ("   ", "s3cret", None),
+            ("ada", "wrong", None),
+            ("AdA", "s3cret", Some("ada")),
         ] {
-            assert!(
-                check_password(&store, &slots, name, password)
-                    .await
-                    .unwrap()
-                    .is_none(),
-                "{name:?} must not authenticate"
+            let before = auth_store::VERIFICATIONS.load(Ordering::Relaxed);
+            let got = authenticate(&store, &slots, name, password).await.unwrap();
+            assert_eq!(
+                got.map(|u| u.name).as_deref(),
+                expected,
+                "wrong outcome for {name:?}"
+            );
+            assert_eq!(
+                auth_store::VERIFICATIONS.load(Ordering::Relaxed) - before,
+                1,
+                "logging in as {name:?} must cost exactly one verification, \
+                 or how long it takes says which kind of miss it was"
             );
         }
-        assert_eq!(
-            DUMMY_VERIFIES.load(Ordering::Relaxed) - before,
-            5,
-            "every miss path must have paid for a verification"
-        );
-
-        // The one path that really verifies does not pay twice.
-        let before = DUMMY_VERIFIES.load(Ordering::Relaxed);
-        let user = check_password(&store, &slots, "AdA", "s3cret")
-            .await
-            .unwrap()
-            .expect("the right password authenticates");
-        assert_eq!(user.name, "ada");
-        assert_eq!(DUMMY_VERIFIES.load(Ordering::Relaxed), before);
     }
 
     /// The memory cap: however many logins arrive at once, only [`LOGIN_SLOTS`]
@@ -639,6 +697,60 @@ mod tests {
             !is_loopback_request(&HeaderMap::new()),
             "a request with no Host is treated as remote"
         );
+    }
+
+    /// The `Secure` decision, including the case that makes `Host` alone
+    /// insufficient: nginx's default for `proxy_pass` is `Host $proxy_host`,
+    /// which rewrites the header to the upstream's own `127.0.0.1:port`, so a
+    /// TLS deployment behind a stock config looks local. A forwarded-protocol
+    /// header overrides that reading; only both signals together drop the flag.
+    #[test]
+    fn a_forwarded_https_hop_marks_the_cookie_secure_whatever_the_host_says() {
+        let secure = |pairs: &[(&str, &str)]| cookie_needs_secure(&header_map(pairs));
+
+        // Genuinely local: the one shape that may drop the flag.
+        assert!(!secure(&[("host", "localhost:8765")]));
+        assert!(!secure(&[("host", "127.0.0.1:8765")]));
+        assert!(!secure(&[
+            ("host", "127.0.0.1:8765"),
+            ("x-forwarded-proto", "http")
+        ]));
+        assert!(!secure(&[
+            ("host", "localhost"),
+            ("forwarded", "for=192.0.2.1;proto=http")
+        ]));
+
+        // The stock-nginx shape: Host says loopback, the proxy says TLS.
+        assert!(secure(&[
+            ("host", "127.0.0.1:8765"),
+            ("x-forwarded-proto", "https")
+        ]));
+        assert!(secure(&[
+            ("host", "127.0.0.1:8765"),
+            ("x-forwarded-proto", "HTTPS")
+        ]));
+        // A chain of proxies appends, so the client-facing hop comes first.
+        assert!(secure(&[
+            ("host", "localhost"),
+            ("x-forwarded-proto", "https, http")
+        ]));
+        // RFC 7239 spelling, with and without the optional quotes.
+        assert!(secure(&[
+            ("host", "localhost"),
+            ("forwarded", "for=192.0.2.1;proto=https;by=203.0.113.4")
+        ]));
+        assert!(secure(&[
+            ("host", "localhost"),
+            ("forwarded", "proto=\"https\"")
+        ]));
+        assert!(!secure(&[
+            ("host", "localhost"),
+            ("forwarded", "for=192.0.2.1")
+        ]));
+
+        // Not local at all: the flag is set with or without a proxy header.
+        assert!(secure(&[("host", "example.com")]));
+        assert!(secure(&[]), "no Host at all is treated as remote");
     }
 
     #[test]
@@ -736,5 +848,22 @@ mod tests {
         // paths are not ridable by another origin's cookie.
         let headerless = Identity::default();
         assert!(check_csrf(&headerless, &request("POST", "/auth/logout", None)).is_ok());
+
+        // An empty stored token must not match an absent header. `None` (no
+        // session) and `Some("")` (a session whose token went missing) are
+        // opposite answers: the first has nothing to protect, the second has
+        // something to protect and no way to check it.
+        let tokenless_session = Identity {
+            csrf: Some(String::new()),
+            ..Identity::default()
+        };
+        for csrf in [None, Some(""), Some("anything")] {
+            let err = check_csrf(&tokenless_session, &request("POST", "/auth/logout", csrf))
+                .expect_err("an empty expected token must fail closed");
+            assert_eq!(err.status, axum::http::StatusCode::FORBIDDEN);
+        }
+        // A safe method is still safe, and login is still exempt.
+        assert!(check_csrf(&tokenless_session, &request("GET", "/domains", None)).is_ok());
+        assert!(check_csrf(&tokenless_session, &request("POST", LOGIN_PATH, None)).is_ok());
     }
 }

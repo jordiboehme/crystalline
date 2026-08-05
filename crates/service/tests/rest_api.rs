@@ -549,3 +549,71 @@ async fn concurrent_failed_logins_all_answer() {
         assert_eq!(task.await.unwrap(), 401);
     }
 }
+
+/// Behind a TLS-terminating proxy the cookie must be `Secure` even though the
+/// `Host` says loopback: nginx's default `proxy_pass` rewrites `Host` to the
+/// upstream's own address, so the forwarded protocol is the only signal left
+/// that the browser is on the far side of TLS.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_forwarded_https_login_gets_a_secure_cookie() {
+    let fixture = serve_with_ada(AuthOptions::default()).await;
+    for (header, value) in [
+        ("x-forwarded-proto", "https"),
+        ("forwarded", "for=192.0.2.1;proto=https"),
+    ] {
+        let resp = client()
+            .post(format!("http://{}/api/v1/auth/login", fixture.addr))
+            .header(header, value)
+            .json(&serde_json::json!({"name": "ada", "password": "s3cret"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let raw = set_cookie(&resp).expect("login sets the session cookie");
+        assert!(
+            raw.contains("Secure"),
+            "{header} must force the Secure flag: {raw}"
+        );
+    }
+}
+
+/// Session fixation: a token the caller arrives holding is retired by a
+/// successful login rather than left live beside the new one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn logging_in_retires_the_session_that_was_presented() {
+    let fixture = serve_with_ada(AuthOptions::default()).await;
+    let (planted, _) = login(fixture.addr, "ada", "s3cret").await;
+
+    let resp = client()
+        .post(format!("http://{}/api/v1/auth/login", fixture.addr))
+        .header("cookie", format!("fluid_session={planted}"))
+        .json(&serde_json::json!({"name": "ada", "password": "s3cret"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let fresh = session_cookie(&resp).unwrap();
+    assert_ne!(fresh, planted, "a login always mints a new token");
+
+    let me: serde_json::Value = client()
+        .get(format!("http://{}/api/v1/auth/me", fixture.addr))
+        .header("cookie", format!("fluid_session={planted}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(me["user"].is_null(), "the presented session is dead: {me}");
+
+    let still: serde_json::Value = client()
+        .get(format!("http://{}/api/v1/auth/me", fixture.addr))
+        .header("cookie", format!("fluid_session={fresh}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(still["user"]["name"], "ada");
+}

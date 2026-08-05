@@ -148,6 +148,24 @@ pub struct User {
     pub disabled: bool,
 }
 
+/// What checking a password found, kept apart by how much work each one costs.
+///
+/// Only the first two run argon2. [`PasswordCheck::NoHash`] returns before any
+/// hashing, which is what makes it cheap enough to hear over a network - see
+/// [`AuthStore::check_password`].
+#[derive(Debug)]
+pub enum PasswordCheck {
+    /// The password matched this account's hash.
+    Verified(User),
+    /// There was a hash and the password did not match it.
+    Mismatch,
+    /// There was no hash to check against: no such account, a disabled one, an
+    /// account provisioned without a password, or a name that will not
+    /// normalize. Deliberately one variant: the caller must not be able to tell
+    /// these apart either, and none of them did any argon2 work.
+    NoHash,
+}
+
 /// A freshly issued session. The `token` is the only copy in existence that is
 /// not hashed - it goes to the client and is never written down here.
 #[derive(Clone, Debug)]
@@ -328,9 +346,31 @@ impl AuthStore {
     /// with no password at all (one provisioned by [`AuthStore::ensure_user`]),
     /// and a name that will not normalize. They are deliberately
     /// indistinguishable, so a caller cannot leak which one it was.
+    ///
+    /// A caller whose *timing* is observable wants
+    /// [`AuthStore::check_password`] instead: collapsing the outcomes to
+    /// `None` here hides which of them happened from the value, not from the
+    /// clock.
     pub async fn verify_password(&self, name: &str, password: &str) -> Result<Option<User>> {
+        Ok(match self.check_password(name, password).await? {
+            PasswordCheck::Verified(user) => Some(user),
+            PasswordCheck::Mismatch | PasswordCheck::NoHash => None,
+        })
+    }
+
+    /// Check a password, saying which of the three outcomes it was.
+    ///
+    /// The split exists for one reason: exactly one of them, [`NoHash`], does
+    /// no argon2 work, and a caller that answers over the network has to make
+    /// up the difference itself or leak the existence of an account through how
+    /// fast it answers. See `rest::auth::authenticate`, which pairs
+    /// [`NoHash`] with [`dummy_verify`] so every login attempt costs one
+    /// verification whatever the outcome.
+    ///
+    /// [`NoHash`]: PasswordCheck::NoHash
+    pub async fn check_password(&self, name: &str, password: &str) -> Result<PasswordCheck> {
         let Ok(name) = normalize_name(name) else {
-            return Ok(None);
+            return Ok(PasswordCheck::NoHash);
         };
         // Scoped so the lock is released before the argon2 verify below.
         let row = {
@@ -342,19 +382,19 @@ impl AuthStore {
             .await?
         };
         let Some(row) = row else {
-            return Ok(None);
+            return Ok(PasswordCheck::NoHash);
         };
         let user = user_from_row(&row);
         if user.disabled {
-            return Ok(None);
+            return Ok(PasswordCheck::NoHash);
         }
         let Some(hash) = cell_text(&row, 5) else {
-            return Ok(None);
+            return Ok(PasswordCheck::NoHash);
         };
         if verify_hash(hash, password.to_string()).await? {
-            Ok(Some(user))
+            Ok(PasswordCheck::Verified(user))
         } else {
-            Ok(None)
+            Ok(PasswordCheck::Mismatch)
         }
     }
 
@@ -783,6 +823,17 @@ async fn hash_password(password: &str) -> Result<String> {
     .context("the password hashing task failed")?
 }
 
+/// Counts every argon2 verification this process has run, real or dummy.
+///
+/// The point of the dummy verification is that a login attempt costs the same
+/// wherever it lands, and a code path that merely looks balanced is not
+/// evidence of that. This lets a test assert the cost itself: exactly one
+/// verification per attempt, on every path. Test-only; nothing in a served
+/// binary touches it.
+#[cfg(test)]
+pub(crate) static VERIFICATIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Verify `password` against a hash no account has, and throw the answer away.
 ///
 /// The point is the time it takes, not the result.
@@ -809,6 +860,8 @@ pub(crate) async fn dummy_verify(password: &str) -> Result<bool> {
 /// same reason as [`hash_password`]. A hash this cannot parse verifies as
 /// false rather than erroring: a corrupt row must fail closed.
 async fn verify_hash(hash: String, password: String) -> Result<bool> {
+    #[cfg(test)]
+    VERIFICATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     tokio::task::spawn_blocking(move || match PasswordHash::new(&hash) {
         Ok(parsed) => Argon2::default()
             .verify_password(password.as_bytes(), &parsed)
