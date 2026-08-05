@@ -15,15 +15,29 @@
 //! the database concurrently, so Turso's young multi-process path is never
 //! exercised". That holds for the index, which the daemon alone owns. It does
 //! not hold here: `crystalline users ...` opens this file while `serve` has it
-//! open, so this module does exercise that path, on purpose. What that costs
-//! us in return: `PRAGMA busy_timeout` is set on every connection so a writer
-//! waits instead of failing, no transaction spans more than the two statements
-//! of [`AuthStore::remove_user`], and the two multi-statement operations
-//! ([`AuthStore::remove_user`] and [`AuthStore::create_session`]) take
-//! `BEGIN IMMEDIATE` so they serialize against each other rather than
-//! interleaving. `two_stores_on_one_file_interleave_writes` in this module's
-//! tests is the covering test; if turso's multi-process behavior ever proves
-//! unreliable, that test is where it will show up first.
+//! open, so this module does exercise that path, on purpose.
+//!
+//! Concurrency therefore has two independent layers, and both are needed:
+//!
+//! 1. *Across processes*, the CLI and the daemon each have their own
+//!    connection. `PRAGMA busy_timeout` is set on every connection so a writer
+//!    waits instead of failing, no transaction spans more than the two
+//!    statements of [`AuthStore::remove_user`], and the two multi-statement
+//!    operations ([`AuthStore::remove_user`] and [`AuthStore::create_session`])
+//!    take `BEGIN IMMEDIATE` so they serialize against each other rather than
+//!    interleaving. Covering test:
+//!    `two_stores_on_one_file_interleave_writes`.
+//! 2. *Within one process*, every method serializes on `AuthStore::guard`,
+//!    because turso's [`Connection`] refuses concurrent use outright rather
+//!    than queueing. The daemon shares one `AuthStore` across axum handlers, so
+//!    two simultaneous logins really are two concurrent calls on one
+//!    connection. Covering tests:
+//!    `concurrent_sessions_on_one_store_never_fail_spuriously` and
+//!    `concurrent_mixed_writes_on_one_store_never_fail_spuriously`.
+//!
+//! Layer 1 says nothing about layer 2 and vice versa; neither substitutes for
+//! the other. If turso's multi-process behavior ever proves unreliable, the
+//! layer 1 test is where it will show up first.
 //!
 //! Two secrets are stored, neither in the clear. Passwords are argon2id at the
 //! [`argon2`] crate's own recommended defaults, so the cost parameters follow
@@ -149,10 +163,39 @@ pub struct Session {
 /// The users and sessions database. Open one per process that needs it: the
 /// daemon holds one for the lifetime of `serve`, the `crystalline users` CLI
 /// opens one for the length of a single command.
+///
+/// Safe to share across tasks (`Arc<AuthStore>` in the daemon): every method
+/// takes `&self` and serializes its database work internally. See `guard`.
 pub struct AuthStore {
     // Retained so the connection stays valid for as long as the store does.
     _db: Database,
     conn: Connection,
+    /// Serializes database access within this process.
+    ///
+    /// turso's [`Connection`] refuses concurrent use outright - a second
+    /// caller does not queue behind the busy timeout, it fails immediately
+    /// ("concurrent use forbidden", and for the transactional methods "cannot
+    /// start a transaction within a transaction"). The daemon holds one
+    /// `AuthStore` for the lifetime of `serve`, so two simultaneous logins are
+    /// two concurrent [`AuthStore::create_session`] calls on this one
+    /// connection: without this lock they would spuriously fail.
+    ///
+    /// A [`tokio::sync::Mutex`] rather than a connection per call. Auth traffic
+    /// is a handful of requests around login, so contention is irrelevant,
+    /// while a connection per call would pay turso's open cost and re-apply
+    /// `PRAGMA busy_timeout` on every password check, and would multiply this
+    /// process's handles on one small file for no gain. It is a `tokio` mutex
+    /// rather than a `std` one because it is held across `await`.
+    ///
+    /// This is the *in-process* half of the concurrency story only. Serializing
+    /// here says nothing about the `crystalline users` CLI in another process;
+    /// that is what `BEGIN IMMEDIATE` and the busy timeout are for. Both halves
+    /// are needed and neither substitutes for the other.
+    ///
+    /// Argon2 hashing is deliberately kept *outside* the lock: it is tens of
+    /// milliseconds of CPU with no database access, and holding the lock across
+    /// it would serialize every login behind every other login.
+    guard: tokio::sync::Mutex<()>,
 }
 
 /// Create the tables on first open. `IF NOT EXISTS` throughout, so this is the
@@ -208,7 +251,11 @@ impl AuthStore {
         conn.execute_batch(SCHEMA)
             .await
             .context("creating the auth database schema")?;
-        Ok(AuthStore { _db: db, conn })
+        Ok(AuthStore {
+            _db: db,
+            conn,
+            guard: tokio::sync::Mutex::new(()),
+        })
     }
 
     /// Add an account with a password. The name is folded by
@@ -224,7 +271,9 @@ impl AuthStore {
         password: &str,
     ) -> Result<()> {
         let name = normalize_name(name)?;
+        // Hash before taking the lock: argon2 is CPU, not database.
         let hash = hash_password(password).await?;
+        let _guard = self.guard.lock().await;
         self.conn
             .execute(
                 "INSERT INTO users (name, display, email, role, pass_hash, disabled, created_at)
@@ -255,13 +304,16 @@ impl AuthStore {
         let Ok(name) = normalize_name(name) else {
             return Ok(None);
         };
-        let Some(row) = self
-            .query_first(
+        // Scoped so the lock is released before the argon2 verify below.
+        let row = {
+            let _guard = self.guard.lock().await;
+            self.query_first(
                 &format!("SELECT {USER_COLUMNS}, pass_hash FROM users WHERE name = ?1"),
                 vec![Value::Text(name)],
             )
             .await?
-        else {
+        };
+        let Some(row) = row else {
             return Ok(None);
         };
         let user = user_from_row(&row);
@@ -332,6 +384,7 @@ impl AuthStore {
     pub async fn remove_user(&self, name: &str) -> Result<()> {
         let name = normalize_name(name)?;
         let key = vec![Value::Text(name.clone())];
+        let _guard = self.guard.lock().await;
         self.begin_immediate()
             .await
             .with_context(|| format!("removing user '{name}'"))?;
@@ -357,6 +410,7 @@ impl AuthStore {
     /// Every account, by name. Names sort byte-wise, which is the ordering
     /// contract the rest of the workspace's text columns use.
     pub async fn list_users(&self) -> Result<Vec<User>> {
+        let _guard = self.guard.lock().await;
         let mut rows = self
             .conn
             .query(
@@ -387,6 +441,7 @@ impl AuthStore {
     pub async fn ensure_user(&self, name: &str, role: Role) -> Result<User> {
         let display = name.trim().to_string();
         let name = normalize_name(name)?;
+        let _guard = self.guard.lock().await;
         self.conn
             .execute(
                 "INSERT OR IGNORE INTO users
@@ -424,6 +479,7 @@ impl AuthStore {
         let token = random_hex();
         let csrf = random_hex();
         let expires_at = chrono::Utc::now().timestamp().saturating_add(ttl_secs);
+        let _guard = self.guard.lock().await;
         self.begin_immediate()
             .await
             .with_context(|| format!("creating a session for user '{name}'"))?;
@@ -476,6 +532,7 @@ impl AuthStore {
     /// dormant.
     pub async fn session_user(&self, token: &str) -> Result<Option<(User, String)>> {
         let now = chrono::Utc::now().timestamp();
+        let _guard = self.guard.lock().await;
         self.conn
             .execute(
                 "DELETE FROM sessions
@@ -510,6 +567,7 @@ impl AuthStore {
     /// out twice, or with a stale cookie, is a normal thing for a browser to
     /// do.
     pub async fn delete_session(&self, token: &str) -> Result<()> {
+        let _guard = self.guard.lock().await;
         self.conn
             .execute(
                 "DELETE FROM sessions WHERE token_hash = ?1",
@@ -524,6 +582,7 @@ impl AuthStore {
     /// account does not exist.
     async fn update_user(&self, sql: &str, name: &str, value: Value) -> Result<()> {
         let name = normalize_name(name)?;
+        let _guard = self.guard.lock().await;
         let changed = self
             .conn
             .execute(sql, vec![Value::Text(name.clone()), value])
@@ -943,6 +1002,82 @@ mod tests {
         cli.remove_user("ada").await.unwrap();
         assert!(daemon.session_user(&second.token).await.unwrap().is_none());
         assert!(daemon.list_users().await.unwrap().is_empty());
+    }
+
+    /// Two simultaneous logins in the daemon are two concurrent
+    /// `create_session` calls on the one shared `AuthStore`. Both open a
+    /// transaction on the same connection, so without serialization the second
+    /// fails outright with "cannot start a transaction within a transaction"
+    /// rather than queueing. Every call must succeed and every token must work.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_sessions_on_one_store_never_fail_spuriously() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(
+            AuthStore::open(&dir.path().join("web-auth.db"))
+                .await
+                .unwrap(),
+        );
+        store
+            .add_user("ada", "Ada", None, Role::Editor, "pw")
+            .await
+            .unwrap();
+
+        let mut tasks = Vec::new();
+        for _ in 0..16 {
+            let store = store.clone();
+            tasks.push(tokio::spawn(async move {
+                store.create_session("ada", 3600).await
+            }));
+        }
+        let mut tokens = Vec::new();
+        for task in tasks {
+            let session = task
+                .await
+                .expect("the task must not panic")
+                .expect("create_session must not fail under concurrency");
+            tokens.push(session.token);
+        }
+        for token in &tokens {
+            assert!(store.session_user(token).await.unwrap().is_some());
+        }
+    }
+
+    /// The same shape with the two transactional methods mixed, plus the
+    /// autocommit ones, so nothing can slip into another call's transaction.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_mixed_writes_on_one_store_never_fail_spuriously() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(
+            AuthStore::open(&dir.path().join("web-auth.db"))
+                .await
+                .unwrap(),
+        );
+        for i in 0..8 {
+            store
+                .add_user(&format!("u{i}"), "U", None, Role::Editor, "pw")
+                .await
+                .unwrap();
+        }
+
+        let mut tasks = Vec::new();
+        for i in 0..8 {
+            let store = store.clone();
+            tasks.push(tokio::spawn(async move {
+                let name = format!("u{i}");
+                store.create_session(&name, 3600).await?;
+                store.set_role(&name, Role::Admin).await?;
+                store.create_session(&name, 3600).await?;
+                store.remove_user(&name).await?;
+                store.list_users().await?;
+                anyhow::Ok(())
+            }));
+        }
+        for task in tasks {
+            task.await
+                .expect("the task must not panic")
+                .expect("no call may fail under concurrency");
+        }
+        assert!(store.list_users().await.unwrap().is_empty());
     }
 
     #[tokio::test]
