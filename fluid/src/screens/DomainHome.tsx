@@ -31,35 +31,8 @@ import { fetchTags, vocabularyKey } from "../api/vocabulary";
 import type { TagCount } from "../api/vocabulary";
 import { EngramList } from "../components/EngramList";
 import { Markdown } from "../components/Markdown";
+import { SUGGESTED_STATUSES, SUGGESTED_TYPES } from "../filters";
 import { plural } from "../format";
-import { RETIRED_STATUSES } from "../lifecycle";
-
-/**
- * Values offered as suggestions for the two free-form filters.
- *
- * `type` and `status` are free form by design and no endpoint enumerates the
- * values a domain actually uses, so these are the vocabulary the product
- * recommends rather than a claim about this domain. They are suggestions in a
- * datalist for that reason: anything can be typed, and nothing here says a
- * value not on the list is wrong.
- */
-const SUGGESTED_TYPES = [
-  "engram",
-  "guide",
-  "decision",
-  "architecture",
-  "runbook",
-  "reference",
-];
-const SUGGESTED_STATUSES = [
-  "stable",
-  "current",
-  "draft",
-  "proposed",
-  "idea",
-  "poc",
-  ...RETIRED_STATUSES,
-];
 
 export default function DomainHome() {
   const { domain = "" } = useParams();

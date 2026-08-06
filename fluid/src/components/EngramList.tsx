@@ -26,6 +26,7 @@ import type { EngramPage, EngramRow } from "../api/engrams";
 import { hasNextPage as envelopeHasNext } from "../api/engrams";
 import { RETIRED_CLASS, isRetired } from "../lifecycle";
 import { engramRoute } from "../paths";
+import { snippetParts } from "../snippet";
 
 /** How tall one row is, in pixels. The tests scroll by it, so it is exported. */
 export const ENGRAM_ROW_HEIGHT = 76;
@@ -42,6 +43,17 @@ export interface EngramListProps {
   label: string;
   /** What to say when the source answers with nothing. */
   emptyMessage: string;
+  /**
+   * Words to mark inside a row's snippet: the terms of the query that produced
+   * these rows. Empty for a list nobody searched for.
+   */
+  highlight?: string[];
+  /**
+   * What the envelope itself says, drawn above the rows. Search uses it for the
+   * mode that actually ran, which is a fact about the page rather than about
+   * any row, and which matters just as much when the page is empty.
+   */
+  summary?: (page: EngramPage) => ReactNode;
 }
 
 export function EngramList({
@@ -49,6 +61,8 @@ export function EngramList({
   loadPage,
   label,
   emptyMessage,
+  highlight = [],
+  summary,
 }: EngramListProps) {
   const scroller = useRef<HTMLDivElement>(null);
 
@@ -105,16 +119,22 @@ export function EngramList({
     return <ListProblem error={query.error} />;
   }
 
+  const envelope = data?.pages[0];
+
   if (rows.length === 0) {
     return (
-      <p className="py-6 text-sm text-slate-500 dark:text-slate-400">
-        {emptyMessage}
-      </p>
+      <div>
+        {envelope && summary?.(envelope)}
+        <p className="py-6 text-sm text-slate-500 dark:text-slate-400">
+          {emptyMessage}
+        </p>
+      </div>
     );
   }
 
   return (
     <div>
+      {envelope && summary?.(envelope)}
       <p className="pb-2 text-xs text-slate-500 tabular-nums dark:text-slate-400">
         {rows.length} of {total} shown
       </p>
@@ -132,6 +152,7 @@ export function EngramList({
               key={`${rows[item.index].domain}/${rows[item.index].permalink}`}
               row={rows[item.index]}
               offset={item.start}
+              highlight={highlight}
             />
           ))}
         </ul>
@@ -153,7 +174,15 @@ export function EngramList({
  * retired one is faded and still readable, which is the whole point of fading
  * rather than filtering.
  */
-function Row({ row, offset }: { row: EngramRow; offset: number }) {
+function Row({
+  row,
+  offset,
+  highlight,
+}: {
+  row: EngramRow;
+  offset: number;
+  highlight: string[];
+}) {
   const retired = isRetired(row.status);
   return (
     <li
@@ -196,12 +225,39 @@ function Row({ row, offset }: { row: EngramRow; offset: number }) {
           ))}
           {row.snippet !== null && (
             <span className="truncate text-slate-500 dark:text-slate-400">
-              {row.snippet}
+              <Snippet text={row.snippet} highlight={highlight} />
             </span>
           )}
         </span>
       </Link>
     </li>
+  );
+}
+
+/**
+ * The matched text of a row, with the searched-for words marked.
+ *
+ * The snippet is text the engine cut out of an engram and it is rendered as
+ * text: the pieces become elements here, and nothing turns a server string into
+ * markup. An engram that talks about `<script>` reads the way it was written.
+ */
+function Snippet({ text, highlight }: { text: string; highlight: string[] }) {
+  if (highlight.length === 0) {
+    return text;
+  }
+  return snippetParts(text, highlight).map((part, index) =>
+    part.match ? (
+      // Keyed by position: the pieces are a cut of one string, so a piece is
+      // only ever itself and the list never reorders.
+      <mark
+        key={index}
+        className="bg-amber-100 text-inherit dark:bg-amber-900/60"
+      >
+        {part.text}
+      </mark>
+    ) : (
+      <span key={index}>{part.text}</span>
+    ),
   );
 }
 

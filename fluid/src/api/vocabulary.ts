@@ -7,7 +7,9 @@
  * rather than as a closed set.
  *
  * The domain is a filter on this route rather than a path segment, so an
- * unknown name answers an empty vocabulary rather than a 404.
+ * unknown name answers an empty vocabulary rather than a 404, and leaving it
+ * off asks what every domain on the instance is written in - which is what a
+ * search across all of them needs.
  */
 
 import { api, encodeSegment } from "./client";
@@ -37,14 +39,16 @@ export function readTags(payload: unknown): TagCount[] {
   );
 }
 
-/** The cache key of one domain's vocabulary. */
-export function vocabularyKey(domain: string): readonly unknown[] {
+/** The cache key of one domain's vocabulary, or of the whole instance's. */
+export function vocabularyKey(domain: string | null): readonly unknown[] {
   return ["vocabulary", domain];
 }
 
-/** Fetch the tags in use in one domain. */
-export async function fetchTags(domain: string): Promise<TagCount[]> {
-  return readTags(
-    await api<unknown>(`/vocabulary?domain=${encodeSegment(domain)}`),
-  );
+/** Fetch the tags in use in one domain, or in every domain for `null`. */
+export async function fetchTags(domain: string | null): Promise<TagCount[]> {
+  const path =
+    domain === null
+      ? "/vocabulary"
+      : `/vocabulary?domain=${encodeSegment(domain)}`;
+  return readTags(await api<unknown>(path));
 }
