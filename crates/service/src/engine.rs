@@ -66,6 +66,13 @@ const EMBED_BATCH: usize = 16;
 /// whole-index correct rather than per-chunk.
 const NEIGHBOR_CHUNK: usize = 5_000;
 
+/// The most nodes one [`Engine::graph_neighborhood`] response carries. A graph
+/// view is read by eye, and past a couple of hundred nodes it is a hairball
+/// rather than a picture; the ceiling also keeps a hand-written `max_nodes` from
+/// asking for a whole index in one payload. A cut slice says so through its
+/// `truncated` flag rather than pretending to be whole.
+const MAX_GRAPH_NODES: usize = 150;
+
 /// The default `evolve_engrams` page size. Small on purpose: the queue is meant
 /// to be worked top-down and agreed item by item, not read in bulk.
 const EVOLVE_DEFAULT_LIMIT: usize = 10;
@@ -2540,6 +2547,141 @@ impl Engine {
         }))
     }
 
+    /// The nodes and typed edges around an anchor, for a graph view.
+    ///
+    /// The same traversal [`Engine::build_context`] runs, answered in the flat
+    /// shape a graph renderer wants: every node carries what a client labels and
+    /// styles it with (`id`, `domain`, `permalink`, `title`, `status`, `type`),
+    /// every edge keeps its direction and `rel_type`, and `truncated` says
+    /// whether the cap cut anything. `id` is the index's own engram id, opaque
+    /// to a client and stable only within one response: it is what the edges
+    /// join on, never an address. `crystalline://domain/permalink` is the
+    /// address.
+    ///
+    /// `depth` is clamped to one or two hops and `max_nodes` to at least one and
+    /// at most [`MAX_GRAPH_NODES`], so a hand-written URL can ask neither for
+    /// nothing nor for the whole index in one payload.
+    ///
+    /// Retired engrams come back like any other, with their status, because the
+    /// graph is the shape of what is written rather than of what still holds:
+    /// hiding a superseded node would break the chain that explains what replaced
+    /// it. A client fades them; this does not drop them, and the cap below does
+    /// not demote them either.
+    ///
+    /// When the cap bites, the anchors are kept first and the rest are kept by
+    /// the same spread mass and salience lift `build_context` ranks with, so what
+    /// survives is the neighborhood nearest the anchor rather than whatever the
+    /// index happened to list first.
+    pub async fn graph_neighborhood(
+        &self,
+        anchor: &str,
+        depth: u8,
+        max_nodes: usize,
+    ) -> Result<Value> {
+        let url = CrystallineUrl::parse(anchor).ok_or_else(|| {
+            EngineError::Invalid(format!("anchor '{anchor}' is not a crystalline:// URL"))
+        })?;
+        let depth = depth.clamp(1, 2);
+        let max_nodes = max_nodes.clamp(1, MAX_GRAPH_NODES);
+
+        let store = self.store.lock().await;
+        let seeds: Vec<EngramDescriptor> = if url.glob {
+            store
+                .list_engrams(&url.domain, None, None)
+                .await?
+                .into_iter()
+                .filter(|d| url.matches(&d.domain, &d.permalink))
+                .collect()
+        } else {
+            match store.find_engram(&url.domain, &url.permalink).await? {
+                Some(d) => vec![d],
+                None => {
+                    return Err(EngineError::NotFound(format!(
+                        "no engram '{}' in domain '{}'",
+                        url.permalink, url.domain
+                    )));
+                }
+            }
+        };
+        drop(store);
+        if seeds.is_empty() {
+            return Err(EngineError::NotFound(format!(
+                "anchor '{anchor}' matched no engrams"
+            )));
+        }
+
+        let seed_ids: HashSet<i64> = seeds.iter().map(|d| d.id.0).collect();
+        let ids: Vec<EngramId> = seeds.iter().map(|d| d.id).collect();
+        let slice = self.sweep_neighbors(&ids, depth).await?;
+
+        let mass = context_rank(&slice, &seed_ids);
+        let weight = {
+            let config = self.config.read().unwrap();
+            config.salience_weight().unwrap_or(DEFAULT_SALIENCE_WEIGHT)
+        };
+        let mut anchors: Vec<&GraphNode> = Vec::new();
+        let mut related: Vec<(f64, &GraphNode)> = Vec::new();
+        for node in &slice.nodes {
+            if seed_ids.contains(&node.id.0) {
+                anchors.push(node);
+            } else {
+                let score = mass.get(&node.id.0).copied().unwrap_or(0.0)
+                    * (1.0 + salience_prior(node.salience, weight));
+                related.push((score, node));
+            }
+        }
+        related.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| a.1.id.0.cmp(&b.1.id.0))
+        });
+
+        let total = anchors.len() + related.len();
+        let mut kept: HashSet<i64> = HashSet::new();
+        let mut nodes = Vec::new();
+        for node in anchors
+            .into_iter()
+            .chain(related.into_iter().map(|(_, node)| node))
+            .take(max_nodes)
+        {
+            kept.insert(node.id.0);
+            nodes.push(json!({
+                "id": node.id.0,
+                "domain": node.domain,
+                "permalink": node.permalink,
+                "title": node.title,
+                "status": node.status,
+                "type": node.engram_type,
+            }));
+        }
+        // An edge is only meaningful when both of its ends survived the cap; one
+        // that lost an end would render as an arrow into nothing. The relation
+        // and the prose link between one pair are one edge here, because the
+        // payload states the type rather than the origin: an engram that both
+        // declares `- links_to [[X]]` and writes the wikilink in its prose is
+        // one line on the picture, not two drawn over each other.
+        let mut drawn: HashSet<(i64, i64, &str)> = HashSet::new();
+        let edges: Vec<Value> = slice
+            .edges
+            .iter()
+            .filter(|e| kept.contains(&e.from.0) && kept.contains(&e.to.0))
+            .filter(|e| drawn.insert((e.from.0, e.to.0, e.rel_type.as_str())))
+            .map(|e| {
+                json!({
+                    "from": e.from.0,
+                    "to": e.to.0,
+                    "rel_type": e.rel_type,
+                })
+            })
+            .collect();
+
+        Ok(json!({
+            "nodes": nodes,
+            "edges": edges,
+            "truncated": total > nodes.len(),
+        }))
+    }
+
     // --- recent --------------------------------------------------------------
 
     /// Recent engrams within a timeframe.
@@ -3260,22 +3402,35 @@ impl Engine {
 
     /// The resolved graph around a whole domain, at depth 1 so every
     /// cross-domain target carries a status.
-    ///
-    /// The seed list is chunked because both backends inline it into an SQL
-    /// `IN (...)`. Every edge incident on a seed has its other end inside that
-    /// chunk's slice, so merging the slices yields exactly the whole-index edge
-    /// set for the domain. Nodes and edges are deduped on the merge: a node
-    /// reached from two chunks, and an edge whose two ends sit in different
-    /// chunks, both come back more than once, and a double-counted edge would
-    /// inflate the degrees the ranking and the orphan rule read.
     async fn sweep_graph(&self, descs: &[EngramDescriptor]) -> Result<GraphSlice> {
         let ids: Vec<EngramId> = descs.iter().map(|d| d.id).collect();
+        self.sweep_neighbors(&ids, 1).await
+    }
+
+    /// [`Store::neighbors`] over a seed list of any size, merged into one slice.
+    ///
+    /// The seed list is chunked because both backends inline it into an SQL
+    /// `IN (...)`, so a whole domain in one call would build a statement
+    /// proportional to its size. Merging is exact rather than approximate at
+    /// every depth the callers use: the traversal collects an edge whenever one
+    /// of its ends lies within `depth - 1` hops of a seed, and a node whenever it
+    /// lies within `depth` hops, and hop distance from the whole seed set is the
+    /// smallest hop distance from any one chunk. The union over the chunks is
+    /// therefore exactly what one unchunked call would have returned.
+    ///
+    /// Nodes and edges are deduped on the merge: a node reached from two chunks,
+    /// and an edge whose two ends sit in different chunks, both come back more
+    /// than once, and a double-counted edge would inflate the degrees the
+    /// consolidation ranking and the orphan rule read. The merged nodes are
+    /// sorted by id, so a chunked sweep answers in the same ascending order a
+    /// single-chunk one does and every caller's ordering holds either way.
+    async fn sweep_neighbors(&self, ids: &[EngramId], depth: u8) -> Result<GraphSlice> {
         let mut graph = GraphSlice::default();
         let mut seen_nodes: HashSet<i64> = HashSet::new();
         let mut seen_edges: HashSet<(i64, i64, String, u8)> = HashSet::new();
         for chunk in ids.chunks(NEIGHBOR_CHUNK) {
             let store = self.store.lock().await;
-            let slice = store.neighbors(chunk, 1).await?;
+            let slice = store.neighbors(chunk, depth).await?;
             drop(store);
             for node in slice.nodes {
                 if seen_nodes.insert(node.id.0) {
@@ -3292,6 +3447,7 @@ impl Engine {
                 }
             }
         }
+        graph.nodes.sort_by_key(|n| n.id.0);
         Ok(graph)
     }
 

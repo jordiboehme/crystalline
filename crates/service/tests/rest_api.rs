@@ -302,8 +302,8 @@ fn hit_permalinks(page: &serde_json::Value) -> Vec<String> {
         .collect()
 }
 
-/// The `permalink` of every node a context response returned, in the order it
-/// returned them: the seeds first, then the neighborhood by rank.
+/// The `permalink` of every node a context or graph response returned, in the
+/// order it returned them: the anchors first, then the neighborhood by rank.
 fn node_permalinks(context: &serde_json::Value) -> Vec<String> {
     context["nodes"]
         .as_array()
@@ -509,6 +509,7 @@ async fn data_routes_401_without_identity_when_not_anonymous() {
         "/api/v1/vocabulary",
         "/api/v1/context",
         "/api/v1/activity",
+        "/api/v1/graph",
     ] {
         let resp = get(fixture.addr, path).await;
         assert_eq!(resp.status(), 401, "{path} must be guarded");
@@ -1592,4 +1593,111 @@ async fn activity_respects_the_timeframe_and_its_filters() {
         default["timeframe"], "7d",
         "the engine's own default, not a second one here: {default}"
     );
+}
+
+/// The graph endpoint answers the same neighborhood `/context` walks, in the
+/// shape a renderer draws: nodes carrying what labels and styles them, edges
+/// carrying their direction and relation type, and a flag saying whether the
+/// node cap cut anything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn graph_returns_the_nodes_and_typed_edges_around_an_anchor() {
+    let fixture = serve_anonymous().await;
+
+    let resp = get(fixture.addr, "/api/v1/graph?anchor=crystalline://eng/alpha").await;
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let permalinks = node_permalinks(&body);
+    assert_eq!(permalinks[0], "alpha", "the anchor leads: {body}");
+    assert!(
+        permalinks.contains(&"notes/beta".to_string()),
+        "the engram relating to it comes with: {body}"
+    );
+    assert_eq!(body["truncated"], false, "nothing was cut: {body}");
+
+    // What a client draws a node with, all of it in the node itself.
+    let anchor = &body["nodes"][0];
+    assert_eq!(anchor["domain"], "eng");
+    assert_eq!(anchor["title"], "Alpha");
+    assert_eq!(anchor["status"], "current");
+    assert_eq!(anchor["type"], "engram");
+    let anchor_id = anchor["id"].as_i64().expect("a node carries its id");
+
+    // The edge points from Beta, which declared the relation, at the anchor.
+    let edges = body["edges"].as_array().unwrap();
+    assert_eq!(edges.len(), 1, "the one relation the fixture holds: {body}");
+    assert_eq!(edges[0]["rel_type"], "relates_to");
+    assert_eq!(edges[0]["to"], anchor_id, "and it points at Alpha: {body}");
+
+    // The node cap is a real bound, and a cut slice says it was cut.
+    let capped: serde_json::Value = get(
+        fixture.addr,
+        "/api/v1/graph?anchor=crystalline://eng/alpha&max_nodes=1",
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(
+        node_permalinks(&capped),
+        vec!["alpha".to_string()],
+        "the anchor alone: {capped}"
+    );
+    assert_eq!(capped["truncated"], true, "{capped}");
+    assert!(
+        capped["edges"].as_array().unwrap().is_empty(),
+        "an edge whose other end was cut is cut too: {capped}"
+    );
+
+    // A second hop is served rather than refused, clamped or not.
+    let deep = get(
+        fixture.addr,
+        "/api/v1/graph?anchor=crystalline://eng/alpha&depth=9",
+    )
+    .await;
+    assert_eq!(
+        deep.status(),
+        200,
+        "an over-deep request is clamped, not refused"
+    );
+}
+
+/// The three ways an anchor can be wrong, answered here exactly as `/context`
+/// answers them: a rejected request, one the server understood and refused, and
+/// one pointing at nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bad_graph_anchor_is_a_problem_detail() {
+    let fixture = serve_anonymous().await;
+
+    let missing = get(fixture.addr, "/api/v1/graph").await;
+    assert_eq!(missing.status(), 400, "the anchor is required");
+    assert_eq!(
+        missing.headers()["content-type"],
+        "application/problem+json"
+    );
+    let body: serde_json::Value = missing.json().await.unwrap();
+    assert!(
+        body["detail"].as_str().unwrap().contains("anchor"),
+        "the detail names the parameter: {body}"
+    );
+
+    let malformed = get(fixture.addr, "/api/v1/graph?anchor=alpha").await;
+    assert_eq!(malformed.status(), 422);
+    let body: serde_json::Value = malformed.json().await.unwrap();
+    assert!(
+        body["detail"]
+            .as_str()
+            .unwrap()
+            .contains("not a crystalline:// URL"),
+        "the engine's own message: {body}"
+    );
+
+    let unknown = get(fixture.addr, "/api/v1/graph?anchor=crystalline://eng/ghost").await;
+    assert_eq!(unknown.status(), 404);
+    assert_eq!(
+        unknown.headers()["content-type"],
+        "application/problem+json"
+    );
+    let body: serde_json::Value = unknown.json().await.unwrap();
+    assert_eq!(body["title"], "not found");
+    assert!(body["detail"].as_str().unwrap().contains("ghost"), "{body}");
 }

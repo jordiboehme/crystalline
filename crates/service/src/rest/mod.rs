@@ -9,6 +9,7 @@ mod discovery;
 mod domains;
 mod engrams;
 mod error;
+mod graph;
 
 use std::sync::Arc;
 
@@ -87,6 +88,7 @@ pub fn router(state: RestState) -> Router {
         .route("/vocabulary", get(discovery::vocabulary))
         .route("/context", get(discovery::context))
         .route("/activity", get(discovery::activity))
+        .route("/graph", get(graph::graph))
         .fallback(unknown_path)
         // Applies to every method router registered above it, so it stays
         // below the routes and above the guard.
