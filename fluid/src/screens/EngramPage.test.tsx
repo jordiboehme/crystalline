@@ -444,6 +444,73 @@ describe("the engram page", () => {
     );
   });
 
+  it("keeps the agent's-eye view folded away until somebody asks for it", async () => {
+    serve();
+
+    renderApp("/d/eng/e/alpha");
+
+    const toggle = await screen.findByRole("button", {
+      name: /what an agent is taught/i,
+    });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByText(/Route here for eng questions/)).toBeNull();
+  });
+
+  it("shows what an agent is taught about this engram", async () => {
+    serve();
+
+    renderApp("/d/eng/e/alpha");
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: /what an agent is taught/i }),
+    );
+
+    const panel = await screen.findByRole("region", { name: /agent/i });
+    // The domain's routing line, which is what sends an agent here at all.
+    expect(panel).toHaveTextContent("Route here for eng questions.");
+    // The salience the engram carries, which is what ranks it once it is here.
+    expect(within(panel).getByText("7")).toBeVisible();
+    // And what reading it costs, named as the estimate it is rather than as a
+    // count nobody measured.
+    const tokens = Math.ceil(BODY.length / 4);
+    expect(panel).toHaveTextContent(new RegExp(`${String(tokens)} tokens`));
+    expect(panel).toHaveTextContent(/approximate/i);
+  });
+
+  it("says nothing about a salience the engram does not carry", async () => {
+    serve({
+      "/domains/eng/engrams/alpha": () =>
+        detailResponse({
+          frontmatter: {
+            engram_type: "engram",
+            title: "Alpha",
+            permalink: "alpha",
+            status: "stable",
+            tags: [],
+            extra: {},
+            valid_from: null,
+            valid_to: null,
+            stale_after: null,
+            verified: [],
+            last_verified: null,
+            review_after: null,
+            recorded_at: null,
+          },
+        }),
+    });
+
+    renderApp("/d/eng/e/alpha");
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: /what an agent is taught/i }),
+    );
+
+    const panel = await screen.findByRole("region", { name: /agent/i });
+    expect(panel).toHaveTextContent("Route here for eng questions.");
+    // No row, no placeholder, no zero: an engram with no salience has none.
+    expect(within(panel).queryByText(/salience/i)).toBeNull();
+  });
+
   it("says an engram nobody wrote is a wrong address", async () => {
     serve({
       "/domains/eng/engrams/alpha": () => {

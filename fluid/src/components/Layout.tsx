@@ -23,6 +23,7 @@ import { useAuth } from "../auth/AuthContext";
 import { domainRoute, searchRoute } from "../paths";
 import { useTheme } from "../theme/context";
 import type { ThemePreference } from "../theme/context";
+import { CommandPalette } from "./CommandPalette";
 
 /** The classes every menu surface shares. */
 const MENU_CLASSES =
@@ -49,6 +50,11 @@ export function Layout() {
           <Outlet />
         </main>
       </div>
+      {/*
+        Once for the whole app, so the shortcut works on every screen and the
+        palette outlives the screen a jump leaves behind.
+      */}
+      <CommandPalette />
     </div>
   );
 }

@@ -17,6 +17,7 @@
   "dependencies": {
     "@tanstack/react-query": "^5.101.4",
     "@tanstack/react-virtual": "^3.14.9",
+    "cmdk": "^1.1.1",
     "cytoscape": "^3.34.0",
     "mermaid": "^11.16.1",
     "radix-ui": "^1.6.7",

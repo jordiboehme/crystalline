@@ -42,6 +42,7 @@ import {
   fetchGraph,
   graphKey,
 } from "../api/graph";
+import { AgentsEye } from "../components/AgentsEye";
 import { BacklinksPanel } from "../components/BacklinksPanel";
 import { FrontmatterPanel } from "../components/FrontmatterPanel";
 import { LifecycleBanner } from "../components/LifecycleBanner";
@@ -155,6 +156,11 @@ export default function EngramPage() {
           <Observations observations={engram.observations} />
           <Relations relations={engram.relations} resolve={wikilinks} />
           <GraphSection domain={engram.domain} permalink={engram.permalink} />
+          <AgentsEye
+            domain={engram.domain}
+            salience={engram.frontmatter.salience}
+            content={engram.content}
+          />
         </div>
         <aside className="flex flex-col gap-4">
           <FrontmatterPanel frontmatter={engram.frontmatter} />

@@ -29,6 +29,7 @@ import type { EngramPage } from "../api/engrams";
 import type { SearchMode, SearchRequest } from "../api/search";
 import {
   DEFAULT_SEARCH_MODE,
+  SEARCH_DEBOUNCE_MS,
   fetchSearch,
   hasSearchFilters,
   isSearchable,
@@ -40,9 +41,6 @@ import { EngramList } from "../components/EngramList";
 import { Facets } from "../components/Facets";
 import type { FacetChange } from "../components/Facets";
 import { searchTerms } from "../snippet";
-
-/** How long a pause in the typing means the query is ready to run, in ms. */
-const DEBOUNCE_MS = 250;
 
 export default function Search() {
   const [params, setParams] = useSearchParams();
@@ -94,7 +92,7 @@ export default function Search() {
         // the results the way they came. Every refinement after it replaces.
         { replace: q !== "" },
       );
-    }, DEBOUNCE_MS);
+    }, SEARCH_DEBOUNCE_MS);
     return () => {
       clearTimeout(timer);
     };

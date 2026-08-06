@@ -32,6 +32,16 @@ export type SearchMode = (typeof SEARCH_MODES)[number];
 /** What a search runs as when nobody chose: lexical plus semantic ranking. */
 export const DEFAULT_SEARCH_MODE: SearchMode = "hybrid";
 
+/**
+ * How long a pause in the typing means a query is ready to run, in ms.
+ *
+ * A property of how often this client is willing to ask the server rather than
+ * of any one screen, so it lives beside the request it paces: the search screen
+ * and the command palette both search as somebody types, and two different
+ * pauses would make one of them feel broken next to the other.
+ */
+export const SEARCH_DEBOUNCE_MS = 250;
+
 /** Read a mode name, falling back to the default for anything unknown. */
 export function readSearchMode(value: string | null): SearchMode {
   return (SEARCH_MODES as readonly string[]).includes(value ?? "")
@@ -102,6 +112,18 @@ export function searchKey(request: SearchRequest): readonly unknown[] {
     request.after,
     request.mode,
   ];
+}
+
+/**
+ * The cache key of a palette lookup by title.
+ *
+ * Deliberately not {@link searchKey}, even though the request is one a search
+ * screen could make: that key holds an infinite query's pages, and a plain
+ * lookup writing a single envelope under it would hand the list a shape it
+ * cannot page.
+ */
+export function titleMatchesKey(term: string): readonly unknown[] {
+  return ["title-matches", term];
 }
 
 /** Fetch one page of results. */
