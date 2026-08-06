@@ -59,7 +59,12 @@ async fn build_engine() -> (tempfile::TempDir, Arc<Engine>) {
 /// background task for the duration of the test.
 async fn spawn_router() -> std::net::SocketAddr {
     let (_tmp, engine) = build_engine().await;
-    let router = http_router(engine, Arc::new(AtomicUsize::new(0)), &[]);
+    let auth = Arc::new(
+        crystalline_service::rest::AuthStore::open(&_tmp.path().join("web-auth.db"))
+            .await
+            .unwrap(),
+    );
+    let router = http_router(engine, Arc::new(AtomicUsize::new(0)), &[], auth).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {

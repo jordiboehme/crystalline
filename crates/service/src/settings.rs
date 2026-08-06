@@ -10,8 +10,9 @@
 use std::path::PathBuf;
 
 use crystalline_core::config::{
-    DatabaseBackend, DatabaseConfig, GitHubConfig, GlobalConfig, HttpSetting, IdentityConfig,
-    IndexConfig, ResponseFormat, SearchConfig, ServiceConfig, SkillsConfig, SkillsServe,
+    AuthConfig, DatabaseBackend, DatabaseConfig, GitHubConfig, GlobalConfig, HttpSetting,
+    IdentityConfig, IndexConfig, ResponseFormat, SearchConfig, ServiceConfig, SkillsConfig,
+    SkillsServe,
 };
 use crystalline_index::{DEFAULT_RETIRED_WEIGHT, DEFAULT_SALIENCE_WEIGHT};
 
@@ -251,6 +252,24 @@ pub fn registry() -> &'static [SettingSpec] {
             clear: clear_identity_actor,
             effective: identity_actor_effective,
         },
+        SettingSpec {
+            key: "auth.trusted_header",
+            doc: "The request header a trusted reverse proxy sets to name the authenticated user, for example X-Forwarded-User; unset means no header is believed (applies at the next daemon start)",
+            kind: SettingKind::String,
+            startup_effective: true,
+            apply: set_trusted_header,
+            clear: clear_trusted_header,
+            effective: trusted_header_effective,
+        },
+        SettingSpec {
+            key: "auth.anonymous",
+            doc: "Serve requests that carry no identity at all (default false) (applies at the next daemon start)",
+            kind: SettingKind::Bool,
+            startup_effective: true,
+            apply: set_anonymous,
+            clear: clear_anonymous,
+            effective: anonymous_effective,
+        },
     ]
 }
 
@@ -421,6 +440,15 @@ fn drop_index_if_empty(config: &mut GlobalConfig) {
 fn drop_identity_if_empty(config: &mut GlobalConfig) {
     if config.identity.as_ref() == Some(&IdentityConfig::default()) {
         config.identity = None;
+    }
+}
+
+/// Drop the `auth` block entirely once every field in it has been cleared, so
+/// an unset config round-trips to exactly the pre-feature shape (no empty
+/// `auth: {}` line).
+fn drop_auth_if_empty(config: &mut GlobalConfig) {
+    if config.auth.as_ref() == Some(&AuthConfig::default()) {
+        config.auth = None;
     }
 }
 
@@ -935,6 +963,79 @@ fn identity_actor_effective(config: &GlobalConfig) -> (String, bool) {
     }
 }
 
+// --- auth.trusted_header ------------------------------------------------------
+
+fn set_trusted_header(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(SettingsError(
+            "auth.trusted_header must not be empty".to_string(),
+        ));
+    }
+    if trimmed.contains(char::is_whitespace) {
+        return Err(SettingsError(format!(
+            "auth.trusted_header must not contain whitespace, got '{value}'"
+        )));
+    }
+    // The served API parses this into an `axum` `HeaderName` when it builds the
+    // HTTP surface, and a value that will not parse leaves that surface
+    // refusing to come up. Parsing here means a typo is refused at the moment
+    // it is typed, rather than accepted now and discovered as a dead endpoint
+    // at the next daemon start. The parse over there stays as the second layer.
+    if axum::http::HeaderName::try_from(trimmed.to_ascii_lowercase()).is_err() {
+        return Err(SettingsError(format!(
+            "auth.trusted_header must be a valid HTTP header name - letters, digits or any of \
+             !#$%&'*+-.^_`|~, and nothing else - got '{value}'"
+        )));
+    }
+    config
+        .auth
+        .get_or_insert_with(AuthConfig::default)
+        .trusted_header = Some(trimmed.to_string());
+    Ok(())
+}
+
+fn clear_trusted_header(config: &mut GlobalConfig) {
+    if let Some(a) = config.auth.as_mut() {
+        a.trusted_header = None;
+    }
+    drop_auth_if_empty(config);
+}
+
+fn trusted_header_effective(config: &GlobalConfig) -> (String, bool) {
+    match config.auth_trusted_header() {
+        Some(header) => (header.to_string(), false),
+        None => (String::new(), true),
+    }
+}
+
+// --- auth.anonymous -----------------------------------------------------------
+
+fn set_anonymous(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
+    let parsed: bool = value.parse().map_err(|_| {
+        SettingsError(format!(
+            "auth.anonymous must be true or false, got '{value}'"
+        ))
+    })?;
+    config
+        .auth
+        .get_or_insert_with(AuthConfig::default)
+        .anonymous = Some(parsed);
+    Ok(())
+}
+
+fn clear_anonymous(config: &mut GlobalConfig) {
+    if let Some(a) = config.auth.as_mut() {
+        a.anonymous = None;
+    }
+    drop_auth_if_empty(config);
+}
+
+fn anonymous_effective(config: &GlobalConfig) -> (String, bool) {
+    let is_default = config.auth.as_ref().and_then(|a| a.anonymous).is_none();
+    (config.auth_anonymous().to_string(), is_default)
+}
+
 // --- domains_root ----------------------------------------------------------
 
 fn set_domains_root(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
@@ -968,7 +1069,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_lists_exactly_the_sixteen_keys_in_order() {
+    fn registry_lists_exactly_the_eighteen_keys_in_order() {
         assert_eq!(
             known_keys(),
             vec![
@@ -988,6 +1089,8 @@ mod tests {
                 "search.retired_weight",
                 "index.files",
                 "identity.actor",
+                "auth.trusted_header",
+                "auth.anonymous",
             ]
         );
     }
@@ -1039,6 +1142,11 @@ mod tests {
                 ),
                 ("index.files", "CRYSTALLINE_INDEX_FILES".to_string()),
                 ("identity.actor", "CRYSTALLINE_IDENTITY_ACTOR".to_string()),
+                (
+                    "auth.trusted_header",
+                    "CRYSTALLINE_AUTH_TRUSTED_HEADER".to_string()
+                ),
+                ("auth.anonymous", "CRYSTALLINE_AUTH_ANONYMOUS".to_string()),
             ]
         );
     }
@@ -1061,6 +1169,8 @@ mod tests {
         assert!(change_note("search.retired_weight", &no_env).is_none());
         assert!(change_note("index.files", &no_env).is_none());
         assert!(change_note("identity.actor", &no_env).is_none());
+        assert!(change_note("auth.trusted_header", &no_env).is_some());
+        assert!(change_note("auth.anonymous", &no_env).is_some());
         assert!(change_note("github.bogus", &no_env).is_none());
     }
 
@@ -1359,7 +1469,7 @@ mod tests {
         apply(&mut cfg, "github.enabled", "true").unwrap();
 
         let views = snapshot(&cfg, &EnvOverlay::default());
-        assert_eq!(views.len(), 16);
+        assert_eq!(views.len(), 18);
         assert_eq!(
             views.iter().map(|v| v.key.as_str()).collect::<Vec<_>>(),
             vec![
@@ -1379,6 +1489,8 @@ mod tests {
                 "search.retired_weight",
                 "index.files",
                 "identity.actor",
+                "auth.trusted_header",
+                "auth.anonymous",
             ]
         );
 
@@ -1450,6 +1562,14 @@ mod tests {
         let identity_actor = &views[15];
         assert_eq!(identity_actor.value, "");
         assert_eq!(identity_actor.source, SettingSource::Default);
+
+        let trusted_header = &views[16];
+        assert_eq!(trusted_header.value, "");
+        assert_eq!(trusted_header.source, SettingSource::Default);
+
+        let anonymous = &views[17];
+        assert_eq!(anonymous.value, "false");
+        assert_eq!(anonymous.source, SettingSource::Default);
     }
 
     #[test]
@@ -1747,5 +1867,147 @@ mod tests {
         let database = cfg.database.as_ref().expect("url keeps the block alive");
         assert_eq!(database.backend, DatabaseBackend::Turso);
         assert_eq!(database.url.as_deref(), Some("postgres://db/crystalline"));
+    }
+
+    // --- auth.trusted_header ----------------------------------------------------
+
+    #[test]
+    fn apply_auth_trusted_header_happy_path() {
+        let mut cfg = GlobalConfig::default();
+        assert_eq!(
+            cfg.auth_trusted_header(),
+            None,
+            "the feature is off by default"
+        );
+        apply(&mut cfg, "auth.trusted_header", " X-Forwarded-User ").unwrap();
+        assert_eq!(cfg.auth_trusted_header(), Some("X-Forwarded-User"));
+        assert_eq!(
+            trusted_header_effective(&cfg),
+            ("X-Forwarded-User".to_string(), false)
+        );
+    }
+
+    #[test]
+    fn apply_auth_trusted_header_rejects_empty_and_whitespace() {
+        let mut cfg = GlobalConfig::default();
+        let err = apply(&mut cfg, "auth.trusted_header", "   ").unwrap_err();
+        assert!(err.to_string().contains("empty"), "{err}");
+        let err = apply(&mut cfg, "auth.trusted_header", "X-Forwarded User").unwrap_err();
+        assert!(err.to_string().contains("whitespace"), "{err}");
+        assert!(cfg.auth.is_none(), "a rejected value must not be written");
+    }
+
+    /// A value HTTP does not allow as a header name is refused here, where the
+    /// operator typed it. Accepting it would store a setting the served API
+    /// cannot parse, and the HTTP endpoint would then refuse to come up at the
+    /// next start with nothing pointing back at this command.
+    #[test]
+    fn apply_auth_trusted_header_rejects_an_invalid_header_name() {
+        let mut cfg = GlobalConfig::default();
+        for bad in [
+            "X-User:",
+            "X-User@host",
+            "user/name",
+            "(remote-user)",
+            "\"x\"",
+        ] {
+            let err = apply(&mut cfg, "auth.trusted_header", bad).unwrap_err();
+            assert!(
+                err.to_string().contains("valid HTTP header name"),
+                "{bad:?} must be refused as a header name, got: {err}"
+            );
+            assert!(
+                cfg.auth.is_none(),
+                "a rejected value must not be written: {bad:?}"
+            );
+        }
+
+        // The shapes a proxy actually sets, including the punctuation a token
+        // does allow, are all accepted.
+        for good in [
+            "X-Forwarded-User",
+            "remote-user",
+            "Remote_User",
+            "X-User.Id",
+        ] {
+            apply(&mut cfg, "auth.trusted_header", good).unwrap();
+            assert_eq!(cfg.auth_trusted_header(), Some(good));
+        }
+    }
+
+    #[test]
+    fn unset_auth_trusted_header_drops_an_emptied_auth_block() {
+        let mut cfg = GlobalConfig::default();
+        apply(&mut cfg, "auth.trusted_header", "X-Forwarded-User").unwrap();
+        assert!(cfg.auth.is_some());
+
+        unset(&mut cfg, "auth.trusted_header").unwrap();
+        assert!(
+            cfg.auth.is_none(),
+            "the only set field was cleared, so the block should vanish"
+        );
+        assert_eq!(cfg.auth_trusted_header(), None);
+
+        let yaml = serde_yaml_ng::to_string(&cfg).unwrap();
+        assert!(
+            !yaml.contains("auth"),
+            "an emptied auth block must not round-trip into the yaml: {yaml}"
+        );
+    }
+
+    // --- auth.anonymous ---------------------------------------------------------
+
+    #[test]
+    fn apply_auth_anonymous_happy_path() {
+        let mut cfg = GlobalConfig::default();
+        assert!(!cfg.auth_anonymous(), "anonymous access is off by default");
+        apply(&mut cfg, "auth.anonymous", "true").unwrap();
+        assert!(cfg.auth_anonymous());
+        apply(&mut cfg, "auth.anonymous", "false").unwrap();
+        assert!(!cfg.auth_anonymous());
+        assert_eq!(anonymous_effective(&cfg), ("false".to_string(), false));
+    }
+
+    #[test]
+    fn auth_anonymous_rejects_non_bool() {
+        let mut cfg = GlobalConfig::default();
+        let err = apply(&mut cfg, "auth.anonymous", "yes").unwrap_err();
+        assert!(err.to_string().contains("must be true or false"), "{err}");
+        assert!(cfg.auth.is_none(), "a rejected value must not be written");
+    }
+
+    #[test]
+    fn unset_auth_anonymous_drops_an_emptied_auth_block() {
+        let mut cfg = GlobalConfig::default();
+        apply(&mut cfg, "auth.anonymous", "true").unwrap();
+        assert!(cfg.auth.is_some());
+
+        unset(&mut cfg, "auth.anonymous").unwrap();
+        assert!(
+            cfg.auth.is_none(),
+            "the only set field was cleared, so the block should vanish"
+        );
+        assert!(!cfg.auth_anonymous());
+
+        let yaml = serde_yaml_ng::to_string(&cfg).unwrap();
+        assert!(
+            !yaml.contains("auth"),
+            "an emptied auth block must not round-trip into the yaml: {yaml}"
+        );
+    }
+
+    #[test]
+    fn auth_block_survives_when_a_sibling_field_remains_set() {
+        let mut cfg = GlobalConfig::default();
+        apply(&mut cfg, "auth.trusted_header", "X-Forwarded-User").unwrap();
+        apply(&mut cfg, "auth.anonymous", "true").unwrap();
+
+        unset(&mut cfg, "auth.anonymous").unwrap();
+        assert!(
+            cfg.auth.is_some(),
+            "trusted_header is still set, so the block must survive"
+        );
+        assert_eq!(cfg.auth_trusted_header(), Some("X-Forwarded-User"));
+        assert!(!cfg.auth_anonymous());
     }
 }

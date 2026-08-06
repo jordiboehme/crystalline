@@ -62,6 +62,13 @@ indexmap = "2.14.0"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json"] }
 fs4 = "1.1.0"
 axum = "0.8.9"
+# Only the cookie extractor is used (session and CSRF handling in the REST
+# auth layer); default features pull in tracing for unrelated extractors.
+axum-extra = { version = "0.12.6", default-features = false, features = ["cookie"] }
+# Only `Duration`, for the session cookie's Max-Age: the `cookie` crate that
+# axum-extra builds on takes its durations from here and re-exports no
+# constructor of its own. Already in the graph through that edge.
+time = { version = "0.3.55", default-features = false }
 libc = "0.2.189"
 serde_yaml_ng = "0.10.0"
 toml = "1.1.4"
@@ -89,6 +96,11 @@ keyring = { version = "4.1.6", default-features = false, features = ["v1"] }
 tar = "0.4.46"
 flate2 = "1.1.9"
 base64 = "0.22.1"
+# Password hashing for the REST auth store (crates/service). Default features
+# already pull `password-hash` and its `rand_core`, so the salt and the session
+# token both draw from `password_hash::rand_core::OsRng` and no separate `rand`
+# dependency is needed; `std` is on so hashing errors carry `std::error::Error`.
+argon2 = { version = "0.5.3", features = ["std"] }
 
 insta = { version = "1.48.0", features = ["yaml"] }
 assert_cmd = "2.2.2"

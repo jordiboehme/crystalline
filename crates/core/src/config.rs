@@ -88,6 +88,11 @@ pub struct GlobalConfig {
     /// working untouched.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<IdentityConfig>,
+    /// Authentication settings for the served API. Absent means no trusted
+    /// header is honoured and anonymous access stays off, so every existing
+    /// config keeps working untouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<AuthConfig>,
 }
 
 impl GlobalConfig {
@@ -180,6 +185,26 @@ impl GlobalConfig {
             .and_then(|i| i.actor.as_deref())
             .map(str::trim)
             .filter(|s| !s.is_empty())
+    }
+
+    /// The request header naming the authenticated user, from
+    /// `auth.trusted_header`. Absent config or an absent key means the trusted
+    /// header is off: no header is believed, whatever a proxy sends.
+    pub fn auth_trusted_header(&self) -> Option<&str> {
+        self.auth
+            .as_ref()
+            .and_then(|a| a.trusted_header.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Whether a request that carries no identity is served anyway, from
+    /// `auth.anonymous`. Absent config or an absent key means off (false).
+    pub fn auth_anonymous(&self) -> bool {
+        self.auth
+            .as_ref()
+            .and_then(|a| a.anonymous)
+            .unwrap_or(false)
     }
 }
 
@@ -486,6 +511,22 @@ pub struct IdentityConfig {
     /// `process:name` for an automated job. Absent means no override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actor: Option<String>,
+}
+
+/// The `auth` block: how the served API identifies a caller. Reads like a
+/// settings-page section - see the `configure` tool, which exposes exactly
+/// these keys.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AuthConfig {
+    /// The request header a trusted reverse proxy sets to name the
+    /// authenticated user. Absent means the trusted-header path is off and no
+    /// header is believed. Only safe when a proxy in front of Crystalline
+    /// strips the header from client requests and sets it itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trusted_header: Option<String>,
+    /// Serve requests that carry no identity at all. Absent means off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anonymous: Option<bool>,
 }
 
 /// Service configuration.
@@ -799,6 +840,17 @@ pub fn state_dir() -> Result<PathBuf, ConfigError> {
 /// The derived index database path, `<state_dir>/index.db`.
 pub fn index_db_path() -> Result<PathBuf, ConfigError> {
     Ok(state_dir()?.join("index.db"))
+}
+
+/// The web API's users and sessions database, `<state_dir>/web-auth.db`.
+///
+/// Deliberately not derived from the index database path: credentials are not
+/// knowledge, they must survive a `reindex --full` that discards the index,
+/// and `--db` names a scratch index rather than a second set of accounts. The
+/// `crystalline users` CLI and the daemon both resolve the file here, so the
+/// two always meet on one path.
+pub fn web_auth_db_path() -> Result<PathBuf, ConfigError> {
+    Ok(state_dir()?.join("web-auth.db"))
 }
 
 /// The single-instance lock path, `<state_dir>/service.lock`. Lock only: the
