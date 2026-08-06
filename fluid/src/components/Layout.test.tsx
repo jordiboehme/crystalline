@@ -7,7 +7,7 @@ import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { ApiProblem, api } from "../api/client";
+import { ApiProblem, api, setCsrfToken } from "../api/client";
 import {
   answersFor,
   domainsResponse,
@@ -22,6 +22,7 @@ vi.mock("../api/client", async (importOriginal) => {
 });
 
 const apiMock = vi.mocked(api);
+const setCsrfTokenMock = vi.mocked(setCsrfToken);
 
 function serve(routes: Record<string, () => unknown>) {
   apiMock.mockImplementation(answersFor(routes));
@@ -38,6 +39,7 @@ function serveSignedIn(extra: Record<string, () => unknown> = {}) {
 
 beforeEach(() => {
   apiMock.mockReset();
+  setCsrfTokenMock.mockReset();
   document.documentElement.removeAttribute("data-theme");
 });
 
@@ -104,7 +106,9 @@ describe("the layout", () => {
     let signedIn = true;
     serve({
       "/auth/me": () =>
-        signedIn ? meResponse({ user: userFixture() }) : meResponse(),
+        signedIn
+          ? meResponse({ user: userFixture(), csrf: "sess" })
+          : meResponse(),
       "/auth/logout": () => {
         signedIn = false;
         return { ok: true };
@@ -120,5 +124,24 @@ describe("the layout", () => {
     await user.click(await screen.findByRole("menuitem", { name: "Log out" }));
 
     expect(await screen.findByLabelText("Name")).toBeVisible();
+
+    // The screen says the session is over; this says the token went with it.
+    // Asserted against the clock rather than as a bare "was called with null",
+    // because the re-probe that follows a logout answers with a null token
+    // too and would satisfy that on its own. What has to be true is the
+    // order: the token is dropped as part of logging out, before any further
+    // request goes out, so nothing in between can carry a dead one.
+    expect(setCsrfTokenMock).toHaveBeenCalledWith(null);
+    const dropped = setCsrfTokenMock.mock.calls.findIndex(
+      ([token]) => token === null,
+    );
+    const droppedAt = setCsrfTokenMock.mock.invocationCallOrder[dropped];
+    const probes = apiMock.mock.calls
+      .map((call, index) => ({
+        path: call[0],
+        order: apiMock.mock.invocationCallOrder[index],
+      }))
+      .filter((call) => call.path === "/auth/me");
+    expect(droppedAt).toBeLessThan(probes[probes.length - 1].order);
   });
 });

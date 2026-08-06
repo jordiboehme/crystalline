@@ -10,6 +10,7 @@
 
 import { render } from "@testing-library/react";
 import type { RenderResult } from "@testing-library/react";
+import type { ReactNode } from "react";
 import { MemoryRouter } from "react-router";
 
 import App from "../App";
@@ -81,10 +82,17 @@ export function domainsResponse() {
   };
 }
 
-/** Mount the app at `entry`, on an in-memory history. */
-export function renderApp(entry = "/"): RenderResult {
+/**
+ * Mount the app at `entry`, on an in-memory history.
+ *
+ * `beside` is rendered inside the router and outside the app, which is how a
+ * test can put a real `Link` on screen and click it: the link needs the
+ * router's context, not the app's.
+ */
+export function renderApp(entry = "/", beside?: ReactNode): RenderResult {
   return render(
     <MemoryRouter initialEntries={[entry]}>
+      {beside}
       <App />
     </MemoryRouter>,
   );
