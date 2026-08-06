@@ -6,6 +6,7 @@
 mod auth;
 mod auth_store;
 mod domains;
+mod engrams;
 mod error;
 
 use std::sync::Arc;
@@ -74,6 +75,13 @@ pub fn router(state: RestState) -> Router {
         .route("/domains", get(domains::list))
         .route("/domains/{domain}/tree", get(domains::tree))
         .route("/domains/{domain}/manifest", get(domains::manifest))
+        .route("/domains/{domain}/engrams", get(engrams::list))
+        // A wildcard, not a segment: a permalink is a path, so an engram in a
+        // subfolder carries the slashes with it.
+        .route(
+            "/domains/{domain}/engrams/{*permalink}",
+            get(engrams::detail),
+        )
         .fallback(unknown_path)
         // Applies to every method router registered above it, so it stays
         // below the routes and above the guard.

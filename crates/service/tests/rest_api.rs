@@ -49,14 +49,10 @@ async fn build_engine(opts: AuthOptions) -> (tempfile::TempDir, Arc<Engine>) {
     .unwrap();
     // A handful of engrams, so the listing and tree endpoints have real
     // structure to report: one at the root, one a folder down, one two down.
-    for (rel, title) in [
-        ("alpha.md", "Alpha"),
-        ("notes/beta.md", "Beta"),
-        ("notes/deep/gamma.md", "Gamma"),
-    ] {
-        let path = dir.join(rel);
+    for engram in FIXTURE_ENGRAMS {
+        let path = dir.join(engram.path);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, engram_markdown(title)).unwrap();
+        std::fs::write(&path, engram.markdown()).unwrap();
     }
     cfg.domains
         .insert("eng".to_string(), DomainEntry::file(dir));
@@ -77,15 +73,68 @@ async fn build_engine(opts: AuthOptions) -> (tempfile::TempDir, Arc<Engine>) {
     (tmp, engine)
 }
 
-/// One engram's markdown, in the shape a sync indexes: the frontmatter the
-/// format layer requires plus a body, so the fixture domain holds real rows
-/// rather than empty files.
-fn engram_markdown(title: &str) -> String {
-    let slug = title.to_ascii_lowercase();
-    format!(
-        "---\ntype: engram\ntitle: {title}\npermalink: {slug}\ntags:\n  - eng\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# {title}\n\nA rule about {slug}.\n"
-    )
+/// One fixture engram: where it lives, what it is called, and the frontmatter
+/// that lets a filtered listing tell it apart from its siblings.
+struct FixtureEngram {
+    /// The domain-relative path the file is written at.
+    path: &'static str,
+    /// The engram title.
+    title: &'static str,
+    /// The permalink it carries, folder-shaped for the nested ones the way a
+    /// real domain writes them.
+    permalink: &'static str,
+    /// The engram `type`.
+    engram_type: &'static str,
+    /// The tag it carries beside the shared `eng` one.
+    tag: &'static str,
 }
+
+impl FixtureEngram {
+    /// This engram's markdown, in the shape a sync indexes: the frontmatter the
+    /// format layer requires plus a body, so the fixture domain holds real rows
+    /// rather than empty files.
+    fn markdown(&self) -> String {
+        let FixtureEngram {
+            title,
+            permalink,
+            engram_type,
+            tag,
+            ..
+        } = *self;
+        let slug = title.to_ascii_lowercase();
+        format!(
+            "---\ntype: {engram_type}\ntitle: {title}\npermalink: {permalink}\ntags:\n  - eng\n  - {tag}\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# {title}\n\nA rule about {slug}.\n"
+        )
+    }
+}
+
+/// The seeded engrams: one at the root, one a folder down, one two down. The
+/// nested two carry folder-shaped permalinks, so the detail route is exercised
+/// on a permalink with slashes in it, and the types and tags differ so a
+/// filtered listing has something to select on.
+const FIXTURE_ENGRAMS: [FixtureEngram; 3] = [
+    FixtureEngram {
+        path: "alpha.md",
+        title: "Alpha",
+        permalink: "alpha",
+        engram_type: "engram",
+        tag: "root",
+    },
+    FixtureEngram {
+        path: "notes/beta.md",
+        title: "Beta",
+        permalink: "notes/beta",
+        engram_type: "guide",
+        tag: "nested",
+    },
+    FixtureEngram {
+        path: "notes/deep/gamma.md",
+        title: "Gamma",
+        permalink: "notes/deep/gamma",
+        engram_type: "engram",
+        tag: "nested",
+    },
+];
 
 /// Bind `http_router` on an ephemeral loopback port and serve it on a
 /// background task for the duration of the test.
@@ -108,6 +157,14 @@ struct Fixture {
     addr: std::net::SocketAddr,
     auth: Arc<AuthStore>,
     _tmp: tempfile::TempDir,
+}
+
+impl Fixture {
+    /// The bytes of one seeded engram as they sit on disk, the source of truth
+    /// a response is checked against.
+    fn engram_bytes(&self, path: &str) -> Vec<u8> {
+        std::fs::read(self._tmp.path().join("eng").join(path)).unwrap()
+    }
 }
 
 /// Serve the production router over a fixture engine. The returned guard owns
@@ -213,6 +270,31 @@ fn engram_paths(tree: &serde_json::Value) -> Vec<String> {
         .expect("a tree response carries an engrams array")
         .iter()
         .map(|e| e["path"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// The `permalink` of every hit a listing returned, in the order it returned
+/// them.
+fn hit_permalinks(page: &serde_json::Value) -> Vec<String> {
+    page["hits"]
+        .as_array()
+        .expect("a listing carries a hits array")
+        .iter()
+        .map(|h| h["permalink"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// The lowercase hex SHA-256 digest of `bytes`, computed here rather than
+/// asked of the server: the point of the ETag assertions is that the validator
+/// the API sends is the digest of the markdown, independently arrived at.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
         .collect()
 }
 
@@ -382,6 +464,9 @@ async fn data_routes_401_without_identity_when_not_anonymous() {
         "/api/v1/domains",
         "/api/v1/domains/eng/tree",
         "/api/v1/domains/eng/manifest",
+        "/api/v1/domains/eng/engrams",
+        "/api/v1/domains/eng/engrams/alpha",
+        "/api/v1/domains/eng/engrams/notes/deep/gamma",
     ] {
         let resp = get(fixture.addr, path).await;
         assert_eq!(resp.status(), 401, "{path} must be guarded");
@@ -778,6 +863,165 @@ async fn domain_manifest_returns_the_markdown_source() {
         markdown.contains("Route here for eng questions"),
         "{markdown}"
     );
+}
+
+/// The listing is `search_engrams` with no query behind a query string: the
+/// filters select, and the page envelope the engine already writes comes
+/// through unchanged so a client can page without a second shape to learn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn engram_list_filters_and_carries_the_page_envelope() {
+    let fixture = serve_anonymous().await;
+
+    let all: serde_json::Value = get(fixture.addr, "/api/v1/domains/eng/engrams")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        all["total"], 4,
+        "the MANIFEST and the three seeded engrams: {all}"
+    );
+    assert_eq!(all["page"], 1, "the envelope names the page: {all}");
+    assert_eq!(all["limit"], 10, "and the page size: {all}");
+    assert_eq!(all["count"], 4, "and what this page holds: {all}");
+
+    // A comma-separated tag list is split, and every tag has to match: `eng` is
+    // on all three, `nested` on two, so the intersection is the nested pair.
+    let tagged: serde_json::Value =
+        get(fixture.addr, "/api/v1/domains/eng/engrams?tags=eng,nested")
+            .await
+            .json()
+            .await
+            .unwrap();
+    assert_eq!(tagged["total"], 2, "only the tagged pair: {tagged}");
+    assert_eq!(
+        hit_permalinks(&tagged),
+        vec!["notes/beta".to_string(), "notes/deep/gamma".to_string()],
+        "{tagged}"
+    );
+
+    let typed: serde_json::Value = get(fixture.addr, "/api/v1/domains/eng/engrams?type=guide")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(hit_permalinks(&typed), vec!["notes/beta".to_string()]);
+
+    let statused: serde_json::Value = get(fixture.addr, "/api/v1/domains/eng/engrams?status=draft")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(statused["total"], 0, "nothing is a draft here: {statused}");
+
+    // Paging: two pages of two over the same filtered set, disjoint and
+    // covering it.
+    let first: serde_json::Value = get(fixture.addr, "/api/v1/domains/eng/engrams?limit=2&page=1")
+        .await
+        .json()
+        .await
+        .unwrap();
+    let second: serde_json::Value = get(fixture.addr, "/api/v1/domains/eng/engrams?limit=2&page=2")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(second["page"], 2);
+    assert_eq!(second["limit"], 2);
+    assert_eq!(second["total"], 4, "the total spans the pages: {second}");
+    let mut paged = hit_permalinks(&first);
+    paged.extend(hit_permalinks(&second));
+    assert_eq!(paged.len(), 4, "two pages of two: {first} {second}");
+    let mut unique = paged.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), 4, "the pages do not overlap: {paged:?}");
+}
+
+/// The detail route answers with the engram itself - its frontmatter, its
+/// markdown and the graph the engine resolves around it - plus an `ETag` a
+/// later conditional write can present. The validator is the SHA-256 of the
+/// markdown, quoted as RFC 9110 requires of a strong one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn engram_detail_carries_the_source_and_a_strong_etag() {
+    let fixture = serve_anonymous().await;
+    let resp = get(fixture.addr, "/api/v1/domains/eng/engrams/alpha").await;
+    assert_eq!(resp.status(), 200);
+    let etag = resp
+        .headers()
+        .get("etag")
+        .expect("the detail response carries an ETag")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let body: serde_json::Value = resp.json().await.unwrap();
+
+    assert_eq!(body["domain"], "eng");
+    assert_eq!(body["permalink"], "alpha");
+    assert_eq!(body["title"], "Alpha");
+    assert_eq!(body["url"], "crystalline://eng/alpha");
+    assert_eq!(
+        body["frontmatter"]["title"], "Alpha",
+        "the frontmatter is part of the answer: {body}"
+    );
+    assert_eq!(body["frontmatter"]["permalink"], "alpha");
+
+    let on_disk = fixture.engram_bytes("alpha.md");
+    assert_eq!(
+        body["content"].as_str().unwrap().as_bytes(),
+        on_disk.as_slice(),
+        "the content is the markdown as written: {body}"
+    );
+    assert_eq!(
+        etag,
+        format!("\"{}\"", sha256_hex(&on_disk)),
+        "the ETag is the quoted SHA-256 of that markdown"
+    );
+    assert!(
+        etag.starts_with('"') && etag.ends_with('"') && !etag.starts_with("W/"),
+        "a strong validator, quoted: {etag}"
+    );
+}
+
+/// A permalink is a path, not a segment: the route captures the rest of the URL
+/// so an engram two folders down is reachable by the permalink it carries.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn engram_detail_resolves_a_permalink_with_folders() {
+    let fixture = serve_anonymous().await;
+    let resp = get(fixture.addr, "/api/v1/domains/eng/engrams/notes/deep/gamma").await;
+    assert_eq!(resp.status(), 200, "a nested permalink resolves");
+    let etag = resp.headers()["etag"].to_str().unwrap().to_string();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["permalink"], "notes/deep/gamma");
+    assert_eq!(body["path"], "notes/deep/gamma.md");
+    assert_eq!(
+        etag,
+        format!(
+            "\"{}\"",
+            sha256_hex(&fixture.engram_bytes("notes/deep/gamma.md"))
+        )
+    );
+}
+
+/// An engram nobody wrote is a 404 problem detail, the same shape every other
+/// failure on this surface has, and the engine's own message says what was
+/// looked for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unknown_permalink_is_a_404_problem_detail() {
+    let fixture = serve_anonymous().await;
+    let resp = get(fixture.addr, "/api/v1/domains/eng/engrams/notes/ghost").await;
+    assert_eq!(resp.status(), 404);
+    assert_eq!(resp.headers()["content-type"], "application/problem+json");
+    assert!(
+        resp.headers().get("etag").is_none(),
+        "a failure carries no validator"
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["status"], 404);
+    assert_eq!(body["title"], "not found");
+    let detail = body["detail"].as_str().unwrap();
+    assert!(detail.contains("notes/ghost"), "{detail}");
+    assert!(detail.contains("eng"), "{detail}");
 }
 
 /// A domain nobody registered is a 404 problem detail that names the domains
