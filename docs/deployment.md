@@ -1,6 +1,6 @@
 # Deploy Crystalline
 
-Crystalline runs the same way in every scenario: a daemon in the middle keeps one search index in sync with knowledge, and one or more agents connect to it, whether that connection is a local stdio pipe or a network HTTP endpoint. The eight scenarios below are variations on that one architecture.
+Crystalline runs the same way in every scenario: a daemon in the middle keeps one search index in sync with knowledge, and one or more agents connect to it, whether that connection is a local stdio pipe or a network HTTP endpoint. The nine scenarios below are variations on that one architecture.
 
 See [Get started](../README.md#get-started) in the README to install the binary and wire up an agent; this guide covers where the daemon, its knowledge and its index live in each shape.
 
@@ -49,6 +49,35 @@ flowchart LR
     D -->|bind mount| K[Knowledge files]
     D -->|volume| I[Index]
 ```
+
+## Team server with Fluid
+
+The team server with a browser in front of it. `deploy/fluid/docker-compose.yml` runs two containers on one network: the same Crystalline daemon as above, and Fluid, the web UI, as an nginx image (`ghcr.io/jordiboehme/crystalline-fluid`) that serves a static bundle on port 80 and forwards `/api/` to the daemon. Agents keep reading and writing over MCP exactly as before; people get the same knowledge as pages they can browse, search, link to and read side by side with what an agent was taught. Crystalline stores what was learned; Fluid is where you think with it.
+
+```mermaid
+flowchart LR
+    B[Browser] -->|HTTP :80| F[Fluid, nginx]
+    F --> S[Static bundle]
+    F -->|/api to crystalline:7411| D[Daemon]
+    A[Agent] -->|MCP over HTTP| D
+    D -->|bind mount| K[Knowledge files]
+    D -->|volume| I[Index]
+```
+
+Nothing is readable until an account exists: the JSON API answers `401` to a request that carries no identity. Creating the first admin is the one manual step, and `users add` writes the accounts database directly (never through the daemon), so a running instance picks the new account up on its next lookup with nothing to restart:
+
+```sh
+docker compose -f deploy/fluid/docker-compose.yml up -d
+
+printf '%s' 'the-password' | docker compose -f deploy/fluid/docker-compose.yml \
+  exec -T crystalline crystalline users add ada --role admin --password-stdin
+```
+
+`-T` because `--password-stdin` reads a pipe and compose would otherwise allocate a terminal there is nothing to read from. Everyone else is `--role viewer` or `--role editor`. Two other identity modes need no accounts at all: `CRYSTALLINE_AUTH_ANONYMOUS=true` serves an identityless request at viewer level, which together with `--read-only` is a published archive anyone who can reach it may browse, and `CRYSTALLINE_AUTH_TRUSTED_HEADER=remote-user` takes the already-authenticated user from a header an SSO proxy sets, creating that account at viewer role the first time it is seen. The trusted header is only safe when the proxy sets it itself and strips whatever a client sent, which means that proxy has to sit in front of Fluid rather than behind it: nginx forwards client headers untouched.
+
+Serve it over TLS anywhere but localhost. The session cookie is marked `Secure` for any browser `Host` that is not loopback, and for any request a proxy in front reports as `https`, so a browser on a plain `http://team.lan` is handed a cookie it refuses to store and signing in never sticks. Put a TLS terminator in front of the Fluid container and the same deployment works unchanged: Fluid passes an existing `X-Forwarded-Proto` through rather than overwriting it with its own hop.
+
+Fluid holds no state of its own, so it scales to as many replicas as a deployment wants. One variable configures the image: `CRYSTALLINE_UPSTREAM`, the daemon's `host:port`, `crystalline:7411` by default. nginx resolves it once, when it loads its configuration, which is why the compose file gates Fluid on the daemon's healthcheck and why a daemon that moves to a new address needs the Fluid container restarted rather than only itself. Reading is what the UI is for: the sidebar lists what this instance knows about, an engram page carries its frontmatter, observations, relations, backlinks and an interactive neighborhood graph, and Cmd+K (Ctrl+K where there is no Cmd key) opens a command palette that jumps to any domain, or to any engram by title, from anywhere in the app.
 
 ## Linux server with systemd
 
@@ -174,11 +203,12 @@ The `with-model` variant sets `CRYSTALLINE_MODELS_DIR` (also settable directly, 
 
 Both variants ship a built-in Docker `HEALTHCHECK` that probes `GET /health` with no shell involved (the image is distroless), so `docker ps` reports health directly and a Compose service can gate on `condition: service_healthy`. External monitors (a Kubernetes `httpGet` probe, an uptime checker such as Gatus, a load balancer) can probe the same `/health` endpoint directly rather than going through Docker's own health state.
 
-Two sample Compose files ship under [`examples/docker/`](../examples/docker/):
+Sample Compose files ship under [`examples/docker/`](../examples/docker/), and the one deployment that is meant to be run rather than read from under [`deploy/`](../deploy/):
 
 - **`compose.yaml`** - the single-container setup above, plus a commented one-shot `domain init` / `domain add` recipe for bootstrapping a fresh domain (`domain add` indexes it immediately, routed to the running daemon over the shared `/data` volume).
 - **`compose.git-sync.yaml`** - a scale-deployment variant that adds a sidecar keeping the knowledge folder synced from a git remote every 60 seconds, mounted read-only into Crystalline. This is the pattern for a team that manages engrams as a reviewed git repository rather than writing into the container directly.
 - **`compose.postgres.yaml`** - the [Shared database collaboration](#shared-database-collaboration) setup: a Postgres service with pgvector plus a Crystalline instance pointed at it via environment variables, and a commented second instance showing how a second worker shares the same database. Reach for it when several instances should share one federated index instead of each keeping its own.
+- **`deploy/fluid/docker-compose.yml`** - the [Team server with Fluid](#team-server-with-fluid) setup: the daemon plus the browser UI on port 80, with the first-admin bootstrap in a comment. It can build the Fluid image locally (`docker compose build fluid`) as well as pull it.
 
 ### Configure through environment variables
 
@@ -200,6 +230,7 @@ An immutable image with no `config.yaml` to mount or edit configures purely thro
 | `CRYSTALLINE_INDEX_FILES` | `index.files` | `true` (default) keeps a generated `index.md` in every folder of a file domain |
 | `CRYSTALLINE_AUTH_TRUSTED_HEADER` | `auth.trusted_header` | the request header a trusted reverse proxy sets to name the already-authenticated user, for example `remote-user`. Unset (default) means no header is believed, whatever a client sends; an account named by a configured header is created at viewer role the first time it is seen. Only safe when the proxy in front of Crystalline strips the header from client requests and sets it itself. Read once when the HTTP surface starts, like `service.read_only` |
 | `CRYSTALLINE_AUTH_ANONYMOUS` | `auth.anonymous` | `true` serves JSON API requests that carry no identity at all, at viewer level; `false` (default) answers them `401`. Read once when the HTTP surface starts, like `service.read_only` |
+| `CRYSTALLINE_UPSTREAM` | n/a (Fluid image only) | not a Crystalline setting: it is read by the Fluid image, and names where its nginx forwards `/api/`, as `host:port` (default `crystalline:7411`). Read once, when nginx loads its configuration, so an upstream that changes address needs the Fluid container restarted. See [Team server with Fluid](#team-server-with-fluid) |
 | `CRYSTALLINE_CONFIG` | an alternate config file path | `--config` wins over it |
 | `CRYSTALLINE_DOMAIN_<NAME>` | a domain rooted at that path, overlay only | never written to `config.yaml` |
 | `CRYSTALLINE_DOMAIN_<NAME>_ORIGIN` | `owner/repo[/subpath][@branch]` | bootstraps the domain on first start |

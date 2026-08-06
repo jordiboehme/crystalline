@@ -1,0 +1,91 @@
+# Fluid's server: the built app from disk, the JSON API forwarded to
+# Crystalline.
+#
+# This is a template rather than a finished conf. The nginx image's entrypoint
+# runs envsubst over /etc/nginx/templates/*.template on every container start
+# and writes the result into /etc/nginx/conf.d/, which is where the name this
+# file is copied under (default.conf) takes over from the stock server block.
+# Only CRYSTALLINE_-prefixed names are substituted (NGINX_ENVSUBST_FILTER in
+# the Dockerfile), so every nginx $variable below survives to nginx itself.
+
+server {
+    listen 80;
+    server_name _;
+
+    root /usr/share/nginx/html;
+    index index.html;
+
+    # The bundle is a megabyte of JavaScript and CSS split across many chunks,
+    # and all of it compresses well. text/html is always included by nginx.
+    gzip on;
+    gzip_min_length 1024;
+    gzip_types text/css application/javascript application/json image/svg+xml;
+
+    # A build emits about a hundred content-hashed chunks under /assets, so a
+    # name never survives a change to what is behind it: these can be held for
+    # as long as a browser is willing to hold anything.
+    location /assets/ {
+        # One header rather than `expires` as well: the two do not merge, and
+        # a response carrying two Cache-Control lines is only ever confusing.
+        add_header Cache-Control "public, max-age=31536000, immutable";
+        try_files $uri =404;
+    }
+
+    # The one file whose name is not content-hashed. It is what names the
+    # current chunks, so a stale cached copy is exactly how a browser ends up
+    # asking a new deployment for chunks that no longer exist.
+    location = /index.html {
+        add_header Cache-Control "no-store";
+    }
+
+    # The API, forwarded to the Crystalline daemon.
+    location /api/ {
+        # The Host the browser asked for, not the upstream's name. The daemon
+        # reads it to decide whether the session cookie needs the Secure flag,
+        # and nginx's default here ($proxy_host, literally the upstream
+        # host:port) would make every session look remote.
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        # X-Forwarded-Proto is deliberately not set. Whatever a TLS terminator
+        # in front of this container sent is forwarded untouched; setting it to
+        # $scheme here would overwrite an https with the http of this hop and
+        # tell the daemon a TLS session was plain.
+        proxy_http_version 1.1;
+
+        # Longer than the 60s default, for the cold start: the daemon answers
+        # its healthcheck (and so Fluid starts serving) while the slim image is
+        # still downloading the embedding model, and the first search that
+        # needs an embedding waits for that to finish. 120s covers a normal
+        # download without letting a genuinely stuck request hang forever.
+        proxy_read_timeout 120s;
+        proxy_send_timeout 120s;
+
+        # No URI part after the upstream, and that is load bearing. With none,
+        # nginx passes the request URI exactly as the client sent it. Add a
+        # trailing slash or any path and nginx switches rules: it then sends
+        # the normalized, DECODED URI - percent escapes resolved, duplicate
+        # slashes collapsed, dot segments removed. That rewrites a path the app
+        # encoded deliberately and segment by segment, and a permalink is
+        # itself a path: an %2F or a %25 in one would reach the daemon meaning
+        # something else, so the request would land on a different engram or on
+        # none, with nothing on screen to explain it. Only this form has the
+        # daemon decode exactly once, and decode exactly what the browser sent.
+        # Do not "clean this up".
+        #
+        # By the time nginx reads this, envsubst has replaced the variable with
+        # a literal host:port, which is what keeps the rule above in force: a
+        # proxy_pass containing a variable is the other rule again. nginx
+        # therefore resolves the upstream when it loads its configuration, so a
+        # crystalline container that changed address needs this one restarted
+        # (or reloaded with `nginx -s reload`), not merely restarted itself.
+        proxy_pass http://${CRYSTALLINE_UPSTREAM};
+    }
+
+    # Everything else is a route inside the app, including a deep link such as
+    # /d/<domain>/e/<multi/segment/permalink>. No file stands behind those, so
+    # they are answered with the app itself and its router takes over.
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+}

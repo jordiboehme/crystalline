@@ -2,3 +2,9 @@ dist
 node_modules
 pnpm-lock.yaml
 src/api/types.ts
+
+# The browser smoke's fixture domain: engram files, written in the shape
+# Crystalline's own emitter writes them (an unindented YAML sequence for tags
+# among other things). Prettier reformats that frontmatter, which would leave
+# the fixture looking unlike every engram the product itself produces.
+e2e/fixtures

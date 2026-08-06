@@ -1,0 +1,83 @@
+# A team server with Fluid in front of it: Crystalline holding the knowledge,
+# and the browser UI serving the people who read it.
+#
+# Start it:
+#   docker compose -f deploy/fluid/docker-compose.yml up -d
+#
+# Then open http://localhost. There are no accounts until you create one, and
+# the JSON API answers 401 to a request that carries no identity, so the first
+# admin is the one manual step. `users add` writes the accounts database
+# directly and a running daemon picks the change up on its next lookup, so
+# there is nothing to restart:
+#
+#   printf '%s' 'the-password' | docker compose -f deploy/fluid/docker-compose.yml \
+#     exec -T crystalline crystalline users add ada --role admin --password-stdin
+#
+# (`-T` because --password-stdin reads a pipe; without it compose allocates a
+# TTY and there is nothing to read.) Everyone else is `--role viewer` or
+# `--role editor`, or comes from one of the two identity modes documented in
+# docs/deployment.md: auth.anonymous for a read-only instance anyone on the
+# network may browse, or auth.trusted_header behind an SSO proxy.
+#
+# Knowledge lives in ./knowledge next to this file, one subfolder per domain,
+# and stays plain markdown. The path is relative to this compose file wherever
+# it is run from, so create that folder before `up`: Docker creates a missing
+# bind-mount source itself, as an empty directory owned by root, which the
+# container's non-root user cannot then write to. Register a domain the same
+# way the single-container example does:
+#
+#   docker compose -f deploy/fluid/docker-compose.yml run --rm crystalline domain init /knowledge/team --name team
+#   docker compose -f deploy/fluid/docker-compose.yml run --rm crystalline domain add team /knowledge/team
+
+services:
+  crystalline:
+    image: ghcr.io/jordiboehme/crystalline:latest
+    # Alternative: the with-model variant, which needs no model download on
+    # first start (see docs/deployment.md#run-in-a-container):
+    # image: ghcr.io/jordiboehme/crystalline:with-model
+    #
+    # 0.0.0.0 because a container has to bind every interface to be reachable
+    # at all: 127.0.0.1 inside a container is reachable only from inside that
+    # same container, and Fluid is a different one.
+    command: ["serve", "--http", "0.0.0.0:7411"]
+    # The daemon is not published to the host here: Fluid is the only thing
+    # that needs it, and it reaches it over this compose network. Publish it
+    # too when agents should connect to the MCP endpoint as well, and add the
+    # name they use to CRYSTALLINE_SERVICE_ALLOWED_HOSTS - the MCP transport
+    # validates the Host header (the JSON API Fluid uses does not).
+    # ports:
+    #   - "7411:7411"
+    # environment:
+    #   CRYSTALLINE_SERVICE_ALLOWED_HOSTS: "crystalline,muthur.lan"
+    #   # Let anyone who can reach Fluid read without an account, at viewer
+    #   # level. Pair it with --read-only for a published, browsable archive.
+    #   CRYSTALLINE_AUTH_ANONYMOUS: "true"
+    #   # Or take the already-authenticated user from an SSO proxy's header.
+    #   # Only safe when that proxy sets the header itself and strips whatever
+    #   # a client sent, and it must sit in front of Fluid, not behind it.
+    #   CRYSTALLINE_AUTH_TRUSTED_HEADER: "remote-user"
+    volumes:
+      - ./knowledge:/knowledge
+      - crystalline-data:/data
+    restart: unless-stopped
+
+  fluid:
+    image: ghcr.io/jordiboehme/crystalline-fluid:latest
+    # Build it locally instead of pulling with `docker compose build fluid`.
+    build:
+      context: ../../fluid
+      dockerfile: Dockerfile
+    environment:
+      # Where the daemon answers. nginx resolves this once, when it loads its
+      # configuration, so it needs the crystalline container to exist first -
+      # which is what depends_on below guarantees.
+      CRYSTALLINE_UPSTREAM: "crystalline:7411"
+    ports:
+      - "80:80"
+    depends_on:
+      crystalline:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  crystalline-data:

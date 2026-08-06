@@ -716,6 +716,69 @@ jobs:
           tags: ${{ steps.meta_with_model.outputs.tags }}
           labels: ${{ steps.meta_with_model.outputs.labels }}
 
+  # Fluid, the browser UI, as an image of its own. It carries no binary and
+  # consumes nothing the build matrix produces, but it still waits on it: a tag
+  # whose binaries failed to build is not a release, and a UI image published
+  # for one would point at a Crystalline nobody can install.
+  fluid-image:
+    name: publish the Fluid image
+    needs: build
+    runs-on: ubuntu-latest
+    # Same tag guard as publish and images: workflow_dispatch is a build-matrix
+    # dry run only, it never pushes an image.
+    if: github.ref_type == 'tag'
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Generate image metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/jordiboehme/crystalline-fluid
+          # latest=false plus the explicit raw tag, the same shape the
+          # crystalline images use, so what moves `latest` is written down
+          # rather than inferred from a default.
+          flavor: |
+            latest=false
+          tags: |
+            type=semver,pattern={{version}}
+            type=raw,value=latest
+          labels: |
+            org.opencontainers.image.title=Crystalline Fluid
+            org.opencontainers.image.description=The browser UI for a Crystalline instance. Crystalline stores what was learned; Fluid is where you think with it.
+            org.opencontainers.image.licenses=AGPL-3.0-or-later
+
+      # No QEMU, unlike the crystalline images: the node stage is pinned to the
+      # build platform (see fluid/Dockerfile) because a static bundle is the
+      # same bytes whatever the target is, so only the nginx stage is built per
+      # platform and nothing runs emulated.
+      - name: Build and push
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: fluid
+          file: fluid/Dockerfile
+          target: runtime
+          platforms: linux/amd64,linux/arm64
+          push: true
+          # Same as the crystalline pushes: no unknown/unknown attestation
+          # entries in the image index.
+          provenance: false
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
   homebrew:
     name: update homebrew tap
     needs: publish

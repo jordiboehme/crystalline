@@ -29,6 +29,16 @@ import { CommandPalette } from "./CommandPalette";
 const MENU_CLASSES =
   "z-50 min-w-48 rounded border border-slate-200 bg-white p-1 text-sm shadow-lg dark:border-slate-700 dark:bg-slate-900";
 
+/**
+ * What the command palette's shortcut is called on this keyboard.
+ *
+ * The palette answers to both modifiers, so this only decides which one to
+ * name, and it names the one this keyboard has.
+ */
+const PALETTE_HINT = /Mac|iPhone|iPad/.test(navigator.userAgent)
+  ? "⌘K"
+  : "Ctrl K";
+
 /** The classes every menu row shares. */
 const ITEM_CLASSES =
   "flex cursor-pointer items-center gap-2 rounded px-2 py-1.5 outline-none select-none data-[highlighted]:bg-slate-100 dark:data-[highlighted]:bg-slate-800";
@@ -124,17 +134,31 @@ function SearchBox() {
       <label htmlFor="topbar-search" className="sr-only">
         Search
       </label>
-      <input
-        id="topbar-search"
-        type="search"
-        name="q"
-        value={query}
-        placeholder="Search this instance"
-        onChange={(event) => {
-          setQuery(event.target.value);
-        }}
-        className="w-full rounded border border-slate-300 bg-white px-3 py-1.5 text-sm outline-none focus-visible:ring-2 focus-visible:ring-sky-500 dark:border-slate-700 dark:bg-slate-900"
-      />
+      {/*
+        The badge is the only thing that says the palette is there at all: a
+        shortcut nobody is told about is a shortcut nobody presses. It sits in
+        the box it is an alternative to, out of the way of the text and out of
+        the way of a screen reader, which has the label above instead.
+      */}
+      <div className="relative">
+        <input
+          id="topbar-search"
+          type="search"
+          name="q"
+          value={query}
+          placeholder="Search this instance"
+          onChange={(event) => {
+            setQuery(event.target.value);
+          }}
+          className="w-full rounded border border-slate-300 bg-white py-1.5 pr-16 pl-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-sky-500 dark:border-slate-700 dark:bg-slate-900"
+        />
+        <kbd
+          aria-hidden="true"
+          className="pointer-events-none absolute top-1/2 right-2 hidden -translate-y-1/2 rounded border border-slate-300 px-1 py-0.5 text-[10px] text-slate-500 sm:block dark:border-slate-700 dark:text-slate-400"
+        >
+          {PALETTE_HINT}
+        </kbd>
+      </div>
     </form>
   );
 }
