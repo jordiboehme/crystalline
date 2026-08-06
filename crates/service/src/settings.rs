@@ -977,6 +977,17 @@ fn set_trusted_header(config: &mut GlobalConfig, value: &str) -> Result<(), Sett
             "auth.trusted_header must not contain whitespace, got '{value}'"
         )));
     }
+    // The served API parses this into an `axum` `HeaderName` when it builds the
+    // HTTP surface, and a value that will not parse leaves that surface
+    // refusing to come up. Parsing here means a typo is refused at the moment
+    // it is typed, rather than accepted now and discovered as a dead endpoint
+    // at the next daemon start. The parse over there stays as the second layer.
+    if axum::http::HeaderName::try_from(trimmed.to_ascii_lowercase()).is_err() {
+        return Err(SettingsError(format!(
+            "auth.trusted_header must be a valid HTTP header name - letters, digits or any of \
+             !#$%&'*+-.^_`|~, and nothing else - got '{value}'"
+        )));
+    }
     config
         .auth
         .get_or_insert_with(AuthConfig::default)
@@ -1884,6 +1895,44 @@ mod tests {
         let err = apply(&mut cfg, "auth.trusted_header", "X-Forwarded User").unwrap_err();
         assert!(err.to_string().contains("whitespace"), "{err}");
         assert!(cfg.auth.is_none(), "a rejected value must not be written");
+    }
+
+    /// A value HTTP does not allow as a header name is refused here, where the
+    /// operator typed it. Accepting it would store a setting the served API
+    /// cannot parse, and the HTTP endpoint would then refuse to come up at the
+    /// next start with nothing pointing back at this command.
+    #[test]
+    fn apply_auth_trusted_header_rejects_an_invalid_header_name() {
+        let mut cfg = GlobalConfig::default();
+        for bad in [
+            "X-User:",
+            "X-User@host",
+            "user/name",
+            "(remote-user)",
+            "\"x\"",
+        ] {
+            let err = apply(&mut cfg, "auth.trusted_header", bad).unwrap_err();
+            assert!(
+                err.to_string().contains("valid HTTP header name"),
+                "{bad:?} must be refused as a header name, got: {err}"
+            );
+            assert!(
+                cfg.auth.is_none(),
+                "a rejected value must not be written: {bad:?}"
+            );
+        }
+
+        // The shapes a proxy actually sets, including the punctuation a token
+        // does allow, are all accepted.
+        for good in [
+            "X-Forwarded-User",
+            "remote-user",
+            "Remote_User",
+            "X-User.Id",
+        ] {
+            apply(&mut cfg, "auth.trusted_header", good).unwrap();
+            assert_eq!(cfg.auth_trusted_header(), Some(good));
+        }
     }
 
     #[test]
