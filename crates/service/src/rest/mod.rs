@@ -5,6 +5,7 @@
 
 mod auth;
 mod auth_store;
+mod discovery;
 mod domains;
 mod engrams;
 mod error;
@@ -82,6 +83,10 @@ pub fn router(state: RestState) -> Router {
             "/domains/{domain}/engrams/{*permalink}",
             get(engrams::detail),
         )
+        .route("/search", get(discovery::search))
+        .route("/vocabulary", get(discovery::vocabulary))
+        .route("/context", get(discovery::context))
+        .route("/activity", get(discovery::activity))
         .fallback(unknown_path)
         // Applies to every method router registered above it, so it stays
         // below the routes and above the guard.
@@ -103,4 +108,45 @@ async fn unknown_path() -> ApiError {
 /// problem+json rather than axum's empty 405.
 async fn wrong_method() -> ApiError {
     ApiError::method_not_allowed()
+}
+
+/// Split a comma-separated query parameter into the `Vec<String>` the engine's
+/// params take, dropping the whitespace and the empties a hand-written URL
+/// brings with it: `?tags=a,%20b,` asks for `a` and `b` rather than for a tag
+/// that is one space long, and an absent parameter asks for nothing at all.
+///
+/// Every list-valued parameter on this surface arrives this way rather than as a
+/// repeated key: one spelling for a caller to learn, and the same one the engine
+/// then sees whichever endpoint it came through.
+fn csv(raw: Option<&str>) -> Vec<String> {
+    raw.map(|raw| {
+        raw.split(',')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .map(str::to_string)
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_comma_list_splits_and_drops_the_empties() {
+        assert_eq!(csv(Some("a,b")), vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(
+            csv(Some(" a , b ")),
+            vec!["a".to_string(), "b".to_string()],
+            "a hand-written list is not punished for its spaces"
+        );
+        assert_eq!(csv(Some("a,,")), vec!["a".to_string()]);
+        assert!(
+            csv(Some("")).is_empty(),
+            "no values rather than one empty one"
+        );
+        assert!(csv(Some(" , ")).is_empty());
+        assert!(csv(None).is_empty(), "an absent parameter asks for nothing");
+    }
 }

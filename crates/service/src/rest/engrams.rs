@@ -14,7 +14,7 @@ use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::{ApiError, ApiPath, ApiQuery, RestState};
+use super::{ApiError, ApiPath, ApiQuery, RestState, csv};
 use crate::params::{ReadParams, SearchParams};
 
 /// The query string `GET /domains/{domain}/engrams` takes: the filter side of
@@ -76,7 +76,7 @@ pub async fn list(
             query: None,
             domains: vec![domain],
             engram_type: query.engram_type,
-            tags: query.tags.as_deref().map(split_tags).unwrap_or_default(),
+            tags: csv(query.tags.as_deref()),
             status: query.status,
             after: query.after,
             page: query.page,
@@ -136,36 +136,9 @@ fn etag(value: &Value) -> Result<HeaderValue, ApiError> {
         .map_err(|_| ApiError::internal("the engram's checksum is not a usable ETag"))
 }
 
-/// Split a comma-separated tag list, dropping the whitespace and the empties a
-/// hand-written URL brings with it, so `?tags=a,%20b,` asks for `a` and `b`
-/// rather than for a tag that is one space long.
-fn split_tags(raw: &str) -> Vec<String> {
-    raw.split(',')
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_tag_list_splits_on_commas_and_drops_the_empties() {
-        assert_eq!(split_tags("a,b"), vec!["a".to_string(), "b".to_string()]);
-        assert_eq!(
-            split_tags(" a , b "),
-            vec!["a".to_string(), "b".to_string()],
-            "a hand-written list is not punished for its spaces"
-        );
-        assert_eq!(split_tags("a,,"), vec!["a".to_string()]);
-        assert!(
-            split_tags("").is_empty(),
-            "no tags rather than one empty one"
-        );
-        assert!(split_tags(" , ").is_empty());
-    }
 
     /// The tag is a quoted strong validator, which is what an `If-Match`
     /// comparison later depends on: unquoted or `W/`-prefixed would not match.

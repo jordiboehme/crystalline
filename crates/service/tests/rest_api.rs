@@ -94,6 +94,9 @@ struct FixtureEngram {
     engram_type: &'static str,
     /// The tag it carries beside the shared `eng` one.
     tag: &'static str,
+    /// The title this engram declares a `relates_to` relation onto, if any, so
+    /// the fixture domain holds a real edge for the context endpoint to walk.
+    relates_to: Option<&'static str>,
 }
 
 impl FixtureEngram {
@@ -106,11 +109,15 @@ impl FixtureEngram {
             permalink,
             engram_type,
             tag,
+            relates_to,
             ..
         } = *self;
         let slug = title.to_ascii_lowercase();
+        let relation = relates_to
+            .map(|target| format!("\n- relates_to [[{target}]]\n"))
+            .unwrap_or_default();
         format!(
-            "---\ntype: {engram_type}\ntitle: {title}\npermalink: {permalink}\ntags:\n  - eng\n  - {tag}\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# {title}\n\nA rule about {slug}.\n"
+            "---\ntype: {engram_type}\ntitle: {title}\npermalink: {permalink}\ntags:\n  - eng\n  - {tag}\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# {title}\n\nA rule about {slug}.\n{relation}"
         )
     }
 }
@@ -118,7 +125,8 @@ impl FixtureEngram {
 /// The seeded engrams: one at the root, one a folder down, one two down. The
 /// nested two carry folder-shaped permalinks, so the detail route is exercised
 /// on a permalink with slashes in it, and the types and tags differ so a
-/// filtered listing has something to select on.
+/// filtered listing has something to select on. Beta relates to Alpha, so the
+/// domain holds one edge and the context endpoint has a neighborhood to return.
 const FIXTURE_ENGRAMS: [FixtureEngram; 3] = [
     FixtureEngram {
         path: "alpha.md",
@@ -126,6 +134,7 @@ const FIXTURE_ENGRAMS: [FixtureEngram; 3] = [
         permalink: "alpha",
         engram_type: "engram",
         tag: "root",
+        relates_to: None,
     },
     FixtureEngram {
         path: "notes/beta.md",
@@ -133,6 +142,7 @@ const FIXTURE_ENGRAMS: [FixtureEngram; 3] = [
         permalink: "notes/beta",
         engram_type: "guide",
         tag: "nested",
+        relates_to: Some("Alpha"),
     },
     FixtureEngram {
         path: "notes/deep/gamma.md",
@@ -140,6 +150,7 @@ const FIXTURE_ENGRAMS: [FixtureEngram; 3] = [
         permalink: "notes/deep/gamma",
         engram_type: "engram",
         tag: "nested",
+        relates_to: None,
     },
 ];
 
@@ -288,6 +299,26 @@ fn hit_permalinks(page: &serde_json::Value) -> Vec<String> {
         .expect("a listing carries a hits array")
         .iter()
         .map(|h| h["permalink"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// The `permalink` of every node a context response returned, in the order it
+/// returned them: the seeds first, then the neighborhood by rank.
+fn node_permalinks(context: &serde_json::Value) -> Vec<String> {
+    context["nodes"]
+        .as_array()
+        .expect("a context response carries a nodes array")
+        .iter()
+        .map(|n| n["permalink"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// The `name` of every entry in one of a vocabulary response's count lists.
+fn names(list: &serde_json::Value) -> Vec<String> {
+    list.as_array()
+        .expect("a vocabulary list is an array")
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_string())
         .collect()
 }
 
@@ -474,6 +505,10 @@ async fn data_routes_401_without_identity_when_not_anonymous() {
         "/api/v1/domains/eng/engrams",
         "/api/v1/domains/eng/engrams/alpha",
         "/api/v1/domains/eng/engrams/notes/deep/gamma",
+        "/api/v1/search",
+        "/api/v1/vocabulary",
+        "/api/v1/context",
+        "/api/v1/activity",
     ] {
         let resp = get(fixture.addr, path).await;
         assert_eq!(resp.status(), 401, "{path} must be guarded");
@@ -1176,4 +1211,385 @@ async fn a_malformed_request_body_is_a_problem_detail() {
             "the detail says what was wrong: {body}"
         );
     }
+}
+
+/// Search is `search_engrams` behind a query string: the text selects on the
+/// body rather than on a title, every filter narrows the same way the MCP tool's
+/// does, and the engine's page envelope comes through unchanged.
+///
+/// The word searched for lives only in the fixture bodies, so a hit proves the
+/// content was matched rather than the permalink the URL already carries. The
+/// fixture has no embeddings and the test engine no provider, so hybrid resolves
+/// to its text fallback and the response says so in `mode`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn search_finds_engrams_by_their_content() {
+    let fixture = serve_anonymous().await;
+
+    let resp = get(fixture.addr, "/api/v1/search?q=rule").await;
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["mode"], "text",
+        "hybrid falls back to text with no embeddings to search: {body}"
+    );
+    assert_eq!(body["page"], 1, "the page envelope is the engine's: {body}");
+    assert_eq!(body["limit"], 10, "{body}");
+    assert_eq!(
+        body["total"], 3,
+        "the three bodies, not the MANIFEST: {body}"
+    );
+    let mut found = hit_permalinks(&body);
+    found.sort();
+    assert_eq!(
+        found,
+        vec![
+            "alpha".to_string(),
+            "notes/beta".to_string(),
+            "notes/deep/gamma".to_string()
+        ],
+        "{body}"
+    );
+
+    // Every filter, mapped one for one onto the search parameters.
+    let typed: serde_json::Value = get(fixture.addr, "/api/v1/search?q=rule&type=guide")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(hit_permalinks(&typed), vec!["notes/beta".to_string()]);
+
+    let tagged: serde_json::Value = get(fixture.addr, "/api/v1/search?q=rule&tags=eng,nested")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        tagged["total"], 2,
+        "a comma list is split and every tag must match: {tagged}"
+    );
+
+    let statused: serde_json::Value = get(fixture.addr, "/api/v1/search?q=rule&status=draft")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(statused["total"], 0, "nothing is a draft here: {statused}");
+
+    let recent: serde_json::Value = get(fixture.addr, "/api/v1/search?q=rule&after=2026-06-01")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        recent["total"], 0,
+        "everything was recorded before that: {recent}"
+    );
+
+    let titled: serde_json::Value = get(fixture.addr, "/api/v1/search?q=Alpha&search_type=title")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        titled["mode"], "title",
+        "the mode asked for is used: {titled}"
+    );
+    assert_eq!(hit_permalinks(&titled), vec!["alpha".to_string()]);
+
+    let bounded: serde_json::Value = get(
+        fixture.addr,
+        "/api/v1/search?q=rule&search_type=text&min_similarity=0.5&limit=2&page=2",
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(bounded["page"], 2, "{bounded}");
+    assert_eq!(bounded["limit"], 2, "{bounded}");
+    assert_eq!(bounded["total"], 3, "the total spans the pages: {bounded}");
+    assert_eq!(bounded["count"], 1, "the tail of three: {bounded}");
+}
+
+/// A domain in the query string is a filter, not a resource: it narrows what is
+/// searched and an unmatched name narrows it to nothing. That is what separates
+/// it from a domain in a path segment, which names a resource and 404s when
+/// nobody registered it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_domain_filter_narrows_rather_than_404s() {
+    let fixture = serve_anonymous().await;
+
+    let scoped: serde_json::Value = get(fixture.addr, "/api/v1/search?q=rule&domains=eng")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(scoped["total"], 3, "{scoped}");
+
+    let elsewhere: serde_json::Value = get(fixture.addr, "/api/v1/search?q=rule&domains=void")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        elsewhere["total"], 0,
+        "the other registered domain holds nothing: {elsewhere}"
+    );
+
+    let unknown = get(fixture.addr, "/api/v1/search?q=rule&domains=ghost").await;
+    assert_eq!(
+        unknown.status(),
+        200,
+        "an unregistered name in a filter selects nothing, it does not 404"
+    );
+    let body: serde_json::Value = unknown.json().await.unwrap();
+    assert_eq!(body["total"], 0, "{body}");
+
+    // The list is split on commas, so both names are asked for at once.
+    let both: serde_json::Value = get(fixture.addr, "/api/v1/search?q=rule&domains=eng,void")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(both["total"], 3, "{both}");
+
+    let activity: serde_json::Value = get(fixture.addr, "/api/v1/activity?domains=ghost")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        activity["count"], 0,
+        "the same rule on activity: {activity}"
+    );
+
+    let vocab = get(fixture.addr, "/api/v1/vocabulary?domain=ghost").await;
+    assert_eq!(vocab.status(), 200, "and on the vocabulary");
+    let body: serde_json::Value = vocab.json().await.unwrap();
+    assert!(body["tags"].as_array().unwrap().is_empty(), "{body}");
+}
+
+/// A value the engine refuses is a 422 problem detail carrying the engine's own
+/// message, so the caller is told which values do work rather than being handed
+/// a bare status.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unknown_search_type_is_a_422_carrying_the_engines_message() {
+    let fixture = serve_anonymous().await;
+    let resp = get(fixture.addr, "/api/v1/search?q=rule&search_type=nope").await;
+    assert_eq!(resp.status(), 422);
+    assert_eq!(resp.headers()["content-type"], "application/problem+json");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["status"], 422);
+    assert_eq!(body["title"], "invalid request");
+    let detail = body["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("unknown search_type 'nope'"),
+        "the engine's own message arrives verbatim: {detail}"
+    );
+    assert!(
+        detail.contains("hybrid, text, semantic, title or permalink"),
+        "and it names what does work: {detail}"
+    );
+}
+
+/// The vocabulary endpoint hands back what the domains are written in: the tags
+/// in use with their counts, the observation categories and the relation types.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn vocabulary_lists_the_tags_and_relation_types_in_use() {
+    let fixture = serve_anonymous().await;
+
+    let resp = get(fixture.addr, "/api/v1/vocabulary").await;
+    assert_eq!(resp.status(), 200);
+    let all: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        all["domain"].is_null(),
+        "no domain was asked for, so none is echoed: {all}"
+    );
+    let tags = names(&all["tags"]);
+    for tag in ["eng", "root", "nested", "manifest"] {
+        assert!(tags.contains(&tag.to_string()), "{tag} missing from {all}");
+    }
+    let eng = all["tags"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "eng")
+        .expect("the shared tag is listed");
+    assert_eq!(eng["engrams"], 3, "it tags the three seeded engrams: {all}");
+    assert!(
+        names(&all["relation_types"]).contains(&"relates_to".to_string()),
+        "the one relation the fixture declares: {all}"
+    );
+
+    let scoped: serde_json::Value = get(fixture.addr, "/api/v1/vocabulary?domain=void")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(scoped["domain"], "void", "the scope is echoed: {scoped}");
+    assert!(
+        scoped["tags"].as_array().unwrap().is_empty(),
+        "the empty domain is written in nothing yet: {scoped}"
+    );
+}
+
+/// Context walks the graph out from a `crystalline://` anchor: the anchor comes
+/// back as a seed node, its neighbors come back beside it, and the edges between
+/// them say how they are related.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn context_returns_the_anchor_and_its_neighborhood() {
+    let fixture = serve_anonymous().await;
+
+    let resp = get(
+        fixture.addr,
+        "/api/v1/context?anchor=crystalline://eng/alpha",
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["anchor"], "crystalline://eng/alpha");
+    assert_eq!(body["depth"], 1, "one hop by default: {body}");
+    let nodes = body["nodes"].as_array().unwrap();
+    assert_eq!(nodes[0]["permalink"], "alpha", "the anchor leads: {body}");
+    assert_eq!(nodes[0]["seed"], true, "and is marked as the seed: {body}");
+    assert!(
+        node_permalinks(&body).contains(&"notes/beta".to_string()),
+        "the engram relating to it comes with: {body}"
+    );
+    let edges = body["edges"].as_array().unwrap();
+    assert!(
+        edges.iter().any(|e| e["rel_type"] == "relates_to"),
+        "the edge says how they are related: {body}"
+    );
+
+    // `max_related` caps the neighborhood, `domains` filters it, and `depth` is
+    // passed through to the traversal.
+    let alone: serde_json::Value = get(
+        fixture.addr,
+        "/api/v1/context?anchor=crystalline://eng/alpha&max_related=0&depth=2",
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(alone["depth"], 2, "{alone}");
+    assert_eq!(
+        node_permalinks(&alone),
+        vec!["alpha".to_string()],
+        "the seed alone: {alone}"
+    );
+
+    let filtered: serde_json::Value = get(
+        fixture.addr,
+        "/api/v1/context?anchor=crystalline://eng/alpha&domains=void",
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    assert!(
+        node_permalinks(&filtered).is_empty(),
+        "a domain filter that matches nothing keeps nothing: {filtered}"
+    );
+}
+
+/// The three ways an anchor can be wrong, each answered in the same problem+json
+/// contract: absent is a rejected request, unparseable is one the server
+/// understood and refused, and one pointing at nothing is missing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bad_context_anchor_is_a_problem_detail() {
+    let fixture = serve_anonymous().await;
+
+    let missing = get(fixture.addr, "/api/v1/context").await;
+    assert_eq!(missing.status(), 400, "the anchor is required");
+    assert_eq!(
+        missing.headers()["content-type"],
+        "application/problem+json"
+    );
+    let body: serde_json::Value = missing.json().await.unwrap();
+    assert!(
+        body["detail"].as_str().unwrap().contains("anchor"),
+        "the detail names the parameter: {body}"
+    );
+
+    let malformed = get(fixture.addr, "/api/v1/context?anchor=alpha").await;
+    assert_eq!(malformed.status(), 422);
+    let body: serde_json::Value = malformed.json().await.unwrap();
+    assert!(
+        body["detail"]
+            .as_str()
+            .unwrap()
+            .contains("not a crystalline:// URL"),
+        "the engine's own message: {body}"
+    );
+
+    let unknown = get(
+        fixture.addr,
+        "/api/v1/context?anchor=crystalline://eng/ghost",
+    )
+    .await;
+    assert_eq!(unknown.status(), 404);
+    let body: serde_json::Value = unknown.json().await.unwrap();
+    assert_eq!(body["title"], "not found");
+    assert!(body["detail"].as_str().unwrap().contains("ghost"), "{body}");
+}
+
+/// Activity is the recency window behind a query string: the timeframe decides
+/// what is recent enough to report, and the type and domain filters narrow it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn activity_respects_the_timeframe_and_its_filters() {
+    let fixture = serve_anonymous().await;
+
+    // The fixture was recorded on a fixed past date, so a one-day window reaches
+    // nothing and a wide one reaches everything: the window is what changes the
+    // answer.
+    let today = get(fixture.addr, "/api/v1/activity?timeframe=1d").await;
+    assert_eq!(today.status(), 200);
+    let body: serde_json::Value = today.json().await.unwrap();
+    assert_eq!(body["timeframe"], "1d", "the window is echoed: {body}");
+    assert_eq!(body["count"], 0, "nothing was recorded yesterday: {body}");
+
+    let ever: serde_json::Value = get(fixture.addr, "/api/v1/activity?timeframe=20y")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        ever["count"], 4,
+        "the MANIFEST and the three seeded engrams: {ever}"
+    );
+    let permalinks: Vec<&str> = ever["engrams"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["permalink"].as_str().unwrap())
+        .collect();
+    assert!(permalinks.contains(&"alpha"), "{ever}");
+
+    let typed: serde_json::Value = get(fixture.addr, "/api/v1/activity?timeframe=20y&types=guide")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(typed["count"], 1, "only the guide: {typed}");
+    assert_eq!(typed["engrams"][0]["permalink"], "notes/beta");
+
+    let multi: serde_json::Value = get(
+        fixture.addr,
+        "/api/v1/activity?timeframe=20y&types=guide,manifest&domains=eng",
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(multi["count"], 2, "a comma list is split: {multi}");
+
+    let default: serde_json::Value = get(fixture.addr, "/api/v1/activity")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        default["timeframe"], "7d",
+        "the engine's own default, not a second one here: {default}"
+    );
 }
