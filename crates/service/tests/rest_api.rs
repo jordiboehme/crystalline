@@ -47,6 +47,17 @@ async fn build_engine(opts: AuthOptions) -> (tempfile::TempDir, Arc<Engine>) {
         "---\ntype: manifest\ntitle: eng\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# eng\n\n## Scope\n\n- Everything about eng\n\n## When to Use\n\n- Route here for eng questions\n",
     )
     .unwrap();
+    // A handful of engrams, so the listing and tree endpoints have real
+    // structure to report: one at the root, one a folder down, one two down.
+    for (rel, title) in [
+        ("alpha.md", "Alpha"),
+        ("notes/beta.md", "Beta"),
+        ("notes/deep/gamma.md", "Gamma"),
+    ] {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, engram_markdown(title)).unwrap();
+    }
     cfg.domains
         .insert("eng".to_string(), DomainEntry::file(dir));
     cfg.service = Some(ServiceConfig {
@@ -64,6 +75,16 @@ async fn build_engine(opts: AuthOptions) -> (tempfile::TempDir, Arc<Engine>) {
     ));
     engine.sync(None).await.unwrap();
     (tmp, engine)
+}
+
+/// One engram's markdown, in the shape a sync indexes: the frontmatter the
+/// format layer requires plus a body, so the fixture domain holds real rows
+/// rather than empty files.
+fn engram_markdown(title: &str) -> String {
+    let slug = title.to_ascii_lowercase();
+    format!(
+        "---\ntype: engram\ntitle: {title}\npermalink: {slug}\ntags:\n  - eng\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# {title}\n\nA rule about {slug}.\n"
+    )
 }
 
 /// Bind `http_router` on an ephemeral loopback port and serve it on a
@@ -111,6 +132,16 @@ async fn serve_with_auth(opts: AuthOptions) -> Fixture {
         auth,
         _tmp: tmp,
     }
+}
+
+/// The fixture with `auth.anonymous` on: the shortest way to reach a data
+/// route with an identity the guard accepts.
+async fn serve_anonymous() -> Fixture {
+    serve_with_auth(AuthOptions {
+        anonymous: true,
+        ..AuthOptions::default()
+    })
+    .await
 }
 
 /// The same fixture with one viewer account, `ada` / `s3cret`, already added.
@@ -172,6 +203,17 @@ fn set_cookie(resp: &reqwest::Response) -> Option<String> {
         .filter_map(|v| v.to_str().ok())
         .find(|v| v.starts_with("fluid_session="))
         .map(str::to_string)
+}
+
+/// The `path` of every engram a tree response lists, in the order it listed
+/// them.
+fn engram_paths(tree: &serde_json::Value) -> Vec<String> {
+    tree["engrams"]
+        .as_array()
+        .expect("a tree response carries an engrams array")
+        .iter()
+        .map(|e| e["path"].as_str().unwrap().to_string())
+        .collect()
 }
 
 /// The capability probe answers without an identity, which is what lets the UI
@@ -330,19 +372,27 @@ async fn a_failed_login_is_an_indistinguishable_401() {
 }
 
 /// The guard runs ahead of routing, so an unauthenticated caller is told to
-/// authenticate rather than being told which paths exist.
+/// authenticate rather than being told which paths exist. Every data route is
+/// checked, not just one: a route registered below the guard layer instead of
+/// above it would serve its payload to anybody, and only asking it would say so.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn data_routes_401_without_identity_when_not_anonymous() {
     let fixture = serve_with_auth(AuthOptions::default()).await;
-    let resp = get(fixture.addr, "/api/v1/domains").await;
-    assert_eq!(resp.status(), 401);
-    assert_eq!(resp.headers()["content-type"], "application/problem+json");
-    let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body["status"], 401);
+    for path in [
+        "/api/v1/domains",
+        "/api/v1/domains/eng/tree",
+        "/api/v1/domains/eng/manifest",
+    ] {
+        let resp = get(fixture.addr, path).await;
+        assert_eq!(resp.status(), 401, "{path} must be guarded");
+        assert_eq!(resp.headers()["content-type"], "application/problem+json");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["status"], 401);
+    }
 }
 
-/// A logged-in caller passes the guard: the request reaches routing, where this
-/// path is simply unknown until the data routes land.
+/// A logged-in caller passes the guard and is served the data itself: the
+/// session cookie alone is enough to read the domain listing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn data_routes_pass_the_guard_with_a_session() {
     let fixture = serve_with_ada(AuthOptions::default()).await;
@@ -353,20 +403,20 @@ async fn data_routes_pass_the_guard_with_a_session() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 404, "past the guard, into routing");
+    assert_eq!(resp.status(), 200, "past the guard, into the handler");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["domains"][0]["name"], "eng");
 }
 
 /// With `auth.anonymous` on, an unidentified caller is served as a viewer, so
-/// the guard lets the request through to routing.
+/// the guard lets the request through to the data itself.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn anonymous_access_passes_the_guard() {
-    let fixture = serve_with_auth(AuthOptions {
-        anonymous: true,
-        ..AuthOptions::default()
-    })
-    .await;
+    let fixture = serve_anonymous().await;
     let resp = get(fixture.addr, "/api/v1/domains").await;
-    assert_eq!(resp.status(), 404, "past the guard, into routing");
+    assert_eq!(resp.status(), 200, "past the guard, into the handler");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["domains"][0]["name"], "eng");
 }
 
 /// The trusted-header path: the proxy has already authenticated the caller, so
@@ -395,14 +445,16 @@ async fn trusted_header_maps_identity() {
     assert_eq!(users.len(), 1, "the account was provisioned once");
     assert_eq!(users[0].name, "bob");
 
-    // A data route is reachable with the header alone: no cookie, no login.
+    // A data route is served with the header alone: no cookie, no login.
     let resp = client()
         .get(format!("http://{}/api/v1/domains", fixture.addr))
         .header("remote-user", "bob")
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 404, "past the guard, into routing");
+    assert_eq!(resp.status(), 200, "past the guard, into the handler");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["domains"][0]["name"], "eng");
 }
 
 /// The header is only believed when it is configured: an instance that has not
@@ -616,4 +668,217 @@ async fn logging_in_retires_the_session_that_was_presented() {
         .await
         .unwrap();
     assert_eq!(still["user"]["name"], "ada");
+}
+
+/// The domain listing is the engine's own value, verbatim: every registered
+/// domain with its counts, plus the routing block a client needs to know what
+/// each domain is for. `include_routing` is always on, so `behavior` and
+/// `when_to_use` are part of the contract rather than an option a caller has to
+/// ask for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn domains_lists_every_domain_with_its_routing_bullets() {
+    let fixture = serve_anonymous().await;
+    let resp = get(fixture.addr, "/api/v1/domains").await;
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body["behavior"].as_array().is_some_and(|b| !b.is_empty()),
+        "the listing carries the behavior rules: {body}"
+    );
+    let domains = body["domains"].as_array().unwrap();
+    assert_eq!(domains.len(), 1, "one registered domain: {body}");
+    assert_eq!(domains[0]["name"], "eng");
+    assert_eq!(domains[0]["kind"], "file");
+    assert_eq!(
+        domains[0]["engrams"], 4,
+        "the MANIFEST and the three seeded engrams: {body}"
+    );
+    assert!(
+        domains[0]["when_to_use"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b.as_str().unwrap().contains("Route here for eng")),
+        "the routing bullets come from the MANIFEST: {body}"
+    );
+}
+
+/// The tree endpoint is `browse_domain` behind a query string: the defaults
+/// list the root one level deep, `path` descends, `depth` widens and `glob`
+/// filters.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn domain_tree_walks_folders_and_filters_by_glob() {
+    let fixture = serve_anonymous().await;
+
+    let root: serde_json::Value = get(fixture.addr, "/api/v1/domains/eng/tree")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(root["domain"], "eng");
+    assert_eq!(root["path"], "/");
+    assert_eq!(root["folders"].as_array().unwrap(), &["notes"]);
+    let paths = engram_paths(&root);
+    assert!(paths.contains(&"alpha.md".to_string()), "{paths:?}");
+    assert!(paths.contains(&"MANIFEST.md".to_string()), "{paths:?}");
+    assert!(
+        !paths.contains(&"notes/beta.md".to_string()),
+        "one level deep by default: {paths:?}"
+    );
+
+    let notes: serde_json::Value = get(fixture.addr, "/api/v1/domains/eng/tree?path=notes&depth=2")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(notes["path"], "notes");
+    assert_eq!(notes["folders"].as_array().unwrap(), &["deep"]);
+    let paths = engram_paths(&notes);
+    assert!(paths.contains(&"notes/beta.md".to_string()), "{paths:?}");
+    assert!(
+        paths.contains(&"notes/deep/gamma.md".to_string()),
+        "depth 2 reaches the nested folder: {paths:?}"
+    );
+
+    let globbed: serde_json::Value = get(
+        fixture.addr,
+        "/api/v1/domains/eng/tree?depth=3&glob=notes/**",
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    let paths = engram_paths(&globbed);
+    assert_eq!(
+        paths,
+        vec![
+            "notes/beta.md".to_string(),
+            "notes/deep/gamma.md".to_string()
+        ],
+        "the glob filters the whole walk"
+    );
+}
+
+/// The manifest endpoint hands back the domain's MANIFEST markdown as written,
+/// so a client can render or edit the source rather than a reduction of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn domain_manifest_returns_the_markdown_source() {
+    let fixture = serve_anonymous().await;
+    let resp = get(fixture.addr, "/api/v1/domains/eng/manifest").await;
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["domain"], "eng");
+    let markdown = body["markdown"].as_str().expect("markdown is a string");
+    assert!(
+        markdown.starts_with("---\n"),
+        "the frontmatter is part of the source: {markdown}"
+    );
+    assert!(markdown.contains("## When to Use"), "{markdown}");
+    assert!(
+        markdown.contains("Route here for eng questions"),
+        "{markdown}"
+    );
+}
+
+/// A domain nobody registered is a 404 problem detail that names the domains
+/// that do exist, the same answer the engine's other verbs give.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unknown_domain_is_a_404_problem_detail() {
+    let fixture = serve_anonymous().await;
+    for path in [
+        "/api/v1/domains/ghost/tree",
+        "/api/v1/domains/ghost/manifest",
+    ] {
+        let resp = get(fixture.addr, path).await;
+        assert_eq!(resp.status(), 404, "{path} must be a 404");
+        assert_eq!(resp.headers()["content-type"], "application/problem+json");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["status"], 404);
+        assert_eq!(body["title"], "not found");
+        let detail = body["detail"].as_str().unwrap();
+        assert!(detail.contains("ghost"), "{detail}");
+        assert!(detail.contains("eng"), "the valid set is named: {detail}");
+    }
+}
+
+/// axum's own extractor rejections are rendered in the same problem+json
+/// contract as everything else, so a client never has to parse a plain-text
+/// body it was not expecting: a query parameter of the wrong type is a 400
+/// problem detail rather than `Failed to deserialize query string` in text.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_malformed_query_parameter_is_a_problem_detail() {
+    let fixture = serve_anonymous().await;
+    let resp = get(fixture.addr, "/api/v1/domains/eng/tree?depth=deep").await;
+    assert_eq!(resp.status(), 400);
+    assert_eq!(resp.headers()["content-type"], "application/problem+json");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["status"], 400);
+    assert_eq!(body["title"], "invalid request");
+    assert!(
+        body["detail"].as_str().unwrap().contains("query"),
+        "the detail says what was wrong: {body}"
+    );
+}
+
+/// A method a route does not serve is a 405 problem detail rather than axum's
+/// empty default, and it still carries the `Allow` header the HTTP spec asks
+/// for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_wrong_method_is_a_405_problem_detail() {
+    let fixture = serve_anonymous().await;
+    let resp = client()
+        .post(format!("http://{}/api/v1/domains", fixture.addr))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 405);
+    assert_eq!(resp.headers()["content-type"], "application/problem+json");
+    assert!(
+        resp.headers()
+            .get("allow")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.contains("GET")),
+        "a 405 names the methods that do work: {:?}",
+        resp.headers()
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["status"], 405);
+    assert_eq!(body["title"], "method not allowed");
+}
+
+/// The same contract on the way in: a login body axum cannot deserialize is a
+/// problem detail, whether it is unparseable, the wrong shape or sent without a
+/// JSON content type.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_malformed_request_body_is_a_problem_detail() {
+    let fixture = serve_with_ada(AuthOptions::default()).await;
+    let url = format!("http://{}/api/v1/auth/login", fixture.addr);
+    let cases = [
+        // Unparseable JSON.
+        (
+            client()
+                .post(&url)
+                .header("content-type", "application/json")
+                .body("{"),
+            400,
+        ),
+        // Parseable, but not the shape the handler takes.
+        (
+            client().post(&url).json(&serde_json::json!({"name": 7})),
+            422,
+        ),
+        // No JSON content type at all.
+        (client().post(&url).body("name=ada"), 415),
+    ];
+    for (request, expected) in cases {
+        let resp = request.send().await.unwrap();
+        assert_eq!(resp.status(), expected);
+        assert_eq!(resp.headers()["content-type"], "application/problem+json");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["status"], expected);
+        assert!(
+            !body["detail"].as_str().unwrap().is_empty(),
+            "the detail says what was wrong: {body}"
+        );
+    }
 }

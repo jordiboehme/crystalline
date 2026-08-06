@@ -5,6 +5,7 @@
 
 mod auth;
 mod auth_store;
+mod domains;
 mod error;
 
 use std::sync::Arc;
@@ -17,7 +18,7 @@ pub use auth::{
     AuthCfg, CSRF_HEADER, Caller, Identity, LOGIN_SLOTS, SESSION_COOKIE, SESSION_TTL_SECS,
 };
 pub use auth_store::*;
-pub use error::ApiError;
+pub use error::{ApiError, ApiJson, ApiPath, ApiQuery};
 
 use crate::engine::Engine;
 
@@ -62,13 +63,21 @@ impl RestState {
 /// [`auth::guard`] is layered over the whole thing, fallback included, so
 /// identity resolution, the CSRF check and the closed-by-default rule apply to
 /// every path under the mount - including the ones later tasks add, which are
-/// guarded the moment they are registered.
+/// guarded the moment they are registered. Every route therefore belongs
+/// *above* the `.layer` call: axum only wraps what was declared before it, so a
+/// route added below would serve unguarded.
 pub fn router(state: RestState) -> Router {
     Router::new()
         .route("/auth/login", post(auth::login))
         .route("/auth/logout", post(auth::logout))
         .route("/auth/me", get(auth::me))
+        .route("/domains", get(domains::list))
+        .route("/domains/{domain}/tree", get(domains::tree))
+        .route("/domains/{domain}/manifest", get(domains::manifest))
         .fallback(unknown_path)
+        // Applies to every method router registered above it, so it stays
+        // below the routes and above the guard.
+        .method_not_allowed_fallback(wrong_method)
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::guard,
@@ -80,4 +89,10 @@ pub fn router(state: RestState) -> Router {
 /// fall through to the MCP transport, which would reply in its own shape.
 async fn unknown_path() -> ApiError {
     ApiError::not_found("unknown API path")
+}
+
+/// Answer a known path asked for with a method it does not serve, in
+/// problem+json rather than axum's empty 405.
+async fn wrong_method() -> ApiError {
+    ApiError::method_not_allowed()
 }
