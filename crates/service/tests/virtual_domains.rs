@@ -974,3 +974,49 @@ async fn retag_rejects_a_non_canonical_name() {
         .await;
     assert!(matches!(bad, Err(EngineError::Invalid(_))));
 }
+
+// --- manifest source ---------------------------------------------------------
+
+/// `manifest_markdown` reads a virtual domain's MANIFEST out of the database,
+/// the way a file domain's is read off disk. Three answers matter to the caller
+/// serving it: the source once one exists, a `NotFound` while it does not, and
+/// an `UnknownDomain` naming the registered set for a domain nobody added.
+async fn virtual_manifest_markdown(store: Arc<Mutex<dyn Store>>) {
+    let engine = virtual_engine(store);
+
+    let missing = engine.manifest_markdown("notes").await;
+    assert!(
+        matches!(missing, Err(EngineError::NotFound(_))),
+        "a domain with no MANIFEST yet is a NotFound, got {missing:?}"
+    );
+
+    engine
+        .scaffold_virtual_manifest(
+            "notes",
+            "---\ntype: manifest\ntitle: Notes\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Notes\n\n## Scope\n\n- notes\n\n## When to Use\n\n- Route here for notes\n",
+        )
+        .await
+        .unwrap();
+
+    let markdown = engine.manifest_markdown("notes").await.unwrap();
+    assert!(
+        markdown.starts_with("---\n"),
+        "the frontmatter is part of the source: {markdown}"
+    );
+    assert!(markdown.contains("## When to Use"), "{markdown}");
+    assert!(markdown.contains("- Route here for notes"), "{markdown}");
+
+    let unknown = engine.manifest_markdown("ghost").await.unwrap_err();
+    assert!(
+        matches!(unknown, EngineError::UnknownDomain { .. }),
+        "got {unknown:?}"
+    );
+    assert!(
+        unknown.to_string().contains("notes"),
+        "the valid set is named: {unknown}"
+    );
+}
+both_backends!(
+    virtual_manifest_markdown_reads_the_database,
+    virtual_manifest_markdown
+);

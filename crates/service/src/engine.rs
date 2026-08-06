@@ -2606,6 +2606,47 @@ impl Engine {
         Ok(json!({ "domains": out }))
     }
 
+    /// One domain's MANIFEST markdown, read through the same source its routing
+    /// bullets are read through: a file domain's `MANIFEST.md` on disk, a
+    /// virtual domain's MANIFEST engram in the database.
+    ///
+    /// The source, not a reduction of it: a client that renders or edits a
+    /// manifest needs the frontmatter and every section, not the routing
+    /// bullets [`Engine::list_domains`] already extracts. An unregistered domain
+    /// errors with the registered set named, like every other verb; a domain
+    /// that carries no MANIFEST yet is a `NotFound`, since a manifest is what
+    /// routes an agent to a domain at all rather than an optional extra.
+    pub async fn manifest_markdown(&self, domain: &str) -> Result<String> {
+        match self.content_source(domain)? {
+            ContentSource::File { root } => {
+                let path = root.join("MANIFEST.md");
+                match std::fs::read_to_string(&path) {
+                    Ok(source) => Ok(source),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        Err(EngineError::NotFound(format!(
+                            "domain '{domain}' has no MANIFEST.md at {}",
+                            path.display()
+                        )))
+                    }
+                    Err(source) => Err(EngineError::Io {
+                        path: path.display().to_string(),
+                        source,
+                    }),
+                }
+            }
+            ContentSource::Virtual => {
+                let store = self.store.lock().await;
+                let content = match store.find_engram(domain, "manifest").await? {
+                    Some(d) => store.engram_content(d.domain_id, &d.path).await?,
+                    None => None,
+                };
+                content.ok_or_else(|| {
+                    EngineError::NotFound(format!("domain '{domain}' has no MANIFEST engram yet"))
+                })
+            }
+        }
+    }
+
     /// Routing bullets for one virtual domain, read from its `MANIFEST.md`
     /// engram in the database. Empty when there is no MANIFEST engram yet.
     async fn virtual_routing_bullets_for(&self, name: &str) -> Vec<String> {
