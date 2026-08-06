@@ -1,8 +1,18 @@
 //! The single error type every REST handler returns, rendered as an RFC 9457
 //! problem detail so a browser client can branch on `status` alone.
+//!
+//! axum's own extractors reject in plain text, which would put a second error
+//! shape on the wire for exactly the requests a client is most likely to get
+//! wrong. [`ApiQuery`], [`ApiPath`] and [`ApiJson`] wrap them so every
+//! rejection arrives as a problem detail too; the router pairs them with a
+//! method-not-allowed fallback (see [`ApiError::method_not_allowed`]) so the
+//! last plain-text answer axum can produce is covered as well.
 
+use axum::extract::{FromRequest, FromRequestParts, Request};
 use axum::http::StatusCode;
+use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};
+use serde::de::DeserializeOwned;
 
 use crate::engine::EngineError;
 
@@ -54,6 +64,106 @@ impl ApiError {
     /// A 500 for a failure that is not the caller's fault.
     pub fn internal(detail: impl Into<String>) -> ApiError {
         internal_error(detail.into())
+    }
+
+    /// A 405 for a path that exists but does not serve this method. Mounted as
+    /// the router's `method_not_allowed_fallback`, which is the one answer axum
+    /// would otherwise produce with an empty body; the `Allow` header axum adds
+    /// on the way out survives, so the response still names what does work.
+    pub fn method_not_allowed() -> ApiError {
+        ApiError {
+            status: StatusCode::METHOD_NOT_ALLOWED,
+            title: "method not allowed",
+            detail: "this path does not serve that method".to_string(),
+        }
+    }
+
+    /// Re-render an axum extractor rejection as a problem detail.
+    ///
+    /// The status axum chose is kept rather than folded into one of this
+    /// module's own: its rejections already distinguish unparseable from
+    /// well-formed-but-wrong (400 against 422) and a missing JSON content type
+    /// (415), and that classification is more specific than anything this layer
+    /// could recover after the fact. Only the rendering changes. The two
+    /// accessors each wrapper reads it with are inherent methods on unrelated
+    /// rejection types rather than one shared trait, so the call sites repeat
+    /// rather than routing through a seam that would only exist to hide three
+    /// identical lines.
+    fn from_rejection(status: StatusCode, detail: String) -> ApiError {
+        let title = match status {
+            StatusCode::METHOD_NOT_ALLOWED => "method not allowed",
+            StatusCode::UNSUPPORTED_MEDIA_TYPE => "unsupported media type",
+            StatusCode::PAYLOAD_TOO_LARGE => "payload too large",
+            s if s.is_server_error() => "internal error",
+            _ => "invalid request",
+        };
+        ApiError {
+            status,
+            title,
+            detail,
+        }
+    }
+}
+
+/// [`axum::extract::Query`] with this module's rejection contract: a query
+/// string that will not deserialize answers in problem+json instead of text.
+pub struct ApiQuery<T>(
+    /// The deserialized query parameters.
+    pub T,
+);
+
+impl<T: DeserializeOwned, S: Send + Sync> FromRequestParts<S> for ApiQuery<T> {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<ApiQuery<T>, ApiError> {
+        match axum::extract::Query::<T>::from_request_parts(parts, state).await {
+            Ok(axum::extract::Query(value)) => Ok(ApiQuery(value)),
+            Err(rejection) => Err(ApiError::from_rejection(
+                rejection.status(),
+                rejection.body_text(),
+            )),
+        }
+    }
+}
+
+/// [`axum::extract::Path`] with this module's rejection contract.
+pub struct ApiPath<T>(
+    /// The deserialized path parameters.
+    pub T,
+);
+
+impl<T: DeserializeOwned + Send, S: Send + Sync> FromRequestParts<S> for ApiPath<T> {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<ApiPath<T>, ApiError> {
+        match axum::extract::Path::<T>::from_request_parts(parts, state).await {
+            Ok(axum::extract::Path(value)) => Ok(ApiPath(value)),
+            Err(rejection) => Err(ApiError::from_rejection(
+                rejection.status(),
+                rejection.body_text(),
+            )),
+        }
+    }
+}
+
+/// [`axum::Json`] with this module's rejection contract, for request bodies. A
+/// response still uses `axum::Json`, which never rejects.
+pub struct ApiJson<T>(
+    /// The deserialized body.
+    pub T,
+);
+
+impl<T: DeserializeOwned, S: Send + Sync> FromRequest<S> for ApiJson<T> {
+    type Rejection = ApiError;
+
+    async fn from_request(req: Request, state: &S) -> Result<ApiJson<T>, ApiError> {
+        match axum::Json::<T>::from_request(req, state).await {
+            Ok(axum::Json(value)) => Ok(ApiJson(value)),
+            Err(rejection) => Err(ApiError::from_rejection(
+                rejection.status(),
+                rejection.body_text(),
+            )),
+        }
     }
 }
 
@@ -181,6 +291,31 @@ mod tests {
             ApiError::from(EngineError::Internal("store blew up".into())).status,
             StatusCode::INTERNAL_SERVER_ERROR
         );
+    }
+
+    /// An axum rejection keeps the status axum chose and gains a title from
+    /// this module's stable set, so a client can branch on either.
+    #[test]
+    fn a_rejection_keeps_its_status_and_gains_a_title() {
+        let title = |status| ApiError::from_rejection(status, "why".to_string()).title;
+        assert_eq!(title(StatusCode::BAD_REQUEST), "invalid request");
+        assert_eq!(title(StatusCode::UNPROCESSABLE_ENTITY), "invalid request");
+        assert_eq!(
+            title(StatusCode::UNSUPPORTED_MEDIA_TYPE),
+            "unsupported media type"
+        );
+        assert_eq!(title(StatusCode::PAYLOAD_TOO_LARGE), "payload too large");
+        assert_eq!(
+            title(StatusCode::METHOD_NOT_ALLOWED),
+            "method not allowed",
+            "the same title the router's own 405 carries"
+        );
+        assert_eq!(title(StatusCode::INTERNAL_SERVER_ERROR), "internal error");
+
+        let rendered = ApiError::from_rejection(StatusCode::BAD_REQUEST, "why".to_string());
+        assert_eq!(rendered.status, StatusCode::BAD_REQUEST);
+        assert_eq!(rendered.detail, "why", "axum's own message is kept");
+        assert_eq!(ApiError::method_not_allowed().title, "method not allowed");
     }
 
     #[test]

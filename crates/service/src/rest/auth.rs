@@ -39,7 +39,7 @@ use serde_json::Value;
 use tokio::sync::Semaphore;
 
 use super::auth_store::{AuthStore, PasswordCheck, Role, User, dummy_verify};
-use super::{ApiError, RestState};
+use super::{ApiError, ApiJson, RestState};
 
 /// The session cookie. Named for the UI it serves so it never collides with a
 /// cookie another app sets on a shared host.
@@ -333,11 +333,16 @@ pub struct LoginBody {
 
 /// Exchange credentials for a session: sets [`SESSION_COOKIE`] and returns the
 /// account plus the CSRF token every later mutating request must echo.
+///
+/// The body comes in through [`ApiJson`] rather than `axum::Json` so a
+/// malformed one is refused in problem+json like every other failure here: this
+/// is the first request a client ever sends, and the worst moment to hand it an
+/// error shape it has no parser for.
 pub async fn login(
     State(state): State<RestState>,
     jar: CookieJar,
     headers: HeaderMap,
-    axum::Json(body): axum::Json<LoginBody>,
+    ApiJson(body): ApiJson<LoginBody>,
 ) -> Result<(CookieJar, axum::Json<Value>), ApiError> {
     let Some(user) =
         authenticate(&state.auth, &state.login_slots, &body.name, &body.password).await?
