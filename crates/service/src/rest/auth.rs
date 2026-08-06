@@ -382,6 +382,27 @@ pub struct LogoutResponse {
 pub struct MeResponse {
     /// The account behind this request, or null when there is none.
     user: Option<User>,
+    /// The CSRF token of the session this request arrived on, or null when it
+    /// arrived on no session.
+    ///
+    /// Reissued here, not only by login, because the session cookie is
+    /// `HttpOnly` and the token is not stored anywhere a reload survives: a
+    /// browser that refreshes holds a live session whose token it can no longer
+    /// produce, and would be unable to log out or to write until it logged in
+    /// again. This probe is what a client opens on, so it is where the token
+    /// belongs.
+    ///
+    /// Null for the anonymous viewer, which has no session, and null for a
+    /// trusted-header identity, which has none either: what protects those
+    /// requests is the shape they are allowed to have, not a token. See the
+    /// `check_csrf` invariant.
+    ///
+    /// Handing the token back on a `GET` is safe for the same reason handing it
+    /// back from login is: no CORS layer exists on this surface, so another
+    /// origin can send the request but cannot read the answer. **That is load
+    /// bearing - a CORS layer must not be added without revisiting this.**
+    #[schema(example = "9f2c1d7e4b6a8035")]
+    csrf: Option<String>,
     /// Whether the request is being served as the anonymous viewer.
     anonymous: bool,
     /// Whether this instance refuses content mutations.
@@ -432,6 +453,12 @@ pub struct MeResponse {
             description = "The name or password is wrong. One message for every \
                            way this can fail, so nothing is learned about which \
                            accounts exist.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "The trusted-header identity names a disabled account.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -569,7 +596,9 @@ pub(super) async fn with_login_slot<F: Future>(
         ),
         (
             status = 403,
-            description = "A cookie session did not echo its CSRF token.",
+            description = "A cookie session did not echo its CSRF token, or \
+                           the trusted-header identity names a disabled \
+                           account.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -596,22 +625,37 @@ pub async fn logout(
 /// Answers without an identity on purpose. `user: null, anonymous: false` is
 /// what tells a browser to show a login form; `anonymous: true` tells it to
 /// browse instead.
+///
+/// It also reissues the session's CSRF token, which is the only way a reloaded
+/// browser gets it back: see `MeResponse::csrf`.
 #[utoipa::path(
     get,
     path = "/api/v1/auth/me",
     tag = "auth",
     operation_id = "get_me",
-    responses((
-        status = 200,
-        description = "Who the caller is and what this instance allows. Answered \
-                       without an identity too, which is how a client learns it \
-                       has to log in.",
-        body = MeResponse,
-    )),
+    responses(
+        (
+            status = 200,
+            description = "Who the caller is and what this instance allows. \
+                           Answered without an identity too, which is how a \
+                           client learns it has to log in.",
+            body = MeResponse,
+        ),
+        (
+            status = 403,
+            description = "The trusted-header identity names a disabled account. \
+                           The guard resolves identity ahead of routing, so this \
+                           answer reaches even the paths that are served without \
+                           one.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
 )]
 pub async fn me(State(state): State<RestState>, identity: Identity) -> axum::Json<MeResponse> {
     axum::Json(MeResponse {
         user: identity.user,
+        csrf: identity.csrf,
         anonymous: identity.anonymous,
         read_only: state.engine.read_only(),
         version: crystalline_core::VERSION,

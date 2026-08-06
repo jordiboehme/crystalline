@@ -420,6 +420,61 @@ async fn me_reports_anonymous_access_when_it_is_enabled() {
         .unwrap();
     assert!(body["user"].is_null());
     assert_eq!(body["anonymous"], true);
+    assert!(
+        body["csrf"].is_null(),
+        "the anonymous viewer has no session and so no token: {body}"
+    );
+}
+
+/// The probe reissues the session's CSRF token, and it is the same one login
+/// minted.
+///
+/// This is what makes a reload survivable. The session cookie is `HttpOnly`, so
+/// a refreshed page still holds a live session but has lost the token login
+/// handed it in a response body; without this it could neither log out nor
+/// write, and its only way back would be logging in again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn me_reissues_the_sessions_csrf_token() {
+    let fixture = serve_with_ada(AuthOptions::default()).await;
+    let (token, csrf) = login(fixture.addr, "ada", "s3cret").await;
+    let body: serde_json::Value = client()
+        .get(format!("http://{}/api/v1/auth/me", fixture.addr))
+        .header("cookie", format!("fluid_session={token}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["user"]["name"], "ada");
+    assert_eq!(
+        body["csrf"], csrf,
+        "the probe hands back the token login minted: {body}"
+    );
+
+    // And the reissued token is usable, which is the whole point: a browser
+    // that only ever saw this response can still send a mutating request.
+    let resp = client()
+        .post(format!("http://{}/api/v1/auth/logout", fixture.addr))
+        .header("cookie", format!("fluid_session={token}"))
+        .header("x-csrf-token", body["csrf"].as_str().unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "the reissued token passes the CSRF check"
+    );
+}
+
+/// A request carrying no session gets no token, so a client cannot mistake an
+/// unauthenticated probe for a usable one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn me_carries_no_csrf_token_without_a_session() {
+    let (addr, _guard) = serve_test_router_with_fixture().await;
+    let body: serde_json::Value = get(addr, "/api/v1/auth/me").await.json().await.unwrap();
+    assert!(body["csrf"].is_null(), "{body}");
 }
 
 /// An unknown path under the mount answers in problem+json rather than falling
@@ -559,6 +614,12 @@ async fn data_routes_401_without_identity_when_not_anonymous() {
         // `crates/service/openapi/fluid-v1.json` instead, so nothing needs it
         // open.
         "/api/v1/openapi.json",
+        // A path nothing mounts, which must answer 401 rather than 404. The
+        // published document claims an unauthenticated caller never learns
+        // which paths exist, and that claim rests on the fallback being
+        // registered above the guard layer: without this line, moving it below
+        // would start mapping the API out for anybody and no test would say so.
+        "/api/v1/nope",
         "/api/v1/domains",
         "/api/v1/domains/eng/tree",
         "/api/v1/domains/eng/manifest",
@@ -653,6 +714,12 @@ async fn trusted_header_maps_identity() {
     assert_eq!(me["user"]["name"], "bob", "the name is folded by the store");
     assert_eq!(me["user"]["display"], "Bob");
     assert_eq!(me["user"]["role"], "viewer");
+    assert!(
+        me["csrf"].is_null(),
+        "a trusted-header identity carries no session and so no token; what \
+         keeps its mutating requests off another origin is the shape they are \
+         allowed to have. See `check_csrf`. Body: {me}"
+    );
 
     let users = fixture.auth.list_users().await.unwrap();
     assert_eq!(users.len(), 1, "the account was provisioned once");

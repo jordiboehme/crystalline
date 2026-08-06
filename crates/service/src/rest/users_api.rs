@@ -86,7 +86,8 @@ pub struct UserResponse {
         ),
         (
             status = 403,
-            description = "The caller is not an admin.",
+            description = "The caller is not an admin, or the trusted-header \
+                           identity names a disabled account.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -160,8 +161,9 @@ pub struct CreateBody {
         ),
         (
             status = 403,
-            description = "The caller is not an admin, or a cookie session did \
-                           not echo its CSRF token.",
+            description = "The caller is not an admin, a cookie session did \
+                           not echo its CSRF token, or the trusted-header \
+                           identity names a disabled account.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -303,8 +305,9 @@ impl std::fmt::Debug for PatchBody {
         ),
         (
             status = 403,
-            description = "The caller is not an admin, or a cookie session did \
-                           not echo its CSRF token.",
+            description = "The caller is not an admin, a cookie session did \
+                           not echo its CSRF token, or the trusted-header \
+                           identity names a disabled account.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -399,8 +402,9 @@ pub async fn update(
         ),
         (
             status = 403,
-            description = "The caller is not an admin, or a cookie session did \
-                           not echo its CSRF token.",
+            description = "The caller is not an admin, a cookie session did \
+                           not echo its CSRF token, or the trusted-header \
+                           identity names a disabled account.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),

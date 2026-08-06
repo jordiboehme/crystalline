@@ -55,6 +55,12 @@ use crate::params::{BrowseParams, ListDomainsParams};
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
+        (
+            status = 403,
+            description = "The trusted-header identity names a disabled account.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
     ),
 )]
 pub async fn list(State(state): State<RestState>) -> Result<Json<Value>, ApiError> {
@@ -124,6 +130,12 @@ pub struct TreeQuery {
             content_type = "application/problem+json",
         ),
         (
+            status = 403,
+            description = "The trusted-header identity names a disabled account.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
             status = 404,
             description = "No such domain.",
             body = ProblemDetail,
@@ -176,6 +188,12 @@ pub async fn tree(
         (
             status = 401,
             description = "No identity.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "The trusted-header identity names a disabled account.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),

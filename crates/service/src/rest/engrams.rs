@@ -121,6 +121,12 @@ pub struct ListQuery {
             content_type = "application/problem+json",
         ),
         (
+            status = 403,
+            description = "The trusted-header identity names a disabled account.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
             status = 404,
             description = "No such domain.",
             body = ProblemDetail,
@@ -210,6 +216,12 @@ pub async fn list(
         (
             status = 401,
             description = "No identity.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "The trusted-header identity names a disabled account.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),

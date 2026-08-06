@@ -242,6 +242,12 @@ pub fn router(state: RestState) -> Router {
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
+        (
+            status = 403,
+            description = "The trusted-header identity names a disabled account.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
     ),
 )]
 async fn openapi_json() -> axum::Json<utoipa::openapi::OpenApi> {

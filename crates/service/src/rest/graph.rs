@@ -112,6 +112,12 @@ const DEFAULT_MAX_NODES: usize = 100;
             content_type = "application/problem+json",
         ),
         (
+            status = 403,
+            description = "The trusted-header identity names a disabled account.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
             status = 404,
             description = "The anchor names no engram.",
             body = ProblemDetail,

@@ -134,6 +134,12 @@ pub struct SearchQuery {
             content_type = "application/problem+json",
         ),
         (
+            status = 403,
+            description = "The trusted-header identity names a disabled account.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
             status = 422,
             description = "`search_type` names a mode the engine does not know.",
             body = ProblemDetail,
@@ -212,6 +218,12 @@ pub struct VocabularyQuery {
         (
             status = 401,
             description = "No identity.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "The trusted-header identity names a disabled account.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -319,6 +331,12 @@ pub struct ContextQuery {
             content_type = "application/problem+json",
         ),
         (
+            status = 403,
+            description = "The trusted-header identity names a disabled account.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
             status = 404,
             description = "The anchor names no engram.",
             body = ProblemDetail,
@@ -408,6 +426,12 @@ pub struct ActivityQuery {
         (
             status = 401,
             description = "No identity.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "The trusted-header identity names a disabled account.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
