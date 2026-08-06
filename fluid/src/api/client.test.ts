@@ -137,6 +137,58 @@ describe("api", () => {
       api("/users/ada", { method: "DELETE" }),
     ).resolves.toBeUndefined();
   });
+
+  it("parses a 200 that really is JSON", async () => {
+    stubFetch(jsonResponse({ domains: ["eng"] }));
+
+    await expect(api("/domains")).resolves.toEqual({ domains: ["eng"] });
+  });
+
+  it("refuses a 200 whose body is not JSON", async () => {
+    // A captive portal or a misconfigured proxy answering with its own sign-in
+    // page. It is a failed request wearing a success status, and resolving it
+    // as undefined would move the failure to whatever reads the missing field.
+    stubFetch(
+      new Response("<html>sign in</html>", {
+        status: 200,
+        headers: { "content-type": "text/html; charset=utf-8" },
+      }),
+    );
+
+    const failure = await api("/domains").catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(ApiProblem);
+    const problem = failure as ApiProblem;
+    expect(problem.status).toBe(200);
+    expect(problem.title).toBe("unexpected response");
+    expect(problem.detail).toContain("text/html");
+  });
+
+  it("refuses a 200 that announces JSON but is not", async () => {
+    stubFetch(
+      new Response("<html>sign in</html>", {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+
+    const failure = await api("/domains").catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(ApiProblem);
+    expect((failure as ApiProblem).title).toBe("unexpected response");
+    expect((failure as ApiProblem).detail).toContain("not valid JSON");
+  });
+
+  it("keeps a bodyless 200 as undefined rather than a failure", async () => {
+    stubFetch(
+      new Response("", {
+        status: 200,
+        headers: { "content-type": "text/html" },
+      }),
+    );
+
+    await expect(api("/domains")).resolves.toBeUndefined();
+  });
 });
 
 describe("csrf", () => {
@@ -190,6 +242,18 @@ describe("path building", () => {
       "notes/deep%20dive/gamma",
     );
     expect(encodePermalink("notes/a?b/c#d")).toBe("notes/a%3Fb/c%23d");
+  });
+
+  it("escapes a literal percent so it cannot read as an escape", () => {
+    // encodeURIComponent escapes the "%" itself, so a second pass over an
+    // already encoded permalink is the failure mode, not this one.
+    expect(encodePermalink("notes/100%/gamma")).toBe("notes/100%25/gamma");
+    expect(encodePermalink("notes/%2Fnot-a-slash")).toBe(
+      "notes/%252Fnot-a-slash",
+    );
+    expect(engramPath("eng", "notes/100%/gamma")).toBe(
+      "/domains/eng/engrams/notes/100%25/gamma",
+    );
   });
 
   it("builds an engram path a nested permalink survives", () => {

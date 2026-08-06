@@ -103,8 +103,9 @@ export function engramPath(domain: string, permalink: string): string {
  * {@link encodeSegment} and {@link engramPath}).
  *
  * Resolves with the parsed JSON body, or `undefined` when the response carries
- * none. Rejects with an {@link ApiProblem} for every failure, including one the
- * network never delivered.
+ * none. Rejects with an {@link ApiProblem} for every failure: one the server
+ * described in problem+json, one the network never delivered, and one wearing a
+ * success status while carrying a body this client cannot read.
  */
 export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   const method = (init.method ?? "GET").toUpperCase();
@@ -140,7 +141,11 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   if (!response.ok) {
     throw await problemFrom(response);
   }
-  return (await readBody(response)) as T;
+  const body = await readBody(response);
+  if (body.kind === "foreign") {
+    throw foreignBodyProblem(response, body);
+  }
+  return (body.kind === "json" ? body.value : undefined) as T;
 }
 
 /**
@@ -148,13 +153,19 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
  *
  * The transport status wins over the one mirrored in the body: they agree by
  * contract, and when they cannot (a proxy answered, so there is no body at all)
- * the transport is the one telling the truth.
+ * the transport is the one telling the truth. A failure whose body is not the
+ * problem detail it should be still becomes an `ApiProblem` on its status
+ * alone: the request failed either way, and that is the fact the caller needs.
  */
 async function problemFrom(response: Response): Promise<ApiProblem> {
   const fallbackTitle = response.statusText || "request failed";
-  const body = await readBody(response).catch(() => undefined);
-  if (body !== undefined && body !== null && typeof body === "object") {
-    const problem = body as Partial<Record<"title" | "detail", unknown>>;
+  const body = await readBody(response);
+  if (
+    body.kind === "json" &&
+    body.value !== null &&
+    typeof body.value === "object"
+  ) {
+    const problem = body.value as Partial<Record<"title" | "detail", unknown>>;
     const title =
       typeof problem.title === "string" && problem.title !== ""
         ? problem.title
@@ -169,21 +180,57 @@ async function problemFrom(response: Response): Promise<ApiProblem> {
 }
 
 /**
- * The response body as JSON, or `undefined` when there is none to read: a 204,
- * or anything that did not announce itself as JSON (a proxy's HTML error page,
- * say, which tells a client nothing it can use).
+ * What a response body turned out to be. Three outcomes rather than two,
+ * because "there was nothing to read" and "there was something and it was not
+ * JSON" are different facts and the caller answers them differently.
  */
-async function readBody(response: Response): Promise<unknown> {
+type Body =
+  /** A 204, or a response that carried no bytes. */
+  | { kind: "empty" }
+  /** A JSON body, parsed. */
+  | { kind: "json"; value: unknown }
+  /** Bytes this client cannot use, with the content type that announced them. */
+  | { kind: "foreign"; contentType: string; announcedJson: boolean };
+
+/** Read the body once and classify it. Never throws. */
+async function readBody(response: Response): Promise<Body> {
   if (response.status === 204) {
-    return undefined;
+    return { kind: "empty" };
   }
   const contentType = response.headers.get("content-type") ?? "";
-  if (!contentType.includes("json")) {
-    return undefined;
-  }
-  const text = await response.text();
+  const text = await response.text().catch(() => "");
   if (text === "") {
-    return undefined;
+    return { kind: "empty" };
   }
-  return JSON.parse(text) as unknown;
+  if (!contentType.includes("json")) {
+    return { kind: "foreign", contentType, announcedJson: false };
+  }
+  try {
+    return { kind: "json", value: JSON.parse(text) as unknown };
+  } catch {
+    return { kind: "foreign", contentType, announcedJson: true };
+  }
+}
+
+/**
+ * The failure for a 2xx response whose body this client cannot read.
+ *
+ * A captive portal, a misconfigured proxy or an HTML sign-in page answered
+ * with 200 all look like success to `fetch`. Handing the caller `undefined`
+ * for one would push the failure into whatever touches the missing field
+ * next, as a `TypeError` naming nothing useful. It is a failed request, so it
+ * leaves here as one.
+ */
+function foreignBodyProblem(
+  response: Response,
+  body: Extract<Body, { kind: "foreign" }>,
+): ApiProblem {
+  const named =
+    body.contentType === ""
+      ? "no content type"
+      : `content type "${body.contentType}"`;
+  const detail = body.announcedJson
+    ? `the server answered ${named} but the body is not valid JSON`
+    : `expected a JSON body, but the server answered ${named}: something other than Crystalline may have answered this request`;
+  return new ApiProblem(response.status, "unexpected response", detail);
 }

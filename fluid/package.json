@@ -10,6 +10,7 @@
     "typecheck": "tsc -b",
     "lint": "eslint .",
     "format": "prettier --write .",
+    "format:check": "prettier --check .",
     "test": "vitest run",
     "generate:api": "openapi-typescript ../crates/service/openapi/fluid-v1.json -o src/api/types.ts"
   },
