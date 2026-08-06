@@ -8,13 +8,15 @@
  * `graphElements.ts`, and how it looks in `graphStyle.ts`, which is what leaves
  * this file with nothing a canvas-less test environment could see.
  *
- * The instance is rebuilt when the elements or the theme change and destroyed
- * on the way out: the library holds a canvas, a renderer and its own event
- * listeners, none of which React knows how to reclaim.
+ * The instance is rebuilt when the elements change and destroyed on the way
+ * out: the library holds a canvas, a renderer and its own event listeners, none
+ * of which React knows how to reclaim. A change of theme is not a rebuild - the
+ * stylesheet is swapped on the instance that is already there, so switching to
+ * dark repaints the picture instead of laying it out again under the reader.
  */
 
 import cytoscape from "cytoscape";
-import type { EventObjectNode } from "cytoscape";
+import type { Core, EventObjectNode } from "cytoscape";
 import { useEffect, useRef } from "react";
 
 import type { GraphElement, GraphNodeData } from "../graphElements";
@@ -31,9 +33,13 @@ export interface GraphCanvasProps {
 export default function GraphCanvas({ elements, onSelect }: GraphCanvasProps) {
   const container = useRef<HTMLDivElement>(null);
   const { resolved } = useTheme();
-  // Held in a ref so a caller that hands over a fresh callback does not cost a
-  // rebuilt graph, and with it the layout the reader was looking at.
+  const dark = resolved === "dark";
+  // Held in refs so neither a caller handing over a fresh callback nor a change
+  // of theme costs a rebuilt graph, and with it the layout the reader was
+  // looking at.
   const select = useRef(onSelect);
+  const instance = useRef<Core | null>(null);
+  const isDark = useRef(dark);
   useEffect(() => {
     select.current = onSelect;
   }, [onSelect]);
@@ -46,7 +52,7 @@ export default function GraphCanvas({ elements, onSelect }: GraphCanvasProps) {
     const cy = cytoscape({
       container: element,
       elements,
-      style: graphStylesheet(resolved === "dark"),
+      style: graphStylesheet(isDark.current),
       layout: GRAPH_LAYOUT,
       // A neighborhood is for following, not for editing: dragging a box
       // around several nodes selects things nothing here acts on.
@@ -57,10 +63,19 @@ export default function GraphCanvas({ elements, onSelect }: GraphCanvasProps) {
       const data = event.target.data() as GraphNodeData;
       select.current(data.domain, data.permalink);
     });
+    instance.current = cy;
     return () => {
+      instance.current = null;
       cy.destroy();
     };
-  }, [elements, resolved]);
+  }, [elements]);
+
+  // A repaint rather than a rebuild: the elements and their positions are what
+  // they were, and only the palette moved.
+  useEffect(() => {
+    isDark.current = dark;
+    instance.current?.style(graphStylesheet(dark));
+  }, [dark]);
 
   // The picture is decoration to anything that cannot see it: the same
   // neighborhood is listed as links beside it, which is what a screen reader

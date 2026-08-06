@@ -20,7 +20,7 @@
 
 import type { ElementDefinition } from "cytoscape";
 
-import type { GraphNeighborhood } from "./api/graph";
+import type { GraphNeighborhood, GraphNode } from "./api/graph";
 import { isRetired } from "./lifecycle";
 
 /** The class a retired engram carries, which the stylesheet fades. */
@@ -78,7 +78,56 @@ export function isEdgeElement(
 }
 
 /**
- * The elements for one payload: a node per engram, an edge per relation.
+ * One arrow with both of its ends read out: what the picture draws, said as a
+ * sentence. It is what the screen offers anything that cannot see a canvas, so
+ * it carries the whole node at each end - the address a link needs, and the
+ * status that fades a retired one - rather than only a name.
+ */
+export interface GraphConnection {
+  /** The same id the drawn arrow has, so the two forms line up exactly. */
+  id: string;
+  from: GraphNode;
+  to: GraphNode;
+  /** The relation as it was declared, or null when the payload named none. */
+  relType: string | null;
+}
+
+/**
+ * The arrows of one payload, with their ends resolved.
+ *
+ * The filtering is the picture's filtering, because {@link graphElements} draws
+ * from this: an arrow with an end nothing named is dropped, and one pair with
+ * one relation is one arrow however often the payload repeats it.
+ */
+export function graphConnections(graph: GraphNeighborhood): GraphConnection[] {
+  const byId = new Map<number, GraphNode>();
+  for (const node of graph.nodes) {
+    if (!byId.has(node.id)) {
+      byId.set(node.id, node);
+    }
+  }
+
+  const seen = new Set<string>();
+  const connections: GraphConnection[] = [];
+  for (const edge of graph.edges) {
+    const from = byId.get(edge.from);
+    const to = byId.get(edge.to);
+    // An arrow into an engram nobody named points at nothing.
+    if (!from || !to) {
+      continue;
+    }
+    const id = `edge-${String(edge.from)}-${String(edge.to)}-${edge.relType ?? ""}`;
+    if (seen.has(id)) {
+      continue;
+    }
+    seen.add(id);
+    connections.push({ id, from, to, relType: edge.relType });
+  }
+  return connections;
+}
+
+/**
+ * The elements for one payload: a node per engram, an edge per connection.
  *
  * Ids are the payload's own with the kind in front of them, because nodes and
  * edges share one id namespace in the renderer, and the payload's ids are only
@@ -115,22 +164,18 @@ export function graphElements(
     });
   }
 
-  for (const edge of graph.edges) {
-    const source = nodeId(edge.from);
-    const target = nodeId(edge.to);
-    // An arrow into an engram nobody drew points at nothing.
-    if (!drawn.has(source) || !drawn.has(target)) {
-      continue;
-    }
-    // Written as it was declared, and left blank rather than named something
-    // the payload never said.
-    const label = edge.relType ?? "";
-    const id = `edge-${String(edge.from)}-${String(edge.to)}-${label}`;
-    if (drawn.has(id)) {
-      continue;
-    }
-    drawn.add(id);
-    elements.push({ data: { id, label, source, target }, classes: [] });
+  for (const connection of graphConnections(graph)) {
+    elements.push({
+      data: {
+        id: connection.id,
+        // Written as it was declared, and left blank rather than labelled
+        // something the payload never said.
+        label: connection.relType ?? "",
+        source: nodeId(connection.from.id),
+        target: nodeId(connection.to.id),
+      },
+      classes: [],
+    });
   }
 
   return elements;

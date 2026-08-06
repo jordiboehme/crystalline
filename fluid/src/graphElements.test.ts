@@ -16,6 +16,7 @@ import type { GraphElement, GraphNodeElement } from "./graphElements";
 import {
   ANCHOR_CLASS,
   FADED_CLASS,
+  graphConnections,
   graphElements,
   isEdgeElement,
 } from "./graphElements";
@@ -168,5 +169,71 @@ describe("the graph elements", () => {
     expect(
       graphElements({ nodes: [], edges: [], truncated: false }, ANCHOR),
     ).toEqual([]);
+  });
+});
+
+/**
+ * The same neighborhood as sentences, which is what anything that cannot see a
+ * canvas is given. It has to carry what the picture carries - both ends of each
+ * arrow and the relation it is - or the reader is handed a bag of names.
+ */
+describe("the graph connections", () => {
+  it("names both ends of each arrow and the relation it is", () => {
+    const connections = graphConnections(neighborhood());
+
+    expect(
+      connections.map((one) => [one.from.title, one.relType, one.to.title]),
+    ).toEqual([
+      ["Alpha", "supersedes", "Beta"],
+      ["Gamma", "links_to", "Alpha"],
+    ]);
+  });
+
+  it("carries each end whole, status and address included", () => {
+    const [first] = graphConnections(neighborhood());
+
+    // The status is what fades a retired end, and the address is what the
+    // link points at: both come from the node rather than from the edge.
+    expect(first.to).toMatchObject({
+      domain: "eng",
+      permalink: "notes/beta",
+      status: "deprecated",
+    });
+  });
+
+  it("keeps an arrow between two engrams that are not the anchor", () => {
+    // Which is the whole of what a second hop adds: at depth two the payload
+    // carries edges neither end of which is the engram being read.
+    const connections = graphConnections(
+      neighborhood({ edges: [{ from: 2, to: 3, rel_type: "relates_to" }] }),
+    );
+
+    expect(connections).toHaveLength(1);
+    expect(connections[0].from.title).toBe("Beta");
+    expect(connections[0].to.title).toBe("Gamma");
+  });
+
+  it("agrees with the picture about which arrows there are", () => {
+    // Same filtering, same dedupe, same ids: the text and the drawing are one
+    // answer in two forms rather than two answers.
+    const graph = neighborhood({
+      edges: [
+        { from: 1, to: 2, rel_type: "supersedes" },
+        { from: 1, to: 2, rel_type: "supersedes" },
+        { from: 1, to: 99, rel_type: "links_to" },
+      ],
+    });
+
+    expect(graphConnections(graph).map((one) => one.id)).toEqual(
+      edges(graphElements(graph, ANCHOR)).map((edge) => edge.data.id),
+    );
+  });
+
+  it("says nothing about a relation the payload did not name", () => {
+    const connections = graphConnections(
+      neighborhood({ edges: [{ from: 1, to: 2 }] }),
+    );
+
+    expect(connections[0].relType).toBeNull();
   });
 });

@@ -74,4 +74,24 @@ describe("the graph stylesheet", () => {
     cy.destroy();
     warn.mockRestore();
   });
+
+  it("repaints an instance that is already drawn, without moving it", () => {
+    // What lets a change of theme swap the stylesheet on the graph the reader
+    // is looking at instead of building a new one and laying it out again.
+    const cy = cytoscape({
+      headless: true,
+      styleEnabled: true,
+      elements: elements(),
+      style: graphStylesheet(false),
+      layout: GRAPH_LAYOUT,
+    });
+    const light = String(cy.edges().style("line-color"));
+    const where = { ...cy.nodes().first().position() };
+
+    cy.style(graphStylesheet(true));
+
+    expect(String(cy.edges().style("line-color"))).not.toBe(light);
+    expect(cy.nodes().first().position()).toEqual(where);
+    cy.destroy();
+  });
 });

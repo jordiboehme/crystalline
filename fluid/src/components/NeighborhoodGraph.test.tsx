@@ -19,6 +19,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiProblem, api } from "../api/client";
 import type { GraphElement, GraphNodeData } from "../graphElements";
 import { isEdgeElement } from "../graphElements";
+import { RETIRED_CLASS } from "../lifecycle";
 import { NeighborhoodGraph } from "./NeighborhoodGraph";
 
 vi.mock("../api/client", async (importOriginal) => {
@@ -150,15 +151,106 @@ describe("the neighborhood graph", () => {
     });
   });
 
-  it("lists the engrams as links, so the picture is not the only way in", async () => {
+  it("says in text what the picture says, arrows and all", async () => {
+    mount();
+
+    // Not a bag of names: both ends of the arrow and the relation it is, so a
+    // reader who cannot see the canvas learns the same thing from the list.
+    const list = await screen.findByRole("list", {
+      name: /connections in this neighborhood/i,
+    });
+    const [connection] = within(list).getAllByRole("listitem");
+    expect(connection).toHaveTextContent("links_to");
+    expect(
+      within(connection).getByRole("link", { name: /Beta/ }),
+    ).toHaveAttribute("href", "/d/eng/e/notes/beta");
+    expect(
+      within(connection).getByRole("link", { name: /Alpha/ }),
+    ).toHaveAttribute("href", "/d/eng/e/alpha");
+  });
+
+  it("fades a retired end of a connection, and never leaves it out", async () => {
     mount();
 
     const list = await screen.findByRole("list", {
-      name: /engrams in this neighborhood/i,
+      name: /connections in this neighborhood/i,
     });
-    expect(within(list).getByRole("link", { name: /Beta/ })).toHaveAttribute(
+    // Beta is deprecated: it is named, linked, and faded like every other
+    // retired thing in this app. Faded per end rather than per line, because
+    // the other end of this arrow is live.
+    expect(within(list).getByRole("link", { name: /Beta/ })).toHaveClass(
+      RETIRED_CLASS,
+    );
+    expect(within(list).getByRole("link", { name: /Alpha/ })).not.toHaveClass(
+      RETIRED_CLASS,
+    );
+  });
+
+  it("names a connection between two engrams that are not the anchor", async () => {
+    // What a second hop is for: an arrow neither end of which is the engram
+    // the neighborhood was drawn around.
+    apiMock.mockImplementation(() =>
+      Promise.resolve(
+        graphResponse({
+          nodes: [
+            ...graphResponse().nodes,
+            {
+              id: 3,
+              domain: "ops",
+              permalink: "gamma",
+              title: "Gamma",
+              status: "stable",
+              type: "runbook",
+            },
+          ],
+          edges: [
+            { from: 2, to: 1, rel_type: "links_to" },
+            { from: 3, to: 2, rel_type: "supersedes" },
+          ],
+        }),
+      ),
+    );
+
+    mount(2);
+
+    const list = await screen.findByRole("list", {
+      name: /connections in this neighborhood/i,
+    });
+    const outer = within(list)
+      .getAllByRole("listitem")
+      .find((item) => item.textContent?.includes("supersedes"));
+    expect(outer).toBeDefined();
+    expect(outer).toHaveTextContent("Gamma");
+    expect(outer).toHaveTextContent("Beta");
+  });
+
+  it("names an engram no surviving arrow mentions rather than dropping it", async () => {
+    apiMock.mockImplementation(() =>
+      Promise.resolve(
+        graphResponse({
+          nodes: [
+            ...graphResponse().nodes,
+            {
+              id: 3,
+              domain: "ops",
+              permalink: "gamma",
+              title: "Gamma",
+              status: "stable",
+              type: "runbook",
+            },
+          ],
+        }),
+      ),
+    );
+
+    mount();
+
+    const list = await screen.findByRole("list", {
+      name: /engrams with no connection/i,
+    });
+    expect(within(list).getByRole("link", { name: /Gamma/ })).toHaveAttribute(
       "href",
-      "/d/eng/e/notes/beta",
+      "/d/ops/e/gamma",
     );
   });
 

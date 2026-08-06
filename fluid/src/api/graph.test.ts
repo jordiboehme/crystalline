@@ -10,7 +10,12 @@
 
 import { describe, expect, it } from "vitest";
 
-import { backlinksTo, readGraph } from "./graph";
+import {
+  NEIGHBORHOOD_DEPTH,
+  backlinksTo,
+  readGraph,
+  readGraphDepth,
+} from "./graph";
 
 /** Alpha is the anchor, Beta points at it, Gamma is pointed at by it. */
 function neighborhood() {
@@ -91,5 +96,31 @@ describe("backlinks", () => {
     expect(graph.nodes).toEqual([]);
     expect(graph.edges).toEqual([{ from: 1, to: 2, relType: "links_to" }]);
     expect(graph.truncated).toBe(false);
+  });
+});
+
+/**
+ * How far out to walk, read off a URL.
+ *
+ * The endpoint walks one hop or two and clamps anything else, so a screen that
+ * refused to draw over a hand-typed number would be refusing the picture
+ * somebody came for. Every answer this gives is a depth the endpoint has.
+ */
+describe("the graph depth", () => {
+  it("takes the depths the endpoint walks", () => {
+    expect(readGraphDepth("1")).toBe(1);
+    expect(readGraphDepth("2")).toBe(2);
+  });
+
+  it("falls back to one hop for anything else", () => {
+    expect(readGraphDepth(null)).toBe(NEIGHBORHOOD_DEPTH);
+    expect(readGraphDepth(undefined)).toBe(NEIGHBORHOOD_DEPTH);
+    expect(readGraphDepth("")).toBe(NEIGHBORHOOD_DEPTH);
+    expect(readGraphDepth("abc")).toBe(NEIGHBORHOOD_DEPTH);
+    expect(readGraphDepth("99")).toBe(NEIGHBORHOOD_DEPTH);
+    expect(readGraphDepth("0")).toBe(NEIGHBORHOOD_DEPTH);
+    expect(readGraphDepth("-1")).toBe(NEIGHBORHOOD_DEPTH);
+    // Not a whole hop, and not something to round into one either.
+    expect(readGraphDepth("1.5")).toBe(NEIGHBORHOOD_DEPTH);
   });
 });

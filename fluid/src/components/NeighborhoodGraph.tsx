@@ -12,10 +12,13 @@
  * under: opening the graph there draws what the page has rather than waiting on
  * a payload of its own.
  *
- * The engrams are listed under the drawing as links as well. A canvas is one
- * opaque element to a screen reader and untabbable to a keyboard, and the
- * neighborhood is worth having either way, so the list is the same answer in
- * the form anything can read.
+ * Under the drawing the same neighborhood is written out, arrow by arrow: both
+ * ends named and linked with the relation between them, and any engram no
+ * surviving arrow mentions listed after. A canvas is one opaque element to a
+ * screen reader and untabbable to a keyboard, so this is not a courtesy index
+ * of names - it is the picture's own content in the form anything can read, and
+ * it is derived from the same payload by the same rules so the two cannot drift
+ * apart.
  */
 
 import { useQuery } from "@tanstack/react-query";
@@ -25,9 +28,10 @@ import { Link, useNavigate } from "react-router";
 
 import { ApiProblem } from "../api/client";
 import { crystallineAddress } from "../api/engram";
+import type { GraphNode } from "../api/graph";
 import { fetchGraph, graphKey } from "../api/graph";
 import type { GraphAnchor } from "../graphElements";
-import { graphElements } from "../graphElements";
+import { graphConnections, graphElements } from "../graphElements";
 import { RETIRED_CLASS, isRetired } from "../lifecycle";
 import { engramRoute } from "../paths";
 
@@ -92,6 +96,17 @@ export function NeighborhoodGraph({
   }
 
   const neighborhood = graph.data;
+  // The picture, said out loud. Derived from the same payload by the same
+  // rules the drawing is, so the two are one answer in two forms.
+  const connections = graphConnections(neighborhood);
+  const named = new Set(
+    connections.flatMap((connection) => [connection.from.id, connection.to.id]),
+  );
+  // An engram no surviving arrow mentions is still on the picture, so it is
+  // still in the text: a list that quietly dropped it would be the shorter
+  // kind of lie.
+  const stranded = neighborhood.nodes.filter((node) => !named.has(node.id));
+
   // The anchor is in its own neighborhood, so one node is an engram on its own:
   // a single dot with no arrows is a picture that says less than a sentence.
   if (neighborhood.nodes.length <= 1) {
@@ -128,25 +143,61 @@ export function NeighborhoodGraph({
       )}
 
       <ul
-        aria-label="Engrams in this neighborhood"
-        className="flex flex-wrap gap-x-3 gap-y-1 text-sm"
+        aria-label="Connections in this neighborhood"
+        className="flex flex-col gap-1 text-sm"
       >
-        {neighborhood.nodes.map((node) => (
+        {connections.map((connection) => (
           <li
-            key={`${node.domain}/${node.permalink}`}
-            className={isRetired(node.status) ? RETIRED_CLASS : undefined}
+            key={connection.id}
+            className="flex flex-wrap items-baseline gap-x-2"
           >
-            <Link
-              to={engramRoute(node.domain, node.permalink)}
-              aria-label={`${node.title}, ${node.permalink}`}
-              className="text-sky-700 underline underline-offset-2 hover:no-underline dark:text-sky-400"
-            >
-              {node.title}
-            </Link>
+            <EngramName node={connection.from} />
+            {/*
+              Between the two ends, so the line reads as the sentence it is:
+              "Beta supersedes Alpha". A reference the payload gave no type
+              names itself the way the relations list on an engram page names
+              one, rather than leaving the two ends sitting next to each other
+              with nothing between them.
+            */}
+            <span className="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-xs text-slate-600 dark:bg-slate-800 dark:text-slate-300">
+              {connection.relType ?? "relates to"}
+            </span>
+            <EngramName node={connection.to} />
           </li>
         ))}
       </ul>
+
+      {stranded.length > 0 && (
+        <ul
+          aria-label="Engrams with no connection drawn"
+          className="flex flex-wrap gap-x-3 gap-y-1 text-sm"
+        >
+          {stranded.map((node) => (
+            <li key={`${node.domain}/${node.permalink}`}>
+              <EngramName node={node} />
+            </li>
+          ))}
+        </ul>
+      )}
     </div>
+  );
+}
+
+/**
+ * One end of a connection: named, linked, and faded when it is retired, the
+ * same way every engram this app lists is.
+ */
+function EngramName({ node }: { node: GraphNode }) {
+  return (
+    <Link
+      to={engramRoute(node.domain, node.permalink)}
+      aria-label={`${node.title}, ${node.permalink}`}
+      className={`text-sky-700 underline underline-offset-2 hover:no-underline dark:text-sky-400 ${
+        isRetired(node.status) ? RETIRED_CLASS : ""
+      }`}
+    >
+      {node.title}
+    </Link>
   );
 }
 
