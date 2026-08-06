@@ -82,6 +82,166 @@ jobs:
       - name: cargo test (parity suite on both backends)
         run: cargo test -p crystalline-index
 
+  # Fluid, the browser UI. Nothing under fluid/ is part of the cargo workspace,
+  # so its gates are a job of their own: they neither wait on the Rust matrix
+  # nor hold it up.
+  fluid:
+    name: fluid
+    runs-on: ubuntu-latest
+    env:
+      # Corepack fetches the pinned pnpm on first use, and the confirmation it
+      # would otherwise ask for has nobody to answer it here. Set the same way
+      # fluid/Dockerfile sets it, and for the same reason.
+      COREPACK_ENABLE_DOWNLOAD_PROMPT: '0'
+    defaults:
+      run:
+        working-directory: fluid
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      # Corepack rather than a pnpm setup action, and for one reason: corepack
+      # reads the "packageManager" pin in fluid/package.json, so the pnpm
+      # version used here, in the Fluid image and on a laptop is one fact in one
+      # place. It is no longer bundled with Node, hence the install, pinned to
+      # the same corepack release fluid/Dockerfile pins.
+      - name: Enable corepack
+        run: |
+          npm install --global corepack@0.35.0
+          corepack enable pnpm
+          pnpm --version
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # The UI reads its own version out of package.json at build time and
+      # compares it against the version GET /auth/me reports. They are bumped by
+      # hand, and a bump that forgets one of the two shows every reader a
+      # version-skew warning about a skew that does not exist.
+      - name: The UI version matches the workspace version
+        run: |
+          set -euo pipefail
+          cargo_version=$(grep -m1 '^version = ' ../Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          fluid_version=$(node -p "require('./package.json').version")
+          if [ "$cargo_version" != "$fluid_version" ]; then
+            echo "::error file=fluid/package.json::fluid/package.json says $fluid_version and the workspace Cargo.toml says $cargo_version. Fluid compares its own version against the server's and warns the reader when they differ, so the two are bumped together."
+            exit 1
+          fi
+          echo "version parity: $fluid_version"
+
+      # src/api/types.ts is generated from the OpenAPI snapshot the service
+      # crate emits, and is the only description of the API the UI has. A
+      # regenerated file that differs means the snapshot moved and the UI is
+      # typed against an API that no longer exists.
+      - name: The generated API types match the OpenAPI snapshot
+        run: |
+          set -euo pipefail
+          pnpm generate:api
+          if ! git diff --exit-code src/api/types.ts; then
+            echo "::error file=fluid/src/api/types.ts::the generated types differ from the committed ones. Run 'pnpm generate:api' in fluid/ and commit the result."
+            exit 1
+          fi
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Format check
+        run: pnpm format:check
+
+      - name: Unit tests
+        run: pnpm test
+
+      - name: Build
+        run: pnpm build
+
+  # The browser smoke: the built bundle, a real daemon and a real browser. It
+  # covers what jsdom cannot (see fluid/e2e/smoke.spec.ts) and is a job of its
+  # own because it needs the Rust toolchain as well as Node.
+  fluid-smoke:
+    name: fluid-smoke
+    runs-on: ubuntu-latest
+    env:
+      # See the fluid job: corepack must not stop to ask before fetching pnpm.
+      COREPACK_ENABLE_DOWNLOAD_PROMPT: '0'
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      # Debug rather than release: the smoke drives the API, not the throughput
+      # of the index, and a release build would cost more than the run does.
+      - name: Build crystalline
+        run: cargo build -p crystalline
+
+      - name: Enable corepack
+        run: |
+          npm install --global corepack@0.35.0
+          corepack enable pnpm
+        working-directory: fluid
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+        working-directory: fluid
+
+      - name: Install the browser
+        run: pnpm exec playwright install --with-deps chromium
+        working-directory: fluid
+
+      # Builds the bundle, stands up the daemon on a scratch state directory
+      # with the fixture domain and one account, then runs Playwright against
+      # `vite preview`. The script is the whole sequence, so a local run is the
+      # same run.
+      - name: Run the browser smoke
+        run: bash fluid/e2e/run-smoke.sh
+
+      - name: Upload the failure traces
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fluid-smoke-traces
+          path: fluid/test-results
+          if-no-files-found: ignore
+
+  # The Fluid image, built the way the release builds it. Nothing here is
+  # pushed: what it proves is that the Dockerfile still assembles (corepack on
+  # musl, the COPY paths, the nginx stage) and that the configuration template
+  # the entrypoint renders is one nginx accepts.
+  fluid-image:
+    name: fluid-image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      # The build context is fluid/, exactly as the release job and the compose
+      # file build it.
+      - name: Build the image
+        run: docker build -f fluid/Dockerfile -t crystalline-fluid:ci fluid/
+
+      # A literal address rather than the image's own `crystalline:7411`
+      # default: nginx resolves a proxy_pass host when it loads its
+      # configuration, so a name nothing answers to would fail the test for a
+      # reason that has nothing to do with the configuration.
+      #
+      # The command starts with `nginx`, which is what makes the image's own
+      # entrypoint run envsubst over the template first: this validates the
+      # rendered configuration, not the template.
+      - name: The rendered nginx configuration is valid
+        run: docker run --rm -e CRYSTALLINE_UPSTREAM=127.0.0.1:7411 crystalline-fluid:ci nginx -t
+
+      - name: The bundle is where nginx serves from
+        run: |
+          docker run --rm --entrypoint sh crystalline-fluid:ci -c '
+            set -eu
+            test -f /usr/share/nginx/html/index.html
+            test -d /usr/share/nginx/html/assets
+            ls /usr/share/nginx/html/assets | head -n 3
+          '
+
   style:
     name: style
     runs-on: ubuntu-latest

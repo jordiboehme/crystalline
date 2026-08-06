@@ -10,7 +10,12 @@
 # Fluid is a static bundle. It holds no state, talks to exactly one upstream
 # and is safe to run in as many replicas as a deployment wants.
 
-FROM node:26-alpine AS build
+# Pinned to the platform doing the building rather than the one being built
+# for. What this stage produces is a static bundle - the same bytes for every
+# architecture - so building it under emulation for a second platform would
+# cost minutes of QEMU to arrive at an identical dist/. Only the nginx stage
+# below is built per platform.
+FROM --platform=$BUILDPLATFORM node:26-alpine AS build
 
 WORKDIR /app
 
@@ -36,7 +41,7 @@ FROM nginx:stable-alpine AS runtime
 LABEL org.opencontainers.image.title="Crystalline Fluid" \
       org.opencontainers.image.description="The browser UI for a Crystalline instance" \
       org.opencontainers.image.source="https://github.com/jordiboehme/crystalline" \
-      org.opencontainers.image.licenses="Apache-2.0"
+      org.opencontainers.image.licenses="AGPL-3.0-or-later"
 
 # Where the Crystalline daemon answers, as host:port. The nginx image's own
 # entrypoint runs envsubst over /etc/nginx/templates/*.template at every

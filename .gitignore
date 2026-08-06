@@ -6,6 +6,10 @@
 /fluid/node_modules/
 /fluid/dist/
 
+# Fluid browser smoke output: traces and screenshots from a failed run
+/fluid/test-results/
+/fluid/playwright-report/
+
 # Skill training harness runtime state (evals/skill-training)
 evals/skill-training/outputs/
 evals/skill-training/.venv/
