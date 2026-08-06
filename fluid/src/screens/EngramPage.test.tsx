@@ -324,6 +324,25 @@ describe("the engram page", () => {
     expect(panel).toHaveTextContent("links_to");
   });
 
+  it("says what the server said when the neighborhood could not be read", async () => {
+    serve({
+      // A refusal rather than a server error, so the query layer answers it
+      // once instead of retrying: what is pinned here is the message, not the
+      // retry policy.
+      "/graph": () => {
+        throw new ApiProblem(403, "forbidden", "this account may not read eng");
+      },
+    });
+
+    renderApp("/d/eng/e/alpha");
+
+    const panel = await screen.findByRole("region", { name: "Backlinks" });
+    const alert = await within(panel).findByRole("alert");
+    // The server's own words, the way every other error surface in this app
+    // shows them: a house sentence would hide the one thing worth reading.
+    expect(alert).toHaveTextContent("this account may not read eng");
+  });
+
   it("says plainly when nothing points here yet", async () => {
     serve({
       "/graph": () =>

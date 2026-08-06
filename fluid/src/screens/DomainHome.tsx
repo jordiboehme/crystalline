@@ -17,7 +17,7 @@ import { useQuery } from "@tanstack/react-query";
 import { useMemo } from "react";
 import { Link, useParams, useSearchParams } from "react-router";
 
-import { ApiProblem } from "../api/client";
+import { ApiProblem, problemDetail } from "../api/client";
 import { fetchManifest, fetchTree, manifestKey, treeKey } from "../api/domain";
 import { DOMAINS_QUERY_KEY, fetchDomains } from "../api/domains";
 import type { EngramFilters } from "../api/engrams";
@@ -186,7 +186,7 @@ export default function DomainHome() {
             role="alert"
             className="rounded bg-red-50 px-3 py-2 text-sm text-red-800 dark:bg-red-950 dark:text-red-200"
           >
-            {detailOf(tree.error)}
+            {problemDetail(tree.error)}
           </p>
         ) : (
           <p className="text-sm text-slate-500 dark:text-slate-400">
@@ -232,7 +232,7 @@ function ManifestPanel({
         role="alert"
         className="rounded bg-red-50 px-3 py-2 text-sm text-red-800 dark:bg-red-950 dark:text-red-200"
       >
-        {detailOf(error)}
+        {problemDetail(error)}
       </p>
     );
   }
@@ -385,8 +385,4 @@ function DomainNotFound({ domain }: { domain: string }) {
 /** Whether this failure is the server saying there is nothing at that address. */
 function isMissing(error: unknown): boolean {
   return error instanceof ApiProblem && error.status === 404;
-}
-
-function detailOf(error: Error): string {
-  return error instanceof ApiProblem ? error.detail : error.message;
 }

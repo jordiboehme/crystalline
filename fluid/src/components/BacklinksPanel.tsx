@@ -15,6 +15,7 @@
 
 import { Link } from "react-router";
 
+import { problemDetail } from "../api/client";
 import type { Backlink } from "../api/graph";
 import { RETIRED_CLASS, isRetired } from "../lifecycle";
 import { engramRoute } from "../paths";
@@ -51,7 +52,12 @@ export function BacklinksPanel({
           role="alert"
           className="rounded bg-red-50 px-2 py-1 text-sm text-red-800 dark:bg-red-950 dark:text-red-200"
         >
-          The neighborhood could not be read, so what points here is unknown.
+          {/*
+            What the reader lost, then the server's own words for why: the
+            detail is the only part of this that says anything specific, and
+            every other error surface in this app prints it verbatim.
+          */}
+          What points here is unknown: {problemDetail(error)}
         </p>
       ) : backlinks.length === 0 ? (
         <p className="text-sm text-slate-500 dark:text-slate-400">

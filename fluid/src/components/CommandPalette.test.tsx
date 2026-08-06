@@ -16,6 +16,7 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { api } from "../api/client";
+import { RETIRED_CLASS } from "../lifecycle";
 import {
   answersFor,
   domainsResponse,
@@ -231,6 +232,39 @@ describe("the command palette", () => {
     // And it costs nothing on the wire either: no lookup for a term nobody is
     // asking about any more.
     expect(searches()).toHaveLength(asked);
+  });
+
+  it("fades a retired engram, so the jump list says what every other list does", async () => {
+    serve({ "/search": () => page([hit({ status: "deprecated" })]) });
+    const user = userEvent.setup();
+    await openApp();
+
+    await user.keyboard("{Meta>}k{/Meta}");
+    await user.type(await screen.findByRole("combobox"), "alph");
+
+    // The fade is the whole design of the retired status in this app, and a
+    // row that jumps somewhere is exactly where it has to hold: a palette
+    // that drew a deprecated engram like a current one would send a reader
+    // off on it without a word.
+    const row = await within(palette()).findByRole("option", {
+      name: /Alpha/,
+    });
+    expect(row).toHaveClass(RETIRED_CLASS);
+    expect(row).toHaveTextContent("deprecated");
+  });
+
+  it("leaves a current engram unfaded", async () => {
+    serve();
+    const user = userEvent.setup();
+    await openApp();
+
+    await user.keyboard("{Meta>}k{/Meta}");
+    await user.type(await screen.findByRole("combobox"), "alph");
+
+    const row = await within(palette()).findByRole("option", {
+      name: /Alpha/,
+    });
+    expect(row).not.toHaveClass(RETIRED_CLASS);
   });
 
   it("goes to a domain the sidebar knows about", async () => {

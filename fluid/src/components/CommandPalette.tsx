@@ -32,6 +32,7 @@ import {
   fetchSearch,
   titleMatchesKey,
 } from "../api/search";
+import { RETIRED_CLASS, isRetired } from "../lifecycle";
 import { domainRoute, engramRoute, searchRoute } from "../paths";
 
 /**
@@ -276,9 +277,26 @@ export function CommandPalette() {
                 onSelect={() => {
                   go(engramRoute(hit.domain, hit.permalink));
                 }}
-                className={ROW_CLASSES}
+                // Faded when it is retired, the same way every list in this
+                // app fades one: a row that jumps somewhere is exactly where
+                // the fade has to hold, or a reader is sent off on a
+                // deprecated engram without a word.
+                className={`${ROW_CLASSES} ${
+                  isRetired(hit.status) ? RETIRED_CLASS : ""
+                }`}
               >
                 <span className="truncate">{hit.title}</span>
+                {/*
+                  And the word itself, only where it changes what the row
+                  means. A status on every row would be noise in a list read
+                  at a glance; the fade alone says something is off without
+                  saying what.
+                */}
+                {isRetired(hit.status) && (
+                  <span className="truncate text-xs text-slate-500 dark:text-slate-400">
+                    {hit.status}
+                  </span>
+                )}
                 <span className="truncate text-xs text-slate-500 dark:text-slate-400">
                   {hit.domain}
                 </span>

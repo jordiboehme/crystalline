@@ -304,9 +304,12 @@ describe("the neighborhood graph", () => {
 
     mount();
 
-    expect(await screen.findByRole("alert")).toHaveTextContent(
-      /neighborhood could not be read/i,
-    );
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(/neighborhood could not be read/i);
+    // And what the server said about it. On the full view this message is the
+    // whole screen, so a house sentence in place of the detail would leave a
+    // reader with nothing to act on and nothing to report.
+    expect(alert).toHaveTextContent("the index is rebuilding");
   });
 
   it("says an anchor nobody wrote is a wrong address rather than a failure", async () => {

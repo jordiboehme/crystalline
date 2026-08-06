@@ -16,7 +16,7 @@ import { useState } from "react";
 import { DropdownMenu } from "radix-ui";
 import { Link, NavLink, Outlet, useNavigate } from "react-router";
 
-import { ApiProblem } from "../api/client";
+import { problemDetail } from "../api/client";
 import { DOMAINS_QUERY_KEY, fetchDomains } from "../api/domains";
 import type { DomainSummary } from "../api/domains";
 import { useAuth } from "../auth/AuthContext";
@@ -309,7 +309,7 @@ function DomainLink({ domain }: { domain: DomainSummary }) {
  * on it, and the gate redirects.
  */
 function SidebarProblem({ error }: { error: Error }) {
-  const detail = error instanceof ApiProblem ? error.detail : error.message;
+  const detail = problemDetail(error);
   return (
     <p
       role="alert"

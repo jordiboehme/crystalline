@@ -49,6 +49,19 @@ export class ApiProblem extends Error {
 }
 
 /**
+ * What to show a reader about a failure: the server's own words where there
+ * are any, and the error's message where there are not.
+ *
+ * Every failure a screen can hold is either an {@link ApiProblem} the server
+ * described or an `Error` the app itself threw, and the rule for both is the
+ * same everywhere: print what it says. This is that rule in one place, so a
+ * surface cannot quietly opt out of it by writing its own sentence instead.
+ */
+export function problemDetail(error: Error): string {
+  return error instanceof ApiProblem ? error.detail : error.message;
+}
+
+/**
  * The CSRF token of the current session, held in memory only.
  *
  * The session cookie is `HttpOnly`, so a reload cannot read the token back out
@@ -142,8 +155,8 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
     throw await problemFrom(response);
   }
   const body = await readBody(response);
-  if (body.kind === "foreign") {
-    throw foreignBodyProblem(response, body);
+  if (body.kind === "foreign" || body.kind === "unreadable") {
+    throw unusableBodyProblem(response, body);
   }
   return (body.kind === "json" ? body.value : undefined) as T;
 }
@@ -180,9 +193,10 @@ async function problemFrom(response: Response): Promise<ApiProblem> {
 }
 
 /**
- * What a response body turned out to be. Three outcomes rather than two,
- * because "there was nothing to read" and "there was something and it was not
- * JSON" are different facts and the caller answers them differently.
+ * What a response body turned out to be. Four outcomes rather than two,
+ * because "there was nothing to read", "there was something and it was not
+ * JSON" and "the reading itself failed" are different facts and the caller
+ * answers them differently.
  */
 type Body =
   /** A 204, or a response that carried no bytes. */
@@ -190,7 +204,9 @@ type Body =
   /** A JSON body, parsed. */
   | { kind: "json"; value: unknown }
   /** Bytes this client cannot use, with the content type that announced them. */
-  | { kind: "foreign"; contentType: string; announcedJson: boolean };
+  | { kind: "foreign"; contentType: string; announcedJson: boolean }
+  /** The headers arrived and the stream broke before the bytes did. */
+  | { kind: "unreadable" };
 
 /** Read the body once and classify it. Never throws. */
 async function readBody(response: Response): Promise<Body> {
@@ -198,7 +214,18 @@ async function readBody(response: Response): Promise<Body> {
     return { kind: "empty" };
   }
   const contentType = response.headers.get("content-type") ?? "";
-  const text = await response.text().catch(() => "");
+  // A read that fails is its own outcome, never an empty body. `fetch`
+  // resolves as soon as the headers land, so a connection dropped mid-stream
+  // rejects here on a 200, and calling that "empty" would hand the caller
+  // `undefined` for a listing - which the screens above render as "no domains
+  // are registered on this instance yet". That is a claim about the knowledge
+  // base, made because a read failed.
+  let text: string;
+  try {
+    text = await response.text();
+  } catch {
+    return { kind: "unreadable" };
+  }
   if (text === "") {
     return { kind: "empty" };
   }
@@ -213,24 +240,36 @@ async function readBody(response: Response): Promise<Body> {
 }
 
 /**
- * The failure for a 2xx response whose body this client cannot read.
+ * The failure for a 2xx response whose body this client cannot use.
  *
  * A captive portal, a misconfigured proxy or an HTML sign-in page answered
- * with 200 all look like success to `fetch`. Handing the caller `undefined`
- * for one would push the failure into whatever touches the missing field
- * next, as a `TypeError` naming nothing useful. It is a failed request, so it
- * leaves here as one.
+ * with 200 all look like success to `fetch`, and so does a response whose
+ * stream broke after the headers. Handing the caller `undefined` for one would
+ * push the failure into whatever touches the missing field next, as a
+ * `TypeError` naming nothing useful, or worse: on a list route `undefined`
+ * reads as an empty list, and the screen says the instance holds nothing. It
+ * is a failed request, so it leaves here as one.
  */
-function foreignBodyProblem(
+function unusableBodyProblem(
   response: Response,
-  body: Extract<Body, { kind: "foreign" }>,
+  body: Extract<Body, { kind: "foreign" | "unreadable" }>,
 ): ApiProblem {
+  return new ApiProblem(
+    response.status,
+    "unexpected response",
+    body.kind === "unreadable"
+      ? "the response body could not be read: the connection may have dropped before the answer was complete"
+      : foreignBodyDetail(body),
+  );
+}
+
+/** Why a body this client cannot parse is not the answer it was expecting. */
+function foreignBodyDetail(body: Extract<Body, { kind: "foreign" }>): string {
   const named =
     body.contentType === ""
       ? "no content type"
       : `content type "${body.contentType}"`;
-  const detail = body.announcedJson
+  return body.announcedJson
     ? `the server answered ${named} but the body is not valid JSON`
     : `expected a JSON body, but the server answered ${named}: something other than Crystalline may have answered this request`;
-  return new ApiProblem(response.status, "unexpected response", detail);
 }

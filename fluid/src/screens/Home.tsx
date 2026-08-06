@@ -15,7 +15,7 @@ import { useQuery } from "@tanstack/react-query";
 import { useMemo } from "react";
 import { Link } from "react-router";
 
-import { ApiProblem } from "../api/client";
+import { problemDetail } from "../api/client";
 import { ACTIVITY_QUERY_KEY, fetchActivity } from "../api/activity";
 import type { Activity } from "../api/activity";
 import { DOMAINS_QUERY_KEY, fetchDomains } from "../api/domains";
@@ -64,7 +64,7 @@ export default function Home() {
         */}
         {listing.error && (
           <p className="text-sm text-red-800 dark:text-red-200">
-            {detailOf(listing.error)}
+            {problemDetail(listing.error)}
           </p>
         )}
         {listing.data?.domains.length === 0 && (
@@ -188,7 +188,7 @@ function ActivityFeed({
         role="alert"
         className="rounded bg-red-50 px-3 py-2 text-sm text-red-800 dark:bg-red-950 dark:text-red-200"
       >
-        {detailOf(error)}
+        {problemDetail(error)}
       </p>
     );
   }
@@ -258,8 +258,4 @@ function lastRecordedByDomain(
     }
   }
   return newest;
-}
-
-function detailOf(error: Error): string {
-  return error instanceof ApiProblem ? error.detail : error.message;
 }

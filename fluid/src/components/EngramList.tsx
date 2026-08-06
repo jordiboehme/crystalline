@@ -21,7 +21,7 @@ import { useEffect, useMemo, useRef } from "react";
 import type { ReactNode } from "react";
 import { Link } from "react-router";
 
-import { ApiProblem } from "../api/client";
+import { problemDetail } from "../api/client";
 import type { EngramPage, EngramRow } from "../api/engrams";
 import { hasNextPage as envelopeHasNext } from "../api/engrams";
 import { RETIRED_CLASS, isRetired } from "../lifecycle";
@@ -278,7 +278,7 @@ function Badge({ children, title }: { children: ReactNode; title?: string }) {
  * answer about this list, not a reason to bounce a reader to a login form.
  */
 function ListProblem({ error }: { error: Error }) {
-  const detail = error instanceof ApiProblem ? error.detail : error.message;
+  const detail = problemDetail(error);
   return (
     <p
       role="alert"

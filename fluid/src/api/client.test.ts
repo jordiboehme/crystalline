@@ -29,6 +29,22 @@ function problemResponse(
   );
 }
 
+/**
+ * A response whose body cannot be read: the headers arrived, the stream broke
+ * before the bytes did. `fetch` resolves such a response and only `text()`
+ * rejects, which is what makes it worth pinning.
+ */
+function unreadableResponse(status = 200): Response {
+  const response = new Response("{}", {
+    status,
+    headers: { "content-type": "application/json" },
+  });
+  Object.defineProperty(response, "text", {
+    value: () => Promise.reject(new TypeError("network error")),
+  });
+  return response;
+}
+
 /** Install a fetch stub and hand back the spy the assertions read. */
 function stubFetch(...responses: Response[]) {
   const queue = [...responses];
@@ -177,6 +193,32 @@ describe("api", () => {
     expect(failure).toBeInstanceOf(ApiProblem);
     expect((failure as ApiProblem).title).toBe("unexpected response");
     expect((failure as ApiProblem).detail).toContain("not valid JSON");
+  });
+
+  it("refuses a 200 whose body could not be read", async () => {
+    // A stream that broke mid-read is not an empty body, and an empty body on
+    // a listing route is a claim about the knowledge base: "no domains are
+    // registered on this instance yet". The app must not state that fact
+    // because a read failed, so this leaves here as the failure it is.
+    stubFetch(unreadableResponse());
+
+    const failure = await api("/domains").catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(ApiProblem);
+    const problem = failure as ApiProblem;
+    expect(problem.status).toBe(200);
+    expect(problem.title).toBe("unexpected response");
+    expect(problem.detail).toContain("could not be read");
+  });
+
+  it("keeps the transport status when a failure's body could not be read", async () => {
+    stubFetch(unreadableResponse(503));
+
+    const failure = await api("/domains").catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(ApiProblem);
+    expect((failure as ApiProblem).status).toBe(503);
+    expect((failure as ApiProblem).detail).not.toBe("");
   });
 
   it("keeps a bodyless 200 as undefined rather than a failure", async () => {

@@ -26,7 +26,7 @@ import type { ReactNode } from "react";
 import { Suspense, lazy, useCallback, useMemo } from "react";
 import { Link, useNavigate } from "react-router";
 
-import { ApiProblem } from "../api/client";
+import { ApiProblem, problemDetail } from "../api/client";
 import { crystallineAddress } from "../api/engram";
 import type { GraphNode } from "../api/graph";
 import { fetchGraph, graphKey } from "../api/graph";
@@ -90,7 +90,15 @@ export function NeighborhoodGraph({
         role="alert"
         className="rounded bg-red-50 px-3 py-2 text-sm text-red-800 dark:bg-red-950 dark:text-red-200"
       >
-        The neighborhood could not be read, so there is nothing to draw.
+        {/*
+          The framing says what the reader lost; the server's own detail says
+          why, verbatim, the way every other error surface in this app shows
+          it. On the full view this message is the whole screen, so a house
+          sentence on its own would leave a reader with nothing to act on and
+          nothing to report.
+        */}
+        The neighborhood could not be read, so there is nothing to draw:{" "}
+        {problemDetail(graph.error)}
       </p>
     );
   }

@@ -28,7 +28,7 @@ import { useQuery } from "@tanstack/react-query";
 import { useEffect, useMemo, useState } from "react";
 import { Link, useParams } from "react-router";
 
-import { ApiProblem } from "../api/client";
+import { ApiProblem, problemDetail } from "../api/client";
 import type {
   EngramDetail,
   EngramObservation,
@@ -90,9 +90,7 @@ export default function EngramPage() {
         role="alert"
         className="rounded bg-red-50 px-3 py-2 text-sm text-red-800 dark:bg-red-950 dark:text-red-200"
       >
-        {detail.error instanceof ApiProblem
-          ? detail.error.detail
-          : detail.error.message}
+        {problemDetail(detail.error)}
       </p>
     );
   }
