@@ -71,7 +71,10 @@ pub async fn run(command: UsersCommand, json: bool) -> Result<()> {
         } => {
             let password = read_password(password_stdin)?;
             store.set_password(&name, &password).await?;
-            println!("Changed the password for '{}'.", stored_name(&name));
+            println!(
+                "Changed the password for '{}' and signed out its sessions.",
+                stored_name(&name)
+            );
         }
         UsersCommand::Role { name, role } => {
             let role: Role = role.into();
@@ -81,7 +84,7 @@ pub async fn run(command: UsersCommand, json: bool) -> Result<()> {
         UsersCommand::Disable { name } => {
             store.set_disabled(&name, true).await?;
             println!(
-                "Disabled '{}'. Its sessions stop working immediately.",
+                "Disabled '{}' and revoked its sessions. Enabling it again does not bring them back.",
                 stored_name(&name)
             );
         }

@@ -5,21 +5,110 @@
 
 mod auth;
 mod auth_store;
+mod discovery;
+mod domains;
+mod engrams;
 mod error;
+mod graph;
+mod users_api;
 
 use std::sync::Arc;
 
 use axum::Router;
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 use tokio::sync::Semaphore;
 
 pub use auth::{
     AuthCfg, CSRF_HEADER, Caller, Identity, LOGIN_SLOTS, SESSION_COOKIE, SESSION_TTL_SECS,
 };
 pub use auth_store::*;
-pub use error::ApiError;
+pub use error::{ApiError, ApiJson, ApiPath, ApiQuery, ProblemDetail};
 
 use crate::engine::Engine;
+
+/// The OpenAPI 3.1 document for this surface, assembled from the
+/// `#[utoipa::path]` annotation on every handler.
+///
+/// `info.version` is the *API* version, pinned to `v1` to match the `/api/v1`
+/// mount, rather than the crate version utoipa would otherwise take from
+/// `Cargo.toml`. That is what makes the committed snapshot survive a release:
+/// bumping the workspace version must not rewrite an artifact the UI's client
+/// generator is compiled against, and the crate version is already reported by
+/// `GET /auth/me` for the client that wants it.
+#[derive(utoipa::OpenApi)]
+#[openapi(
+    info(
+        title = "Crystalline Fluid API",
+        version = "v1",
+        description = "The JSON API `crystalline serve --http` mounts at \
+                       `/api/v1`, the surface the Fluid UI talks to. Read-only \
+                       in this version apart from the session and account \
+                       routes.\n\nEvery path but `/auth/login`, `/auth/logout` \
+                       and `/auth/me` is closed by default: a request that \
+                       carries no identity is answered 401 ahead of routing, so \
+                       an unauthenticated caller never learns which paths \
+                       exist. Every failure is an RFC 9457 problem detail sent \
+                       as `application/problem+json`.\n\nThe payloads marked as \
+                       generic objects are the engine's own JSON, passed \
+                       through unchanged so this API and the MCP tools stay one \
+                       source of truth; each carries an example of the shape it \
+                       answers with.",
+        license(name = "AGPL-3.0-or-later"),
+    ),
+    tags(
+        (name = "meta", description = "The API's description of itself."),
+        (name = "auth", description = "Sessions and the capability probe."),
+        (name = "domains", description = "Which domains this instance serves and what each holds."),
+        (name = "engrams", description = "Listing and reading engrams."),
+        (name = "discovery", description = "Search, vocabulary, context and recent activity."),
+        (name = "graph", description = "The neighborhood graph around an anchor."),
+        (name = "users", description = "Account management. Admin only."),
+    ),
+    paths(
+        openapi_json,
+        auth::login,
+        auth::logout,
+        auth::me,
+        domains::list,
+        domains::tree,
+        domains::manifest,
+        engrams::list,
+        engrams::detail,
+        discovery::search,
+        discovery::vocabulary,
+        discovery::context,
+        discovery::activity,
+        graph::graph,
+        users_api::list,
+        users_api::create,
+        users_api::update,
+        users_api::remove,
+    ),
+    components(schemas(
+        ProblemDetail,
+        User,
+        Role,
+        auth::LoginBody,
+        auth::LoginResponse,
+        auth::LogoutResponse,
+        auth::MeResponse,
+        users_api::CreateBody,
+        users_api::PatchBody,
+        users_api::UserResponse,
+        users_api::UsersResponse,
+    )),
+)]
+struct ApiDoc;
+
+/// This surface's OpenAPI document.
+///
+/// One definition with two consumers: the [`openapi_json`] route serves it, and
+/// `tests/openapi_snapshot.rs` compares it against the committed
+/// `openapi/fluid-v1.json` the UI generates its client types from. Neither can
+/// drift from the annotations without the other noticing.
+pub fn openapi_document() -> utoipa::openapi::OpenApi {
+    <ApiDoc as utoipa::OpenApi>::openapi()
+}
 
 /// What every REST handler is given: the one shared engine the daemon owns,
 /// the one auth store this process holds open, and the auth settings resolved
@@ -53,6 +142,20 @@ impl RestState {
             login_slots: auth::login_slots(),
         })
     }
+
+    /// Run `work` holding one of the [`LOGIN_SLOTS`] password-work permits.
+    ///
+    /// The semaphore is deliberately not exposed itself: password work is the
+    /// only thing it may gate, and a handler that hashes has to go through here
+    /// rather than reach for the field. See [`auth::with_login_slot`] for what
+    /// the cap is for and why the admin routes share the login one instead of
+    /// getting a second.
+    pub(super) async fn with_login_slot<F: std::future::Future>(
+        &self,
+        work: F,
+    ) -> Result<F::Output, ApiError> {
+        auth::with_login_slot(&self.login_slots, work).await
+    }
 }
 
 /// Build the REST router. Mounted with `nest("/api/v1", ...)`, so the paths
@@ -62,13 +165,42 @@ impl RestState {
 /// [`auth::guard`] is layered over the whole thing, fallback included, so
 /// identity resolution, the CSRF check and the closed-by-default rule apply to
 /// every path under the mount - including the ones later tasks add, which are
-/// guarded the moment they are registered.
+/// guarded the moment they are registered. Every route therefore belongs
+/// *above* the `.layer` call: axum only wraps what was declared before it, so a
+/// route added below would serve unguarded.
 pub fn router(state: RestState) -> Router {
     Router::new()
+        .route("/openapi.json", get(openapi_json))
         .route("/auth/login", post(auth::login))
         .route("/auth/logout", post(auth::logout))
         .route("/auth/me", get(auth::me))
+        .route("/domains", get(domains::list))
+        .route("/domains/{domain}/tree", get(domains::tree))
+        .route("/domains/{domain}/manifest", get(domains::manifest))
+        .route("/domains/{domain}/engrams", get(engrams::list))
+        // A wildcard, not a segment: a permalink is a path, so an engram in a
+        // subfolder carries the slashes with it.
+        .route(
+            "/domains/{domain}/engrams/{*permalink}",
+            get(engrams::detail),
+        )
+        .route("/search", get(discovery::search))
+        .route("/vocabulary", get(discovery::vocabulary))
+        .route("/context", get(discovery::context))
+        .route("/activity", get(discovery::activity))
+        .route("/graph", get(graph::graph))
+        // Admin only, enforced inside the handlers: the guard below stops at
+        // viewer. See [`users_api`] for the three rules these first mutating
+        // routes are held to.
+        .route("/users", get(users_api::list).post(users_api::create))
+        .route(
+            "/users/{name}",
+            patch(users_api::update).delete(users_api::remove),
+        )
         .fallback(unknown_path)
+        // Applies to every method router registered above it, so it stays
+        // below the routes and above the guard.
+        .method_not_allowed_fallback(wrong_method)
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::guard,
@@ -76,8 +208,163 @@ pub fn router(state: RestState) -> Router {
         .with_state(state)
 }
 
+/// `GET /openapi.json` - this API's own OpenAPI 3.1 document.
+///
+/// Served *behind* the viewer guard, with no [`auth`] `PUBLIC_PATHS` exception:
+/// the description of a closed API is part of what being closed by default
+/// protects, and an unauthenticated caller learning every path and parameter
+/// would undo what the guard's answering 401 ahead of routing is for. Nothing
+/// is lost by that. The document is a committed artifact at
+/// `crates/service/openapi/fluid-v1.json`, and the UI's client generator reads
+/// the file rather than this route, so tooling never needs a running server -
+/// let alone an unauthenticated one.
+#[utoipa::path(
+    get,
+    path = "/api/v1/openapi.json",
+    tag = "meta",
+    operation_id = "get_openapi_document",
+    summary = "This API's own OpenAPI 3.1 document.",
+    description = "Served behind the viewer guard like every other data route: \
+                   the description of a closed API is part of what being closed \
+                   by default protects. Tooling does not need this route, since \
+                   the document is a committed artifact in the repository at \
+                   `crates/service/openapi/fluid-v1.json`.",
+    responses(
+        (
+            status = 200,
+            description = "This document. Behind the viewer guard like every \
+                           other data route.",
+            body = Object,
+        ),
+        (
+            status = 401,
+            description = "No identity.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "The trusted-header identity names a disabled account.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+async fn openapi_json() -> axum::Json<utoipa::openapi::OpenApi> {
+    axum::Json(openapi_document())
+}
+
 /// Answer an unknown `/api/v1` path in problem+json rather than letting it
 /// fall through to the MCP transport, which would reply in its own shape.
 async fn unknown_path() -> ApiError {
     ApiError::not_found("unknown API path")
+}
+
+/// Answer a known path asked for with a method it does not serve, in
+/// problem+json rather than axum's empty 405.
+async fn wrong_method() -> ApiError {
+    ApiError::method_not_allowed()
+}
+
+/// Split a comma-separated query parameter into the `Vec<String>` the engine's
+/// params take, dropping the whitespace and the empties a hand-written URL
+/// brings with it: `?tags=a,%20b,` asks for `a` and `b` rather than for a tag
+/// that is one space long, and an absent parameter asks for nothing at all.
+///
+/// Every list-valued parameter on this surface arrives this way rather than as a
+/// repeated key: one spelling for a caller to learn, and the same one the engine
+/// then sees whichever endpoint it came through.
+fn csv(raw: Option<&str>) -> Vec<String> {
+    raw.map(|raw| {
+        raw.split(',')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .map(str::to_string)
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    /// A [`RestState`] over an empty in-memory engine and a fresh auth
+    /// database: enough to exercise the state's own machinery without a domain
+    /// on disk behind it.
+    async fn test_state() -> (tempfile::TempDir, RestState) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crystalline_index::TursoStore::open_in_memory()
+            .await
+            .unwrap();
+        let engine = Arc::new(Engine::new(
+            Arc::new(tokio::sync::Mutex::new(store)),
+            crystalline_core::config::GlobalConfig::default(),
+            None,
+            None,
+        ));
+        let auth = Arc::new(
+            AuthStore::open(&dir.path().join("web-auth.db"))
+                .await
+                .unwrap(),
+        );
+        (dir, RestState::new(engine, auth).unwrap())
+    }
+
+    /// The cap the admin routes borrow: whatever calls
+    /// [`RestState::with_login_slot`] - a login, an account being created, a
+    /// password being reset - only [`LOGIN_SLOTS`] of them hold argon2's
+    /// working memory at a time. Asserted on the mechanism, by counting how
+    /// many bodies are inside at once, rather than on how long anything took.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_login_limiter_caps_every_caller_that_hashes() {
+        let (_dir, state) = test_state().await;
+        let live = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+
+        let mut tasks = Vec::new();
+        for _ in 0..32 {
+            let (state, live, peak) = (state.clone(), live.clone(), peak.clone());
+            tasks.push(tokio::spawn(async move {
+                state
+                    .with_login_slot(async {
+                        let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(now, Ordering::SeqCst);
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                        live.fetch_sub(1, Ordering::SeqCst);
+                    })
+                    .await
+                    .unwrap();
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        assert_eq!(live.load(Ordering::SeqCst), 0, "every permit came back");
+        let peak = peak.load(Ordering::SeqCst);
+        assert!(
+            peak <= LOGIN_SLOTS,
+            "at most {LOGIN_SLOTS} may hash at once, saw {peak}"
+        );
+        assert!(peak > 1, "and the limiter must not serialize them either");
+    }
+
+    #[test]
+    fn a_comma_list_splits_and_drops_the_empties() {
+        assert_eq!(csv(Some("a,b")), vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(
+            csv(Some(" a , b ")),
+            vec!["a".to_string(), "b".to_string()],
+            "a hand-written list is not punished for its spaces"
+        );
+        assert_eq!(csv(Some("a,,")), vec!["a".to_string()]);
+        assert!(
+            csv(Some("")).is_empty(),
+            "no values rather than one empty one"
+        );
+        assert!(csv(Some(" , ")).is_empty());
+        assert!(csv(None).is_empty(), "an absent parameter asks for nothing");
+    }
 }

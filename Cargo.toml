@@ -102,6 +102,12 @@ base64 = "0.22.1"
 # dependency is needed; `std` is on so hashing errors carry `std::error::Error`.
 argon2 = { version = "0.5.3", features = ["std"] }
 
+# The OpenAPI document for the REST surface (crates/service). Default features
+# are exactly the `macros` one the `#[utoipa::path]`, `ToSchema` and
+# `IntoParams` attributes need; `preserve_order` stays off, so nothing here can
+# switch serde_json's map type on the whole workspace.
+utoipa = "5.5.0"
+
 insta = { version = "1.48.0", features = ["yaml"] }
 assert_cmd = "2.2.2"
 tempfile = "3.27.0"
