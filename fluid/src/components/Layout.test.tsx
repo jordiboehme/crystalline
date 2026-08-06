@@ -75,7 +75,20 @@ describe("the layout", () => {
   });
 
   it("routes the search box to the search screen", async () => {
-    serveSignedIn();
+    // The screen it lands on runs the query it was handed, so the routes it
+    // needs are stubbed here: an unstubbed one is a failed request, and the
+    // reader would arrive at their results behind an error box.
+    serveSignedIn({
+      "/search": () => ({
+        mode: "text",
+        total: 0,
+        page: 1,
+        limit: 50,
+        count: 0,
+        hits: [],
+      }),
+      "/vocabulary": () => ({ tags: [] }),
+    });
 
     renderApp("/");
     await screen.findByRole("heading", { name: "Home" });
@@ -86,6 +99,11 @@ describe("the layout", () => {
     expect(
       await screen.findByRole("heading", { name: "Search" }),
     ).toBeVisible();
+    // A clean landing: the query ran, and nothing on the way there failed.
+    await waitFor(() => {
+      expect(screen.getByText(/no engram matches/i)).toBeVisible();
+    });
+    expect(screen.queryByRole("alert")).toBeNull();
   });
 
   it("writes the chosen theme onto the document", async () => {

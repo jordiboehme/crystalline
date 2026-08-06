@@ -14,7 +14,7 @@
  */
 
 import { useQuery } from "@tanstack/react-query";
-import { useMemo, useState } from "react";
+import { useMemo } from "react";
 import { Link, useParams, useSearchParams } from "react-router";
 
 import { ApiProblem } from "../api/client";
@@ -30,8 +30,8 @@ import {
 import { fetchTags, vocabularyKey } from "../api/vocabulary";
 import type { TagCount } from "../api/vocabulary";
 import { EngramList } from "../components/EngramList";
+import { FilterFields, TagChips } from "../components/FilterControls";
 import { Markdown } from "../components/Markdown";
-import { SUGGESTED_STATUSES, SUGGESTED_TYPES } from "../filters";
 import { plural } from "../format";
 
 export default function DomainHome() {
@@ -147,8 +147,6 @@ export default function DomainHome() {
           key={`${filters.type ?? ""}|${filters.status ?? ""}`}
           filters={filters}
           tags={tags.data ?? []}
-          types={SUGGESTED_TYPES}
-          statuses={SUGGESTED_STATUSES}
           onChange={(next) => {
             apply(next);
           }}
@@ -323,126 +321,45 @@ function FolderNav({
 /**
  * The frontmatter filters.
  *
- * Tags are chips because the vocabulary endpoint knows every tag in the domain
- * and how many engrams carry it, so the set on screen is the real one. Type and
- * status are typed rather than picked, because nothing enumerates them: a chip
- * row built from one page of results would look like the whole truth about a
- * domain while being whatever the first fifty rows happened to say.
+ * The controls are the shared ones (`FilterControls`); what this adds is what a
+ * change means here, which is a filter across the whole domain rather than
+ * inside the folder being browsed. There is no timeframe field: this screen
+ * asks what a domain holds, and the listing endpoint filters on frontmatter
+ * alone.
  */
 function FilterBar({
   filters,
   tags,
-  types,
-  statuses,
   onChange,
 }: {
   filters: EngramFilters;
   tags: TagCount[];
-  types: string[];
-  statuses: string[];
   onChange: (next: {
     type?: string | null;
     status?: string | null;
     tags?: string[];
   }) => void;
 }) {
-  const [type, setType] = useState(filters.type ?? "");
-  const [status, setStatus] = useState(filters.status ?? "");
-  const chosen = new Set(filters.tags);
-
   return (
     <div className="flex flex-col gap-3">
-      <form
-        className="flex flex-wrap items-end gap-3"
-        onSubmit={(event) => {
-          event.preventDefault();
-          onChange({ type: type.trim(), status: status.trim() });
+      <FilterFields
+        type={filters.type}
+        status={filters.status}
+        clearable={hasFilters(filters)}
+        onApply={({ type, status }) => {
+          onChange({ type, status });
         }}
-      >
-        <label className="flex flex-col gap-1 text-xs text-slate-500 dark:text-slate-400">
-          Type
-          <input
-            list="filter-types"
-            value={type}
-            onChange={(event) => {
-              setType(event.target.value);
-            }}
-            className="w-40 rounded border border-slate-300 bg-white px-2 py-1 text-sm text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
-          />
-          <datalist id="filter-types">
-            {types.map((value) => (
-              <option key={value} value={value} />
-            ))}
-          </datalist>
-        </label>
-        <label className="flex flex-col gap-1 text-xs text-slate-500 dark:text-slate-400">
-          Status
-          <input
-            list="filter-statuses"
-            value={status}
-            onChange={(event) => {
-              setStatus(event.target.value);
-            }}
-            className="w-40 rounded border border-slate-300 bg-white px-2 py-1 text-sm text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
-          />
-          <datalist id="filter-statuses">
-            {statuses.map((value) => (
-              <option key={value} value={value} />
-            ))}
-          </datalist>
-        </label>
-        <button
-          type="submit"
-          className="rounded border border-slate-300 px-2 py-1 text-sm hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800"
-        >
-          Apply
-        </button>
-        {hasFilters(filters) && (
-          <button
-            type="button"
-            className="rounded px-2 py-1 text-sm underline underline-offset-2 hover:no-underline"
-            onClick={() => {
-              setType("");
-              setStatus("");
-              onChange({ type: null, status: null, tags: [] });
-            }}
-          >
-            Clear filters
-          </button>
-        )}
-      </form>
-      {tags.length > 0 && (
-        <ul className="flex flex-wrap gap-1.5">
-          {tags.map((tag) => {
-            const on = chosen.has(tag.name);
-            return (
-              <li key={tag.name}>
-                <button
-                  type="button"
-                  aria-pressed={on}
-                  className={`flex items-baseline gap-1 rounded-full border px-2 py-0.5 text-xs focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:outline-none ${
-                    on
-                      ? "border-sky-600 bg-sky-50 text-sky-800 dark:bg-sky-950 dark:text-sky-200"
-                      : "border-slate-200 hover:bg-slate-100 dark:border-slate-800 dark:hover:bg-slate-800"
-                  }`}
-                  onClick={() => {
-                    onChange({
-                      tags: on
-                        ? filters.tags.filter((name) => name !== tag.name)
-                        : [...filters.tags, tag.name],
-                    });
-                  }}
-                >
-                  <span>#{tag.name}</span>
-                  <span className="text-slate-500 tabular-nums dark:text-slate-400">
-                    {tag.engrams}
-                  </span>
-                </button>
-              </li>
-            );
-          })}
-        </ul>
-      )}
+        onClear={() => {
+          onChange({ type: null, status: null, tags: [] });
+        }}
+      />
+      <TagChips
+        tags={tags}
+        chosen={filters.tags}
+        onChange={(next) => {
+          onChange({ tags: next });
+        }}
+      />
     </div>
   );
 }
