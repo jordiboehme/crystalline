@@ -12,9 +12,11 @@
  */
 
 import { render, screen, waitFor } from "@testing-library/react";
+import { MemoryRouter } from "react-router";
 import { describe, expect, it } from "vitest";
 
 import { ThemeProvider } from "../theme/ThemeProvider";
+import type { WikilinkResolver } from "../wikilinks";
 import { Markdown } from "./Markdown";
 
 /**
@@ -22,12 +24,17 @@ import { Markdown } from "./Markdown";
  * seam, so nothing is on screen until it has. The wait is for the fallback to
  * be gone rather than for it to appear and go, because after the first test in
  * a file the module is loaded and there is no fallback at all.
+ *
+ * Mounted inside a router because a resolved wikilink navigates in place, so
+ * it is a router link rather than an anchor.
  */
-async function renderMarkdown(source: string) {
+async function renderMarkdown(source: string, wikilinks?: WikilinkResolver) {
   const result = render(
-    <ThemeProvider>
-      <Markdown source={source} />
-    </ThemeProvider>,
+    <MemoryRouter>
+      <ThemeProvider>
+        <Markdown source={source} wikilinks={wikilinks} />
+      </ThemeProvider>
+    </MemoryRouter>,
   );
   await waitFor(() => {
     expect(screen.queryByText("Rendering")).toBeNull();
@@ -99,6 +106,58 @@ describe("the markdown renderer", () => {
     await renderMarkdown("See [[Alpha]] for the rest.");
 
     expect(screen.getByText(/See \[\[Alpha\]\] for the rest\./)).toBeVisible();
+    expect(screen.queryByRole("link")).toBeNull();
+  });
+
+  it("turns a wikilink into a link when a resolver says where it goes", async () => {
+    await renderMarkdown("See [[Alpha]] for the rest.", (inner) =>
+      inner === "Alpha"
+        ? { kind: "resolved", href: "/d/eng/e/alpha", label: "Alpha" }
+        : null,
+    );
+
+    const link = screen.getByRole("link", { name: "Alpha" });
+    expect(link).toHaveAttribute("href", "/d/eng/e/alpha");
+    // The brackets are the source's punctuation for a reference; once it is a
+    // link the link itself says so.
+    expect(screen.queryByText(/\[\[Alpha\]\]/)).toBeNull();
+  });
+
+  it("marks a wikilink the index could not resolve without linking it", async () => {
+    await renderMarkdown("See [[Ghost]] for the rest.", () => ({
+      kind: "unresolved",
+    }));
+
+    const marked = screen.getByTitle("not resolved");
+    // Left as written, so a reader can see exactly what the engram claims
+    // points somewhere.
+    expect(marked).toHaveTextContent("[[Ghost]]");
+    expect(marked.className).toContain("decoration-dotted");
+    expect(screen.queryByRole("link")).toBeNull();
+  });
+
+  it("leaves a wikilink the resolver knows nothing about as text", async () => {
+    // Nothing known is not the same as known to be broken: before the graph
+    // has answered, a wikilink is prose rather than a claim either way.
+    await renderMarkdown("See [[Alpha]] for the rest.", () => null);
+
+    expect(screen.getByText(/See \[\[Alpha\]\] for the rest\./)).toBeVisible();
+    expect(screen.queryByRole("link")).toBeNull();
+    expect(screen.queryByTitle("not resolved")).toBeNull();
+  });
+
+  it("never rewrites a wikilink inside code", async () => {
+    await renderMarkdown(
+      [
+        "```md",
+        "See [[Alpha]] here.",
+        "```",
+        "",
+        "And `[[Alpha]]` inline.",
+      ].join("\n"),
+      () => ({ kind: "resolved", href: "/d/eng/e/alpha", label: "Alpha" }),
+    );
+
     expect(screen.queryByRole("link")).toBeNull();
   });
 });

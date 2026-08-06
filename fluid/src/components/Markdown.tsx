@@ -15,14 +15,23 @@
 
 import { Suspense, lazy } from "react";
 
+import type { WikilinkResolver } from "../wikilinks";
+
 const MarkdownBody = lazy(() => import("./MarkdownBody"));
 
 export interface MarkdownProps {
   /** The markdown as written, frontmatter and all. */
   source: string;
+  /**
+   * What each `[[Target]]` in the prose resolves to, when the caller knows.
+   * Absent, and for every target it answers `null` about, a wikilink stays the
+   * text it was written as: only the engram page holds the payloads that say
+   * where one goes.
+   */
+  wikilinks?: WikilinkResolver;
 }
 
-export function Markdown({ source }: MarkdownProps) {
+export function Markdown({ source, wikilinks }: MarkdownProps) {
   return (
     <Suspense
       fallback={
@@ -33,7 +42,7 @@ export function Markdown({ source }: MarkdownProps) {
         </p>
       }
     >
-      <MarkdownBody source={source} />
+      <MarkdownBody source={source} wikilinks={wikilinks} />
     </Suspense>
   );
 }

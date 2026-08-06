@@ -18,3 +18,27 @@ export function formatDay(value: string): string {
 export function plural(count: number, one: string, many: string): string {
   return `${String(count)} ${count === 1 ? one : many}`;
 }
+
+/**
+ * Today where this browser is, as `YYYY-MM-DD`.
+ *
+ * The local day rather than the UTC one, for the reason {@link formatDay}
+ * exists: the dates in a knowledge base are days somebody wrote down, and a
+ * reader west of UTC comparing them against `toISOString()` would be told a day
+ * ahead of the one they are living in.
+ */
+export function localDay(now: Date = new Date()): string {
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return `${String(now.getFullYear())}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+}
+
+/**
+ * Whether `day` is on or before `today`, for two `YYYY-MM-DD` strings.
+ *
+ * Compared as text, which is what the ISO ordering is for, and never parsed
+ * into a `Date`. A value that is not a plain day is not a date this app can
+ * reason about, so it answers false rather than guessing.
+ */
+export function hasArrived(day: string, today: string): boolean {
+  return /^\d{4}-\d{2}-\d{2}$/.test(day) && day <= today;
+}

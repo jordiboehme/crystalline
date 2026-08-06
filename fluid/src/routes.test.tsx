@@ -8,13 +8,17 @@
  * a 404 nobody can explain from the link they clicked. So this walks the whole
  * round trip through the real router, and it starts from the links a reader
  * actually clicks: the rows of a domain's engram list.
+ *
+ * The round trip ends at the request the engram screen makes, because that is
+ * the last place the permalink can be mangled: the API path has to carry the
+ * same slashes the link did, encoded a segment at a time.
  */
 
 import { screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { api } from "./api/client";
+import { api, engramPath } from "./api/client";
 import {
   answersFor,
   domainsResponse,
@@ -30,7 +34,7 @@ vi.mock("./api/client", async (importOriginal) => {
 
 const apiMock = vi.mocked(api);
 
-/** A domain whose one engram sits at `permalink`. */
+/** A domain whose one engram sits at `permalink`, and that engram itself. */
 function serveDomain(domain: string, permalink: string) {
   const encoded = encodeURIComponent(domain);
   apiMock.mockImplementation(
@@ -52,8 +56,28 @@ function serveDomain(domain: string, permalink: string) {
         ],
       }),
       "/vocabulary": () => ({ domain, tags: [] }),
+      [engramPath(domain, permalink)]: () => ({
+        domain,
+        permalink,
+        title: "Gamma",
+        type: "engram",
+        status: "stable",
+        url: `crystalline://${domain}/${permalink}`,
+        content: "The third engram.",
+        checksum: "abc123",
+        frontmatter: { engram_type: "engram", status: "stable", tags: [] },
+        observations: [],
+        relations: [],
+        links: [],
+      }),
+      "/graph": () => ({ nodes: [], edges: [], truncated: false }),
     }),
   );
+}
+
+/** Every path the app asked for, in order. */
+function requested(): string[] {
+  return apiMock.mock.calls.map((call) => call[0]);
 }
 
 /** Open the domain and click the row the list drew for its one engram. */
@@ -76,33 +100,29 @@ describe("the engram route", () => {
     // The slashes inside the permalink stay slashes in the URL, which is what
     // makes the splat match rather than a single escaped segment.
     expect(row).toHaveAttribute("href", "/d/eng/e/notes/deep/gamma");
-    expect(
-      await screen.findByRole("heading", {
-        name: "Engram: notes/deep/gamma in eng",
-      }),
-    ).toBeVisible();
+    expect(await screen.findByRole("heading", { name: "Gamma" })).toBeVisible();
+    // And the same slashes reach the API, which is the only proof the splat
+    // arrived whole rather than merely matching a route.
+    expect(requested()).toContain("/domains/eng/engrams/notes/deep/gamma");
   });
 
   it("round-trips a segment that needed encoding, decoded", async () => {
     const row = await followRowIn("eng", "notes/deep dive/gamma");
 
     expect(row).toHaveAttribute("href", "/d/eng/e/notes/deep%20dive/gamma");
-    // Encoded on the way out, decoded on the way in: the screen sees the
-    // permalink as it is written on disk, not as it travelled.
-    expect(
-      await screen.findByRole("heading", {
-        name: "Engram: notes/deep dive/gamma in eng",
-      }),
-    ).toBeVisible();
+    // Encoded on the way out, decoded on the way in, and encoded again a
+    // segment at a time on the way to the API: the screen sees the permalink
+    // as it is written on disk, not as it travelled.
+    expect(await screen.findByRole("heading", { name: "Gamma" })).toBeVisible();
+    expect(requested()).toContain(
+      "/domains/eng/engrams/notes/deep%20dive/gamma",
+    );
   });
 
   it("carries a domain that needed encoding too", async () => {
     await followRowIn("team eng", "notes/alpha");
 
-    expect(
-      await screen.findByRole("heading", {
-        name: "Engram: notes/alpha in team eng",
-      }),
-    ).toBeVisible();
+    expect(await screen.findByRole("heading", { name: "Gamma" })).toBeVisible();
+    expect(requested()).toContain("/domains/team%20eng/engrams/notes/alpha");
   });
 });

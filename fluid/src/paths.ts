@@ -33,3 +33,14 @@ export function engramRoute(domain: string, permalink: string): string {
 export function searchRoute(query: string): string {
   return `/search?q=${encodeURIComponent(query)}`;
 }
+
+/**
+ * Everything carrying one tag, across every domain.
+ *
+ * Search rather than a domain listing on purpose: a tag is a thread through the
+ * whole knowledge base, and following it out of the domain it was noticed in is
+ * the point of clicking one.
+ */
+export function tagRoute(tag: string): string {
+  return `/search?tags=${encodeURIComponent(tag)}`;
+}
