@@ -17,6 +17,10 @@
     "jsx": "react-jsx",
 
     /* Linting */
+    // Pinned rather than inherited: TypeScript 6 defaults `strict` to true, so
+    // this is a no-op today, but it keeps the guarantee stated in the config
+    // instead of resting on a compiler default that used to be false.
+    "strict": true,
     "noUnusedLocals": true,
     "noUnusedParameters": true,
     "erasableSyntaxOnly": true,
