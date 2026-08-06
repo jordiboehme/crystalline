@@ -10,11 +10,12 @@ mod domains;
 mod engrams;
 mod error;
 mod graph;
+mod users_api;
 
 use std::sync::Arc;
 
 use axum::Router;
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 use tokio::sync::Semaphore;
 
 pub use auth::{
@@ -89,6 +90,14 @@ pub fn router(state: RestState) -> Router {
         .route("/context", get(discovery::context))
         .route("/activity", get(discovery::activity))
         .route("/graph", get(graph::graph))
+        // Admin only, enforced inside the handlers: the guard below stops at
+        // viewer. See [`users_api`] for the three rules these first mutating
+        // routes are held to.
+        .route("/users", get(users_api::list).post(users_api::create))
+        .route(
+            "/users/{name}",
+            patch(users_api::update).delete(users_api::remove),
+        )
         .fallback(unknown_path)
         // Applies to every method router registered above it, so it stays
         // below the routes and above the guard.

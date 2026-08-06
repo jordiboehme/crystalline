@@ -1,0 +1,435 @@
+//! The accounts that may sign in to this instance, managed over HTTP.
+//!
+//! The same four operations `crystalline users` performs, behind the same
+//! store, so the CLI and the UI are one source of truth rather than two: the
+//! listing is the `{"users": [...]}` envelope `users list --json` already
+//! prints, and every refusal here is the store's own, surfaced with a status a
+//! browser client can branch on.
+//!
+//! These are the first mutating routes on this surface, so three rules are
+//! written down rather than left to be re-derived:
+//!
+//! 1. **Admin only, in the handler.** [`super::auth::guard`] enforces viewer
+//!    and nothing more, so every handler below opens with
+//!    [`Identity::require_admin`]. A route added here without it would be
+//!    reachable by any account that can log in.
+//! 2. **Cross-site protection.** A cookie session must echo its CSRF token on
+//!    every unsafe method; the middleware does that. The other two identities
+//!    carry no token, so each needs its own reason to be safe:
+//!    - The anonymous viewer never gets past `require_admin`. It has no
+//!      account, so it is answered 401 rather than served.
+//!    - A trusted-header admin is protected by the request shape. `PATCH` and
+//!      `DELETE` are not simple methods, so a cross-origin caller cannot send
+//!      them at all without a CORS preflight; `POST` it can send, but only with
+//!      `application/x-www-form-urlencoded`, `text/plain` or
+//!      `multipart/form-data`, and [`create`] takes its body through
+//!      [`ApiJson`], which demands `application/json` and refuses all three.
+//!      **No CORS layer exists on this surface and one must not be added
+//!      without revisiting the CSRF check in [`super::auth`] first**: a
+//!      permitted preflight would remove the only thing standing between
+//!      another origin and a trusted-header admin's account.
+//! 3. **No lockout escape hatch.** The store refuses to remove, disable or
+//!    demote the last enabled admin, and that refusal is passed through as a
+//!    409 rather than overridden by any flag. An installation must never be
+//!    lockable out of its own user management over HTTP; `crystalline users`,
+//!    which runs on the machine that holds the database, is the recovery path.
+//!    For the same reason an admin may not delete or disable *itself*, which is
+//!    a distinct refusal: another admin may well exist, and the account being
+//!    protected is the caller's own way back in.
+
+use axum::Json;
+use axum::extract::State;
+use axum::http::StatusCode;
+use serde::Deserialize;
+use serde_json::{Value, json};
+
+use super::auth::{Caller, Identity};
+use super::auth_store::{Role, User};
+use super::{ApiError, ApiJson, ApiPath, RestState};
+
+/// `GET /users` - every account, by name.
+///
+/// [`User`] carries no password material, so the rows go out as they come back
+/// from the store. Admin only: the account list names every way into the
+/// instance and who holds it.
+pub async fn list(
+    State(state): State<RestState>,
+    identity: Identity,
+) -> Result<Json<Value>, ApiError> {
+    identity.require_admin()?;
+    let users = state
+        .auth
+        .list_users()
+        .await
+        .map_err(|e| store_error(e, ""))?;
+    Ok(Json(json!({ "users": users })))
+}
+
+/// What `POST /users` takes. `display` defaults to the name as typed, matching
+/// `crystalline users add`, and `email` is optional and never used for login.
+#[derive(Debug, Deserialize)]
+pub struct CreateBody {
+    /// The login name, in any casing: the store folds it.
+    name: String,
+    /// Human-readable name for the UI. Defaults to `name` as typed.
+    #[serde(default)]
+    display: Option<String>,
+    /// Optional contact address.
+    #[serde(default)]
+    email: Option<String>,
+    /// What the new account may do.
+    role: Role,
+    /// The initial password. Never stored in the clear; the store hashes it.
+    password: String,
+}
+
+/// `POST /users` - add an account, answering 201 with the account as stored.
+///
+/// The response is read back out of the store rather than echoed from the
+/// request, so what the client renders is what was written: the folded name,
+/// the defaulted display name, and the disabled flag the row starts with.
+pub async fn create(
+    State(state): State<RestState>,
+    identity: Identity,
+    ApiJson(body): ApiJson<CreateBody>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    identity.require_admin()?;
+    check_password(&body.password)?;
+    // The login name as typed makes the better default display name: the store
+    // folds the login name but keeps this one as given.
+    let display = body.display.unwrap_or_else(|| body.name.trim().to_string());
+    state
+        .auth
+        .add_user(
+            &body.name,
+            &display,
+            body.email.as_deref(),
+            body.role,
+            &body.password,
+        )
+        .await
+        .map_err(|e| store_error(e, &body.name))?;
+    let user = read_back(&state, &body.name).await?;
+    Ok((StatusCode::CREATED, Json(json!({ "user": user }))))
+}
+
+/// What `PATCH /users/{name}` takes: whichever of the three an admin wants to
+/// change. All absent is refused rather than served as a no-op, so a client
+/// sending the wrong field names hears about it.
+#[derive(Debug, Deserialize)]
+pub struct PatchBody {
+    /// The new role.
+    #[serde(default)]
+    role: Option<Role>,
+    /// Whether the account is disabled. A disabled account can neither log in
+    /// nor use a session it already holds.
+    #[serde(default)]
+    disabled: Option<bool>,
+    /// A replacement password.
+    #[serde(default)]
+    password: Option<String>,
+}
+
+/// `PATCH /users/{name}` - change a role, a disabled flag, a password, or any
+/// combination, answering with the account as it now stands.
+///
+/// Every check runs before the first write, so a request that will be refused
+/// changes nothing. The writes themselves are one store call each rather than
+/// one transaction: the store's guarded statements each own their own
+/// invariant, and a failure part-way leaves the earlier fields applied and says
+/// which operation was refused. That is visible to a client only in the
+/// pathological case of a concurrent edit racing this one, since the refusals a
+/// caller can provoke on purpose - the last-admin guard and an unknown account
+/// - are decided identically by all three statements.
+pub async fn update(
+    State(state): State<RestState>,
+    identity: Identity,
+    ApiPath(name): ApiPath<String>,
+    ApiJson(body): ApiJson<PatchBody>,
+) -> Result<Json<Value>, ApiError> {
+    let caller = identity.require_admin()?;
+    if body.role.is_none() && body.disabled.is_none() && body.password.is_none() {
+        return Err(ApiError::unprocessable(
+            "this request changes nothing: send role, disabled or password",
+        ));
+    }
+    if let Some(password) = &body.password {
+        check_password(password)?;
+    }
+    if body.disabled == Some(true) {
+        refuse_self(&caller, &name, "disable")?;
+    }
+    if let Some(role) = body.role {
+        state
+            .auth
+            .set_role(&name, role)
+            .await
+            .map_err(|e| store_error(e, &name))?;
+    }
+    if let Some(disabled) = body.disabled {
+        state
+            .auth
+            .set_disabled(&name, disabled)
+            .await
+            .map_err(|e| store_error(e, &name))?;
+    }
+    if let Some(password) = &body.password {
+        state
+            .auth
+            .set_password(&name, password)
+            .await
+            .map_err(|e| store_error(e, &name))?;
+    }
+    let user = read_back(&state, &name).await?;
+    Ok(Json(json!({ "user": user })))
+}
+
+/// `DELETE /users/{name}` - remove an account and every session it holds,
+/// answering 204.
+///
+/// An admin may not remove its own account (409), and the store refuses to
+/// remove the last enabled admin whoever asks (409 as well, in its own words).
+pub async fn remove(
+    State(state): State<RestState>,
+    identity: Identity,
+    ApiPath(name): ApiPath<String>,
+) -> Result<StatusCode, ApiError> {
+    let caller = identity.require_admin()?;
+    refuse_self(&caller, &name, "delete")?;
+    state
+        .auth
+        .remove_user(&name)
+        .await
+        .map_err(|e| store_error(e, &name))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Refuse an admin acting destructively on its own account. `verb` names what
+/// was asked for, and the message is deliberately unlike the store's last-admin
+/// one: this refusal can fire while other admins exist, and what it protects is
+/// the caller's own session rather than the installation.
+fn refuse_self(caller: &Caller, target: &str, verb: &str) -> Result<(), ApiError> {
+    if folded(target) != caller.name() {
+        return Ok(());
+    }
+    Err(ApiError::conflict(format!(
+        "refusing to {verb} your own account ('{}'): ask another admin to do it, \
+         or use `crystalline users` on the server",
+        caller.name()
+    )))
+}
+
+/// Refuse an empty password before it is hashed into an account nobody can log
+/// in as. The store would accept it; `crystalline users` refuses it, and this
+/// surface matches.
+fn check_password(password: &str) -> Result<(), ApiError> {
+    if password.is_empty() {
+        return Err(ApiError::unprocessable(
+            "the password is empty; pick one with at least one character",
+        ));
+    }
+    Ok(())
+}
+
+/// The account as it now stands, read back out of the store after a write.
+///
+/// The listing rather than a single-row read because the store exposes no
+/// by-name getter, and the cost is one small query over a table with a handful
+/// of rows in it.
+async fn read_back(state: &RestState, name: &str) -> Result<User, ApiError> {
+    let name = folded(name);
+    state
+        .auth
+        .list_users()
+        .await
+        .map_err(|e| store_error(e, &name))?
+        .into_iter()
+        .find(|user| user.name == name)
+        .ok_or_else(|| {
+            // Only reachable if something removed the account between the write
+            // and this read. The write did happen, so this is not a failure of
+            // the request - but answering with a body that was made up here
+            // would be worse than saying the read did not work.
+            ApiError::internal(format!(
+                "the account '{name}' was written but could not be read back"
+            ))
+        })
+}
+
+/// The form the store keys on: trimmed and lowercased, mirroring the store's
+/// own `normalize_name`.
+///
+/// Mirrored rather than shared because the store's folding is private to it and
+/// is the authority; nothing here writes with this value, it only compares
+/// (`refuse_self`) and looks up (`read_back`). `folding_matches_the_store`
+/// pins the two together, so a change on either side fails a test rather than
+/// silently opening a way around the self-account check.
+fn folded(name: &str) -> String {
+    name.trim().to_lowercase()
+}
+
+/// Classify an [`AuthStore`](super::AuthStore) failure for the wire.
+///
+/// The store reports in `anyhow`, so this reads its message. That is a string
+/// seam, and it is tested rather than assumed: `store_errors_are_classified`
+/// below drives a real store into each of these failures and asserts the status
+/// that comes out, so rewording a message on the store side fails here instead
+/// of quietly turning a 409 into a 500.
+///
+/// Anything unrecognized stays a 500: an error this layer cannot name is not
+/// the caller's fault by default. `subject` is the account the failed call was
+/// about, for the one message that has to be rewritten rather than passed
+/// through; pass `""` where there is no single one.
+fn store_error(e: anyhow::Error, subject: &str) -> ApiError {
+    let detail = format!("{e:#}");
+    if detail.contains("UNIQUE constraint") {
+        // The store's message here is the database's, and it names a column.
+        // The caller gets product copy instead, naming the account and what to
+        // do about it, the way `crystalline users add` does.
+        return ApiError::conflict(format!(
+            "a user named '{}' already exists; edit that account instead",
+            folded(subject)
+        ));
+    }
+    if detail.contains("the last admin") {
+        return ApiError::conflict(detail);
+    }
+    if detail.contains("no such user") {
+        return ApiError::not_found(detail);
+    }
+    if detail.contains("a user name cannot be empty") {
+        return ApiError::unprocessable(detail);
+    }
+    ApiError::internal(detail)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rest::AuthStore;
+
+    async fn store() -> (tempfile::TempDir, AuthStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AuthStore::open(&dir.path().join("web-auth.db"))
+            .await
+            .unwrap();
+        (dir, store)
+    }
+
+    /// The classifier against the store's real errors rather than against
+    /// strings written down twice: every one of these is provoked by asking the
+    /// store to do the thing it refuses.
+    #[tokio::test]
+    async fn store_errors_are_classified() {
+        let (_dir, store) = store().await;
+        store
+            .add_user("ada", "Ada", None, Role::Admin, "s3cret")
+            .await
+            .unwrap();
+
+        let duplicate = store
+            .add_user("ADA", "Ada again", None, Role::Viewer, "other")
+            .await
+            .expect_err("the primary key refuses a second 'ada'");
+        let api = store_error(duplicate, "ADA");
+        assert_eq!(api.status, StatusCode::CONFLICT);
+        assert!(
+            !api.detail.contains("UNIQUE"),
+            "in product copy: {}",
+            api.detail
+        );
+        assert!(
+            api.detail.contains("'ada'"),
+            "naming the account as it is stored: {}",
+            api.detail
+        );
+
+        let last_admin = store
+            .set_role("ada", Role::Viewer)
+            .await
+            .expect_err("the last admin cannot be demoted");
+        let api = store_error(last_admin, "ada");
+        assert_eq!(api.status, StatusCode::CONFLICT);
+        assert!(
+            api.detail.contains("last admin"),
+            "the store's own words: {}",
+            api.detail
+        );
+
+        let removed = store
+            .remove_user("ada")
+            .await
+            .expect_err("nor removed")
+            .to_string();
+        assert!(removed.contains("last admin"), "{removed}");
+
+        let missing = store
+            .set_password("ghost", "s3cret")
+            .await
+            .expect_err("no such account");
+        let api = store_error(missing, "ghost");
+        assert_eq!(api.status, StatusCode::NOT_FOUND);
+        assert!(api.detail.contains("ghost"), "{}", api.detail);
+
+        let empty = store
+            .set_disabled("   ", true)
+            .await
+            .expect_err("an empty name is not a name");
+        assert_eq!(
+            store_error(empty, "   ").status,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+
+        assert_eq!(
+            store_error(anyhow::anyhow!("the disk fell over"), "ada").status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "an error this layer cannot name is not the caller's fault"
+        );
+    }
+
+    /// [`folded`] and the store must agree, because the self-account check
+    /// compares this layer's folding against the name the store handed back.
+    #[tokio::test]
+    async fn folding_matches_the_store() {
+        let (_dir, store) = store().await;
+        for raw in ["  AdA ", "ADA", "ada", "Ada\t"] {
+            store
+                .add_user(raw, "Ada", None, Role::Viewer, "s3cret")
+                .await
+                .ok();
+            let users = store.list_users().await.unwrap();
+            assert_eq!(users.len(), 1, "every spelling is the one account");
+            assert_eq!(users[0].name, folded(raw), "'{raw}' folds the same way");
+        }
+    }
+
+    /// The self-account refusal fires on the folded name, so a differently
+    /// spelled path is not a way around it, and leaves another account alone.
+    #[test]
+    fn an_admin_cannot_target_its_own_account() {
+        let caller = Caller::Account(User {
+            name: "root".to_string(),
+            display: "Root".to_string(),
+            email: None,
+            role: Role::Admin,
+            disabled: false,
+        });
+        for spelling in ["root", "ROOT", "  Root  "] {
+            let refused = refuse_self(&caller, spelling, "delete")
+                .expect_err("'{spelling}' is the caller's own account");
+            assert_eq!(refused.status, StatusCode::CONFLICT);
+            assert!(refused.detail.contains("your own account"));
+        }
+        assert!(refuse_self(&caller, "ada", "delete").is_ok());
+    }
+
+    /// An empty password is refused before it reaches the store.
+    #[test]
+    fn an_empty_password_is_refused() {
+        assert_eq!(
+            check_password("").unwrap_err().status,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert!(check_password(" ").is_ok(), "a space is a character");
+    }
+}

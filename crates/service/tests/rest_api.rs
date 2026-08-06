@@ -230,6 +230,20 @@ async fn serve_with_ada(opts: AuthOptions) -> Fixture {
     fixture
 }
 
+/// The same fixture with one admin account, `root` / `rootpw`, already added
+/// and logged in. Returns the fixture beside that session's cookie and CSRF
+/// token, which every admin-route request needs.
+async fn serve_as_admin(opts: AuthOptions) -> (Fixture, String, String) {
+    let fixture = serve_with_auth(opts).await;
+    fixture
+        .auth
+        .add_user("root", "Root", None, Role::Admin, "rootpw")
+        .await
+        .unwrap();
+    let (token, csrf) = login(fixture.addr, "root", "rootpw").await;
+    (fixture, token, csrf)
+}
+
 /// A client with proxy discovery disabled: the target is loopback, where a
 /// system proxy must never be consulted anyway, and reqwest's platform proxy
 /// lookup can block for a minute on a machine with a managed network
@@ -245,6 +259,45 @@ async fn get(addr: std::net::SocketAddr, path: &str) -> reqwest::Response {
         .send()
         .await
         .unwrap()
+}
+
+/// A request carrying a session's cookie and its CSRF token, the shape every
+/// mutating request from the browser client has. The caller adds a body and
+/// sends it.
+fn as_session(
+    addr: std::net::SocketAddr,
+    method: reqwest::Method,
+    path: &str,
+    token: &str,
+    csrf: &str,
+) -> reqwest::RequestBuilder {
+    client()
+        .request(method, format!("http://{addr}{path}"))
+        .header("cookie", format!("fluid_session={token}"))
+        .header("x-csrf-token", csrf)
+}
+
+/// The field names one user object carries, which is the whole contract: the
+/// five columns the CLI's `users list --json` prints and nothing else.
+fn user_fields(user: &serde_json::Value) -> Vec<String> {
+    let mut keys: Vec<String> = user
+        .as_object()
+        .expect("a user is an object")
+        .keys()
+        .cloned()
+        .collect();
+    keys.sort();
+    keys
+}
+
+/// The `name` of every account in a `{"users": [...]}` envelope.
+fn user_names(body: &serde_json::Value) -> Vec<String> {
+    body["users"]
+        .as_array()
+        .expect("the listing carries a users array")
+        .iter()
+        .map(|u| u["name"].as_str().unwrap().to_string())
+        .collect()
 }
 
 /// Log in as `name`, returning the session cookie value and the CSRF token.
@@ -510,6 +563,8 @@ async fn data_routes_401_without_identity_when_not_anonymous() {
         "/api/v1/context",
         "/api/v1/activity",
         "/api/v1/graph",
+        "/api/v1/users",
+        "/api/v1/users/ada",
     ] {
         let resp = get(fixture.addr, path).await;
         assert_eq!(resp.status(), 401, "{path} must be guarded");
@@ -1700,4 +1755,493 @@ async fn a_bad_graph_anchor_is_a_problem_detail() {
     let body: serde_json::Value = unknown.json().await.unwrap();
     assert_eq!(body["title"], "not found");
     assert!(body["detail"].as_str().unwrap().contains("ghost"), "{body}");
+}
+
+/// Every user route is admin-only, and the refusal is about the role rather
+/// than about the CSRF token: each request below carries a valid one, so a
+/// viewer and an editor are refused on what they are, not on what they sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn user_routes_are_refused_to_a_viewer_and_an_editor() {
+    for role in [Role::Viewer, Role::Editor] {
+        let fixture = serve_with_auth(AuthOptions::default()).await;
+        fixture
+            .auth
+            .add_user("ada", "Ada", None, role, "s3cret")
+            .await
+            .unwrap();
+        let (token, csrf) = login(fixture.addr, "ada", "s3cret").await;
+        let cases = [
+            (reqwest::Method::GET, "/api/v1/users", None),
+            (
+                reqwest::Method::POST,
+                "/api/v1/users",
+                Some(serde_json::json!({"name": "bob", "role": "viewer", "password": "hunter2"})),
+            ),
+            (
+                reqwest::Method::PATCH,
+                "/api/v1/users/ada",
+                Some(serde_json::json!({"role": "admin"})),
+            ),
+            (reqwest::Method::DELETE, "/api/v1/users/ada", None),
+        ];
+        for (method, path, body) in cases {
+            let mut request = as_session(fixture.addr, method.clone(), path, &token, &csrf);
+            if let Some(body) = &body {
+                request = request.json(body);
+            }
+            let resp = request.send().await.unwrap();
+            assert_eq!(
+                resp.status(),
+                403,
+                "a {role} must not reach {method} {path}"
+            );
+            assert_eq!(resp.headers()["content-type"], "application/problem+json");
+            let detail: serde_json::Value = resp.json().await.unwrap();
+            assert_eq!(detail["status"], 403);
+        }
+        let users = fixture.auth.list_users().await.unwrap();
+        assert_eq!(users.len(), 1, "nothing a {role} sent changed anything");
+        assert_eq!(users[0].role, role, "including its own row");
+    }
+}
+
+/// The admin round trip: create an account, see it in the listing, edit it,
+/// and remove it again. The response carries the account as stored - the name
+/// folded, no password material - and the listing is the `{"users": [...]}`
+/// envelope the CLI's `users list --json` already prints.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_admin_creates_lists_edits_and_removes_an_account() {
+    let (fixture, token, csrf) = serve_as_admin(AuthOptions::default()).await;
+    let addr = fixture.addr;
+
+    let created = as_session(addr, reqwest::Method::POST, "/api/v1/users", &token, &csrf)
+        .json(&serde_json::json!({
+            "name": "  BoB ",
+            "display": "Bob",
+            "email": "bob@example.com",
+            "role": "editor",
+            "password": "hunter2",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201);
+    let body: serde_json::Value = created.json().await.unwrap();
+    assert_eq!(
+        body["user"]["name"], "bob",
+        "the store folds the name: {body}"
+    );
+    assert_eq!(body["user"]["display"], "Bob");
+    assert_eq!(body["user"]["email"], "bob@example.com");
+    assert_eq!(body["user"]["role"], "editor");
+    assert_eq!(body["user"]["disabled"], false);
+    assert_eq!(
+        user_fields(&body["user"]),
+        vec!["disabled", "display", "email", "name", "role"],
+        "no password material may reach the client: {body}"
+    );
+
+    let listed = as_session(addr, reqwest::Method::GET, "/api/v1/users", &token, &csrf)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), 200);
+    let body: serde_json::Value = listed.json().await.unwrap();
+    assert_eq!(
+        user_names(&body),
+        vec!["bob".to_string(), "root".to_string()],
+        "every account, by name: {body}"
+    );
+    assert_eq!(
+        user_fields(&body["users"][0]),
+        vec!["disabled", "display", "email", "name", "role"],
+        "the listing carries no hashes either: {body}"
+    );
+
+    let patched = as_session(
+        addr,
+        reqwest::Method::PATCH,
+        "/api/v1/users/bob",
+        &token,
+        &csrf,
+    )
+    .json(&serde_json::json!({"role": "viewer", "disabled": true}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(patched.status(), 200);
+    let body: serde_json::Value = patched.json().await.unwrap();
+    assert_eq!(body["user"]["role"], "viewer", "{body}");
+    assert_eq!(body["user"]["disabled"], true, "{body}");
+
+    // A password change lands too, which the store only proves by accepting it
+    // at login - so the account is re-enabled and asked to log in with it.
+    let repaired = as_session(
+        addr,
+        reqwest::Method::PATCH,
+        "/api/v1/users/bob",
+        &token,
+        &csrf,
+    )
+    .json(&serde_json::json!({"disabled": false, "password": "corrected horse"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(repaired.status(), 200);
+    let (bob_token, _) = login(addr, "bob", "corrected horse").await;
+    let me: serde_json::Value = client()
+        .get(format!("http://{addr}/api/v1/auth/me"))
+        .header("cookie", format!("fluid_session={bob_token}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(me["user"]["name"], "bob", "the new password works: {me}");
+
+    let removed = as_session(
+        addr,
+        reqwest::Method::DELETE,
+        "/api/v1/users/bob",
+        &token,
+        &csrf,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(removed.status(), 204);
+    assert!(
+        removed.bytes().await.unwrap().is_empty(),
+        "204 carries no body"
+    );
+
+    let body: serde_json::Value =
+        as_session(addr, reqwest::Method::GET, "/api/v1/users", &token, &csrf)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    assert_eq!(user_names(&body), vec!["root".to_string()], "{body}");
+}
+
+/// An admin cannot lock itself out by hand: deleting or disabling its own
+/// account is refused as a conflict, and the refusal reads differently from the
+/// last-admin one - here another admin exists, so the installation is in no
+/// danger and only the caller's own session is being protected.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_admin_cannot_delete_or_disable_itself() {
+    let (fixture, token, csrf) = serve_as_admin(AuthOptions::default()).await;
+    let addr = fixture.addr;
+    fixture
+        .auth
+        .add_user("ada", "Ada", None, Role::Admin, "s3cret")
+        .await
+        .unwrap();
+
+    for (method, path, body) in [
+        (reqwest::Method::DELETE, "/api/v1/users/root", None),
+        (
+            reqwest::Method::PATCH,
+            "/api/v1/users/root",
+            Some(serde_json::json!({"disabled": true})),
+        ),
+        // The same account by another spelling: the comparison folds, so a
+        // capitalized path is not a way around the check.
+        (reqwest::Method::DELETE, "/api/v1/users/ROOT", None),
+    ] {
+        let mut request = as_session(addr, method.clone(), path, &token, &csrf);
+        if let Some(body) = &body {
+            request = request.json(body);
+        }
+        let resp = request.send().await.unwrap();
+        assert_eq!(resp.status(), 409, "{method} {path} must be refused");
+        assert_eq!(resp.headers()["content-type"], "application/problem+json");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["title"], "conflict");
+        let detail = body["detail"].as_str().unwrap();
+        assert!(
+            detail.contains("your own account"),
+            "the refusal says whose account it is: {body}"
+        );
+        assert!(
+            !detail.contains("last admin"),
+            "and it is not the last-admin refusal: {body}"
+        );
+    }
+
+    let users = fixture.auth.list_users().await.unwrap();
+    let root = users.iter().find(|u| u.name == "root").unwrap();
+    assert!(!root.disabled, "the account is untouched and still enabled");
+    assert_eq!(root.role, Role::Admin);
+}
+
+/// The store's last-admin guard reaches the wire as a 409 carrying its own
+/// message. There is deliberately no escape hatch: an installation must never
+/// be lockable out of its own user management over HTTP, and the CLI is the
+/// recovery path. Self-demotion is the way to ask for it, since any other admin
+/// caller would itself be a remaining admin.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn demoting_the_last_admin_is_refused_with_the_stores_message() {
+    let (fixture, token, csrf) = serve_as_admin(AuthOptions::default()).await;
+    let addr = fixture.addr;
+
+    let refused = as_session(
+        addr,
+        reqwest::Method::PATCH,
+        "/api/v1/users/root",
+        &token,
+        &csrf,
+    )
+    .json(&serde_json::json!({"role": "viewer"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(refused.status(), 409);
+    assert_eq!(
+        refused.headers()["content-type"],
+        "application/problem+json"
+    );
+    let body: serde_json::Value = refused.json().await.unwrap();
+    assert_eq!(body["title"], "conflict");
+    let detail = body["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("last admin"),
+        "the store's own words: {body}"
+    );
+    assert!(
+        detail.contains("add or enable another admin first"),
+        "including what to do about it: {body}"
+    );
+
+    let users = fixture.auth.list_users().await.unwrap();
+    assert_eq!(users[0].role, Role::Admin, "the demotion did not land");
+
+    // With a second admin in place the same request goes through, so what
+    // refused it was the guard and not the route.
+    fixture
+        .auth
+        .add_user("ada", "Ada", None, Role::Admin, "s3cret")
+        .await
+        .unwrap();
+    let ok = as_session(
+        addr,
+        reqwest::Method::PATCH,
+        "/api/v1/users/root",
+        &token,
+        &csrf,
+    )
+    .json(&serde_json::json!({"role": "viewer"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(ok.status(), 200);
+    let body: serde_json::Value = ok.json().await.unwrap();
+    assert_eq!(body["user"]["role"], "viewer", "{body}");
+}
+
+/// A mutating admin request from a cookie session carries the CSRF token like
+/// every other one: without it the middleware refuses before the handler runs,
+/// and no account is created.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn creating_an_account_needs_the_csrf_token() {
+    let (fixture, token, csrf) = serve_as_admin(AuthOptions::default()).await;
+    let addr = fixture.addr;
+    let body = serde_json::json!({"name": "bob", "role": "viewer", "password": "hunter2"});
+
+    let refused = client()
+        .post(format!("http://{addr}/api/v1/users"))
+        .header("cookie", format!("fluid_session={token}"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 403);
+    assert_eq!(
+        refused.headers()["content-type"],
+        "application/problem+json"
+    );
+    assert_eq!(
+        fixture.auth.list_users().await.unwrap().len(),
+        1,
+        "the refused request created nothing"
+    );
+
+    let ok = as_session(addr, reqwest::Method::POST, "/api/v1/users", &token, &csrf)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), 201, "with the token it goes through");
+}
+
+/// The invariant the trusted-header path leans on, asserted rather than
+/// assumed: that identity carries no CSRF token, so what keeps a cross-site
+/// form off these routes is the JSON content type this API demands. A form or
+/// text body - all a cross-site form can send without a CORS preflight, and no
+/// CORS layer exists on this surface - is refused by the extractor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cross_site_shaped_body_is_refused_on_the_trusted_header_path() {
+    let fixture = serve_with_auth(AuthOptions {
+        trusted_header: Some("remote-user"),
+        ..AuthOptions::default()
+    })
+    .await;
+    let addr = fixture.addr;
+    fixture
+        .auth
+        .ensure_user("proxy", Role::Viewer)
+        .await
+        .unwrap();
+    fixture.auth.set_role("proxy", Role::Admin).await.unwrap();
+    let url = format!("http://{addr}/api/v1/users");
+
+    for content_type in ["application/x-www-form-urlencoded", "text/plain"] {
+        let resp = client()
+            .post(&url)
+            .header("remote-user", "proxy")
+            .header("content-type", content_type)
+            .body(r#"{"name":"bob","role":"admin","password":"hunter2"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            415,
+            "a {content_type} body must not be acted on"
+        );
+        assert_eq!(resp.headers()["content-type"], "application/problem+json");
+    }
+    let names: Vec<String> = fixture
+        .auth
+        .list_users()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|u| u.name)
+        .collect();
+    assert_eq!(names, vec!["proxy".to_string()], "nothing was created");
+
+    let ok = client()
+        .post(&url)
+        .header("remote-user", "proxy")
+        .json(&serde_json::json!({"name": "bob", "role": "viewer", "password": "hunter2"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), 201, "the JSON request is served");
+}
+
+/// The anonymous viewer never reaches these routes, which is what keeps the
+/// CSRF-less anonymous identity off every mutating admin path: it has no
+/// account, so it is told to authenticate rather than being served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_anonymous_viewer_cannot_reach_the_user_routes() {
+    let fixture = serve_anonymous().await;
+    let addr = fixture.addr;
+
+    let listed = get(addr, "/api/v1/users").await;
+    assert_eq!(listed.status(), 401);
+    assert_eq!(listed.headers()["content-type"], "application/problem+json");
+
+    let created = client()
+        .post(format!("http://{addr}/api/v1/users"))
+        .json(&serde_json::json!({"name": "bob", "role": "admin", "password": "hunter2"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 401);
+    assert!(
+        fixture.auth.list_users().await.unwrap().is_empty(),
+        "nothing was created"
+    );
+}
+
+/// The ways a user request can be wrong, each answered with the status a client
+/// can branch on: a name already taken is a conflict, an account nobody created
+/// is a 404, and a request the server understood but cannot act on is a 422.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn user_request_failures_are_classified() {
+    let (fixture, token, csrf) = serve_as_admin(AuthOptions::default()).await;
+    let addr = fixture.addr;
+
+    let duplicate = as_session(addr, reqwest::Method::POST, "/api/v1/users", &token, &csrf)
+        .json(&serde_json::json!({"name": "Root", "role": "admin", "password": "hunter2"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(duplicate.status(), 409, "the name is taken");
+    let body: serde_json::Value = duplicate.json().await.unwrap();
+    assert!(
+        body["detail"].as_str().unwrap().contains("root"),
+        "the refusal names the account: {body}"
+    );
+    assert!(
+        !body["detail"].as_str().unwrap().contains("UNIQUE"),
+        "in product copy rather than in the database's words: {body}"
+    );
+
+    for (path, body, expected) in [
+        (
+            "/api/v1/users",
+            serde_json::json!({"name": "  ", "role": "viewer", "password": "hunter2"}),
+            422,
+        ),
+        (
+            "/api/v1/users",
+            serde_json::json!({"name": "bob", "role": "viewer", "password": ""}),
+            422,
+        ),
+        (
+            "/api/v1/users",
+            serde_json::json!({"name": "bob", "role": "wizard", "password": "hunter2"}),
+            422,
+        ),
+    ] {
+        let resp = as_session(addr, reqwest::Method::POST, path, &token, &csrf)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), expected, "POST {body} must be refused");
+        assert_eq!(resp.headers()["content-type"], "application/problem+json");
+    }
+
+    for (method, body) in [
+        (
+            reqwest::Method::PATCH,
+            Some(serde_json::json!({"role": "viewer"})),
+        ),
+        (reqwest::Method::DELETE, None),
+    ] {
+        let mut request = as_session(addr, method.clone(), "/api/v1/users/ghost", &token, &csrf);
+        if let Some(body) = &body {
+            request = request.json(body);
+        }
+        let resp = request.send().await.unwrap();
+        assert_eq!(resp.status(), 404, "{method} on an unknown account");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["title"], "not found");
+        assert!(body["detail"].as_str().unwrap().contains("ghost"), "{body}");
+    }
+
+    let nothing = as_session(
+        addr,
+        reqwest::Method::PATCH,
+        "/api/v1/users/root",
+        &token,
+        &csrf,
+    )
+    .json(&serde_json::json!({}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(nothing.status(), 422, "a patch that changes nothing");
+    let body: serde_json::Value = nothing.json().await.unwrap();
+    assert!(
+        body["detail"].as_str().unwrap().contains("role"),
+        "the detail names what it takes: {body}"
+    );
 }

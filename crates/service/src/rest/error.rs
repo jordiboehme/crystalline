@@ -61,6 +61,26 @@ impl ApiError {
         }
     }
 
+    /// A 409 for a request the server understood, is allowed to serve, and
+    /// refuses because carrying it out would break a rule about the state
+    /// rather than about the request: a name already taken, or an edit that
+    /// would leave the installation without an admin. Nothing about the request
+    /// can be corrected to make it succeed - something else has to change
+    /// first, which is what separates it from [`ApiError::unprocessable`].
+    pub fn conflict(detail: impl Into<String>) -> ApiError {
+        ApiError {
+            status: StatusCode::CONFLICT,
+            title: "conflict",
+            detail: detail.into(),
+        }
+    }
+
+    /// A 422 for a request the server understood but cannot act on, matching
+    /// the status the engine's own caller errors take.
+    pub fn unprocessable(detail: impl Into<String>) -> ApiError {
+        unprocessable_error(detail.into())
+    }
+
     /// A 500 for a failure that is not the caller's fault.
     pub fn internal(detail: impl Into<String>) -> ApiError {
         internal_error(detail.into())
@@ -205,7 +225,7 @@ impl From<EngineError> for ApiError {
             | EngineError::Conflict(_)
             | EngineError::Invalid(_)
             | EngineError::ReadOnly
-            | EngineError::EnvTokenConnect => unprocessable(detail),
+            | EngineError::EnvTokenConnect => unprocessable_error(detail),
             EngineError::Remote(remote) => remote_to_api_error(remote, detail),
             EngineError::Io { .. } | EngineError::Internal(_) => internal_error(detail),
         }
@@ -246,12 +266,12 @@ fn remote_to_api_error(e: crystalline_remote::RemoteError, detail: String) -> Ap
         | RemoteError::ConflictNotFound { .. } => ApiError::not_found(detail),
         RemoteError::NotEnabled
         | RemoteError::NotConnected
-        | RemoteError::ConflictsPending { .. } => unprocessable(detail),
+        | RemoteError::ConflictsPending { .. } => unprocessable_error(detail),
     }
 }
 
 /// A 422 for a request the server understood but cannot act on.
-fn unprocessable(detail: String) -> ApiError {
+fn unprocessable_error(detail: String) -> ApiError {
     ApiError {
         status: StatusCode::UNPROCESSABLE_ENTITY,
         title: "invalid request",

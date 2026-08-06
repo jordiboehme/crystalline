@@ -277,6 +277,23 @@ async fn resolve(state: &RestState, headers: &HeaderMap) -> Result<Identity, Api
 /// have no token to compare against, and for the trusted header the proxy that
 /// injects the identity owns that boundary. Login is exempt because it is what
 /// mints the token.
+///
+/// Passing the tokenless identities through is a deliberate invariant rather
+/// than an accident, and the mutating routes lean on it:
+///
+/// - The anonymous viewer is a viewer and nothing else, so it never reaches a
+///   route that changes anything - `require_admin` answers it 401 first.
+/// - A trusted-header caller can be an admin, and its request carries a header
+///   a browser attaches on its own for any origin. What keeps a cross-site
+///   request off those routes is the shape it is allowed to have instead:
+///   `PATCH` and `DELETE` are not simple methods, so another origin cannot send
+///   them without a CORS preflight, and the `POST` it can send is refused by
+///   [`ApiJson`], which demands `application/json` while a cross-site form can
+///   only send `application/x-www-form-urlencoded`, `text/plain` or
+///   `multipart/form-data`. **No CORS layer exists on this surface and one must
+///   not be added without revisiting this check**: allowing a cross-origin
+///   preflight would remove the only thing standing between another origin and
+///   a trusted-header admin's account.
 fn check_csrf(identity: &Identity, req: &Request) -> Result<(), ApiError> {
     if req.method().is_safe() || req.uri().path() == LOGIN_PATH {
         return Ok(());
