@@ -1,0 +1,35 @@
+# What never belongs in a Docker build context.
+#
+# Docker does not read .gitignore, so every gitignored path is still sent to
+# the daemon (and still copyable by a COPY) unless it is named here. The two
+# that matter most are fluid/node_modules and fluid/dist: both exist on any
+# machine that has run the front end once, both are large, and a stale
+# fluid/dist could be copied into an image and shadow the build that image
+# just made.
+#
+# dist/ itself is deliberately absent from this list. The release workflow
+# stages the musl binaries and the embedding model under dist/ before building
+# the server image, and the root Dockerfile copies them from exactly there.
+#
+# This file applies to a build whose context is the repository root. The Fluid
+# image builds from the fluid/ folder as its context, and Docker reads the
+# .dockerignore next to that context, so fluid/.dockerignore covers it.
+
+.git
+.gitignore
+.github
+
+target/
+**/node_modules/
+fluid/dist/
+
+.superpowers/
+plans/
+research/
+evals/skill-training/outputs/
+evals/skill-training/.venv/
+**/__pycache__/
+
+.DS_Store
+.idea/
+.vscode/

@@ -13,18 +13,23 @@ cd "$(git rev-parse --show-toplevel)"
 
 fail=0
 
-# Tracked markdown, Rust and Fluid front-end sources, excluding build output
-# and vendored third-party files, which must stay byte-identical to their
-# upstream (see evals/skill-training/vendor/README.md), plus the API types
-# fluid/src/api/types.ts, which are generated from the OpenAPI snapshot by
-# `pnpm generate:api` and never hand-written. Lockfiles need no exclusion:
-# none of the patterns below can match one.
+# Tracked markdown, Rust and Fluid front-end sources, plus the deployment
+# files (Dockerfiles, compose and workflow YAML, nginx configuration and its
+# templates), which carry as much prose in comments as anything else here.
+#
+# Excluded: build output; vendored third-party files, which must stay
+# byte-identical to their upstream (see evals/skill-training/vendor/README.md);
+# the API types fluid/src/api/types.ts, generated from the OpenAPI snapshot by
+# `pnpm generate:api` and never hand-written; and fluid/pnpm-lock.yaml, which
+# is generated too and is the one lockfile the patterns below can match.
 files=$(git ls-files -- '*.md' '*.rs' '*.ts' '*.tsx' '*.css' '*.html' \
+    '*Dockerfile' '*.dockerignore' '*.yml' '*.yaml' '*.conf' '*.template' \
     | grep -v '/target/' \
     | grep -v '^target/' \
     | grep -v '/node_modules/' \
     | grep -v '^evals/skill-training/vendor/' \
-    | grep -v '^fluid/src/api/types\.ts$' || true)
+    | grep -v '^fluid/src/api/types\.ts$' \
+    | grep -v '^fluid/pnpm-lock\.yaml$' || true)
 
 if [ -z "$files" ]; then
     echo "style-lint: no tracked source files found"

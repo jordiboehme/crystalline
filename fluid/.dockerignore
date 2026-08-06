@@ -1,0 +1,15 @@
+# The Fluid image builds with fluid/ as its context (see the Dockerfile), so
+# this is the ignore file Docker reads for it - the repository root's
+# .dockerignore is not consulted for a build rooted here.
+#
+# node_modules is reinstalled inside the image from the lockfile, and dist is
+# produced there by the build stage: shipping either into the context would
+# only make the upload slower and risk a stale bundle winning.
+
+node_modules/
+dist/
+
+.env
+.env.*
+
+.DS_Store

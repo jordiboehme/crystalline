@@ -58,6 +58,7 @@ Once knowledge grows into the thousands or tens of thousands of units, reading a
 - **Built on an open format.** The engram format extends [Google's Open Knowledge Format (OKF) v0.2](https://github.com/GoogleCloudPlatform/knowledge-catalog/tree/main/okf): plain markdown with YAML frontmatter, readable by any OKF tooling, with no lock-in. Unknown keys are always preserved, every engram records who wrote it and when and Crystalline layers its routing, temporal and knowledge-graph conventions on top - so OKF documents drop straight into a domain and your knowledge stays portable, diffable files whatever tools come next.
 - **Knowledge retires, it does not disappear.** When a fact stops holding, the old engram is superseded rather than overwritten: its `status` marks it as no longer current, `valid_from`/`valid_to` keep the past addressable by date ("what applied last June") and the lessons it taught carry forward as unbounded knowledge - the way a person still draws on a past job without mistaking it for the present. A retired engram stays in every search; it is only softly faded in ranking, so current knowledge surfaces first without the past ever going missing.
 - **MANIFEST routing** lets an agent (or a person) figure out which domain owns a task without reading every file: `crystalline prompt system` turns each domain's `## When to Use` bullets into a compact session-start briefing.
+- **Fluid** is the browser UI for an instance, and it is the half of this that is for people. Everything an agent captured is a page you can read: domains down the side, an engram with its frontmatter, observations, relations and backlinks, faceted search across the whole instance, an interactive graph of a neighborhood, and Cmd+K to jump anywhere by name. Crystalline stores what was learned; Fluid is where you think with it. One compose file runs both, see [Team server with Fluid](docs/deployment.md#team-server-with-fluid).
 
 ## Get started
 
@@ -408,6 +409,7 @@ Crystalline runs the same way in every scenario: a daemon in the middle keeps on
 | [Personal workstation](docs/deployment.md#personal-workstation) | The default: local folders, agents over stdio, one shared background daemon |
 | [Claude Desktop extension](docs/deployment.md#claude-desktop-extension) | One-click `.mcpb` install, no terminal involved; the agent creates domains at runtime |
 | [Team server](docs/deployment.md#team-server) | One container on the network, every agent connects over HTTP |
+| [Team server with Fluid](docs/deployment.md#team-server-with-fluid) | Browse and search the archive in a browser; one compose file wires Fluid and Crystalline together |
 | [Linux server with systemd](docs/deployment.md#linux-server-with-systemd) | The .deb ships a unit, disabled by default; enable it once and agents connect over HTTP |
 | [Published read-only domains](docs/deployment.md#published-read-only-domains) | Knowledge curated in a git repository, served read-only to agents |
 | [Air-gapped or egress-restricted](docs/deployment.md#air-gapped-or-egress-restricted) | The `with-model` image or a pre-fetched model directory; nothing at runtime needs the network |
