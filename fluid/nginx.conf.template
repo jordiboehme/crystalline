@@ -53,6 +53,14 @@ server {
         # tell the daemon a TLS session was plain.
         proxy_http_version 1.1;
 
+        # Longer than the 60s default, for the cold start: the daemon answers
+        # its healthcheck (and so Fluid starts serving) while the slim image is
+        # still downloading the embedding model, and the first search that
+        # needs an embedding waits for that to finish. 120s covers a normal
+        # download without letting a genuinely stuck request hang forever.
+        proxy_read_timeout 120s;
+        proxy_send_timeout 120s;
+
         # No URI part after the upstream, and that is load bearing. With none,
         # nginx passes the request URI exactly as the client sent it. Add a
         # trailing slash or any path and nginx switches rules: it then sends

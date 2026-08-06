@@ -20,8 +20,11 @@
 # network may browse, or auth.trusted_header behind an SSO proxy.
 #
 # Knowledge lives in ./knowledge next to this file, one subfolder per domain,
-# and stays plain markdown. Register a domain the same way the single-container
-# example does:
+# and stays plain markdown. The path is relative to this compose file wherever
+# it is run from, so create that folder before `up`: Docker creates a missing
+# bind-mount source itself, as an empty directory owned by root, which the
+# container's non-root user cannot then write to. Register a domain the same
+# way the single-container example does:
 #
 #   docker compose -f deploy/fluid/docker-compose.yml run --rm crystalline domain init /knowledge/team --name team
 #   docker compose -f deploy/fluid/docker-compose.yml run --rm crystalline domain add team /knowledge/team
