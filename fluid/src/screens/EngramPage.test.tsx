@@ -29,6 +29,11 @@ vi.mock("../api/client", async (importOriginal) => {
   return { ...actual, api: vi.fn(), setCsrfToken: vi.fn() };
 });
 
+/** The graph renderer paints to a canvas, which jsdom has none of. */
+vi.mock("../components/GraphCanvas", () => ({
+  default: () => <div data-testid="canvas" />,
+}));
+
 const apiMock = vi.mocked(api);
 
 const BODY = [
@@ -401,6 +406,42 @@ describe("the engram page", () => {
     await waitFor(() => {
       expect(outcome).toHaveTextContent("Copy refused");
     });
+  });
+
+  it("keeps the graph folded away until somebody asks for it", async () => {
+    serve();
+
+    renderApp("/d/eng/e/alpha");
+
+    // Folded, and unbuilt: the drawing is the heaviest thing this page can
+    // load, and a reader who never opens it never pays for it.
+    const toggle = await screen.findByRole("button", { name: /neighborhood/i });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByTestId("canvas")).toBeNull();
+  });
+
+  it("draws the neighborhood the page already read, on request", async () => {
+    serve();
+
+    renderApp("/d/eng/e/alpha");
+    // The backlinks panel is drawn from the same neighborhood, so once it has
+    // one the graph section has one too.
+    const panel = await screen.findByRole("region", { name: "Backlinks" });
+    await within(panel).findByRole("link", { name: /Beta/ });
+
+    await userEvent.click(
+      screen.getByRole("button", { name: /neighborhood/i }),
+    );
+
+    // Under the same cache key, so the section opens onto the neighborhood
+    // rather than onto a wait for one.
+    expect(screen.queryByText(/reading the neighborhood/i)).toBeNull();
+    expect(await screen.findByTestId("canvas")).toBeVisible();
+    // And the full view is a link away, pointed at this engram already.
+    expect(screen.getByRole("link", { name: /full view/i })).toHaveAttribute(
+      "href",
+      "/graph?anchor=crystalline%3A%2F%2Feng%2Falpha",
+    );
   });
 
   it("says an engram nobody wrote is a wrong address", async () => {

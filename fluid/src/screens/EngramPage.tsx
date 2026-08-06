@@ -47,8 +47,9 @@ import { FrontmatterPanel } from "../components/FrontmatterPanel";
 import { LifecycleBanner } from "../components/LifecycleBanner";
 import type { LifecycleLink } from "../components/LifecycleBanner";
 import { Markdown } from "../components/Markdown";
+import { NeighborhoodGraph } from "../components/NeighborhoodGraph";
 import { ReferenceLink } from "../components/ReferenceLink";
-import { domainRoute, engramRoute } from "../paths";
+import { domainRoute, engramRoute, graphRoute } from "../paths";
 import type { WikilinkResolver } from "../wikilinks";
 import { buildWikilinkResolver, innerOf, referenceState } from "../wikilinks";
 
@@ -153,6 +154,7 @@ export default function EngramPage() {
           </article>
           <Observations observations={engram.observations} />
           <Relations relations={engram.relations} resolve={wikilinks} />
+          <GraphSection domain={engram.domain} permalink={engram.permalink} />
         </div>
         <aside className="flex flex-col gap-4">
           <FrontmatterPanel frontmatter={engram.frontmatter} />
@@ -307,6 +309,64 @@ function Relations({
           );
         })}
       </ul>
+    </section>
+  );
+}
+
+/**
+ * The neighborhood, one hop out, folded away until it is asked for.
+ *
+ * Folded by default for two reasons that point the same way. The drawing is the
+ * heaviest thing this page can load and it arrives only when the section opens,
+ * so a reader who came for the prose never pays for it; and the picture is a
+ * detour from the engram, which is what this page is for. Opened, it costs
+ * nothing on the wire either: it reads the same neighborhood under the same
+ * cache key the backlinks panel already read.
+ */
+function GraphSection({
+  domain,
+  permalink,
+}: {
+  domain: string;
+  permalink: string;
+}) {
+  const [open, setOpen] = useState(false);
+
+  return (
+    <section aria-labelledby="engram-graph">
+      <div className="mb-2 flex flex-wrap items-baseline justify-between gap-3">
+        <h2 id="engram-graph" className="text-lg font-semibold">
+          Graph
+        </h2>
+        {open && (
+          <Link
+            to={graphRoute(domain, permalink)}
+            className="text-sm text-sky-700 underline underline-offset-2 hover:no-underline dark:text-sky-400"
+          >
+            Open the full view
+          </Link>
+        )}
+      </div>
+      <button
+        type="button"
+        aria-expanded={open}
+        aria-controls="engram-graph-panel"
+        onClick={() => {
+          setOpen((was) => !was);
+        }}
+        className="rounded border border-slate-300 px-2 py-1 text-sm hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800"
+      >
+        {open ? "Hide the neighborhood" : "Show the neighborhood"}
+      </button>
+      <div id="engram-graph-panel" className="mt-3">
+        {open && (
+          <NeighborhoodGraph
+            anchor={{ domain, permalink }}
+            depth={NEIGHBORHOOD_DEPTH}
+            height="h-80"
+          />
+        )}
+      </div>
     </section>
   );
 }

@@ -8,6 +8,8 @@
  */
 
 import { encodePermalink, encodeSegment } from "./api/client";
+import { crystallineAddress } from "./api/engram";
+import { NEIGHBORHOOD_DEPTH } from "./api/graph";
 
 /** The address of one domain. */
 export function domainRoute(domain: string): string {
@@ -27,6 +29,26 @@ export function domainRoute(domain: string): string {
  */
 export function engramRoute(domain: string, permalink: string): string {
   return `${domainRoute(domain)}/e/${encodePermalink(permalink)}`;
+}
+
+/**
+ * The neighborhood of one engram, full screen.
+ *
+ * The anchor is the engram's own `crystalline://` address rather than the two
+ * halves of it, because that is what `GET /graph` takes and what somebody can
+ * paste in from anywhere else. The depth rides along only when it is not the
+ * default: a URL says what was chosen, and one hop is what a neighborhood is
+ * when nobody chose.
+ */
+export function graphRoute(
+  domain: string,
+  permalink: string,
+  depth: number = NEIGHBORHOOD_DEPTH,
+): string {
+  const anchor = encodeURIComponent(crystallineAddress(domain, permalink));
+  return depth === NEIGHBORHOOD_DEPTH
+    ? `/graph?anchor=${anchor}`
+    : `/graph?anchor=${anchor}&depth=${String(depth)}`;
 }
 
 /** Where the topbar's search box sends a query. */

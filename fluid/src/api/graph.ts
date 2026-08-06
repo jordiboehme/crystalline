@@ -56,6 +56,25 @@ export interface Backlink {
 /** How many hops out an engram page opens on. A second hop is a deliberate act. */
 export const NEIGHBORHOOD_DEPTH = 1;
 
+/**
+ * The hops this endpoint will walk. The engine clamps anything else into this
+ * range rather than refusing it, so a client that offers a choice offers these.
+ */
+export const GRAPH_DEPTHS = [1, 2] as const;
+
+/**
+ * The depth a URL asked for, as a depth this endpoint has. Anything else - a
+ * missing param, a word, a hand-typed 7 - is the default rather than an error:
+ * the engine would clamp it anyway, and a screen that refused to draw over a
+ * mistyped number would be refusing the picture somebody came for.
+ */
+export function readGraphDepth(value: string | null | undefined): number {
+  const depth = Number(value);
+  return (GRAPH_DEPTHS as readonly number[]).includes(depth)
+    ? depth
+    : NEIGHBORHOOD_DEPTH;
+}
+
 /** Read one node, or null when it carries no address. */
 function readNode(value: unknown): GraphNode | null {
   const record = asObject(value);

@@ -127,6 +127,32 @@ export function crystallineAddress(domain: string, permalink: string): string {
   return `crystalline://${domain}/${permalink}`;
 }
 
+/**
+ * Read an address back apart, or null when it is not one.
+ *
+ * The other direction of {@link crystallineAddress}, and here beside it so the
+ * one form an engram is named in is written down once. A screen that takes an
+ * address from its URL needs the two halves back: the permalink is a path, so
+ * the split is at the first slash and every slash after it stays in the
+ * permalink.
+ */
+export function parseCrystallineAddress(
+  address: string,
+): { domain: string; permalink: string } | null {
+  const scheme = "crystalline://";
+  if (!address.startsWith(scheme)) {
+    return null;
+  }
+  const rest = address.slice(scheme.length);
+  const cut = rest.indexOf("/");
+  if (cut <= 0) {
+    return null;
+  }
+  const domain = rest.slice(0, cut);
+  const permalink = rest.slice(cut + 1);
+  return permalink === "" ? null : { domain, permalink };
+}
+
 /** The cache key of one engram. */
 export function engramDetailKey(
   domain: string,
