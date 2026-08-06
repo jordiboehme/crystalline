@@ -1,17 +1,31 @@
 /**
- * The app shell. Deliberately bare: the screens arrive with the tasks that
- * need them, and this only has to prove the toolchain renders and typechecks.
+ * The app, which is to say the order the providers go in.
+ *
+ * The order is the design. Query first, because the auth provider's probe is a
+ * query. Theme next, so every screen including the ones the auth provider
+ * renders instead of the app (the server-down banner, the disabled-account
+ * screen) is drawn in the right theme. Auth last, so nothing below it renders
+ * before the app knows who is asking.
+ *
+ * The router is not here: it wraps this from `main.tsx`, which is what lets a
+ * test mount the same tree on an in-memory history.
  */
-function App() {
+
+import { AuthProvider } from "./auth/AuthProvider";
+import { VersionSkewToast } from "./components/VersionSkewToast";
+import { QueryProvider } from "./query/QueryProvider";
+import { AppRoutes } from "./routes";
+import { ThemeProvider } from "./theme/ThemeProvider";
+
+export default function App() {
   return (
-    <main className="flex min-h-screen flex-col items-center justify-center gap-2">
-      <h1 className="text-2xl font-semibold">Fluid</h1>
-      <p className="text-sm opacity-70">
-        Crystalline stores what was learned; Fluid is where you think with it.
-      </p>
-      <p className="text-xs opacity-50">v{import.meta.env.VITE_APP_VERSION}</p>
-    </main>
+    <QueryProvider>
+      <ThemeProvider>
+        <AuthProvider>
+          <VersionSkewToast />
+          <AppRoutes />
+        </AuthProvider>
+      </ThemeProvider>
+    </QueryProvider>
   );
 }
-
-export default App;

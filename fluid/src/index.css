@@ -1,1 +1,29 @@
 @import "tailwindcss";
+
+/*
+ * Dark mode follows an attribute rather than a class, because the theme is a
+ * property of the document rather than a utility applied to it: one
+ * `data-theme` on `<html>` is what the pre-paint script in index.html sets and
+ * what the theme provider keeps in step, and every `dark:` utility reads it.
+ */
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
+
+@layer base {
+  /*
+   * Tell the browser which way the document leans, so form controls,
+   * scrollbars and the default canvas match the theme instead of staying
+   * stubbornly light behind it.
+   */
+  :root,
+  [data-theme="light"] {
+    color-scheme: light;
+  }
+
+  [data-theme="dark"] {
+    color-scheme: dark;
+  }
+
+  body {
+    @apply bg-white text-slate-900 antialiased dark:bg-slate-950 dark:text-slate-100;
+  }
+}

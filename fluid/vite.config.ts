@@ -46,7 +46,12 @@ export default defineConfig({
     },
   },
   test: {
-    environment: "node",
+    // The app is a browser app, so the tests run in one: components are
+    // rendered and queried through the DOM rather than asserted on in the
+    // abstract. The transport tests keep working under jsdom because jsdom
+    // leaves `fetch`, `Response` and `Headers` to the Node globals.
+    environment: "jsdom",
+    setupFiles: ["./src/test/setup.ts"],
     include: ["src/**/*.test.{ts,tsx}"],
   },
 });
