@@ -9,14 +9,29 @@ fn bin() -> Command {
     Command::cargo_bin("crystalline").unwrap()
 }
 
-/// Redirect `HOME` and the XDG base directories into `home`. The auth database
-/// lives at `<state_dir>/web-auth.db`, and `XDG_STATE_HOME` is what
-/// `crystalline_core::config::state_dir` resolves it from.
+/// Redirect every base directory this child can resolve into `home`, so the
+/// auth database at `<state_dir>/web-auth.db` is this test's alone.
+///
+/// Both families are needed, because `state_dir` goes through etcetera's
+/// `choose_base_strategy`, which is a different strategy per platform: the XDG
+/// one on unix and macOS, which reads `HOME` and `XDG_*_HOME`, and the Windows
+/// one, which reads `USERPROFILE`, `APPDATA` and `LOCALAPPDATA` and ignores
+/// the XDG variables entirely. On Windows it also has no state directory of
+/// its own, so `state_dir` falls back to the data directory, `APPDATA`.
+/// Setting only the XDG variables would leave every test in this file
+/// resolving one real `%APPDATA%\crystalline\web-auth.db` and locking each
+/// other out of it (Windows byte-range locks are mandatory). The Windows names
+/// and layout mirror `service_windows.rs`, which isolates the daemon the same
+/// way; setting them on unix as well is harmless there and keeps this helper
+/// free of a `cfg`.
 fn isolate(cmd: &mut Command, home: &std::path::Path) {
     cmd.env("HOME", home)
         .env("XDG_CONFIG_HOME", home.join("config"))
         .env("XDG_STATE_HOME", home.join("state"))
-        .env("XDG_CACHE_HOME", home.join("cache"));
+        .env("XDG_CACHE_HOME", home.join("cache"))
+        .env("USERPROFILE", home)
+        .env("APPDATA", home.join("roaming"))
+        .env("LOCALAPPDATA", home.join("local"));
 }
 
 /// Run `crystalline users ...` in the isolated home, feeding `stdin` when
