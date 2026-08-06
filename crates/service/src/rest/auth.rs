@@ -434,8 +434,18 @@ async fn authenticate(
 }
 
 /// Run `work` holding one of the [`LOGIN_SLOTS`] password-checking permits, so
-/// concurrent logins queue instead of each reserving argon2's memory at once.
-async fn with_login_slot<F: Future>(slots: &Semaphore, work: F) -> Result<F::Output, ApiError> {
+/// concurrent argon2 work queues instead of each reserving its memory at once.
+///
+/// Every path on this surface that hashes or verifies a password goes through
+/// here, not only login: an admin creating accounts or resetting passwords
+/// (see `super::users_api`) spends the same 19 MiB per operation on the same
+/// blocking pool, so a second, unbounded, source of it would defeat the cap
+/// rather than sit beside it. [`RestState::with_login_slot`] is how a handler
+/// outside this module reaches it.
+pub(super) async fn with_login_slot<F: Future>(
+    slots: &Semaphore,
+    work: F,
+) -> Result<F::Output, ApiError> {
     let _permit = slots.acquire().await.map_err(|_| {
         ApiError::internal("the login limiter is closed, so this instance is shutting down")
     })?;

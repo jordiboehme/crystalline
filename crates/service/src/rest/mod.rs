@@ -58,6 +58,20 @@ impl RestState {
             login_slots: auth::login_slots(),
         })
     }
+
+    /// Run `work` holding one of the [`LOGIN_SLOTS`] password-work permits.
+    ///
+    /// The semaphore is deliberately not exposed itself: password work is the
+    /// only thing it may gate, and a handler that hashes has to go through here
+    /// rather than reach for the field. See [`auth::with_login_slot`] for what
+    /// the cap is for and why the admin routes share the login one instead of
+    /// getting a second.
+    pub(super) async fn with_login_slot<F: std::future::Future>(
+        &self,
+        work: F,
+    ) -> Result<F::Output, ApiError> {
+        auth::with_login_slot(&self.login_slots, work).await
+    }
 }
 
 /// Build the REST router. Mounted with `nest("/api/v1", ...)`, so the paths
@@ -142,7 +156,69 @@ fn csv(raw: Option<&str>) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
+
+    /// A [`RestState`] over an empty in-memory engine and a fresh auth
+    /// database: enough to exercise the state's own machinery without a domain
+    /// on disk behind it.
+    async fn test_state() -> (tempfile::TempDir, RestState) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crystalline_index::TursoStore::open_in_memory()
+            .await
+            .unwrap();
+        let engine = Arc::new(Engine::new(
+            Arc::new(tokio::sync::Mutex::new(store)),
+            crystalline_core::config::GlobalConfig::default(),
+            None,
+            None,
+        ));
+        let auth = Arc::new(
+            AuthStore::open(&dir.path().join("web-auth.db"))
+                .await
+                .unwrap(),
+        );
+        (dir, RestState::new(engine, auth).unwrap())
+    }
+
+    /// The cap the admin routes borrow: whatever calls
+    /// [`RestState::with_login_slot`] - a login, an account being created, a
+    /// password being reset - only [`LOGIN_SLOTS`] of them hold argon2's
+    /// working memory at a time. Asserted on the mechanism, by counting how
+    /// many bodies are inside at once, rather than on how long anything took.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_login_limiter_caps_every_caller_that_hashes() {
+        let (_dir, state) = test_state().await;
+        let live = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+
+        let mut tasks = Vec::new();
+        for _ in 0..32 {
+            let (state, live, peak) = (state.clone(), live.clone(), peak.clone());
+            tasks.push(tokio::spawn(async move {
+                state
+                    .with_login_slot(async {
+                        let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(now, Ordering::SeqCst);
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                        live.fetch_sub(1, Ordering::SeqCst);
+                    })
+                    .await
+                    .unwrap();
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        assert_eq!(live.load(Ordering::SeqCst), 0, "every permit came back");
+        let peak = peak.load(Ordering::SeqCst);
+        assert!(
+            peak <= LOGIN_SLOTS,
+            "at most {LOGIN_SLOTS} may hash at once, saw {peak}"
+        );
+        assert!(peak > 1, "and the limiter must not serialize them either");
+    }
 
     #[test]
     fn a_comma_list_splits_and_drops_the_empties() {

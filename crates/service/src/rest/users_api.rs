@@ -67,7 +67,11 @@ pub async fn list(
 
 /// What `POST /users` takes. `display` defaults to the name as typed, matching
 /// `crystalline users add`, and `email` is optional and never used for login.
-#[derive(Debug, Deserialize)]
+///
+/// [`Debug`] is written by hand rather than derived, here and on [`PatchBody`]:
+/// the derived one would print the plaintext password, and this type is one
+/// `tracing::debug!` or one `unwrap` on a rejection away from a log file.
+#[derive(Deserialize)]
 pub struct CreateBody {
     /// The login name, in any casing: the store folds it.
     name: String,
@@ -98,16 +102,19 @@ pub async fn create(
     // The login name as typed makes the better default display name: the store
     // folds the login name but keeps this one as given.
     let display = body.display.unwrap_or_else(|| body.name.trim().to_string());
+    // Under the login limiter: `add_user` hashes with argon2id, which costs
+    // about 19 MiB on a blocking thread, and an admin client looping over a
+    // list of new accounts would otherwise reserve that memory without bound
+    // while logins on the same instance are being held to four.
     state
-        .auth
-        .add_user(
+        .with_login_slot(state.auth.add_user(
             &body.name,
             &display,
             body.email.as_deref(),
             body.role,
             &body.password,
-        )
-        .await
+        ))
+        .await?
         .map_err(|e| store_error(e, &body.name))?;
     let user = read_back(&state, &body.name).await?;
     Ok((StatusCode::CREATED, Json(json!({ "user": user }))))
@@ -116,22 +123,56 @@ pub async fn create(
 /// What `PATCH /users/{name}` takes: whichever of the three an admin wants to
 /// change. All absent is refused rather than served as a no-op, so a client
 /// sending the wrong field names hears about it.
-#[derive(Debug, Deserialize)]
+///
+/// [`Debug`] is hand-written and redacts the password, as on [`CreateBody`].
+#[derive(Deserialize)]
 pub struct PatchBody {
     /// The new role.
     #[serde(default)]
     role: Option<Role>,
-    /// Whether the account is disabled. A disabled account can neither log in
-    /// nor use a session it already holds.
+    /// Whether the account is disabled. Disabling deletes every session the
+    /// account holds, so it is a revocation rather than a flag a later
+    /// re-enabling hands back; it also stops any new login.
     #[serde(default)]
     disabled: Option<bool>,
-    /// A replacement password.
+    /// A replacement password. Setting it revokes every session the account
+    /// holds, so whoever was signed in under the old one is signed out.
     #[serde(default)]
     password: Option<String>,
 }
 
+impl std::fmt::Debug for CreateBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CreateBody")
+            .field("name", &self.name)
+            .field("display", &self.display)
+            .field("email", &self.email)
+            .field("role", &self.role)
+            .field("password", &"<redacted>")
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for PatchBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PatchBody")
+            .field("role", &self.role)
+            .field("disabled", &self.disabled)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
 /// `PATCH /users/{name}` - change a role, a disabled flag, a password, or any
 /// combination, answering with the account as it now stands.
+///
+/// Two of the three fields are revocations as well as edits: setting a password
+/// and disabling an account each delete every session that account holds, in
+/// the store and in the same transaction as the change. That is what makes this
+/// route useful against a compromised account - a reset that left the intruder's
+/// cookie alive for the rest of its 30-day life would be theatre - and it means
+/// an admin resetting their own password signs their own other sessions out too,
+/// this one included.
 ///
 /// Every check runs before the first write, so a request that will be refused
 /// changes nothing. The writes themselves are one store call each rather than
@@ -174,10 +215,10 @@ pub async fn update(
             .map_err(|e| store_error(e, &name))?;
     }
     if let Some(password) = &body.password {
+        // Under the login limiter, for the reason `create` gives.
         state
-            .auth
-            .set_password(&name, password)
-            .await
+            .with_login_slot(state.auth.set_password(&name, password))
+            .await?
             .map_err(|e| store_error(e, &name))?;
     }
     let user = read_back(&state, &name).await?;
@@ -291,11 +332,14 @@ fn store_error(e: anyhow::Error, subject: &str) -> ApiError {
             folded(subject)
         ));
     }
-    if detail.contains("the last admin") {
-        return ApiError::conflict(detail);
-    }
+    // Before the last-admin branch, not after: `no such user: 'the last admin'`
+    // is a legal name for an account nobody created, and reading the refusals
+    // in the other order would answer that miss with a 409.
     if detail.contains("no such user") {
         return ApiError::not_found(detail);
+    }
+    if detail.contains("the last admin") {
+        return ApiError::conflict(detail);
     }
     if detail.contains("a user name cannot be empty") {
         return ApiError::unprocessable(detail);
@@ -356,12 +400,10 @@ mod tests {
             api.detail
         );
 
-        let removed = store
-            .remove_user("ada")
-            .await
-            .expect_err("nor removed")
-            .to_string();
-        assert!(removed.contains("last admin"), "{removed}");
+        let removed = store.remove_user("ada").await.expect_err("nor removed");
+        let api = store_error(removed, "ada");
+        assert_eq!(api.status, StatusCode::CONFLICT);
+        assert!(api.detail.contains("last admin"), "{}", api.detail);
 
         let missing = store
             .set_password("ghost", "s3cret")
@@ -370,6 +412,18 @@ mod tests {
         let api = store_error(missing, "ghost");
         assert_eq!(api.status, StatusCode::NOT_FOUND);
         assert!(api.detail.contains("ghost"), "{}", api.detail);
+
+        // A miss stays a miss even when the account name is the phrase the
+        // last-admin refusal is recognized by, which is why that branch is
+        // read second.
+        let named = store
+            .set_password("the last admin", "s3cret")
+            .await
+            .expect_err("no such account");
+        assert_eq!(
+            store_error(named, "the last admin").status,
+            StatusCode::NOT_FOUND
+        );
 
         let empty = store
             .set_disabled("   ", true)
@@ -421,6 +475,33 @@ mod tests {
             assert!(refused.detail.contains("your own account"));
         }
         assert!(refuse_self(&caller, "ada", "delete").is_ok());
+    }
+
+    /// The plaintext password must never be one `tracing::debug!` away, on
+    /// either body.
+    #[test]
+    fn a_debugged_body_redacts_the_password() {
+        let create: CreateBody = serde_json::from_value(json!({
+            "name": "bob",
+            "role": "viewer",
+            "password": "hunter2",
+        }))
+        .unwrap();
+        let text = format!("{create:?}");
+        assert!(!text.contains("hunter2"), "{text}");
+        assert!(text.contains("<redacted>"), "{text}");
+        assert!(text.contains("bob"), "the rest of the body is still there");
+
+        let patch: PatchBody = serde_json::from_value(json!({"password": "hunter2"})).unwrap();
+        let text = format!("{patch:?}");
+        assert!(!text.contains("hunter2"), "{text}");
+        assert!(text.contains("<redacted>"), "{text}");
+
+        let empty: PatchBody = serde_json::from_value(json!({})).unwrap();
+        assert!(
+            format!("{empty:?}").contains("None"),
+            "an absent password still reads as absent"
+        );
     }
 
     /// An empty password is refused before it reaches the store.

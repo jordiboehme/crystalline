@@ -398,16 +398,42 @@ impl AuthStore {
         }
     }
 
-    /// Replace an account's password. Errors if the account does not exist, so
-    /// a mistyped name on the CLI is reported rather than silently ignored.
+    /// Replace an account's password and revoke every session it holds. Errors
+    /// if the account does not exist, so a mistyped name on the CLI is reported
+    /// rather than silently ignored.
+    ///
+    /// The revocation is the point rather than a courtesy. A password is reset
+    /// because the old one is no longer trusted, and a session issued under it
+    /// never presents a password again: without this, whoever holds a cookie
+    /// minted before the reset keeps the account for the rest of the session's
+    /// life, which is exactly the person a reset is meant to evict. Both
+    /// statements are one `BEGIN IMMEDIATE` transaction, so no session from
+    /// before the change can survive it, and a refused change (an account that
+    /// is not there) revokes nothing.
     pub async fn set_password(&self, name: &str, password: &str) -> Result<()> {
+        let name = normalize_name(name)?;
+        // Hash before taking the lock: argon2 is CPU, not database.
         let hash = hash_password(password).await?;
-        self.update_user(
-            "UPDATE users SET pass_hash = ?2 WHERE name = ?1",
-            name,
-            Value::Text(hash),
-        )
-        .await
+        let _guard = self.guard.lock().await;
+        self.begin_immediate()
+            .await
+            .with_context(|| format!("updating user '{name}'"))?;
+        let result = async {
+            let changed = self
+                .conn
+                .execute(
+                    "UPDATE users SET pass_hash = ?2 WHERE name = ?1",
+                    vec![Value::Text(name.clone()), Value::Text(hash)],
+                )
+                .await
+                .with_context(|| format!("updating user '{name}'"))?;
+            if changed == 0 {
+                bail!("no such user: '{name}'");
+            }
+            self.delete_sessions_of(&name).await
+        }
+        .await;
+        self.finish(result).await
     }
 
     /// Change an account's role. Demoting the last enabled admin is refused
@@ -425,22 +451,64 @@ impl AuthStore {
         .await
     }
 
-    /// Disable or re-enable an account. Disabling leaves existing sessions in
-    /// place but [`AuthStore::session_user`] stops honoring them, so the effect
-    /// is immediate without having to hunt the session rows down.
+    /// Disable or re-enable an account. Disabling deletes every session it
+    /// holds, in the same transaction as the flag.
+    ///
+    /// [`AuthStore::session_user`] also refuses a disabled account's sessions
+    /// at read time, and that check stays: it is what makes the effect
+    /// immediate for a session another process is already holding open. It is
+    /// not enough on its own, though, because it only hides the rows while the
+    /// flag is set - re-enabling the account would hand every cookie from
+    /// before the disabling back. Deleting them means disabling is a
+    /// revocation, which is what an operator disabling a compromised account
+    /// is asking for, and re-enabling starts from no sessions at all.
     ///
     /// Disabling the last enabled admin is refused (see [`NOT_LAST_ADMIN`]);
-    /// re-enabling never is, so the `?2 = 0` arm short-circuits the guard.
+    /// re-enabling never is, so the `?2 = 0` arm short-circuits the guard. A
+    /// refused disabling rolls back, sessions included.
     pub async fn set_disabled(&self, name: &str, disabled: bool) -> Result<()> {
-        self.update_guarded(
-            &format!(
-                "UPDATE users SET disabled = ?2 WHERE name = ?1 AND (?2 = 0 OR {NOT_LAST_ADMIN})"
-            ),
-            name,
-            Value::Integer(i64::from(disabled)),
-            "disable",
-        )
-        .await
+        let name = normalize_name(name)?;
+        let _guard = self.guard.lock().await;
+        self.begin_immediate()
+            .await
+            .with_context(|| format!("updating user '{name}'"))?;
+        let result = async {
+            let changed = self
+                .conn
+                .execute(
+                    &format!(
+                        "UPDATE users SET disabled = ?2 \
+                         WHERE name = ?1 AND (?2 = 0 OR {NOT_LAST_ADMIN})"
+                    ),
+                    vec![
+                        Value::Text(name.clone()),
+                        Value::Integer(i64::from(disabled)),
+                    ],
+                )
+                .await
+                .with_context(|| format!("updating user '{name}'"))?;
+            if changed == 0 {
+                // Zero rows means the account is not there, or that disabling
+                // it would have left no enabled admin. The probe is inside the
+                // transaction, so it sees exactly what the update saw.
+                let exists = self
+                    .query_first(
+                        "SELECT 1 FROM users WHERE name = ?1",
+                        vec![Value::Text(name.clone())],
+                    )
+                    .await?;
+                if exists.is_some() {
+                    return Err(last_admin_error("disable", &name));
+                }
+                bail!("no such user: '{name}'");
+            }
+            if disabled {
+                self.delete_sessions_of(&name).await?;
+            }
+            Ok(())
+        }
+        .await;
+        self.finish(result).await
     }
 
     /// Delete an account and every session it holds. Errors if there is no
@@ -473,10 +541,7 @@ impl AuthStore {
             .await
             .with_context(|| format!("removing user '{name}'"))?;
         let result = async {
-            self.conn
-                .execute("DELETE FROM sessions WHERE user_name = ?1", key.clone())
-                .await
-                .with_context(|| format!("removing sessions for user '{name}'"))?;
+            self.delete_sessions_of(&name).await?;
             let changed = self
                 .conn
                 .execute(
@@ -674,26 +739,28 @@ impl AuthStore {
         Ok(())
     }
 
-    /// Run a single-column update against one account, failing when the
-    /// account does not exist.
-    async fn update_user(&self, sql: &str, name: &str, value: Value) -> Result<()> {
-        let name = normalize_name(name)?;
-        let _guard = self.guard.lock().await;
-        let changed = self
-            .conn
-            .execute(sql, vec![Value::Text(name.clone()), value])
+    /// Delete every session `name` holds. `name` must already be normalized.
+    ///
+    /// Called by the three operations that end an account's right to the
+    /// sessions it was issued - a removal, a password change and a disabling -
+    /// each of which calls it while holding the guard and inside its own
+    /// transaction, so the revocation lands with the change or not at all.
+    async fn delete_sessions_of(&self, name: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM sessions WHERE user_name = ?1",
+                vec![Value::Text(name.to_string())],
+            )
             .await
-            .with_context(|| format!("updating user '{name}'"))?;
-        if changed == 0 {
-            bail!("no such user: '{name}'");
-        }
+            .with_context(|| format!("removing sessions for user '{name}'"))?;
         Ok(())
     }
 
-    /// [`AuthStore::update_user`] for a statement carrying the
-    /// [`NOT_LAST_ADMIN`] guard, where zero rows changed has a second possible
-    /// meaning: the edit was refused because it would have left no enabled
-    /// admin. `verb` names the refused operation in that message.
+    /// Run a single-column update against one account, failing when the account
+    /// does not exist, for a statement carrying the [`NOT_LAST_ADMIN`] guard:
+    /// zero rows changed then has a second possible meaning, that the edit was
+    /// refused because it would have left no enabled admin. `verb` names the
+    /// refused operation in that message.
     ///
     /// The follow-up existence probe only picks between the two messages -
     /// nothing was written either way - so it does not need to share the
@@ -1010,6 +1077,80 @@ mod tests {
         assert!(store.session_user(&s.token).await.unwrap().is_none());
     }
 
+    /// Disabling is a revocation, not a flag over the session rows: re-enabling
+    /// the account must not hand back the cookies it held before. Otherwise
+    /// disabling a compromised account and enabling it again once the password
+    /// was changed would restore the intruder's session.
+    #[tokio::test]
+    async fn re_enabling_does_not_resurrect_the_sessions_disabling_took() {
+        let (_dir, store) = store().await;
+        store
+            .add_user("ada", "Ada", None, Role::Editor, "pw")
+            .await
+            .unwrap();
+        let s = store.create_session("ada", 3600).await.unwrap();
+        store.set_disabled("ada", true).await.unwrap();
+        store.set_disabled("ada", false).await.unwrap();
+        assert!(
+            store.session_user(&s.token).await.unwrap().is_none(),
+            "the session was deleted, not merely hidden while the flag was set"
+        );
+        // The account itself is back, and a fresh session works.
+        let fresh = store.create_session("ada", 3600).await.unwrap();
+        assert!(store.session_user(&fresh.token).await.unwrap().is_some());
+    }
+
+    /// A password reset evicts whoever was signed in under the old one: a
+    /// session never presents a password again, so without this the holder of a
+    /// cookie minted before the reset keeps the account.
+    #[tokio::test]
+    async fn changing_a_password_revokes_the_sessions_it_issued() {
+        let (_dir, store) = store().await;
+        store
+            .add_user("ada", "Ada", None, Role::Editor, "pw")
+            .await
+            .unwrap();
+        let before = store.create_session("ada", 3600).await.unwrap();
+        store.set_password("ada", "new pw").await.unwrap();
+        assert!(
+            store.session_user(&before.token).await.unwrap().is_none(),
+            "the cookie from before the reset is dead"
+        );
+        assert!(
+            store
+                .verify_password("ada", "new pw")
+                .await
+                .unwrap()
+                .is_some(),
+            "and the new password logs in"
+        );
+        let after = store.create_session("ada", 3600).await.unwrap();
+        assert!(store.session_user(&after.token).await.unwrap().is_some());
+    }
+
+    /// A refused edit revokes nothing: the transaction rolls back with the
+    /// sessions in it, the same property `a_refused_removal_keeps_the_admins_sessions`
+    /// pins for a removal.
+    #[tokio::test]
+    async fn a_refused_edit_leaves_the_sessions_alone() {
+        let (_dir, store) = store().await;
+        store
+            .add_user("ada", "Ada", None, Role::Admin, "pw")
+            .await
+            .unwrap();
+        let live = store.create_session("ada", 3600).await.unwrap();
+        assert!(
+            store.set_disabled("ada", true).await.is_err(),
+            "the last enabled admin cannot be disabled"
+        );
+        assert!(
+            store.session_user(&live.token).await.unwrap().is_some(),
+            "the rolled-back disabling must leave the live session in place"
+        );
+        assert!(store.set_password("ghost", "new pw").await.is_err());
+        assert!(store.session_user(&live.token).await.unwrap().is_some());
+    }
+
     #[tokio::test]
     async fn the_plaintext_token_is_not_in_the_database() {
         let dir = tempfile::tempdir().unwrap();
@@ -1160,7 +1301,8 @@ mod tests {
         let second = daemon.create_session("ada", 3600).await.unwrap();
         assert!(cli.session_user(&second.token).await.unwrap().is_some());
 
-        // The CLI disables; the daemon stops honoring the live session.
+        // The CLI disables, which revokes; the daemon no longer resolves the
+        // session the CLI's write deleted.
         cli.set_disabled("ada", true).await.unwrap();
         assert!(daemon.session_user(&session.token).await.unwrap().is_none());
 

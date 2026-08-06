@@ -2245,3 +2245,133 @@ async fn user_request_failures_are_classified() {
         "the detail names what it takes: {body}"
     );
 }
+
+/// An admin resetting an account's password signs that account out. A session
+/// never presents a password again, so a reset that left the old cookie live
+/// would evict nobody - which is the whole point of resetting one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_password_reset_revokes_the_targets_sessions() {
+    let (fixture, token, csrf) = serve_as_admin(AuthOptions::default()).await;
+    let addr = fixture.addr;
+    fixture
+        .auth
+        .add_user("ada", "Ada", None, Role::Viewer, "s3cret")
+        .await
+        .unwrap();
+    let (ada, _) = login(addr, "ada", "s3cret").await;
+    let signed_in = client()
+        .get(format!("http://{addr}/api/v1/domains"))
+        .header("cookie", format!("fluid_session={ada}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(signed_in.status(), 200, "the session works to begin with");
+
+    let reset = as_session(
+        addr,
+        reqwest::Method::PATCH,
+        "/api/v1/users/ada",
+        &token,
+        &csrf,
+    )
+    .json(&serde_json::json!({"password": "corrected horse"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(reset.status(), 200);
+
+    let after = client()
+        .get(format!("http://{addr}/api/v1/domains"))
+        .header("cookie", format!("fluid_session={ada}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        after.status(),
+        401,
+        "the cookie from before the reset is dead"
+    );
+    // And the account is usable again with the password the admin set.
+    login(addr, "ada", "corrected horse").await;
+}
+
+/// Disabling revokes rather than hides: re-enabling the account must not hand
+/// back the cookies it held, or disabling a compromised account and enabling it
+/// again would restore the intruder's session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disabling_and_re_enabling_does_not_restore_the_old_sessions() {
+    let (fixture, token, csrf) = serve_as_admin(AuthOptions::default()).await;
+    let addr = fixture.addr;
+    fixture
+        .auth
+        .add_user("ada", "Ada", None, Role::Viewer, "s3cret")
+        .await
+        .unwrap();
+    let (ada, _) = login(addr, "ada", "s3cret").await;
+
+    for disabled in [true, false] {
+        let resp = as_session(
+            addr,
+            reqwest::Method::PATCH,
+            "/api/v1/users/ada",
+            &token,
+            &csrf,
+        )
+        .json(&serde_json::json!({ "disabled": disabled }))
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 200, "setting disabled={disabled}");
+    }
+
+    let after = client()
+        .get(format!("http://{addr}/api/v1/domains"))
+        .header("cookie", format!("fluid_session={ada}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        after.status(),
+        401,
+        "the session was deleted, not hidden while the flag was set"
+    );
+    // The account is enabled again, so a fresh login works.
+    login(addr, "ada", "s3cret").await;
+}
+
+/// Creating accounts is argon2 work like logging in, and it goes through the
+/// same limiter. Asserted as liveness rather than as timing: every concurrent
+/// request is answered and every account exists afterwards, which is what a
+/// limiter that queues (rather than drops or deadlocks) looks like from
+/// outside. The bound itself is asserted on the mechanism in
+/// `rest::tests::the_login_limiter_caps_every_caller_that_hashes`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_account_creations_all_answer() {
+    let (fixture, token, csrf) = serve_as_admin(AuthOptions::default()).await;
+    let addr = fixture.addr;
+
+    let mut tasks = Vec::new();
+    for n in 0..12 {
+        let (token, csrf) = (token.clone(), csrf.clone());
+        tasks.push(tokio::spawn(async move {
+            as_session(addr, reqwest::Method::POST, "/api/v1/users", &token, &csrf)
+                .json(&serde_json::json!({
+                    "name": format!("user{n}"),
+                    "role": "viewer",
+                    "password": "hunter2",
+                }))
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }));
+    }
+    for task in tasks {
+        assert_eq!(task.await.unwrap(), 201, "every creation is answered");
+    }
+    assert_eq!(
+        fixture.auth.list_users().await.unwrap().len(),
+        13,
+        "twelve new accounts beside the admin"
+    );
+}
