@@ -1,0 +1,144 @@
+@import "tailwindcss";
+
+/*
+ * Dark mode follows an attribute rather than a class, because the theme is a
+ * property of the document rather than a utility applied to it: one
+ * `data-theme` on `<html>` is what the pre-paint script in index.html sets and
+ * what the theme provider keeps in step, and every `dark:` utility reads it.
+ */
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
+
+@layer base {
+  /*
+   * Tell the browser which way the document leans, so form controls,
+   * scrollbars and the default canvas match the theme instead of staying
+   * stubbornly light behind it.
+   */
+  :root,
+  [data-theme="light"] {
+    color-scheme: light;
+  }
+
+  [data-theme="dark"] {
+    color-scheme: dark;
+  }
+
+  body {
+    @apply bg-white text-slate-900 antialiased dark:bg-slate-950 dark:text-slate-100;
+  }
+}
+
+/*
+ * Syntax highlighting.
+ *
+ * rehype-highlight labels the tokens and ships no colors, and the themes that
+ * come with the highlighter are files inside a transitive dependency. So the
+ * palette lives here instead: a dozen rules in the app's own colors, following
+ * the same `data-theme` attribute every other themed thing follows, and no
+ * stylesheet the bundle has to reach through the dependency tree for.
+ */
+@layer components {
+  .hljs-comment,
+  .hljs-quote {
+    color: #64748b;
+    font-style: italic;
+  }
+
+  .hljs-keyword,
+  .hljs-selector-tag,
+  .hljs-literal,
+  .hljs-section,
+  .hljs-doctag,
+  .hljs-name {
+    color: #b91c1c;
+  }
+
+  .hljs-string,
+  .hljs-regexp,
+  .hljs-addition,
+  .hljs-attribute,
+  .hljs-meta .hljs-string {
+    color: #0f766e;
+  }
+
+  .hljs-number,
+  .hljs-symbol,
+  .hljs-bullet,
+  .hljs-link,
+  .hljs-variable,
+  .hljs-template-variable {
+    color: #1d4ed8;
+  }
+
+  .hljs-title,
+  .hljs-class .hljs-title,
+  .hljs-type,
+  .hljs-built_in {
+    color: #7e22ce;
+  }
+
+  .hljs-attr,
+  .hljs-selector-attr,
+  .hljs-selector-class,
+  .hljs-selector-id {
+    color: #a16207;
+  }
+
+  .hljs-deletion {
+    color: #b91c1c;
+  }
+
+  .hljs-emphasis {
+    font-style: italic;
+  }
+
+  .hljs-strong {
+    font-weight: 600;
+  }
+
+  [data-theme="dark"] .hljs-comment,
+  [data-theme="dark"] .hljs-quote {
+    color: #94a3b8;
+  }
+
+  [data-theme="dark"] .hljs-keyword,
+  [data-theme="dark"] .hljs-selector-tag,
+  [data-theme="dark"] .hljs-literal,
+  [data-theme="dark"] .hljs-section,
+  [data-theme="dark"] .hljs-doctag,
+  [data-theme="dark"] .hljs-name,
+  [data-theme="dark"] .hljs-deletion {
+    color: #fca5a5;
+  }
+
+  [data-theme="dark"] .hljs-string,
+  [data-theme="dark"] .hljs-regexp,
+  [data-theme="dark"] .hljs-addition,
+  [data-theme="dark"] .hljs-attribute,
+  [data-theme="dark"] .hljs-meta .hljs-string {
+    color: #5eead4;
+  }
+
+  [data-theme="dark"] .hljs-number,
+  [data-theme="dark"] .hljs-symbol,
+  [data-theme="dark"] .hljs-bullet,
+  [data-theme="dark"] .hljs-link,
+  [data-theme="dark"] .hljs-variable,
+  [data-theme="dark"] .hljs-template-variable {
+    color: #93c5fd;
+  }
+
+  [data-theme="dark"] .hljs-title,
+  [data-theme="dark"] .hljs-class .hljs-title,
+  [data-theme="dark"] .hljs-type,
+  [data-theme="dark"] .hljs-built_in {
+    color: #d8b4fe;
+  }
+
+  [data-theme="dark"] .hljs-attr,
+  [data-theme="dark"] .hljs-selector-attr,
+  [data-theme="dark"] .hljs-selector-class,
+  [data-theme="dark"] .hljs-selector-id {
+    color: #fcd34d;
+  }
+}

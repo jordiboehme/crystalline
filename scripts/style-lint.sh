@@ -13,13 +13,21 @@ cd "$(git rev-parse --show-toplevel)"
 
 fail=0
 
-# Tracked markdown and Rust files, excluding build output and vendored
-# third-party files, which must stay byte-identical to their upstream
-# (see evals/skill-training/vendor/README.md).
-files=$(git ls-files -- '*.md' '*.rs' | grep -v '/target/' | grep -v '^target/' | grep -v '^evals/skill-training/vendor/' || true)
+# Tracked markdown, Rust and Fluid front-end sources, excluding build output
+# and vendored third-party files, which must stay byte-identical to their
+# upstream (see evals/skill-training/vendor/README.md), plus the API types
+# fluid/src/api/types.ts, which are generated from the OpenAPI snapshot by
+# `pnpm generate:api` and never hand-written. Lockfiles need no exclusion:
+# none of the patterns below can match one.
+files=$(git ls-files -- '*.md' '*.rs' '*.ts' '*.tsx' '*.css' '*.html' \
+    | grep -v '/target/' \
+    | grep -v '^target/' \
+    | grep -v '/node_modules/' \
+    | grep -v '^evals/skill-training/vendor/' \
+    | grep -v '^fluid/src/api/types\.ts$' || true)
 
 if [ -z "$files" ]; then
-    echo "style-lint: no tracked .md or .rs files found"
+    echo "style-lint: no tracked source files found"
     exit 0
 fi
 

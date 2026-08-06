@@ -1,0 +1,119 @@
+/**
+ * What an engram's lifecycle says about how to read it.
+ *
+ * Two facts earn a line here and nothing else does.
+ *
+ * A retired status (`deprecated`, `superseded`, `archived`, `legacy`) means the
+ * engram is kept for the record rather than as current knowledge. It is never
+ * hidden - hiding it would misrepresent what the domain holds - so it is
+ * announced instead, together with the supersedes chain, which is the way out
+ * of it: `superseded_by` points at what replaced this, `supersedes` at what
+ * this replaced.
+ *
+ * A `stale_after` that has passed means the knowledge is due for a check. That
+ * is a different claim from being retired and gets its own line, because an
+ * engram can be either, both, or neither.
+ *
+ * Everything else is silence. Absent `valid_from` means the knowledge has
+ * always been valid and absent `valid_to` means it is valid forever, so an
+ * engram carrying no dates renders nothing at all rather than a placeholder
+ * date somebody, or some agent, would carry away as a fact.
+ */
+
+import { hasArrived, localDay } from "../format";
+import { isRetired } from "../lifecycle";
+import type { ReferenceState } from "../wikilinks";
+import { ReferenceLink } from "./ReferenceLink";
+
+/**
+ * One end of the supersedes chain, as far as the index could follow it.
+ *
+ * The state travels with it rather than being inferred from a missing `href`.
+ * Two different things have no address - a target nothing resolves, and one
+ * that resolves to somewhere the graph has not reported yet - and collapsing
+ * them would put "nothing resolves this" under a successor that resolves
+ * perfectly well, for as long as the graph request takes.
+ */
+export interface LifecycleLink {
+  /** What to call it: the target's title, or the target as it was written. */
+  label: string;
+  /** Where it lives, known only in the resolved state. */
+  href: string | null;
+  /** Which of the three reference states it is in. */
+  state: ReferenceState;
+}
+
+export interface LifecycleBannerProps {
+  /** The engram's `status` frontmatter, free form. */
+  status: string | null;
+  /** Its `stale_after` date, or null when it carries none. */
+  staleAfter: string | null;
+  /** What replaced it, from its `superseded_by` relations. */
+  supersededBy: LifecycleLink[];
+  /** What it replaced, from its `supersedes` relations. */
+  supersedes: LifecycleLink[];
+  /** Today, as `YYYY-MM-DD`. Defaults to the day this browser is having. */
+  today?: string;
+}
+
+export function LifecycleBanner({
+  status,
+  staleAfter,
+  supersededBy,
+  supersedes,
+  today = localDay(),
+}: LifecycleBannerProps) {
+  const retired = isRetired(status);
+  const stale = staleAfter !== null && hasArrived(staleAfter, today);
+  if (!retired && !stale) {
+    return null;
+  }
+
+  return (
+    <div className="flex flex-col gap-2">
+      {retired && (
+        <aside
+          // A statement about what is on screen rather than an alert about
+          // something that just happened: nothing here interrupts a reader.
+          role="note"
+          className="rounded border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-100"
+        >
+          <p>
+            This engram is <strong>{status}</strong>, so it is kept for the
+            record rather than as current knowledge.
+          </p>
+          <Chain label="Superseded by" links={supersededBy} />
+          <Chain label="Supersedes" links={supersedes} />
+        </aside>
+      )}
+      {stale && (
+        <aside
+          role="status"
+          className="rounded border border-slate-300 bg-slate-50 px-3 py-2 text-sm text-slate-700 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200"
+        >
+          Due for a check: it was marked stale after {staleAfter}.
+        </aside>
+      )}
+    </div>
+  );
+}
+
+/**
+ * One direction of the chain, drawn only when it leads somewhere.
+ *
+ * Each end is drawn by the shared reference presentation, so a successor reads
+ * here exactly as the same target reads in the body and in the relation list.
+ */
+function Chain({ label, links }: { label: string; links: LifecycleLink[] }) {
+  if (links.length === 0) {
+    return null;
+  }
+  return (
+    <p className="mt-1 flex flex-wrap items-baseline gap-x-2">
+      <span>{label}</span>
+      {links.map((link) => (
+        <ReferenceLink key={`${link.label}-${link.href ?? ""}`} {...link} />
+      ))}
+    </p>
+  );
+}

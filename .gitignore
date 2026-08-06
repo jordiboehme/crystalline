@@ -2,6 +2,10 @@
 /target/
 /dist/
 
+# Fluid (the React UI) build output and installed packages
+/fluid/node_modules/
+/fluid/dist/
+
 # Skill training harness runtime state (evals/skill-training)
 evals/skill-training/outputs/
 evals/skill-training/.venv/
