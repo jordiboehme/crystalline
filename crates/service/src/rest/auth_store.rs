@@ -58,7 +58,7 @@ use turso::{Builder, Connection, Database, Row, Value};
 
 /// What a user may do. Ordered least to most privileged; the REST layer maps
 /// each endpoint to the minimum role it accepts.
-#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     /// Read only: search, read, browse.
@@ -132,14 +132,17 @@ fn normalize_name(name: &str) -> Result<String> {
 
 /// One account. Carries no password material, so it is safe to hand to a
 /// handler and serialize into a response.
-#[derive(Clone, Debug, serde::Serialize)]
+#[derive(Clone, Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct User {
     /// The login name and primary key. Also the identity the trusted-header
     /// mode provisions against.
+    #[schema(example = "ada")]
     pub name: String,
     /// Human-readable name for the UI.
+    #[schema(example = "Ada Lovelace")]
     pub display: String,
     /// Optional contact address; never used for login.
+    #[schema(example = "ada@example.com")]
     pub email: Option<String>,
     /// What this account may do.
     pub role: Role,

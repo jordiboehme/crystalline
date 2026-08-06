@@ -22,9 +22,93 @@ pub use auth::{
     AuthCfg, CSRF_HEADER, Caller, Identity, LOGIN_SLOTS, SESSION_COOKIE, SESSION_TTL_SECS,
 };
 pub use auth_store::*;
-pub use error::{ApiError, ApiJson, ApiPath, ApiQuery};
+pub use error::{ApiError, ApiJson, ApiPath, ApiQuery, ProblemDetail};
 
 use crate::engine::Engine;
+
+/// The OpenAPI 3.1 document for this surface, assembled from the
+/// `#[utoipa::path]` annotation on every handler.
+///
+/// `info.version` is the *API* version, pinned to `v1` to match the `/api/v1`
+/// mount, rather than the crate version utoipa would otherwise take from
+/// `Cargo.toml`. That is what makes the committed snapshot survive a release:
+/// bumping the workspace version must not rewrite an artifact the UI's client
+/// generator is compiled against, and the crate version is already reported by
+/// `GET /auth/me` for the client that wants it.
+#[derive(utoipa::OpenApi)]
+#[openapi(
+    info(
+        title = "Crystalline Fluid API",
+        version = "v1",
+        description = "The JSON API `crystalline serve --http` mounts at \
+                       `/api/v1`, the surface the Fluid UI talks to. Read-only \
+                       in this version apart from the session and account \
+                       routes.\n\nEvery path but `/auth/login`, `/auth/logout` \
+                       and `/auth/me` is closed by default: a request that \
+                       carries no identity is answered 401 ahead of routing, so \
+                       an unauthenticated caller never learns which paths \
+                       exist. Every failure is an RFC 9457 problem detail sent \
+                       as `application/problem+json`.\n\nThe payloads marked as \
+                       generic objects are the engine's own JSON, passed \
+                       through unchanged so this API and the MCP tools stay one \
+                       source of truth; each carries an example of the shape it \
+                       answers with.",
+        license(name = "AGPL-3.0-or-later"),
+    ),
+    tags(
+        (name = "meta", description = "The API's description of itself."),
+        (name = "auth", description = "Sessions and the capability probe."),
+        (name = "domains", description = "Which domains this instance serves and what each holds."),
+        (name = "engrams", description = "Listing and reading engrams."),
+        (name = "discovery", description = "Search, vocabulary, context and recent activity."),
+        (name = "graph", description = "The neighborhood graph around an anchor."),
+        (name = "users", description = "Account management. Admin only."),
+    ),
+    paths(
+        openapi_json,
+        auth::login,
+        auth::logout,
+        auth::me,
+        domains::list,
+        domains::tree,
+        domains::manifest,
+        engrams::list,
+        engrams::detail,
+        discovery::search,
+        discovery::vocabulary,
+        discovery::context,
+        discovery::activity,
+        graph::graph,
+        users_api::list,
+        users_api::create,
+        users_api::update,
+        users_api::remove,
+    ),
+    components(schemas(
+        ProblemDetail,
+        User,
+        Role,
+        auth::LoginBody,
+        auth::LoginResponse,
+        auth::LogoutResponse,
+        auth::MeResponse,
+        users_api::CreateBody,
+        users_api::PatchBody,
+        users_api::UserResponse,
+        users_api::UsersResponse,
+    )),
+)]
+struct ApiDoc;
+
+/// This surface's OpenAPI document.
+///
+/// One definition with two consumers: the [`openapi_json`] route serves it, and
+/// `tests/openapi_snapshot.rs` compares it against the committed
+/// `openapi/fluid-v1.json` the UI generates its client types from. Neither can
+/// drift from the annotations without the other noticing.
+pub fn openapi_document() -> utoipa::openapi::OpenApi {
+    <ApiDoc as utoipa::OpenApi>::openapi()
+}
 
 /// What every REST handler is given: the one shared engine the daemon owns,
 /// the one auth store this process holds open, and the auth settings resolved
@@ -86,6 +170,7 @@ impl RestState {
 /// route added below would serve unguarded.
 pub fn router(state: RestState) -> Router {
     Router::new()
+        .route("/openapi.json", get(openapi_json))
         .route("/auth/login", post(auth::login))
         .route("/auth/logout", post(auth::logout))
         .route("/auth/me", get(auth::me))
@@ -121,6 +206,46 @@ pub fn router(state: RestState) -> Router {
             auth::guard,
         ))
         .with_state(state)
+}
+
+/// `GET /openapi.json` - this API's own OpenAPI 3.1 document.
+///
+/// Served *behind* the viewer guard, with no [`auth`] `PUBLIC_PATHS` exception:
+/// the description of a closed API is part of what being closed by default
+/// protects, and an unauthenticated caller learning every path and parameter
+/// would undo what the guard's answering 401 ahead of routing is for. Nothing
+/// is lost by that. The document is a committed artifact at
+/// `crates/service/openapi/fluid-v1.json`, and the UI's client generator reads
+/// the file rather than this route, so tooling never needs a running server -
+/// let alone an unauthenticated one.
+#[utoipa::path(
+    get,
+    path = "/api/v1/openapi.json",
+    tag = "meta",
+    operation_id = "get_openapi_document",
+    summary = "This API's own OpenAPI 3.1 document.",
+    description = "Served behind the viewer guard like every other data route: \
+                   the description of a closed API is part of what being closed \
+                   by default protects. Tooling does not need this route, since \
+                   the document is a committed artifact in the repository at \
+                   `crates/service/openapi/fluid-v1.json`.",
+    responses(
+        (
+            status = 200,
+            description = "This document. Behind the viewer guard like every \
+                           other data route.",
+            body = Object,
+        ),
+        (
+            status = 401,
+            description = "No identity.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+async fn openapi_json() -> axum::Json<utoipa::openapi::OpenApi> {
+    axum::Json(openapi_document())
 }
 
 /// Answer an unknown `/api/v1` path in problem+json rather than letting it

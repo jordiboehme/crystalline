@@ -1,0 +1,1876 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Crystalline Fluid API",
+    "description": "The JSON API `crystalline serve --http` mounts at `/api/v1`, the surface the Fluid UI talks to. Read-only in this version apart from the session and account routes.\n\nEvery path but `/auth/login`, `/auth/logout` and `/auth/me` is closed by default: a request that carries no identity is answered 401 ahead of routing, so an unauthenticated caller never learns which paths exist. Every failure is an RFC 9457 problem detail sent as `application/problem+json`.\n\nThe payloads marked as generic objects are the engine's own JSON, passed through unchanged so this API and the MCP tools stay one source of truth; each carries an example of the shape it answers with.",
+    "license": {
+      "name": "AGPL-3.0-or-later"
+    },
+    "version": "v1"
+  },
+  "paths": {
+    "/api/v1/activity": {
+      "get": {
+        "tags": [
+          "discovery"
+        ],
+        "summary": "`GET /activity` - what was recorded lately, newest first, which is what a\nclient opens on.",
+        "description": "The window defaults in the engine rather than here, so the API and the MCP\ntool answer the same question when neither is told which window to use.",
+        "operationId": "get_activity",
+        "parameters": [
+          {
+            "name": "domains",
+            "in": "query",
+            "description": "Restrict to these domains, comma separated. Defaults to every registered\ndomain.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "eng,ops"
+          },
+          {
+            "name": "timeframe",
+            "in": "query",
+            "description": "A recency window such as `7d`, `24h` or `2w`. Defaults to `7d`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "7d"
+          },
+          {
+            "name": "types",
+            "in": "query",
+            "description": "Restrict to these `type` values, comma separated.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "decision,runbook"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The engine's own activity payload, unchanged, with the window it actually used echoed back.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                },
+                "example": {
+                  "count": 1,
+                  "engrams": [
+                    {
+                      "domain": "eng",
+                      "engram_type": "engram",
+                      "permalink": "alpha",
+                      "recorded_at": "2026-08-04",
+                      "status": "stable",
+                      "tags": [
+                        "eng"
+                      ],
+                      "title": "Alpha"
+                    }
+                  ],
+                  "timeframe": "7d"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The query string will not parse.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/auth/login": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Exchange credentials for a session.",
+        "description": "Sets the `fluid_session` cookie and returns the account plus the CSRF token every later mutating request must echo in `x-csrf-token`. Any session the request arrived holding is revoked first, so a planted token cannot survive a login.",
+        "operationId": "login",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LoginBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Signed in. The session cookie is set and the CSRF token is in the body.",
+            "headers": {
+              "set-cookie": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "The `fluid_session` session cookie, HttpOnly and SameSite=Lax."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LoginResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The body is not JSON.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "The name or password is wrong. One message for every way this can fail, so nothing is learned about which accounts exist.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body is not `application/json`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The body is JSON but not a login.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/auth/logout": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Revoke the session and clear its cookie. Not an error without one: a browser\nlogging out twice, or with a cookie this server has already forgotten, is\nordinary. Guarded by the CSRF check like any other mutating request, so\nanother origin cannot log a user out.",
+        "operationId": "logout",
+        "responses": {
+          "200": {
+            "description": "Signed out, whether or not there was a session to revoke.",
+            "headers": {
+              "set-cookie": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Clears the `fluid_session` cookie."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LogoutResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "A cookie session did not echo its CSRF token.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/auth/me": {
+      "get": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "The capability probe a client calls before anything else: who it is, whether\nit is being served anonymously, whether this instance refuses content\nmutations, and which server version it is talking to, so a mismatched UI can\nsay so instead of failing later.",
+        "description": "Answers without an identity on purpose. `user: null, anonymous: false` is\nwhat tells a browser to show a login form; `anonymous: true` tells it to\nbrowse instead.",
+        "operationId": "get_me",
+        "responses": {
+          "200": {
+            "description": "Who the caller is and what this instance allows. Answered without an identity too, which is how a client learns it has to log in.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MeResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/context": {
+      "get": {
+        "tags": [
+          "discovery"
+        ],
+        "summary": "`GET /context` - the graph around an anchor: the anchored engrams as seed\nnodes, the neighborhood ranked out from them, and the edges that connect what\ncame back. This is what a client draws a relationship view from.",
+        "description": "The three ways an anchor can be wrong stay distinguishable: absent is a 400\nfrom the extractor, one that is not a `crystalline://` URL is the engine's\nown 422, and one pointing at an engram nobody wrote is a 404.\n\n`timeframe` is not exposed: the engine documents it as advisory in this\nversion, and a parameter that does not change the answer is not worth a\nclient learning.",
+        "operationId": "get_context",
+        "parameters": [
+          {
+            "name": "anchor",
+            "in": "query",
+            "description": "A `crystalline://domain/permalink` anchor. A `/*` suffix globs a prefix.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "crystalline://eng/alpha"
+          },
+          {
+            "name": "depth",
+            "in": "query",
+            "description": "Traversal depth, 1 to 3. Defaults to 1.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            },
+            "example": 1
+          },
+          {
+            "name": "domains",
+            "in": "query",
+            "description": "Restrict the returned neighborhood to these domains, comma separated.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "eng,ops"
+          },
+          {
+            "name": "max_related",
+            "in": "query",
+            "description": "Maximum related engrams beyond the anchors. Defaults to 10.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "example": 10
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The engine's own context payload, unchanged: the anchored engrams as seed nodes plus the neighborhood ranked out from them.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                },
+                "example": {
+                  "anchor": "crystalline://eng/alpha",
+                  "depth": 1,
+                  "edges": [
+                    {
+                      "from": 1,
+                      "kind": "relation",
+                      "rel_type": "relates_to",
+                      "to": 2
+                    }
+                  ],
+                  "nodes": [
+                    {
+                      "domain": "eng",
+                      "id": 1,
+                      "permalink": "alpha",
+                      "seed": true,
+                      "title": "Alpha",
+                      "type": "engram"
+                    },
+                    {
+                      "domain": "eng",
+                      "id": 2,
+                      "permalink": "notes/beta",
+                      "seed": false,
+                      "title": "Beta",
+                      "type": "engram"
+                    }
+                  ],
+                  "timeframe": null
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The query string will not parse, `anchor` included: it has no default.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The anchor names no engram.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The anchor is not a `crystalline://` URL.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/domains": {
+      "get": {
+        "tags": [
+          "domains"
+        ],
+        "summary": "`GET /domains` - every registered domain with its counts, its kind and its\nrouting bullets, plus the behavior rules that govern them.",
+        "description": "`include_routing` is always on rather than a query parameter: a browser\nclient is exactly the caller that has no other way to learn what a domain is\nfor, and the bullets are a handful of lines per domain.",
+        "operationId": "list_domains",
+        "responses": {
+          "200": {
+            "description": "The engine's own domain listing, unchanged.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                },
+                "example": {
+                  "behavior": [
+                    "Search before answering from memory.",
+                    "Record what was learned as an engram."
+                  ],
+                  "domains": [
+                    {
+                      "engrams": 4,
+                      "kind": "file",
+                      "last_sync": "2026-08-05T09:14:22Z",
+                      "name": "eng",
+                      "observations": 12,
+                      "path": "/Users/ada/Documents/Crystalline/eng",
+                      "relations": 3,
+                      "when_to_use": [
+                        "Route here for eng questions."
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/domains/{domain}/engrams": {
+      "get": {
+        "tags": [
+          "engrams"
+        ],
+        "summary": "One domain's engrams, filtered by frontmatter and paged.",
+        "description": "A filter-only search, so the answer carries the same page envelope a search does and a client pages it the same way. Listing by folder is not here: the tree endpoint owns the navigation view and this one owns the frontmatter view.\n\nA domain nobody registered is a 404, while filters that match nothing are an empty page: two states a client can tell apart.",
+        "operationId": "list_engrams",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The registered domain.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "type",
+            "in": "query",
+            "description": "Filter by `type`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "decision"
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "description": "Filter by `status`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "stable"
+          },
+          {
+            "name": "tags",
+            "in": "query",
+            "description": "Require all of these tags, comma separated. A URL is a string, so the\nrepeated-parameter form a `Vec` would need is not on offer here; the\nlist is split on the way in.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "eng,nested"
+          },
+          {
+            "name": "after",
+            "in": "query",
+            "description": "Only engrams recorded on or after this ISO date.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "2026-01-31"
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "description": "One-based page number. Defaults to 1.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "example": 1
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size. Defaults to 10.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "example": 10
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The engine's page envelope, unchanged.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                },
+                "example": {
+                  "count": 1,
+                  "hits": [
+                    {
+                      "domain": "eng",
+                      "engram_type": "engram",
+                      "kind": "engram",
+                      "permalink": "alpha",
+                      "score": 1.0,
+                      "snippet": "The first engram in this domain.",
+                      "status": "stable",
+                      "tags": [
+                        "eng"
+                      ],
+                      "title": "Alpha"
+                    }
+                  ],
+                  "limit": 10,
+                  "mode": "text",
+                  "page": 1,
+                  "total": 4
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The query string will not parse.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/domains/{domain}/engrams/{permalink}": {
+      "get": {
+        "tags": [
+          "engrams"
+        ],
+        "summary": "One engram in full.",
+        "description": "Its frontmatter, its markdown as written and the references the engine resolves around it.\n\nThe response carries an `ETag` over the markdown, so a client knows which version it is holding and can say so when it later writes back.",
+        "operationId": "get_engram",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The registered domain.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "permalink",
+            "in": "path",
+            "description": "The engram permalink. A permalink is a path, so this segment may contain slashes: `notes/deep/gamma`.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "notes/deep/gamma"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The engine's own read payload, unchanged.",
+            "headers": {
+              "etag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "The quoted checksum of the engram as read, the same token a later write compares an `expected_checksum` against."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                },
+                "example": {
+                  "checksum": "3f8a1c05e2",
+                  "content": "---\ntitle: Alpha\n---\n\nThe first engram.\n",
+                  "domain": "eng",
+                  "frontmatter": {
+                    "permalink": "alpha",
+                    "title": "Alpha"
+                  },
+                  "links": [],
+                  "observations": [],
+                  "path": "alpha.md",
+                  "permalink": "alpha",
+                  "relations": [],
+                  "status": "stable",
+                  "title": "Alpha",
+                  "type": "engram",
+                  "url": "crystalline://eng/alpha"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain or engram.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/domains/{domain}/manifest": {
+      "get": {
+        "tags": [
+          "domains"
+        ],
+        "summary": "`GET /domains/{domain}/manifest` - the domain's MANIFEST markdown as\nwritten, so a client can render or edit the source rather than a reduction\nof it.",
+        "operationId": "get_domain_manifest",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The registered domain.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The manifest source beside the domain it belongs to.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                },
+                "example": {
+                  "domain": "eng",
+                  "markdown": "---\ntitle: eng\n---\n\n## When to Use\n\n- Route here for eng questions.\n"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain, or the domain carries no MANIFEST yet.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/domains/{domain}/tree": {
+      "get": {
+        "tags": [
+          "domains"
+        ],
+        "summary": "`GET /domains/{domain}/tree` - one domain's engrams and subfolders under a\npath, the navigation a file tree in the UI is built from.",
+        "operationId": "get_domain_tree",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The registered domain.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "path",
+            "in": "query",
+            "description": "A domain-relative folder path. Defaults to the root.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "notes"
+          },
+          {
+            "name": "depth",
+            "in": "query",
+            "description": "How many folder levels deep to list. Defaults to 1.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "example": 2
+          },
+          {
+            "name": "glob",
+            "in": "query",
+            "description": "A glob filtering the engram paths listed.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "notes/**"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The engine's own browse payload, unchanged.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                },
+                "example": {
+                  "domain": "eng",
+                  "engrams": [
+                    {
+                      "path": "alpha.md",
+                      "permalink": "alpha",
+                      "title": "Alpha",
+                      "type": "engram"
+                    }
+                  ],
+                  "folders": [
+                    "notes"
+                  ],
+                  "path": "/"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The query string will not parse.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The glob is not a valid pattern.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/graph": {
+      "get": {
+        "tags": [
+          "graph"
+        ],
+        "summary": "`GET /graph` - the nodes and typed edges around an anchor: every node with\nthe address, title, status and type a client labels it with, every edge with\nits direction and `rel_type`, and `truncated` saying whether the node cap\ncut anything.",
+        "description": "Both bounds are the server's to decide: the engine clamps the depth to one or\ntwo hops and the node count to its own ceiling, so a hand-written URL can ask\nneither for nothing nor for a whole index in one payload. A clamped request\nis answered rather than refused - the honest report of what was returned is\nthe payload itself.\n\nRetired engrams are part of the answer, carrying their status. The graph is\nthe shape of what is written, and a client fades what is retired rather than\nbeing served a graph with the retired nodes already cut out of it.\n\nThe three ways an anchor can be wrong stay distinguishable, as on `/context`:\nabsent is a 400 from the extractor, one that is not a `crystalline://` URL is\nthe engine's own 422, and one pointing at an engram nobody wrote is a 404.",
+        "operationId": "get_graph",
+        "parameters": [
+          {
+            "name": "anchor",
+            "in": "query",
+            "description": "A `crystalline://domain/permalink` anchor. A `/*` suffix globs a prefix.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "crystalline://eng/alpha"
+          },
+          {
+            "name": "depth",
+            "in": "query",
+            "description": "Traversal depth, 1 or 2. Defaults to 1.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            },
+            "example": 1
+          },
+          {
+            "name": "max_nodes",
+            "in": "query",
+            "description": "The most nodes to return. Defaults to 100, capped by the engine.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "example": 100
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The engine's own graph payload, unchanged: the flat node and edge lists a renderer draws from, with `truncated` saying whether the node cap cut anything. `id` is opaque and stable only within one response; the address is `crystalline://domain/permalink`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                },
+                "example": {
+                  "edges": [
+                    {
+                      "from": 1,
+                      "rel_type": "relates_to",
+                      "to": 2
+                    }
+                  ],
+                  "nodes": [
+                    {
+                      "domain": "eng",
+                      "id": 1,
+                      "permalink": "alpha",
+                      "status": "stable",
+                      "title": "Alpha",
+                      "type": "engram"
+                    },
+                    {
+                      "domain": "eng",
+                      "id": 2,
+                      "permalink": "notes/beta",
+                      "status": "deprecated",
+                      "title": "Beta",
+                      "type": "engram"
+                    }
+                  ],
+                  "truncated": false
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The query string will not parse, `anchor` included: it has no default.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The anchor names no engram.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The anchor is not a `crystalline://` URL.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/openapi.json": {
+      "get": {
+        "tags": [
+          "meta"
+        ],
+        "summary": "This API's own OpenAPI 3.1 document.",
+        "description": "Served behind the viewer guard like every other data route: the description of a closed API is part of what being closed by default protects. Tooling does not need this route, since the document is a committed artifact in the repository at `crates/service/openapi/fluid-v1.json`.",
+        "operationId": "get_openapi_document",
+        "responses": {
+          "200": {
+            "description": "This document. Behind the viewer guard like every other data route.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/search": {
+      "get": {
+        "tags": [
+          "discovery"
+        ],
+        "summary": "`GET /search` - search across the registered domains, or across the ones\n`domains` names.",
+        "description": "The answer is the engine's page envelope (`mode`, `total`, `page`, `limit`,\n`count`, `hits`), so a client pages a search the way it pages a listing.\n`mode` is the mode that actually ran rather than the one asked for: hybrid\nand semantic fall back to text where there is nothing embedded to search, and\nthe response says which happened rather than quietly answering from a\ndifferent index than the caller expected.\n\nA `search_type` the engine does not know is its own error, surfaced as a 422\nproblem detail carrying the engine's message, so the caller learns which\nvalues do work instead of being handed a bare status.\n\n`metadata_filters` is not exposed: it takes a JSON object of comparisons,\nwhich has no honest query-string spelling, and no client needs it yet.",
+        "operationId": "search",
+        "parameters": [
+          {
+            "name": "q",
+            "in": "query",
+            "description": "The free-text query. Omit for a filter-only search.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "retrieval latency"
+          },
+          {
+            "name": "domains",
+            "in": "query",
+            "description": "Restrict to these domains, comma separated. Defaults to every registered\ndomain.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "eng,ops"
+          },
+          {
+            "name": "type",
+            "in": "query",
+            "description": "Filter by `type`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "decision"
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "description": "Filter by `status`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "stable"
+          },
+          {
+            "name": "tags",
+            "in": "query",
+            "description": "Require all of these tags, comma separated.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "eng,nested"
+          },
+          {
+            "name": "after",
+            "in": "query",
+            "description": "Only engrams recorded on or after this ISO date.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "2026-01-31"
+          },
+          {
+            "name": "search_type",
+            "in": "query",
+            "description": "hybrid (default), text, semantic, title or permalink.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "hybrid"
+          },
+          {
+            "name": "min_similarity",
+            "in": "query",
+            "description": "Minimum cosine similarity for a semantic hit.",
+            "required": false,
+            "schema": {
+              "type": "number",
+              "format": "float"
+            },
+            "example": 0.65
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "description": "One-based page number. Defaults to 1.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "example": 1
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size. Defaults to 10.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "example": 10
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The engine's page envelope, unchanged. `mode` is the mode that actually ran, which may be a fallback to text.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                },
+                "example": {
+                  "count": 1,
+                  "hits": [
+                    {
+                      "domain": "eng",
+                      "engram_type": "engram",
+                      "kind": "observation",
+                      "line": 14,
+                      "permalink": "alpha",
+                      "score": 0.82,
+                      "snippet": "...retrieval latency dropped by half...",
+                      "status": "stable",
+                      "tags": [
+                        "eng"
+                      ],
+                      "title": "Alpha"
+                    }
+                  ],
+                  "limit": 10,
+                  "mode": "hybrid",
+                  "page": 1,
+                  "total": 3
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The query string will not parse.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`search_type` names a mode the engine does not know.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/users": {
+      "get": {
+        "tags": [
+          "users"
+        ],
+        "summary": "Every account, by name.",
+        "description": "An account carries no password material, so the rows go out as they come back from the store. Admin only: the account list names every way into the instance and who holds it.",
+        "operationId": "list_users",
+        "responses": {
+          "200": {
+            "description": "Every account.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UsersResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an admin.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "users"
+        ],
+        "summary": "`POST /users` - add an account, answering 201 with the account as stored.",
+        "description": "The response is read back out of the store rather than echoed from the\nrequest, so what the client renders is what was written: the folded name,\nthe defaulted display name, and the disabled flag the row starts with.",
+        "operationId": "create_user",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "The account as stored.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The body is not JSON.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an admin, or a cookie session did not echo its CSRF token.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "That name is already taken.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body is not `application/json`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The body is JSON but not an account, or the password is empty.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/users/{name}": {
+      "delete": {
+        "tags": [
+          "users"
+        ],
+        "summary": "`DELETE /users/{name}` - remove an account and every session it holds,\nanswering 204.",
+        "description": "An admin may not remove its own account (409), and the store refuses to\nremove the last enabled admin whoever asks (409 as well, in its own words).",
+        "operationId": "delete_user",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "The account, in any casing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The account and its sessions are gone."
+          },
+          "401": {
+            "description": "No identity.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an admin, or a cookie session did not echo its CSRF token.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The account is the caller's own, or is the last enabled admin.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "users"
+        ],
+        "summary": "`PATCH /users/{name}` - change a role, a disabled flag, a password, or any\ncombination, answering with the account as it now stands.",
+        "description": "Two of the three fields are revocations as well as edits: setting a password\nand disabling an account each delete every session that account holds, in\nthe store and in the same transaction as the change. That is what makes this\nroute useful against a compromised account - a reset that left the intruder's\ncookie alive for the rest of its 30-day life would be theatre - and it means\nan admin resetting their own password signs their own other sessions out too,\nthis one included.\n\nEvery check runs before the first write, so a request that will be refused\nchanges nothing. The writes themselves are one store call each rather than\none transaction: the store's guarded statements each own their own\ninvariant, and a failure part-way leaves the earlier fields applied and says\nwhich operation was refused. That is visible to a client only in the\npathological case of a concurrent edit racing this one, since the refusals a\ncaller can provoke on purpose - the last-admin guard and an unknown account\n- are decided identically by all three statements.",
+        "operationId": "update_user",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "The account, in any casing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PatchBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The account as it now stands.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The body is not JSON.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an admin, or a cookie session did not echo its CSRF token.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The change would disable the caller's own account, or would leave the installation without an enabled admin.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body is not `application/json`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The body changes nothing, or the new password is empty.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/vocabulary": {
+      "get": {
+        "tags": [
+          "discovery"
+        ],
+        "summary": "`GET /vocabulary` - the words the domains are written in: the tags in use\nwith their counts, the observation categories and the relation types, plus\nthe near-duplicate clusters and tag aliases the engine reports when there are\nany.",
+        "description": "The domain is a filter here rather than a path segment, so an unknown name\nanswers an empty vocabulary rather than a 404: this route asks what is in\nuse, and the answer to that can legitimately be nothing.",
+        "operationId": "get_vocabulary",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "query",
+            "description": "Restrict to one domain. Omit for a vocabulary across every domain.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "eng"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The engine's own vocabulary payload, unchanged. `clusters` and `aliases` are omitted when there are none.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                },
+                "example": {
+                  "aliases": [
+                    {
+                      "alias": "engineering",
+                      "canonical": "eng"
+                    }
+                  ],
+                  "categories": [
+                    {
+                      "count": 4,
+                      "name": "decision"
+                    }
+                  ],
+                  "domain": "eng",
+                  "relation_types": [
+                    {
+                      "count": 2,
+                      "name": "relates_to"
+                    }
+                  ],
+                  "tags": [
+                    {
+                      "engrams": 3,
+                      "name": "eng",
+                      "observations": 5
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The query string will not parse.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "CreateBody": {
+        "type": "object",
+        "description": "A new account. `display` defaults to `name` as typed, and `email` is optional and never used for login.",
+        "required": [
+          "name",
+          "role",
+          "password"
+        ],
+        "properties": {
+          "display": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Human-readable name for the UI. Defaults to `name` as typed.",
+            "example": "Bob"
+          },
+          "email": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional contact address.",
+            "example": "bob@example.com"
+          },
+          "name": {
+            "type": "string",
+            "description": "The login name, in any casing: the store folds it.",
+            "example": "bob"
+          },
+          "password": {
+            "type": "string",
+            "description": "The initial password. Never stored in the clear; the store hashes it.",
+            "example": "correct horse battery staple"
+          },
+          "role": {
+            "$ref": "#/components/schemas/Role",
+            "description": "What the new account may do."
+          }
+        }
+      },
+      "LoginBody": {
+        "type": "object",
+        "description": "What `POST /auth/login` takes.",
+        "required": [
+          "name",
+          "password"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The account name, in any casing: the store folds it.",
+            "example": "ada"
+          },
+          "password": {
+            "type": "string",
+            "description": "The password, checked with argon2id.",
+            "example": "correct horse battery staple"
+          }
+        }
+      },
+      "LoginResponse": {
+        "type": "object",
+        "description": "What `POST /auth/login` answers with.\n\nA type rather than an inline `json!`, so the OpenAPI document and the\nresponse are one definition. Same for the two below it.",
+        "required": [
+          "user",
+          "csrf"
+        ],
+        "properties": {
+          "csrf": {
+            "type": "string",
+            "description": "The session's CSRF token, which every later mutating request must echo\nin the `x-csrf-token` header (see `CSRF_HEADER`).\n\nThe header is named in plain backticks rather than through an intra-doc\nlink because utoipa copies this comment into the published document,\nwhere a Rust link target reads as noise. Same wherever else a schema\nfield's comment names something in this crate.",
+            "example": "9f2c1d7e4b6a8035"
+          },
+          "user": {
+            "$ref": "#/components/schemas/User",
+            "description": "The account that was signed in."
+          }
+        }
+      },
+      "LogoutResponse": {
+        "type": "object",
+        "description": "What `POST /auth/logout` answers with: an acknowledgement and nothing else,\nsince a logout that found no session is a success too.",
+        "required": [
+          "ok"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "description": "Always true."
+          }
+        }
+      },
+      "MeResponse": {
+        "type": "object",
+        "description": "What `GET /auth/me` answers with: everything a client needs before it draws\nanything.",
+        "required": [
+          "anonymous",
+          "read_only",
+          "version"
+        ],
+        "properties": {
+          "anonymous": {
+            "type": "boolean",
+            "description": "Whether the request is being served as the anonymous viewer."
+          },
+          "read_only": {
+            "type": "boolean",
+            "description": "Whether this instance refuses content mutations."
+          },
+          "user": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/User",
+                "description": "The account behind this request, or null when there is none."
+              }
+            ]
+          },
+          "version": {
+            "type": "string",
+            "description": "The server version, so a mismatched UI can say so.",
+            "example": "0.12.0"
+          }
+        }
+      },
+      "PatchBody": {
+        "type": "object",
+        "description": "Whichever of the three an admin wants to change. All absent is refused with a 422 rather than served as a no-op, so a client sending the wrong field names hears about it.",
+        "properties": {
+          "disabled": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Whether the account is disabled. Disabling deletes every session the\naccount holds, so it is a revocation rather than a flag a later\nre-enabling hands back; it also stops any new login."
+          },
+          "password": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A replacement password. Setting it revokes every session the account\nholds, so whoever was signed in under the old one is signed out."
+          },
+          "role": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Role",
+                "description": "The new role."
+              }
+            ]
+          }
+        }
+      },
+      "ProblemDetail": {
+        "type": "object",
+        "description": "An RFC 9457 problem detail, sent as `application/problem+json`. Every failure on this surface has this shape, so a client can branch on `status` alone.",
+        "required": [
+          "type",
+          "status",
+          "title",
+          "detail"
+        ],
+        "properties": {
+          "detail": {
+            "type": "string",
+            "description": "The specific occurrence, safe to show to the caller.",
+            "example": "no engram 'ghost' in domain 'eng'"
+          },
+          "status": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The HTTP status, mirrored into the body so a client that only has the\nparsed payload can still branch on it.",
+            "example": 404,
+            "minimum": 0
+          },
+          "title": {
+            "type": "string",
+            "description": "A short, stable, human-readable summary of the problem type.",
+            "example": "not found"
+          },
+          "type": {
+            "type": "string",
+            "description": "The problem type URI. Always `about:blank`: `status` and `title` carry\nthe classification, and this surface publishes no per-problem pages to\npoint at.",
+            "example": "about:blank"
+          }
+        }
+      },
+      "Role": {
+        "type": "string",
+        "description": "What a user may do. Ordered least to most privileged; the REST layer maps\neach endpoint to the minimum role it accepts.",
+        "enum": [
+          "viewer",
+          "editor",
+          "admin"
+        ]
+      },
+      "User": {
+        "type": "object",
+        "description": "One account. Carries no password material, so it is safe to hand to a\nhandler and serialize into a response.",
+        "required": [
+          "name",
+          "display",
+          "role",
+          "disabled"
+        ],
+        "properties": {
+          "disabled": {
+            "type": "boolean",
+            "description": "A disabled account keeps its rows but can neither log in nor use an\nalready-issued session."
+          },
+          "display": {
+            "type": "string",
+            "description": "Human-readable name for the UI.",
+            "example": "Ada Lovelace"
+          },
+          "email": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional contact address; never used for login.",
+            "example": "ada@example.com"
+          },
+          "name": {
+            "type": "string",
+            "description": "The login name and primary key. Also the identity the trusted-header\nmode provisions against.",
+            "example": "ada"
+          },
+          "role": {
+            "$ref": "#/components/schemas/Role",
+            "description": "What this account may do."
+          }
+        }
+      },
+      "UserResponse": {
+        "type": "object",
+        "description": "What the two writing routes answer with: the account as stored, read back\nafter the write rather than echoed from the request.",
+        "required": [
+          "user"
+        ],
+        "properties": {
+          "user": {
+            "$ref": "#/components/schemas/User",
+            "description": "The account as it now stands."
+          }
+        }
+      },
+      "UsersResponse": {
+        "type": "object",
+        "description": "What `GET /users` answers with. A wrapper rather than a bare array, matching\nthe `{\"users\": [...]}` envelope `crystalline users list --json` prints.",
+        "required": [
+          "users"
+        ],
+        "properties": {
+          "users": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/User"
+            },
+            "description": "Every account, by name."
+          }
+        }
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "meta",
+      "description": "The API's description of itself."
+    },
+    {
+      "name": "auth",
+      "description": "Sessions and the capability probe."
+    },
+    {
+      "name": "domains",
+      "description": "Which domains this instance serves and what each holds."
+    },
+    {
+      "name": "engrams",
+      "description": "Listing and reading engrams."
+    },
+    {
+      "name": "discovery",
+      "description": "Search, vocabulary, context and recent activity."
+    },
+    {
+      "name": "graph",
+      "description": "The neighborhood graph around an anchor."
+    },
+    {
+      "name": "users",
+      "description": "Account management. Admin only."
+    }
+  ]
+}

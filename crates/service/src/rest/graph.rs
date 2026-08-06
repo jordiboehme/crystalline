@@ -10,21 +10,26 @@ use axum::Json;
 use axum::extract::State;
 use serde::Deserialize;
 use serde_json::Value;
+use utoipa::IntoParams;
 
-use super::{ApiError, ApiQuery, RestState};
+use super::{ApiError, ApiQuery, ProblemDetail, RestState};
 
 /// The query string `GET /graph` takes. `anchor` has no default: a traversal
 /// with nothing to start from is not a request this route can answer, so a
 /// missing one is rejected by the extractor as a 400 rather than guessed at.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct GraphQuery {
     /// A `crystalline://domain/permalink` anchor. A `/*` suffix globs a prefix.
+    #[param(example = "crystalline://eng/alpha")]
     anchor: String,
     /// Traversal depth, 1 or 2. Defaults to 1.
     #[serde(default)]
+    #[param(example = 1)]
     depth: Option<u8>,
     /// The most nodes to return. Defaults to 100, capped by the engine.
     #[serde(default)]
+    #[param(example = 100)]
     max_nodes: Option<usize>,
 }
 
@@ -55,6 +60,71 @@ const DEFAULT_MAX_NODES: usize = 100;
 /// The three ways an anchor can be wrong stay distinguishable, as on `/context`:
 /// absent is a 400 from the extractor, one that is not a `crystalline://` URL is
 /// the engine's own 422, and one pointing at an engram nobody wrote is a 404.
+#[utoipa::path(
+    get,
+    path = "/api/v1/graph",
+    tag = "graph",
+    operation_id = "get_graph",
+    params(GraphQuery),
+    responses(
+        (
+            status = 200,
+            description = "The engine's own graph payload, unchanged: the flat \
+                           node and edge lists a renderer draws from, with \
+                           `truncated` saying whether the node cap cut anything. \
+                           `id` is opaque and stable only within one response; \
+                           the address is `crystalline://domain/permalink`.",
+            body = Object,
+            example = json!({
+                "nodes": [
+                    {
+                        "id": 1,
+                        "domain": "eng",
+                        "permalink": "alpha",
+                        "title": "Alpha",
+                        "status": "stable",
+                        "type": "engram"
+                    },
+                    {
+                        "id": 2,
+                        "domain": "eng",
+                        "permalink": "notes/beta",
+                        "title": "Beta",
+                        "status": "deprecated",
+                        "type": "engram"
+                    }
+                ],
+                "edges": [{ "from": 1, "to": 2, "rel_type": "relates_to" }],
+                "truncated": false
+            }),
+        ),
+        (
+            status = 400,
+            description = "The query string will not parse, `anchor` included: it \
+                           has no default.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 401,
+            description = "No identity.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 404,
+            description = "The anchor names no engram.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 422,
+            description = "The anchor is not a `crystalline://` URL.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
 pub async fn graph(
     State(state): State<RestState>,
     ApiQuery(query): ApiQuery<GraphQuery>,

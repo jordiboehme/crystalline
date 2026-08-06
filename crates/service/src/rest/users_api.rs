@@ -41,28 +41,68 @@ use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use serde::Deserialize;
-use serde_json::{Value, json};
 
 use super::auth::{Caller, Identity};
 use super::auth_store::{Role, User};
-use super::{ApiError, ApiJson, ApiPath, RestState};
+use super::{ApiError, ApiJson, ApiPath, ProblemDetail, RestState};
+
+/// What `GET /users` answers with. A wrapper rather than a bare array, matching
+/// the `{"users": [...]}` envelope `crystalline users list --json` prints.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct UsersResponse {
+    /// Every account, by name.
+    users: Vec<User>,
+}
+
+/// What the two writing routes answer with: the account as stored, read back
+/// after the write rather than echoed from the request.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct UserResponse {
+    /// The account as it now stands.
+    user: User,
+}
 
 /// `GET /users` - every account, by name.
 ///
 /// [`User`] carries no password material, so the rows go out as they come back
 /// from the store. Admin only: the account list names every way into the
 /// instance and who holds it.
+#[utoipa::path(
+    get,
+    path = "/api/v1/users",
+    tag = "users",
+    operation_id = "list_users",
+    summary = "Every account, by name.",
+    description = "An account carries no password material, so the rows go out \
+                   as they come back from the store. Admin only: the account \
+                   list names every way into the instance and who holds it.",
+    responses(
+        (status = 200, description = "Every account.", body = UsersResponse),
+        (
+            status = 401,
+            description = "No identity.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "The caller is not an admin.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
 pub async fn list(
     State(state): State<RestState>,
     identity: Identity,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<UsersResponse>, ApiError> {
     identity.require_admin()?;
     let users = state
         .auth
         .list_users()
         .await
         .map_err(|e| store_error(e, ""))?;
-    Ok(Json(json!({ "users": users })))
+    Ok(Json(UsersResponse { users }))
 }
 
 /// What `POST /users` takes. `display` defaults to the name as typed, matching
@@ -71,19 +111,25 @@ pub async fn list(
 /// [`Debug`] is written by hand rather than derived, here and on [`PatchBody`]:
 /// the derived one would print the plaintext password, and this type is one
 /// `tracing::debug!` or one `unwrap` on a rejection away from a log file.
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
+#[schema(description = "A new account. `display` defaults to `name` as typed, \
+                        and `email` is optional and never used for login.")]
 pub struct CreateBody {
     /// The login name, in any casing: the store folds it.
+    #[schema(example = "bob")]
     name: String,
     /// Human-readable name for the UI. Defaults to `name` as typed.
     #[serde(default)]
+    #[schema(example = "Bob")]
     display: Option<String>,
     /// Optional contact address.
     #[serde(default)]
+    #[schema(example = "bob@example.com")]
     email: Option<String>,
     /// What the new account may do.
     role: Role,
     /// The initial password. Never stored in the clear; the store hashes it.
+    #[schema(example = "correct horse battery staple")]
     password: String,
 }
 
@@ -92,11 +138,59 @@ pub struct CreateBody {
 /// The response is read back out of the store rather than echoed from the
 /// request, so what the client renders is what was written: the folded name,
 /// the defaulted display name, and the disabled flag the row starts with.
+#[utoipa::path(
+    post,
+    path = "/api/v1/users",
+    tag = "users",
+    operation_id = "create_user",
+    request_body = CreateBody,
+    responses(
+        (status = 201, description = "The account as stored.", body = UserResponse),
+        (
+            status = 400,
+            description = "The body is not JSON.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 401,
+            description = "No identity.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "The caller is not an admin, or a cookie session did \
+                           not echo its CSRF token.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 409,
+            description = "That name is already taken.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 415,
+            description = "The body is not `application/json`.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 422,
+            description = "The body is JSON but not an account, or the password \
+                           is empty.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
 pub async fn create(
     State(state): State<RestState>,
     identity: Identity,
     ApiJson(body): ApiJson<CreateBody>,
-) -> Result<(StatusCode, Json<Value>), ApiError> {
+) -> Result<(StatusCode, Json<UserResponse>), ApiError> {
     identity.require_admin()?;
     check_password(&body.password)?;
     // The login name as typed makes the better default display name: the store
@@ -117,7 +211,7 @@ pub async fn create(
         .await?
         .map_err(|e| store_error(e, &body.name))?;
     let user = read_back(&state, &body.name).await?;
-    Ok((StatusCode::CREATED, Json(json!({ "user": user }))))
+    Ok((StatusCode::CREATED, Json(UserResponse { user })))
 }
 
 /// What `PATCH /users/{name}` takes: whichever of the three an admin wants to
@@ -125,7 +219,11 @@ pub async fn create(
 /// sending the wrong field names hears about it.
 ///
 /// [`Debug`] is hand-written and redacts the password, as on [`CreateBody`].
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
+#[schema(description = "Whichever of the three an admin wants to change. All \
+                        absent is refused with a 422 rather than served as a \
+                        no-op, so a client sending the wrong field names hears \
+                        about it.")]
 pub struct PatchBody {
     /// The new role.
     #[serde(default)]
@@ -182,12 +280,67 @@ impl std::fmt::Debug for PatchBody {
 /// pathological case of a concurrent edit racing this one, since the refusals a
 /// caller can provoke on purpose - the last-admin guard and an unknown account
 /// - are decided identically by all three statements.
+#[utoipa::path(
+    patch,
+    path = "/api/v1/users/{name}",
+    tag = "users",
+    operation_id = "update_user",
+    params(("name" = String, Path, description = "The account, in any casing.")),
+    request_body = PatchBody,
+    responses(
+        (status = 200, description = "The account as it now stands.", body = UserResponse),
+        (
+            status = 400,
+            description = "The body is not JSON.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 401,
+            description = "No identity.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "The caller is not an admin, or a cookie session did \
+                           not echo its CSRF token.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 404,
+            description = "No such account.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 409,
+            description = "The change would disable the caller's own account, or \
+                           would leave the installation without an enabled admin.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 415,
+            description = "The body is not `application/json`.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 422,
+            description = "The body changes nothing, or the new password is empty.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
 pub async fn update(
     State(state): State<RestState>,
     identity: Identity,
     ApiPath(name): ApiPath<String>,
     ApiJson(body): ApiJson<PatchBody>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<UserResponse>, ApiError> {
     let caller = identity.require_admin()?;
     if body.role.is_none() && body.disabled.is_none() && body.password.is_none() {
         return Err(ApiError::unprocessable(
@@ -222,7 +375,7 @@ pub async fn update(
             .map_err(|e| store_error(e, &name))?;
     }
     let user = read_back(&state, &name).await?;
-    Ok(Json(json!({ "user": user })))
+    Ok(Json(UserResponse { user }))
 }
 
 /// `DELETE /users/{name}` - remove an account and every session it holds,
@@ -230,6 +383,42 @@ pub async fn update(
 ///
 /// An admin may not remove its own account (409), and the store refuses to
 /// remove the last enabled admin whoever asks (409 as well, in its own words).
+#[utoipa::path(
+    delete,
+    path = "/api/v1/users/{name}",
+    tag = "users",
+    operation_id = "delete_user",
+    params(("name" = String, Path, description = "The account, in any casing.")),
+    responses(
+        (status = 204, description = "The account and its sessions are gone."),
+        (
+            status = 401,
+            description = "No identity.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "The caller is not an admin, or a cookie session did \
+                           not echo its CSRF token.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 404,
+            description = "No such account.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 409,
+            description = "The account is the caller's own, or is the last \
+                           enabled admin.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
 pub async fn remove(
     State(state): State<RestState>,
     identity: Identity,
@@ -349,6 +538,8 @@ fn store_error(e: anyhow::Error, subject: &str) -> ApiError {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
     use crate::rest::AuthStore;
 

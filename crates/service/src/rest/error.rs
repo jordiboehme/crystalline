@@ -187,14 +187,45 @@ impl<T: DeserializeOwned, S: Send + Sync> FromRequest<S> for ApiJson<T> {
     }
 }
 
+/// The wire form of an [`ApiError`]: the RFC 9457 body every failure on this
+/// surface carries, and the one schema the OpenAPI document names for every
+/// error response.
+///
+/// Written as a type rather than as an inline `json!` so the document and the
+/// response are the same definition: a field renamed here changes both at once,
+/// which is the whole reason a generated client can trust the error shape.
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+#[schema(description = "An RFC 9457 problem detail, sent as \
+                        `application/problem+json`. Every failure on this \
+                        surface has this shape, so a client can branch on \
+                        `status` alone.")]
+pub struct ProblemDetail {
+    /// The problem type URI. Always `about:blank`: `status` and `title` carry
+    /// the classification, and this surface publishes no per-problem pages to
+    /// point at.
+    #[serde(rename = "type")]
+    #[schema(example = "about:blank")]
+    pub problem_type: &'static str,
+    /// The HTTP status, mirrored into the body so a client that only has the
+    /// parsed payload can still branch on it.
+    #[schema(example = 404)]
+    pub status: u16,
+    /// A short, stable, human-readable summary of the problem type.
+    #[schema(example = "not found")]
+    pub title: &'static str,
+    /// The specific occurrence, safe to show to the caller.
+    #[schema(example = "no engram 'ghost' in domain 'eng'")]
+    pub detail: String,
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let body = serde_json::json!({
-            "type": "about:blank",
-            "status": self.status.as_u16(),
-            "title": self.title,
-            "detail": self.detail,
-        });
+        let body = ProblemDetail {
+            problem_type: "about:blank",
+            status: self.status.as_u16(),
+            title: self.title,
+            detail: self.detail,
+        };
         let mut resp = (self.status, axum::Json(body)).into_response();
         // `axum::Json` writes `application/json`; RFC 9457 requires the
         // problem media type, so the header is replaced rather than appended.

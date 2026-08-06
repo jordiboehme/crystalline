@@ -552,6 +552,13 @@ async fn a_failed_login_is_an_indistinguishable_401() {
 async fn data_routes_401_without_identity_when_not_anonymous() {
     let fixture = serve_with_auth(AuthOptions::default()).await;
     for path in [
+        // The document describing this API is guarded like the data it
+        // describes: it is deliberately not in `PUBLIC_PATHS`, because handing
+        // an unauthenticated caller every path and parameter would undo what
+        // answering 401 ahead of routing is for. Tooling reads the committed
+        // `crates/service/openapi/fluid-v1.json` instead, so nothing needs it
+        // open.
+        "/api/v1/openapi.json",
         "/api/v1/domains",
         "/api/v1/domains/eng/tree",
         "/api/v1/domains/eng/manifest",
@@ -572,6 +579,29 @@ async fn data_routes_401_without_identity_when_not_anonymous() {
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["status"], 401);
     }
+}
+
+/// The served document is the same one the snapshot pins, so a client that does
+/// reach the route reads exactly what the committed artifact says.
+///
+/// Asserted over the wire rather than only in `openapi_snapshot.rs`, because
+/// that test never mounts a router: this is what says the route is wired to
+/// `openapi_document` and not to some second, drifting construction.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn openapi_route_serves_the_document_the_snapshot_pins() {
+    let fixture = serve_with_ada(AuthOptions::default()).await;
+    let (token, _) = login(fixture.addr, "ada", "s3cret").await;
+    let resp = client()
+        .get(format!("http://{}/api/v1/openapi.json", fixture.addr))
+        .header("cookie", format!("fluid_session={token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let served: serde_json::Value = resp.json().await.unwrap();
+    let generated = serde_json::to_value(crystalline_service::rest::openapi_document()).unwrap();
+    assert_eq!(served, generated, "the route serves the document verbatim");
+    assert_eq!(served["info"]["version"], "v1");
 }
 
 /// A logged-in caller passes the guard and is served the data itself: the

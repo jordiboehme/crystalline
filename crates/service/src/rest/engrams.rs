@@ -13,34 +13,42 @@ use axum::http::header::ETAG;
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde_json::Value;
+use utoipa::IntoParams;
 
-use super::{ApiError, ApiPath, ApiQuery, RestState, csv};
+use super::{ApiError, ApiPath, ApiQuery, ProblemDetail, RestState, csv};
 use crate::params::{ReadParams, SearchParams};
 
 /// The query string `GET /domains/{domain}/engrams` takes: the filter side of
 /// [`SearchParams`], minus the domain the path already names and minus the
 /// free-text query, which belongs to the search endpoint rather than a listing.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct ListQuery {
     /// Filter by `type`.
     #[serde(rename = "type", default)]
+    #[param(example = "decision")]
     engram_type: Option<String>,
     /// Filter by `status`.
     #[serde(default)]
+    #[param(example = "stable")]
     status: Option<String>,
     /// Require all of these tags, comma separated. A URL is a string, so the
     /// repeated-parameter form a `Vec` would need is not on offer here; the
     /// list is split on the way in.
     #[serde(default)]
+    #[param(example = "eng,nested")]
     tags: Option<String>,
     /// Only engrams recorded on or after this ISO date.
     #[serde(default)]
+    #[param(example = "2026-01-31")]
     after: Option<String>,
     /// One-based page number. Defaults to 1.
     #[serde(default)]
+    #[param(example = 1)]
     page: Option<usize>,
     /// Page size. Defaults to 10.
     #[serde(default)]
+    #[param(example = 10)]
     limit: Option<usize>,
 }
 
@@ -62,6 +70,64 @@ pub struct ListQuery {
 /// route's own verb opens with; `search_engrams` is left alone, because an
 /// unmatched name in its `domains` filter really is just a narrower filter, and
 /// that verb is shared with the MCP tool.
+#[utoipa::path(
+    get,
+    path = "/api/v1/domains/{domain}/engrams",
+    tag = "engrams",
+    operation_id = "list_engrams",
+    summary = "One domain's engrams, filtered by frontmatter and paged.",
+    description = "A filter-only search, so the answer carries the same page \
+                   envelope a search does and a client pages it the same way. \
+                   Listing by folder is not here: the tree endpoint owns the \
+                   navigation view and this one owns the frontmatter view.\n\nA \
+                   domain nobody registered is a 404, while filters that match \
+                   nothing are an empty page: two states a client can tell \
+                   apart.",
+    params(("domain" = String, Path, description = "The registered domain."), ListQuery),
+    responses(
+        (
+            status = 200,
+            description = "The engine's page envelope, unchanged.",
+            body = Object,
+            example = json!({
+                "mode": "text",
+                "total": 4,
+                "page": 1,
+                "limit": 10,
+                "count": 1,
+                "hits": [{
+                    "domain": "eng",
+                    "permalink": "alpha",
+                    "title": "Alpha",
+                    "snippet": "The first engram in this domain.",
+                    "score": 1.0,
+                    "engram_type": "engram",
+                    "status": "stable",
+                    "tags": ["eng"],
+                    "kind": "engram"
+                }]
+            }),
+        ),
+        (
+            status = 400,
+            description = "The query string will not parse.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 401,
+            description = "No identity.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 404,
+            description = "No such domain.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
 pub async fn list(
     State(state): State<RestState>,
     ApiPath(domain): ApiPath<String>,
@@ -97,6 +163,64 @@ pub async fn list(
 ///
 /// The response carries an `ETag` over the markdown, so a client knows which
 /// version it is holding. See [`etag`].
+#[utoipa::path(
+    get,
+    path = "/api/v1/domains/{domain}/engrams/{permalink}",
+    tag = "engrams",
+    operation_id = "get_engram",
+    summary = "One engram in full.",
+    description = "Its frontmatter, its markdown as written and the references \
+                   the engine resolves around it.\n\nThe response carries an \
+                   `ETag` over the markdown, so a client knows which version it \
+                   is holding and can say so when it later writes back.",
+    params(
+        ("domain" = String, Path, description = "The registered domain."),
+        (
+            "permalink" = String,
+            Path,
+            description = "The engram permalink. A permalink is a path, so this \
+                           segment may contain slashes: `notes/deep/gamma`.",
+            example = "notes/deep/gamma",
+        ),
+    ),
+    responses(
+        (
+            status = 200,
+            description = "The engine's own read payload, unchanged.",
+            body = Object,
+            headers(("etag" = String, description = "The quoted checksum of the \
+                     engram as read, the same token a later write compares an \
+                     `expected_checksum` against.")),
+            example = json!({
+                "domain": "eng",
+                "permalink": "alpha",
+                "title": "Alpha",
+                "type": "engram",
+                "status": "stable",
+                "path": "alpha.md",
+                "url": "crystalline://eng/alpha",
+                "content": "---\ntitle: Alpha\n---\n\nThe first engram.\n",
+                "checksum": "3f8a1c05e2",
+                "frontmatter": { "title": "Alpha", "permalink": "alpha" },
+                "observations": [],
+                "relations": [],
+                "links": []
+            }),
+        ),
+        (
+            status = 401,
+            description = "No identity.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 404,
+            description = "No such domain or engram.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
 pub async fn detail(
     State(state): State<RestState>,
     ApiPath((domain, permalink)): ApiPath<(String, String)>,

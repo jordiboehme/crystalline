@@ -35,11 +35,10 @@ use axum::middleware::Next;
 use axum::response::Response;
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use crystalline_core::config::GlobalConfig;
-use serde_json::Value;
 use tokio::sync::Semaphore;
 
 use super::auth_store::{AuthStore, PasswordCheck, Role, User, dummy_verify};
-use super::{ApiError, ApiJson, RestState};
+use super::{ApiError, ApiJson, ProblemDetail, RestState};
 
 /// The session cookie. Named for the UI it serves so it never collides with a
 /// cookie another app sets on a shared host.
@@ -340,12 +339,56 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 /// What `POST /auth/login` takes.
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, utoipa::ToSchema)]
 pub struct LoginBody {
     /// The account name, in any casing: the store folds it.
+    #[schema(example = "ada")]
     name: String,
     /// The password, checked with argon2id.
+    #[schema(example = "correct horse battery staple")]
     password: String,
+}
+
+/// What `POST /auth/login` answers with.
+///
+/// A type rather than an inline `json!`, so the OpenAPI document and the
+/// response are one definition. Same for the two below it.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct LoginResponse {
+    /// The account that was signed in.
+    user: User,
+    /// The session's CSRF token, which every later mutating request must echo
+    /// in the `x-csrf-token` header (see `CSRF_HEADER`).
+    ///
+    /// The header is named in plain backticks rather than through an intra-doc
+    /// link because utoipa copies this comment into the published document,
+    /// where a Rust link target reads as noise. Same wherever else a schema
+    /// field's comment names something in this crate.
+    #[schema(example = "9f2c1d7e4b6a8035")]
+    csrf: String,
+}
+
+/// What `POST /auth/logout` answers with: an acknowledgement and nothing else,
+/// since a logout that found no session is a success too.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct LogoutResponse {
+    /// Always true.
+    ok: bool,
+}
+
+/// What `GET /auth/me` answers with: everything a client needs before it draws
+/// anything.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct MeResponse {
+    /// The account behind this request, or null when there is none.
+    user: Option<User>,
+    /// Whether the request is being served as the anonymous viewer.
+    anonymous: bool,
+    /// Whether this instance refuses content mutations.
+    read_only: bool,
+    /// The server version, so a mismatched UI can say so.
+    #[schema(example = "0.12.0")]
+    version: &'static str,
 }
 
 /// Exchange credentials for a session: sets [`SESSION_COOKIE`] and returns the
@@ -355,12 +398,63 @@ pub struct LoginBody {
 /// malformed one is refused in problem+json like every other failure here: this
 /// is the first request a client ever sends, and the worst moment to hand it an
 /// error shape it has no parser for.
+#[utoipa::path(
+    post,
+    path = "/api/v1/auth/login",
+    tag = "auth",
+    operation_id = "login",
+    // Spelled out rather than taken from the rustdoc above, which is written
+    // for a Rust reader and carries intra-doc links that read as noise in a
+    // published document. Same on the five other handlers whose rustdoc links.
+    summary = "Exchange credentials for a session.",
+    description = "Sets the `fluid_session` cookie and returns the account plus \
+                   the CSRF token every later mutating request must echo in \
+                   `x-csrf-token`. Any session the request arrived holding is \
+                   revoked first, so a planted token cannot survive a login.",
+    request_body = LoginBody,
+    responses(
+        (
+            status = 200,
+            description = "Signed in. The session cookie is set and the CSRF \
+                           token is in the body.",
+            body = LoginResponse,
+            headers(("set-cookie" = String, description = "The `fluid_session` \
+                     session cookie, HttpOnly and SameSite=Lax.")),
+        ),
+        (
+            status = 400,
+            description = "The body is not JSON.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 401,
+            description = "The name or password is wrong. One message for every \
+                           way this can fail, so nothing is learned about which \
+                           accounts exist.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 415,
+            description = "The body is not `application/json`.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 422,
+            description = "The body is JSON but not a login.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
 pub async fn login(
     State(state): State<RestState>,
     jar: CookieJar,
     headers: HeaderMap,
     ApiJson(body): ApiJson<LoginBody>,
-) -> Result<(CookieJar, axum::Json<Value>), ApiError> {
+) -> Result<(CookieJar, axum::Json<LoginResponse>), ApiError> {
     let Some(user) =
         authenticate(&state.auth, &state.login_slots, &body.name, &body.password).await?
     else {
@@ -388,7 +482,10 @@ pub async fn login(
         .build();
     Ok((
         jar.add(cookie),
-        axum::Json(serde_json::json!({ "user": user, "csrf": session.csrf })),
+        axum::Json(LoginResponse {
+            user,
+            csrf: session.csrf,
+        }),
     ))
 }
 
@@ -456,20 +553,39 @@ pub(super) async fn with_login_slot<F: Future>(
 /// logging out twice, or with a cookie this server has already forgotten, is
 /// ordinary. Guarded by the CSRF check like any other mutating request, so
 /// another origin cannot log a user out.
+#[utoipa::path(
+    post,
+    path = "/api/v1/auth/logout",
+    tag = "auth",
+    operation_id = "logout",
+    responses(
+        (
+            status = 200,
+            description = "Signed out, whether or not there was a session to \
+                           revoke.",
+            body = LogoutResponse,
+            headers(("set-cookie" = String, description = "Clears the \
+                     `fluid_session` cookie.")),
+        ),
+        (
+            status = 403,
+            description = "A cookie session did not echo its CSRF token.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
 pub async fn logout(
     State(state): State<RestState>,
     jar: CookieJar,
-) -> Result<(CookieJar, axum::Json<Value>), ApiError> {
+) -> Result<(CookieJar, axum::Json<LogoutResponse>), ApiError> {
     if let Some(cookie) = jar.get(SESSION_COOKIE) {
         state.auth.delete_session(cookie.value()).await?;
     }
     // The removal has to carry the same path the cookie was set with, or the
     // browser keeps the original and only shadows it.
     let removal = Cookie::build(SESSION_COOKIE).path("/").build();
-    Ok((
-        jar.remove(removal),
-        axum::Json(serde_json::json!({ "ok": true })),
-    ))
+    Ok((jar.remove(removal), axum::Json(LogoutResponse { ok: true })))
 }
 
 /// The capability probe a client calls before anything else: who it is, whether
@@ -480,13 +596,26 @@ pub async fn logout(
 /// Answers without an identity on purpose. `user: null, anonymous: false` is
 /// what tells a browser to show a login form; `anonymous: true` tells it to
 /// browse instead.
-pub async fn me(State(state): State<RestState>, identity: Identity) -> axum::Json<Value> {
-    axum::Json(serde_json::json!({
-        "user": identity.user,
-        "anonymous": identity.anonymous,
-        "read_only": state.engine.read_only(),
-        "version": crystalline_core::VERSION,
-    }))
+#[utoipa::path(
+    get,
+    path = "/api/v1/auth/me",
+    tag = "auth",
+    operation_id = "get_me",
+    responses((
+        status = 200,
+        description = "Who the caller is and what this instance allows. Answered \
+                       without an identity too, which is how a client learns it \
+                       has to log in.",
+        body = MeResponse,
+    )),
+)]
+pub async fn me(State(state): State<RestState>, identity: Identity) -> axum::Json<MeResponse> {
+    axum::Json(MeResponse {
+        user: identity.user,
+        anonymous: identity.anonymous,
+        read_only: state.engine.read_only(),
+        version: crystalline_core::VERSION,
+    })
 }
 
 /// Whether the session cookie is marked `Secure`, which is to say: is there any
