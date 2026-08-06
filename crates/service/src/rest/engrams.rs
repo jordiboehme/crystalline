@@ -53,16 +53,21 @@ pub struct ListQuery {
 /// folder is not here: the tree endpoint owns the navigation view, this one
 /// owns the frontmatter view, and neither reimplements the other.
 ///
-/// An unregistered domain lists empty rather than answering 404, which is what
-/// `search_engrams` does with a domain filter nothing matches. The tree and
-/// manifest routes do 404, because the engine's verbs behind them resolve the
-/// domain first; keeping each route on its verb's own contract is what keeps
-/// this surface a projection of the engine rather than a second opinion.
+/// A domain nobody registered is a 404, like the tree and manifest routes
+/// beside it: a path segment names a resource, and a resource that does not
+/// exist is missing, while query filters may legitimately filter to nothing. So
+/// an unknown domain answers 404 and a registered domain that holds nothing
+/// answers an empty page, two states a client can tell apart. The check is
+/// [`crate::engine::Engine::require_domain`], the same resolution the tree
+/// route's own verb opens with; `search_engrams` is left alone, because an
+/// unmatched name in its `domains` filter really is just a narrower filter, and
+/// that verb is shared with the MCP tool.
 pub async fn list(
     State(state): State<RestState>,
     ApiPath(domain): ApiPath<String>,
     ApiQuery(query): ApiQuery<ListQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    state.engine.require_domain(&domain)?;
     let value = state
         .engine
         .search_engrams(&SearchParams {
@@ -119,6 +124,10 @@ pub async fn detail(
 /// response is exactly the token a later `If-Match` can be turned into, with
 /// one definition of what version an engram is at rather than two that agree
 /// until one of them moves.
+///
+/// The error branch is unreachable under the current engine, which always emits
+/// `checksum` from a read; it guards against a future contract break, loudly,
+/// rather than letting an engram be served without a version.
 fn etag(value: &Value) -> Result<HeaderValue, ApiError> {
     let checksum = value["checksum"].as_str().ok_or_else(|| {
         ApiError::internal("the engram read carried no checksum to version it by")

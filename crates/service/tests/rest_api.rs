@@ -56,6 +56,13 @@ async fn build_engine(opts: AuthOptions) -> (tempfile::TempDir, Arc<Engine>) {
     }
     cfg.domains
         .insert("eng".to_string(), DomainEntry::file(dir));
+    // A registered domain that holds nothing, so "this domain does not exist"
+    // and "this domain is empty" are both reachable and visibly different. It
+    // is virtual because a file domain always has its MANIFEST indexed and so
+    // is never truly empty. Registered after `eng`, and the config keeps
+    // insertion order, so the listing's first domain is still `eng`.
+    cfg.domains
+        .insert("void".to_string(), DomainEntry::virtual_domain());
     cfg.service = Some(ServiceConfig {
         response_format: Some(ResponseFormat::Json),
         ..ServiceConfig::default()
@@ -771,7 +778,11 @@ async fn domains_lists_every_domain_with_its_routing_bullets() {
         "the listing carries the behavior rules: {body}"
     );
     let domains = body["domains"].as_array().unwrap();
-    assert_eq!(domains.len(), 1, "one registered domain: {body}");
+    assert_eq!(
+        domains.len(),
+        2,
+        "the seeded domain and the empty one: {body}"
+    );
     assert_eq!(domains[0]["name"], "eng");
     assert_eq!(domains[0]["kind"], "file");
     assert_eq!(
@@ -938,6 +949,45 @@ async fn engram_list_filters_and_carries_the_page_envelope() {
     assert_eq!(unique.len(), 4, "the pages do not overlap: {paged:?}");
 }
 
+/// The two states a client must be able to tell apart, which is why the
+/// listing resolves the domain in its path rather than passing it to the
+/// search filter and reporting whatever comes back: a domain nobody
+/// registered is missing, and a registered domain that holds nothing is
+/// empty. A filter that selects nothing is the empty case too - the path
+/// segment names a resource, the query only narrows it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_empty_domain_lists_empty_and_an_unknown_one_is_a_404() {
+    let fixture = serve_anonymous().await;
+
+    let empty = get(fixture.addr, "/api/v1/domains/void/engrams").await;
+    assert_eq!(empty.status(), 200, "a registered domain answers");
+    let body: serde_json::Value = empty.json().await.unwrap();
+    assert_eq!(body["total"], 0, "and holds nothing: {body}");
+    assert!(hit_permalinks(&body).is_empty(), "{body}");
+
+    let filtered: serde_json::Value = get(fixture.addr, "/api/v1/domains/eng/engrams?tags=nothing")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        filtered["total"], 0,
+        "a filter that selects nothing is empty, not missing: {filtered}"
+    );
+
+    let unknown = get(fixture.addr, "/api/v1/domains/ghost/engrams").await;
+    assert_eq!(unknown.status(), 404, "an unregistered domain is missing");
+    assert_eq!(
+        unknown.headers()["content-type"],
+        "application/problem+json"
+    );
+    let body: serde_json::Value = unknown.json().await.unwrap();
+    assert_eq!(body["title"], "not found");
+    let detail = body["detail"].as_str().unwrap();
+    assert!(detail.contains("ghost"), "{detail}");
+    assert!(detail.contains("eng"), "the valid set is named: {detail}");
+}
+
 /// The detail route answers with the engram itself - its frontmatter, its
 /// markdown and the graph the engine resolves around it - plus an `ETag` a
 /// later conditional write can present. The validator is the SHA-256 of the
@@ -1032,6 +1082,7 @@ async fn an_unknown_domain_is_a_404_problem_detail() {
     for path in [
         "/api/v1/domains/ghost/tree",
         "/api/v1/domains/ghost/manifest",
+        "/api/v1/domains/ghost/engrams",
     ] {
         let resp = get(fixture.addr, path).await;
         assert_eq!(resp.status(), 404, "{path} must be a 404");

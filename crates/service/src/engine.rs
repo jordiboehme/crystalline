@@ -944,6 +944,22 @@ impl Engine {
 
     // --- domain helpers ------------------------------------------------------
 
+    /// Fail unless `name` is a registered domain, with the same
+    /// [`EngineError::UnknownDomain`] naming the domains that do exist that
+    /// every other verb produces.
+    ///
+    /// This is the check [`Engine::browse_domain`] opens with, exposed for a
+    /// caller whose own verb does not resolve a domain but whose surface still
+    /// has to: the REST engram listing addresses a domain in the path, where a
+    /// name nobody registered is a missing resource rather than a filter that
+    /// selected nothing. Search itself deliberately does not resolve its
+    /// `domains` filter - an unmatched name there is simply a narrower filter -
+    /// and that stays as it is.
+    pub fn require_domain(&self, name: &str) -> Result<()> {
+        self.domain_entry(name)?;
+        Ok(())
+    }
+
     /// Resolve a registered domain to its content source: a filesystem root for
     /// a file domain, or the database for a virtual domain. Errors when the
     /// domain is not registered (the write path wants that), the layered lookup
