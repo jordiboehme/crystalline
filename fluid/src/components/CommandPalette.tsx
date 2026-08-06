@@ -20,7 +20,7 @@
 
 import { useQuery } from "@tanstack/react-query";
 import { Command } from "cmdk";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router";
 
 import { DOMAINS_QUERY_KEY, fetchDomains } from "../api/domains";
@@ -89,6 +89,24 @@ export function CommandPalette() {
   // back. A dialog opened by a key has no trigger to return to on its own.
   const invoker = useRef<HTMLElement | null>(null);
 
+  /**
+   * Shut the palette, and let go of everything a shut palette must forget.
+   *
+   * Every way out goes through here, which is the point: a jump closes the
+   * palette from the inside and never reaches the dialog's own `onOpenChange`,
+   * so a reset hanging off that callback would fire on every exit except the
+   * common one and the next Cmd+K would open onto the last question. The
+   * highlight is dropped with the query, because a choice made against rows
+   * that are gone must not win over the new top row when the two happen to
+   * line up.
+   */
+  const close = useCallback(() => {
+    setOpen(false);
+    setQuery("");
+    setTerm("");
+    setChoice({ top: "", value: "" });
+  }, []);
+
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
       // Either modifier: one keyboard has a Cmd key and the other does not,
@@ -100,22 +118,25 @@ export function CommandPalette() {
         return;
       }
       event.preventDefault();
-      setOpen((was) => {
-        if (!was) {
-          invoker.current =
-            document.activeElement instanceof HTMLElement
-              ? document.activeElement
-              : null;
-        }
-        return !was;
-      });
+      if (open) {
+        close();
+        return;
+      }
+      invoker.current =
+        document.activeElement instanceof HTMLElement
+          ? document.activeElement
+          : null;
+      setOpen(true);
     }
     window.addEventListener("keydown", onKeyDown);
     return () => {
       window.removeEventListener("keydown", onKeyDown);
     };
-  }, []);
+  }, [open, close]);
 
+  // The focus, handed back after the dialog is gone rather than while closing
+  // it: the palette traps focus for as long as it is mounted, and an invoker
+  // focused a moment too early would be pulled straight back in.
   useEffect(() => {
     if (open) {
       return;
@@ -187,7 +208,7 @@ export function CommandPalette() {
 
   /** Go, and get out of the way. */
   function go(to: string): void {
-    setOpen(false);
+    close();
     void navigate(to);
   }
 
@@ -195,12 +216,12 @@ export function CommandPalette() {
     <Command.Dialog
       open={open}
       onOpenChange={(next) => {
-        setOpen(next);
-        if (!next) {
-          // A palette that reopens onto the last query is a palette that
-          // answers the question before it, so it forgets on the way out.
-          setQuery("");
-          setTerm("");
+        // Escape, or a click on the overlay. The palette itself only ever
+        // opens from the shortcut, which captures the invoker as it goes.
+        if (next) {
+          setOpen(true);
+        } else {
+          close();
         }
       }}
       label="Command palette"

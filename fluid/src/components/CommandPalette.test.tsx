@@ -179,6 +179,60 @@ describe("the command palette", () => {
     );
   });
 
+  it("walks the rows with the arrow keys, and Enter takes the one it lands on", async () => {
+    serve();
+    const user = userEvent.setup();
+    await openApp();
+
+    await user.keyboard("{Meta>}k{/Meta}");
+    await user.type(await screen.findByRole("combobox"), "alph");
+    const match = await within(palette()).findByRole("option", {
+      name: /Alpha/,
+    });
+    const escape = within(palette()).getByRole("option", {
+      name: /Search for/,
+    });
+    expect(match).toHaveAttribute("aria-selected", "true");
+
+    await user.keyboard("{ArrowDown}");
+    expect(escape).toHaveAttribute("aria-selected", "true");
+    expect(match).toHaveAttribute("aria-selected", "false");
+
+    await user.keyboard("{ArrowUp}");
+    expect(match).toHaveAttribute("aria-selected", "true");
+
+    // Enter follows the highlight rather than the top row, which is the whole
+    // point of being able to move it.
+    await user.keyboard("{Enter}");
+    expect(await screen.findByRole("heading", { name: "Alpha" })).toBeVisible();
+  });
+
+  it("forgets the query it jumped on, so the next Cmd+K opens clean", async () => {
+    serve();
+    const user = userEvent.setup();
+    await openApp();
+
+    await user.keyboard("{Meta>}k{/Meta}");
+    await user.type(await screen.findByRole("combobox"), "alph");
+    await within(palette()).findByRole("option", { name: /Alpha/ });
+    await user.keyboard("{Enter}");
+    await screen.findByRole("heading", { name: "Alpha" });
+    const asked = searches().length;
+
+    await user.keyboard("{Meta>}k{/Meta}");
+
+    // A jump is how the palette is left most of the time, so it has to forget
+    // on that path too: reopening onto the last query would answer the
+    // question before this one.
+    const box = await screen.findByRole("combobox");
+    await waitFor(() => {
+      expect(box).toHaveValue("");
+    });
+    // And it costs nothing on the wire either: no lookup for a term nobody is
+    // asking about any more.
+    expect(searches()).toHaveLength(asked);
+  });
+
   it("goes to a domain the sidebar knows about", async () => {
     serve();
     const user = userEvent.setup();
