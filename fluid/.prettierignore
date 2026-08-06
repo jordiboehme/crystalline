@@ -8,3 +8,9 @@ src/api/types.ts
 # among other things). Prettier reformats that frontmatter, which would leave
 # the fixture looking unlike every engram the product itself produces.
 e2e/fixtures
+
+# What a browser smoke leaves behind: Playwright's own run record, traces and
+# screenshots. Not ours to format, and a local smoke run would otherwise make
+# the next format check fail on a file nobody wrote.
+test-results
+playwright-report
