@@ -20,17 +20,27 @@
  * date somebody, or some agent, would carry away as a fact.
  */
 
-import { Link } from "react-router";
-
 import { hasArrived, localDay } from "../format";
 import { isRetired } from "../lifecycle";
+import type { ReferenceState } from "../wikilinks";
+import { ReferenceLink } from "./ReferenceLink";
 
-/** One end of the supersedes chain, as far as the index could follow it. */
+/**
+ * One end of the supersedes chain, as far as the index could follow it.
+ *
+ * The state travels with it rather than being inferred from a missing `href`.
+ * Two different things have no address - a target nothing resolves, and one
+ * that resolves to somewhere the graph has not reported yet - and collapsing
+ * them would put "nothing resolves this" under a successor that resolves
+ * perfectly well, for as long as the graph request takes.
+ */
 export interface LifecycleLink {
   /** What to call it: the target's title, or the target as it was written. */
   label: string;
-  /** Where it lives, or null when nothing on this instance resolved it. */
+  /** Where it lives, known only in the resolved state. */
   href: string | null;
+  /** Which of the three reference states it is in. */
+  state: ReferenceState;
 }
 
 export interface LifecycleBannerProps {
@@ -91,10 +101,8 @@ export function LifecycleBanner({
 /**
  * One direction of the chain, drawn only when it leads somewhere.
  *
- * A target the index did not resolve is named and not linked. The engram says
- * it was superseded by something, which is worth showing; nothing on this
- * instance answers to that name, and a link that goes nowhere would say
- * otherwise.
+ * Each end is drawn by the shared reference presentation, so a successor reads
+ * here exactly as the same target reads in the body and in the relation list.
  */
 function Chain({ label, links }: { label: string; links: LifecycleLink[] }) {
   if (links.length === 0) {
@@ -103,25 +111,9 @@ function Chain({ label, links }: { label: string; links: LifecycleLink[] }) {
   return (
     <p className="mt-1 flex flex-wrap items-baseline gap-x-2">
       <span>{label}</span>
-      {links.map((link) =>
-        link.href === null ? (
-          <span
-            key={link.label}
-            title="Nothing on this instance resolves this target"
-            className="underline decoration-dotted underline-offset-2"
-          >
-            {link.label}
-          </span>
-        ) : (
-          <Link
-            key={link.label}
-            to={link.href}
-            className="font-medium underline underline-offset-2 hover:no-underline"
-          >
-            {link.label}
-          </Link>
-        ),
-      )}
+      {links.map((link) => (
+        <ReferenceLink key={`${link.label}-${link.href ?? ""}`} {...link} />
+      ))}
     </p>
   );
 }

@@ -30,7 +30,7 @@ import rehypeHighlight from "rehype-highlight";
 import { Link } from "react-router";
 import remarkGfm from "remark-gfm";
 
-import { WIKILINK } from "../wikilinks";
+import { WIKILINK, referenceState } from "../wikilinks";
 import type { WikilinkResolution, WikilinkResolver } from "../wikilinks";
 
 const MermaidDiagram = lazy(() => import("./MermaidDiagram"));
@@ -139,16 +139,21 @@ function rewrite(node: HastNode, resolve: WikilinkResolver): void {
 /**
  * Split one run of text around the wikilinks the resolver recognizes.
  *
- * A target it answers `null` about is left in place, brackets and all: nothing
- * is known about it, which is not the same as knowing it is broken, and the
- * graph request that would say is often still in flight.
+ * The three reference states are classified by the one shared rule, and the
+ * pending one is drawn here by leaving the text exactly as written: a target
+ * the index resolved and the graph has not placed yet is prose, which is what
+ * it already was, and it becomes a link once the graph lands without ever
+ * having claimed to be broken.
  */
 function split(text: string, resolve: WikilinkResolver): HastNode[] {
   const parts: HastNode[] = [];
   let taken = 0;
   for (const match of text.matchAll(WIKILINK)) {
     const resolution = resolve(match[1]);
-    if (resolution === null) {
+    // Bracket text carries no parsed reference of its own, so the payload has
+    // nothing to say about it here.
+    const state = referenceState(resolution, null);
+    if (state === "pending" || resolution === null) {
       continue;
     }
     if (match.index > taken) {

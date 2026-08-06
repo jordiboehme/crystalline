@@ -35,6 +35,7 @@ import type {
   EngramReference,
 } from "../api/engram";
 import { engramDetailKey, fetchEngramDetail } from "../api/engram";
+import type { Backlink } from "../api/graph";
 import {
   NEIGHBORHOOD_DEPTH,
   backlinksTo,
@@ -46,9 +47,10 @@ import { FrontmatterPanel } from "../components/FrontmatterPanel";
 import { LifecycleBanner } from "../components/LifecycleBanner";
 import type { LifecycleLink } from "../components/LifecycleBanner";
 import { Markdown } from "../components/Markdown";
-import { domainRoute } from "../paths";
+import { ReferenceLink } from "../components/ReferenceLink";
+import { domainRoute, engramRoute } from "../paths";
 import type { WikilinkResolver } from "../wikilinks";
-import { buildWikilinkResolver, innerOf } from "../wikilinks";
+import { buildWikilinkResolver, innerOf, referenceState } from "../wikilinks";
 
 /** How long the copy button keeps saying it worked. */
 const COPIED_FOR_MS = 2000;
@@ -101,6 +103,7 @@ export default function EngramPage() {
   }
 
   const engram = detail.data;
+  const backlinks = backlinksTo(graph.data, engram.domain, engram.permalink);
   return (
     <div className="flex flex-col gap-6">
       <header className="flex flex-col gap-2">
@@ -122,8 +125,20 @@ export default function EngramPage() {
       <LifecycleBanner
         status={engram.frontmatter.status}
         staleAfter={engram.frontmatter.staleAfter}
-        supersededBy={chain(engram, wikilinks, "superseded_by")}
-        supersedes={chain(engram, wikilinks, "supersedes")}
+        supersededBy={chain(
+          engram,
+          wikilinks,
+          backlinks,
+          "superseded_by",
+          "supersedes",
+        )}
+        supersedes={chain(
+          engram,
+          wikilinks,
+          backlinks,
+          "supersedes",
+          "superseded_by",
+        )}
       />
 
       {/*
@@ -142,7 +157,7 @@ export default function EngramPage() {
         <aside className="flex flex-col gap-4">
           <FrontmatterPanel frontmatter={engram.frontmatter} />
           <BacklinksPanel
-            backlinks={backlinksTo(graph.data, engram.domain, engram.permalink)}
+            backlinks={backlinks}
             pending={graph.isPending}
             error={graph.error}
             truncated={graph.data?.truncated ?? false}
@@ -154,26 +169,58 @@ export default function EngramPage() {
 }
 
 /**
- * One direction of the supersedes chain, read off the engram's own relations.
+ * One direction of the supersedes chain.
  *
- * Outbound only, which is what the engram itself asserts. A successor that
- * declares the other half of the pair shows up as a backlink instead, where it
- * belongs: this banner speaks for the engram being read.
+ * Both halves of it, because either end may be the one that wrote the relation
+ * down: this engram saying `- superseded_by [[Beta]]`, or Beta saying
+ * `- supersedes [[Alpha]]` from its own side. Only the first is in this
+ * engram's payload, so the second is read off the inbound edges of the graph,
+ * where the direction is inverted: an inbound `supersedes` means the other
+ * engram replaced this one, which is this engram's `superseded_by`.
+ *
+ * An engram whose successor states it from both sides appears once, because
+ * both halves key by the same address.
  */
 function chain(
   engram: EngramDetail,
   resolve: WikilinkResolver,
+  backlinks: Backlink[],
   relType: string,
+  inboundRelType: string,
 ): LifecycleLink[] {
-  return engram.relations
+  const outbound: LifecycleLink[] = engram.relations
     .filter((relation) => relation.relType === relType)
     .map((relation) => {
       const resolution = resolve(innerOf(relation.target));
       return {
         label: relation.target.target,
         href: resolution?.kind === "resolved" ? resolution.href : null,
+        state: referenceState(resolution, relation.resolved),
       };
     });
+
+  // An inbound edge exists because the index resolved it, and the node it came
+  // from carries its own address, so there is nothing pending about it.
+  const inbound: LifecycleLink[] = backlinks
+    .filter((backlink) => backlink.relTypes.includes(inboundRelType))
+    .map((backlink) => ({
+      label: backlink.node.title,
+      href: engramRoute(backlink.node.domain, backlink.node.permalink),
+      state: "resolved" as const,
+    }));
+
+  // Keyed by address, which is what makes the two halves of one pair the same
+  // entry. A pending end has no address yet, but neither does the inbound half
+  // exist yet: both wait on the same graph request, so there is no window in
+  // which one pair could key two ways.
+  const merged = new Map<string, LifecycleLink>();
+  for (const link of [...outbound, ...inbound]) {
+    const key = link.href ?? link.label;
+    if (!merged.has(key)) {
+      merged.set(key, link);
+    }
+  }
+  return [...merged.values()];
 }
 
 /** The observation bullets, as the structure they are rather than as prose. */
@@ -251,23 +298,11 @@ function Relations({
               <span className="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-xs text-slate-600 dark:bg-slate-800 dark:text-slate-300">
                 {relation.relType ?? "relates to"}
               </span>
-              {resolution?.kind === "resolved" ? (
-                <Link
-                  to={resolution.href}
-                  className="text-sky-700 underline underline-offset-2 hover:no-underline dark:text-sky-400"
-                >
-                  {relation.target.target}
-                </Link>
-              ) : relation.resolved ? (
-                <span>{relation.target.target}</span>
-              ) : (
-                <span
-                  title="not resolved"
-                  className="underline decoration-dotted underline-offset-2 opacity-70"
-                >
-                  {relation.target.target}
-                </span>
-              )}
+              <ReferenceLink
+                label={relation.target.target}
+                href={resolution?.kind === "resolved" ? resolution.href : null}
+                state={referenceState(resolution, relation.resolved)}
+              />
             </li>
           );
         })}
@@ -282,6 +317,12 @@ function Relations({
  * `crystalline://domain/permalink` rather than the browser's URL: it is what
  * this engram is called everywhere else, so it is what an agent, a MANIFEST or
  * another engram can be given.
+ *
+ * The outcome is announced in a live region beside the button rather than
+ * written into the button's own label. A control that renames itself is a
+ * control a reader navigating by name loses track of, and a label that changes
+ * silently is no announcement at all: the region is in the document from the
+ * start and empty, so the text arriving in it is what gets read out.
  */
 function CopyAddressButton({ address }: { address: string }) {
   const [state, setState] = useState<"idle" | "copied" | "failed">("idle");
@@ -299,33 +340,40 @@ function CopyAddressButton({ address }: { address: string }) {
   }, [state]);
 
   return (
-    <button
-      type="button"
-      // Named by what it does rather than by what it says, so the confirmation
-      // replacing the label does not rename the control under a reader.
-      aria-label="Copy address"
-      title={address}
-      className="rounded border border-slate-300 px-2 py-0.5 text-xs hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800"
-      onClick={() => {
-        void (async () => {
-          try {
-            await navigator.clipboard.writeText(address);
-            setState("copied");
-          } catch {
-            // A browser that refuses the clipboard is not a failure of the
-            // page: the address is in the button's tooltip either way, and
-            // saying so beats a button that silently does nothing.
-            setState("failed");
-          }
-        })();
-      }}
-    >
-      {state === "copied"
-        ? "Copied"
-        : state === "failed"
-          ? "Copy refused"
-          : "Copy address"}
-    </button>
+    <span className="inline-flex items-center gap-2">
+      <button
+        type="button"
+        title={address}
+        className="rounded border border-slate-300 px-2 py-0.5 text-xs hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800"
+        onClick={() => {
+          void (async () => {
+            try {
+              await navigator.clipboard.writeText(address);
+              setState("copied");
+            } catch {
+              // A browser that refuses the clipboard is not a failure of the
+              // page: the address is in the button's tooltip either way, and
+              // saying so beats a button that silently does nothing.
+              setState("failed");
+            }
+          })();
+        }}
+      >
+        Copy address
+      </button>
+      <span
+        role="status"
+        aria-live="polite"
+        aria-label="Copy address result"
+        className="text-xs text-slate-500 dark:text-slate-400"
+      >
+        {state === "copied"
+          ? "Copied"
+          : state === "failed"
+            ? "Copy refused"
+            : ""}
+      </span>
+    </span>
   );
 }
 

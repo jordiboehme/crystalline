@@ -245,6 +245,65 @@ describe("the engram page", () => {
     ).toBe(true);
   });
 
+  it("never calls the successor unresolved while the graph is still coming", async () => {
+    // The ordinary load path: the graph is asked for only once the detail has
+    // landed, so every retired engram spends at least one round trip here.
+    serve({ "/graph": () => new Promise(() => undefined) });
+
+    renderApp("/d/eng/e/alpha");
+
+    const banner = await screen.findByRole("note");
+    // The index resolved it, so any claim that nothing does would be false,
+    // and there is nothing to hover over saying one.
+    const successor = within(banner).getByText("Beta");
+    expect(successor).not.toHaveAttribute("title");
+    expect(within(banner).queryByRole("link")).toBeNull();
+  });
+
+  it("shows a successor that declared the relation from its own side", async () => {
+    serve({
+      "/domains/eng/engrams/alpha": () =>
+        // Alpha declares nothing: the successor is the one that wrote
+        // `- supersedes [[Alpha]]`, so the fact lives on an inbound edge.
+        detailResponse({ relations: [], links: [] }),
+      "/graph": () =>
+        graphResponse({
+          edges: [{ from: 2, to: 1, rel_type: "supersedes" }],
+        }),
+    });
+
+    renderApp("/d/eng/e/alpha");
+
+    const banner = await screen.findByRole("note");
+    await waitFor(() => {
+      expect(
+        within(banner).getByRole("link", { name: "Beta" }),
+      ).toHaveAttribute("href", "/d/eng/e/notes/beta");
+    });
+    expect(banner).toHaveTextContent("Superseded by");
+  });
+
+  it("lists a successor named on both sides only once", async () => {
+    serve({
+      "/graph": () =>
+        graphResponse({
+          edges: [
+            { from: 1, to: 2, rel_type: "superseded_by" },
+            { from: 2, to: 1, rel_type: "supersedes" },
+          ],
+        }),
+    });
+
+    renderApp("/d/eng/e/alpha");
+
+    const banner = await screen.findByRole("note");
+    await waitFor(() => {
+      expect(
+        within(banner).getAllByRole("link", { name: "Beta" }),
+      ).toHaveLength(1);
+    });
+  });
+
   it("lists what points here, from the graph rather than the capped sample", async () => {
     serve();
 
@@ -308,12 +367,39 @@ describe("the engram page", () => {
 
     renderApp("/d/eng/e/alpha");
 
-    const button = await screen.findByRole("button", { name: /copy address/i });
+    const button = await screen.findByRole("button", { name: "Copy address" });
     await userEvent.click(button);
 
     expect(writeText).toHaveBeenCalledWith("crystalline://eng/alpha");
+    // Announced rather than merely drawn: the outcome lands in a live region,
+    // so somebody who cannot see the label change is told it worked.
+    const outcome = screen.getByRole("status", { name: "Copy address result" });
     await waitFor(() => {
-      expect(screen.getByText(/copied/i)).toBeVisible();
+      expect(outcome).toHaveTextContent("Copied");
+    });
+    // And the control keeps its name, so it is not silently renamed under a
+    // reader navigating by control.
+    expect(button).toHaveAccessibleName("Copy address");
+  });
+
+  it("says so when the browser refuses the clipboard", async () => {
+    Object.defineProperty(navigator, "clipboard", {
+      value: {
+        writeText: () => Promise.reject(new Error("denied")),
+      },
+      configurable: true,
+    });
+    serve();
+
+    renderApp("/d/eng/e/alpha");
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Copy address" }),
+    );
+
+    const outcome = screen.getByRole("status", { name: "Copy address result" });
+    await waitFor(() => {
+      expect(outcome).toHaveTextContent("Copy refused");
     });
   });
 

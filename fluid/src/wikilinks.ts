@@ -34,6 +34,40 @@ export type WikilinkResolution =
 export type WikilinkResolver = (inner: string) => WikilinkResolution | null;
 
 /**
+ * How a reference presents itself. Three states, and the middle one is the
+ * whole reason this type exists: a reference the index resolved and the graph
+ * has not placed yet is neither a link nor a broken one, and every surface that
+ * draws a reference has to agree about that or the same target will read as
+ * broken in one place and fine in another.
+ */
+export type ReferenceState =
+  /** There is somewhere to go. */
+  | "resolved"
+  /** It goes somewhere; which somewhere is still in flight. */
+  | "pending"
+  /** The index looked for it and found nothing. */
+  | "unresolved";
+
+/**
+ * Which of the three a reference is in.
+ *
+ * The single definition of the rule, so the body, the relation list and the
+ * lifecycle banner cannot drift apart. `parsedResolved` is what the detail
+ * payload said about this reference, for a caller holding a parsed one; a
+ * caller with only bracket text in hand passes `null`, and an unrecognized
+ * bracket reads as pending, which is drawn as the prose it already was.
+ */
+export function referenceState(
+  resolution: WikilinkResolution | null,
+  parsedResolved: boolean | null,
+): ReferenceState {
+  if (resolution !== null) {
+    return resolution.kind;
+  }
+  return parsedResolved === false ? "unresolved" : "pending";
+}
+
+/**
  * The bracket pair itself. No nesting and no empty target: `[[]]` is
  * punctuation somebody typed, not a reference.
  */
