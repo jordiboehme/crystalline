@@ -10,6 +10,7 @@
  */
 
 import { api } from "./client";
+import { asObject, asStrings } from "./json";
 
 /** One registered domain, as much of it as a client can rely on. */
 export interface DomainSummary {
@@ -19,6 +20,12 @@ export interface DomainSummary {
   kind: string | null;
   /** How many engrams it holds, or null when the listing did not say. */
   engrams: number | null;
+  /**
+   * When this domain was last synced into the index, or null when the listing
+   * did not say. A sync is not the same fact as an engram being recorded, so
+   * whatever shows it has to name it as what it is.
+   */
+  lastSync: string | null;
   /** The routing bullets from its MANIFEST: what this domain is for. */
   whenToUse: string[];
 }
@@ -28,21 +35,6 @@ export interface DomainListing {
   domains: DomainSummary[];
   /** The behavior rules that govern every domain on this instance. */
   behavior: string[];
-}
-
-/** A JSON object, for reading fields off an unknown payload. */
-type JsonObject = Record<string, unknown>;
-
-function asObject(value: unknown): JsonObject | null {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
-    ? (value as JsonObject)
-    : null;
-}
-
-function asStrings(value: unknown): string[] {
-  return Array.isArray(value)
-    ? value.filter((item): item is string => typeof item === "string")
-    : [];
 }
 
 /** Read one domain, or null when there is not even a name to key it by. */
@@ -56,6 +48,7 @@ function readDomain(value: unknown): DomainSummary | null {
     name,
     kind: typeof record?.kind === "string" ? record.kind : null,
     engrams: typeof record?.engrams === "number" ? record.engrams : null,
+    lastSync: typeof record?.last_sync === "string" ? record.last_sync : null,
     whenToUse: asStrings(record?.when_to_use),
   };
 }

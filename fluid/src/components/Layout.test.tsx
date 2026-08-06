@@ -28,11 +28,14 @@ function serve(routes: Record<string, () => unknown>) {
   apiMock.mockImplementation(answersFor(routes));
 }
 
-/** Signed in, with one domain to list. */
+/** Signed in, with one domain to list and a quiet activity feed. */
 function serveSignedIn(extra: Record<string, () => unknown> = {}) {
   serve({
     "/auth/me": () => meResponse({ user: userFixture() }),
     "/domains": domainsResponse,
+    // The home screen behind this frame reads the feed; an unstubbed route
+    // would fail and put a second alert on screen.
+    "/activity": () => ({ timeframe: "7d", count: 0, engrams: [] }),
     ...extra,
   });
 }

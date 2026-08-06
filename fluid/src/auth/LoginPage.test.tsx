@@ -125,6 +125,17 @@ describe("the login screen", () => {
         return { csrf: "sess", user: userFixture() };
       },
       "/domains": domainsResponse,
+      // The domain screen behind the gate reads these; without them it would
+      // render its not-found state and this test would be asserting on the
+      // wrong screen.
+      "/domains/eng/manifest": () => ({ domain: "eng", markdown: "" }),
+      "/domains/eng/tree": () => ({
+        domain: "eng",
+        path: "/",
+        folders: [],
+        engrams: [],
+      }),
+      "/vocabulary": () => ({ domain: "eng", tags: [] }),
     });
 
     // Landing on a domain while signed out bounces to the login screen, which
@@ -133,7 +144,7 @@ describe("the login screen", () => {
     await signIn();
 
     expect(
-      await screen.findByRole("heading", { name: /Domain: eng/ }),
+      await screen.findByRole("heading", { level: 1, name: "eng" }),
     ).toBeVisible();
   });
 });
