@@ -10,7 +10,7 @@
  * filters. The screen names which one is on screen instead of blending them.
  */
 
-import { screen, waitFor } from "@testing-library/react";
+import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -113,6 +113,16 @@ function requested(): string[] {
   return apiMock.mock.calls.map((call) => call[0]);
 }
 
+/**
+ * The screen itself, without the frame around it.
+ *
+ * Inside a domain the sidebar draws the same folders and the same engrams as
+ * navigation, so a query for one of them has to say which of the two it means.
+ */
+async function screenBody(): Promise<HTMLElement> {
+  return screen.findByRole("main");
+}
+
 beforeEach(() => {
   apiMock.mockReset();
 });
@@ -129,7 +139,9 @@ describe("the domain screen", () => {
     expect(
       await screen.findByRole("heading", { name: "When to Use" }),
     ).toBeVisible();
-    const row = await screen.findByRole("link", { name: /Alpha/ });
+    const row = await within(await screenBody()).findByRole("link", {
+      name: /Alpha/,
+    });
     expect(row).toHaveAttribute("href", "/d/eng/e/alpha");
   });
 
@@ -193,21 +205,23 @@ describe("the domain screen", () => {
       screen.queryByRole("heading", { name: "Domain not found" }),
     ).toBeNull();
     // The engrams are still listed: the manifest is one panel, not the screen.
-    expect(await screen.findByRole("link", { name: /Alpha/ })).toBeVisible();
+    expect(
+      await within(await screenBody()).findByRole("link", { name: /Alpha/ }),
+    ).toBeVisible();
   });
 
   it("opens a folder into its own list", async () => {
     serve();
 
     renderApp("/d/eng");
-    await screen.findByRole("link", { name: /Alpha/ });
+    const body = await screenBody();
+    await within(body).findByRole("link", { name: /Alpha/ });
 
-    await userEvent.click(await screen.findByRole("button", { name: "notes" }));
+    await userEvent.click(within(body).getByRole("button", { name: "notes" }));
 
-    expect(await screen.findByRole("link", { name: /Beta/ })).toHaveAttribute(
-      "href",
-      "/d/eng/e/notes/beta",
-    );
+    expect(
+      await within(body).findByRole("link", { name: /Beta/ }),
+    ).toHaveAttribute("href", "/d/eng/e/notes/beta");
     await waitFor(() => {
       expect(requested().some((path) => path.includes("path=notes"))).toBe(
         true,
@@ -219,9 +233,10 @@ describe("the domain screen", () => {
     serve();
 
     renderApp("/d/eng");
-    await screen.findByRole("link", { name: /Alpha/ });
+    const body = await screenBody();
+    await within(body).findByRole("link", { name: /Alpha/ });
 
-    await userEvent.click(await screen.findByRole("button", { name: /#eng/ }));
+    await userEvent.click(within(body).getByRole("button", { name: /#eng/ }));
 
     // The frontmatter view answers, and it is the one that carries status.
     const row = await screen.findByRole("link", { name: /Gamma/ });

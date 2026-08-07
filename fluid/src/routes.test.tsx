@@ -14,7 +14,7 @@
  * same slashes the link did, encoded a segment at a time.
  */
 
-import { screen } from "@testing-library/react";
+import { screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -80,11 +80,18 @@ function requested(): string[] {
   return apiMock.mock.calls.map((call) => call[0]);
 }
 
-/** Open the domain and click the row the list drew for its one engram. */
+/**
+ * Open the domain and click the row the list drew for its one engram.
+ *
+ * Scoped to the screen: inside a domain the frame's sidebar draws the same
+ * engram as a tree entry, so an unscoped query would be asking about two
+ * links at once.
+ */
 async function followRowIn(domain: string, permalink: string) {
   serveDomain(domain, permalink);
   renderApp(`/d/${encodeURIComponent(domain)}`);
-  const row = await screen.findByRole("link", { name: /Gamma/ });
+  const screenBody = await screen.findByRole("main");
+  const row = await within(screenBody).findByRole("link", { name: /Gamma/ });
   await userEvent.click(row);
   return row;
 }
