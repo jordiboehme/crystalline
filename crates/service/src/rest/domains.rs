@@ -113,6 +113,7 @@ pub struct TreeQuery {
                     "permalink": "alpha",
                     "title": "Alpha",
                     "type": "engram",
+                    "status": "stable",
                     "path": "alpha.md"
                 }]
             }),

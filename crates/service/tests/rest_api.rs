@@ -1002,6 +1002,17 @@ async fn domain_tree_walks_folders_and_filters_by_glob() {
     assert_eq!(root["domain"], "eng");
     assert_eq!(root["path"], "/");
     assert_eq!(root["folders"].as_array().unwrap(), &["notes"]);
+    // A row says what state its engram is in, not only where it lives: a tree
+    // is what a navigation sidebar is drawn from, and fading a retired engram
+    // there would otherwise cost a second request per folder.
+    let alpha = root["engrams"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["path"] == "alpha.md")
+        .unwrap_or_else(|| panic!("the root holds alpha: {root}"));
+    assert_eq!(alpha["status"], "current", "{alpha}");
+    assert_eq!(alpha["type"], "engram", "{alpha}");
     let paths = engram_paths(&root);
     assert!(paths.contains(&"alpha.md".to_string()), "{paths:?}");
     assert!(paths.contains(&"MANIFEST.md".to_string()), "{paths:?}");

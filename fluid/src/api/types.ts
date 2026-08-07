@@ -1308,6 +1308,7 @@ export interface operations {
                      *         {
                      *           "path": "alpha.md",
                      *           "permalink": "alpha",
+                     *           "status": "stable",
                      *           "title": "Alpha",
                      *           "type": "engram"
                      *         }

@@ -60,10 +60,9 @@ function twoDomainsResponse() {
 /**
  * The browse payload, answering with the folder that was asked for.
  *
- * The retired row carries a `status`, which the live browse payload does not
- * send today. The shared row reader takes one when a source has it, so this
- * pins the fade rule the sidebar applies rather than inventing a field: the
- * day the payload carries a status, the fade is already right.
+ * Every row carries a `status`, which is the shape the endpoint answers with:
+ * a browse row is what a tree is drawn from, so it says what state its engram
+ * is in as well as where it lives. That is what the fade below is reading.
  */
 function treeResponse(path: string) {
   if (path.includes("path=notes")) {
@@ -76,6 +75,7 @@ function treeResponse(path: string) {
           permalink: "notes/beta",
           title: "Beta",
           type: "engram",
+          status: "stable",
           path: "notes/beta.md",
         },
       ],
@@ -86,7 +86,13 @@ function treeResponse(path: string) {
     path: "/",
     folders: ["notes"],
     engrams: [
-      { permalink: "alpha", title: "Alpha", type: "engram", path: "alpha.md" },
+      {
+        permalink: "alpha",
+        title: "Alpha",
+        type: "engram",
+        status: "stable",
+        path: "alpha.md",
+      },
       {
         permalink: "old",
         title: "Old Way",
