@@ -105,7 +105,14 @@ test("a multi-segment permalink loads from the address bar", async ({
   await page.goto(`/d/${DOMAIN}/e/${DEEP_PERMALINK}`);
 
   await expect(engramTitle(page)).toHaveText("Deep Gamma Note");
-  await expect(page.getByText(DEEP_PERMALINK, { exact: true })).toBeVisible();
+  // Scoped to the page's own header, which is where the permalink the address
+  // bar carried is echoed. Unscoped this is a race rather than an assertion:
+  // the body of this fixture quotes its own permalink in a code span, so once
+  // the markdown chunk has landed there are two matches and strict mode is
+  // right to refuse them.
+  await expect(
+    page.locator("main header").getByText(DEEP_PERMALINK, { exact: true }),
+  ).toBeVisible();
 });
 
 test("a search finds an engram by what is in it", async ({ page }) => {

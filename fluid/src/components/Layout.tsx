@@ -2,9 +2,12 @@
  * The frame every screen inside the app is drawn in: which domains exist down
  * the side, and search, theme and identity across the top.
  *
- * The domain listing is the one thing this fetches. It is what the sidebar is,
- * and it is also the app's answer to "what does this instance know about",
- * which is the question a person arrives with.
+ * The domain listing is the one thing this fetches. It is what the sidebar is
+ * outside a domain, and it is also the app's answer to "what does this
+ * instance know about", which is the question a person arrives with. Inside a
+ * domain the question has changed - they are in one place and want their way
+ * around it - so the sidebar changes with it and hands over to `DomainNav`,
+ * which is the switcher and the folder tree.
  *
  * Down to tablet width the frame is unchanged. Narrower than that the sidebar
  * folds behind a disclosure rather than shrinking into a column too narrow to
@@ -14,7 +17,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { useState } from "react";
 import { DropdownMenu } from "radix-ui";
-import { Link, NavLink, Outlet, useNavigate } from "react-router";
+import { Link, NavLink, Outlet, useMatch, useNavigate } from "react-router";
 
 import { problemDetail } from "../api/client";
 import { DOMAINS_QUERY_KEY, fetchDomains } from "../api/domains";
@@ -24,10 +27,8 @@ import { domainRoute, searchRoute } from "../paths";
 import { useTheme } from "../theme/context";
 import type { ThemePreference } from "../theme/context";
 import { CommandPalette } from "./CommandPalette";
-
-/** The classes every menu surface shares. */
-const MENU_CLASSES =
-  "z-50 min-w-48 rounded border border-slate-200 bg-white p-1 text-sm shadow-lg dark:border-slate-700 dark:bg-slate-900";
+import { DomainNav } from "./DomainNav";
+import { ITEM_CLASSES, MENU_CLASSES } from "./menu";
 
 /**
  * What the command palette's shortcut is called on this keyboard.
@@ -38,10 +39,6 @@ const MENU_CLASSES =
 const PALETTE_HINT = /Mac|iPhone|iPad/.test(navigator.userAgent)
   ? "⌘K"
   : "Ctrl K";
-
-/** The classes every menu row shares. */
-const ITEM_CLASSES =
-  "flex cursor-pointer items-center gap-2 rounded px-2 py-1.5 outline-none select-none data-[highlighted]:bg-slate-100 dark:data-[highlighted]:bg-slate-800";
 
 export function Layout() {
   const [navOpen, setNavOpen] = useState(false);
@@ -265,41 +262,93 @@ function UserMenu() {
   );
 }
 
-/** The domain list, which is what this instance knows about. */
+/**
+ * The sidebar, in whichever of its two modes the address calls for.
+ *
+ * The route is read with `useMatch` rather than `useParams`, which inside a
+ * layout route only sees the params the layout's own pattern declares - none.
+ * `useMatch` matches the whole location, so the frame knows the domain and the
+ * engram the screen inside it is showing.
+ */
 function DomainSidebar({ open }: { open: boolean }) {
   const listing = useQuery({
     queryKey: DOMAINS_QUERY_KEY,
     queryFn: fetchDomains,
   });
 
+  const match = useMatch("/d/:domain/*");
+  const domain = match?.params.domain ?? "";
+  // The splat holds whatever follows the domain: `e/<permalink>` on an engram
+  // screen, the empty string on the domain's own.
+  const rest = match?.params["*"] ?? "";
+  const permalink = rest.startsWith("e/") ? rest.slice(2) : "";
+
   return (
     <nav
       id="domain-sidebar"
-      aria-label="Domains"
+      aria-label={domain === "" ? "Domains" : `Domain ${domain}`}
       className={`${open ? "block" : "hidden"} w-56 shrink-0 md:block`}
     >
+      {domain === "" ? (
+        <DomainList
+          domains={listing.data?.domains}
+          pending={listing.isPending}
+          error={listing.error}
+        />
+      ) : (
+        <>
+          {/*
+            A listing that failed is said here as it is in the flat mode. The
+            switcher is drawn either way: it names the domain the reader is in
+            from the address, so it works even when nothing could be listed to
+            switch to.
+          */}
+          {listing.error && <SidebarProblem error={listing.error} />}
+          <DomainNav
+            domain={domain}
+            permalink={permalink}
+            domains={listing.data?.domains ?? []}
+          />
+        </>
+      )}
+    </nav>
+  );
+}
+
+/** Every domain this instance holds: the sidebar outside any one of them. */
+function DomainList({
+  domains,
+  pending,
+  error,
+}: {
+  domains: DomainSummary[] | undefined;
+  pending: boolean;
+  error: Error | null;
+}) {
+  return (
+    <>
       <h2 className="px-2 pb-2 text-xs font-semibold tracking-wide text-slate-500 uppercase dark:text-slate-400">
         Domains
       </h2>
-      {listing.isPending && (
+      {pending && (
         <p className="px-2 text-sm text-slate-500 dark:text-slate-400">
           Loading domains
         </p>
       )}
-      {listing.error && <SidebarProblem error={listing.error} />}
+      {error && <SidebarProblem error={error} />}
       <ul className="flex flex-col gap-0.5">
-        {listing.data?.domains.map((domain) => (
+        {domains?.map((domain) => (
           <li key={domain.name}>
             <DomainLink domain={domain} />
           </li>
         ))}
       </ul>
-      {listing.data?.domains.length === 0 && (
+      {domains?.length === 0 && (
         <p className="px-2 text-sm text-slate-500 dark:text-slate-400">
           No domains are registered on this instance yet.
         </p>
       )}
-    </nav>
+    </>
   );
 }
 

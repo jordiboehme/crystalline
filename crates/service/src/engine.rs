@@ -3023,10 +3023,17 @@ impl Engine {
                 folders.insert(segments[0].to_string());
             }
             if segments.len() <= depth {
+                // `status` rides along with the rest of the descriptor, which
+                // already carries it: a browse row is what a navigation tree is
+                // drawn from, and whether an engram is retired is the one thing
+                // such a tree has to say about a row it is not otherwise
+                // describing. Leaving it out meant every client browsing a
+                // domain had to fetch the listing again to learn it.
                 entries.push(json!({
                     "permalink": d.permalink,
                     "title": d.title,
                     "type": d.engram_type,
+                    "status": d.status,
                     "path": d.path,
                 }));
             }

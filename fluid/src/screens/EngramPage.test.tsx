@@ -143,6 +143,22 @@ function serve(routes: Record<string, (path: string) => unknown> = {}) {
     answersFor({
       "/auth/me": () => meResponse({ user: userFixture() }),
       "/domains": domainsResponse,
+      // The frame around this screen browses the domain it is in, so the tree
+      // is stubbed here the way the domain listing is: an unstubbed one would
+      // put a failed sidebar beside every assertion below.
+      "/domains/eng/tree": () => ({
+        domain: "eng",
+        path: "/",
+        folders: [],
+        engrams: [
+          {
+            permalink: "alpha",
+            title: "Alpha",
+            type: "decision",
+            path: "alpha.md",
+          },
+        ],
+      }),
       "/domains/eng/engrams/alpha": () => detailResponse(),
       "/graph": () => graphResponse(),
       ...routes,

@@ -1562,6 +1562,15 @@ async fn recent_list_browse_delete() {
             .iter()
             .any(|f| f == "sub")
     );
+    // And the row carries the engram's status, so an agent browsing a domain
+    // can tell a retired engram from a live one without reading it.
+    let fresh = browse["engrams"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["permalink"] == "sub/fresh")
+        .unwrap_or_else(|| panic!("the browse lists the engram just written: {browse}"));
+    assert_eq!(fresh["status"], "stable", "{fresh}");
 
     // delete removes the file and index row.
     let del = call(
