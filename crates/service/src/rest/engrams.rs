@@ -961,6 +961,170 @@ pub async fn move_action(
     Ok(Json(value))
 }
 
+/// What `POST /validate` takes: the document a save would write, checked
+/// without writing.
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+#[schema(description = "The document a save would write, checked without \
+                        writing. Lives beside the engram routes because what \
+                        it validates is engram markdown, not because it is \
+                        scoped to a domain the way the other write routes are.")]
+pub struct ValidateBody {
+    /// The full markdown text, frontmatter included.
+    #[schema(example = "---\ntitle: Alpha\n---\n\nA rule about alpha.\n")]
+    content: String,
+    /// The domain the document belongs (or will belong) to. Names the scan
+    /// root in findings; defaults to "draft".
+    #[serde(default)]
+    #[schema(example = "eng")]
+    domain: Option<String>,
+    /// The domain-relative path the document sits (or will sit) at. Defaults
+    /// to "draft.md".
+    #[serde(default)]
+    #[schema(example = "alpha.md")]
+    path: Option<String>,
+}
+
+/// One finding, and the envelope: the same fields the verify report carries.
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct ValidateFinding {
+    /// The rule id, for example E002 or T005.
+    #[schema(example = "T005")]
+    rule: String,
+    /// error, warning or info. Hard errors are what a client blocks a save on.
+    #[schema(example = "warning")]
+    severity: String,
+    /// What is wrong, in the rule's own words.
+    message: String,
+    /// The one-based source line, when the finding points at one.
+    line: Option<usize>,
+    /// A suggested fix, when the rule has one.
+    fix: Option<String>,
+}
+
+/// What `POST /validate` answers: every finding the format and temporal rule
+/// families raise over the document, and how many of them are hard errors.
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct ValidateResponse {
+    /// Every finding, format and temporal families, default severities.
+    findings: Vec<ValidateFinding>,
+    /// How many findings are hard errors.
+    errors: usize,
+}
+
+/// `POST /validate` - the dry-run that gives an editor pre-save feedback:
+/// every issue `crystalline verify`'s format (`E`) and temporal (`T`) rule
+/// families would raise over the document, without writing anything or even
+/// requiring the engram to exist yet.
+///
+/// Link, manifest, schema and quality rules need a whole domain for context
+/// and are not run here; see [`crystalline_core::verify::check_document`],
+/// which this handler calls unchanged. `T006` (missing write provenance) is
+/// dropped by that function for the same reason it is dropped from every
+/// other caller of it: a fresh, unsaved document has not been through the
+/// write pipeline that stamps provenance, so flagging its absence here would
+/// nag an editor about a field the save is about to add.
+///
+/// Refused like every other write on this surface - editor role, read-only
+/// answered first - even though nothing here is ever written: a dry run that
+/// bypassed those gates would let a viewer or a read-only instance run the
+/// rule engine over arbitrary content, which is scope this route does not
+/// mean to open. There is no engine verb to carry the read-only check, so the
+/// handler makes it itself.
+#[utoipa::path(
+    post,
+    path = "/api/v1/validate",
+    tag = "engrams",
+    operation_id = "validate_document",
+    summary = "Pre-save validation: the findings a save would raise, without writing.",
+    description = "Runs verify's format (`E`) and temporal (`T`) rule \
+                   families over the document text, the same families \
+                   `crystalline verify` runs for a single document. Link, \
+                   manifest, schema and quality rules need a whole domain for \
+                   context and are not run here.\n\n`T006` (missing write \
+                   provenance) is dropped, so a fresh unsaved document is not \
+                   nagged about a field the save is about to stamp.\n\nRefused \
+                   like every other write on this surface - editor role, \
+                   read-only answered first - even though nothing is ever \
+                   written.",
+    request_body = ValidateBody,
+    responses(
+        (
+            status = 200,
+            description = "Every finding, and how many are hard errors.",
+            body = ValidateResponse,
+            example = json!({
+                "findings": [{
+                    "rule": "T005",
+                    "severity": "warning",
+                    "message": "status is `superseded` but no `superseded_by` relation is present",
+                    "line": null,
+                    "fix": "add `- superseded_by [[Target]]`"
+                }],
+                "errors": 0
+            }),
+        ),
+        (
+            status = 401,
+            description = "No identity, or an anonymous one: an identity with \
+                           no account behind it never writes.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "The caller is not an editor, the request did not \
+                           echo its CSRF token, this instance is read-only, or \
+                           the trusted-header identity names a disabled account.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 415,
+            description = "The body is not `application/json`.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+pub async fn validate(
+    State(state): State<RestState>,
+    identity: Identity,
+    ApiJson(body): ApiJson<ValidateBody>,
+) -> Result<Json<ValidateResponse>, ApiError> {
+    identity.require_editor()?;
+    // No engine verb runs here, so nothing else answers read-only; the
+    // handler makes the check itself, ahead of running the rule engine, for
+    // the same reason `save` and `remove` answer it before their own
+    // preconditions: an instance that refuses writes refuses them whatever
+    // the request otherwise looks like.
+    if state.engine.read_only() {
+        return Err(ApiError::forbidden(
+            "this instance is read-only; content mutations are disabled",
+        ));
+    }
+    let domain = body.domain.as_deref().unwrap_or("draft");
+    let rel = body.path.as_deref().unwrap_or("draft.md");
+    let issues =
+        crystalline_core::verify::check_document(domain, std::path::Path::new(rel), &body.content);
+    let findings: Vec<ValidateFinding> = issues
+        .into_iter()
+        .map(|i| ValidateFinding {
+            rule: i.rule.to_string(),
+            severity: match i.severity {
+                crystalline_core::verify::Severity::Error => "error",
+                crystalline_core::verify::Severity::Warning => "warning",
+                crystalline_core::verify::Severity::Info => "info",
+            }
+            .to_string(),
+            message: i.message,
+            line: i.line,
+            fix: i.fix,
+        })
+        .collect();
+    let errors = findings.iter().filter(|f| f.severity == "error").count();
+    Ok(Json(ValidateResponse { findings, errors }))
+}
+
 /// `DELETE /domains/{domain}/engrams/{*permalink}` - hard delete an engram,
 /// guarded by the `If-Match` token of the version being removed.
 ///

@@ -86,6 +86,7 @@ use crate::engine::Engine;
         engrams::retire,
         engrams::move_action,
         engrams::remove,
+        engrams::validate,
         discovery::search,
         discovery::vocabulary,
         discovery::context,
@@ -106,6 +107,9 @@ use crate::engine::Engine;
         engrams::SaveEngramBody,
         engrams::RetireBody,
         engrams::MoveBody,
+        engrams::ValidateBody,
+        engrams::ValidateFinding,
+        engrams::ValidateResponse,
         auth::LoginBody,
         auth::LoginResponse,
         auth::LogoutResponse,
@@ -231,6 +235,11 @@ pub fn router(state: RestState) -> Router {
         // the engram being retired or moved rides in the body instead.
         .route("/domains/{domain}/retire", post(engrams::retire))
         .route("/domains/{domain}/move", post(engrams::move_action))
+        // Not domain-scoped like the routes above it: the document being
+        // validated may not exist yet, so there is no path segment to name a
+        // domain with. It lives here rather than beside `/search` and its
+        // siblings because what it checks is engram markdown.
+        .route("/validate", post(engrams::validate))
         .route("/search", get(discovery::search))
         .route("/vocabulary", get(discovery::vocabulary))
         .route("/context", get(discovery::context))

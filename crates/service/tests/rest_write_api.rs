@@ -559,6 +559,17 @@ async fn the_write_routes_refuse_viewers_the_anonymous_and_the_tokenless() {
     .await
     .unwrap();
     assert_eq!(manifest_saved.status(), 403);
+    // /validate writes nothing, but it is held to the same editor-only rule
+    // as every other write on this surface: see the standing lesson at the
+    // top of this matrix - a dry run that bypassed the gate would let a
+    // viewer run the rule engine over arbitrary content this route does not
+    // mean to open.
+    let validated = as_session(fx.addr, reqwest::Method::POST, "/api/v1/validate", &viewer)
+        .json(&serde_json::json!({"content": ALPHA}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(validated.status(), 403);
 
     // Each route's own valid body, so a schema mismatch never masks the
     // identity check: `ApiJson` extraction runs ahead of the handler and
@@ -594,6 +605,11 @@ async fn the_write_routes_refuse_viewers_the_anonymous_and_the_tokenless() {
                 reqwest::Method::PUT,
                 "/api/v1/domains/eng/manifest",
                 serde_json::json!({"markdown": "no"}),
+            ),
+            (
+                reqwest::Method::POST,
+                "/api/v1/validate",
+                serde_json::json!({"content": ALPHA}),
             ),
         ]
     };
@@ -676,6 +692,16 @@ async fn a_read_only_instance_refuses_before_the_precondition_check() {
     .await
     .unwrap();
     assert_eq!(created.status(), 403);
+
+    // /validate refuses too, even though it writes nothing: it checks
+    // `read_only` itself, since no engine verb runs underneath it to answer
+    // that for free.
+    let validated = as_session(fx.addr, reqwest::Method::POST, "/api/v1/validate", &editor)
+        .json(&serde_json::json!({"content": ALPHA}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(validated.status(), 403);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -866,6 +892,47 @@ async fn the_manifest_reads_with_an_etag_and_saves_under_if_match() {
             .as_str()
             .unwrap()
             .contains("all things eng")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn validate_reports_findings_without_writing() {
+    let fx = serve(Options::default()).await;
+    let editor = login(fx.addr, "eddy", "eddypw").await;
+
+    // A superseded engram without a successor trips T005.
+    let resp = as_session(fx.addr, reqwest::Method::POST, "/api/v1/validate", &editor)
+        .json(&serde_json::json!({
+            "domain": "eng",
+            "path": "alpha.md",
+            "content": ALPHA.replace("status: stable", "status: superseded")
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let rules: Vec<&str> = body["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["rule"].as_str().unwrap())
+        .collect();
+    assert!(rules.contains(&"T005"), "expected T005 in {rules:?}");
+
+    // A clean document has no findings, and nothing was ever written.
+    let clean = as_session(fx.addr, reqwest::Method::POST, "/api/v1/validate", &editor)
+        .json(&serde_json::json!({"content": ALPHA}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(clean.status(), 200);
+    let clean: serde_json::Value = clean.json().await.unwrap();
+    assert_eq!(clean["errors"], 0);
+    assert_eq!(
+        std::fs::read_to_string(fx._tmp.path().join("eng/alpha.md")).unwrap(),
+        ALPHA,
+        "a dry run writes nothing"
     );
 }
 

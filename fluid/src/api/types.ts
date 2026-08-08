@@ -450,6 +450,30 @@ export interface paths {
         patch: operations["update_user"];
         trace?: never;
     };
+    "/api/v1/validate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Pre-save validation: the findings a save would raise, without writing.
+         * @description Runs verify's format (`E`) and temporal (`T`) rule families over the document text, the same families `crystalline verify` runs for a single document. Link, manifest, schema and quality rules need a whole domain for context and are not run here.
+         *
+         *     `T006` (missing write provenance) is dropped, so a fresh unsaved document is not nagged about a field the save is about to stamp.
+         *
+         *     Refused like every other write on this surface - editor role, read-only answered first - even though nothing is ever written.
+         */
+        post: operations["validate_document"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/vocabulary": {
         parameters: {
             query?: never;
@@ -799,6 +823,59 @@ export interface components {
         UsersResponse: {
             /** @description Every account, by name. */
             users: components["schemas"]["User"][];
+        };
+        /** @description The document a save would write, checked without writing. Lives beside the engram routes because what it validates is engram markdown, not because it is scoped to a domain the way the other write routes are. */
+        ValidateBody: {
+            /**
+             * @description The full markdown text, frontmatter included.
+             * @example ---
+             *     title: Alpha
+             *     ---
+             *
+             *     A rule about alpha.
+             */
+            content: string;
+            /**
+             * @description The domain the document belongs (or will belong) to. Names the scan
+             *     root in findings; defaults to "draft".
+             * @example eng
+             */
+            domain?: string | null;
+            /**
+             * @description The domain-relative path the document sits (or will sit) at. Defaults
+             *     to "draft.md".
+             * @example alpha.md
+             */
+            path?: string | null;
+        };
+        /** @description One finding, and the envelope: the same fields the verify report carries. */
+        ValidateFinding: {
+            /** @description A suggested fix, when the rule has one. */
+            fix?: string | null;
+            /** @description The one-based source line, when the finding points at one. */
+            line?: number | null;
+            /** @description What is wrong, in the rule's own words. */
+            message: string;
+            /**
+             * @description The rule id, for example E002 or T005.
+             * @example T005
+             */
+            rule: string;
+            /**
+             * @description error, warning or info. Hard errors are what a client blocks a save on.
+             * @example warning
+             */
+            severity: string;
+        };
+        /**
+         * @description What `POST /validate` answers: every finding the format and temporal rule
+         *     families raise over the document, and how many of them are hard errors.
+         */
+        ValidateResponse: {
+            /** @description How many findings are hard errors. */
+            errors: number;
+            /** @description Every finding, format and temporal families, default severities. */
+            findings: components["schemas"]["ValidateFinding"][];
         };
     };
     responses: never;
@@ -2698,6 +2775,71 @@ export interface operations {
             };
             /** @description The body changes nothing, or the new password is empty. */
             422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    validate_document: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ValidateBody"];
+            };
+        };
+        responses: {
+            /** @description Every finding, and how many are hard errors. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "errors": 0,
+                     *       "findings": [
+                     *         {
+                     *           "fix": "add `- superseded_by [[Target]]`",
+                     *           "line": null,
+                     *           "message": "status is `superseded` but no `superseded_by` relation is present",
+                     *           "rule": "T005",
+                     *           "severity": "warning"
+                     *         }
+                     *       ]
+                     *     }
+                     */
+                    "application/json": components["schemas"]["ValidateResponse"];
+                };
+            };
+            /** @description No identity, or an anonymous one: an identity with no account behind it never writes. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The caller is not an editor, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The body is not `application/json`. */
+            415: {
                 headers: {
                     [name: string]: unknown;
                 };

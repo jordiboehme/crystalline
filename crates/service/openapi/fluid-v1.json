@@ -2395,6 +2395,80 @@
         }
       }
     },
+    "/api/v1/validate": {
+      "post": {
+        "tags": [
+          "engrams"
+        ],
+        "summary": "Pre-save validation: the findings a save would raise, without writing.",
+        "description": "Runs verify's format (`E`) and temporal (`T`) rule families over the document text, the same families `crystalline verify` runs for a single document. Link, manifest, schema and quality rules need a whole domain for context and are not run here.\n\n`T006` (missing write provenance) is dropped, so a fresh unsaved document is not nagged about a field the save is about to stamp.\n\nRefused like every other write on this surface - editor role, read-only answered first - even though nothing is ever written.",
+        "operationId": "validate_document",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ValidateBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Every finding, and how many are hard errors.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ValidateResponse"
+                },
+                "example": {
+                  "errors": 0,
+                  "findings": [
+                    {
+                      "fix": "add `- superseded_by [[Target]]`",
+                      "line": null,
+                      "message": "status is `superseded` but no `superseded_by` relation is present",
+                      "rule": "T005",
+                      "severity": "warning"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or an anonymous one: an identity with no account behind it never writes.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an editor, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body is not `application/json`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/vocabulary": {
       "get": {
         "tags": [
@@ -2950,6 +3024,98 @@
               "$ref": "#/components/schemas/User"
             },
             "description": "Every account, by name."
+          }
+        }
+      },
+      "ValidateBody": {
+        "type": "object",
+        "description": "The document a save would write, checked without writing. Lives beside the engram routes because what it validates is engram markdown, not because it is scoped to a domain the way the other write routes are.",
+        "required": [
+          "content"
+        ],
+        "properties": {
+          "content": {
+            "type": "string",
+            "description": "The full markdown text, frontmatter included.",
+            "example": "---\ntitle: Alpha\n---\n\nA rule about alpha.\n"
+          },
+          "domain": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The domain the document belongs (or will belong) to. Names the scan\nroot in findings; defaults to \"draft\".",
+            "example": "eng"
+          },
+          "path": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The domain-relative path the document sits (or will sit) at. Defaults\nto \"draft.md\".",
+            "example": "alpha.md"
+          }
+        }
+      },
+      "ValidateFinding": {
+        "type": "object",
+        "description": "One finding, and the envelope: the same fields the verify report carries.",
+        "required": [
+          "rule",
+          "severity",
+          "message"
+        ],
+        "properties": {
+          "fix": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A suggested fix, when the rule has one."
+          },
+          "line": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "The one-based source line, when the finding points at one.",
+            "minimum": 0
+          },
+          "message": {
+            "type": "string",
+            "description": "What is wrong, in the rule's own words."
+          },
+          "rule": {
+            "type": "string",
+            "description": "The rule id, for example E002 or T005.",
+            "example": "T005"
+          },
+          "severity": {
+            "type": "string",
+            "description": "error, warning or info. Hard errors are what a client blocks a save on.",
+            "example": "warning"
+          }
+        }
+      },
+      "ValidateResponse": {
+        "type": "object",
+        "description": "What `POST /validate` answers: every finding the format and temporal rule\nfamilies raise over the document, and how many of them are hard errors.",
+        "required": [
+          "findings",
+          "errors"
+        ],
+        "properties": {
+          "errors": {
+            "type": "integer",
+            "description": "How many findings are hard errors.",
+            "minimum": 0
+          },
+          "findings": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ValidateFinding"
+            },
+            "description": "Every finding, format and temporal families, default severities."
           }
         }
       }
