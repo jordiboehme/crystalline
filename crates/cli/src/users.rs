@@ -92,12 +92,35 @@ pub async fn run(command: UsersCommand, json: bool) -> Result<()> {
             store.set_disabled(&name, false).await?;
             println!("Enabled '{}'.", stored_name(&name));
         }
-        UsersCommand::Remove { name } => {
-            store.remove_user(&name).await?;
-            println!(
-                "Removed '{}' and every session it held.",
-                stored_name(&name)
-            );
+        UsersCommand::Demote { name, role, force } => {
+            let role: Role = role.into();
+            if force {
+                store.set_role_force(&name, role).await?;
+                println!(
+                    "'{}' is now {role} (forced). The installation may now have no \
+                     admin; add one with `crystalline users role <name> admin`.",
+                    stored_name(&name)
+                );
+            } else {
+                store.set_role(&name, role).await?;
+                println!("'{}' is now {role}.", stored_name(&name));
+            }
+        }
+        UsersCommand::Remove { name, force } => {
+            if force {
+                store.remove_user_force(&name).await?;
+                println!(
+                    "Removed '{}' and every session it held (forced). The installation \
+                     may now have no admin; add one with `crystalline users add <name> --role admin`.",
+                    stored_name(&name)
+                );
+            } else {
+                store.remove_user(&name).await?;
+                println!(
+                    "Removed '{}' and every session it held.",
+                    stored_name(&name)
+                );
+            }
         }
     }
     Ok(())

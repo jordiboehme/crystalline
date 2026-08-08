@@ -163,6 +163,124 @@ fn the_last_admin_cannot_be_removed() {
 }
 
 #[test]
+fn the_last_admin_cannot_be_demoted_without_force() {
+    let home = tempfile::tempdir().unwrap();
+    users_ok(
+        home.path(),
+        &["add", "ada", "--role", "admin", "--password-stdin"],
+        Some("s3cret\n"),
+    );
+
+    let err = users_err(home.path(), &["demote", "ada"], None);
+    assert!(
+        err.contains("last admin"),
+        "the lockout refusal is surfaced: {err}"
+    );
+
+    let out = users_ok(home.path(), &["--json", "list"], None);
+    let users: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        users["users"][0]["role"], "admin",
+        "the refused demotion left the role untouched"
+    );
+}
+
+#[test]
+fn demote_defaults_to_viewer() {
+    let home = tempfile::tempdir().unwrap();
+    users_ok(
+        home.path(),
+        &["add", "ada", "--role", "admin", "--password-stdin"],
+        Some("s3cret\n"),
+    );
+    users_ok(
+        home.path(),
+        &["add", "bob", "--role", "admin", "--password-stdin"],
+        Some("hunter2\n"),
+    );
+
+    let out = users_ok(home.path(), &["demote", "bob"], None);
+    assert!(out.contains("viewer"), "{out}");
+
+    let out = users_ok(home.path(), &["--json", "list"], None);
+    let users: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let bob = users["users"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["name"] == "bob")
+        .unwrap();
+    assert_eq!(bob["role"], "viewer");
+}
+
+#[test]
+fn demote_force_bypasses_the_last_admin_guard() {
+    let home = tempfile::tempdir().unwrap();
+    users_ok(
+        home.path(),
+        &["add", "ada", "--role", "admin", "--password-stdin"],
+        Some("s3cret\n"),
+    );
+
+    let out = users_ok(home.path(), &["demote", "ada", "--force"], None);
+    assert!(out.contains("forced"), "{out}");
+    assert!(
+        out.contains("no admin"),
+        "the operator is warned about the lockout: {out}"
+    );
+
+    let out = users_ok(home.path(), &["--json", "list"], None);
+    let users: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        users["users"][0]["role"], "viewer",
+        "the forced demotion went through despite being the last admin"
+    );
+}
+
+#[test]
+fn demote_force_can_set_a_specific_role() {
+    let home = tempfile::tempdir().unwrap();
+    users_ok(
+        home.path(),
+        &["add", "ada", "--role", "admin", "--password-stdin"],
+        Some("s3cret\n"),
+    );
+
+    users_ok(
+        home.path(),
+        &["demote", "ada", "--role", "editor", "--force"],
+        None,
+    );
+
+    let out = users_ok(home.path(), &["--json", "list"], None);
+    let users: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(users["users"][0]["role"], "editor");
+}
+
+#[test]
+fn remove_force_bypasses_the_last_admin_guard() {
+    let home = tempfile::tempdir().unwrap();
+    users_ok(
+        home.path(),
+        &["add", "ada", "--role", "admin", "--password-stdin"],
+        Some("s3cret\n"),
+    );
+
+    let out = users_ok(home.path(), &["remove", "ada", "--force"], None);
+    assert!(out.contains("forced"), "{out}");
+    assert!(
+        out.contains("no admin"),
+        "the operator is warned about the lockout: {out}"
+    );
+
+    let out = users_ok(home.path(), &["list"], None);
+    assert!(
+        !out.contains("ada"),
+        "the forced removal went through: {out}"
+    );
+}
+
+#[test]
 fn adding_the_same_name_twice_says_so_in_words() {
     let home = tempfile::tempdir().unwrap();
     users_ok(

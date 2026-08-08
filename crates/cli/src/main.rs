@@ -725,11 +725,27 @@ enum UsersCommand {
         /// The account to enable.
         name: String,
     },
+    /// Demote an account, the recovery escape hatch included: with --force the
+    /// last-admin guard is bypassed, which can leave the installation with no
+    /// admin at all. The web UI never offers this.
+    Demote {
+        /// The account to demote.
+        name: String,
+        /// The role to demote to. Defaults to viewer.
+        #[arg(long, value_enum, default_value_t = RoleArg::Viewer)]
+        role: RoleArg,
+        /// Bypass the last-admin guard. Recovery scenarios only.
+        #[arg(long)]
+        force: bool,
+    },
     /// Delete an account and every session it holds. Removing the last
     /// enabled admin is refused.
     Remove {
         /// The account to delete.
         name: String,
+        /// Bypass the last-admin guard. Recovery scenarios only.
+        #[arg(long)]
+        force: bool,
     },
 }
 
