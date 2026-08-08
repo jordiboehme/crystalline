@@ -154,6 +154,30 @@ pub struct SaveParams {
     pub expected_checksum: String,
 }
 
+/// Parameters for `retire_engram`, the guided retirement behind the HTTP
+/// retire action.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct RetireParams {
+    /// The engram's domain.
+    pub domain: String,
+    /// A bare permalink, title or `crystalline://` URL, domain-relative.
+    pub identifier: String,
+    /// The retirement status: deprecated, superseded or archived. This guided
+    /// flow accepts exactly these three; any other status goes through the
+    /// ordinary save path.
+    pub status: String,
+    /// The successor's permalink or title in the same domain. Wires the
+    /// superseded_by / supersedes relation pair. Required when status is
+    /// superseded (T005 would flag the result otherwise), refused for the
+    /// other two.
+    #[serde(default)]
+    pub successor: Option<String>,
+    /// The date validity ends, plain ISO (YYYY-MM-DD). Omitted means the end
+    /// date is unknown, never a sentinel.
+    #[serde(default)]
+    pub valid_to: Option<String>,
+}
+
 /// Parameters for `move_engram`.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct MoveParams {

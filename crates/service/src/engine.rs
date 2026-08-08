@@ -1514,6 +1514,229 @@ impl Engine {
         }))
     }
 
+    /// The retirement statuses [`Engine::retire_engram`] accepts. Any other
+    /// status is this verb's business to refuse, not a global rule: the
+    /// ordinary save and edit paths accept any status string.
+    const RETIREMENT_STATUSES: [&str; 3] = ["deprecated", "superseded", "archived"];
+
+    /// Guided retirement: set a retirement `status`, optionally close out
+    /// `valid_to`, and, for `superseded`, wire the supersede pair as body
+    /// relations so verify's T005 and the evolve sweep see a reciprocal link
+    /// rather than a dangling one.
+    pub async fn retire_engram(&self, p: &RetireParams) -> Result<Value> {
+        self.retire_engram_as(p, None).await
+    }
+
+    /// [`Engine::retire_engram`] with the retiring identity, resolved by
+    /// [`Engine::actor`] and stamped into both engrams' `generated` block.
+    ///
+    /// Everything is validated and resolved before anything is written: the
+    /// status is checked against [`Self::RETIREMENT_STATUSES`], the
+    /// successor rule (required for `superseded`, refused otherwise) is
+    /// enforced, `valid_to` is parsed and, when a successor is named, it is
+    /// resolved in the same domain so a missing successor is `NotFound`
+    /// before the target is touched. The target is then written first, and
+    /// only then the successor's reciprocal `- supersedes [[..]]` line
+    /// (appended only when not already present, so a repeat call is
+    /// idempotent). A failure on the successor write leaves the target
+    /// retired with a one-sided pair; nothing here rolls that back, since the
+    /// evolve sweep already flags a `superseded_by` with no matching
+    /// `supersedes` as its own finding.
+    pub async fn retire_engram_as(&self, p: &RetireParams, client: Option<&str>) -> Result<Value> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        if !Self::RETIREMENT_STATUSES.contains(&p.status.as_str()) {
+            return Err(EngineError::Invalid(format!(
+                "retire_engram accepts status deprecated, superseded or archived, got '{}'; \
+                 use edit_engram's set_frontmatter operation for any other status",
+                p.status
+            )));
+        }
+        match (p.status.as_str(), p.successor.is_some()) {
+            ("superseded", false) => {
+                return Err(EngineError::Invalid(
+                    "status superseded needs a successor to wire the supersede pair, \
+                     or verify rule T005 flags the result as a dangling retirement"
+                        .into(),
+                ));
+            }
+            (other, true) if other != "superseded" => {
+                return Err(EngineError::Invalid(format!(
+                    "successor is only accepted when status is superseded, not '{other}'"
+                )));
+            }
+            _ => {}
+        }
+        let valid_to = p
+            .valid_to
+            .as_deref()
+            .map(|raw| {
+                NaiveDate::parse_from_str(raw, "%Y-%m-%d").map_err(|_| {
+                    EngineError::Invalid(format!(
+                        "valid_to must be a plain ISO date (YYYY-MM-DD), got '{raw}'"
+                    ))
+                })
+            })
+            .transpose()?;
+
+        let actor = self.actor(client);
+        let (desc, source) = self.resolve(&p.identifier, Some(&p.domain)).await?;
+
+        // Resolved before the target is touched: a missing successor must
+        // never leave the target half-retired.
+        let successor = match &p.successor {
+            Some(identifier) => Some(self.resolve(identifier, Some(&p.domain)).await?),
+            None => None,
+        };
+        let successor_title = successor.as_ref().map(|(d, _)| d.title.clone());
+
+        // -- target: status, optional valid_to, optional superseded_by line --
+        match &source {
+            ContentSource::File { root } => {
+                let abs = join_rel(root, &desc.path);
+                let current = std::fs::read_to_string(&abs).map_err(|source| EngineError::Io {
+                    path: abs.display().to_string(),
+                    source,
+                })?;
+                let edited = Self::build_retirement_edit(
+                    &current,
+                    &p.status,
+                    valid_to,
+                    successor_title.as_deref(),
+                    &actor,
+                );
+                write_file(&abs, &edited)?;
+                let store = self.store.lock().await;
+                self.reindex_file(&*store, desc.domain_id, root, &desc.path)
+                    .await?;
+            }
+            ContentSource::Virtual => {
+                let current = {
+                    let store = self.store.lock().await;
+                    store
+                        .engram_content(desc.domain_id, &desc.path)
+                        .await?
+                        .ok_or_else(|| {
+                            EngineError::NotFound(format!(
+                                "no content stored for '{}' in domain '{}'",
+                                desc.permalink, desc.domain
+                            ))
+                        })?
+                };
+                let edited = Self::build_retirement_edit(
+                    &current,
+                    &p.status,
+                    valid_to,
+                    successor_title.as_deref(),
+                    &actor,
+                );
+                let stamp = virtual_stamp(&edited);
+                let store = self.store.lock().await;
+                self.index_markdown(
+                    &*store,
+                    desc.domain_id,
+                    &desc.path,
+                    &edited,
+                    stamp,
+                    None,
+                    true,
+                )
+                .await?;
+            }
+        }
+        if matches!(source, ContentSource::Virtual) {
+            self.refresh_routing_cache().await;
+        }
+        self.refresh_index_files(&desc.domain).await;
+
+        // -- successor: reciprocal supersedes line, appended once --
+        if let Some((succ_desc, succ_source)) = &successor {
+            let line = format!("- supersedes [[{}]]", desc.title);
+            match succ_source {
+                ContentSource::File { root } => {
+                    let abs = join_rel(root, &succ_desc.path);
+                    let current =
+                        std::fs::read_to_string(&abs).map_err(|source| EngineError::Io {
+                            path: abs.display().to_string(),
+                            source,
+                        })?;
+                    if !current.contains(&line) {
+                        let edited =
+                            touch_generated(&append_body(&current, &line), &actor, now_offset());
+                        write_file(&abs, &edited)?;
+                        let store = self.store.lock().await;
+                        self.reindex_file(&*store, succ_desc.domain_id, root, &succ_desc.path)
+                            .await?;
+                    }
+                }
+                ContentSource::Virtual => {
+                    let current = {
+                        let store = self.store.lock().await;
+                        store
+                            .engram_content(succ_desc.domain_id, &succ_desc.path)
+                            .await?
+                            .ok_or_else(|| {
+                                EngineError::NotFound(format!(
+                                    "no content stored for '{}' in domain '{}'",
+                                    succ_desc.permalink, succ_desc.domain
+                                ))
+                            })?
+                    };
+                    if !current.contains(&line) {
+                        let edited =
+                            touch_generated(&append_body(&current, &line), &actor, now_offset());
+                        let stamp = virtual_stamp(&edited);
+                        let store = self.store.lock().await;
+                        self.index_markdown(
+                            &*store,
+                            succ_desc.domain_id,
+                            &succ_desc.path,
+                            &edited,
+                            stamp,
+                            None,
+                            true,
+                        )
+                        .await?;
+                    }
+                }
+            }
+            if matches!(succ_source, ContentSource::Virtual) {
+                self.refresh_routing_cache().await;
+            }
+            self.refresh_index_files(&succ_desc.domain).await;
+        }
+
+        Ok(json!({
+            "domain": desc.domain,
+            "permalink": desc.permalink,
+            "status": p.status,
+            "successor": successor.map(|(d, _)| d.permalink),
+        }))
+    }
+
+    /// Build the target engram's retirement edit: set `status`, set
+    /// `valid_to` when given, append the `superseded_by` relation when a
+    /// successor title is given, then stamp `generated` provenance. Shared by
+    /// the file and virtual arms of [`Engine::retire_engram_as`].
+    fn build_retirement_edit(
+        current: &str,
+        status: &str,
+        valid_to: Option<NaiveDate>,
+        successor_title: Option<&str>,
+        actor: &str,
+    ) -> String {
+        let mut edited = set_frontmatter_field(current, "status", status);
+        if let Some(date) = valid_to {
+            edited =
+                set_frontmatter_field(&edited, "valid_to", &date.format("%Y-%m-%d").to_string());
+        }
+        if let Some(title) = successor_title {
+            edited = append_body(&edited, &format!("- superseded_by [[{title}]]"));
+        }
+        touch_generated(&edited, actor, now_offset())
+    }
+
     // --- read ----------------------------------------------------------------
 
     /// Read an engram's full markdown and resolved frontmatter. The content

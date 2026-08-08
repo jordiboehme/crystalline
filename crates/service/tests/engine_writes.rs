@@ -7,7 +7,7 @@ use std::sync::Arc;
 use crystalline_core::config::{DomainEntry, GlobalConfig, ResponseFormat, ServiceConfig};
 use crystalline_index::TursoStore;
 use crystalline_service::Engine;
-use crystalline_service::params::{ReadParams, SaveParams};
+use crystalline_service::params::{ReadParams, RetireParams, SaveParams};
 use tokio::sync::Mutex;
 
 const ALPHA: &str = "---\ntype: engram\ntitle: Alpha\npermalink: alpha\ntags:\n  - eng\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# Alpha\n\nA rule about alpha.\n";
@@ -258,5 +258,108 @@ async fn a_save_that_does_not_parse_is_refused_without_writing() {
     assert_eq!(
         std::fs::read(tmp.path().join("eng/alpha.md")).unwrap(),
         before
+    );
+}
+
+#[tokio::test]
+async fn retirement_sets_status_and_wires_the_supersede_pair() {
+    let (tmp, engine) = engine_fixture().await;
+    // A successor beside alpha.
+    std::fs::write(
+        tmp.path().join("eng/beta.md"),
+        "---\ntype: engram\ntitle: Beta\npermalink: beta\ntags:\n  - eng\nstatus: stable\nrecorded_at: 2026-02-01\n---\n\n# Beta\n\nThe sharper rule.\n",
+    )
+    .unwrap();
+    engine.sync(None).await.unwrap();
+
+    let out = engine
+        .retire_engram(&RetireParams {
+            domain: "eng".to_string(),
+            identifier: "alpha".to_string(),
+            status: "superseded".to_string(),
+            successor: Some("beta".to_string()),
+            valid_to: Some("2026-08-01".to_string()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(out["status"], "superseded");
+    assert_eq!(out["successor"], "beta");
+
+    let alpha = std::fs::read_to_string(tmp.path().join("eng/alpha.md")).unwrap();
+    assert!(alpha.contains("status: superseded"), "{alpha}");
+    assert!(alpha.contains("valid_to: 2026-08-01"), "{alpha}");
+    assert!(alpha.contains("- superseded_by [[Beta]]"), "{alpha}");
+    let beta = std::fs::read_to_string(tmp.path().join("eng/beta.md")).unwrap();
+    assert!(beta.contains("- supersedes [[Alpha]]"), "{beta}");
+}
+
+#[tokio::test]
+async fn retirement_validates_status_successor_and_date() {
+    let (_tmp, engine) = engine_fixture().await;
+    let retire = |status: &str, successor: Option<&str>, valid_to: Option<&str>| RetireParams {
+        domain: "eng".to_string(),
+        identifier: "alpha".to_string(),
+        status: status.to_string(),
+        successor: successor.map(str::to_string),
+        valid_to: valid_to.map(str::to_string),
+    };
+
+    // Not a retirement status.
+    assert!(
+        engine
+            .retire_engram(&retire("stable", None, None))
+            .await
+            .is_err()
+    );
+    // Superseded needs its successor; the others refuse one.
+    assert!(
+        engine
+            .retire_engram(&retire("superseded", None, None))
+            .await
+            .is_err()
+    );
+    assert!(
+        engine
+            .retire_engram(&retire("deprecated", Some("beta"), None))
+            .await
+            .is_err()
+    );
+    // A bad date never lands, and neither does a missing successor.
+    assert!(
+        engine
+            .retire_engram(&retire("archived", None, Some("soon")))
+            .await
+            .is_err()
+    );
+    assert!(
+        engine
+            .retire_engram(&retire("superseded", Some("ghost"), None))
+            .await
+            .is_err()
+    );
+
+    // Nothing was written by any refusal.
+    let alpha = std::fs::read_to_string(_tmp.path().join("eng/alpha.md")).unwrap();
+    assert!(alpha.contains("status: stable"), "{alpha}");
+}
+
+#[tokio::test]
+async fn plain_deprecation_needs_no_successor() {
+    let (tmp, engine) = engine_fixture().await;
+    engine
+        .retire_engram(&RetireParams {
+            domain: "eng".to_string(),
+            identifier: "alpha".to_string(),
+            status: "deprecated".to_string(),
+            successor: None,
+            valid_to: None,
+        })
+        .await
+        .unwrap();
+    let alpha = std::fs::read_to_string(tmp.path().join("eng/alpha.md")).unwrap();
+    assert!(alpha.contains("status: deprecated"), "{alpha}");
+    assert!(
+        !alpha.contains("valid_to"),
+        "no sentinel dates, ever: {alpha}"
     );
 }
