@@ -66,6 +66,7 @@ function serveEditor(
 
 beforeEach(() => {
   apiMock.mockReset();
+  localStorage.clear();
 });
 
 describe("the engram editor", () => {
@@ -141,5 +142,70 @@ describe("the engram editor", () => {
     await userEvent.click(screen.getByRole("button", { name: "Save" }));
     // The header echoes the address the engram now answers at.
     expect(await screen.findByText("sharper-alpha")).toBeInTheDocument();
+  });
+
+  it("offers a stored draft and restores it", async () => {
+    localStorage.setItem(
+      "fluid.draft.ada.eng/alpha",
+      JSON.stringify({
+        content: CONTENT.replace("A rule.", "A recovered rule."),
+        baseChecksum: "3f8a1c05e2",
+        savedAt: "2026-08-09T10:00:00Z",
+      }),
+    );
+    serveEditor();
+    renderApp("/d/eng/edit/alpha");
+    expect(await screen.findByText(/unsaved draft/i)).toBeInTheDocument();
+    await userEvent.click(
+      screen.getByRole("button", { name: "Restore draft" }),
+    );
+    await waitFor(() => {
+      expect(screen.getByLabelText("Engram source").textContent).toContain(
+        "A recovered rule.",
+      );
+    });
+  });
+
+  it("discarding the draft keeps the server text and drops the banner", async () => {
+    localStorage.setItem(
+      "fluid.draft.ada.eng/alpha",
+      JSON.stringify({
+        content: "other",
+        baseChecksum: "3f8a1c05e2",
+        savedAt: "",
+      }),
+    );
+    serveEditor();
+    renderApp("/d/eng/edit/alpha");
+    await screen.findByText(/unsaved draft/i);
+    await userEvent.click(
+      screen.getByRole("button", { name: "Discard draft" }),
+    );
+    await waitFor(() => {
+      expect(screen.queryByText(/unsaved draft/i)).not.toBeInTheDocument();
+    });
+    expect(localStorage.getItem("fluid.draft.ada.eng/alpha")).toBeNull();
+  });
+
+  it("clears the draft on a successful save", async () => {
+    serveEditor({
+      "/domains/eng/engrams/alpha": (_path, init) =>
+        init?.method === "PUT"
+          ? detailResponse({ checksum: "next111" })
+          : detailResponse(),
+    });
+    renderApp("/d/eng/edit/alpha");
+    await screen.findByLabelText("Engram source");
+    localStorage.setItem(
+      "fluid.draft.ada.eng/alpha",
+      JSON.stringify({
+        content: "mid-edit",
+        baseChecksum: "3f8a1c05e2",
+        savedAt: "",
+      }),
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Save" }));
+    await screen.findByText("Saved");
+    expect(localStorage.getItem("fluid.draft.ada.eng/alpha")).toBeNull();
   });
 });

@@ -21,6 +21,12 @@ import { engramDetailKey, fetchEngramDetail } from "../api/engram";
 import { saveEngram } from "../api/writes";
 import { useAuth } from "../auth/AuthContext";
 import CmEditor from "../editor/CmEditor";
+import {
+  clearDraft,
+  DRAFT_DEBOUNCE_MS,
+  readDraft,
+  writeDraft,
+} from "../editor/drafts";
 import { baseExtensions, docText, lineSeparatorFor } from "../editor/setup";
 import { editRoute, engramRoute } from "../paths";
 import { useTheme } from "../theme/context";
@@ -102,6 +108,10 @@ function EditorSurface({ engram }: { engram: EngramDetail }) {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const { resolved } = useTheme();
+  const { user } = useAuth();
+  // Anonymous can never reach this screen (`canWrite` gates it above); the
+  // fallback only satisfies the types.
+  const account = user?.name ?? "anonymous";
   const viewRef = useRef<EditorView | null>(null);
   // What the server holds, moved forward on every successful save.
   const [checksum, setChecksum] = useState(engram.checksum ?? "");
@@ -109,11 +119,18 @@ function EditorSurface({ engram }: { engram: EngramDetail }) {
   const [buffer, setBuffer] = useState(engram.content);
   const [notice, setNotice] = useState<Notice | null>(null);
   const dirty = buffer !== savedText;
+  // A browser-stored draft newer than what the server sent, read once per
+  // mount and offered through the recovery banner below.
+  const [offeredDraft, setOfferedDraft] = useState(() => {
+    const stored = readDraft(account, engram.domain, engram.permalink);
+    return stored !== null && stored.content !== engram.content ? stored : null;
+  });
 
   const save = useMutation({
     mutationFn: (content: string) =>
       saveEngram(engram.domain, engram.permalink, content, checksum),
     onSuccess: (saved) => {
+      clearDraft(account, engram.domain, engram.permalink);
       setChecksum(saved.checksum ?? "");
       setSavedText(saved.content);
       setNotice({ kind: "done", text: "Saved" });
@@ -159,6 +176,41 @@ function EditorSurface({ engram }: { engram: EngramDetail }) {
       view.dom.removeEventListener(SAVE_EVENT, onSaveRequested);
     };
   });
+
+  // The safety net: a pause in typing snapshots the buffer to browser
+  // storage, so a crash, a closed tab or an accidental navigation away loses
+  // at most a debounce window of work.
+  useEffect(() => {
+    if (!dirty) {
+      return;
+    }
+    const timer = setTimeout(() => {
+      writeDraft(account, engram.domain, engram.permalink, {
+        content: buffer,
+        baseChecksum: checksum,
+        savedAt: new Date().toISOString(),
+      });
+    }, DRAFT_DEBOUNCE_MS);
+    return () => {
+      clearTimeout(timer);
+    };
+  }, [account, engram.domain, engram.permalink, buffer, checksum, dirty]);
+
+  // Closing the tab or reloading it loses the draft's safety net too, so it
+  // gets its own prompt. In-app navigation does not: the draft already
+  // covers it, and the declarative router has no blocker to hook.
+  useEffect(() => {
+    if (!dirty) {
+      return;
+    }
+    const prompt = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+    };
+    window.addEventListener("beforeunload", prompt);
+    return () => {
+      window.removeEventListener("beforeunload", prompt);
+    };
+  }, [dirty]);
 
   const extensions = useMemo(
     () => [
@@ -215,6 +267,46 @@ function EditorSurface({ engram }: { engram: EngramDetail }) {
           </Link>
         </div>
       </header>
+      {offeredDraft && (
+        <aside
+          role="note"
+          className="flex flex-wrap items-baseline gap-3 rounded border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-100"
+        >
+          <span>
+            An unsaved draft of this engram from{" "}
+            {offeredDraft.savedAt || "an earlier session"} is on this browser.
+          </span>
+          <button
+            type="button"
+            className="underline underline-offset-2 hover:no-underline"
+            onClick={() => {
+              const view = viewRef.current;
+              if (view) {
+                view.dispatch({
+                  changes: {
+                    from: 0,
+                    to: view.state.doc.length,
+                    insert: offeredDraft.content,
+                  },
+                });
+              }
+              setOfferedDraft(null);
+            }}
+          >
+            Restore draft
+          </button>
+          <button
+            type="button"
+            className="underline underline-offset-2 hover:no-underline"
+            onClick={() => {
+              clearDraft(account, engram.domain, engram.permalink);
+              setOfferedDraft(null);
+            }}
+          >
+            Discard draft
+          </button>
+        </aside>
+      )}
       <div className="rounded border border-slate-200 dark:border-slate-800">
         <CmEditor
           initialDoc={engram.content}

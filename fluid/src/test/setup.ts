@@ -12,6 +12,27 @@ afterEach(() => {
   cleanup();
 });
 
+// Node ships its own global `localStorage`/`sessionStorage`. vitest's jsdom
+// environment only overrides a global that already exists on `globalThis`
+// when the name is on its fixed list of window properties, and storage is
+// not on it, so Node's copy - unusable without `--localstorage-file` - wins
+// over jsdom's real one. `globalThis.jsdom` is the live `JSDOM` instance the
+// environment stashed there, and its `window` carries the storage jsdom
+// actually implements; repointing the two globals at it is what makes
+// `localStorage` behave like a browser's inside every test.
+const jsdomWindow = (globalThis as { jsdom?: { window: Window } }).jsdom
+  ?.window;
+if (jsdomWindow) {
+  Object.defineProperty(globalThis, "localStorage", {
+    configurable: true,
+    get: () => jsdomWindow.localStorage,
+  });
+  Object.defineProperty(globalThis, "sessionStorage", {
+    configurable: true,
+    get: () => jsdomWindow.sessionStorage,
+  });
+}
+
 // jsdom implements neither the Pointer Events capture API nor
 // `scrollIntoView`, and a Radix menu calls both while opening. They are
 // no-ops here: the tests assert on what is in the document, never on where it
