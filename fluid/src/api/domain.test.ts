@@ -9,10 +9,18 @@
  * rather than throwing three components deep.
  */
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
-import { readTree } from "./domain";
+import { api } from "./client";
+import { fetchManifestDetail, readTree, saveManifest } from "./domain";
 import { defined } from "../test/assert";
+
+vi.mock("./client", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./client")>();
+  return { ...actual, api: vi.fn() };
+});
+
+const apiMock = vi.mocked(api);
 
 /** One folder of a domain, in the shape the endpoint answers with. */
 function browsePayload() {
@@ -68,5 +76,28 @@ describe("a browse payload", () => {
     const row = defined(tree.engrams[0], "the first row");
     expect(row.status).toBeNull();
     expect(row.title).toBe("a");
+  });
+});
+
+describe("a manifest detail", () => {
+  it("fetches the route and carries the checksum for editing", async () => {
+    apiMock.mockResolvedValueOnce({ markdown: "# eng", checksum: "abc123" });
+    const detail = await fetchManifestDetail("eng");
+    expect(apiMock).toHaveBeenLastCalledWith("/domains/eng/manifest");
+    expect(detail).toEqual({ markdown: "# eng", checksum: "abc123" });
+  });
+
+  it("saves with a quoted If-Match", async () => {
+    apiMock.mockResolvedValueOnce({ markdown: "# eng v2", checksum: "def456" });
+    const saved = await saveManifest("eng", "# eng v2", "abc123");
+    expect(apiMock).toHaveBeenLastCalledWith(
+      "/domains/eng/manifest",
+      expect.objectContaining({
+        method: "PUT",
+        headers: { "If-Match": '"abc123"' },
+        body: JSON.stringify({ markdown: "# eng v2" }),
+      }),
+    );
+    expect(saved.checksum).toBe("def456");
   });
 });

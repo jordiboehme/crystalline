@@ -38,13 +38,21 @@ export class ApiProblem extends Error {
   readonly title: string;
   /** The specific occurrence, safe to show to the person using the app. */
   readonly detail: string;
+  /** Every other member of the problem body, verbatim. Empty when none arrived. */
+  readonly extensions: Record<string, unknown>;
 
-  constructor(status: number, title: string, detail: string) {
+  constructor(
+    status: number,
+    title: string,
+    detail: string,
+    extensions: Record<string, unknown> = {},
+  ) {
     super(detail || title);
     this.name = "ApiProblem";
     this.status = status;
     this.title = title;
     this.detail = detail;
+    this.extensions = extensions;
   }
 }
 
@@ -187,7 +195,14 @@ async function problemFrom(response: Response): Promise<ApiProblem> {
       typeof problem.detail === "string" && problem.detail !== ""
         ? problem.detail
         : title;
-    return new ApiProblem(response.status, title, detail);
+    const KNOWN = new Set(["type", "status", "title", "detail", "instance"]);
+    const extensions: Record<string, unknown> = {};
+    for (const [key, member] of Object.entries(body.value)) {
+      if (!KNOWN.has(key)) {
+        extensions[key] = member;
+      }
+    }
+    return new ApiProblem(response.status, title, detail, extensions);
   }
   return new ApiProblem(response.status, fallbackTitle, fallbackTitle);
 }

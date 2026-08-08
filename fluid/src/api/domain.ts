@@ -81,3 +81,45 @@ export async function fetchManifest(domain: string): Promise<string> {
   );
   return asString(asObject(payload)?.markdown) ?? "";
 }
+
+/** A manifest with the version token an edit of it needs. */
+export interface ManifestDetail {
+  markdown: string;
+  /** sha256 of the markdown, the manifest save's If-Match token. */
+  checksum: string | null;
+}
+
+/** Fetch a domain's MANIFEST with its checksum, for editing. */
+export async function fetchManifestDetail(
+  domain: string,
+): Promise<ManifestDetail> {
+  const payload = await api<unknown>(
+    `/domains/${encodeSegment(domain)}/manifest`,
+  );
+  const record = asObject(payload);
+  return {
+    markdown: asString(record?.markdown) ?? "",
+    checksum: asString(record?.checksum),
+  };
+}
+
+/** Save a MANIFEST verbatim, guarded by the checksum it is based on. */
+export async function saveManifest(
+  domain: string,
+  markdown: string,
+  checksum: string,
+): Promise<ManifestDetail> {
+  const payload = await api<unknown>(
+    `/domains/${encodeSegment(domain)}/manifest`,
+    {
+      method: "PUT",
+      headers: { "If-Match": `"${checksum}"` },
+      body: JSON.stringify({ markdown }),
+    },
+  );
+  const record = asObject(payload);
+  return {
+    markdown: asString(record?.markdown) ?? markdown,
+    checksum: asString(record?.checksum),
+  };
+}

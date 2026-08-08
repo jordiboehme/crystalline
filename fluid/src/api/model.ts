@@ -37,3 +37,27 @@ export type CreateUserBody = components["schemas"]["CreateBody"];
 
 /** What `PATCH /users/{name}` takes. */
 export type PatchUserBody = components["schemas"]["PatchBody"];
+
+/** What `POST /domains/{domain}/engrams` takes. */
+export type CreateEngramBody = components["schemas"]["CreateEngramBody"];
+
+/** What `PUT /domains/{domain}/engrams/{permalink}` takes. */
+export type SaveEngramBody = components["schemas"]["SaveEngramBody"];
+
+/** What `POST /domains/{domain}/retire` takes. */
+export type RetireBody = components["schemas"]["RetireBody"];
+
+/** What `POST /domains/{domain}/move` takes. */
+export type MoveBody = components["schemas"]["MoveBody"];
+
+/** What `PUT /domains/{domain}/manifest` takes. */
+export type SaveManifestBody = components["schemas"]["SaveManifestBody"];
+
+/** What `POST /validate` takes. */
+export type ValidateBody = components["schemas"]["ValidateBody"];
+
+/** One finding a validation raises. */
+export type ValidateFinding = components["schemas"]["ValidateFinding"];
+
+/** What `POST /validate` answers with. */
+export type ValidateResponse = components["schemas"]["ValidateResponse"];
