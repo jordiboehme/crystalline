@@ -975,6 +975,19 @@ impl AuthStore {
             if exists.is_none() {
                 bail!("no such user: '{name}'");
             }
+            // Drop this account's expired rows while the transaction is open.
+            // `session_user` is the only other pruner, and a probe that never
+            // presents a cookie never reaches it: without this, an SSO identity
+            // whose session lapsed would leave a dead row behind on every
+            // expiry, forever. Scoped to one account rather than sweeping the
+            // table, so the cost stays proportional to the caller.
+            self.conn
+                .execute(
+                    "DELETE FROM sessions WHERE user_name = ?1 AND expires_at <= ?2",
+                    vec![Value::Text(name.clone()), Value::Integer(now)],
+                )
+                .await
+                .with_context(|| format!("pruning expired sessions for user '{name}'"))?;
             if let Some(live) = self.live_csrf(&name, now).await? {
                 reused = Some(live);
                 return Ok(());
@@ -1020,6 +1033,27 @@ impl AuthStore {
         let now = chrono::Utc::now().timestamp();
         let _guard = self.guard.lock().await;
         self.live_csrf(&name, now).await
+    }
+
+    /// Which account a live session belongs to, or `None` when the token names
+    /// no live session.
+    ///
+    /// A pure read, unlike [`AuthStore::session_user`], which stamps
+    /// `last_seen_at` for whoever it resolves. `GET /auth/me` asks this about a
+    /// cookie it is deciding whether to retire, and the answer must not record
+    /// the cookie's owner as having just been seen: they are not the one making
+    /// the request.
+    pub async fn session_owner(&self, token: &str) -> Result<Option<String>> {
+        let now = chrono::Utc::now().timestamp();
+        let _guard = self.guard.lock().await;
+        Ok(self
+            .query_first(
+                "SELECT user_name FROM sessions
+                 WHERE token_hash = ?1 AND expires_at > ?2",
+                vec![Value::Text(token_hash(token)), Value::Integer(now)],
+            )
+            .await?
+            .and_then(|row| cell_text(&row, 0)))
     }
 
     /// How many session rows exist, live and expired alike. A diagnostic, and
@@ -1515,15 +1549,23 @@ mod tests {
         let (_, csrf) = store.session_user(&first.token).await.unwrap().unwrap();
         assert_eq!(csrf, first.csrf);
 
-        // An expired session is not live, so the next probe issues a fresh one.
-        // (The prune in `session_user` has already dropped the old row.)
+        // An expired session is not live, so the next probe issues a fresh one
+        // and takes the dead row with it. `session_user` is the only other
+        // pruner and a cookieless probe never reaches it, so without this an
+        // account whose session lapsed would leave a row behind every time.
         store.delete_session(&first.token).await.unwrap();
         store.create_session("ada", -1).await.unwrap();
+        assert_eq!(store.session_count().await.unwrap(), 1, "the expired row");
         assert!(store.newest_session_csrf("ada").await.unwrap().is_none());
         let SessionMint::Created(second) = store.ensure_session("ada", 3600).await.unwrap() else {
             panic!("nothing live is left to reuse, so this creates");
         };
         assert_ne!(second.csrf, first.csrf);
+        assert_eq!(
+            store.session_count().await.unwrap(),
+            1,
+            "the expired row was pruned rather than left beside the new one"
+        );
 
         // Another account's live session is never handed over.
         store

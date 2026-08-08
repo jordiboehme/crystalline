@@ -772,6 +772,21 @@ pub async fn me(
 ) -> Result<(CookieJar, NoStore, axum::Json<MeResponse>), ApiError> {
     let mut jar = jar;
     let mut csrf = identity.csrf.clone();
+    // A cookie that is not this identity's own session is retired here, the
+    // same fixation rule login applies: a token planted on the victim must not
+    // survive the call that hands them a working one. Judged on who the cookie
+    // belongs to rather than on whether a token was resolved, because since the
+    // trusted-header path reads its token by identity, an account holding any
+    // live session arrives with `csrf` already set - and a foreign cookie
+    // presented beside the header would otherwise be left live.
+    if let Some(user) = &identity.user
+        && let Some(presented) = jar.get(SESSION_COOKIE).map(|c| c.value().to_string())
+    {
+        let owner = state.auth.session_owner(&presented).await?;
+        if owner.as_deref() != Some(user.name.as_str()) {
+            state.auth.delete_session(&presented).await?;
+        }
+    }
     // A trusted-header identity arrives with an account and no session (a
     // cookie session always carries its token). Ensure one here: this probe is
     // what a client opens on, so it is where the token belongs - for the
@@ -779,12 +794,6 @@ pub async fn me(
     if csrf.is_none()
         && let Some(user) = &identity.user
     {
-        // Whatever session the caller presented resolves to someone else or
-        // to nothing; retire it rather than leave a planted token beside the
-        // new one, the same fixation rule login applies.
-        if let Some(presented) = jar.get(SESSION_COOKIE) {
-            state.auth.delete_session(presented.value()).await?;
-        }
         // Reuse before minting. A probe that issued a session every time would
         // add a row per call for a client that keeps no cookie, and would hand
         // two tabs opening at once two different tokens; `ensure_session` does

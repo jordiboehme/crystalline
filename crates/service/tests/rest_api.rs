@@ -2424,6 +2424,12 @@ async fn repeated_probes_reuse_one_session_for_a_trusted_header_identity() {
         .unwrap();
     assert_eq!(fixture.auth.session_count().await.unwrap(), 0);
 
+    // A session that has already lapsed. Resolving a cookie is what usually
+    // prunes, and a cookieless probe never resolves one, so the probe has to
+    // clear this itself or a lapsed SSO session leaves a row behind for good.
+    fixture.auth.create_session("root", -1).await.unwrap();
+    assert_eq!(fixture.auth.session_count().await.unwrap(), 1);
+
     // The first probe issues the session; four more, each as cookieless as the
     // first, reuse it.
     let mut tokens = Vec::new();
@@ -2443,7 +2449,8 @@ async fn repeated_probes_reuse_one_session_for_a_trusted_header_identity() {
     assert_eq!(
         fixture.auth.session_count().await.unwrap(),
         1,
-        "five probes, one session: the probe must not mint per call"
+        "five probes, one session: the probe must not mint per call, and the \
+         expired row must be gone rather than counted alongside"
     );
     assert!(
         cookies[0].is_some(),
@@ -2486,6 +2493,88 @@ async fn repeated_probes_reuse_one_session_for_a_trusted_header_identity() {
         .await
         .unwrap();
     assert_eq!(refused.status(), 403);
+}
+
+/// A cookie that belongs to somebody else does not survive the probe.
+///
+/// This is the fixation rule login applies, on the path that needs it just as
+/// much: behind an SSO proxy the header names who the caller is, so a cookie
+/// planted on them names somebody else by definition, and leaving it live would
+/// keep a session the victim never asked for open on their browser. The
+/// judgement is on who the cookie belongs to rather than on whether the request
+/// resolved a token, because an identity that already holds a session arrives
+/// with a token either way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_foreign_cookie_does_not_survive_the_probe() {
+    let fixture = serve_with_auth(AuthOptions {
+        trusted_header: Some("remote-user"),
+        ..AuthOptions::default()
+    })
+    .await;
+    let addr = fixture.addr;
+    fixture
+        .auth
+        .add_user("root", "Root", None, Role::Admin, "rootpw")
+        .await
+        .unwrap();
+    fixture
+        .auth
+        .add_user("ada", "Ada", None, Role::Viewer, "s3cret")
+        .await
+        .unwrap();
+    let (adas_cookie, _) = login(addr, "ada", "s3cret").await;
+    assert_eq!(
+        fixture.auth.session_owner(&adas_cookie).await.unwrap(),
+        Some("ada".to_string())
+    );
+
+    // Root probes with Ada's cookie on it: root's own session is issued, and
+    // Ada's is retired rather than left live beside it.
+    let probe = client()
+        .get(format!("http://{addr}/api/v1/auth/me"))
+        .header("remote-user", "root")
+        .header("cookie", format!("fluid_session={adas_cookie}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(probe.status(), 200);
+    let own = session_cookie(&probe).expect("the probe issued root a session");
+    let body: serde_json::Value = probe.json().await.unwrap();
+    assert_eq!(body["user"]["name"], "root", "the header is the authority");
+    assert!(
+        fixture
+            .auth
+            .session_owner(&adas_cookie)
+            .await
+            .unwrap()
+            .is_none(),
+        "the foreign session was retired"
+    );
+
+    // And it is gone for real: the cookie no longer authenticates anybody.
+    let stale = client()
+        .get(format!("http://{addr}/api/v1/domains"))
+        .header("cookie", format!("fluid_session={adas_cookie}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), 401);
+
+    // The identity's own cookie is not collateral: probing again with the
+    // session this call issued leaves it alone.
+    let again = client()
+        .get(format!("http://{addr}/api/v1/auth/me"))
+        .header("remote-user", "root")
+        .header("cookie", format!("fluid_session={own}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(again.status(), 200);
+    assert_eq!(
+        fixture.auth.session_owner(&own).await.unwrap(),
+        Some("root".to_string()),
+        "a caller's own session survives its own probe"
+    );
 }
 
 /// The settlement end to end: a trusted-header admin is minted a session by
