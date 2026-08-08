@@ -95,6 +95,7 @@ use crate::engine::Engine;
         users_api::list,
         users_api::create,
         users_api::update,
+        users_api::reset_password,
         users_api::remove,
     ),
     components(schemas(
@@ -116,6 +117,7 @@ use crate::engine::Engine;
         auth::MeResponse,
         users_api::CreateBody,
         users_api::PatchBody,
+        users_api::PasswordBody,
         users_api::UserResponse,
         users_api::UsersResponse,
     )),
@@ -253,6 +255,7 @@ pub fn router(state: RestState) -> Router {
             "/users/{name}",
             patch(users_api::update).delete(users_api::remove),
         )
+        .route("/users/{name}/password", post(users_api::reset_password))
         .fallback(unknown_path)
         // Applies to every method router registered above it, so it stays
         // below the routes and above the guard.

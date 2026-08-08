@@ -1984,6 +1984,11 @@ async fn user_routes_are_refused_to_a_viewer_and_an_editor() {
                 "/api/v1/users/ada",
                 Some(serde_json::json!({"role": "admin"})),
             ),
+            (
+                reqwest::Method::POST,
+                "/api/v1/users/ada/password",
+                Some(serde_json::json!({"password": "hunter2"})),
+            ),
             (reqwest::Method::DELETE, "/api/v1/users/ada", None),
         ];
         for (method, path, body) in cases {
@@ -2076,16 +2081,28 @@ async fn an_admin_creates_lists_edits_and_removes_an_account() {
     assert_eq!(body["user"]["role"], "viewer", "{body}");
     assert_eq!(body["user"]["disabled"], true, "{body}");
 
-    // A password change lands too, which the store only proves by accepting it
-    // at login - so the account is re-enabled and asked to log in with it.
-    let repaired = as_session(
+    // Re-enable, then reset the password on its own route, which the store
+    // only proves by accepting it at login.
+    let re_enabled = as_session(
         addr,
         reqwest::Method::PATCH,
         "/api/v1/users/bob",
         &token,
         &csrf,
     )
-    .json(&serde_json::json!({"disabled": false, "password": "corrected horse"}))
+    .json(&serde_json::json!({"disabled": false}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(re_enabled.status(), 200);
+    let repaired = as_session(
+        addr,
+        reqwest::Method::POST,
+        "/api/v1/users/bob/password",
+        &token,
+        &csrf,
+    )
+    .json(&serde_json::json!({"password": "corrected horse"}))
     .send()
     .await
     .unwrap();
@@ -2734,6 +2751,37 @@ async fn user_request_failures_are_classified() {
         assert!(body["detail"].as_str().unwrap().contains("ghost"), "{body}");
     }
 
+    // The password route is classified the same way: unknown account is 404,
+    // and an empty replacement is 422 before the store is ever asked.
+    let unknown = as_session(
+        addr,
+        reqwest::Method::POST,
+        "/api/v1/users/ghost/password",
+        &token,
+        &csrf,
+    )
+    .json(&serde_json::json!({"password": "hunter2"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(unknown.status(), 404);
+    let body: serde_json::Value = unknown.json().await.unwrap();
+    assert_eq!(body["title"], "not found");
+    assert!(body["detail"].as_str().unwrap().contains("ghost"), "{body}");
+
+    let empty = as_session(
+        addr,
+        reqwest::Method::POST,
+        "/api/v1/users/root/password",
+        &token,
+        &csrf,
+    )
+    .json(&serde_json::json!({"password": ""}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(empty.status(), 422);
+
     let nothing = as_session(
         addr,
         reqwest::Method::PATCH,
@@ -2776,8 +2824,8 @@ async fn a_password_reset_revokes_the_targets_sessions() {
 
     let reset = as_session(
         addr,
-        reqwest::Method::PATCH,
-        "/api/v1/users/ada",
+        reqwest::Method::POST,
+        "/api/v1/users/ada/password",
         &token,
         &csrf,
     )

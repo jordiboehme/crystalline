@@ -988,3 +988,234 @@ async fn a_proxy_identity_writes_once_it_is_an_editor_carrying_its_token() {
     let on_disk = std::fs::read_to_string(fx._tmp.path().join("eng/delta.md")).unwrap();
     assert!(on_disk.contains("human:dana"), "{on_disk}");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_admin_edits_display_names_and_resets_passwords() {
+    let fx = serve(Options::default()).await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+
+    // Display name set and cleared.
+    let patched = as_session(
+        fx.addr,
+        reqwest::Method::PATCH,
+        "/api/v1/users/eddy",
+        &admin,
+    )
+    .json(&serde_json::json!({"display": "Eddy the Editor"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(patched.status(), 200);
+    let body: serde_json::Value = patched.json().await.unwrap();
+    assert_eq!(body["user"]["display"], "Eddy the Editor");
+    let cleared = as_session(
+        fx.addr,
+        reqwest::Method::PATCH,
+        "/api/v1/users/eddy",
+        &admin,
+    )
+    .json(&serde_json::json!({"display": ""}))
+    .send()
+    .await
+    .unwrap();
+    let cleared: serde_json::Value = cleared.json().await.unwrap();
+    assert_eq!(
+        cleared["user"]["display"], "eddy",
+        "clear resets to the login name"
+    );
+
+    // Password now travels its own route, and PATCH refuses it.
+    let old_shape = as_session(
+        fx.addr,
+        reqwest::Method::PATCH,
+        "/api/v1/users/eddy",
+        &admin,
+    )
+    .json(&serde_json::json!({"password": "newpw"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(
+        old_shape.status(),
+        422,
+        "password is no longer a PATCH field"
+    );
+
+    let reset = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/users/eddy/password",
+        &admin,
+    )
+    .json(&serde_json::json!({"password": "newpw"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(reset.status(), 200);
+
+    // The reset revoked eddy's sessions: the old login is dead, the new works.
+    let editor = login(fx.addr, "eddy", "newpw").await;
+    let probe = as_session(fx.addr, reqwest::Method::GET, "/api/v1/auth/me", &editor)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(probe.status(), 200);
+}
+
+/// Session revocation through the API, both triggers (spec section 10).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deactivation_and_reset_revoke_live_sessions_through_the_api() {
+    let fx = serve(Options::default()).await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    let eddy = login(fx.addr, "eddy", "eddypw").await;
+
+    // Deactivate: eddy's live session stops resolving mid-flight.
+    let off = as_session(
+        fx.addr,
+        reqwest::Method::PATCH,
+        "/api/v1/users/eddy",
+        &admin,
+    )
+    .json(&serde_json::json!({"disabled": true}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(off.status(), 200);
+    let dead = as_session(fx.addr, reqwest::Method::GET, "/api/v1/domains", &eddy)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(dead.status(), 401, "the revoked session no longer resolves");
+
+    // Reactivate, log in again, then reset the password: same eviction.
+    as_session(
+        fx.addr,
+        reqwest::Method::PATCH,
+        "/api/v1/users/eddy",
+        &admin,
+    )
+    .json(&serde_json::json!({"disabled": false}))
+    .send()
+    .await
+    .unwrap();
+    let eddy = login(fx.addr, "eddy", "eddypw").await;
+    as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/users/eddy/password",
+        &admin,
+    )
+    .json(&serde_json::json!({"password": "rotated"}))
+    .send()
+    .await
+    .unwrap();
+    let dead = as_session(fx.addr, reqwest::Method::GET, "/api/v1/domains", &eddy)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(dead.status(), 401);
+}
+
+/// NOT_LAST_ADMIN through the API: absolute, server-side, 409 with the
+/// store's own explanation (spec section 10).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_last_admin_is_protected_through_the_api() {
+    let fx = serve(Options::default()).await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+
+    for (method, path, body) in [
+        (
+            reqwest::Method::PATCH,
+            "/api/v1/users/root",
+            Some(serde_json::json!({"role": "viewer"})),
+        ),
+        (reqwest::Method::DELETE, "/api/v1/users/root", None),
+    ] {
+        let mut req = as_session(fx.addr, method, path, &admin);
+        if let Some(body) = body {
+            req = req.json(&body);
+        }
+        let resp = req.send().await.unwrap();
+        assert_eq!(resp.status(), 409);
+        let problem: serde_json::Value = resp.json().await.unwrap();
+        let detail = problem["detail"].as_str().unwrap();
+        assert!(
+            detail.contains("last admin") || detail.contains("your own account"),
+            "a refusal in words, never a raw error: {detail}"
+        );
+    }
+}
+
+/// Every mutating user-admin route is refused on a read-only instance, ahead
+/// of the checks each one would otherwise run: an unknown account is never
+/// probed, and a change that would otherwise be well-formed is refused before
+/// it reaches the store. `crystalline users` on the server is the recovery
+/// path (spec section 10, resolved ambiguity 7).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_only_instance_refuses_user_mutations() {
+    let fx = serve(Options {
+        read_only: true,
+        ..Options::default()
+    })
+    .await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+
+    let created = as_session(fx.addr, reqwest::Method::POST, "/api/v1/users", &admin)
+        .json(&serde_json::json!({"name": "gina", "role": "viewer", "password": "hunter2"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 403);
+    assert_eq!(
+        created.headers()["content-type"],
+        "application/problem+json"
+    );
+
+    let patched = as_session(
+        fx.addr,
+        reqwest::Method::PATCH,
+        "/api/v1/users/eddy",
+        &admin,
+    )
+    .json(&serde_json::json!({"display": "Nope"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(patched.status(), 403);
+
+    let reset = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/users/eddy/password",
+        &admin,
+    )
+    .json(&serde_json::json!({"password": "newpw"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(reset.status(), 403);
+
+    let removed = as_session(
+        fx.addr,
+        reqwest::Method::DELETE,
+        "/api/v1/users/eddy",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(removed.status(), 403);
+
+    // `GET /users` stays served: read-only refuses writes, not reads.
+    let listed = as_session(fx.addr, reqwest::Method::GET, "/api/v1/users", &admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), 200);
+
+    assert_eq!(
+        fx.auth.list_users().await.unwrap().len(),
+        5,
+        "nothing above changed anything"
+    );
+}

@@ -2176,7 +2176,7 @@
             }
           },
           "403": {
-            "description": "The caller is not an admin, a cookie session did not echo its CSRF token, or the trusted-header identity names a disabled account.",
+            "description": "The caller is not an admin, a cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -2252,7 +2252,7 @@
             }
           },
           "403": {
-            "description": "The caller is not an admin, a cookie session did not echo its CSRF token, or the trusted-header identity names a disabled account.",
+            "description": "The caller is not an admin, a cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -2287,8 +2287,8 @@
         "tags": [
           "users"
         ],
-        "summary": "`PATCH /users/{name}` - change a role, a disabled flag, a password, or any\ncombination, answering with the account as it now stands.",
-        "description": "Two of the three fields are revocations as well as edits: setting a password\nand disabling an account each delete every session that account holds, in\nthe store and in the same transaction as the change. That is what makes this\nroute useful against a compromised account - a reset that left the intruder's\ncookie alive for the rest of its 30-day life would be theatre - and it means\nan admin resetting their own password signs their own other sessions out too,\nthis one included.\n\nEvery check runs before the first write, so a request that will be refused\nchanges nothing. The writes themselves are one store call each rather than\none transaction: the store's guarded statements each own their own\ninvariant, and a failure part-way leaves the earlier fields applied and says\nwhich operation was refused. That is visible to a client only in the\npathological case of a concurrent edit racing this one, since the refusals a\ncaller can provoke on purpose - the last-admin guard and an unknown account\n- are decided identically by all three statements.",
+        "summary": "`PATCH /users/{name}` - change a role, a disabled flag, a display name, or\nany combination, answering with the account as it now stands. A password\nreset is a separate route, [`reset_password`].",
+        "description": "Disabling an account is a revocation as well as an edit: it deletes every\nsession that account holds, in the store and in the same transaction as the\nflag. Setting a role or a display name never touches a session.\n\nEvery check runs before the first write, so a request that will be refused\nchanges nothing. The writes themselves are one store call each rather than\none transaction: the store's guarded statements each own their own\ninvariant, and a failure part-way leaves the earlier fields applied and says\nwhich operation was refused. That is visible to a client only in the\npathological case of a concurrent edit racing this one, since the refusals a\ncaller can provoke on purpose - the last-admin guard and an unknown account\n- are decided identically by all three statements.",
         "operationId": "update_user",
         "parameters": [
           {
@@ -2343,7 +2343,7 @@
             }
           },
           "403": {
-            "description": "The caller is not an admin, a cookie session did not echo its CSRF token, or the trusted-header identity names a disabled account.",
+            "description": "The caller is not an admin, a cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -2383,7 +2383,110 @@
             }
           },
           "422": {
-            "description": "The body changes nothing, or the new password is empty.",
+            "description": "The body changes nothing: send role, disabled or display.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/users/{name}/password": {
+      "post": {
+        "tags": [
+          "users"
+        ],
+        "summary": "`POST /users/{name}/password` - replace an account's password, answering\nwith the account as it now stands.",
+        "description": "A distinct route rather than a `PATCH` field: setting a password revokes\nevery session the account holds, in the same transaction as the change -\nthe reset is useless against a compromised account otherwise, since a\ncookie minted before it would keep working for the rest of its life. An\nadmin resetting their own password signs their own other sessions out too,\nthis one included.",
+        "operationId": "reset_user_password",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "The account, in any casing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PasswordBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The account as it now stands.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The body is not JSON.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an admin, a cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body is not `application/json`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The new password is empty.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -2816,9 +2919,23 @@
           }
         }
       },
+      "PasswordBody": {
+        "type": "object",
+        "description": "The replacement password. Setting it revokes every session the account holds, this admin's own included when they reset themselves.",
+        "required": [
+          "password"
+        ],
+        "properties": {
+          "password": {
+            "type": "string",
+            "description": "The replacement password. Setting it revokes every session the account\nholds, this admin's own included when they reset themselves.",
+            "example": "correct horse battery staple"
+          }
+        }
+      },
       "PatchBody": {
         "type": "object",
-        "description": "Whichever of the three an admin wants to change. All absent is refused with a 422 rather than served as a no-op, so a client sending the wrong field names hears about it.",
+        "description": "Whichever of the three an admin wants to change. All absent is refused with a 422 rather than served as a no-op, so a client sending the wrong field names hears about it. `display` clears to the login name when sent empty or blank; the password lives on its own route, `POST /users/{name}/password`.",
         "properties": {
           "disabled": {
             "type": [
@@ -2827,12 +2944,12 @@
             ],
             "description": "Whether the account is disabled. Disabling deletes every session the\naccount holds, so it is a revocation rather than a flag a later\nre-enabling hands back; it also stops any new login."
           },
-          "password": {
+          "display": {
             "type": [
               "string",
               "null"
             ],
-            "description": "A replacement password. Setting it revokes every session the account\nholds, so whoever was signed in under the old one is signed out."
+            "description": "The new display name. Empty or blank clears it, resetting the account\nto its folded login name - a row is never nameless. Never normalized\nlike a login name: spaces and casing are kept as sent."
           },
           "role": {
             "oneOf": [
@@ -3000,7 +3117,7 @@
       },
       "UserResponse": {
         "type": "object",
-        "description": "What the two writing routes answer with: the account as stored, read back\nafter the write rather than echoed from the request.",
+        "description": "What every writing route but `DELETE` answers with: the account as stored,\nread back after the write rather than echoed from the request.",
         "required": [
           "user"
         ],

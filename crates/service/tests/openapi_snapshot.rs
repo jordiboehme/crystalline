@@ -46,6 +46,7 @@ const MOUNTED_OPERATIONS: &[&str] = &[
     "POST /api/v1/users",
     "PATCH /api/v1/users/{name}",
     "DELETE /api/v1/users/{name}",
+    "POST /api/v1/users/{name}/password",
 ];
 
 /// Where the committed snapshot lives, as an absolute path, for the writer.

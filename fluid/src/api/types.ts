@@ -428,15 +428,12 @@ export interface paths {
         options?: never;
         head?: never;
         /**
-         * `PATCH /users/{name}` - change a role, a disabled flag, a password, or any
-         *     combination, answering with the account as it now stands.
-         * @description Two of the three fields are revocations as well as edits: setting a password
-         *     and disabling an account each delete every session that account holds, in
-         *     the store and in the same transaction as the change. That is what makes this
-         *     route useful against a compromised account - a reset that left the intruder's
-         *     cookie alive for the rest of its 30-day life would be theatre - and it means
-         *     an admin resetting their own password signs their own other sessions out too,
-         *     this one included.
+         * `PATCH /users/{name}` - change a role, a disabled flag, a display name, or
+         *     any combination, answering with the account as it now stands. A password
+         *     reset is a separate route, [`reset_password`].
+         * @description Disabling an account is a revocation as well as an edit: it deletes every
+         *     session that account holds, in the store and in the same transaction as the
+         *     flag. Setting a role or a display name never touches a session.
          *
          *     Every check runs before the first write, so a request that will be refused
          *     changes nothing. The writes themselves are one store call each rather than
@@ -448,6 +445,32 @@ export interface paths {
          *     - are decided identically by all three statements.
          */
         patch: operations["update_user"];
+        trace?: never;
+    };
+    "/api/v1/users/{name}/password": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `POST /users/{name}/password` - replace an account's password, answering
+         *     with the account as it now stands.
+         * @description A distinct route rather than a `PATCH` field: setting a password revokes
+         *     every session the account holds, in the same transaction as the change -
+         *     the reset is useless against a compromised account otherwise, since a
+         *     cookie minted before it would keep working for the rest of its life. An
+         *     admin resetting their own password signs their own other sessions out too,
+         *     this one included.
+         */
+        post: operations["reset_user_password"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
         trace?: never;
     };
     "/api/v1/validate": {
@@ -678,7 +701,16 @@ export interface components {
              */
             permalink: string;
         };
-        /** @description Whichever of the three an admin wants to change. All absent is refused with a 422 rather than served as a no-op, so a client sending the wrong field names hears about it. */
+        /** @description The replacement password. Setting it revokes every session the account holds, this admin's own included when they reset themselves. */
+        PasswordBody: {
+            /**
+             * @description The replacement password. Setting it revokes every session the account
+             *     holds, this admin's own included when they reset themselves.
+             * @example correct horse battery staple
+             */
+            password: string;
+        };
+        /** @description Whichever of the three an admin wants to change. All absent is refused with a 422 rather than served as a no-op, so a client sending the wrong field names hears about it. `display` clears to the login name when sent empty or blank; the password lives on its own route, `POST /users/{name}/password`. */
         PatchBody: {
             /**
              * @description Whether the account is disabled. Disabling deletes every session the
@@ -687,10 +719,11 @@ export interface components {
              */
             disabled?: boolean | null;
             /**
-             * @description A replacement password. Setting it revokes every session the account
-             *     holds, so whoever was signed in under the old one is signed out.
+             * @description The new display name. Empty or blank clears it, resetting the account
+             *     to its folded login name - a row is never nameless. Never normalized
+             *     like a login name: spaces and casing are kept as sent.
              */
-            password?: string | null;
+            display?: string | null;
             role?: null | components["schemas"]["Role"];
         };
         /** @description An RFC 9457 problem detail, sent as `application/problem+json`. Every failure on this surface has this shape, so a client can branch on `status` alone. */
@@ -809,8 +842,8 @@ export interface components {
             role: components["schemas"]["Role"];
         };
         /**
-         * @description What the two writing routes answer with: the account as stored, read back
-         *     after the write rather than echoed from the request.
+         * @description What every writing route but `DELETE` answers with: the account as stored,
+         *     read back after the write rather than echoed from the request.
          */
         UserResponse: {
             /** @description The account as it now stands. */
@@ -2599,7 +2632,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
-            /** @description The caller is not an admin, a cookie session did not echo its CSRF token, or the trusted-header identity names a disabled account. */
+            /** @description The caller is not an admin, a cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -2665,7 +2698,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
-            /** @description The caller is not an admin, a cookie session did not echo its CSRF token, or the trusted-header identity names a disabled account. */
+            /** @description The caller is not an admin, a cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -2737,7 +2770,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
-            /** @description The caller is not an admin, a cookie session did not echo its CSRF token, or the trusted-header identity names a disabled account. */
+            /** @description The caller is not an admin, a cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -2773,7 +2806,88 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
-            /** @description The body changes nothing, or the new password is empty. */
+            /** @description The body changes nothing: send role, disabled or display. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    reset_user_password: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The account, in any casing. */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PasswordBody"];
+            };
+        };
+        responses: {
+            /** @description The account as it now stands. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UserResponse"];
+                };
+            };
+            /** @description The body is not JSON. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No identity. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The caller is not an admin, a cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No such account. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The body is not `application/json`. */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The new password is empty. */
             422: {
                 headers: {
                     [name: string]: unknown;

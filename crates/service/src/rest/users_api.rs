@@ -1,12 +1,14 @@
 //! The accounts that may sign in to this instance, managed over HTTP.
 //!
-//! The same four operations `crystalline users` performs, behind the same
-//! store, so the CLI and the UI are one source of truth rather than two: the
-//! listing is the `{"users": [...]}` envelope `users list --json` already
-//! prints, and every refusal here is the store's own, surfaced with a status a
-//! browser client can branch on.
+//! The same operations `crystalline users` performs, behind the same store, so
+//! the CLI and the UI are one source of truth rather than two: the listing is
+//! the `{"users": [...]}` envelope `users list --json` already prints, and
+//! every refusal here is the store's own, surfaced with a status a browser
+//! client can branch on. A password reset lives on its own route
+//! ([`reset_password`]) rather than as a `PATCH` field, since it is a distinct,
+//! higher-stakes action with its own session-revoking side effect.
 //!
-//! These are the first mutating routes on this surface, so three rules are
+//! These are the first mutating routes on this surface, so four rules are
 //! written down rather than left to be re-derived:
 //!
 //! 1. **Admin only, in the handler.** [`super::auth::guard`] enforces viewer
@@ -36,6 +38,13 @@
 //!    For the same reason an admin may not delete or disable *itself*, which is
 //!    a distinct refusal: another admin may well exist, and the account being
 //!    protected is the caller's own way back in.
+//! 4. **Read-only refuses every mutation.** [`create`], [`update`], [`remove`]
+//!    and [`reset_password`] each open with [`refuse_read_only`] right after
+//!    their role check: a read-only instance answers 403 rather than touching
+//!    the store, and `crystalline users` on the server that holds the database
+//!    is the only way to change an account there. `GET /users` carries no such
+//!    check - read-only means writes are refused, not that the roster goes
+//!    dark.
 
 use axum::Json;
 use axum::extract::State;
@@ -54,8 +63,8 @@ pub struct UsersResponse {
     users: Vec<User>,
 }
 
-/// What the two writing routes answer with: the account as stored, read back
-/// after the write rather than echoed from the request.
+/// What every writing route but `DELETE` answers with: the account as stored,
+/// read back after the write rather than echoed from the request.
 #[derive(serde::Serialize, utoipa::ToSchema)]
 pub struct UserResponse {
     /// The account as it now stands.
@@ -109,9 +118,10 @@ pub async fn list(
 /// What `POST /users` takes. `display` defaults to the name as typed, matching
 /// `crystalline users add`, and `email` is optional and never used for login.
 ///
-/// [`Debug`] is written by hand rather than derived, here and on [`PatchBody`]:
-/// the derived one would print the plaintext password, and this type is one
-/// `tracing::debug!` or one `unwrap` on a rejection away from a log file.
+/// [`Debug`] is written by hand rather than derived, here and on
+/// [`PasswordBody`]: the derived one would print the plaintext password, and
+/// this type is one `tracing::debug!` or one `unwrap` on a rejection away from
+/// a log file.
 #[derive(Deserialize, utoipa::ToSchema)]
 #[schema(description = "A new account. `display` defaults to `name` as typed, \
                         and `email` is optional and never used for login.")]
@@ -162,8 +172,9 @@ pub struct CreateBody {
         (
             status = 403,
             description = "The caller is not an admin, a cookie session did \
-                           not echo its CSRF token, or the trusted-header \
-                           identity names a disabled account.",
+                           not echo its CSRF token, this instance is \
+                           read-only, or the trusted-header identity names a \
+                           disabled account.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -194,6 +205,7 @@ pub async fn create(
     ApiJson(body): ApiJson<CreateBody>,
 ) -> Result<(StatusCode, Json<UserResponse>), ApiError> {
     identity.require_admin()?;
+    refuse_read_only(&state)?;
     check_password(&body.password)?;
     // The login name as typed makes the better default display name: the store
     // folds the login name but keeps this one as given.
@@ -220,12 +232,17 @@ pub async fn create(
 /// change. All absent is refused rather than served as a no-op, so a client
 /// sending the wrong field names hears about it.
 ///
-/// [`Debug`] is hand-written and redacts the password, as on [`CreateBody`].
+/// The password lives on its own route ([`reset_password`]) rather than here:
+/// a reset is a distinct, higher-stakes action, and keeping it off this body
+/// means a client editing a role or a display name can never trip the
+/// password's own session-revoking side effect by accident.
 #[derive(Deserialize, utoipa::ToSchema)]
 #[schema(description = "Whichever of the three an admin wants to change. All \
                         absent is refused with a 422 rather than served as a \
                         no-op, so a client sending the wrong field names hears \
-                        about it.")]
+                        about it. `display` clears to the login name when sent \
+                        empty or blank; the password lives on its own route, \
+                        `POST /users/{name}/password`.")]
 pub struct PatchBody {
     /// The new role.
     #[serde(default)]
@@ -235,10 +252,25 @@ pub struct PatchBody {
     /// re-enabling hands back; it also stops any new login.
     #[serde(default)]
     disabled: Option<bool>,
-    /// A replacement password. Setting it revokes every session the account
-    /// holds, so whoever was signed in under the old one is signed out.
+    /// The new display name. Empty or blank clears it, resetting the account
+    /// to its folded login name - a row is never nameless. Never normalized
+    /// like a login name: spaces and casing are kept as sent.
     #[serde(default)]
-    password: Option<String>,
+    display: Option<String>,
+}
+
+/// What `POST /users/{name}/password` takes.
+///
+/// [`Debug`] is hand-written and redacts the password, as on [`CreateBody`].
+#[derive(Deserialize, utoipa::ToSchema)]
+#[schema(description = "The replacement password. Setting it revokes every \
+                        session the account holds, this admin's own included \
+                        when they reset themselves.")]
+pub struct PasswordBody {
+    /// The replacement password. Setting it revokes every session the account
+    /// holds, this admin's own included when they reset themselves.
+    #[schema(example = "correct horse battery staple")]
+    password: String,
 }
 
 impl std::fmt::Debug for CreateBody {
@@ -258,21 +290,26 @@ impl std::fmt::Debug for PatchBody {
         f.debug_struct("PatchBody")
             .field("role", &self.role)
             .field("disabled", &self.disabled)
-            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("display", &self.display)
             .finish()
     }
 }
 
-/// `PATCH /users/{name}` - change a role, a disabled flag, a password, or any
-/// combination, answering with the account as it now stands.
+impl std::fmt::Debug for PasswordBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PasswordBody")
+            .field("password", &"<redacted>")
+            .finish()
+    }
+}
+
+/// `PATCH /users/{name}` - change a role, a disabled flag, a display name, or
+/// any combination, answering with the account as it now stands. A password
+/// reset is a separate route, [`reset_password`].
 ///
-/// Two of the three fields are revocations as well as edits: setting a password
-/// and disabling an account each delete every session that account holds, in
-/// the store and in the same transaction as the change. That is what makes this
-/// route useful against a compromised account - a reset that left the intruder's
-/// cookie alive for the rest of its 30-day life would be theatre - and it means
-/// an admin resetting their own password signs their own other sessions out too,
-/// this one included.
+/// Disabling an account is a revocation as well as an edit: it deletes every
+/// session that account holds, in the store and in the same transaction as the
+/// flag. Setting a role or a display name never touches a session.
 ///
 /// Every check runs before the first write, so a request that will be refused
 /// changes nothing. The writes themselves are one store call each rather than
@@ -306,8 +343,9 @@ impl std::fmt::Debug for PatchBody {
         (
             status = 403,
             description = "The caller is not an admin, a cookie session did \
-                           not echo its CSRF token, or the trusted-header \
-                           identity names a disabled account.",
+                           not echo its CSRF token, this instance is \
+                           read-only, or the trusted-header identity names a \
+                           disabled account.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -332,7 +370,7 @@ impl std::fmt::Debug for PatchBody {
         ),
         (
             status = 422,
-            description = "The body changes nothing, or the new password is empty.",
+            description = "The body changes nothing: send role, disabled or display.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -345,13 +383,11 @@ pub async fn update(
     ApiJson(body): ApiJson<PatchBody>,
 ) -> Result<Json<UserResponse>, ApiError> {
     let caller = identity.require_admin()?;
-    if body.role.is_none() && body.disabled.is_none() && body.password.is_none() {
+    refuse_read_only(&state)?;
+    if body.role.is_none() && body.disabled.is_none() && body.display.is_none() {
         return Err(ApiError::unprocessable(
-            "this request changes nothing: send role, disabled or password",
+            "this request changes nothing: send role, disabled or display",
         ));
-    }
-    if let Some(password) = &body.password {
-        check_password(password)?;
     }
     if body.disabled == Some(true) {
         refuse_self(&caller, &name, "disable")?;
@@ -370,13 +406,92 @@ pub async fn update(
             .await
             .map_err(|e| store_error(e, &name))?;
     }
-    if let Some(password) = &body.password {
-        // Under the login limiter, for the reason `create` gives.
+    if let Some(display) = &body.display {
+        // Blank clears to the folded login name; the store does the trimming
+        // and the fallback, so this is a straight pass-through.
         state
-            .with_login_slot(state.auth.set_password(&name, password))
-            .await?
+            .auth
+            .set_display(&name, Some(display.as_str()))
+            .await
             .map_err(|e| store_error(e, &name))?;
     }
+    let user = read_back(&state, &name).await?;
+    Ok(Json(UserResponse { user }))
+}
+
+/// `POST /users/{name}/password` - replace an account's password, answering
+/// with the account as it now stands.
+///
+/// A distinct route rather than a `PATCH` field: setting a password revokes
+/// every session the account holds, in the same transaction as the change -
+/// the reset is useless against a compromised account otherwise, since a
+/// cookie minted before it would keep working for the rest of its life. An
+/// admin resetting their own password signs their own other sessions out too,
+/// this one included.
+#[utoipa::path(
+    post,
+    path = "/api/v1/users/{name}/password",
+    tag = "users",
+    operation_id = "reset_user_password",
+    params(("name" = String, Path, description = "The account, in any casing.")),
+    request_body = PasswordBody,
+    responses(
+        (status = 200, description = "The account as it now stands.", body = UserResponse),
+        (
+            status = 400,
+            description = "The body is not JSON.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 401,
+            description = "No identity.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "The caller is not an admin, a cookie session did \
+                           not echo its CSRF token, this instance is \
+                           read-only, or the trusted-header identity names a \
+                           disabled account.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 404,
+            description = "No such account.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 415,
+            description = "The body is not `application/json`.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 422,
+            description = "The new password is empty.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+pub async fn reset_password(
+    State(state): State<RestState>,
+    identity: Identity,
+    ApiPath(name): ApiPath<String>,
+    ApiJson(body): ApiJson<PasswordBody>,
+) -> Result<Json<UserResponse>, ApiError> {
+    identity.require_admin()?;
+    refuse_read_only(&state)?;
+    check_password(&body.password)?;
+    // Under the login limiter, for the reason `create` gives.
+    state
+        .with_login_slot(state.auth.set_password(&name, &body.password))
+        .await?
+        .map_err(|e| store_error(e, &name))?;
     let user = read_back(&state, &name).await?;
     Ok(Json(UserResponse { user }))
 }
@@ -403,8 +518,9 @@ pub async fn update(
         (
             status = 403,
             description = "The caller is not an admin, a cookie session did \
-                           not echo its CSRF token, or the trusted-header \
-                           identity names a disabled account.",
+                           not echo its CSRF token, this instance is \
+                           read-only, or the trusted-header identity names a \
+                           disabled account.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -429,6 +545,7 @@ pub async fn remove(
     ApiPath(name): ApiPath<String>,
 ) -> Result<StatusCode, ApiError> {
     let caller = identity.require_admin()?;
+    refuse_read_only(&state)?;
     refuse_self(&caller, &name, "delete")?;
     state
         .auth
@@ -451,6 +568,20 @@ fn refuse_self(caller: &Caller, target: &str, verb: &str) -> Result<(), ApiError
          or use `crystalline users` on the server",
         caller.name()
     )))
+}
+
+/// Refuse a mutation on a read-only instance, ahead of every other check that
+/// would otherwise touch the store. `crystalline users` on the server that
+/// holds the database is the recovery path - there is no flag that reopens
+/// this surface, on purpose (resolved ambiguity 7 in the plan).
+fn refuse_read_only(state: &RestState) -> Result<(), ApiError> {
+    if state.engine.read_only() {
+        return Err(ApiError::forbidden(
+            "this instance is read-only; account changes are disabled here - \
+             use `crystalline users` on the server",
+        ));
+    }
+    Ok(())
 }
 
 /// Refuse an empty password before it is hashed into an account nobody can log
@@ -680,7 +811,7 @@ mod tests {
     }
 
     /// The plaintext password must never be one `tracing::debug!` away, on
-    /// either body.
+    /// either body that carries one.
     #[test]
     fn a_debugged_body_redacts_the_password() {
         let create: CreateBody = serde_json::from_value(json!({
@@ -694,15 +825,25 @@ mod tests {
         assert!(text.contains("<redacted>"), "{text}");
         assert!(text.contains("bob"), "the rest of the body is still there");
 
-        let patch: PatchBody = serde_json::from_value(json!({"password": "hunter2"})).unwrap();
-        let text = format!("{patch:?}");
+        let reset: PasswordBody = serde_json::from_value(json!({"password": "hunter2"})).unwrap();
+        let text = format!("{reset:?}");
         assert!(!text.contains("hunter2"), "{text}");
         assert!(text.contains("<redacted>"), "{text}");
+    }
+
+    /// [`PatchBody`] carries no password, so its `Debug` needs no redaction -
+    /// pinned so a field added back to it later is not silently exempt.
+    #[test]
+    fn a_debugged_patch_body_carries_no_secret() {
+        let patch: PatchBody =
+            serde_json::from_value(json!({"display": "Eddy the Editor"})).unwrap();
+        let text = format!("{patch:?}");
+        assert!(text.contains("Eddy the Editor"), "{text}");
 
         let empty: PatchBody = serde_json::from_value(json!({})).unwrap();
         assert!(
             format!("{empty:?}").contains("None"),
-            "an absent password still reads as absent"
+            "an absent field still reads as absent"
         );
     }
 
