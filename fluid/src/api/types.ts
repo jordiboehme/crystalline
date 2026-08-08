@@ -2315,7 +2315,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description The engine's own graph payload, unchanged: the flat node and edge lists a renderer draws from, with `truncated` saying whether the node cap cut anything. `id` is opaque and stable only within one response; the address is `crystalline://domain/permalink`. */
+            /** @description The engine's own graph payload, unchanged: the flat node and edge lists a renderer draws from, with `truncated` saying whether the node cap cut anything and `hidden` counting the nodes the cap cut, retired ones first. `id` is opaque and stable only within one response; the address is `crystalline://domain/permalink`. */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -2330,6 +2330,7 @@ export interface operations {
                      *           "to": 2
                      *         }
                      *       ],
+                     *       "hidden": 0,
                      *       "nodes": [
                      *         {
                      *           "domain": "eng",

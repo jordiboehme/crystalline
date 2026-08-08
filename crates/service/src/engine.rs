@@ -3042,13 +3042,13 @@ impl Engine {
     /// Retired engrams come back like any other, with their status, because the
     /// graph is the shape of what is written rather than of what still holds:
     /// hiding a superseded node would break the chain that explains what replaced
-    /// it. A client fades them; this does not drop them, and the cap below does
-    /// not demote them either.
+    /// it. A client fades them; this does not drop them from an uncapped answer.
     ///
-    /// When the cap bites, the anchors are kept first and the rest are kept by
-    /// the same spread mass and salience lift `build_context` ranks with, so what
-    /// survives is the neighborhood nearest the anchor rather than whatever the
-    /// index happened to list first.
+    /// When the cap bites, the anchors are kept first, then the rest are kept by
+    /// the same spread mass and salience lift `build_context` ranks with - except
+    /// that retired non-anchor nodes yield to live ones first, since a fading
+    /// node is the one the budget can least afford to keep over live knowledge.
+    /// `hidden` counts every node the cap cut, retired or not.
     pub async fn graph_neighborhood(
         &self,
         anchor: &str,
@@ -3112,6 +3112,11 @@ impl Engine {
                 .unwrap_or(Ordering::Equal)
                 .then_with(|| a.1.id.0.cmp(&b.1.id.0))
         });
+        // Retired knowledge yields first when the cap bites. A stable partition
+        // after the score sort: under the cap the kept SET is identical (order
+        // within the payload is not part of the contract), over it the live
+        // neighborhood survives and the hidden count below reports the cut.
+        related.sort_by_key(|(_, node)| crystalline_index::is_retired_status(&node.status));
 
         let total = anchors.len() + related.len();
         let mut kept: HashSet<i64> = HashSet::new();
@@ -3156,6 +3161,7 @@ impl Engine {
             "nodes": nodes,
             "edges": edges,
             "truncated": total > nodes.len(),
+            "hidden": total - nodes.len(),
         }))
     }
 
