@@ -7,7 +7,7 @@ use std::sync::Arc;
 use crystalline_core::config::{DomainEntry, GlobalConfig, ResponseFormat, ServiceConfig};
 use crystalline_index::TursoStore;
 use crystalline_service::Engine;
-use crystalline_service::params::{ReadParams, RetireParams, SaveParams};
+use crystalline_service::params::{DeleteParams, ReadParams, RetireParams, SaveParams};
 use tokio::sync::Mutex;
 
 const ALPHA: &str = "---\ntype: engram\ntitle: Alpha\npermalink: alpha\ntags:\n  - eng\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# Alpha\n\nA rule about alpha.\n";
@@ -416,4 +416,90 @@ async fn retiring_the_same_engram_twice_is_idempotent() {
     );
     let beta = std::fs::read_to_string(tmp.path().join("eng/beta.md")).unwrap();
     assert_eq!(beta.matches("- supersedes [[Alpha]]").count(), 1, "{beta}");
+}
+
+#[tokio::test]
+async fn a_guarded_delete_refuses_when_the_engram_moved_on() {
+    let (tmp, engine) = engine_fixture().await;
+    let err = engine
+        .delete_engram(&DeleteParams {
+            identifier: "alpha".to_string(),
+            domain: "eng".to_string(),
+            expected_checksum: Some("0".repeat(64)),
+        })
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("stale edit"), "{err}");
+    assert!(
+        tmp.path().join("eng/alpha.md").exists(),
+        "nothing was deleted"
+    );
+
+    let (checksum, _) = checksum_of(&engine, "eng", "alpha").await;
+    engine
+        .delete_engram(&DeleteParams {
+            identifier: "alpha".to_string(),
+            domain: "eng".to_string(),
+            expected_checksum: Some(checksum),
+        })
+        .await
+        .unwrap();
+    assert!(!tmp.path().join("eng/alpha.md").exists());
+}
+
+#[tokio::test]
+async fn manifest_save_is_guarded_verbatim_and_refreshes_routing() {
+    let (tmp, engine) = engine_fixture().await;
+    let current = engine.manifest_markdown("eng").await.unwrap();
+    let checksum = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(current.as_bytes());
+        h.finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    };
+
+    // Stale token: refused, file untouched.
+    let err = engine
+        .save_manifest("eng", &current.replace("eng questions", "nothing"), "beef")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("stale edit"), "{err}");
+
+    // Fresh token: the exact bytes land.
+    let edited = current.replace(
+        "Route here for eng questions",
+        "Route here for everything eng",
+    );
+    engine
+        .save_manifest("eng", &edited, &checksum)
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("eng/MANIFEST.md")).unwrap(),
+        edited
+    );
+
+    // Unparseable markdown never lands.
+    let (_, checksum2) = {
+        let now = engine.manifest_markdown("eng").await.unwrap();
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(now.as_bytes());
+        (
+            now,
+            h.finalize()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>(),
+        )
+    };
+    assert!(
+        engine
+            .save_manifest("eng", "no frontmatter", &checksum2)
+            .await
+            .is_err()
+    );
 }

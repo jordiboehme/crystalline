@@ -205,6 +205,11 @@ pub struct DeleteParams {
     pub identifier: String,
     /// The engram's domain.
     pub domain: String,
+    /// The checksum from a prior read. When supplied, the delete is refused as
+    /// a conflict if the engram changed since that read. Omit for an
+    /// unconditional delete (the MCP tool's existing behavior).
+    #[serde(default)]
+    pub expected_checksum: Option<String>,
 }
 
 /// Parameters for `search_engrams`.

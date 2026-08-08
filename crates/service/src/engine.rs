@@ -2641,6 +2641,13 @@ impl Engine {
             return Err(EngineError::ReadOnly);
         }
         let (desc, source) = self.resolve(&p.identifier, Some(&p.domain)).await?;
+        if let Some(expected) = &p.expected_checksum {
+            let current = self.load_content(&source, &desc).await?;
+            let found = sha256_hex(current.as_bytes());
+            if &found != expected {
+                return Err(EngineError::Conflict(stale_edit_message(expected, &found)));
+            }
+        }
         if let ContentSource::File { root } = &source {
             let abs = join_rel(root, &desc.path);
             std::fs::remove_file(&abs).map_err(|source| EngineError::Io {
@@ -3140,6 +3147,108 @@ impl Engine {
                 })
             }
         }
+    }
+
+    /// Save a domain's MANIFEST markdown verbatim, guarded by the checksum of
+    /// the version the caller read - the manifest counterpart of
+    /// [`Engine::save_engram`], through the same `expected_checksum` seam and
+    /// the same "stale edit" wording on both domain kinds.
+    ///
+    /// `refresh_routing_cache` runs unconditionally afterwards, on both file
+    /// and virtual domains, even though the cache it fills
+    /// (`Engine::routing_virtual`) only ever holds virtual-domain bullets: a
+    /// file domain's bullets are read straight off `MANIFEST.md` on disk by
+    /// `routing_text` at request time, so a file-domain save has nothing in
+    /// the cache to refresh. Calling it unconditionally keeps this call site
+    /// correct without the caller needing to know which kind answered.
+    pub async fn save_manifest(
+        &self,
+        domain: &str,
+        markdown: &str,
+        expected_checksum: &str,
+    ) -> Result<Value> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        // Same hard gate as `save_engram`: a MANIFEST with no frontmatter (or
+        // an empty block) is not a manifest at all - it carries the domain's
+        // routing bullets and Tag Aliases, so losing the frontmatter here
+        // silently strips those too. `parse_engram` alone would not catch
+        // this, since an empty frontmatter span parses to
+        // `Frontmatter::default()` rather than an error.
+        let parsed =
+            parse_engram_lossless(markdown).map_err(|e| EngineError::Invalid(e.to_string()))?;
+        if !parsed.has_frontmatter || parsed.raw_frontmatter.trim().is_empty() {
+            return Err(EngineError::Invalid(
+                "the document carries no frontmatter, so it is not a MANIFEST; \
+                 keep the --- delimited frontmatter block at the top of the file"
+                    .into(),
+            ));
+        }
+
+        match self.content_source(domain)? {
+            ContentSource::File { root } => {
+                let path = root.join("MANIFEST.md");
+                let current = match std::fs::read_to_string(&path) {
+                    Ok(source) => source,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        return Err(EngineError::NotFound(format!(
+                            "domain '{domain}' has no MANIFEST.md at {}",
+                            path.display()
+                        )));
+                    }
+                    Err(source) => {
+                        return Err(EngineError::Io {
+                            path: path.display().to_string(),
+                            source,
+                        });
+                    }
+                };
+                let found = sha256_hex(current.as_bytes());
+                if found != expected_checksum {
+                    return Err(EngineError::Conflict(stale_edit_message(
+                        expected_checksum,
+                        &found,
+                    )));
+                }
+                write_file(&path, markdown)?;
+                let store = self.store.lock().await;
+                let domain_id = store
+                    .upsert_domain(domain, Some(&root.to_string_lossy()), DomainKind::File)
+                    .await?;
+                self.reindex_file(&*store, domain_id, &root, "MANIFEST.md")
+                    .await?;
+            }
+            ContentSource::Virtual => {
+                let store = self.store.lock().await;
+                let desc = store
+                    .find_engram(domain, "manifest")
+                    .await?
+                    .ok_or_else(|| {
+                        EngineError::NotFound(format!(
+                            "domain '{domain}' has no MANIFEST engram yet"
+                        ))
+                    })?;
+                let stamp = virtual_stamp(markdown);
+                self.index_markdown(
+                    &*store,
+                    desc.domain_id,
+                    &desc.path,
+                    markdown,
+                    stamp,
+                    Some(expected_checksum),
+                    true,
+                )
+                .await?;
+            }
+        }
+
+        self.refresh_routing_cache().await;
+
+        Ok(json!({
+            "domain": domain,
+            "checksum": sha256_hex(markdown.as_bytes()),
+        }))
     }
 
     /// Routing bullets for one virtual domain, read from its `MANIFEST.md`

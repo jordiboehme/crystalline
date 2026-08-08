@@ -182,6 +182,7 @@ async fn virtual_crud(store: Arc<Mutex<dyn Store>>) {
         .delete_engram(&DeleteParams {
             identifier: "first-note".to_string(),
             domain: "notes".to_string(),
+            expected_checksum: None,
         })
         .await
         .unwrap();
@@ -929,6 +930,7 @@ async fn deleting_manifest_clears_alias_folding(store: Arc<Mutex<dyn Store>>) {
         .delete_engram(&DeleteParams {
             identifier: "manifest".to_string(),
             domain: "notes".to_string(),
+            expected_checksum: None,
         })
         .await
         .unwrap();
