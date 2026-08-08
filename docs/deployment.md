@@ -73,6 +73,8 @@ printf '%s' 'the-password' | docker compose -f deploy/fluid/docker-compose.yml \
   exec -T crystalline crystalline users add ada --role admin --password-stdin
 ```
 
+Restart the daemon after upgrading the binary, before editing accounts, so both sides open the accounts database the same way. A container upgrade recreates the container and has this covered already; a native install upgraded underneath a daemon that keeps running does not.
+
 `-T` because `--password-stdin` reads a pipe and compose would otherwise allocate a terminal there is nothing to read from. Everyone else is `--role viewer` or `--role editor`. Two other identity modes need no accounts at all: `CRYSTALLINE_AUTH_ANONYMOUS=true` serves an identityless request at viewer level, which together with `--read-only` is a published archive anyone who can reach it may browse, and `CRYSTALLINE_AUTH_TRUSTED_HEADER=remote-user` takes the already-authenticated user from a header an SSO proxy sets, creating that account at viewer role the first time it is seen. The trusted header is only safe when the proxy sets it itself and strips whatever a client sent, which means that proxy has to sit in front of Fluid rather than behind it: nginx forwards client headers untouched.
 
 Serve it over TLS anywhere but localhost. The session cookie is marked `Secure` for any browser `Host` that is not loopback, and for any request a proxy in front reports as `https`, so a browser on a plain `http://team.lan` is handed a cookie it refuses to store and signing in never sticks. Put a TLS terminator in front of the Fluid container and the same deployment works unchanged: Fluid passes an existing `X-Forwarded-Proto` through rather than overwriting it with its own hop.

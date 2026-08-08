@@ -20,13 +20,20 @@
 //! Concurrency therefore has two independent layers, and both are needed:
 //!
 //! 1. *Across processes*, the CLI and the daemon each have their own
-//!    connection. `PRAGMA busy_timeout` is set on every connection so a writer
-//!    waits instead of failing, no transaction spans more than the two
-//!    statements of [`AuthStore::remove_user`], and the two multi-statement
-//!    operations ([`AuthStore::remove_user`] and [`AuthStore::create_session`])
-//!    take `BEGIN IMMEDIATE` so they serialize against each other rather than
+//!    connection. The file is opened with turso's experimental multiprocess
+//!    WAL, without which the daemon's open holds an exclusive lock on the
+//!    whole file and the CLI cannot open it at all (see [`open_database`],
+//!    which is where the interesting part of this lives). On top of that,
+//!    `PRAGMA busy_timeout` is set on every connection so a writer waits
+//!    instead of failing, no transaction spans more than the two statements of
+//!    [`AuthStore::remove_user`], and the two multi-statement operations
+//!    ([`AuthStore::remove_user`] and [`AuthStore::create_session`]) take
+//!    `BEGIN IMMEDIATE` so they serialize against each other rather than
 //!    interleaving. Covering test:
-//!    `two_stores_on_one_file_interleave_writes`.
+//!    `users_add_works_while_another_process_holds_the_auth_db` in the CLI's
+//!    `tests/users.rs`, which is the only one that spawns a second process.
+//!    `two_stores_on_one_file_interleave_writes` below covers the ordering
+//!    within one process and nothing about the locking.
 //! 2. *Within one process*, every method serializes on `AuthStore::guard`,
 //!    because turso's [`Connection`] refuses concurrent use outright rather
 //!    than queueing. The daemon shares one `AuthStore` across axum handlers, so
@@ -276,6 +283,95 @@ fn last_admin_error(verb: &str, name: &str) -> anyhow::Error {
     )
 }
 
+/// Open the database file itself, in the one mode that lets a second process
+/// open it at the same time.
+///
+/// turso's default open path takes a whole-file, process-scoped, *exclusive*
+/// advisory lock on the database file (`IO::lock_file`, non-blocking, no
+/// retry), so while `serve` holds this file open a second process cannot even
+/// get to a statement: `crystalline users add` fails at open time with a
+/// locking error, and neither the busy timeout nor `BEGIN IMMEDIATE` ever gets
+/// a say, because both act after the open. That is the whole bug this flag
+/// fixes.
+///
+/// `experimental_multiprocess_wal(true)` (turso 0.7.2) replaces that lock with
+/// a shared coordination file beside the database (`web-auth.db-tshm`): the
+/// open adds `OpenFlags::NoLock` instead of locking the file and writers
+/// coordinate through that mapping, so the busy timeout finally does the
+/// waiting it was always meant to do. The rest is read out of the turso 0.7.2
+/// and turso_core 0.7.2 sources (`Database::effective_open_flags_for_path`,
+/// `open_with_flags_async`) and, where noted, checked against a running
+/// daemon:
+///
+/// * The two modes are exclusive per file, but nothing enforces that on the
+///   path this takes. turso rejects a mixed open in both directions
+///   (`reject_live_multiprocess_wal_for_legacy_open` and
+///   `reject_live_legacy_wal_for_multiprocess_open`) only in the *synchronous*
+///   `Database::open_file_with_flags`; `open_with_flags_async`, which is what
+///   `Builder::build` reaches, applies the flags and skips both probes.
+///   Checked, not deduced: with a daemon built without this flag holding the
+///   file and a build carrying it running `users add`, the write goes through
+///   with no complaint, and so does the reverse pairing. This is the only path
+///   that opens `web-auth.db`, so one build never disagrees with itself, and
+///   an upgrade is the one thing that puts two builds on one file. **Restart
+///   the daemon after upgrading the binary, before editing accounts**: two
+///   builds that open this file differently would coordinate through different
+///   indexes (an in-process one against the `-tshm` mapping) on one WAL.
+///   Nothing here can detect that, which is why it is written down here and in
+///   `docs/deployment.md` instead. No shipped Crystalline has ever had a
+///   `web-auth.db`, though, so the only way to be on the wrong side of this is
+///   to run pre-release builds of both halves.
+/// * The flag is a no-op, keeping legacy behavior, where turso_core's
+///   `host_shared_wal` cfg is off, which is every 32-bit target. There the
+///   old failure mode remains.
+/// * It is refused outright, rather than ignored, on a memory-like path and
+///   on network filesystems (NFS, SMB/CIFS, AFS, Ceph, GFS2, Lustre, 9p and
+///   friends). This half *is* on the async path. A state directory on a
+///   network share is unusual but real, and failing to open at all would be a
+///   worse regression than the bug being fixed, so that one case falls back to
+///   a legacy open below.
+async fn open_database(path: &Path) -> Result<Database> {
+    let name = path.to_string_lossy().to_string();
+    let multiprocess = Builder::new_local(&name)
+        .experimental_multiprocess_wal(true)
+        .build()
+        .await;
+    let err = match multiprocess {
+        Ok(db) => return Ok(db),
+        Err(err) if is_multiprocess_unsupported(&err) => err,
+        Err(err) => {
+            return Err(anyhow::Error::new(err))
+                .with_context(|| format!("opening auth database {}", path.display()));
+        }
+    };
+    tracing::warn!(
+        error = %err,
+        path = %path.display(),
+        "this filesystem does not support cross-process access to the auth database; \
+         `crystalline users` will fail while the daemon is running"
+    );
+    Builder::new_local(&name)
+        .build()
+        .await
+        .with_context(|| format!("opening auth database {}", path.display()))
+}
+
+/// Whether this open failed because multiprocess WAL cannot be had here at
+/// all, as opposed to any other reason an open can fail.
+///
+/// Matched on the message because turso flattens `LimboError::InvalidArgument`
+/// into the catch-all `turso::Error::Error(String)` (see `turso_sdk_kit`'s
+/// `From<LimboError> for TursoError`), so the message is the only thing that
+/// survives. The three messages it has to catch all end in "is not supported
+/// ..." and all begin with the same prefix, which is what is matched. A
+/// locking error is deliberately *not* matched: that one means another process
+/// holds the file in the other mode, and retrying without the flag would only
+/// swap a clear message for a bare lock failure.
+fn is_multiprocess_unsupported(err: &turso::Error) -> bool {
+    err.to_string()
+        .contains("experimental multiprocess WAL is not supported")
+}
+
 impl AuthStore {
     /// Open (creating if absent) the auth database at `path`, applying the
     /// schema. The parent directory is created too, so a first run against a
@@ -287,10 +383,7 @@ impl AuthStore {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
-        let db = Builder::new_local(&path.to_string_lossy())
-            .build()
-            .await
-            .with_context(|| format!("opening auth database {}", path.display()))?;
+        let db = open_database(path).await?;
         let conn = db.connect().context("connecting to the auth database")?;
         // The CLI and the daemon write the same file. Wait rather than fail;
         // every transaction here is a single short statement.
@@ -1272,12 +1365,21 @@ mod tests {
         assert_eq!(store.list_users().await.unwrap().len(), 1);
     }
 
-    /// The brief's central concurrency requirement: the `crystalline users`
-    /// CLI edits this file while the daemon serves from it. That is two
-    /// processes on one database, which is the case `crystalline_index`'s
-    /// turso store explicitly does not exercise (see this module's docs), so
-    /// it gets a test of its own. Two `AuthStore` instances stand in for the
-    /// two processes; each has its own `Database` and `Connection`.
+    /// Two `AuthStore` handles on one file see each other's writes as they
+    /// happen, in the order the `crystalline users` CLI and the daemon do it.
+    ///
+    /// **Same process only, and deliberately so.** These two handles are not
+    /// two processes and cannot stand in for them: turso keeps a process-wide
+    /// registry of open databases keyed by file identity
+    /// (`Database::lookup_in_registry`), so the second `open` here is handed
+    /// the first one's `Database` back and never opens the file a second time.
+    /// That makes this a test of statement ordering and visibility through one
+    /// engine, which is worth having, and no evidence at all about the file
+    /// locking between processes that [`open_database`] exists to solve. The
+    /// test that does spawn a second process is
+    /// `users_add_works_while_another_process_holds_the_auth_db` in the CLI's
+    /// `tests/users.rs`, and it is the one that fails if the multiprocess WAL
+    /// flag is dropped.
     #[tokio::test]
     async fn two_stores_on_one_file_interleave_writes() {
         let dir = tempfile::tempdir().unwrap();
@@ -1315,6 +1417,70 @@ mod tests {
         cli.remove_user("ada").await.unwrap();
         assert!(daemon.session_user(&second.token).await.unwrap().is_none());
         assert!(daemon.list_users().await.unwrap().is_empty());
+    }
+
+    /// The upgrade path: a `web-auth.db` written by a build that opened
+    /// without the multiprocess WAL flag must open, and keep its accounts,
+    /// under a build that opens with it.
+    ///
+    /// The two modes are exclusive only while a database is *live* in the
+    /// other mode (turso probes both directions on open). Nothing about the
+    /// file itself is mode-specific: the coordination file is a separate
+    /// `-tshm` sibling created on demand, so an existing state directory needs
+    /// no migration. This writes the file exactly as the previous build did,
+    /// closes it and reopens it the way [`open_database`] now does.
+    #[tokio::test]
+    async fn a_database_written_without_the_multiprocess_flag_still_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("web-auth.db");
+        {
+            let legacy = Builder::new_local(&path.to_string_lossy())
+                .build()
+                .await
+                .unwrap();
+            let conn = legacy.connect().unwrap();
+            conn.execute_batch(SCHEMA).await.unwrap();
+            conn.execute(
+                "INSERT INTO users (name, display, email, role, pass_hash, disabled, created_at)
+                 VALUES ('ada', 'Ada', NULL, 'admin', 'x', 0, '2026-01-01T00:00:00Z')",
+                (),
+            )
+            .await
+            .unwrap();
+        }
+
+        let store = AuthStore::open(&path)
+            .await
+            .expect("an existing legacy-mode database must open in multiprocess mode");
+        let users = store.list_users().await.unwrap();
+        assert_eq!(users.len(), 1, "the accounts survived the mode change");
+        assert_eq!(users[0].name, "ada");
+        // The account is still editable, so the reopen is a real read-write
+        // open and not a degraded one.
+        store.set_role("ada", Role::Admin).await.unwrap();
+        assert!(
+            path.with_file_name("web-auth.db-tshm").exists(),
+            "multiprocess mode is what actually opened the file"
+        );
+    }
+
+    /// The fallback in [`open_database`] hinges on recognizing turso's own
+    /// "not supported" wording, which reaches us as a string rather than a
+    /// typed error. A memory-like path is the one way to provoke that message
+    /// without a network filesystem to hand, so it is what pins it: if a turso
+    /// upgrade rewords it, this fails here, rather than the fallback silently
+    /// going missing on the NFS or SMB state directory it exists for.
+    #[tokio::test]
+    async fn turso_still_words_an_unsupported_multiprocess_open_the_way_we_match() {
+        let err = Builder::new_local(":memory:")
+            .experimental_multiprocess_wal(true)
+            .build()
+            .await
+            .expect_err("multiprocess WAL cannot be had on an in-memory path");
+        assert!(
+            is_multiprocess_unsupported(&err),
+            "the fallback no longer recognizes turso's message: {err}"
+        );
     }
 
     /// Two simultaneous logins in the daemon are two concurrent
