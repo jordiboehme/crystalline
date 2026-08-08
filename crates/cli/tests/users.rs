@@ -25,13 +25,27 @@ fn bin() -> Command {
 /// way; setting them on unix as well is harmless there and keeps this helper
 /// free of a `cfg`.
 fn isolate(cmd: &mut Command, home: &std::path::Path) {
-    cmd.env("HOME", home)
-        .env("XDG_CONFIG_HOME", home.join("config"))
-        .env("XDG_STATE_HOME", home.join("state"))
-        .env("XDG_CACHE_HOME", home.join("cache"))
-        .env("USERPROFILE", home)
-        .env("APPDATA", home.join("roaming"))
-        .env("LOCALAPPDATA", home.join("local"));
+    for (name, value) in isolation_env(home) {
+        cmd.env(name, value);
+    }
+}
+
+/// The variables [`isolate`] sets, as pairs, because one other place needs the
+/// same set and cannot go through [`isolate`]:
+/// `users_add_works_while_another_process_holds_the_auth_db` spawns its holder
+/// with a plain [`std::process::Command`], not an `assert_cmd` one. Both read
+/// this list, so a variable added here reaches both and the two cannot drift
+/// into resolving different `web-auth.db` files.
+fn isolation_env(home: &std::path::Path) -> [(&'static str, std::path::PathBuf); 7] {
+    [
+        ("HOME", home.to_path_buf()),
+        ("XDG_CONFIG_HOME", home.join("config")),
+        ("XDG_STATE_HOME", home.join("state")),
+        ("XDG_CACHE_HOME", home.join("cache")),
+        ("USERPROFILE", home.to_path_buf()),
+        ("APPDATA", home.join("roaming")),
+        ("LOCALAPPDATA", home.join("local")),
+    ]
 }
 
 /// Run `crystalline users ...` in the isolated home, feeding `stdin` when
@@ -220,4 +234,150 @@ fn a_password_is_required_and_a_non_terminal_run_must_pass_password_stdin() {
     // An empty password is refused too.
     let err = users_err(home.path(), &["add", "ada", "--password-stdin"], Some("\n"));
     assert!(err.contains("password"), "{err}");
+}
+
+/// Names the auth database this process must hold open, turning this test
+/// binary into the stand-in for a running daemon (see [`holds_the_auth_db`]).
+/// The value is the isolated home, from which the child derives every path.
+const HOLD_ENV: &str = "CRYSTALLINE_TEST_AUTH_HOLD";
+
+/// The child touches this file once its `AuthStore` is open, and exits once
+/// the parent creates [`STOP_FILE`] beside it.
+const READY_FILE: &str = "auth-hold-ready";
+const STOP_FILE: &str = "auth-hold-stop";
+
+/// The daemon stand-in, run as a child process by
+/// [`users_add_works_while_another_process_holds_the_auth_db`] and a no-op in
+/// an ordinary test run.
+///
+/// It has to be a real second process. Two `AuthStore`s in one process prove
+/// nothing about this: turso keeps a process-wide registry of open databases
+/// keyed by file identity, so the second open is handed the first one's
+/// `Database` and never touches the file lock that the CLI trips over. See
+/// `two_stores_on_one_file_interleave_writes` in `crystalline-service`, which
+/// is the same-process test and says so.
+#[test]
+fn holds_the_auth_db() {
+    let Ok(home) = std::env::var(HOLD_ENV) else {
+        return;
+    };
+    let home = std::path::PathBuf::from(home);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let path = crystalline_core::config::web_auth_db_path().unwrap();
+        let store = crystalline_service::rest::AuthStore::open(&path)
+            .await
+            .expect("the holder must be able to open the auth database");
+        std::fs::write(home.join(READY_FILE), "").unwrap();
+
+        // Keep writing while the parent writes, the way a serving daemon
+        // issues sessions while an operator edits accounts. This is what puts
+        // the busy timeout to work across processes, which only has a chance
+        // of mattering once the open no longer locks the whole file.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !home.join(STOP_FILE).exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the parent never came"
+            );
+            store
+                .create_session("ada", 3600)
+                .await
+                .expect("the daemon's own writes must not fail while the CLI writes");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // Still holding the same open store, the writes the other process made
+        // meanwhile are visible without reopening.
+        let names: Vec<String> = store
+            .list_users()
+            .await
+            .expect("listing must work after the other process wrote")
+            .into_iter()
+            .map(|u| u.name)
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "bob"),
+            "the holder sees the account the CLI added: {names:?}"
+        );
+    });
+}
+
+/// The bug this guards: while `serve` holds `web-auth.db` open, every
+/// `crystalline users` command used to fail at open time, because turso's
+/// default open takes a whole-file exclusive advisory lock for the life of the
+/// handle. Neither the busy timeout nor `BEGIN IMMEDIATE` could help, since
+/// both come after the open. `AuthStore` therefore opens with turso's
+/// multiprocess WAL, and this test is the only one that can tell the
+/// difference: it holds the database open in a second, real process.
+#[test]
+fn users_add_works_while_another_process_holds_the_auth_db() {
+    let home = tempfile::tempdir().unwrap();
+    // Create the database first, so the holder does not race the CLI over
+    // which process gets to create the file.
+    users_ok(
+        home.path(),
+        &["add", "ada", "--role", "admin", "--password-stdin"],
+        Some("s3cret\n"),
+    );
+
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args(["holds_the_auth_db", "--exact", "--nocapture"])
+        .env(HOLD_ENV, home.path());
+    for (name, value) in isolation_env(home.path()) {
+        command.env(name, value);
+    }
+    let mut holder = Holder(command.spawn().unwrap());
+
+    let ready = home.path().join(READY_FILE);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !ready.exists() {
+        if let Some(status) = holder.0.try_wait().unwrap() {
+            panic!("the holder exited before it opened the database: {status}");
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the holder never opened the database"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    // The real thing: a second process writes while the first holds its handle.
+    users_ok(
+        home.path(),
+        &["add", "bob", "--password-stdin"],
+        Some("hunter2\n"),
+    );
+    let out = users_ok(home.path(), &["list"], None);
+    assert!(out.contains("bob"), "the write landed: {out}");
+
+    std::fs::write(home.path().join(STOP_FILE), "").unwrap();
+    let status = holder.0.wait().unwrap();
+    assert!(
+        status.success(),
+        "the holder's own assertions must have passed: {status}"
+    );
+}
+
+/// The spawned holder, killed when this goes out of scope.
+///
+/// Every path between the spawn and the orderly stop can panic - a failing
+/// `users_ok`, the readiness loop timing out, the `bob` assertion - and each
+/// one would otherwise leave the child running for its full 60 second timeout:
+/// holding the inherited stdout pipe, which nextest reports as a leak, and on
+/// Windows holding `web-auth.db` open, so the `TempDir` would fail to delete
+/// its own directory on the way out. Killing on unwind makes every failure
+/// path shut the holder down at once. On the success path the child has
+/// already exited through `STOP_FILE` by the time this runs, and both calls
+/// below are no-ops.
+struct Holder(std::process::Child);
+
+impl Drop for Holder {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
