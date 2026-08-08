@@ -45,9 +45,11 @@ describe("the buffer is the file", () => {
   it("keeps the endings when the document is edited", () => {
     const doc = "---\r\ntitle: Windows\r\n---\r\n\r\nBody.\r\n";
     const state = open(doc);
-    // Positions address the buffer, whose lines are joined internally with a
-    // single character: `state.doc.length` is not `doc.length` for a CRLF
-    // file, and anything computing an offset has to ask the document.
+    // Positions are UTF-16 code-unit offsets into the buffer, whose lines are
+    // joined internally with a single character: `state.doc.length` is not
+    // `doc.length` for a CRLF file, and it is not a count of UTF-8 bytes
+    // either, so anything computing an offset has to ask the document and
+    // convert on both axes before the number crosses an API boundary.
     const edited = state.update({
       changes: { from: state.doc.length, insert: state.lineBreak + "More." },
     }).state;

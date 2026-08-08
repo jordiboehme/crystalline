@@ -42,6 +42,7 @@ import {
   fetchGraph,
   graphKey,
 } from "../api/graph";
+import { useAuth } from "../auth/AuthContext";
 import { AgentsEye } from "../components/AgentsEye";
 import { BacklinksPanel } from "../components/BacklinksPanel";
 import { FrontmatterPanel } from "../components/FrontmatterPanel";
@@ -50,18 +51,24 @@ import type { LifecycleLink } from "../components/LifecycleBanner";
 import { Markdown } from "../components/Markdown";
 import { NeighborhoodGraph } from "../components/NeighborhoodGraph";
 import { ReferenceLink } from "../components/ReferenceLink";
-import { domainRoute, engramRoute, graphRoute } from "../paths";
+import { domainRoute, editRoute, engramRoute, graphRoute } from "../paths";
 import type { WikilinkResolver } from "../wikilinks";
 import { buildWikilinkResolver, innerOf, referenceState } from "../wikilinks";
 
 /** How long the copy button keeps saying it worked. */
 const COPIED_FOR_MS = 2000;
 
+/** Warm the editor chunk while the pointer is still on its way to the click. */
+function prefetchEditor(): void {
+  void import("./EngramEditor");
+}
+
 export default function EngramPage() {
   const params = useParams();
   const domain = params.domain ?? "";
   // A permalink is a path of its own, so it arrives through the splat.
   const permalink = params["*"] ?? "";
+  const { capabilities } = useAuth();
 
   const detail = useQuery({
     queryKey: engramDetailKey(domain, permalink),
@@ -119,6 +126,16 @@ export default function EngramPage() {
           </Link>
           <span className="font-mono text-xs">{engram.permalink}</span>
           <CopyAddressButton address={engram.url} />
+          {capabilities.canWrite && (
+            <Link
+              to={editRoute(engram.domain, engram.permalink)}
+              onPointerEnter={prefetchEditor}
+              onFocus={prefetchEditor}
+              className="rounded border border-slate-300 px-2 py-0.5 text-xs hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800"
+            >
+              Edit
+            </Link>
+          )}
         </p>
       </header>
 

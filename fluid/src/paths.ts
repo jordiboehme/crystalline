@@ -32,6 +32,15 @@ export function engramRoute(domain: string, permalink: string): string {
 }
 
 /**
+ * The editor over one engram. Not under `/e/`: that pattern ends in a splat,
+ * and a splat swallows everything after it, so `edit` gets its own segment
+ * ahead of the permalink - the same shape the API gave its action routes.
+ */
+export function editRoute(domain: string, permalink: string): string {
+  return `${domainRoute(domain)}/edit/${encodePermalink(permalink)}`;
+}
+
+/**
  * The neighborhood of one engram, full screen.
  *
  * The anchor is the engram's own `crystalline://` address rather than the two
