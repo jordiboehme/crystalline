@@ -530,4 +530,53 @@ async fn manifest_save_is_guarded_verbatim_and_refreshes_routing() {
             .await
             .is_err()
     );
+
+    // The routing refresh the name promises: `save_manifest` calls
+    // `refresh_routing_cache` unconditionally, but on a file domain like
+    // `eng`, `routing_text` reads `MANIFEST.md` straight off disk regardless
+    // of that cache (see `save_manifest`'s own doc comment on why), so
+    // nothing above actually exercises the refresh. `scratch` is virtual: its
+    // bullets come only from the `routing_virtual` cache, so a save's effect
+    // on `routing_text` is observable only if the cache genuinely refreshed.
+    engine
+        .scaffold_virtual_manifest(
+            "scratch",
+            "---\ntype: manifest\ntitle: scratch\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# scratch\n\n## Scope\n\n- Everything about scratch\n\n## When to Use\n\n- Route here for scratch questions\n",
+        )
+        .await
+        .unwrap();
+    let before_routing = engine.routing_text();
+    assert!(
+        before_routing.contains("Route here for scratch questions"),
+        "{before_routing}"
+    );
+
+    let scratch_manifest = engine.manifest_markdown("scratch").await.unwrap();
+    let scratch_checksum = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(scratch_manifest.as_bytes());
+        h.finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    };
+    let edited_scratch = scratch_manifest.replace(
+        "Route here for scratch questions",
+        "Route here for updated scratch topics",
+    );
+    engine
+        .save_manifest("scratch", &edited_scratch, &scratch_checksum)
+        .await
+        .unwrap();
+
+    let after_routing = engine.routing_text();
+    assert!(
+        after_routing.contains("Route here for updated scratch topics"),
+        "the routing cache reflects the save:\n{after_routing}"
+    );
+    assert!(
+        !after_routing.contains("Route here for scratch questions"),
+        "the stale bullet is gone:\n{after_routing}"
+    );
 }

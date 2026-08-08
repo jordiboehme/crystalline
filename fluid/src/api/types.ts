@@ -1652,7 +1652,7 @@ export interface operations {
                     "application/json": Record<string, never>;
                 };
             };
-            /** @description The body is not JSON. */
+            /** @description The body is not JSON, or `If-Match` carries more than one entity tag: this surface expects exactly one strong checksum, not a comma-separated list. */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -1764,6 +1764,15 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            /** @description `If-Match` carries more than one entity tag: this surface expects exactly one strong checksum, not a comma-separated list. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
             };
             /** @description No identity, or an anonymous one: an identity with no account behind it never writes. */
             401: {
@@ -1909,6 +1918,15 @@ export interface operations {
                      *     }
                      */
                     "application/json": Record<string, never>;
+                };
+            };
+            /** @description `If-Match` carries more than one entity tag: this surface expects exactly one strong checksum, not a comma-separated list. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
             /** @description No identity, or an anonymous one: an identity with no account behind it never writes. */

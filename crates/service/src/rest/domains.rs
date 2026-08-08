@@ -294,6 +294,14 @@ pub struct SaveManifestBody {
             }),
         ),
         (
+            status = 400,
+            description = "`If-Match` carries more than one entity tag: this \
+                           surface expects exactly one strong checksum, not a \
+                           comma-separated list.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
             status = 401,
             description = "No identity, or an anonymous one: an identity with \
                            no account behind it never writes.",

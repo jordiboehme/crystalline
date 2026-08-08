@@ -683,6 +683,30 @@ async fn a_read_only_instance_refuses_before_the_precondition_check() {
         "application/problem+json"
     );
 
+    // The manifest route holds its own read-only check ahead of `if_match`
+    // too (see `save_manifest`'s comment on why it is not shared), so it gets
+    // the same probe.
+    let manifest_no_if_match = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/eng/manifest",
+        &editor,
+    )
+    .json(&serde_json::json!({"markdown": "---\ntitle: hijack\n---\n"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(
+        manifest_no_if_match.status(),
+        403,
+        "read-only answers 403 on the manifest route too, not the 428 a \
+         missing If-Match would earn"
+    );
+    assert_eq!(
+        manifest_no_if_match.headers()["content-type"],
+        "application/problem+json"
+    );
+
     let created = as_session(
         fx.addr,
         reqwest::Method::POST,
@@ -895,6 +919,125 @@ async fn the_manifest_reads_with_an_etag_and_saves_under_if_match() {
             .unwrap()
             .contains("all things eng")
     );
+}
+
+/// A server fixture with one virtual domain (`docs`), its `MANIFEST.md`
+/// scaffolded straight into the database rather than onto disk - the virtual
+/// counterpart of `serve`'s file-domain manifest, so the round trip below
+/// pins the same GET-etag-to-PUT byte consistency for the virtual kind that
+/// `the_manifest_reads_with_an_etag_and_saves_under_if_match` already pins
+/// for a file domain.
+async fn serve_with_a_virtual_domain() -> Fixture {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let mut cfg = GlobalConfig {
+        auth: Some(AuthConfig {
+            trusted_header: None,
+            anonymous: Some(false),
+            max_users: None,
+        }),
+        ..GlobalConfig::default()
+    };
+    cfg.domains
+        .insert("docs".to_string(), DomainEntry::virtual_domain());
+    cfg.service = Some(ServiceConfig {
+        response_format: Some(ResponseFormat::Json),
+        read_only: Some(false),
+        ..ServiceConfig::default()
+    });
+    let config_path = root.join("config.yaml");
+    crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let engine = Arc::new(Engine::new(
+        Arc::new(Mutex::new(store)),
+        cfg,
+        None,
+        Some(config_path),
+    ));
+    engine
+        .scaffold_virtual_manifest(
+            "docs",
+            "---\ntype: manifest\ntitle: docs\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# docs\n\n## Scope\n\n- Everything about docs\n\n## When to Use\n\n- Route here for docs questions\n",
+        )
+        .await
+        .unwrap();
+
+    let auth = Arc::new(
+        AuthStore::open(&tmp.path().join("web-auth.db"))
+            .await
+            .unwrap(),
+    );
+    auth.add_user("eddy", "Eddy", None, Role::Editor, "eddypw")
+        .await
+        .unwrap();
+
+    let router = http_router(engine, Arc::new(AtomicUsize::new(0)), &[], auth.clone()).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        axum::serve(listener, router).await.unwrap();
+    });
+    Fixture {
+        addr,
+        auth,
+        _tmp: tmp,
+    }
+}
+
+/// The virtual-domain counterpart of
+/// `the_manifest_reads_with_an_etag_and_saves_under_if_match`: a GET's ETag
+/// carries straight into a PUT's `If-Match` and lands, proving the manifest
+/// round trip is byte-consistent for a database-backed MANIFEST too, not only
+/// one on disk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_manifest_round_trip_holds_for_a_virtual_domain() {
+    let fx = serve_with_a_virtual_domain().await;
+    let editor = login(fx.addr, "eddy", "eddypw").await;
+
+    let read = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/domains/docs/manifest",
+        &editor,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(read.status(), 200);
+    let etag = read.headers()["etag"]
+        .to_str()
+        .unwrap()
+        .trim_matches('"')
+        .to_string();
+    let body: serde_json::Value = read.json().await.unwrap();
+    assert_eq!(
+        body["checksum"].as_str().unwrap(),
+        etag,
+        "header and body agree"
+    );
+    let markdown = body["markdown"].as_str().unwrap().to_string();
+
+    let edited = markdown.replace(
+        "Route here for docs questions",
+        "Route here for all things docs",
+    );
+    let saved = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/docs/manifest",
+        &editor,
+    )
+    .header("if-match", format!("\"{etag}\""))
+    .json(&serde_json::json!({"markdown": edited}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(saved.status(), 200);
+    let saved_body: serde_json::Value = saved.json().await.unwrap();
+    assert_ne!(saved_body["checksum"].as_str().unwrap(), etag);
+    assert_eq!(saved_body["markdown"].as_str().unwrap(), edited);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

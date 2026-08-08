@@ -96,6 +96,18 @@ impl ApiError {
         }
     }
 
+    /// A 400 for a header the server can parse as HTTP but whose shape this
+    /// surface refuses to accept - a comma-separated `If-Match` list, for
+    /// instance, which RFC 9110 allows but this API's "exactly one strong
+    /// checksum" contract does not.
+    pub fn bad_request(detail: impl Into<String>) -> ApiError {
+        ApiError {
+            status: StatusCode::BAD_REQUEST,
+            title: "invalid request",
+            detail: detail.into(),
+        }
+    }
+
     /// A 405 for a path that exists but does not serve this method. Mounted as
     /// the router's `method_not_allowed_fallback`, which is the one answer axum
     /// would otherwise produce with an empty body; the `Allow` header axum adds
@@ -252,7 +264,11 @@ impl IntoResponse for ApiError {
 /// 428 when the header is absent - the client forgot the contract, and the
 /// answer says where the token comes from. `*`, a weak `W/` validator and an
 /// empty token are 422: this surface versions by strong content checksum only,
-/// and matching "any version" would make If-Match decorative.
+/// and matching "any version" would make If-Match decorative. A
+/// comma-separated list (`"a", "b"`) is RFC 9110-legal but 400: naively
+/// trimming quotes off it would silently mangle it into a malformed token
+/// instead of refusing it, and this surface's tokens are hex, so a comma can
+/// never appear in a legitimate one.
 pub fn if_match(headers: &axum::http::HeaderMap) -> Result<String, ApiError> {
     let raw = headers
         .get(axum::http::header::IF_MATCH)
@@ -266,6 +282,13 @@ pub fn if_match(headers: &axum::http::HeaderMap) -> Result<String, ApiError> {
         .to_str()
         .map_err(|_| ApiError::unprocessable("the If-Match header is not readable text"))?
         .trim();
+    if raw.contains(',') {
+        return Err(ApiError::bad_request(
+            "the If-Match header carries more than one entity tag; this \
+             surface expects exactly one strong checksum from the detail \
+             read, not a comma-separated list",
+        ));
+    }
     if raw == "*" || raw.starts_with("W/") {
         return Err(ApiError::unprocessable(
             "If-Match must carry the strong content checksum from the detail \
@@ -462,6 +485,26 @@ mod tests {
                 "{bad:?} is not a strong checksum"
             );
         }
+    }
+
+    /// RFC 9110 allows a comma-separated `If-Match` list; this surface refuses
+    /// it outright (400) rather than mangling it into a bogus single token by
+    /// trimming quotes off the whole thing.
+    #[test]
+    fn if_match_rejects_a_comma_separated_list() {
+        use axum::http::{HeaderMap, HeaderValue, header};
+        let mut h = HeaderMap::new();
+        h.insert(
+            header::IF_MATCH,
+            HeaderValue::from_str("\"abc123\", \"def456\"").unwrap(),
+        );
+        let err = if_match(&h).unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(
+            err.detail.contains("one") && err.detail.to_lowercase().contains("if-match"),
+            "the detail says one ETag is expected: {}",
+            err.detail
+        );
     }
 
     /// The 412 payload is a problem detail with extension members, sent as

@@ -959,7 +959,7 @@
             }
           },
           "400": {
-            "description": "The body is not JSON.",
+            "description": "The body is not JSON, or `If-Match` carries more than one entity tag: this surface expects exactly one strong checksum, not a comma-separated list.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -1091,6 +1091,16 @@
         "responses": {
           "204": {
             "description": "Deleted. No body."
+          },
+          "400": {
+            "description": "`If-Match` carries more than one entity tag: this surface expects exactly one strong checksum, not a comma-separated list.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
           },
           "401": {
             "description": "No identity, or an anonymous one: an identity with no account behind it never writes.",
@@ -1278,6 +1288,16 @@
                   "checksum": "3f8a1c05e2",
                   "domain": "eng",
                   "markdown": "---\ntitle: eng\n---\n\n## When to Use\n\n- Route here for eng questions.\n"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`If-Match` carries more than one entity tag: this surface expects exactly one strong checksum, not a comma-separated list.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
                 }
               }
             }

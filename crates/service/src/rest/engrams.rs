@@ -594,7 +594,9 @@ pub async fn create(
         ),
         (
             status = 400,
-            description = "The body is not JSON.",
+            description = "The body is not JSON, or `If-Match` carries more \
+                           than one entity tag: this surface expects exactly \
+                           one strong checksum, not a comma-separated list.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -1165,6 +1167,14 @@ pub async fn validate(
         (
             status = 204,
             description = "Deleted. No body.",
+        ),
+        (
+            status = 400,
+            description = "`If-Match` carries more than one entity tag: this \
+                           surface expects exactly one strong checksum, not a \
+                           comma-separated list.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
         ),
         (
             status = 401,
