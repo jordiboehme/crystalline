@@ -201,6 +201,15 @@ What persists where:
 - `./knowledge` (bind mount) holds the engrams of every file domain, one subfolder per domain - the durable state for file-backed knowledge, exactly the same markdown-plus-frontmatter files the native binary reads.
 - `crystalline-data` (named volume, mounted at `/data`) holds the search index and the embedding model cache. For file domains those two are fully rebuildable: losing them costs a `crystalline reindex --full` and a model re-download (skipped entirely on `with-model`, since its model lives outside `/data` and is never affected by the volume), never knowledge. Two things on this volume are not rebuildable, though. If you run virtual domains, their engrams are the source of truth and live here, so back this volume up or `crystalline domain export` them to the bind mount to keep a file copy. And `web-auth.db` holds the JSON API's accounts and sessions, which are data rather than derived state: losing it means creating every user again with `crystalline users add`.
 
+The image runs as the non-root user `65532:65532` and ships `/data` owned by it, so an empty named volume mounted there is writable from the first start: Docker copies the image directory's ownership into the volume when it initializes it. A bind mount never inherits that - the host directory keeps its own ownership - so a host folder mounted at `/data` instead of a named volume has to be made writable by that uid first, or the daemon cannot create its state directory and the container restarts in a loop:
+
+```sh
+mkdir -p ./crystalline-data
+sudo chown 65532:65532 ./crystalline-data
+```
+
+The same applies to the bind-mounted knowledge folder whenever the daemon writes into it (an agent's `write_engram`, or the generated `index.md` files), which includes the case where `docker run` creates a missing bind-mount source itself: Docker creates it root-owned. A knowledge folder mounted read-only, as in `compose.git-sync.yaml`, needs nothing.
+
 The `with-model` variant sets `CRYSTALLINE_MODELS_DIR` (also settable directly, on any install, to relocate the model cache anywhere else) to a path outside `/data` so the baked model is never shadowed by the `/data` volume mount. The bundled model is [BAAI/bge-small-en-v1.5](https://huggingface.co/BAAI/bge-small-en-v1.5), MIT licensed.
 
 Both variants ship a built-in Docker `HEALTHCHECK` that probes `GET /health` with no shell involved (the image is distroless), so `docker ps` reports health directly and a Compose service can gate on `condition: service_healthy`. External monitors (a Kubernetes `httpGet` probe, an uptime checker such as Gatus, a load balancer) can probe the same `/health` endpoint directly rather than going through Docker's own health state.

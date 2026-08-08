@@ -53,6 +53,32 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 
 USER nonroot
 
+# Ship /data owned by the runtime user (65532:65532), so a fresh named volume
+# mounted there is writable from the first start.
+#
+# Docker copies the image's content *and* its ownership into a named volume
+# the first time that volume is used, but a volume mounted over a path the
+# image does not have is created root-owned instead - and this image runs as
+# uid 65532 with no way to chown anything, since distroless has no shell.
+# Without this the daemon cannot create its state directory under /data and
+# restart-loops until an operator chowns the volume by hand.
+#
+# The VOLUME line above is not enough on its own: it declares the mount point
+# and nothing more, and leaves no /data in the image filesystem (verified by
+# exporting the built image, before and after).
+#
+# WORKDIR is what creates the directory: it creates missing directories owned
+# by the current USER, which is why it sits after the USER line above rather
+# than beside the ENV block. The second WORKDIR puts the working directory
+# back to / - only the first one's side effect is wanted, not a container that
+# starts in /data.
+#
+# A *bind* mount cannot inherit any of this: the host directory keeps its own
+# ownership, so a bind-mounted state directory has to be writable by uid 65532
+# on the host (see docs/deployment.md#run-in-a-container).
+WORKDIR /data
+WORKDIR /
+
 ENTRYPOINT ["/usr/local/bin/crystalline"]
 CMD ["serve", "--http", "0.0.0.0:7411"]
 
