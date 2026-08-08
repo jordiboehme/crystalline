@@ -111,14 +111,14 @@ fn stored_name(name: &str) -> String {
     name.trim().to_lowercase()
 }
 
-/// One line per account: name, role, whether it is disabled, display name and
-/// email, columns aligned to the widest entry.
+/// One line per account: name, role, whether it is disabled, display name,
+/// email and when it was last seen, columns aligned to the widest entry.
 fn print_users(users: &[User]) {
     if users.is_empty() {
         println!("No users yet. Add one with: crystalline users add <name> --role admin");
         return;
     }
-    let rows: Vec<[String; 5]> = users
+    let rows: Vec<[String; 6]> = users
         .iter()
         .map(|u| {
             [
@@ -127,13 +127,14 @@ fn print_users(users: &[User]) {
                 if u.disabled { "disabled" } else { "active" }.to_string(),
                 u.display.clone(),
                 u.email.clone().unwrap_or_default(),
+                u.last_seen.clone().unwrap_or_default(),
             ]
         })
         .collect();
-    let header = ["NAME", "ROLE", "STATUS", "DISPLAY", "EMAIL"];
-    // The last column is never padded, so a trailing empty email leaves no
+    let header = ["NAME", "ROLE", "STATUS", "DISPLAY", "EMAIL", "LAST SEEN"];
+    // The last column is never padded, so a trailing empty last-seen leaves no
     // trailing whitespace behind.
-    let widths: Vec<usize> = (0..4)
+    let widths: Vec<usize> = (0..5)
         .map(|c| {
             rows.iter()
                 .map(|r| r[c].chars().count())
@@ -142,17 +143,17 @@ fn print_users(users: &[User]) {
                 .unwrap_or(0)
         })
         .collect();
-    let line = |cells: [&str; 5]| {
+    let line = |cells: [&str; 6]| {
         let mut out = String::new();
-        for (c, cell) in cells.iter().enumerate().take(4) {
+        for (c, cell) in cells.iter().enumerate().take(5) {
             out.push_str(&format!("{cell:<width$}  ", width = widths[c]));
         }
-        out.push_str(cells[4]);
+        out.push_str(cells[5]);
         println!("{}", out.trim_end());
     };
     line(header);
     for row in &rows {
-        line([&row[0], &row[1], &row[2], &row[3], &row[4]]);
+        line([&row[0], &row[1], &row[2], &row[3], &row[4], &row[5]]);
     }
     println!();
     println!(

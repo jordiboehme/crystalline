@@ -662,6 +662,7 @@ mod tests {
             email: None,
             role: Role::Admin,
             disabled: false,
+            last_seen: None,
         });
         for spelling in ["root", "ROOT", "  Root  "] {
             let refused = refuse_self(&caller, spelling, "delete")

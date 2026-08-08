@@ -278,7 +278,7 @@ fn as_session(
 }
 
 /// The field names one user object carries, which is the whole contract: the
-/// five columns the CLI's `users list --json` prints and nothing else.
+/// six columns the CLI's `users list --json` prints and nothing else.
 fn user_fields(user: &serde_json::Value) -> Vec<String> {
     let mut keys: Vec<String> = user
         .as_object()
@@ -1945,7 +1945,7 @@ async fn an_admin_creates_lists_edits_and_removes_an_account() {
     assert_eq!(body["user"]["disabled"], false);
     assert_eq!(
         user_fields(&body["user"]),
-        vec!["disabled", "display", "email", "name", "role"],
+        vec!["disabled", "display", "email", "last_seen", "name", "role"],
         "no password material may reach the client: {body}"
     );
 
@@ -1962,7 +1962,7 @@ async fn an_admin_creates_lists_edits_and_removes_an_account() {
     );
     assert_eq!(
         user_fields(&body["users"][0]),
-        vec!["disabled", "display", "email", "name", "role"],
+        vec!["disabled", "display", "email", "last_seen", "name", "role"],
         "the listing carries no hashes either: {body}"
     );
 

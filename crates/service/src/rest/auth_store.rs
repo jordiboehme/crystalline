@@ -156,6 +156,10 @@ pub struct User {
     /// A disabled account keeps its rows but can neither log in nor use an
     /// already-issued session.
     pub disabled: bool,
+    /// When this account last resolved a session or arrived through the
+    /// trusted header, RFC 3339. Null for an account never seen.
+    #[schema(example = "2026-08-08T09:14:22Z")]
+    pub last_seen: Option<String>,
 }
 
 /// What checking a password found, kept apart by how much work each one costs.
@@ -236,6 +240,7 @@ CREATE TABLE IF NOT EXISTS users (
     role TEXT NOT NULL,
     pass_hash TEXT,
     disabled INTEGER NOT NULL DEFAULT 0,
+    last_seen_at TEXT,
     created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS sessions (
@@ -249,11 +254,11 @@ CREATE INDEX IF NOT EXISTS sessions_expires_at ON sessions (expires_at);
 ";
 
 /// The columns every user read selects, in the order [`user_from_row`] decodes.
-const USER_COLUMNS: &str = "name, display, email, role, disabled";
+const USER_COLUMNS: &str = "name, display, email, role, disabled, last_seen_at";
 
 /// [`USER_COLUMNS`] qualified for the session join, where `users` is aliased
 /// `u`. Same columns in the same order, so [`user_from_row`] decodes both.
-const USER_COLUMNS_JOINED: &str = "u.name, u.display, u.email, u.role, u.disabled";
+const USER_COLUMNS_JOINED: &str = "u.name, u.display, u.email, u.role, u.disabled, u.last_seen_at";
 
 /// A `WHERE` fragment that is true unless the row it matches is the last
 /// *enabled* admin: either this account is not an enabled admin, or another
@@ -393,6 +398,7 @@ impl AuthStore {
         conn.execute_batch(SCHEMA)
             .await
             .context("creating the auth database schema")?;
+        ensure_column(&conn, "users", "last_seen_at TEXT").await?;
         Ok(AuthStore {
             _db: db,
             conn,
@@ -484,7 +490,7 @@ impl AuthStore {
         if user.disabled {
             return Ok(PasswordCheck::NoHash);
         }
-        let Some(hash) = cell_text(&row, 5) else {
+        let Some(hash) = cell_text(&row, 6) else {
             return Ok(PasswordCheck::NoHash);
         };
         if verify_hash(hash, password.to_string()).await? {
@@ -713,6 +719,16 @@ impl AuthStore {
             )
             .await
             .with_context(|| format!("provisioning user '{name}'"))?;
+        self.conn
+            .execute(
+                "UPDATE users SET last_seen_at = ?2 WHERE name = ?1",
+                vec![
+                    Value::Text(name.clone()),
+                    Value::Text(chrono::Utc::now().to_rfc3339()),
+                ],
+            )
+            .await
+            .context("stamping last_seen_at")?;
         self.query_first(
             &format!("SELECT {USER_COLUMNS} FROM users WHERE name = ?1"),
             vec![Value::Text(name.clone())],
@@ -816,7 +832,17 @@ impl AuthStore {
         if user.disabled {
             return Ok(None);
         }
-        let csrf = cell_text(&row, 5).unwrap_or_default();
+        let csrf = cell_text(&row, 6).unwrap_or_default();
+        self.conn
+            .execute(
+                "UPDATE users SET last_seen_at = ?2 WHERE name = ?1",
+                vec![
+                    Value::Text(user.name.clone()),
+                    Value::Text(chrono::Utc::now().to_rfc3339()),
+                ],
+            )
+            .await
+            .context("stamping last_seen_at")?;
         Ok(Some((user, csrf)))
     }
 
@@ -935,6 +961,27 @@ impl AuthStore {
     }
 }
 
+/// Add a column to an existing table when it is missing. The auth database has
+/// no schema-version counter - its `SCHEMA` is idempotent DDL - so a new column
+/// follows the same contract: run the ALTER, and treat "the column is already
+/// there" as success. Any other failure is real and propagates.
+async fn ensure_column(conn: &Connection, table: &str, column_def: &str) -> Result<()> {
+    match conn
+        .execute(&format!("ALTER TABLE {table} ADD COLUMN {column_def}"), ())
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(e)
+            if e.to_string()
+                .to_ascii_lowercase()
+                .contains("duplicate column") =>
+        {
+            Ok(())
+        }
+        Err(e) => Err(e).with_context(|| format!("adding {table}.{column_def}")),
+    }
+}
+
 /// Decode the [`USER_COLUMNS`] prefix of a row.
 fn user_from_row(row: &Row) -> User {
     User {
@@ -943,6 +990,7 @@ fn user_from_row(row: &Row) -> User {
         email: cell_text(row, 2),
         role: role_from_db(&cell_text(row, 3).unwrap_or_default()),
         disabled: matches!(row.get_value(4), Ok(Value::Integer(i)) if i != 0),
+        last_seen: cell_text(row, 5),
     }
 }
 
@@ -1941,5 +1989,69 @@ mod tests {
         assert!("root".parse::<Role>().is_err());
         // A hand-edited or corrupt row resolves to the least privileged role.
         assert_eq!(role_from_db("root"), Role::Viewer);
+    }
+
+    /// The column migration: a database created by the slice-1 schema (no
+    /// last_seen_at) opens cleanly and gains the column, and opening twice is
+    /// harmless - the idempotent-open contract, extended to columns.
+    #[tokio::test]
+    async fn an_old_database_gains_the_last_seen_column_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("web-auth.db");
+        // Hand-create the pre-migration shape.
+        {
+            let db = Builder::new_local(&path.to_string_lossy())
+                .build()
+                .await
+                .unwrap();
+            let conn = db.connect().unwrap();
+            conn.execute_batch(
+                "CREATE TABLE users (
+                    name TEXT PRIMARY KEY,
+                    display TEXT NOT NULL,
+                    email TEXT,
+                    role TEXT NOT NULL,
+                    pass_hash TEXT,
+                    disabled INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL
+                );
+                INSERT INTO users (name, display, email, role, pass_hash, disabled, created_at)
+                VALUES ('ada', 'Ada', NULL, 'admin', NULL, 0, '2026-01-01T00:00:00Z');",
+            )
+            .await
+            .unwrap();
+        }
+        let store = AuthStore::open(&path).await.unwrap();
+        let users = store.list_users().await.unwrap();
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].name, "ada");
+        assert!(users[0].last_seen.is_none(), "never seen yet");
+        drop(store);
+        // Re-opening (the migrated shape) must not fail on the duplicate column.
+        let again = AuthStore::open(&path).await.unwrap();
+        assert_eq!(again.list_users().await.unwrap().len(), 1);
+    }
+
+    /// Resolving a session stamps the account as seen; a trusted-header contact
+    /// (ensure_user) stamps it too.
+    #[tokio::test]
+    async fn resolving_a_session_updates_last_seen() {
+        let (_dir, store) = store().await;
+        store
+            .add_user("ada", "Ada", None, Role::Editor, "pw")
+            .await
+            .unwrap();
+        assert!(store.list_users().await.unwrap()[0].last_seen.is_none());
+
+        let s = store.create_session("ada", 3600).await.unwrap();
+        store.session_user(&s.token).await.unwrap().unwrap();
+        let seen = store.list_users().await.unwrap()[0].last_seen.clone();
+        assert!(seen.is_some(), "a resolved session is a sighting");
+
+        let provisioned = store.ensure_user("bob", Role::Viewer).await.unwrap();
+        assert!(
+            provisioned.last_seen.is_some(),
+            "provisioning is a sighting too"
+        );
     }
 }

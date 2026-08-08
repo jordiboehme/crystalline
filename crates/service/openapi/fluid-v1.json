@@ -1940,6 +1940,14 @@
             "description": "Optional contact address; never used for login.",
             "example": "ada@example.com"
           },
+          "last_seen": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "When this account last resolved a session or arrived through the\ntrusted header, RFC 3339. Null for an account never seen.",
+            "example": "2026-08-08T09:14:22Z"
+          },
           "name": {
             "type": "string",
             "description": "The login name and primary key. Also the identity the trusted-header\nmode provisions against.",

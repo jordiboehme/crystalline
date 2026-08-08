@@ -967,6 +967,7 @@ mod tests {
                 email: None,
                 role,
                 disabled: false,
+                last_seen: None,
             }),
             csrf: None,
             anonymous: false,
