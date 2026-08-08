@@ -27,10 +27,12 @@ WORKDIR /app
 ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0
 RUN npm install --global corepack@0.35.0 && corepack enable pnpm
 
-# The manifest and the lockfile on their own first, so the install layer is
-# rebuilt only when the dependencies actually change and not on every edit to
-# a source file.
-COPY package.json pnpm-lock.yaml ./
+# The manifest, the lockfile and the workspace file (pnpm reads overrides
+# from it, and a frozen install fails if the lockfile records overrides the
+# visible config does not declare) on their own first, so the install layer
+# is rebuilt only when the dependencies actually change and not on every
+# edit to a source file.
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 RUN pnpm install --frozen-lockfile
 
 COPY . .
