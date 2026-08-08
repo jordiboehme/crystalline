@@ -23,6 +23,7 @@ import GraphView from "./screens/GraphView";
 import Home from "./screens/Home";
 import NotFound from "./screens/NotFound";
 import Search from "./screens/Search";
+import UsersAdmin from "./screens/UsersAdmin";
 
 export function AppRoutes() {
   return (
@@ -40,6 +41,12 @@ export function AppRoutes() {
           <Route path="/d/:domain/e/*" element={<EngramPage />} />
           <Route path="/search" element={<Search />} />
           <Route path="/graph" element={<GraphView />} />
+          {/*
+            Routed for everybody and rendered for admins only: the screen
+            itself answers with the not-found screen for anyone else, so the
+            address says exactly as much as a mistyped one does.
+          */}
+          <Route path="/users" element={<UsersAdmin />} />
           <Route path="*" element={<NotFound />} />
         </Route>
       </Route>

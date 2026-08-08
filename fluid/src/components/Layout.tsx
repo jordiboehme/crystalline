@@ -23,7 +23,7 @@ import { problemDetail } from "../api/client";
 import { DOMAINS_QUERY_KEY, fetchDomains } from "../api/domains";
 import type { DomainSummary } from "../api/domains";
 import { useAuth } from "../auth/AuthContext";
-import { domainRoute, searchRoute } from "../paths";
+import { domainRoute, searchRoute, usersRoute } from "../paths";
 import { useTheme } from "../theme/context";
 import type { ThemePreference } from "../theme/context";
 import { CommandPalette } from "./CommandPalette";
@@ -101,6 +101,25 @@ function TopBar({
           <span className="hidden rounded bg-slate-100 px-2 py-1 text-xs text-slate-600 sm:inline dark:bg-slate-800 dark:text-slate-300">
             Read only
           </span>
+        )}
+
+        {/*
+          Only for the session that may use it. The screen refuses everyone
+          else on its own, so this is not the guard - it is the difference
+          between a frame that offers what you can do and one that offers a
+          door that will not open.
+        */}
+        {capabilities.canAdminister && (
+          <NavLink
+            to={usersRoute()}
+            className={({ isActive }) =>
+              `rounded border border-slate-300 px-2 py-1 text-sm hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800 ${
+                isActive ? "bg-slate-100 font-medium dark:bg-slate-800" : ""
+              }`
+            }
+          >
+            Users
+          </NavLink>
         )}
 
         <ThemeMenu />

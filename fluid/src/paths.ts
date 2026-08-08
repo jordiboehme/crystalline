@@ -51,6 +51,17 @@ export function graphRoute(
     : `/graph?anchor=${anchor}&depth=${String(depth)}`;
 }
 
+/**
+ * The account administration screen.
+ *
+ * A constant rather than a literal at each call site for the reason every
+ * builder here exists: the pattern in `routes.tsx` and the links pointing at
+ * it are one fact, kept in one place.
+ */
+export function usersRoute(): string {
+  return "/users";
+}
+
 /** Where the topbar's search box sends a query. */
 export function searchRoute(query: string): string {
   return `/search?q=${encodeURIComponent(query)}`;
