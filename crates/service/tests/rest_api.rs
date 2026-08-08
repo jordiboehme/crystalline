@@ -2850,6 +2850,42 @@ async fn a_password_reset_revokes_the_targets_sessions() {
     login(addr, "ada", "corrected horse").await;
 }
 
+/// An admin resetting its own password is not a special case: the store call
+/// is unconditional on whose account it names, so the caller's own session is
+/// revoked exactly like any other target's would be, this one included.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_admin_resetting_its_own_password_revokes_its_own_session() {
+    let (fixture, token, csrf) = serve_as_admin(AuthOptions::default()).await;
+    let addr = fixture.addr;
+
+    let reset = as_session(
+        addr,
+        reqwest::Method::POST,
+        "/api/v1/users/root/password",
+        &token,
+        &csrf,
+    )
+    .json(&serde_json::json!({"password": "corrected horse"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(reset.status(), 200);
+
+    let after = client()
+        .get(format!("http://{addr}/api/v1/domains"))
+        .header("cookie", format!("fluid_session={token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        after.status(),
+        401,
+        "the admin's own cookie from before the reset is dead"
+    );
+    // And the account is usable again with the password it just set.
+    login(addr, "root", "corrected horse").await;
+}
+
 /// Disabling revokes rather than hides: re-enabling the account must not hand
 /// back the cookies it held, or disabling a compromised account and enabling it
 /// again would restore the intruder's session.
