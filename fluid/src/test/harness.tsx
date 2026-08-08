@@ -32,7 +32,10 @@ export function answersFor(routes: Record<string, Answer>) {
   // Async, so an answer that throws an `ApiProblem` rejects the call exactly
   // as the real client would, without the test having to build a promise.
   return async (path: string, init?: RequestInit): Promise<never> => {
-    const route = path.split("?")[0];
+    // `split` on a non-empty separator always yields at least one element;
+    // the fallback to `path` itself only documents that guarantee to the
+    // checker, it never actually triggers.
+    const [route = path] = path.split("?");
     const answer = routes[route];
     if (!answer) {
       throw new ApiProblem(404, "not found", `no stub for ${route}`);

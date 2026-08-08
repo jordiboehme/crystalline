@@ -6,6 +6,8 @@
 //! directory, so that scenario isolates `HOME`/`XDG_*` the same way the
 //! service integration tests do.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
@@ -35,25 +37,24 @@ fn engram(title: &str, permalink: &str) -> String {
     )
 }
 
+/// Point a doctor invocation's `HOME`/`XDG_*`/Windows base-directory
+/// variables at a fresh scratch directory so its exit-code assertions never
+/// couple to the developer's real machine-wide state (harness configs under
+/// `~/.claude` and `~/.codex`, service lock and socket). Returns the
+/// directory as a guard: keep it bound in the caller for the duration of the
+/// `Command` call, since dropping it removes the directory.
+fn shield_ambient_home(cmd: &mut Command) -> tempfile::TempDir {
+    let home = tempfile::tempdir().unwrap();
+    for (name, value) in common::isolation_env(home.path()) {
+        cmd.env(name, value);
+    }
+    home
+}
+
 /// Scaffold and register a fresh domain, returning its root path. `domain add`
 /// now indexes on registration, so it needs the same `--db` the test's own
 /// later sync/doctor calls use (`work/index.db`), rather than the machine's
 /// default state directory.
-/// Point a doctor invocation's `HOME`/`XDG_*` at a scratch directory so its
-/// exit-code assertions never couple to the developer's real machine-wide
-/// state (harness configs under `~/.claude` and `~/.codex`, service lock and
-/// socket). A no-op on Windows, where the base-directory strategy does not
-/// honor these variables; Windows CI runs on a fresh profile, so the ambient
-/// state is empty there anyway.
-#[allow(unused_variables)]
-fn shield_ambient_home(cmd: &mut Command, tag: &str) {
-    #[cfg(unix)]
-    {
-        let (home, _state) = isolated_home(tag);
-        apply_home(cmd, &home);
-    }
-}
-
 fn setup_domain(work: &Path, name: &str, config: &Path) -> PathBuf {
     let domain_dir = work.join(format!("kb-{name}"));
     bin()
@@ -91,7 +92,7 @@ fn reports_clean_when_nothing_is_wrong() {
         .success();
 
     let mut cmd = bin();
-    shield_ambient_home(&mut cmd, "clean-run");
+    let _home = shield_ambient_home(&mut cmd);
     let out = cmd
         .args(["--json", "doctor", "--config"])
         .arg(&config)
@@ -138,7 +139,7 @@ fn reports_near_duplicate_tag_clusters_without_failing() {
         .success();
 
     let mut cmd = bin();
-    shield_ambient_home(&mut cmd, "tag-clusters");
+    let _home = shield_ambient_home(&mut cmd);
     let out = cmd
         .args(["--json", "doctor", "--config"])
         .arg(&config)
@@ -202,7 +203,7 @@ fn detects_orphan_and_fix_removes_it() {
 
     // --fix removes the orphan row and the report shows zero problems.
     let mut fixed_cmd = bin();
-    shield_ambient_home(&mut fixed_cmd, "orphan-fix");
+    let _home = shield_ambient_home(&mut fixed_cmd);
     let fixed_out = fixed_cmd
         .args(["--json", "doctor", "--fix", "--config"])
         .arg(&config)
@@ -218,7 +219,7 @@ fn detects_orphan_and_fix_removes_it() {
 
     // A clean re-run confirms the row is really gone.
     let mut clean_cmd = bin();
-    shield_ambient_home(&mut clean_cmd, "orphan-clean");
+    let _home = shield_ambient_home(&mut clean_cmd);
     let clean = clean_cmd
         .args(["--json", "doctor", "--config"])
         .arg(&config)
@@ -329,7 +330,7 @@ fn domain_filter_restricts_checks_to_one_domain() {
     setup_domain(work.path(), "product", &config);
 
     let mut cmd = bin();
-    shield_ambient_home(&mut cmd, "domain-filter");
+    let _home = shield_ambient_home(&mut cmd);
     let out = cmd
         .args(["--json", "doctor", "--domain", "eng", "--config"])
         .arg(&config)

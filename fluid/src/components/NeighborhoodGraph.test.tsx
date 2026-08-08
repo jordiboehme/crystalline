@@ -20,6 +20,7 @@ import { ApiProblem, api } from "../api/client";
 import type { GraphElement, GraphNodeData } from "../graphElements";
 import { isEdgeElement } from "../graphElements";
 import { RETIRED_CLASS } from "../lifecycle";
+import { defined } from "../test/assert";
 import { NeighborhoodGraph } from "./NeighborhoodGraph";
 
 vi.mock("../api/client", async (importOriginal) => {
@@ -159,7 +160,10 @@ describe("the neighborhood graph", () => {
     const list = await screen.findByRole("list", {
       name: /connections in this neighborhood/i,
     });
-    const [connection] = within(list).getAllByRole("listitem");
+    const connection = defined(
+      within(list).getAllByRole("listitem")[0],
+      "the sole connection row",
+    );
     expect(connection).toHaveTextContent("links_to");
     expect(
       within(connection).getByRole("link", { name: /Beta/ }),

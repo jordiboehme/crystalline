@@ -132,7 +132,8 @@ export default function Search() {
   // that domain's when exactly one is filtered on, and the instance's
   // otherwise. Either way the chips are the real set for what is being
   // searched rather than a guess assembled from a page of results.
-  const scope = request.domains.length === 1 ? request.domains[0] : null;
+  const scope =
+    request.domains.length === 1 ? (request.domains[0] ?? null) : null;
   const tags = useQuery({
     queryKey: vocabularyKey(scope),
     queryFn: () => fetchTags(scope),

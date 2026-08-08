@@ -12,6 +12,7 @@
 import { describe, expect, it } from "vitest";
 
 import { readTree } from "./domain";
+import { defined } from "../test/assert";
 
 /** One folder of a domain, in the shape the endpoint answers with. */
 function browsePayload() {
@@ -49,8 +50,9 @@ describe("a browse payload", () => {
     ]);
     // The domain of the request rides along, because a tree row names only
     // itself and a link out of one needs both halves of the address.
-    expect(tree.engrams[0].domain).toBe("eng");
-    expect(tree.engrams[0].type).toBe("engram");
+    const alpha = defined(tree.engrams[0], "the first row");
+    expect(alpha.domain).toBe("eng");
+    expect(alpha.type).toBe("engram");
   });
 
   it("leaves the status null when a row does not say", () => {
@@ -63,7 +65,8 @@ describe("a browse payload", () => {
     // Null rather than a plausible default: a row claiming a state nobody
     // wrote would be a lie a reader cannot see through, and it would fade or
     // fail to fade on that lie.
-    expect(tree.engrams[0].status).toBeNull();
-    expect(tree.engrams[0].title).toBe("a");
+    const row = defined(tree.engrams[0], "the first row");
+    expect(row.status).toBeNull();
+    expect(row.title).toBe("a");
   });
 });

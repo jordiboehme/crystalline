@@ -197,11 +197,13 @@ export function CommandPalette() {
   // The top row, in the order they are drawn in. Enter follows the highlight,
   // and the highlight is the top row until somebody moves it off: an answer
   // landing above a highlighted row takes the highlight with it.
+  const firstDomain = domains[0];
+  const firstHit = hits[0];
   const top =
-    domains.length > 0
-      ? domainValue(domains[0].name)
-      : hits.length > 0
-        ? engramValue(hits[0])
+    firstDomain !== undefined
+      ? domainValue(firstDomain.name)
+      : firstHit !== undefined
+        ? engramValue(firstHit)
         : typed === ""
           ? ""
           : searchValue(typed);

@@ -42,7 +42,7 @@ export function Markdown({ source, wikilinks }: MarkdownProps) {
         </p>
       }
     >
-      <MarkdownBody source={source} wikilinks={wikilinks} />
+      <MarkdownBody source={source} {...(wikilinks ? { wikilinks } : {})} />
     </Suspense>
   );
 }

@@ -79,7 +79,7 @@ export function EngramList({
     () => data?.pages.flatMap((page) => page.hits) ?? [],
     [data],
   );
-  const total = data?.pages[data.pages.length - 1].total ?? rows.length;
+  const total = data?.pages[data.pages.length - 1]?.total ?? rows.length;
 
   // The virtualizer hands back functions rather than values, which the React
   // Compiler cannot memoize, so it would skip this component. That is the
@@ -147,14 +147,22 @@ export function EngramList({
           className="relative w-full"
           style={{ height: `${String(virtualizer.getTotalSize())}px` }}
         >
-          {drawn.map((item) => (
-            <Row
-              key={`${rows[item.index].domain}/${rows[item.index].permalink}`}
-              row={rows[item.index]}
-              offset={item.start}
-              highlight={highlight}
-            />
-          ))}
+          {drawn.map((item) => {
+            const row = rows[item.index];
+            // The virtualizer only ever hands back indices within `rows`;
+            // this guards the type honestly rather than trusting that.
+            if (!row) {
+              return null;
+            }
+            return (
+              <Row
+                key={`${row.domain}/${row.permalink}`}
+                row={row}
+                offset={item.start}
+                highlight={highlight}
+              />
+            );
+          })}
         </ul>
       </div>
       {isFetchingNextPage && (
@@ -209,7 +217,7 @@ function Row({
         <span className="flex items-center gap-1.5 overflow-hidden text-xs whitespace-nowrap">
           {row.type !== null && <Badge>{row.type}</Badge>}
           {row.status !== null && (
-            <Badge title={retired ? "A retired status" : undefined}>
+            <Badge {...(retired ? { title: "A retired status" } : {})}>
               {row.status}
             </Badge>
           )}
