@@ -146,6 +146,25 @@ pub fn check_temporal(path: &Path, engram: &Engram) -> Vec<Issue> {
     issues
 }
 
+/// Run the single-document rule families - format (`E`) and temporal (`T`) -
+/// over one in-memory markdown text, without touching a filesystem or writing
+/// anything. Backs the HTTP validation dry-run, so editors and agents get the
+/// same findings `crystalline verify` would raise for these families. Link,
+/// manifest, schema and quality rules need a whole domain for context and are
+/// deliberately not run here.
+///
+/// Like [`check_temporal`]: no `.crystalline.yaml` override and no `--strict`
+/// promotion apply - findings come out at their default severities.
+pub fn check_document(domain: &str, rel_path: &Path, source: &str) -> Vec<Issue> {
+    let file = scanner::scanned_file_from_source(rel_path, source);
+    let mut issues = Vec::new();
+    let mut summary = Summary::default();
+    let mut sink = Sink::new(&mut issues, &mut summary, None, false);
+    format::check(&file, domain, &mut sink);
+    temporal::check(&file, &mut sink);
+    issues
+}
+
 /// Report paths are part of the stable output schema and must be identical
 /// on every platform, so they always use forward slashes.
 pub(crate) fn forward_slashes(path: &Path) -> std::path::PathBuf {
@@ -262,4 +281,42 @@ fn run_rules(domains: &[scanner::Domain], options: &VerifyOptions) -> VerifyRepo
     }
 
     VerifyReport { summary, issues }
+}
+
+#[cfg(test)]
+mod check_document_tests {
+    use super::*;
+    use std::path::Path;
+
+    const GOOD: &str = "---\ntype: engram\ntitle: Alpha\npermalink: alpha\ntags:\n  - eng\nstatus: stable\nrecorded_at: 2026-01-01\ngenerated:\n  by: human\n---\n\n# Alpha\n\nA body.\n";
+
+    #[test]
+    fn a_well_formed_document_has_no_findings() {
+        assert!(check_document("eng", Path::new("alpha.md"), GOOD).is_empty());
+    }
+
+    #[test]
+    fn a_parse_failure_is_a_finding_not_a_panic() {
+        let issues = check_document("eng", Path::new("broken.md"), "no frontmatter at all");
+        assert!(!issues.is_empty());
+        assert!(
+            issues.iter().any(|i| i.severity == Severity::Error),
+            "an unparseable document is a hard error"
+        );
+        assert!(issues.iter().all(|i| i.path == Path::new("broken.md")));
+    }
+
+    #[test]
+    fn temporal_rules_run_over_the_document() {
+        // valid_to before valid_from is the classic T-family finding.
+        let bad = GOOD.replace(
+            "status: stable",
+            "status: stable\nvalid_from: 2026-06-01\nvalid_to: 2026-01-01",
+        );
+        let issues = check_document("eng", Path::new("alpha.md"), &bad);
+        assert!(
+            issues.iter().any(|i| i.rule.starts_with('T')),
+            "expected a temporal finding, got {issues:?}"
+        );
+    }
 }
