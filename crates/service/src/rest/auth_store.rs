@@ -561,6 +561,30 @@ impl AuthStore {
         .await
     }
 
+    /// [`AuthStore::set_role`] without the last-admin guard. The CLI's
+    /// `users demote --force` recovery path; HTTP never calls it, so the
+    /// installation cannot be locked out over the network - only deliberately,
+    /// on the machine that holds this file.
+    pub async fn set_role_force(&self, name: &str, role: Role) -> Result<()> {
+        let name = normalize_name(name)?;
+        let _guard = self.guard.lock().await;
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE users SET role = ?2 WHERE name = ?1",
+                vec![
+                    Value::Text(name.clone()),
+                    Value::Text(role.as_str().to_string()),
+                ],
+            )
+            .await
+            .with_context(|| format!("updating user '{name}'"))?;
+        if changed == 0 {
+            bail!("no such user: '{name}'");
+        }
+        Ok(())
+    }
+
     /// Set or clear an account's display name. Clearing (None, or a value that
     /// trims to nothing) resets it to the folded login name, so a row is never
     /// nameless: the column is NOT NULL and the UI always has something to
@@ -697,6 +721,33 @@ impl AuthStore {
                 if exists.is_some() {
                     return Err(last_admin_error("remove", &name));
                 }
+                bail!("no such user: '{name}'");
+            }
+            Ok(())
+        }
+        .await;
+        self.finish(result).await
+    }
+
+    /// [`AuthStore::remove_user`] without the last-admin guard, for
+    /// `users remove --force`. Sessions still go first, in the same
+    /// `BEGIN IMMEDIATE` transaction, for the resurrection reasons the guarded
+    /// remove documents.
+    pub async fn remove_user_force(&self, name: &str) -> Result<()> {
+        let name = normalize_name(name)?;
+        let key = vec![Value::Text(name.clone())];
+        let _guard = self.guard.lock().await;
+        self.begin_immediate()
+            .await
+            .with_context(|| format!("removing user '{name}'"))?;
+        let result = async {
+            self.delete_sessions_of(&name).await?;
+            let changed = self
+                .conn
+                .execute("DELETE FROM users WHERE name = ?1", key)
+                .await
+                .with_context(|| format!("removing user '{name}'"))?;
+            if changed == 0 {
                 bail!("no such user: '{name}'");
             }
             Ok(())
@@ -2147,5 +2198,35 @@ mod tests {
             provisioned.last_seen.is_some(),
             "provisioning is a sighting too"
         );
+    }
+
+    /// The operator escape hatch: --force bypasses the last-admin guard. It still
+    /// reports a missing account, and a forced removal still takes the sessions
+    /// with it in the same transaction.
+    #[tokio::test]
+    async fn forced_edits_bypass_the_last_admin_guard() {
+        let (_dir, store) = store().await;
+        store
+            .add_user("ada", "Ada", None, Role::Admin, "pw")
+            .await
+            .unwrap();
+        let live = store.create_session("ada", 3600).await.unwrap();
+
+        // The guarded paths refuse; the forced ones do not.
+        assert!(store.set_role("ada", Role::Viewer).await.is_err());
+        store.set_role_force("ada", Role::Viewer).await.unwrap();
+        assert_eq!(store.list_users().await.unwrap()[0].role, Role::Viewer);
+
+        store.set_role_force("ada", Role::Admin).await.unwrap();
+        assert!(store.remove_user("ada").await.is_err());
+        store.remove_user_force("ada").await.unwrap();
+        assert!(store.list_users().await.unwrap().is_empty());
+        assert!(
+            store.session_user(&live.token).await.unwrap().is_none(),
+            "a forced removal still revokes the sessions"
+        );
+
+        assert!(store.set_role_force("ghost", Role::Viewer).await.is_err());
+        assert!(store.remove_user_force("ghost").await.is_err());
     }
 }
