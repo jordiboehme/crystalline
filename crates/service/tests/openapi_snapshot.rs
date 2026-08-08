@@ -20,6 +20,9 @@ use std::collections::BTreeSet;
 /// annotated and an annotation for a route nobody mounted each fail here. The
 /// method is part of it because a documented method the router does not serve
 /// would generate a client function that compiles and then answers 405.
+///
+/// A write operation added here must also join `write_ops()` in
+/// rest_write_api.rs, the auth/CSRF matrix.
 const MOUNTED_OPERATIONS: &[&str] = &[
     "GET /api/v1/openapi.json",
     "POST /api/v1/auth/login",

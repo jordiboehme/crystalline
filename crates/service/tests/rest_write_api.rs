@@ -1219,3 +1219,221 @@ async fn a_read_only_instance_refuses_user_mutations() {
         "nothing above changed anything"
     );
 }
+
+/// One write operation as the matrix drives it.
+struct WriteOp {
+    method: reqwest::Method,
+    path: &'static str,
+    /// A body that passes validation when the caller is allowed.
+    body: Option<serde_json::Value>,
+    /// Whether the route demands admin (403 for an editor).
+    admin_only: bool,
+}
+
+/// Every mutating route the `/api/v1` surface mounts, spec section 10's write
+/// matrix as data. A route added to the router without a row here is caught
+/// only by the pointer comment above `MOUNTED_OPERATIONS` in
+/// `openapi_snapshot.rs` - there is no automatic cross-check, so keep the two
+/// lists in step by hand.
+fn write_ops() -> Vec<WriteOp> {
+    use reqwest::Method;
+    vec![
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/domains/eng/engrams",
+            body: Some(serde_json::json!({"title": "Fresh", "content": "# Fresh\n"})),
+            admin_only: false,
+        },
+        WriteOp {
+            method: Method::PUT,
+            path: "/api/v1/domains/eng/engrams/alpha",
+            body: Some(serde_json::json!({"content": "x"})),
+            admin_only: false,
+        },
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/domains/eng/retire",
+            body: Some(serde_json::json!({"permalink": "alpha", "status": "deprecated"})),
+            admin_only: false,
+        },
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/domains/eng/move",
+            body: Some(serde_json::json!({"permalink": "alpha", "destination": "moved/alpha"})),
+            admin_only: false,
+        },
+        WriteOp {
+            method: Method::DELETE,
+            path: "/api/v1/domains/eng/engrams/alpha",
+            body: None,
+            admin_only: false,
+        },
+        WriteOp {
+            method: Method::PUT,
+            path: "/api/v1/domains/eng/manifest",
+            body: Some(serde_json::json!({"markdown": "x"})),
+            admin_only: false,
+        },
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/validate",
+            body: Some(serde_json::json!({"content": "x"})),
+            admin_only: false,
+        },
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/users",
+            body: Some(serde_json::json!({"name": "new", "role": "viewer", "password": "pw"})),
+            admin_only: true,
+        },
+        WriteOp {
+            method: Method::PATCH,
+            path: "/api/v1/users/mark",
+            body: Some(serde_json::json!({"display": "M"})),
+            admin_only: true,
+        },
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/users/mark/password",
+            body: Some(serde_json::json!({"password": "pw2"})),
+            admin_only: true,
+        },
+        WriteOp {
+            method: Method::DELETE,
+            path: "/api/v1/users/tina",
+            body: None,
+            admin_only: true,
+        },
+    ]
+}
+
+fn request_for(
+    addr: std::net::SocketAddr,
+    op: &WriteOp,
+    session: Option<&(String, String)>,
+    csrf: Option<&str>,
+) -> reqwest::RequestBuilder {
+    let mut req = client().request(op.method.clone(), format!("http://{addr}{}", op.path));
+    if let Some((cookie, own_csrf)) = session {
+        req = req.header("cookie", format!("fluid_session={cookie}"));
+        req = req.header("x-csrf-token", csrf.unwrap_or(own_csrf));
+    }
+    if let Some(body) = &op.body {
+        req = req.json(body);
+    } else {
+        // A bodyless op still needs to not trip 415 on anything; DELETE sends none.
+        req = req.header("content-type", "application/json");
+    }
+    req
+}
+
+/// The spec's matrix: anonymous never writes, viewer 403, admin-only routes
+/// 403 for an editor, missing/wrong CSRF 403, read_only refuses all. "Allowed"
+/// is asserted as "gets past authorization", i.e. anything but 401/403 - the
+/// per-endpoint tests own the happy-path semantics (ETags, bodies, 4xx
+/// preconditions).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_write_matrix_holds_on_every_route() {
+    // Plain instance: role and CSRF rows.
+    let fx = serve(Options::default()).await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    let editor = login(fx.addr, "eddy", "eddypw").await;
+    let viewer = login(fx.addr, "vera", "verapw").await;
+
+    for op in write_ops() {
+        let label = format!("{} {}", op.method, op.path);
+
+        // No identity at all: 401 ahead of everything.
+        let resp = request_for(fx.addr, &op, None, None).send().await.unwrap();
+        assert_eq!(resp.status(), 401, "{label} with no identity");
+
+        // A viewer session: authenticated, refused.
+        let resp = request_for(fx.addr, &op, Some(&viewer), None)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403, "{label} as viewer");
+
+        // Missing and wrong CSRF: refused before any handler logic.
+        let session = if op.admin_only { &admin } else { &editor };
+        let no_token = client()
+            .request(op.method.clone(), format!("http://{}{}", fx.addr, op.path))
+            .header("cookie", format!("fluid_session={}", session.0));
+        let no_token = match &op.body {
+            Some(body) => no_token.json(body),
+            None => no_token,
+        };
+        assert_eq!(
+            no_token.send().await.unwrap().status(),
+            403,
+            "{label} without csrf"
+        );
+        let resp = request_for(fx.addr, &op, Some(session), Some("wrong"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403, "{label} with wrong csrf");
+
+        // Admin-only routes refuse an editor.
+        if op.admin_only {
+            let resp = request_for(fx.addr, &op, Some(&editor), None)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 403, "{label} as editor on an admin route");
+        }
+
+        // The allowed caller gets past authorization: whatever the endpoint
+        // answers (2xx, or a 4xx precondition like 428), it is not 401/403.
+        let resp = request_for(fx.addr, &op, Some(session), None)
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            resp.status() != 401 && resp.status() != 403,
+            "{label} as its minimum role must pass authorization, got {}",
+            resp.status()
+        );
+    }
+
+    // Anonymous instance: the anonymous viewer never writes.
+    let anon = serve(Options {
+        anonymous: true,
+        ..Options::default()
+    })
+    .await;
+    for op in write_ops() {
+        let resp = request_for(anon.addr, &op, None, None)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            401,
+            "{} {} as the anonymous viewer: told to log in, never served",
+            op.method,
+            op.path
+        );
+    }
+
+    // Read-only instance: every write refuses for the strongest caller.
+    let ro = serve(Options {
+        read_only: true,
+        ..Options::default()
+    })
+    .await;
+    let admin = login(ro.addr, "root", "rootpw").await;
+    for op in write_ops() {
+        let resp = request_for(ro.addr, &op, Some(&admin), None)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            403,
+            "{} {} under read_only",
+            op.method,
+            op.path
+        );
+    }
+}
