@@ -70,13 +70,13 @@ const LOGIN_PATH: &str = "/auth/login";
 /// already forgotten, which is exactly the case a browser retries.
 const PUBLIC_PATHS: [&str; 3] = [LOGIN_PATH, "/auth/logout", "/auth/me"];
 
-/// The two auth settings, resolved once when the HTTP surface is built.
+/// The three auth settings, resolved once when the HTTP surface is built.
 ///
 /// Startup-effective by design, like `service.read_only`: the trusted header is
 /// parsed into a [`HeaderName`] here so a typo is a clear startup error rather
 /// than a header that silently never matches, and so no request pays for the
 /// parse.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct AuthCfg {
     /// The header a trusted proxy names the authenticated user in, from
     /// `auth.trusted_header`. `None` means the path is off.
@@ -84,10 +84,24 @@ pub struct AuthCfg {
     /// Whether a request carrying no identity is served anyway, from
     /// `auth.anonymous`.
     pub anonymous: bool,
+    /// How many accounts trusted-header provisioning may mint in total, from
+    /// `auth.max_users`. Only minting a *new* account is capped; an existing
+    /// one always resolves, and the `crystalline users` CLI is never capped.
+    pub max_users: usize,
+}
+
+impl Default for AuthCfg {
+    fn default() -> AuthCfg {
+        AuthCfg {
+            trusted_header: None,
+            anonymous: false,
+            max_users: crystalline_core::config::DEFAULT_MAX_USERS,
+        }
+    }
 }
 
 impl AuthCfg {
-    /// Read both settings out of `config`, validating the header name.
+    /// Read all three settings out of `config`, validating the header name.
     ///
     /// The settings layer only checks that the value is non-empty and has no
     /// whitespace (see `settings::set_trusted_header`), which still admits
@@ -104,6 +118,7 @@ impl AuthCfg {
         Ok(AuthCfg {
             trusted_header,
             anonymous: config.auth_anonymous(),
+            max_users: config.auth_max_users(),
         })
     }
 }
@@ -243,7 +258,20 @@ async fn resolve(state: &RestState, headers: &HeaderMap) -> Result<Identity, Api
         // The store folds the name, so a proxy that sends `Ada` today and `ada`
         // tomorrow keeps one account, and it hands disabled accounts back like
         // any other: refusing them is this layer's job.
-        let user = state.auth.ensure_user(value, Role::Viewer).await?;
+        let user = state
+            .auth
+            .ensure_user(value, Role::Viewer, state.auth_cfg.max_users)
+            .await
+            .map_err(|e| {
+                let msg = format!("{e:#}");
+                if msg.contains("auth.max_users") || msg.contains("login name") {
+                    // The header named an identity this instance will not
+                    // provision: the caller cannot fix it, the operator can.
+                    ApiError::forbidden(msg)
+                } else {
+                    ApiError::internal(msg)
+                }
+            })?;
         if user.disabled {
             return Err(ApiError::forbidden("this account is disabled"));
         }
@@ -779,7 +807,10 @@ mod tests {
             .await
             .unwrap();
         // Provisioned by a trusted header, so it has no password at all.
-        store.ensure_user("bob", Role::Viewer).await.unwrap();
+        store
+            .ensure_user("bob", Role::Viewer, usize::MAX)
+            .await
+            .unwrap();
         store
             .add_user("cyd", "Cyd", None, Role::Editor, "pw")
             .await
@@ -852,18 +883,26 @@ mod tests {
         let mut config = GlobalConfig::default();
         assert!(AuthCfg::resolve(&config).unwrap().trusted_header.is_none());
         assert!(!AuthCfg::resolve(&config).unwrap().anonymous);
+        assert_eq!(
+            AuthCfg::resolve(&config).unwrap().max_users,
+            crystalline_core::config::DEFAULT_MAX_USERS,
+            "an absent auth.max_users resolves to the default cap"
+        );
 
         config.auth = Some(crystalline_core::config::AuthConfig {
             trusted_header: Some("Remote-User".to_string()),
             anonymous: Some(true),
+            max_users: Some(5),
         });
         let cfg = AuthCfg::resolve(&config).unwrap();
         assert_eq!(cfg.trusted_header.unwrap().as_str(), "remote-user");
         assert!(cfg.anonymous);
+        assert_eq!(cfg.max_users, 5);
 
         config.auth = Some(crystalline_core::config::AuthConfig {
             trusted_header: Some("not a header".to_string()),
             anonymous: None,
+            max_users: None,
         });
         let err = AuthCfg::resolve(&config).unwrap_err().to_string();
         assert!(

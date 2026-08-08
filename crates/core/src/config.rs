@@ -206,6 +206,15 @@ impl GlobalConfig {
             .and_then(|a| a.anonymous)
             .unwrap_or(false)
     }
+
+    /// `auth.max_users`. Absent config or an absent key means the default cap.
+    pub fn auth_max_users(&self) -> usize {
+        self.auth
+            .as_ref()
+            .and_then(|a| a.max_users)
+            .map(|n| n as usize)
+            .unwrap_or(DEFAULT_MAX_USERS)
+    }
 }
 
 /// Which side of the one-truth-per-domain rule a domain lives on: files on
@@ -513,6 +522,12 @@ pub struct IdentityConfig {
     pub actor: Option<String>,
 }
 
+/// `auth.max_users`'s default: how many accounts trusted-header provisioning
+/// may mint in total when the setting is absent. Beside [`AuthConfig`] rather
+/// than buried in [`GlobalConfig::auth_max_users`] so a caller that needs the
+/// number without a config in hand (a test, a settings default) has it too.
+pub const DEFAULT_MAX_USERS: usize = 100;
+
 /// The `auth` block: how the served API identifies a caller. Reads like a
 /// settings-page section - see the `configure` tool, which exposes exactly
 /// these keys.
@@ -527,6 +542,11 @@ pub struct AuthConfig {
     /// Serve requests that carry no identity at all. Absent means off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anonymous: Option<bool>,
+    /// `auth.max_users`. How many accounts trusted-header provisioning may
+    /// mint in total; absent means the default of 100. The CLI is never
+    /// capped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_users: Option<u32>,
 }
 
 /// Service configuration.

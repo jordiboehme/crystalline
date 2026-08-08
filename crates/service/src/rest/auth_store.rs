@@ -787,10 +787,45 @@ impl AuthStore {
     /// header value of `Ada` must resolve to the existing `ada` rather than
     /// mint a second account at the default role, which would silently undo a
     /// disable or a demotion. The display name keeps the casing as sent.
-    pub async fn ensure_user(&self, name: &str, role: Role) -> Result<User> {
+    ///
+    /// `cap` bounds how many accounts this call may *mint*: an account that
+    /// already exists always resolves, whatever the current count is relative
+    /// to `cap`, and only bringing a new one into existence is refused once
+    /// the count has reached it. This is the trusted-header mitigation - a
+    /// proxy misconfiguration (a header carrying a session id, say) must not
+    /// mint one account per request forever. The check-then-insert runs under
+    /// this process's `guard`, so two calls in this process cannot both slip
+    /// past it; the cross-process window (a `crystalline users add` racing it
+    /// in another process) can overshoot the cap by at most the number of
+    /// racing writers, which is acceptable for a mitigation whose job is
+    /// stopping *unbounded* minting, not enforcing an exact ceiling.
+    pub async fn ensure_user(&self, name: &str, role: Role, cap: usize) -> Result<User> {
         let display = name.trim().to_string();
         let name = normalize_name(name)?;
         let _guard = self.guard.lock().await;
+        let exists = self
+            .query_first(
+                "SELECT 1 FROM users WHERE name = ?1",
+                vec![Value::Text(name.clone())],
+            )
+            .await?
+            .is_some();
+        if !exists {
+            let count = match self
+                .query_first("SELECT COUNT(*) FROM users", vec![])
+                .await?
+                .map(|row| row.get_value(0))
+            {
+                Some(Ok(Value::Integer(n))) => n as usize,
+                _ => 0,
+            };
+            if count >= cap {
+                bail!(
+                    "refusing to provision '{name}': the account cap is reached \
+                     (auth.max_users = {cap}). Remove unused accounts or raise the cap"
+                );
+            }
+        }
         self.conn
             .execute(
                 "INSERT OR IGNORE INTO users
@@ -1755,26 +1790,77 @@ mod tests {
     #[tokio::test]
     async fn ensure_user_is_idempotent() {
         let (_dir, store) = store().await;
-        let first = store.ensure_user("ada", Role::Viewer).await.unwrap();
-        let second = store.ensure_user("ada", Role::Viewer).await.unwrap();
+        let first = store
+            .ensure_user("ada", Role::Viewer, usize::MAX)
+            .await
+            .unwrap();
+        let second = store
+            .ensure_user("ada", Role::Viewer, usize::MAX)
+            .await
+            .unwrap();
         assert_eq!(first.name, second.name);
         assert_eq!(first.role, second.role);
         assert_eq!(store.list_users().await.unwrap().len(), 1);
     }
 
+    /// The provisioning cap: ensure_user refuses to mint an account past the cap,
+    /// while an existing account keeps resolving whatever the count is. This is
+    /// the trusted-header mitigation - a proxy misconfiguration (a header carrying
+    /// a session id, say) must not mint one account per request forever.
+    #[tokio::test]
+    async fn ensure_user_refuses_to_mint_past_the_cap() {
+        let (_dir, store) = store().await;
+        store.ensure_user("ada", Role::Viewer, 2).await.unwrap();
+        store.ensure_user("bob", Role::Viewer, 2).await.unwrap();
+
+        let err = store.ensure_user("cyd", Role::Viewer, 2).await.unwrap_err();
+        assert!(
+            err.to_string().contains("auth.max_users"),
+            "the refusal names the setting: {err}"
+        );
+        assert_eq!(store.list_users().await.unwrap().len(), 2);
+
+        // Existing accounts resolve regardless of the count-vs-cap state.
+        assert_eq!(
+            store
+                .ensure_user("ada", Role::Viewer, 2)
+                .await
+                .unwrap()
+                .name,
+            "ada"
+        );
+        assert_eq!(
+            store
+                .ensure_user("ADA", Role::Viewer, 1)
+                .await
+                .unwrap()
+                .name,
+            "ada"
+        );
+    }
+
     #[tokio::test]
     async fn ensure_user_keeps_an_admin_assigned_role() {
         let (_dir, store) = store().await;
-        store.ensure_user("ada", Role::Viewer).await.unwrap();
+        store
+            .ensure_user("ada", Role::Viewer, usize::MAX)
+            .await
+            .unwrap();
         store.set_role("ada", Role::Admin).await.unwrap();
-        let again = store.ensure_user("ada", Role::Viewer).await.unwrap();
+        let again = store
+            .ensure_user("ada", Role::Viewer, usize::MAX)
+            .await
+            .unwrap();
         assert_eq!(again.role, Role::Admin);
     }
 
     #[tokio::test]
     async fn a_provisioned_user_has_no_password_to_log_in_with() {
         let (_dir, store) = store().await;
-        store.ensure_user("ada", Role::Editor).await.unwrap();
+        store
+            .ensure_user("ada", Role::Editor, usize::MAX)
+            .await
+            .unwrap();
         assert!(store.verify_password("ada", "").await.unwrap().is_none());
         store.set_password("ada", "pw").await.unwrap();
         assert!(store.verify_password("ada", "pw").await.unwrap().is_some());
@@ -1795,7 +1881,10 @@ mod tests {
             .unwrap();
         store.set_disabled("ada", true).await.unwrap();
 
-        let same = store.ensure_user("Ada", Role::Viewer).await.unwrap();
+        let same = store
+            .ensure_user("Ada", Role::Viewer, usize::MAX)
+            .await
+            .unwrap();
         assert_eq!(same.name, "ada");
         assert!(same.disabled, "the disable must not have been undone");
         assert_eq!(same.role, Role::Editor, "the role must not have been reset");
@@ -1857,7 +1946,12 @@ mod tests {
                     .is_err(),
                 "add_user must reject {blank:?}"
             );
-            assert!(store.ensure_user(blank, Role::Viewer).await.is_err());
+            assert!(
+                store
+                    .ensure_user(blank, Role::Viewer, usize::MAX)
+                    .await
+                    .is_err()
+            );
             // A login attempt is a `None`, not an error, like every other bad
             // credential.
             assert!(store.verify_password(blank, "pw").await.unwrap().is_none());
@@ -1879,7 +1973,12 @@ mod tests {
                     .is_err(),
                 "add_user must reject {name:?}"
             );
-            assert!(store.ensure_user(name, Role::Viewer).await.is_err());
+            assert!(
+                store
+                    .ensure_user(name, Role::Viewer, usize::MAX)
+                    .await
+                    .is_err()
+            );
             assert!(store.set_role(name, Role::Admin).await.is_err());
             // A login attempt is a NoHash, not an error, like other bad names.
             assert!(store.verify_password(name, "pw").await.unwrap().is_none());
@@ -2193,7 +2292,10 @@ mod tests {
         let seen = store.list_users().await.unwrap()[0].last_seen.clone();
         assert!(seen.is_some(), "a resolved session is a sighting");
 
-        let provisioned = store.ensure_user("bob", Role::Viewer).await.unwrap();
+        let provisioned = store
+            .ensure_user("bob", Role::Viewer, usize::MAX)
+            .await
+            .unwrap();
         assert!(
             provisioned.last_seen.is_some(),
             "provisioning is a sighting too"

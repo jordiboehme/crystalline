@@ -270,6 +270,15 @@ pub fn registry() -> &'static [SettingSpec] {
             clear: clear_anonymous,
             effective: anonymous_effective,
         },
+        SettingSpec {
+            key: "auth.max_users",
+            doc: "How many accounts trusted-header provisioning may mint in total (default 100); the crystalline users CLI is never capped (applies at the next daemon start)",
+            kind: SettingKind::String,
+            startup_effective: true,
+            apply: set_max_users,
+            clear: clear_max_users,
+            effective: max_users_effective,
+        },
     ]
 }
 
@@ -1036,6 +1045,39 @@ fn anonymous_effective(config: &GlobalConfig) -> (String, bool) {
     (config.auth_anonymous().to_string(), is_default)
 }
 
+// --- auth.max_users -----------------------------------------------------------
+
+fn set_max_users(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
+    let parsed: u32 = value.trim().parse().map_err(|_| {
+        SettingsError(format!(
+            "auth.max_users must be a positive integer, got '{value}'"
+        ))
+    })?;
+    if parsed == 0 {
+        return Err(SettingsError(
+            "auth.max_users must be at least 1: zero would refuse every trusted-header identity"
+                .to_string(),
+        ));
+    }
+    config
+        .auth
+        .get_or_insert_with(AuthConfig::default)
+        .max_users = Some(parsed);
+    Ok(())
+}
+
+fn clear_max_users(config: &mut GlobalConfig) {
+    if let Some(a) = config.auth.as_mut() {
+        a.max_users = None;
+    }
+    drop_auth_if_empty(config);
+}
+
+fn max_users_effective(config: &GlobalConfig) -> (String, bool) {
+    let is_default = config.auth.as_ref().and_then(|a| a.max_users).is_none();
+    (config.auth_max_users().to_string(), is_default)
+}
+
 // --- domains_root ----------------------------------------------------------
 
 fn set_domains_root(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
@@ -1069,7 +1111,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_lists_exactly_the_eighteen_keys_in_order() {
+    fn registry_lists_exactly_the_nineteen_keys_in_order() {
         assert_eq!(
             known_keys(),
             vec![
@@ -1091,6 +1133,7 @@ mod tests {
                 "identity.actor",
                 "auth.trusted_header",
                 "auth.anonymous",
+                "auth.max_users",
             ]
         );
     }
@@ -1147,6 +1190,7 @@ mod tests {
                     "CRYSTALLINE_AUTH_TRUSTED_HEADER".to_string()
                 ),
                 ("auth.anonymous", "CRYSTALLINE_AUTH_ANONYMOUS".to_string()),
+                ("auth.max_users", "CRYSTALLINE_AUTH_MAX_USERS".to_string()),
             ]
         );
     }
@@ -1171,6 +1215,7 @@ mod tests {
         assert!(change_note("identity.actor", &no_env).is_none());
         assert!(change_note("auth.trusted_header", &no_env).is_some());
         assert!(change_note("auth.anonymous", &no_env).is_some());
+        assert!(change_note("auth.max_users", &no_env).is_some());
         assert!(change_note("github.bogus", &no_env).is_none());
     }
 
@@ -1469,7 +1514,7 @@ mod tests {
         apply(&mut cfg, "github.enabled", "true").unwrap();
 
         let views = snapshot(&cfg, &EnvOverlay::default());
-        assert_eq!(views.len(), 18);
+        assert_eq!(views.len(), 19);
         assert_eq!(
             views.iter().map(|v| v.key.as_str()).collect::<Vec<_>>(),
             vec![
@@ -1491,6 +1536,7 @@ mod tests {
                 "identity.actor",
                 "auth.trusted_header",
                 "auth.anonymous",
+                "auth.max_users",
             ]
         );
 
@@ -2009,5 +2055,49 @@ mod tests {
         );
         assert_eq!(cfg.auth_trusted_header(), Some("X-Forwarded-User"));
         assert!(!cfg.auth_anonymous());
+    }
+
+    // --- auth.max_users -----------------------------------------------------------
+
+    #[test]
+    fn apply_auth_max_users_happy_path() {
+        let mut cfg = GlobalConfig::default();
+        assert_eq!(cfg.auth_max_users(), 100, "the default cap is 100");
+        apply(&mut cfg, "auth.max_users", "50").unwrap();
+        assert_eq!(cfg.auth_max_users(), 50);
+        assert_eq!(max_users_effective(&cfg), ("50".to_string(), false));
+    }
+
+    #[test]
+    fn auth_max_users_rejects_zero_and_non_numbers() {
+        let mut cfg = GlobalConfig::default();
+        let err = apply(&mut cfg, "auth.max_users", "0").unwrap_err();
+        assert!(err.to_string().contains("at least 1"), "{err}");
+        assert!(cfg.auth.is_none(), "a rejected value must not be written");
+
+        let err = apply(&mut cfg, "auth.max_users", "many").unwrap_err();
+        assert!(err.to_string().contains("positive integer"), "{err}");
+        assert!(cfg.auth.is_none(), "a rejected value must not be written");
+    }
+
+    #[test]
+    fn unset_auth_max_users_restores_the_default_and_drops_an_emptied_auth_block() {
+        let mut cfg = GlobalConfig::default();
+        apply(&mut cfg, "auth.max_users", "50").unwrap();
+        assert!(cfg.auth.is_some());
+
+        unset(&mut cfg, "auth.max_users").unwrap();
+        assert!(
+            cfg.auth.is_none(),
+            "the only set field was cleared, so the block should vanish"
+        );
+        assert_eq!(cfg.auth_max_users(), 100);
+        assert_eq!(max_users_effective(&cfg), ("100".to_string(), true));
+
+        let yaml = serde_yaml_ng::to_string(&cfg).unwrap();
+        assert!(
+            !yaml.contains("auth"),
+            "an emptied auth block must not round-trip into the yaml: {yaml}"
+        );
     }
 }

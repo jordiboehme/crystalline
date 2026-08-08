@@ -16,7 +16,7 @@ use crystalline_service::daemon::http_router;
 use crystalline_service::rest::{AuthStore, Role};
 use tokio::sync::Mutex;
 
-/// The two startup-effective auth settings a test varies. Everything else is
+/// The startup-effective auth settings a test varies. Everything else is
 /// the shared fixture below.
 #[derive(Default)]
 struct AuthOptions {
@@ -24,6 +24,9 @@ struct AuthOptions {
     anonymous: bool,
     /// `auth.trusted_header`: the header a trusted proxy names the user in.
     trusted_header: Option<&'static str>,
+    /// `auth.max_users`: how many accounts trusted-header provisioning may
+    /// mint in total. `None` leaves the default cap (100) in place.
+    max_users: Option<u32>,
 }
 
 /// Build the same kind of engine the other service integration tests use: a
@@ -37,6 +40,7 @@ async fn build_engine(opts: AuthOptions) -> (tempfile::TempDir, Arc<Engine>) {
         auth: Some(AuthConfig {
             trusted_header: opts.trusted_header.map(str::to_string),
             anonymous: Some(opts.anonymous),
+            max_users: opts.max_users,
         }),
         ..GlobalConfig::default()
     };
@@ -775,6 +779,94 @@ async fn a_disabled_account_is_refused_on_the_trusted_header() {
         .unwrap();
     assert_eq!(resp.status(), 403);
     assert_eq!(resp.headers()["content-type"], "application/problem+json");
+}
+
+/// A trusted-header value with internal whitespace cannot normalize into a
+/// login name (see `auth_store::normalize_name`). Before this task that
+/// refusal fell through the generic `anyhow` conversion and answered `500`;
+/// the caller cannot fix the proxy's header, so it must be a `403` naming the
+/// problem, not an opaque server error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_trusted_header_name_with_spaces_is_refused_as_403() {
+    let fixture = serve_with_auth(AuthOptions {
+        trusted_header: Some("remote-user"),
+        ..AuthOptions::default()
+    })
+    .await;
+    let resp = client()
+        .get(format!("http://{}/api/v1/auth/me", fixture.addr))
+        .header("remote-user", "ada lovelace")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+    assert_eq!(resp.headers()["content-type"], "application/problem+json");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body["detail"].as_str().unwrap().contains("whitespace"),
+        "the message must be actionable, not opaque: {body}"
+    );
+    assert!(
+        fixture.auth.list_users().await.unwrap().is_empty(),
+        "no account was minted for a name that cannot normalize"
+    );
+}
+
+/// `auth.max_users` bounds trusted-header provisioning: once the cap is
+/// reached, a request naming a new identity is refused `403` rather than
+/// minting past it, while an account that already exists keeps resolving.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn trusted_header_provisioning_is_capped() {
+    let fixture = serve_with_auth(AuthOptions {
+        trusted_header: Some("remote-user"),
+        max_users: Some(1),
+        ..AuthOptions::default()
+    })
+    .await;
+
+    let first = client()
+        .get(format!("http://{}/api/v1/auth/me", fixture.addr))
+        .header("remote-user", "ada")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), 200, "the first account is under the cap");
+
+    let refused = client()
+        .get(format!("http://{}/api/v1/auth/me", fixture.addr))
+        .header("remote-user", "bob")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 403);
+    assert_eq!(
+        refused.headers()["content-type"],
+        "application/problem+json"
+    );
+    let body: serde_json::Value = refused.json().await.unwrap();
+    assert!(
+        body["detail"].as_str().unwrap().contains("auth.max_users"),
+        "the refusal names the setting: {body}"
+    );
+
+    // The existing account still resolves, whatever the count-vs-cap state.
+    let still = client()
+        .get(format!("http://{}/api/v1/auth/me", fixture.addr))
+        .header("remote-user", "ada")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(still.status(), 200);
+
+    let names: Vec<String> = fixture
+        .auth
+        .list_users()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|u| u.name)
+        .collect();
+    assert_eq!(names, vec!["ada".to_string()]);
 }
 
 /// Logout is a mutating request, so it carries the CSRF token the session was
@@ -2200,7 +2292,7 @@ async fn a_cross_site_shaped_body_is_refused_on_the_trusted_header_path() {
     let addr = fixture.addr;
     fixture
         .auth
-        .ensure_user("proxy", Role::Viewer)
+        .ensure_user("proxy", Role::Viewer, usize::MAX)
         .await
         .unwrap();
     fixture.auth.set_role("proxy", Role::Admin).await.unwrap();
