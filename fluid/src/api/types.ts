@@ -189,6 +189,8 @@ export interface paths {
          * @description The text lands verbatim, frontmatter included: nothing rebuilds it and nothing stamps provenance, so a client that saves what it read writes back byte-identical bytes.
          *
          *     The write is guarded by `If-Match`, whose token is the `ETag` of the detail read it is based on: a save that arrives without one is answered 428, and one whose token is stale is answered 412 carrying the version the server holds now, so a client can merge rather than lose the edit.
+         *
+         *     Editing the `permalink` in the frontmatter moves the engram's address, since the index takes the permalink from the file. Such a save is answered 200 with the engram read at its new address, so a client can follow the move rather than lose track of what it just wrote.
          */
         put: operations["save_engram"];
         post?: never;
@@ -1291,6 +1293,15 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
+            /** @description The body is over the 10 MiB limit this API accepts. */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
             /** @description The body is not `application/json`. */
             415: {
                 headers: {
@@ -1469,6 +1480,15 @@ export interface operations {
                 };
                 content: {
                     "application/problem+json": components["schemas"]["ConflictDetail"];
+                };
+            };
+            /** @description The document is over the 10 MiB limit this API accepts. */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
             /** @description The body is not `application/json`. */

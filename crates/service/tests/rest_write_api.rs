@@ -332,17 +332,23 @@ async fn two_concurrent_saves_settle_as_one_winner_and_one_conflict() {
 
 /// The save writes exactly the bytes it was given, frontmatter included, even
 /// when that frontmatter's `permalink` no longer matches the URL the save came
-/// in on. Rewriting the caller's document to keep the two in step is not this
-/// layer's call to make: an editor that saved something other than what its
-/// author typed would be worse than an engram whose address moved, and the
-/// address is derived from the file on the next index pass either way.
+/// in on - and then follows the engram to where it moved.
+///
+/// Rewriting the caller's document to keep the URL and the file in step is not
+/// this layer's call to make: an editor that saved something other than what
+/// its author typed would be worse than an engram whose address moved. So the
+/// answer follows instead, and a rename that also changes the title - the case
+/// with no name left in common - still answers 200 at the new address rather
+/// than 404 over a write that landed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_save_writes_the_caller_s_bytes_verbatim() {
+async fn a_save_writes_verbatim_and_answers_at_the_new_address() {
     let fx = serve(Options::default()).await;
     let editor = login(fx.addr, "eddy", "eddypw").await;
     let (etag, content) = read_alpha(fx.addr, &editor).await;
 
-    let diverged = content.replace("permalink: alpha", "permalink: renamed");
+    let diverged = content
+        .replace("permalink: alpha", "permalink: renamed")
+        .replace("title: Alpha", "title: Renamed");
     let saved = as_session(
         fx.addr,
         reqwest::Method::PUT,
@@ -355,9 +361,77 @@ async fn a_save_writes_the_caller_s_bytes_verbatim() {
     .await
     .unwrap();
     assert_eq!(saved.status(), 200);
+    let new_etag = saved.headers()["etag"].to_str().unwrap().to_string();
+    let body: serde_json::Value = saved.json().await.unwrap();
+    assert_eq!(
+        body["permalink"], "renamed",
+        "the answer is the read at the address the engram now has"
+    );
 
     let on_disk = std::fs::read_to_string(fx._tmp.path().join("eng/alpha.md")).unwrap();
     assert_eq!(on_disk, diverged, "byte for byte what was sent");
+
+    // And the token that came back is the one the next save of it carries.
+    let again = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/eng/engrams/renamed",
+        &editor,
+    )
+    .header("if-match", &new_etag)
+    .json(&serde_json::json!({ "content": diverged.replace("A rule", "Another rule") }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(again.status(), 200);
+}
+
+/// A body past the API's limit is refused with 413 rather than truncated or
+/// hung on, and the refusal is a problem detail like every other one.
+///
+/// The limit is set explicitly (`rest::MAX_BODY_BYTES`) because axum's 2 MiB
+/// default would leave an engram past that size readable but unsavable, which
+/// is a trap an author only finds after making their edit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_body_past_the_limit_is_refused_with_413() {
+    let fx = serve(Options::default()).await;
+    let editor = login(fx.addr, "eddy", "eddypw").await;
+    let (etag, content) = read_alpha(fx.addr, &editor).await;
+
+    // Comfortably past the limit, and past axum's default several times over.
+    let huge = format!(
+        "{content}{}",
+        "x".repeat(crystalline_service::rest::MAX_BODY_BYTES)
+    );
+    let resp = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/eng/engrams/alpha",
+        &editor,
+    )
+    .header("if-match", format!("\"{etag}\""))
+    .json(&serde_json::json!({ "content": huge }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 413);
+    assert_eq!(resp.headers()["content-type"], "application/problem+json");
+
+    // A document that is merely large still saves: the limit is generous on
+    // purpose, and this is the size that broke under axum's default.
+    let big = format!("{}\n{}\n", content.trim_end(), "padding ".repeat(400_000));
+    let ok = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/eng/engrams/alpha",
+        &editor,
+    )
+    .header("if-match", format!("\"{etag}\""))
+    .json(&serde_json::json!({ "content": big }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(ok.status(), 200, "a 3 MiB engram is an engram");
 }
 
 /// The reserved OKF names are not documents: `index.md` is generated from the

@@ -760,6 +760,16 @@
               }
             }
           },
+          "413": {
+            "description": "The body is over the 10 MiB limit this API accepts.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
           "415": {
             "description": "The body is not `application/json`.",
             "content": {
@@ -886,7 +896,7 @@
           "engrams"
         ],
         "summary": "Save an engram's complete markdown text.",
-        "description": "The text lands verbatim, frontmatter included: nothing rebuilds it and nothing stamps provenance, so a client that saves what it read writes back byte-identical bytes.\n\nThe write is guarded by `If-Match`, whose token is the `ETag` of the detail read it is based on: a save that arrives without one is answered 428, and one whose token is stale is answered 412 carrying the version the server holds now, so a client can merge rather than lose the edit.",
+        "description": "The text lands verbatim, frontmatter included: nothing rebuilds it and nothing stamps provenance, so a client that saves what it read writes back byte-identical bytes.\n\nThe write is guarded by `If-Match`, whose token is the `ETag` of the detail read it is based on: a save that arrives without one is answered 428, and one whose token is stale is answered 412 carrying the version the server holds now, so a client can merge rather than lose the edit.\n\nEditing the `permalink` in the frontmatter moves the engram's address, since the index takes the permalink from the file. Such a save is answered 200 with the engram read at its new address, so a client can follow the move rather than lose track of what it just wrote.",
         "operationId": "save_engram",
         "parameters": [
           {
@@ -994,6 +1004,16 @@
               "application/problem+json": {
                 "schema": {
                   "$ref": "#/components/schemas/ConflictDetail"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The document is over the 10 MiB limit this API accepts.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
                 }
               }
             }

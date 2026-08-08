@@ -15,6 +15,7 @@ mod users_api;
 use std::sync::Arc;
 
 use axum::Router;
+use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, patch, post};
 use tokio::sync::Semaphore;
 
@@ -168,6 +169,22 @@ impl RestState {
     }
 }
 
+/// The largest request body this API accepts, in bytes.
+///
+/// Set explicitly rather than left to axum's 2 MiB default, and set generously,
+/// because the body that matters here is one engram's markdown: a domain in the
+/// wild holds documents far past a megabyte (the semantic-search spill this
+/// project chased was provoked by exactly those), and a default that let such
+/// an engram be read but not saved back would fail at the worst moment - after
+/// its author had edited it. Ten mebibytes is comfortably past the largest
+/// document anyone writes by hand and still small enough that a hostile body
+/// cannot make this process reserve serious memory.
+///
+/// A body over the limit is refused with 413 before a handler runs, in
+/// problem+json like every other failure here: `ApiJson` re-renders axum's
+/// rejection and keeps the status it chose.
+pub const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
+
 /// Build the REST router. Mounted with `nest("/api/v1", ...)`, so the paths
 /// here are relative to that prefix and the fallback below only ever answers
 /// for unknown paths under it.
@@ -218,6 +235,9 @@ pub fn router(state: RestState) -> Router {
             state.clone(),
             auth::guard,
         ))
+        // Outermost, so an oversized body is refused before the guard reads a
+        // cookie or the store is touched. See [`MAX_BODY_BYTES`].
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
 }
 

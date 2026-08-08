@@ -1359,6 +1359,21 @@ impl Engine {
         }
         let permalink = slugify(&rel);
 
+        // The whole existence-check-then-write, for a file domain, under that
+        // file's lock: the check and the write it authorizes must be one step,
+        // or two creates of one title both find the permalink free, both write,
+        // and the second answers "created" over the first's body instead of the
+        // conflict that says the name was taken. Taken before the store lock,
+        // like every other holder. See `Engine::write_lock`.
+        let file_lock = match &source {
+            ContentSource::File { root } => Some(self.write_lock(&join_rel(root, &rel))),
+            ContentSource::Virtual => None,
+        };
+        let _guard = match &file_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+
         // Enforce overwrite semantics against the existing permalink.
         {
             let store = self.store.lock().await;
@@ -1442,6 +1457,12 @@ impl Engine {
     /// it in the store's compare-and-swap (`upsert_engram_checked`); both
     /// failure paths speak the store's own "stale edit" language so the HTTP
     /// layer classifies them as one conflict.
+    ///
+    /// The `permalink` in the receipt is the one the engram answers to *after*
+    /// the write, which is not always the one it was addressed by: writing the
+    /// document verbatim means an author may have edited the `permalink` line
+    /// in the frontmatter, and the index takes the permalink from the file. A
+    /// caller that saved a rename is told where its engram went.
     pub async fn save_engram(&self, p: &SaveParams) -> Result<Value> {
         if self.read_only {
             return Err(EngineError::ReadOnly);
@@ -1538,6 +1559,25 @@ impl Engine {
             }
         }
 
+        // Where the engram now answers. Read back after the reindex rather than
+        // echoed from the resolution that preceded it: the index takes an
+        // engram's permalink from its frontmatter, so an author who edited that
+        // line has just moved the address, and a receipt naming the old one
+        // would send its caller to a permalink nothing resolves. The saved
+        // content is the truth here, so the truth is what is asked.
+        let permalink = {
+            let store = self.store.lock().await;
+            store
+                .list_engrams(&desc.domain, Some(&desc.path), None)
+                .await?
+                .into_iter()
+                .find(|found| found.path == desc.path)
+                .map(|found| found.permalink)
+                // Unreachable while the write above succeeded; the resolved
+                // name is the honest fallback rather than a panic.
+                .unwrap_or_else(|| desc.permalink.clone())
+        };
+
         // A save can rewrite the MANIFEST engram of a virtual domain or the
         // titles a folder index lists, same as an edit.
         if matches!(source, ContentSource::Virtual) {
@@ -1547,7 +1587,7 @@ impl Engine {
 
         Ok(json!({
             "domain": desc.domain,
-            "permalink": desc.permalink,
+            "permalink": permalink,
             "path": desc.path,
             "checksum": sha256_hex(p.content.as_bytes()),
         }))
@@ -1634,6 +1674,12 @@ impl Engine {
         match &source {
             ContentSource::File { root } => {
                 let abs = join_rel(root, &desc.path);
+                // Held across the read, the retirement edit and the write, for
+                // the reason `edit_engram_as` gives: this is a read-modify-write
+                // with nothing to refuse a concurrent change on, so serializing
+                // is what stops one from being dropped. See `Engine::write_lock`.
+                let lock = self.write_lock(&abs);
+                let _guard = lock.lock().await;
                 let current = std::fs::read_to_string(&abs).map_err(|source| EngineError::Io {
                     path: abs.display().to_string(),
                     source,
@@ -1697,6 +1743,12 @@ impl Engine {
             match succ_source {
                 ContentSource::File { root } => {
                     let abs = join_rel(root, &succ_desc.path);
+                    // The successor's own file, under its own lock: appending
+                    // the reciprocal line is another read-modify-write. Taken
+                    // after the target's has been released, never with it, so
+                    // two retirements naming each other cannot deadlock.
+                    let lock = self.write_lock(&abs);
+                    let _guard = lock.lock().await;
                     let current =
                         std::fs::read_to_string(&abs).map_err(|source| EngineError::Io {
                             path: abs.display().to_string(),
@@ -1943,6 +1995,16 @@ impl Engine {
         match &source {
             ContentSource::File { root } => {
                 let abs = join_rel(root, &desc.path);
+                // Held across the read, the edit and the write. An edit of a
+                // file domain carries no checksum to refuse on, so serializing
+                // is the whole guarantee: two edits, or an agent's edit racing
+                // a browser's save, each compute their result from a version
+                // the other has already replaced, and the later write drops the
+                // earlier change without a word. Under the lock the second one
+                // reads the first's result and applies to that. See
+                // `Engine::write_lock`.
+                let lock = self.write_lock(&abs);
+                let _guard = lock.lock().await;
                 let current = std::fs::read_to_string(&abs).map_err(|source| EngineError::Io {
                     path: abs.display().to_string(),
                     source,
@@ -6136,32 +6198,63 @@ impl Engine {
             .clone()
     }
 
-    /// The per-file lock the checksum-guarded verbs hold across their whole
-    /// compare-then-write, created lazily on first use and keyed by absolute
-    /// path.
+    /// The per-file lock every content write holds across its whole
+    /// read-decide-write, created lazily on first use and keyed by the file's
+    /// canonical path.
     ///
     /// What it closes is a time-of-check-to-time-of-use race, not a partial
-    /// write: `save_engram`, `save_manifest` and `delete_engram` each read the
-    /// file, hash it, compare that against the caller's `expected_checksum`
-    /// and only then act. Unlocked, two saves of one engram arriving together
-    /// (two browser tabs, or one tab whose autosave overlaps a manual save)
-    /// both read the same text, both find their token fresh and both write.
-    /// One author's version then wins on disk while the other is told the save
-    /// succeeded, which is precisely the outcome `If-Match` exists to prevent.
-    /// Held across the comparison and the write, the second caller reads the
-    /// first's bytes and is answered with the conflict it should have had.
+    /// write. Each of the file-domain writes looks at the world and then acts
+    /// on what it saw, and between those two steps another writer fits:
     ///
-    /// Keyed by the absolute path rather than by `domain/permalink` so two
-    /// domains registered over one root still serialize on the file itself.
-    /// Taken before the store lock, always, so the two never invert; virtual
-    /// domains take neither, since their compare-and-swap happens inside a
-    /// single database statement. The map is never pruned, like
-    /// [`Engine::origin_locks`]: an entry is a path string and an `Arc`, and
-    /// the set of files a process ever writes is bounded by the installation.
+    /// - [`Engine::save_engram`], [`Engine::save_manifest`] and
+    ///   [`Engine::delete_engram`] read the file, hash it and compare that
+    ///   against the caller's `expected_checksum`. Unlocked, two saves of one
+    ///   engram arriving together (two browser tabs, or one tab whose autosave
+    ///   overlaps a manual save) both read the same text, both find their token
+    ///   fresh and both write. One author's version then wins on disk while the
+    ///   other is told the save succeeded, which is precisely the outcome
+    ///   `If-Match` exists to prevent.
+    /// - [`Engine::write_engram_as`] checks that the permalink is free and then
+    ///   creates the file. Two creates of one title would both find it free and
+    ///   both write, and the second would answer 201 over the first's body
+    ///   rather than the 409 that says it was already taken.
+    /// - [`Engine::edit_engram_as`] and [`Engine::retire_engram_as`] read the
+    ///   file, apply their operation to that text and write the result. Two
+    ///   edits, or an agent's edit racing a browser's save, would each compute
+    ///   from a version the other has already replaced, and the last write
+    ///   would silently drop the other's change. This is a lost-update guard
+    ///   rather than a conflict report: an edit of a file domain carries no
+    ///   `expected_checksum` to refuse on (that is the MCP contract, see
+    ///   [`crate::params::EditParams`]), so serializing is all that is on
+    ///   offer, and the second edit applies to the first's result instead of to
+    ///   a version that no longer exists. A retirement takes its successor's
+    ///   lock too, for the reciprocal line it appends there, but never at the
+    ///   same time as its target's.
+    ///
+    /// Held across the whole sequence, the second caller sees the first's bytes
+    /// and either refuses or builds on them.
+    ///
+    /// Keyed by the file's own identity rather than by `domain/permalink`, so
+    /// two domains registered over one root, or over two spellings of one path,
+    /// still serialize on the file itself: the key is
+    /// [`canonicalize`](std::fs::canonicalize)d where the filesystem can
+    /// resolve it, which covers symlinks and `..` segments, and falls back to
+    /// the path as given for a file that does not exist yet - a create and a
+    /// save of one engram therefore share a key only once the file is there,
+    /// which is exactly when both are reading it. Taken before the store lock,
+    /// always, so the two never invert; virtual domains take neither, since
+    /// their compare-and-swap happens inside a single database statement.
+    ///
+    /// The map is never pruned, like [`Engine::origin_locks`]: an entry is a
+    /// path string and an `Arc`, and the set of files a process ever writes is
+    /// bounded by the installation.
+    ///
+    /// **In-process only.** Two Crystalline processes over one domain root are
+    /// not held apart by this; the host-lock machinery governs that.
     fn write_lock(&self, abs: &Path) -> Arc<tokio::sync::Mutex<()>> {
         let mut locks = self.write_locks.lock().unwrap();
         locks
-            .entry(abs.to_string_lossy().into_owned())
+            .entry(lock_key(abs))
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
     }
@@ -7209,6 +7302,30 @@ fn read_engram_file(root: &Path, rel: &str) -> Option<Engram> {
 /// (non-canonical) path when it no longer resolves, so a domain whose folder
 /// moved away still compares by its last-known path instead of silently
 /// dropping out of the comparison. A virtual domain has no path, so `None`.
+/// The [`Engine::write_locks`] key for a file: its canonical path wherever the
+/// filesystem can resolve one, so two spellings of one file - a symlinked
+/// domain root, a `..` segment, a case difference the filesystem folds - share
+/// a lock instead of each getting their own.
+///
+/// A file that does not exist yet cannot be canonicalized, and a create is
+/// exactly that case, so the parent folder is resolved instead and the filename
+/// joined back on. When even the parent is missing (a create that will also
+/// make the folder) the path as given is the key: still stable, and still the
+/// same string for two creates racing on one target, since both derive it from
+/// the same registered root. The same fallback ladder
+/// [`canonicalized_file_path`] uses for a domain root, one level deeper.
+fn lock_key(abs: &Path) -> String {
+    if let Ok(canonical) = std::fs::canonicalize(abs) {
+        return canonical.to_string_lossy().into_owned();
+    }
+    if let (Some(parent), Some(name)) = (abs.parent(), abs.file_name())
+        && let Ok(canonical) = std::fs::canonicalize(parent)
+    {
+        return canonical.join(name).to_string_lossy().into_owned();
+    }
+    abs.to_string_lossy().into_owned()
+}
+
 fn canonicalized_file_path(entry: &DomainEntry) -> Option<PathBuf> {
     let path = entry.file_path()?;
     Some(std::fs::canonicalize(&path).unwrap_or(path))
@@ -7767,6 +7884,227 @@ mod lock_tests {
         let other = engine.write_lock(Path::new("/roots/known/beta.md"));
         assert!(!Arc::ptr_eq(&first, &other), "and it is per file");
         assert_eq!(engine.write_locks.lock().unwrap().len(), 2);
+    }
+
+    /// Two spellings of one file share a lock, which is the point of keying on
+    /// the canonical path: a domain registered through a symlink and the same
+    /// domain registered at its real path are two strings for one file, and two
+    /// locks over one file are no lock at all.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn one_file_reached_two_ways_still_has_one_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("eng");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("alpha.md"), "x").unwrap();
+        let linked = tmp.path().join("linked");
+        std::os::unix::fs::symlink(&root, &linked).unwrap();
+
+        let engine = engine_with_domains(&["known"]).await;
+        let direct = engine.write_lock(&root.join("alpha.md"));
+        let through_link = engine.write_lock(&linked.join("alpha.md"));
+        assert!(
+            Arc::ptr_eq(&direct, &through_link),
+            "the symlinked spelling resolves to the same file, so to the same lock"
+        );
+        // And a file that does not exist yet - a create - still resolves
+        // through its folder, so the create and the first save of one engram
+        // agree on the key.
+        let unborn = engine.write_lock(&root.join("beta.md"));
+        let unborn_linked = engine.write_lock(&linked.join("beta.md"));
+        assert!(Arc::ptr_eq(&unborn, &unborn_linked));
+        assert_eq!(engine.write_locks.lock().unwrap().len(), 2);
+    }
+
+    /// A file-domain engine over `root`, with whatever files were written into
+    /// it already indexed.
+    async fn file_engine(root: &Path) -> Arc<Engine> {
+        let store = TursoStore::open_in_memory().await.unwrap();
+        let mut config = GlobalConfig::default();
+        config
+            .domains
+            .insert("eng".to_string(), DomainEntry::file(root));
+        let engine = Arc::new(Engine::new(Arc::new(Mutex::new(store)), config, None, None));
+        engine.sync(None).await.unwrap();
+        engine
+    }
+
+    /// The markdown of a minimal engram, for the tests below.
+    fn engram(title: &str, permalink: &str, body: &str) -> String {
+        format!(
+            "---\ntype: engram\ntitle: {title}\npermalink: {permalink}\ntags:\n  - eng\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n{body}\n"
+        )
+    }
+
+    /// A create checks that the permalink is free *inside* the file's lock, so
+    /// two creates of one title cannot both find it free.
+    ///
+    /// Unlocked, the second create writes over the first's body and answers
+    /// "created" rather than the conflict that says the name was taken - the
+    /// worse half of the pair, because the caller is told it succeeded. Driven
+    /// the same way as the save test: the lock is held from outside while the
+    /// create is in flight, the engram it is about to claim is landed and
+    /// indexed underneath it, and the create must then refuse.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_create_checks_the_permalink_is_free_inside_the_file_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("eng");
+        std::fs::create_dir_all(&root).unwrap();
+        let engine = file_engine(&root).await;
+
+        let abs = root.join("beta.md");
+        let lock = engine.write_lock(&abs);
+        let held = lock.lock().await;
+
+        let creator = engine.clone();
+        let task = tokio::spawn(async move {
+            creator
+                .write_engram(&WriteParams {
+                    domain: "eng".to_string(),
+                    title: "Beta".to_string(),
+                    content: "Mine.".to_string(),
+                    folder: None,
+                    engram_type: None,
+                    tags: Vec::new(),
+                    status: None,
+                    metadata: None,
+                    overwrite: false,
+                })
+                .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !task.is_finished(),
+            "the create must be waiting on the file lock, not already past its existence check"
+        );
+
+        // The other writer got there first: the file lands and is indexed while
+        // this create is blocked.
+        let theirs = engram("Beta", "beta", "Theirs.");
+        std::fs::write(&abs, &theirs).unwrap();
+        engine.sync(None).await.unwrap();
+        drop(held);
+
+        match task.await.unwrap() {
+            Err(EngineError::Conflict(message)) => assert!(
+                message.contains("already exists"),
+                "the conflict says the name was taken: {message}"
+            ),
+            other => panic!("the create claimed a permalink that was already gone: {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(&abs).unwrap(),
+            theirs,
+            "and the other writer's engram is untouched"
+        );
+    }
+
+    /// An edit reads, applies and writes inside the file's lock, so a
+    /// concurrent write is built on rather than dropped.
+    ///
+    /// An edit of a file domain has no checksum to refuse on, so serializing is
+    /// the entire guarantee: what must not happen is the edit computing from
+    /// text that has already been replaced and then writing that computation
+    /// over the replacement. Here the other writer's line lands while the edit
+    /// is blocked, and both lines have to survive.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_edit_reads_and_writes_inside_the_file_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("eng");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("alpha.md"), engram("Alpha", "alpha", "The body.")).unwrap();
+        let engine = file_engine(&root).await;
+
+        let abs = root.join("alpha.md");
+        let lock = engine.write_lock(&abs);
+        let held = lock.lock().await;
+
+        let editor = engine.clone();
+        let task = tokio::spawn(async move {
+            let params: EditParams = serde_json::from_value(json!({
+                "identifier": "alpha",
+                "domain": "eng",
+                "operation": "append",
+                "content": "From the agent.\n",
+            }))
+            .unwrap();
+            editor.edit_engram(&params).await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !task.is_finished(),
+            "the edit must be waiting on the file lock, not already holding stale text"
+        );
+
+        // The other writer's change lands while the edit is blocked.
+        std::fs::write(
+            &abs,
+            engram("Alpha", "alpha", "The body.\n\nFrom the browser."),
+        )
+        .unwrap();
+        drop(held);
+
+        task.await.unwrap().expect("the edit applies");
+        let final_text = std::fs::read_to_string(&abs).unwrap();
+        assert!(
+            final_text.contains("From the browser."),
+            "the concurrent write must not be silently dropped: {final_text}"
+        );
+        assert!(
+            final_text.contains("From the agent."),
+            "and the edit still applied, on top of it: {final_text}"
+        );
+    }
+
+    /// A save reports where the engram answers *after* it landed, which is not
+    /// always where it was addressed: the document is written verbatim, so an
+    /// author may have edited the `permalink` line in it, and the index takes
+    /// the permalink from the file. A receipt naming the old address would send
+    /// the caller to a permalink nothing resolves.
+    #[tokio::test]
+    async fn a_save_that_renames_reports_the_new_permalink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("eng");
+        std::fs::create_dir_all(&root).unwrap();
+        let original = engram("Alpha", "alpha", "The body.");
+        std::fs::write(root.join("alpha.md"), &original).unwrap();
+        let engine = file_engine(&root).await;
+
+        let renamed = original.replace("permalink: alpha", "permalink: renamed");
+        let receipt = engine
+            .save_engram(&SaveParams {
+                domain: "eng".to_string(),
+                identifier: "alpha".to_string(),
+                content: renamed.clone(),
+                expected_checksum: sha256_hex(original.as_bytes()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            receipt["permalink"], "renamed",
+            "the receipt names where the engram now answers"
+        );
+        assert_eq!(receipt["path"], "alpha.md", "the file did not move");
+        assert_eq!(
+            std::fs::read_to_string(root.join("alpha.md")).unwrap(),
+            renamed,
+            "and the bytes are the author's own"
+        );
+
+        // An ordinary save still reports the address it was given.
+        let plain = renamed.replace("The body.", "A sharper body.");
+        let receipt = engine
+            .save_engram(&SaveParams {
+                domain: "eng".to_string(),
+                identifier: "renamed".to_string(),
+                content: plain.clone(),
+                expected_checksum: sha256_hex(renamed.as_bytes()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(receipt["permalink"], "renamed");
     }
 
     /// A save reads the file it is comparing against *inside* the per-file

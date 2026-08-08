@@ -396,6 +396,12 @@ pub struct SaveEngramBody {
             content_type = "application/problem+json",
         ),
         (
+            status = 413,
+            description = "The body is over the 10 MiB limit this API accepts.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
             status = 415,
             description = "The body is not `application/json`.",
             body = ProblemDetail,
@@ -485,13 +491,14 @@ pub async fn create(
 ///
 /// One consequence of writing the text verbatim is worth knowing: an author who
 /// edits the `permalink` in the frontmatter moves the engram's address, since
-/// the index takes the permalink from the file. The answer is still the read of
-/// what landed, which resolves by title when the permalink has moved out from
-/// under the URL. Rewriting the caller's frontmatter to keep the two in step is
-/// deliberately not done - an editor that saved something other than what its
-/// author typed would be the worse surprise - and an author who changes the
-/// title and the permalink in the same save is answered 404 by that read even
-/// though the write landed; they find their engram at its new address.
+/// the index takes the permalink from the file. Rewriting the caller's
+/// frontmatter to keep the URL and the document in step is deliberately not
+/// done - an editor that saved something other than what its author typed would
+/// be the worse surprise - so the save follows the engram instead: the engine's
+/// receipt names the permalink the engram answers to *after* the write, and the
+/// detail read in the answer is taken at that address. A rename therefore
+/// answers 200 with the engram at its new permalink, and the `ETag` in that
+/// answer is the token for the next save of it.
 #[utoipa::path(
     put,
     path = "/api/v1/domains/{domain}/engrams/{permalink}",
@@ -505,7 +512,12 @@ pub async fn create(
                    the detail read it is based on: a save that arrives without \
                    one is answered 428, and one whose token is stale is \
                    answered 412 carrying the version the server holds now, so a \
-                   client can merge rather than lose the edit.",
+                   client can merge rather than lose the edit.\n\nEditing the \
+                   `permalink` in the frontmatter moves the engram's address, \
+                   since the index takes the permalink from the file. Such a \
+                   save is answered 200 with the engram read at its new \
+                   address, so a client can follow the move rather than lose \
+                   track of what it just wrote.",
     params(
         ("domain" = String, Path, description = "The registered domain."),
         (
@@ -567,6 +579,13 @@ pub async fn create(
             description = "The `If-Match` token is stale. The body carries the \
                            version the server holds now, so a client can merge.",
             body = ConflictDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 413,
+            description = "The document is over the 10 MiB limit this API \
+                           accepts.",
+            body = ProblemDetail,
             content_type = "application/problem+json",
         ),
         (
@@ -632,7 +651,19 @@ pub async fn save(
         })
         .await
     {
-        Ok(_) => {}
+        // Read back from the receipt rather than reusing the URL's permalink:
+        // the text landed verbatim, so an author who edited the `permalink`
+        // line has moved the address, and the detail read has to follow it or
+        // answer 404 for a write that succeeded.
+        Ok(receipt) => {
+            let moved = receipt["permalink"]
+                .as_str()
+                .ok_or_else(|| {
+                    ApiError::internal("the save did not report a permalink to read back")
+                })?
+                .to_string();
+            detail_response(&state, &domain, &moved, StatusCode::OK).await
+        }
         // The one conflict this route translates rather than propagates. Keyed
         // on the prefix `stale_edit_message` owns, which is the seam both
         // storage kinds speak: a file domain compares in the engine and a
@@ -651,11 +682,10 @@ pub async fn save(
                 ApiError::internal("the engram read carried no checksum to version it by")
             })?;
             let content = current["content"].as_str().unwrap_or_default().to_string();
-            return Ok(precondition_failed(message, checksum, content));
+            Ok(precondition_failed(message, checksum, content))
         }
-        Err(e) => return Err(e.into()),
+        Err(e) => Err(e.into()),
     }
-    detail_response(&state, &domain, &permalink, StatusCode::OK).await
 }
 
 /// The prefix every refused compare-and-swap opens with, wherever the
