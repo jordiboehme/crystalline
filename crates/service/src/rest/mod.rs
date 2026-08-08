@@ -44,9 +44,11 @@ use crate::engine::Engine;
         title = "Crystalline Fluid API",
         version = "v1",
         description = "The JSON API `crystalline serve --http` mounts at \
-                       `/api/v1`, the surface the Fluid UI talks to. Read-only \
-                       in this version apart from the session and account \
-                       routes.\n\nEvery path but `/auth/login`, `/auth/logout` \
+                       `/api/v1`, the surface the Fluid UI talks to. Reading is \
+                       open to any signed-in viewer; writing content needs an \
+                       editor account and the `If-Match` token of the version \
+                       being replaced, and account management needs an \
+                       admin.\n\nEvery path but `/auth/login`, `/auth/logout` \
                        and `/auth/me` is closed by default: a request that \
                        carries no identity is answered 401 ahead of routing, so \
                        an unauthenticated caller never learns which paths \
@@ -62,7 +64,7 @@ use crate::engine::Engine;
         (name = "meta", description = "The API's description of itself."),
         (name = "auth", description = "Sessions and the capability probe."),
         (name = "domains", description = "Which domains this instance serves and what each holds."),
-        (name = "engrams", description = "Listing and reading engrams."),
+        (name = "engrams", description = "Listing, reading and writing engrams."),
         (name = "discovery", description = "Search, vocabulary, context and recent activity."),
         (name = "graph", description = "The neighborhood graph around an anchor."),
         (name = "users", description = "Account management. Admin only."),
@@ -77,6 +79,8 @@ use crate::engine::Engine;
         domains::manifest,
         engrams::list,
         engrams::detail,
+        engrams::create,
+        engrams::save,
         discovery::search,
         discovery::vocabulary,
         discovery::context,
@@ -89,8 +93,11 @@ use crate::engine::Engine;
     ),
     components(schemas(
         ProblemDetail,
+        ConflictDetail,
         User,
         Role,
+        engrams::CreateEngramBody,
+        engrams::SaveEngramBody,
         auth::LoginBody,
         auth::LoginResponse,
         auth::LogoutResponse,
@@ -180,12 +187,15 @@ pub fn router(state: RestState) -> Router {
         .route("/domains", get(domains::list))
         .route("/domains/{domain}/tree", get(domains::tree))
         .route("/domains/{domain}/manifest", get(domains::manifest))
-        .route("/domains/{domain}/engrams", get(engrams::list))
+        .route(
+            "/domains/{domain}/engrams",
+            get(engrams::list).post(engrams::create),
+        )
         // A wildcard, not a segment: a permalink is a path, so an engram in a
         // subfolder carries the slashes with it.
         .route(
             "/domains/{domain}/engrams/{*permalink}",
-            get(engrams::detail),
+            get(engrams::detail).put(engrams::save),
         )
         .route("/search", get(discovery::search))
         .route("/vocabulary", get(discovery::vocabulary))

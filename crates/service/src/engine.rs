@@ -469,6 +469,12 @@ pub struct Engine {
     // whole call rather than reasoning about which sub-step actually needs
     // it, simplest and cheap since these calls are already rare and short.
     origin_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    // Per-file lock serializing the checksum-guarded verbs against each other
+    // for one file on disk, keyed by absolute path. See `Engine::write_lock`
+    // for what it protects and why a compare-then-write without it is a race
+    // two browser tabs can reach. Created lazily, one `tokio::sync::Mutex` per
+    // file ever written through those verbs.
+    write_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     // A fixed provider used by every origin operation instead of the
     // production per-operation `GitHubProvider` build, for tests: an engine
     // built this way never reads config or the token store to decide who to
@@ -662,6 +668,7 @@ impl Engine {
             heartbeat_secs: env_secs("CRYSTALLINE_HEARTBEAT_SECS", DEFAULT_HEARTBEAT_SECS),
             stale_secs: env_secs("CRYSTALLINE_STALE_SECS", DEFAULT_STALE_SECS),
             origin_locks: std::sync::Mutex::new(HashMap::new()),
+            write_locks: std::sync::Mutex::new(HashMap::new()),
             origin_provider_override: None,
             origins_dir_override: None,
             connect_auth: Arc::new(RealConnectAuth),
@@ -1463,14 +1470,46 @@ impl Engine {
             ));
         }
         let (desc, source) = self.resolve(&p.identifier, Some(&p.domain)).await?;
+        // A reserved name never resolves to an engram today (sync skips both),
+        // so this is defence in depth rather than a reachable branch: the
+        // generated `index.md` is derived from its folder and would be
+        // overwritten on the next refresh, and `log.md` is reserved beside it.
+        // Checked on the resolved path, which is the authority on what would
+        // actually be written.
+        if crystalline_core::is_reserved_path(&desc.path) {
+            return Err(EngineError::Invalid(reserved_name_error(&desc.path)));
+        }
 
         match &source {
             ContentSource::File { root } => {
                 let abs = join_rel(root, &desc.path);
-                let current = std::fs::read_to_string(&abs).map_err(|source| EngineError::Io {
-                    path: abs.display().to_string(),
-                    source,
-                })?;
+                // Held across the comparison and the write. See
+                // `Engine::write_lock`.
+                let lock = self.write_lock(&abs);
+                let _guard = lock.lock().await;
+                let current = match std::fs::read_to_string(&abs) {
+                    Ok(text) => text,
+                    // Indexed but absent from this machine's disk: the file was
+                    // removed behind the index, or this instance is not the
+                    // domain's host and only ever saw the database rows. Either
+                    // way the engram the caller asked to save is not here to
+                    // save, which is a miss rather than a server fault - the
+                    // same reading `save_manifest` takes of its own file.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        return Err(EngineError::NotFound(format!(
+                            "engram '{}' in domain '{}' has no file at {}",
+                            desc.permalink,
+                            desc.domain,
+                            abs.display()
+                        )));
+                    }
+                    Err(source) => {
+                        return Err(EngineError::Io {
+                            path: abs.display().to_string(),
+                            source,
+                        });
+                    }
+                };
                 let found = sha256_hex(current.as_bytes());
                 if found != p.expected_checksum {
                     return Err(EngineError::Conflict(stale_edit_message(
@@ -2641,6 +2680,17 @@ impl Engine {
             return Err(EngineError::ReadOnly);
         }
         let (desc, source) = self.resolve(&p.identifier, Some(&p.domain)).await?;
+        // Held across the comparison and the removal, so a guarded delete
+        // cannot check a file that a concurrent save then rewrites underneath
+        // it. See `Engine::write_lock`.
+        let file_lock = match &source {
+            ContentSource::File { root } => Some(self.write_lock(&join_rel(root, &desc.path))),
+            ContentSource::Virtual => None,
+        };
+        let _guard = match &file_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
         if let Some(expected) = &p.expected_checksum {
             let current = self.load_content(&source, &desc).await?;
             let found = sha256_hex(current.as_bytes());
@@ -3189,6 +3239,11 @@ impl Engine {
         match self.content_source(domain)? {
             ContentSource::File { root } => {
                 let path = root.join("MANIFEST.md");
+                // The same compare-then-write section `save_engram` holds, for
+                // the same reason: two saves of one MANIFEST must not both find
+                // their token fresh. See `Engine::write_lock`.
+                let lock = self.write_lock(&path);
+                let _guard = lock.lock().await;
                 let current = match std::fs::read_to_string(&path) {
                     Ok(source) => source,
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -6081,6 +6136,36 @@ impl Engine {
             .clone()
     }
 
+    /// The per-file lock the checksum-guarded verbs hold across their whole
+    /// compare-then-write, created lazily on first use and keyed by absolute
+    /// path.
+    ///
+    /// What it closes is a time-of-check-to-time-of-use race, not a partial
+    /// write: `save_engram`, `save_manifest` and `delete_engram` each read the
+    /// file, hash it, compare that against the caller's `expected_checksum`
+    /// and only then act. Unlocked, two saves of one engram arriving together
+    /// (two browser tabs, or one tab whose autosave overlaps a manual save)
+    /// both read the same text, both find their token fresh and both write.
+    /// One author's version then wins on disk while the other is told the save
+    /// succeeded, which is precisely the outcome `If-Match` exists to prevent.
+    /// Held across the comparison and the write, the second caller reads the
+    /// first's bytes and is answered with the conflict it should have had.
+    ///
+    /// Keyed by the absolute path rather than by `domain/permalink` so two
+    /// domains registered over one root still serialize on the file itself.
+    /// Taken before the store lock, always, so the two never invert; virtual
+    /// domains take neither, since their compare-and-swap happens inside a
+    /// single database statement. The map is never pruned, like
+    /// [`Engine::origin_locks`]: an entry is a path string and an `Arc`, and
+    /// the set of files a process ever writes is bounded by the installation.
+    fn write_lock(&self, abs: &Path) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.write_locks.lock().unwrap();
+        locks
+            .entry(abs.to_string_lossy().into_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
     /// The base directory per-domain origin state lives under: the test
     /// override, or the real state directory.
     fn origins_base_dir(&self) -> Result<PathBuf> {
@@ -7267,6 +7352,10 @@ fn write_file(abs: &Path, contents: &str) -> Result<()> {
     write_bytes(abs, contents.as_bytes())
 }
 
+/// Distinguishes one write's temp file from another's within this process. See
+/// [`write_bytes`].
+static TEMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn write_bytes(abs: &Path, contents: &[u8]) -> Result<()> {
     if let Some(parent) = abs.parent() {
         std::fs::create_dir_all(parent).map_err(|source| EngineError::Io {
@@ -7274,8 +7363,15 @@ fn write_bytes(abs: &Path, contents: &[u8]) -> Result<()> {
             source,
         })?;
     }
-    // Write to a sibling temp then rename so the watcher never sees a partial file.
-    let tmp = abs.with_extension(format!("md.tmp.{}", std::process::id()));
+    // Write to a sibling temp then rename so the watcher never sees a partial
+    // file. The name carries a process-lifetime counter as well as the pid:
+    // the pid alone gives every writer in this process the same temp path, so
+    // two writes to one file racing inside one daemon would interleave their
+    // bytes there and rename the blend into place. Per-file locking keeps the
+    // guarded verbs off each other, but the counter is what makes the temp
+    // file private to a single write whichever path produced it.
+    let seq = TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = abs.with_extension(format!("md.tmp.{}.{seq}", std::process::id()));
     std::fs::write(&tmp, contents).map_err(|source| EngineError::Io {
         path: tmp.display().to_string(),
         source,
@@ -7619,7 +7715,7 @@ mod context_rank_tests {
 }
 
 #[cfg(test)]
-mod origin_lock_tests {
+mod lock_tests {
     use super::*;
     use crystalline_core::config::DomainEntry;
     use crystalline_index::TursoStore;
@@ -7659,5 +7755,91 @@ mod origin_lock_tests {
         let second = engine.origin_lock_registered("known").unwrap();
         assert!(Arc::ptr_eq(&first, &second), "the lock is created once");
         assert_eq!(engine.origin_locks.lock().unwrap().len(), 1);
+    }
+
+    /// One lock per file, whoever asks for it.
+    #[tokio::test]
+    async fn one_file_has_one_write_lock() {
+        let engine = engine_with_domains(&["known"]).await;
+        let first = engine.write_lock(Path::new("/roots/known/alpha.md"));
+        let second = engine.write_lock(Path::new("/roots/known/alpha.md"));
+        assert!(Arc::ptr_eq(&first, &second), "the lock is created once");
+        let other = engine.write_lock(Path::new("/roots/known/beta.md"));
+        assert!(!Arc::ptr_eq(&first, &other), "and it is per file");
+        assert_eq!(engine.write_locks.lock().unwrap().len(), 2);
+    }
+
+    /// A save reads the file it is comparing against *inside* the per-file
+    /// lock, which is what makes `If-Match` mean anything when two saves of one
+    /// engram arrive together.
+    ///
+    /// Asserted by holding the lock from outside and rewriting the file while
+    /// the save is blocked on it, which is exactly what a first writer does.
+    /// A save that read and hashed before taking the lock would have compared
+    /// against the original bytes, found its token fresh and overwritten the
+    /// other author's work; a save that reads inside sees the new bytes and
+    /// refuses. Two properties are checked, and the pair is what pins the
+    /// order: that the save cannot finish while the lock is held, and that it
+    /// then fails against the text that landed in the meantime. Driving it
+    /// through two concurrent HTTP saves instead would prove nothing - the
+    /// request round trip is long enough that they serialize by themselves,
+    /// whether or not anything holds them apart.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_save_compares_inside_the_file_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("eng");
+        std::fs::create_dir_all(&root).unwrap();
+        let original = "---\ntype: engram\ntitle: Alpha\npermalink: alpha\ntags:\n  - eng\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\nThe original.\n";
+        std::fs::write(root.join("alpha.md"), original).unwrap();
+        let store = TursoStore::open_in_memory().await.unwrap();
+        let mut config = GlobalConfig::default();
+        config
+            .domains
+            .insert("eng".to_string(), DomainEntry::file(&root));
+        let engine = Arc::new(Engine::new(Arc::new(Mutex::new(store)), config, None, None));
+        engine.sync(None).await.unwrap();
+
+        let abs = root.join("alpha.md");
+        let lock = engine.write_lock(&abs);
+        let held = lock.lock().await;
+
+        let saver = engine.clone();
+        let mine = original.replace("The original.", "Mine.");
+        let expected = sha256_hex(original.as_bytes());
+        let task = tokio::spawn(async move {
+            saver
+                .save_engram(&SaveParams {
+                    domain: "eng".to_string(),
+                    identifier: "alpha".to_string(),
+                    content: mine,
+                    expected_checksum: expected,
+                })
+                .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !task.is_finished(),
+            "the save must be waiting on the file lock, not already past its comparison"
+        );
+
+        // What the other writer did while this save was blocked.
+        let theirs = original.replace("The original.", "Theirs.");
+        std::fs::write(&abs, &theirs).unwrap();
+        drop(held);
+
+        let outcome = task.await.unwrap();
+        match outcome {
+            Err(EngineError::Conflict(message)) => assert!(
+                message.starts_with("stale edit"),
+                "the conflict speaks the shared wording: {message}"
+            ),
+            other => panic!("the save compared against bytes that were already gone: {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(&abs).unwrap(),
+            theirs,
+            "and the other writer's version is still the one on disk"
+        );
     }
 }

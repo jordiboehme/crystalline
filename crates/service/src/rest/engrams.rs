@@ -1,22 +1,46 @@
-//! The two ways a client reaches an engram: a filtered listing of a domain,
-//! and one engram in full.
+//! The ways a client reaches an engram: a filtered listing of a domain, one
+//! engram in full, a new one, and a full-document save of one that exists.
 //!
-//! Both hand the engine's own JSON over unchanged, so this API and the MCP
+//! The reads hand the engine's own JSON over unchanged, so this API and the MCP
 //! tools answer with one payload rather than two shapes that drift. The detail
 //! route adds exactly one thing on top: an `ETag`, so a client that later wants
 //! to write back can say which version it read.
+//!
+//! The two writes are the first content mutations on this surface, so the rules
+//! they are held to are written down here rather than left to be re-derived by
+//! whatever route lands next:
+//!
+//! 1. **Editor only, in the handler.** [`super::auth::guard`] enforces viewer
+//!    and nothing more, so both handlers open with [`Identity::require_editor`].
+//!    That is also what refuses the anonymous viewer: an identity with no
+//!    account behind it can never write, whatever `auth.anonymous` allows it to
+//!    read.
+//! 2. **Cross-site protection is the middleware's.** Every unsafe method from
+//!    an account-bearing identity must echo its session's CSRF token; see
+//!    `check_csrf`. Nothing here re-implements that check or exempts itself
+//!    from it.
+//! 3. **Read-only is answered before preconditions.** [`save`] refuses a
+//!    read-only instance ahead of parsing `If-Match`, so an instance that
+//!    refuses writes answers 403 rather than sending a client to fetch an ETag
+//!    for a write that can never land. The engine refuses too, but only after
+//!    the header parse would already have answered 428.
 
 use axum::Json;
 use axum::extract::State;
-use axum::http::HeaderValue;
 use axum::http::header::ETAG;
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde_json::Value;
 use utoipa::IntoParams;
 
-use super::{ApiError, ApiPath, ApiQuery, ProblemDetail, RestState, csv};
-use crate::params::{ReadParams, SearchParams};
+use super::auth::Identity;
+use super::{
+    ApiError, ApiJson, ApiPath, ApiQuery, ConflictDetail, ProblemDetail, RestState, csv, if_match,
+    precondition_failed,
+};
+use crate::engine::EngineError;
+use crate::params::{ReadParams, SaveParams, SearchParams, WriteParams};
 
 /// The query string `GET /domains/{domain}/engrams` takes: the filter side of
 /// [`SearchParams`], minus the domain the path already names and minus the
@@ -246,6 +270,421 @@ pub async fn detail(
         .await?;
     let etag = etag(&value)?;
     let mut resp = Json(value).into_response();
+    resp.headers_mut().insert(ETAG, etag);
+    Ok(resp)
+}
+
+/// What `POST /domains/{domain}/engrams` takes: the create form's fields, fed
+/// to the engine's write verb unchanged.
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+#[schema(description = "A new engram. The engine builds the frontmatter from \
+                        these fields and slugifies the title into the filename \
+                        and permalink, so the body carries markdown only.")]
+pub struct CreateEngramBody {
+    /// The engram title. Slugified into the filename and permalink.
+    #[schema(example = "Alpha")]
+    title: String,
+    /// The markdown body (no frontmatter: creation builds it).
+    #[schema(example = "# Alpha\n\nA rule about alpha.\n")]
+    content: String,
+    /// A domain-relative subfolder. Defaults to the root.
+    #[serde(default)]
+    #[schema(example = "notes")]
+    folder: Option<String>,
+    /// The engram `type`. Defaults to `engram`. Free form; recommended values
+    /// are guidance.
+    #[serde(rename = "type", default)]
+    #[schema(example = "decision")]
+    engram_type: Option<String>,
+    /// Lifecycle `status`. Defaults to `stable`. Free form.
+    #[serde(default)]
+    status: Option<String>,
+    /// Tags, lowercase-with-hyphens.
+    #[serde(default)]
+    tags: Vec<String>,
+    /// Extra frontmatter keys (valid_from, valid_to, salience, ...), passed to
+    /// the engine's metadata contract unchanged.
+    #[serde(default)]
+    metadata: Option<serde_json::Value>,
+}
+
+/// What `PUT /domains/{domain}/engrams/{permalink}` takes: the complete file
+/// text, frontmatter included, written verbatim.
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+#[schema(description = "The complete file text, frontmatter included. It is \
+                        written verbatim: nothing here rebuilds the \
+                        frontmatter or stamps provenance, so what a client \
+                        reads back is what its author typed.")]
+pub struct SaveEngramBody {
+    /// The full markdown text as the editor holds it.
+    #[schema(example = "---\ntitle: Alpha\npermalink: alpha\n---\n\nA sharper rule.\n")]
+    content: String,
+}
+
+/// `POST /domains/{domain}/engrams` - create an engram from a title and a
+/// markdown body, answering 201 with the detail read of what landed.
+///
+/// The engine builds the frontmatter and slugifies the title into the filename
+/// and permalink, exactly as the MCP write tool does, and the account behind
+/// the request is named in the engram's `generated.by` as `human:<name>` - so a
+/// domain records who taught it what, whether that was a person through this
+/// API or an agent through MCP.
+///
+/// The answer is the detail read rather than the write verb's own receipt, so
+/// a client that has just created an engram holds the same payload the detail
+/// route serves, `ETag` included, and can go straight to editing it without a
+/// second round trip.
+///
+/// A permalink already taken is the engine's `Conflict`, answered 409: this
+/// route never overwrites, so a client that means to replace something saves it
+/// through the PUT with the token it read.
+#[utoipa::path(
+    post,
+    path = "/api/v1/domains/{domain}/engrams",
+    tag = "engrams",
+    operation_id = "create_engram",
+    summary = "Create an engram from a title and a markdown body.",
+    description = "The engine builds the frontmatter and slugifies the title \
+                   into the filename and permalink, and the account behind the \
+                   request is named in the engram's `generated.by`.\n\nThe \
+                   answer is the detail read of what landed, `ETag` included, \
+                   so a client can go straight to editing it. This route never \
+                   overwrites: a permalink already taken is a 409, and \
+                   replacing an engram is what the PUT is for.",
+    params(("domain" = String, Path, description = "The registered domain.")),
+    request_body = CreateEngramBody,
+    responses(
+        (
+            status = 201,
+            description = "The engine's own read payload for the new engram.",
+            body = Object,
+            headers(("etag" = String, description = "The quoted checksum of the \
+                     engram as written, the token a later save carries in \
+                     `If-Match`.")),
+        ),
+        (
+            status = 400,
+            description = "The body is not JSON.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 401,
+            description = "No identity, or an anonymous one: an identity with \
+                           no account behind it never writes.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "The caller is not an editor, the request did not \
+                           echo its CSRF token, this instance is read-only, or \
+                           the trusted-header identity names a disabled account.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 404,
+            description = "No such domain.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 409,
+            description = "That permalink is already taken in this domain.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 415,
+            description = "The body is not `application/json`.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 422,
+            description = "The body is JSON but not an engram, the title does \
+                           not slugify to a permalink, the metadata breaks the \
+                           frontmatter contract, or the target is one of the \
+                           reserved OKF names (`index.md`, `log.md`).",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+pub async fn create(
+    State(state): State<RestState>,
+    identity: Identity,
+    ApiPath(domain): ApiPath<String>,
+    ApiJson(body): ApiJson<CreateEngramBody>,
+) -> Result<Response, ApiError> {
+    let caller = identity.require_editor()?;
+    // The provenance the engram records. `human:` rather than a bare name so
+    // `generated.by` says what kind of author this was: an MCP client writes
+    // its own `clientname/version` there, and the two must not be mistaken for
+    // one another when a domain is read back years later.
+    let actor = format!("human:{}", caller.name());
+    // A reserved target (`index.md`, `log.md`) is refused inside
+    // `write_engram_as`, which owns the title-to-filename slugification and so
+    // is the only place that knows what would actually be written. Repeating
+    // the check here would mean repeating that derivation, which is the kind of
+    // second copy that drifts.
+    let written = state
+        .engine
+        .write_engram_as(
+            &WriteParams {
+                domain: domain.clone(),
+                title: body.title,
+                content: body.content,
+                folder: body.folder,
+                engram_type: body.engram_type,
+                tags: body.tags,
+                status: body.status,
+                metadata: body.metadata,
+                // Never from this route: replacing an engram goes through the
+                // PUT, which demands the token of the version being replaced.
+                overwrite: false,
+            },
+            Some(&actor),
+        )
+        .await
+        // The engine reports a taken permalink as a conflict, which this
+        // surface answers 409 rather than the 422 its generic classification
+        // gives: nothing about the request can be corrected to make it
+        // succeed - the engram is already there - and a client branches on
+        // that difference to offer opening the existing one instead. The match
+        // is on the variant rather than on the message: a collision is the only
+        // way this verb conflicts, whichever layer noticed it.
+        .map_err(|e| match e {
+            EngineError::Conflict(message) => ApiError::conflict(message),
+            other => other.into(),
+        })?;
+    let permalink = written["permalink"]
+        .as_str()
+        .ok_or_else(|| ApiError::internal("the write did not report a permalink to read back"))?
+        .to_string();
+    detail_response(&state, &domain, &permalink, StatusCode::CREATED).await
+}
+
+/// `PUT /domains/{domain}/engrams/{*permalink}` - save an engram's complete
+/// markdown text, guarded by the `If-Match` token of the version being
+/// replaced.
+///
+/// The text lands verbatim: nothing rebuilds the frontmatter and nothing stamps
+/// provenance, so a client that saves what it read writes back byte-identical
+/// bytes. That is the editor's fidelity contract, and it is why this is a PUT
+/// of the whole document rather than a patch of its parts.
+///
+/// The three answers a client has to handle:
+///
+/// - **428** when no `If-Match` arrived. The token comes from the detail read.
+/// - **412** when the token no longer matches, carrying the version the server
+///   holds now (`current_etag`, `current_content`) so a client can show a merge
+///   view instead of asking its author to retype the edit.
+/// - **200** with the detail read of what landed and its new `ETag`.
+///
+/// One consequence of writing the text verbatim is worth knowing: an author who
+/// edits the `permalink` in the frontmatter moves the engram's address, since
+/// the index takes the permalink from the file. The answer is still the read of
+/// what landed, which resolves by title when the permalink has moved out from
+/// under the URL. Rewriting the caller's frontmatter to keep the two in step is
+/// deliberately not done - an editor that saved something other than what its
+/// author typed would be the worse surprise - and an author who changes the
+/// title and the permalink in the same save is answered 404 by that read even
+/// though the write landed; they find their engram at its new address.
+#[utoipa::path(
+    put,
+    path = "/api/v1/domains/{domain}/engrams/{permalink}",
+    tag = "engrams",
+    operation_id = "save_engram",
+    summary = "Save an engram's complete markdown text.",
+    description = "The text lands verbatim, frontmatter included: nothing \
+                   rebuilds it and nothing stamps provenance, so a client that \
+                   saves what it read writes back byte-identical bytes.\n\nThe \
+                   write is guarded by `If-Match`, whose token is the `ETag` of \
+                   the detail read it is based on: a save that arrives without \
+                   one is answered 428, and one whose token is stale is \
+                   answered 412 carrying the version the server holds now, so a \
+                   client can merge rather than lose the edit.",
+    params(
+        ("domain" = String, Path, description = "The registered domain."),
+        (
+            "permalink" = String,
+            Path,
+            description = "The engram permalink. A permalink is a path, so this \
+                           segment may contain slashes: `notes/deep/gamma`.",
+            example = "notes/deep/gamma",
+        ),
+        (
+            "If-Match" = String,
+            Header,
+            description = "The quoted `ETag` of the version being replaced, \
+                           from the detail read.",
+            example = "\"3f8a1c05e2\"",
+        ),
+    ),
+    request_body = SaveEngramBody,
+    responses(
+        (
+            status = 200,
+            description = "The engine's own read payload for the saved engram.",
+            body = Object,
+            headers(("etag" = String, description = "The quoted checksum of the \
+                     engram as saved, the token the next save carries.")),
+        ),
+        (
+            status = 400,
+            description = "The body is not JSON.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 401,
+            description = "No identity, or an anonymous one: an identity with \
+                           no account behind it never writes.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "The caller is not an editor, the request did not \
+                           echo its CSRF token, this instance is read-only, or \
+                           the trusted-header identity names a disabled \
+                           account. A read-only instance answers this ahead of \
+                           the precondition check, so it is never 428.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 404,
+            description = "No such domain or engram, or the engram is indexed \
+                           but its file is not on this machine.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 412,
+            description = "The `If-Match` token is stale. The body carries the \
+                           version the server holds now, so a client can merge.",
+            body = ConflictDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 415,
+            description = "The body is not `application/json`.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 422,
+            description = "The document is not an engram (unparseable, or no \
+                           frontmatter block), the `If-Match` is a wildcard or \
+                           a weak validator, or the target is one of the \
+                           reserved OKF names (`index.md`, `log.md`).",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 428,
+            description = "No `If-Match` arrived. The token comes from the \
+                           detail read.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+pub async fn save(
+    State(state): State<RestState>,
+    identity: Identity,
+    headers: HeaderMap,
+    ApiPath((domain, permalink)): ApiPath<(String, String)>,
+    ApiJson(body): ApiJson<SaveEngramBody>,
+) -> Result<Response, ApiError> {
+    identity.require_editor()?;
+    // Before the If-Match parse, not after: an instance that refuses writes
+    // refuses them whatever headers arrive, so this answers 403 rather than
+    // sending a client off to fetch a token for a write that can never land.
+    // The engine refuses too, but only once `if_match` has already answered.
+    if state.engine.read_only() {
+        return Err(ApiError::forbidden(
+            "this instance is read-only; content mutations are disabled",
+        ));
+    }
+    // The reserved OKF names are generated or reserved rather than authored, so
+    // they are refused here as well as inside the engine: this catches the URL
+    // shape without a database round trip, and the engine catches whatever
+    // resolves to a reserved path by any other route.
+    if crystalline_core::is_reserved_path(&format!("{permalink}.md")) {
+        return Err(ApiError::unprocessable(format!(
+            "'{permalink}' is a reserved OKF name: index.md is generated from \
+             its folder and log.md is reserved beside it, so neither is an \
+             engram this API writes"
+        )));
+    }
+    let token = if_match(&headers)?;
+    match state
+        .engine
+        .save_engram(&SaveParams {
+            domain: domain.clone(),
+            identifier: permalink.clone(),
+            content: body.content,
+            expected_checksum: token,
+        })
+        .await
+    {
+        Ok(_) => {}
+        // The one conflict this route translates rather than propagates. Keyed
+        // on the prefix `stale_edit_message` owns, which is the seam both
+        // storage kinds speak: a file domain compares in the engine and a
+        // virtual one in the database's compare-and-swap, and each reports the
+        // same sentence. Any other conflict is somebody else's rule and keeps
+        // its own status.
+        Err(EngineError::Conflict(message)) if message.starts_with(STALE_EDIT) => {
+            let current = state
+                .engine
+                .read_engram(&ReadParams {
+                    identifier: permalink,
+                    domain: Some(domain),
+                })
+                .await?;
+            let checksum = current["checksum"].as_str().ok_or_else(|| {
+                ApiError::internal("the engram read carried no checksum to version it by")
+            })?;
+            let content = current["content"].as_str().unwrap_or_default().to_string();
+            return Ok(precondition_failed(message, checksum, content));
+        }
+        Err(e) => return Err(e.into()),
+    }
+    detail_response(&state, &domain, &permalink, StatusCode::OK).await
+}
+
+/// The prefix every refused compare-and-swap opens with, wherever the
+/// comparison happened. See `engine::stale_edit_message`, which is its only
+/// source; the phrase is the seam this layer classifies on, so it is spelled
+/// once here rather than at each use.
+const STALE_EDIT: &str = "stale edit";
+
+/// The detail read of an engram, answered with `status` and its `ETag`.
+///
+/// Both writes answer with this rather than with the engine's write receipt, so
+/// there is exactly one payload shape for an engram on this surface and a
+/// client that has just written one holds what the detail route would have
+/// given it.
+async fn detail_response(
+    state: &RestState,
+    domain: &str,
+    permalink: &str,
+    status: StatusCode,
+) -> Result<Response, ApiError> {
+    let value = state
+        .engine
+        .read_engram(&ReadParams {
+            identifier: permalink.to_string(),
+            domain: Some(domain.to_string()),
+        })
+        .await?;
+    let etag = etag(&value)?;
+    let mut resp = (status, Json(value)).into_response();
     resp.headers_mut().insert(ETAG, etag);
     Ok(resp)
 }

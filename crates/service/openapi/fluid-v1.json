@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Crystalline Fluid API",
-    "description": "The JSON API `crystalline serve --http` mounts at `/api/v1`, the surface the Fluid UI talks to. Read-only in this version apart from the session and account routes.\n\nEvery path but `/auth/login`, `/auth/logout` and `/auth/me` is closed by default: a request that carries no identity is answered 401 ahead of routing, so an unauthenticated caller never learns which paths exist. Every failure is an RFC 9457 problem detail sent as `application/problem+json`.\n\nThe payloads marked as generic objects are the engine's own JSON, passed through unchanged so this API and the MCP tools stay one source of truth; each carries an example of the shape it answers with.",
+    "description": "The JSON API `crystalline serve --http` mounts at `/api/v1`, the surface the Fluid UI talks to. Reading is open to any signed-in viewer; writing content needs an editor account and the `If-Match` token of the version being replaced, and account management needs an admin.\n\nEvery path but `/auth/login`, `/auth/logout` and `/auth/me` is closed by default: a request that carries no identity is answered 401 ahead of routing, so an unauthenticated caller never learns which paths exist. Every failure is an RFC 9457 problem detail sent as `application/problem+json`.\n\nThe payloads marked as generic objects are the engine's own JSON, passed through unchanged so this API and the MCP tools stay one source of truth; each carries an example of the shape it answers with.",
     "license": {
       "name": "AGPL-3.0-or-later"
     },
@@ -662,6 +662,125 @@
             }
           }
         }
+      },
+      "post": {
+        "tags": [
+          "engrams"
+        ],
+        "summary": "Create an engram from a title and a markdown body.",
+        "description": "The engine builds the frontmatter and slugifies the title into the filename and permalink, and the account behind the request is named in the engram's `generated.by`.\n\nThe answer is the detail read of what landed, `ETag` included, so a client can go straight to editing it. This route never overwrites: a permalink already taken is a 409, and replacing an engram is what the PUT is for.",
+        "operationId": "create_engram",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The registered domain.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateEngramBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "The engine's own read payload for the new engram.",
+            "headers": {
+              "etag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "The quoted checksum of the engram as written, the token a later save carries in `If-Match`."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The body is not JSON.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or an anonymous one: an identity with no account behind it never writes.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an editor, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "That permalink is already taken in this domain.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body is not `application/json`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The body is JSON but not an engram, the title does not slugify to a permalink, the metadata breaks the frontmatter contract, or the target is one of the reserved OKF names (`index.md`, `log.md`).",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
       }
     },
     "/api/v1/domains/{domain}/engrams/{permalink}": {
@@ -752,6 +871,155 @@
           },
           "404": {
             "description": "No such domain or engram.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "engrams"
+        ],
+        "summary": "Save an engram's complete markdown text.",
+        "description": "The text lands verbatim, frontmatter included: nothing rebuilds it and nothing stamps provenance, so a client that saves what it read writes back byte-identical bytes.\n\nThe write is guarded by `If-Match`, whose token is the `ETag` of the detail read it is based on: a save that arrives without one is answered 428, and one whose token is stale is answered 412 carrying the version the server holds now, so a client can merge rather than lose the edit.",
+        "operationId": "save_engram",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The registered domain.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "permalink",
+            "in": "path",
+            "description": "The engram permalink. A permalink is a path, so this segment may contain slashes: `notes/deep/gamma`.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "notes/deep/gamma"
+          },
+          {
+            "name": "If-Match",
+            "in": "header",
+            "description": "The quoted `ETag` of the version being replaced, from the detail read.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "\"3f8a1c05e2\""
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SaveEngramBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The engine's own read payload for the saved engram.",
+            "headers": {
+              "etag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "The quoted checksum of the engram as saved, the token the next save carries."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The body is not JSON.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or an anonymous one: an identity with no account behind it never writes.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an editor, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. A read-only instance answers this ahead of the precondition check, so it is never 428.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain or engram, or the engram is indexed but its file is not on this machine.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "The `If-Match` token is stale. The body carries the version the server holds now, so a client can merge.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConflictDetail"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body is not `application/json`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The document is not an engram (unparseable, or no frontmatter block), the `If-Match` is a wildcard or a weak validator, or the target is one of the reserved OKF names (`index.md`, `log.md`).",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "428": {
+            "description": "No `If-Match` arrived. The token comes from the detail read.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -1729,6 +1997,42 @@
   },
   "components": {
     "schemas": {
+      "ConflictDetail": {
+        "type": "object",
+        "description": "The wire form of a 412: a problem detail carrying the version the server\nholds now, so a client can show a merge view instead of just failing.",
+        "required": [
+          "type",
+          "status",
+          "title",
+          "detail",
+          "current_etag",
+          "current_content"
+        ],
+        "properties": {
+          "current_content": {
+            "type": "string",
+            "description": "The full markdown the server holds now, so a client can merge."
+          },
+          "current_etag": {
+            "type": "string",
+            "description": "The ETag of the version the server holds now, quoted."
+          },
+          "detail": {
+            "type": "string"
+          },
+          "status": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "title": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string"
+          }
+        }
+      },
       "CreateBody": {
         "type": "object",
         "description": "A new account. `display` defaults to `name` as typed, and `email` is optional and never used for login.",
@@ -1767,6 +2071,59 @@
           "role": {
             "$ref": "#/components/schemas/Role",
             "description": "What the new account may do."
+          }
+        }
+      },
+      "CreateEngramBody": {
+        "type": "object",
+        "description": "A new engram. The engine builds the frontmatter from these fields and slugifies the title into the filename and permalink, so the body carries markdown only.",
+        "required": [
+          "title",
+          "content"
+        ],
+        "properties": {
+          "content": {
+            "type": "string",
+            "description": "The markdown body (no frontmatter: creation builds it).",
+            "example": "# Alpha\n\nA rule about alpha.\n"
+          },
+          "folder": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A domain-relative subfolder. Defaults to the root.",
+            "example": "notes"
+          },
+          "metadata": {
+            "description": "Extra frontmatter keys (valid_from, valid_to, salience, ...), passed to\nthe engine's metadata contract unchanged."
+          },
+          "status": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Lifecycle `status`. Defaults to `stable`. Free form."
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Tags, lowercase-with-hyphens."
+          },
+          "title": {
+            "type": "string",
+            "description": "The engram title. Slugified into the filename and permalink.",
+            "example": "Alpha"
+          },
+          "type": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The engram `type`. Defaults to `engram`. Free form; recommended values\nare guidance.",
+            "example": "decision"
           }
         }
       },
@@ -1939,6 +2296,20 @@
           "admin"
         ]
       },
+      "SaveEngramBody": {
+        "type": "object",
+        "description": "The complete file text, frontmatter included. It is written verbatim: nothing here rebuilds the frontmatter or stamps provenance, so what a client reads back is what its author typed.",
+        "required": [
+          "content"
+        ],
+        "properties": {
+          "content": {
+            "type": "string",
+            "description": "The full markdown text as the editor holds it.",
+            "example": "---\ntitle: Alpha\npermalink: alpha\n---\n\nA sharper rule.\n"
+          }
+        }
+      },
       "User": {
         "type": "object",
         "description": "One account. Carries no password material, so it is safe to hand to a\nhandler and serialize into a response.",
@@ -2031,7 +2402,7 @@
     },
     {
       "name": "engrams",
-      "description": "Listing and reading engrams."
+      "description": "Listing, reading and writing engrams."
     },
     {
       "name": "discovery",
