@@ -1442,20 +1442,23 @@ impl Engine {
         // A document that is not an engram would poison the index on reindex,
         // so it is refused before anything is written. This is the one hard
         // gate, and it is deliberately narrow: the text must parse (clean
-        // UTF-8, frontmatter that is a YAML mapping) and must actually carry a
-        // frontmatter block, because a save that drops it silently strips the
-        // engram's type, title, tags and status. Everything a document can get
-        // wrong while still being an engram - a missing tag, a permalink that
-        // is not a slug, an inverted validity window - is the validation
-        // endpoint's business to report, not this path's to refuse: an engram
-        // that already carries such a flaw must stay editable, since fixing it
-        // here is what the editor is for.
+        // UTF-8, frontmatter that is a YAML mapping) and must carry frontmatter
+        // that actually says something, because a save that drops it silently
+        // strips the engram's type, title, permalink, tags and status at once,
+        // leaving the index to fall back to the path slug. An empty block is
+        // that same strip wearing delimiters, so it is refused the same way.
+        // Everything a document can get wrong while still being an engram - a
+        // missing tag, a permalink that is not a slug, an inverted validity
+        // window - is the validation endpoint's business to report, not this
+        // path's to refuse: an engram that already carries such a flaw must
+        // stay editable, since fixing it here is what the editor is for.
         let parsed =
             parse_engram_lossless(&p.content).map_err(|e| EngineError::Invalid(e.to_string()))?;
-        if !parsed.has_frontmatter {
+        if !parsed.has_frontmatter || parsed.raw_frontmatter.trim().is_empty() {
             return Err(EngineError::Invalid(
-                "the document carries no frontmatter block, so it is not an engram; \
-                 keep the --- delimited frontmatter at the top of the file"
+                "the document carries no frontmatter, so it is not an engram; \
+                 keep the --- delimited frontmatter block, and the type, title, \
+                 permalink and tags in it, at the top of the file"
                     .into(),
             ));
         }

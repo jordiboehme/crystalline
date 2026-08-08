@@ -186,6 +186,34 @@ async fn a_save_with_unparseable_frontmatter_is_refused_without_writing() {
     );
 }
 
+/// An empty frontmatter block is the same identity strip as a missing one,
+/// wearing delimiters: `type`, `title`, `permalink`, `tags` and `status` are
+/// all gone and the index falls back to the path slug. The gate refuses it for
+/// the same reason it refuses a document with no block at all.
+#[tokio::test]
+async fn a_save_with_an_empty_frontmatter_block_is_refused_without_writing() {
+    let (tmp, engine) = engine_fixture().await;
+    let before = std::fs::read(tmp.path().join("eng/alpha.md")).unwrap();
+    let (checksum, _) = checksum_of(&engine, "eng", "alpha").await;
+    let err = engine
+        .save_engram(&SaveParams {
+            domain: "eng".to_string(),
+            identifier: "alpha".to_string(),
+            content: "---\n---\n\n# Alpha\n\nA rule about alpha.\n".to_string(),
+            expected_checksum: checksum,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, crystalline_service::EngineError::Invalid(_)),
+        "{err}"
+    );
+    assert_eq!(
+        std::fs::read(tmp.path().join("eng/alpha.md")).unwrap(),
+        before
+    );
+}
+
 /// A document missing a tag is an E-family verify finding, not an unsavable
 /// document: refusing it would make an engram that already carries the flaw
 /// uneditable through the very editor meant to fix it.
