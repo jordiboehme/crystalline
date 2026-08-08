@@ -2338,6 +2338,156 @@ async fn a_trusted_header_mutation_without_a_token_is_refused() {
     assert_eq!(names, vec!["proxy".to_string()], "nothing was created");
 }
 
+/// Nothing between this server and the browser may keep an auth answer.
+///
+/// `GET /auth/me` is the one that matters: a 200 answer to a GET carrying no
+/// freshness information is exactly what a shared cache may store on a
+/// heuristic, and the trusted-header mode puts a reverse proxy in front of this
+/// surface by definition. A cached probe would hand the next user through that
+/// proxy the previous one's identity, CSRF token and session cookie. Login and
+/// logout carry the same material, so they are marked the same way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_auth_endpoints_are_never_cached() {
+    let fixture = serve_with_ada(AuthOptions {
+        anonymous: true,
+        ..AuthOptions::default()
+    })
+    .await;
+    let addr = fixture.addr;
+
+    let anonymous_probe = get(addr, "/api/v1/auth/me").await;
+    assert_eq!(anonymous_probe.status(), 200);
+    assert_eq!(
+        anonymous_probe.headers()["cache-control"],
+        "no-store",
+        "the probe must never be served from a cache"
+    );
+
+    let login = client()
+        .post(format!("http://{addr}/api/v1/auth/login"))
+        .json(&serde_json::json!({"name": "ada", "password": "s3cret"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), 200);
+    assert_eq!(login.headers()["cache-control"], "no-store");
+    let token = session_cookie(&login).unwrap();
+    let body: serde_json::Value = login.json().await.unwrap();
+    let csrf = body["csrf"].as_str().unwrap().to_string();
+
+    // The probe that carries a real identity and reissues its token, which is
+    // the answer with the most to lose.
+    let session_probe = client()
+        .get(format!("http://{addr}/api/v1/auth/me"))
+        .header("cookie", format!("fluid_session={token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(session_probe.status(), 200);
+    assert_eq!(session_probe.headers()["cache-control"], "no-store");
+
+    let logout = as_session(
+        addr,
+        reqwest::Method::POST,
+        "/api/v1/auth/logout",
+        &token,
+        &csrf,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(logout.status(), 200);
+    assert_eq!(logout.headers()["cache-control"], "no-store");
+}
+
+/// The probe ensures a session rather than issuing one per call.
+///
+/// A trusted-header client that keeps no cookie jar - a script, a health check,
+/// a second tab opened before the first answer landed - would otherwise add a
+/// session row every time it asked who it was. It reuses instead, which also
+/// means every caller of one identity is handed the same token: the second tab
+/// keeps working rather than being outvoted by whichever `Set-Cookie` arrived
+/// last. The token alone authorizes the write, because in this mode the header
+/// is what names the identity and the cookie carries nothing it does not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeated_probes_reuse_one_session_for_a_trusted_header_identity() {
+    let fixture = serve_with_auth(AuthOptions {
+        trusted_header: Some("remote-user"),
+        ..AuthOptions::default()
+    })
+    .await;
+    let addr = fixture.addr;
+    fixture
+        .auth
+        .add_user("root", "Root", None, Role::Admin, "rootpw")
+        .await
+        .unwrap();
+    assert_eq!(fixture.auth.session_count().await.unwrap(), 0);
+
+    // The first probe issues the session; four more, each as cookieless as the
+    // first, reuse it.
+    let mut tokens = Vec::new();
+    let mut cookies = Vec::new();
+    for _ in 0..5 {
+        let probe = client()
+            .get(format!("http://{addr}/api/v1/auth/me"))
+            .header("remote-user", "root")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(probe.status(), 200);
+        cookies.push(session_cookie(&probe));
+        let body: serde_json::Value = probe.json().await.unwrap();
+        tokens.push(body["csrf"].as_str().unwrap().to_string());
+    }
+    assert_eq!(
+        fixture.auth.session_count().await.unwrap(),
+        1,
+        "five probes, one session: the probe must not mint per call"
+    );
+    assert!(
+        cookies[0].is_some(),
+        "the first probe issued the session, so it set the cookie"
+    );
+    assert!(
+        cookies[1..].iter().all(Option::is_none),
+        "a reused session has no unhashed token left to put in a cookie"
+    );
+    assert!(
+        tokens.iter().all(|t| *t == tokens[0]),
+        "every probe of one identity is handed the same token: {tokens:?}"
+    );
+
+    // The token from the last probe, which never saw a cookie, authorizes a
+    // write on its own. This is the second tab, and the cookieless client.
+    let created = client()
+        .post(format!("http://{addr}/api/v1/users"))
+        .header("remote-user", "root")
+        .header("x-csrf-token", tokens.last().unwrap())
+        .json(&serde_json::json!({"name": "bob", "role": "viewer", "password": "pw"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201);
+    assert_eq!(
+        fixture.auth.session_count().await.unwrap(),
+        1,
+        "and the write added no session either"
+    );
+
+    // A wrong token is still refused, so the fallback is a lookup and not a
+    // way past the check.
+    let refused = client()
+        .post(format!("http://{addr}/api/v1/users"))
+        .header("remote-user", "root")
+        .header("x-csrf-token", "not-the-token")
+        .json(&serde_json::json!({"name": "cyd", "role": "viewer", "password": "pw"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 403);
+}
+
 /// The settlement end to end: a trusted-header admin is minted a session by
 /// the probe, and only the minted token authorizes a mutation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

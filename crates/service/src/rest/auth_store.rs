@@ -200,6 +200,32 @@ pub struct Session {
     pub expires_at: i64,
 }
 
+/// What [`AuthStore::ensure_session`] found or did.
+///
+/// The two are answered differently on the wire: a created session has a token
+/// to put in a cookie, a reused one does not, because the stored copy is hashed
+/// and the original was handed out once and never kept.
+#[derive(Clone, Debug)]
+pub enum SessionMint {
+    /// The account already held a live session; this is its CSRF token.
+    Reused {
+        /// The CSRF token that session's requests must echo.
+        csrf: String,
+    },
+    /// The account held none, so one was issued.
+    Created(Session),
+}
+
+impl SessionMint {
+    /// The CSRF token either way, which is what the caller always needs.
+    pub fn csrf(&self) -> &str {
+        match self {
+            SessionMint::Reused { csrf } => csrf,
+            SessionMint::Created(session) => &session.csrf,
+        }
+    }
+}
+
 /// The users and sessions database. Open one per process that needs it: the
 /// daemon holds one for the lifetime of `serve`, the `crystalline users` CLI
 /// opens one for the length of a single command.
@@ -911,6 +937,129 @@ impl AuthStore {
         })
     }
 
+    /// Reuse the account's newest live session, or issue one when it holds
+    /// none.
+    ///
+    /// What `GET /auth/me` calls for a trusted-header identity, which arrives
+    /// with an account and no session of its own. Minting unconditionally would
+    /// add a row per probe - unbounded for a client that keeps no cookie - and
+    /// would hand two tabs opening at once two different CSRF tokens, of which
+    /// only the one whose `Set-Cookie` landed last would work.
+    ///
+    /// The check and the insert are one `BEGIN IMMEDIATE` transaction, which is
+    /// the whole point: two concurrent probes serialize here, so the second sees
+    /// the first's session rather than racing it to a duplicate.
+    ///
+    /// A reused session yields only its CSRF token. The session token itself is
+    /// stored hashed and no unhashed copy is kept, so there is nothing to put in
+    /// a cookie - which is why [`AuthStore::newest_session_csrf`] exists: the
+    /// trusted-header path resolves the token by identity, not by cookie.
+    pub async fn ensure_session(&self, name: &str, ttl_secs: i64) -> Result<SessionMint> {
+        let name = normalize_name(name)?;
+        let now = chrono::Utc::now().timestamp();
+        let token = random_hex();
+        let csrf = random_hex();
+        let expires_at = now.saturating_add(ttl_secs);
+        let _guard = self.guard.lock().await;
+        self.begin_immediate()
+            .await
+            .with_context(|| format!("ensuring a session for user '{name}'"))?;
+        let mut reused = None;
+        let result = async {
+            let exists = self
+                .query_first(
+                    "SELECT 1 FROM users WHERE name = ?1",
+                    vec![Value::Text(name.clone())],
+                )
+                .await?;
+            if exists.is_none() {
+                bail!("no such user: '{name}'");
+            }
+            if let Some(live) = self.live_csrf(&name, now).await? {
+                reused = Some(live);
+                return Ok(());
+            }
+            self.conn
+                .execute(
+                    "INSERT INTO sessions (token_hash, user_name, csrf, expires_at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    vec![
+                        Value::Text(token_hash(&token)),
+                        Value::Text(name.clone()),
+                        Value::Text(csrf.clone()),
+                        Value::Integer(expires_at),
+                    ],
+                )
+                .await
+                .with_context(|| format!("ensuring a session for user '{name}'"))?;
+            Ok(())
+        }
+        .await;
+        self.finish(result).await?;
+        Ok(match reused {
+            Some(csrf) => SessionMint::Reused { csrf },
+            None => SessionMint::Created(Session {
+                token,
+                csrf,
+                expires_at,
+            }),
+        })
+    }
+
+    /// The CSRF token of the newest live session `name` holds, or `None`.
+    ///
+    /// The trusted-header path resolves its token this way rather than through
+    /// the session cookie: the proxy is what names the identity there, the
+    /// cookie carries nothing the header does not already say, and a device
+    /// whose cookie was never set or has gone stale would otherwise hold a token
+    /// the server refuses to recognize. Not used by the cookie-session path,
+    /// where the cookie is the identity and its own session's token is the one
+    /// that must match.
+    pub async fn newest_session_csrf(&self, name: &str) -> Result<Option<String>> {
+        let name = normalize_name(name)?;
+        let now = chrono::Utc::now().timestamp();
+        let _guard = self.guard.lock().await;
+        self.live_csrf(&name, now).await
+    }
+
+    /// How many session rows exist, live and expired alike. A diagnostic, and
+    /// what pins the reuse invariant in tests: a probe that minted per call
+    /// would show here as a growing count.
+    pub async fn session_count(&self) -> Result<usize> {
+        let _guard = self.guard.lock().await;
+        Ok(
+            match self
+                .query_first("SELECT COUNT(*) FROM sessions", vec![])
+                .await?
+                .map(|row| row.get_value(0))
+            {
+                Some(Ok(Value::Integer(n))) => n as usize,
+                _ => 0,
+            },
+        )
+    }
+
+    /// The newest unexpired session's CSRF token for an already-normalized
+    /// `name`. Callers hold the guard; `ensure_session` also holds an open
+    /// transaction, so this must not take either.
+    ///
+    /// Ordered by `expires_at` because the table records no creation time and
+    /// the TTL is a constant, which makes the two orders the same. The tie-break
+    /// on `token_hash` only keeps the answer stable when two sessions were
+    /// issued in the same second.
+    async fn live_csrf(&self, name: &str, now: i64) -> Result<Option<String>> {
+        Ok(self
+            .query_first(
+                "SELECT csrf FROM sessions
+                 WHERE user_name = ?1 AND expires_at > ?2
+                 ORDER BY expires_at DESC, token_hash DESC
+                 LIMIT 1",
+                vec![Value::Text(name.to_string()), Value::Integer(now)],
+            )
+            .await?
+            .and_then(|row| cell_text(&row, 0)))
+    }
+
     /// Resolve a session token to its account and CSRF token. `None` for an
     /// unknown, expired or disabled-account session.
     ///
@@ -1326,6 +1475,112 @@ mod tests {
         assert!(store.session_user("not-a-token").await.unwrap().is_none());
         // The live session survived the expired one's prune.
         assert!(store.session_user(&live.token).await.unwrap().is_some());
+    }
+
+    /// `ensure_session` issues at most one session per account: the first call
+    /// creates, every later one reuses, and only an account with nothing live
+    /// gets a second row. This is what keeps `/auth/me` from adding a session
+    /// per probe for a trusted-header client that keeps no cookie.
+    #[tokio::test]
+    async fn ensure_session_reuses_a_live_session_rather_than_adding_one() {
+        let (_dir, store) = store().await;
+        store
+            .add_user("ada", "Ada", None, Role::Editor, "pw")
+            .await
+            .unwrap();
+        assert_eq!(store.session_count().await.unwrap(), 0);
+        assert!(store.newest_session_csrf("ada").await.unwrap().is_none());
+
+        let SessionMint::Created(first) = store.ensure_session("ada", 3600).await.unwrap() else {
+            panic!("the first call has nothing to reuse, so it creates");
+        };
+        assert_eq!(store.session_count().await.unwrap(), 1);
+
+        // Ten more probes, all reusing: the row count does not move and the
+        // token does not change, which is what keeps a second tab working.
+        for _ in 0..10 {
+            let mint = store.ensure_session("AdA", 3600).await.unwrap();
+            assert!(
+                matches!(mint, SessionMint::Reused { .. }),
+                "a live session must be reused, not duplicated"
+            );
+            assert_eq!(mint.csrf(), first.csrf);
+        }
+        assert_eq!(store.session_count().await.unwrap(), 1);
+        assert_eq!(
+            store.newest_session_csrf("ada").await.unwrap().as_deref(),
+            Some(first.csrf.as_str())
+        );
+        // The created session is still the one the cookie resolves to.
+        let (_, csrf) = store.session_user(&first.token).await.unwrap().unwrap();
+        assert_eq!(csrf, first.csrf);
+
+        // An expired session is not live, so the next probe issues a fresh one.
+        // (The prune in `session_user` has already dropped the old row.)
+        store.delete_session(&first.token).await.unwrap();
+        store.create_session("ada", -1).await.unwrap();
+        assert!(store.newest_session_csrf("ada").await.unwrap().is_none());
+        let SessionMint::Created(second) = store.ensure_session("ada", 3600).await.unwrap() else {
+            panic!("nothing live is left to reuse, so this creates");
+        };
+        assert_ne!(second.csrf, first.csrf);
+
+        // Another account's live session is never handed over.
+        store
+            .add_user("bob", "Bob", None, Role::Editor, "pw")
+            .await
+            .unwrap();
+        assert!(store.newest_session_csrf("bob").await.unwrap().is_none());
+        let SessionMint::Created(bobs) = store.ensure_session("bob", 3600).await.unwrap() else {
+            panic!("bob holds nothing, so this creates");
+        };
+        assert_ne!(bobs.csrf, second.csrf);
+
+        // An account nobody created has no session to ensure.
+        assert!(store.ensure_session("ghost", 3600).await.is_err());
+    }
+
+    /// Concurrent probes, which is the two-tabs-at-once case: the check and the
+    /// insert are one transaction, so exactly one session is created however
+    /// many arrive together, and every caller is handed the same token. Without
+    /// the transaction each tab would get its own token and only the one whose
+    /// `Set-Cookie` landed last would be able to write.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_probes_settle_on_one_session() {
+        let (_dir, store) = store().await;
+        store
+            .add_user("ada", "Ada", None, Role::Editor, "pw")
+            .await
+            .unwrap();
+        let store = std::sync::Arc::new(store);
+
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let store = store.clone();
+            tasks.push(tokio::spawn(async move {
+                store.ensure_session("ada", 3600).await.unwrap()
+            }));
+        }
+        let mints: Vec<SessionMint> = futures::future::join_all(tasks)
+            .await
+            .into_iter()
+            .map(|t| t.unwrap())
+            .collect();
+
+        assert_eq!(
+            store.session_count().await.unwrap(),
+            1,
+            "one session however many probes raced for it"
+        );
+        let created = mints
+            .iter()
+            .filter(|m| matches!(m, SessionMint::Created(_)))
+            .count();
+        assert_eq!(created, 1, "exactly one caller created it");
+        let token = mints[0].csrf();
+        for mint in &mints {
+            assert_eq!(mint.csrf(), token, "every tab was handed the same token");
+        }
     }
 
     #[tokio::test]

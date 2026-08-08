@@ -498,9 +498,10 @@ export interface components {
              *     belongs.
              *
              *     Null only for the anonymous viewer, which has no account and can never
-             *     write; trusted-header identities are minted a session here on first
-             *     call, so every identity that can mutate anything carries a token. See
-             *     the `check_csrf` rule.
+             *     write; a trusted-header identity is given a session here on the first
+             *     call and handed that same session's token on every later one, so every
+             *     identity that can mutate anything carries a token. See the `check_csrf`
+             *     rule.
              *
              *     Handing the token back on a `GET` is safe for the same reason handing it
              *     back from login is: no CORS layer exists on this surface, so another
@@ -725,6 +726,8 @@ export interface operations {
             /** @description Signed in. The session cookie is set and the CSRF token is in the body. */
             200: {
                 headers: {
+                    /** @description `no-store`: this answer carries a session cookie and a CSRF token, so no cache between the server and the browser may keep it. */
+                    "cache-control"?: string;
                     /** @description The `fluid_session` session cookie, HttpOnly and SameSite=Lax. */
                     "set-cookie"?: string;
                     [name: string]: unknown;
@@ -792,6 +795,8 @@ export interface operations {
             /** @description Signed out, whether or not there was a session to revoke. */
             200: {
                 headers: {
+                    /** @description `no-store`: this answer clears the session cookie, so no cache between the server and the browser may keep it. */
+                    "cache-control"?: string;
                     /** @description Clears the `fluid_session` cookie. */
                     "set-cookie"?: string;
                     [name: string]: unknown;
@@ -823,7 +828,9 @@ export interface operations {
             /** @description Who the caller is and what this instance allows. Answered without an identity too, which is how a client learns it has to log in. */
             200: {
                 headers: {
-                    /** @description The `fluid_session` session cookie, HttpOnly and SameSite=Lax. Set only when this call mints a session, which is the first call from a trusted-header identity. */
+                    /** @description `no-store`. Always set: this answer names the caller and carries their CSRF token, and a shared cache is allowed to store a GET 200 heuristically, which behind an SSO proxy would hand the next user the previous one's identity. */
+                    "cache-control"?: string;
+                    /** @description The `fluid_session` session cookie, HttpOnly and SameSite=Lax. Set only when this call issues a session, which is the first call from a trusted-header identity whose account holds none; a later probe reuses that session and sets no cookie. */
                     "set-cookie"?: string;
                     [name: string]: unknown;
                 };

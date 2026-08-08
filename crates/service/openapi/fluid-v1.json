@@ -132,6 +132,12 @@
           "200": {
             "description": "Signed in. The session cookie is set and the CSRF token is in the body.",
             "headers": {
+              "cache-control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "`no-store`: this answer carries a session cookie and a CSRF token, so no cache between the server and the browser may keep it."
+              },
               "set-cookie": {
                 "schema": {
                   "type": "string"
@@ -211,6 +217,12 @@
           "200": {
             "description": "Signed out, whether or not there was a session to revoke.",
             "headers": {
+              "cache-control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "`no-store`: this answer clears the session cookie, so no cache between the server and the browser may keep it."
+              },
               "set-cookie": {
                 "schema": {
                   "type": "string"
@@ -251,11 +263,17 @@
           "200": {
             "description": "Who the caller is and what this instance allows. Answered without an identity too, which is how a client learns it has to log in.",
             "headers": {
+              "cache-control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "`no-store`. Always set: this answer names the caller and carries their CSRF token, and a shared cache is allowed to store a GET 200 heuristically, which behind an SSO proxy would hand the next user the previous one's identity."
+              },
               "set-cookie": {
                 "schema": {
                   "type": "string"
                 },
-                "description": "The `fluid_session` session cookie, HttpOnly and SameSite=Lax. Set only when this call mints a session, which is the first call from a trusted-header identity."
+                "description": "The `fluid_session` session cookie, HttpOnly and SameSite=Lax. Set only when this call issues a session, which is the first call from a trusted-header identity whose account holds none; a later probe reuses that session and sets no cookie."
               }
             },
             "content": {
@@ -1822,7 +1840,7 @@
               "string",
               "null"
             ],
-            "description": "The CSRF token of the session this request arrived on, or null when it\narrived on no session.\n\nReissued here, not only by login, because the session cookie is\n`HttpOnly` and the token is not stored anywhere a reload survives: a\nbrowser that refreshes holds a live session whose token it can no longer\nproduce, and would be unable to log out or to write until it logged in\nagain. This probe is what a client opens on, so it is where the token\nbelongs.\n\nNull only for the anonymous viewer, which has no account and can never\nwrite; trusted-header identities are minted a session here on first\ncall, so every identity that can mutate anything carries a token. See\nthe `check_csrf` rule.\n\nHanding the token back on a `GET` is safe for the same reason handing it\nback from login is: no CORS layer exists on this surface, so another\norigin can send the request but cannot read the answer. **That is load\nbearing - a CORS layer must not be added without revisiting this.**",
+            "description": "The CSRF token of the session this request arrived on, or null when it\narrived on no session.\n\nReissued here, not only by login, because the session cookie is\n`HttpOnly` and the token is not stored anywhere a reload survives: a\nbrowser that refreshes holds a live session whose token it can no longer\nproduce, and would be unable to log out or to write until it logged in\nagain. This probe is what a client opens on, so it is where the token\nbelongs.\n\nNull only for the anonymous viewer, which has no account and can never\nwrite; a trusted-header identity is given a session here on the first\ncall and handed that same session's token on every later one, so every\nidentity that can mutate anything carries a token. See the `check_csrf`\nrule.\n\nHanding the token back on a `GET` is safe for the same reason handing it\nback from login is: no CORS layer exists on this surface, so another\norigin can send the request but cannot read the answer. **That is load\nbearing - a CORS layer must not be added without revisiting this.**",
             "example": "9f2c1d7e4b6a8035"
           },
           "read_only": {

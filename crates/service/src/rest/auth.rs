@@ -37,7 +37,7 @@ use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use crystalline_core::config::GlobalConfig;
 use tokio::sync::Semaphore;
 
-use super::auth_store::{AuthStore, PasswordCheck, Role, User, dummy_verify};
+use super::auth_store::{AuthStore, PasswordCheck, Role, SessionMint, User, dummy_verify};
 use super::{ApiError, ApiJson, ProblemDetail, RestState};
 
 /// The session cookie. Named for the UI it serves so it never collides with a
@@ -286,16 +286,30 @@ async fn resolve(state: &RestState, headers: &HeaderMap) -> Result<Identity, Api
             return Err(ApiError::forbidden("this account is disabled"));
         }
         // The settlement gives trusted-header identities a real session too:
-        // /auth/me mints it, the cookie carries it, and this adopts its CSRF
-        // token when the cookie belongs to the same account the header names.
-        // A cookie for anyone else (the proxy re-mapped the identity) is
-        // ignored: the header is the authority in this mode.
-        let csrf = match CookieJar::from_headers(headers).get(SESSION_COOKIE) {
+        // /auth/me mints it and this adopts its CSRF token. The cookie is
+        // preferred when it names the same account the header does, so a
+        // browser echoes the token of the session it actually holds. A cookie
+        // for anyone else (the proxy re-mapped the identity) is ignored: the
+        // header is the authority in this mode.
+        let from_cookie = match CookieJar::from_headers(headers).get(SESSION_COOKIE) {
             Some(cookie) => match state.auth.session_user(cookie.value()).await? {
                 Some((session_user, csrf)) if session_user.name == user.name => Some(csrf),
                 _ => None,
             },
             None => None,
+        };
+        // With no usable cookie, fall back to the account's own live session.
+        // In this mode the cookie carries nothing the header has not already
+        // said, so binding the token to it would lock out exactly the callers
+        // that have none: a client that keeps no cookie jar, a device whose
+        // cookie went stale, and the second of two tabs opened at once, which
+        // is handed a reused session precisely because it has no token of its
+        // own to be given. What the token proves is unchanged either way - that
+        // whoever sent this read an /auth/me answer for this identity, which no
+        // other origin can do while no CORS layer exists.
+        let csrf = match from_cookie {
+            Some(csrf) => Some(csrf),
+            None => state.auth.newest_session_csrf(&user.name).await?,
         };
         return Ok(Identity {
             user: Some(user),
@@ -455,9 +469,10 @@ pub struct MeResponse {
     /// belongs.
     ///
     /// Null only for the anonymous viewer, which has no account and can never
-    /// write; trusted-header identities are minted a session here on first
-    /// call, so every identity that can mutate anything carries a token. See
-    /// the `check_csrf` rule.
+    /// write; a trusted-header identity is given a session here on the first
+    /// call and handed that same session's token on every later one, so every
+    /// identity that can mutate anything carries a token. See the `check_csrf`
+    /// rule.
     ///
     /// Handing the token back on a `GET` is safe for the same reason handing it
     /// back from login is: no CORS layer exists on this surface, so another
@@ -501,8 +516,13 @@ pub struct MeResponse {
             description = "Signed in. The session cookie is set and the CSRF \
                            token is in the body.",
             body = LoginResponse,
-            headers(("set-cookie" = String, description = "The `fluid_session` \
-                     session cookie, HttpOnly and SameSite=Lax.")),
+            headers(
+                ("set-cookie" = String, description = "The `fluid_session` \
+                 session cookie, HttpOnly and SameSite=Lax."),
+                ("cache-control" = String, description = "`no-store`: this \
+                 answer carries a session cookie and a CSRF token, so no cache \
+                 between the server and the browser may keep it."),
+            ),
         ),
         (
             status = 400,
@@ -543,7 +563,7 @@ pub async fn login(
     jar: CookieJar,
     headers: HeaderMap,
     ApiJson(body): ApiJson<LoginBody>,
-) -> Result<(CookieJar, axum::Json<LoginResponse>), ApiError> {
+) -> Result<(CookieJar, NoStore, axum::Json<LoginResponse>), ApiError> {
     let Some(user) =
         authenticate(&state.auth, &state.login_slots, &body.name, &body.password).await?
     else {
@@ -571,6 +591,7 @@ pub async fn login(
         .build();
     Ok((
         jar.add(cookie),
+        no_store(),
         axum::Json(LoginResponse {
             user,
             csrf: session.csrf,
@@ -653,8 +674,13 @@ pub(super) async fn with_login_slot<F: Future>(
             description = "Signed out, whether or not there was a session to \
                            revoke.",
             body = LogoutResponse,
-            headers(("set-cookie" = String, description = "Clears the \
-                     `fluid_session` cookie.")),
+            headers(
+                ("set-cookie" = String, description = "Clears the \
+                 `fluid_session` cookie."),
+                ("cache-control" = String, description = "`no-store`: this \
+                 answer clears the session cookie, so no cache between the \
+                 server and the browser may keep it."),
+            ),
         ),
         (
             status = 403,
@@ -669,14 +695,18 @@ pub(super) async fn with_login_slot<F: Future>(
 pub async fn logout(
     State(state): State<RestState>,
     jar: CookieJar,
-) -> Result<(CookieJar, axum::Json<LogoutResponse>), ApiError> {
+) -> Result<(CookieJar, NoStore, axum::Json<LogoutResponse>), ApiError> {
     if let Some(cookie) = jar.get(SESSION_COOKIE) {
         state.auth.delete_session(cookie.value()).await?;
     }
     // The removal has to carry the same path the cookie was set with, or the
     // browser keeps the original and only shadows it.
     let removal = Cookie::build(SESSION_COOKIE).path("/").build();
-    Ok((jar.remove(removal), axum::Json(LogoutResponse { ok: true })))
+    Ok((
+        jar.remove(removal),
+        no_store(),
+        axum::Json(LogoutResponse { ok: true }),
+    ))
 }
 
 /// The capability probe a client calls before anything else: who it is, whether
@@ -710,10 +740,18 @@ pub async fn logout(
                            Answered without an identity too, which is how a \
                            client learns it has to log in.",
             body = MeResponse,
-            headers(("set-cookie" = String, description = "The `fluid_session` \
-                     session cookie, HttpOnly and SameSite=Lax. Set only when \
-                     this call mints a session, which is the first call from a \
-                     trusted-header identity.")),
+            headers(
+                ("set-cookie" = String, description = "The `fluid_session` \
+                 session cookie, HttpOnly and SameSite=Lax. Set only when this \
+                 call issues a session, which is the first call from a \
+                 trusted-header identity whose account holds none; a later \
+                 probe reuses that session and sets no cookie."),
+                ("cache-control" = String, description = "`no-store`. Always \
+                 set: this answer names the caller and carries their CSRF \
+                 token, and a shared cache is allowed to store a GET 200 \
+                 heuristically, which behind an SSO proxy would hand the next \
+                 user the previous one's identity."),
+            ),
         ),
         (
             status = 403,
@@ -731,11 +769,11 @@ pub async fn me(
     jar: CookieJar,
     headers: HeaderMap,
     identity: Identity,
-) -> Result<(CookieJar, axum::Json<MeResponse>), ApiError> {
+) -> Result<(CookieJar, NoStore, axum::Json<MeResponse>), ApiError> {
     let mut jar = jar;
     let mut csrf = identity.csrf.clone();
     // A trusted-header identity arrives with an account and no session (a
-    // cookie session always carries its token). Mint one here: this probe is
+    // cookie session always carries its token). Ensure one here: this probe is
     // what a client opens on, so it is where the token belongs - for the
     // trusted-header mode exactly as for a reloaded cookie session.
     if csrf.is_none()
@@ -747,22 +785,32 @@ pub async fn me(
         if let Some(presented) = jar.get(SESSION_COOKIE) {
             state.auth.delete_session(presented.value()).await?;
         }
-        let session = state
+        // Reuse before minting. A probe that issued a session every time would
+        // add a row per call for a client that keeps no cookie, and would hand
+        // two tabs opening at once two different tokens; `ensure_session` does
+        // the check and the insert in one transaction, so the second probe of a
+        // race sees the first's session instead of racing it. A reused session
+        // sets no cookie because there is no unhashed token left to put in one
+        // - `resolve` reads this mode's token by identity for that reason.
+        let mint = state
             .auth
-            .create_session(&user.name, SESSION_TTL_SECS)
+            .ensure_session(&user.name, SESSION_TTL_SECS)
             .await?;
-        let cookie = Cookie::build((SESSION_COOKIE, session.token))
-            .path("/")
-            .http_only(true)
-            .same_site(SameSite::Lax)
-            .secure(cookie_needs_secure(&headers))
-            .max_age(time::Duration::seconds(SESSION_TTL_SECS))
-            .build();
-        jar = jar.add(cookie);
-        csrf = Some(session.csrf);
+        csrf = Some(mint.csrf().to_string());
+        if let SessionMint::Created(session) = mint {
+            let cookie = Cookie::build((SESSION_COOKIE, session.token))
+                .path("/")
+                .http_only(true)
+                .same_site(SameSite::Lax)
+                .secure(cookie_needs_secure(&headers))
+                .max_age(time::Duration::seconds(SESSION_TTL_SECS))
+                .build();
+            jar = jar.add(cookie);
+        }
     }
     Ok((
         jar,
+        no_store(),
         axum::Json(MeResponse {
             user: identity.user,
             csrf,
@@ -845,6 +893,27 @@ fn host_is_loopback(host: &str) -> bool {
         || bare
             .parse::<std::net::IpAddr>()
             .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// The `Cache-Control` header the auth endpoints answer with, as a type a
+/// handler can name in its return position.
+pub type NoStore = [(HeaderName, &'static str); 1];
+
+/// `Cache-Control: no-store`, for every response that carries a CSRF token or a
+/// `Set-Cookie`.
+///
+/// Not decoration. `GET /auth/me` is a 200 answer to a GET with no explicit
+/// freshness information, which is exactly the shape a shared cache is allowed
+/// to store and reuse on a heuristic; and the trusted-header mode puts a reverse
+/// proxy in front of this surface by definition, which is the one place such a
+/// cache is likely to be. A cached probe would hand the next user through that
+/// proxy the previous one's identity, CSRF token and session cookie. Login and
+/// logout carry the same material and are marked the same way: a POST response
+/// is only cacheable with explicit freshness information, so it is defence in
+/// depth there rather than a hole being closed, but a reader should not have to
+/// work out which of the three was safe.
+fn no_store() -> NoStore {
+    [(header::CACHE_CONTROL, "no-store")]
 }
 
 /// The shared login limiter a [`RestState`] is built with.
