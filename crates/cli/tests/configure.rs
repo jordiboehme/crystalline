@@ -6,21 +6,19 @@
 
 use assert_cmd::Command;
 
+mod common;
+use common::isolate;
+
 fn bin() -> Command {
     Command::cargo_bin("crystalline").unwrap()
 }
 
-/// Redirect `HOME` and the XDG base directories into `home` so a child that
-/// reads the environment never reaches a real daemon socket or the developer's
-/// own config, and the default config path stays inside the tempdir. The
-/// environment-driven tests below combine this with a per-child `.env` for the
-/// `CRYSTALLINE_*` variable under test, never a process-global `set_var`.
-fn isolate(cmd: &mut Command, home: &std::path::Path) {
-    cmd.env("HOME", home)
-        .env("XDG_CONFIG_HOME", home.join("config"))
-        .env("XDG_STATE_HOME", home.join("state"))
-        .env("XDG_CACHE_HOME", home.join("cache"));
-}
+// `isolate` (from `common`) redirects every base directory a child can
+// resolve into `home`, so a child that reads the environment never reaches a
+// real daemon socket or the developer's own config, and the default config
+// path stays inside the tempdir. The environment-driven tests below combine
+// this with a per-child `.env` for the `CRYSTALLINE_*` variable under test,
+// never a process-global `set_var`.
 
 #[test]
 fn config_show_set_unset_round_trip_against_a_temp_config() {

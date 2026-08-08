@@ -4,23 +4,18 @@
 //! the variable per-child with `assert_cmd`'s `.env`, never a process-global
 //! `set_var`, and points every path at a tempdir.
 
-use std::path::Path;
-
 use assert_cmd::Command;
+
+mod common;
+use common::isolate;
 
 fn bin() -> Command {
     Command::cargo_bin("crystalline").unwrap()
 }
 
-/// Redirect `HOME` and the XDG base directories into `home` so a child never
-/// reaches a real daemon socket, the developer's own config or a real
-/// credential store.
-fn isolate(cmd: &mut Command, home: &Path) {
-    cmd.env("HOME", home)
-        .env("XDG_CONFIG_HOME", home.join("config"))
-        .env("XDG_STATE_HOME", home.join("state"))
-        .env("XDG_CACHE_HOME", home.join("cache"));
-}
+// `isolate` (from `common`) redirects every base directory a child can
+// resolve into `home`, so a child never reaches a real daemon socket, the
+// developer's own config or a real credential store.
 
 #[test]
 fn connect_github_refuses_when_the_environment_owns_the_token() {

@@ -8,18 +8,16 @@ use std::path::Path;
 
 use assert_cmd::Command;
 
+mod common;
+use common::isolate;
+
 fn bin() -> Command {
     Command::cargo_bin("crystalline").unwrap()
 }
 
-/// Redirect `HOME` and the XDG base directories into `home` so a child never
-/// reaches a real daemon socket, the developer's own config or a real index.
-fn isolate(cmd: &mut Command, home: &Path) {
-    cmd.env("HOME", home)
-        .env("XDG_CONFIG_HOME", home.join("config"))
-        .env("XDG_STATE_HOME", home.join("state"))
-        .env("XDG_CACHE_HOME", home.join("cache"));
-}
+// `isolate` (from `common`) redirects every base directory a child can
+// resolve into `home`, so a child never reaches a real daemon socket, the
+// developer's own config or a real index.
 
 /// A minimal domain directory with a MANIFEST.md so the routing prompt has
 /// something to read.

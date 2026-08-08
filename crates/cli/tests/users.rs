@@ -5,48 +5,21 @@
 
 use assert_cmd::Command;
 
+mod common;
+use common::{isolate, isolation_env};
+
 fn bin() -> Command {
     Command::cargo_bin("crystalline").unwrap()
 }
 
-/// Redirect every base directory this child can resolve into `home`, so the
-/// auth database at `<state_dir>/web-auth.db` is this test's alone.
-///
-/// Both families are needed, because `state_dir` goes through etcetera's
-/// `choose_base_strategy`, which is a different strategy per platform: the XDG
-/// one on unix and macOS, which reads `HOME` and `XDG_*_HOME`, and the Windows
-/// one, which reads `USERPROFILE`, `APPDATA` and `LOCALAPPDATA` and ignores
-/// the XDG variables entirely. On Windows it also has no state directory of
-/// its own, so `state_dir` falls back to the data directory, `APPDATA`.
-/// Setting only the XDG variables would leave every test in this file
-/// resolving one real `%APPDATA%\crystalline\web-auth.db` and locking each
-/// other out of it (Windows byte-range locks are mandatory). The Windows names
-/// and layout mirror `service_windows.rs`, which isolates the daemon the same
-/// way; setting them on unix as well is harmless there and keeps this helper
-/// free of a `cfg`.
-fn isolate(cmd: &mut Command, home: &std::path::Path) {
-    for (name, value) in isolation_env(home) {
-        cmd.env(name, value);
-    }
-}
-
-/// The variables [`isolate`] sets, as pairs, because one other place needs the
-/// same set and cannot go through [`isolate`]:
-/// `users_add_works_while_another_process_holds_the_auth_db` spawns its holder
-/// with a plain [`std::process::Command`], not an `assert_cmd` one. Both read
-/// this list, so a variable added here reaches both and the two cannot drift
-/// into resolving different `web-auth.db` files.
-fn isolation_env(home: &std::path::Path) -> [(&'static str, std::path::PathBuf); 7] {
-    [
-        ("HOME", home.to_path_buf()),
-        ("XDG_CONFIG_HOME", home.join("config")),
-        ("XDG_STATE_HOME", home.join("state")),
-        ("XDG_CACHE_HOME", home.join("cache")),
-        ("USERPROFILE", home.to_path_buf()),
-        ("APPDATA", home.join("roaming")),
-        ("LOCALAPPDATA", home.join("local")),
-    ]
-}
+// `isolate` and `isolation_env` (both from `common`) redirect every base
+// directory this child can resolve into `home`, so the auth database at
+// `<state_dir>/web-auth.db` is this test's alone. `isolation_env` is used
+// directly (not through `isolate`) by
+// `users_add_works_while_another_process_holds_the_auth_db`, which spawns its
+// holder with a plain `std::process::Command`, not an `assert_cmd` one - both
+// read the same list, so a variable added there reaches both and the two
+// cannot drift into resolving different `web-auth.db` files.
 
 /// Run `crystalline users ...` in the isolated home, feeding `stdin` when
 /// given, and return stdout on success.
