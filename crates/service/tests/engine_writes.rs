@@ -157,6 +157,79 @@ async fn a_stale_save_is_a_conflict_on_file_and_virtual_domains() {
     assert!(err.to_string().contains("stale edit"), "{err}");
 }
 
+/// The MCP promise made true on files: an edit that presents the checksum of
+/// the version it read is refused once the content moved on, on BOTH storage
+/// kinds. The file arm compares inside the same per-path lock the save takes,
+/// and speaks through stale_edit_message so the REST layer's "stale edit"
+/// seam holds. An edit with no checksum stays last-write-wins, unchanged.
+#[tokio::test]
+async fn a_stale_edit_is_a_conflict_on_file_and_virtual_domains() {
+    let (_tmp, engine) = engine_fixture().await;
+
+    // File domain: a stale token refuses, the honest token lands.
+    let stale: crystalline_service::params::EditParams =
+        serde_json::from_value(serde_json::json!({
+            "identifier": "alpha",
+            "domain": "eng",
+            "operation": "append",
+            "content": "A late thought.",
+            "expected_checksum": "0000000000000000000000000000000000000000000000000000000000000000",
+        }))
+        .unwrap();
+    let err = engine.edit_engram(&stale).await.unwrap_err();
+    assert!(err.to_string().contains("stale edit"), "{err}");
+
+    let (checksum, _) = checksum_of(&engine, "eng", "alpha").await;
+    let fresh: crystalline_service::params::EditParams =
+        serde_json::from_value(serde_json::json!({
+            "identifier": "alpha",
+            "domain": "eng",
+            "operation": "append",
+            "content": "A timely thought.",
+            "expected_checksum": checksum,
+        }))
+        .unwrap();
+    engine.edit_engram(&fresh).await.unwrap();
+
+    // And with no token at all: last-write-wins, exactly as before.
+    let unguarded: crystalline_service::params::EditParams =
+        serde_json::from_value(serde_json::json!({
+            "identifier": "alpha",
+            "domain": "eng",
+            "operation": "append",
+            "content": "An unguarded thought.",
+        }))
+        .unwrap();
+    engine.edit_engram(&unguarded).await.unwrap();
+
+    // Virtual domain: the seam already held; pin it beside the file case.
+    engine
+        .write_engram(&crystalline_service::params::WriteParams {
+            domain: "scratch".to_string(),
+            title: "Note".to_string(),
+            content: "A note.".to_string(),
+            folder: None,
+            engram_type: None,
+            tags: vec![],
+            status: None,
+            metadata: None,
+            overwrite: false,
+        })
+        .await
+        .unwrap();
+    let stale_virtual: crystalline_service::params::EditParams =
+        serde_json::from_value(serde_json::json!({
+            "identifier": "note",
+            "domain": "scratch",
+            "operation": "append",
+            "content": "A late thought.",
+            "expected_checksum": "not-the-checksum",
+        }))
+        .unwrap();
+    let err = engine.edit_engram(&stale_virtual).await.unwrap_err();
+    assert!(err.to_string().contains("stale edit"), "{err}");
+}
+
 /// The other half of the hard gate: frontmatter that is present but is not
 /// parseable YAML. The engine refuses it for the same reason - the reindex
 /// that follows the write would have to swallow the same failure - while a

@@ -2009,20 +2009,27 @@ impl Engine {
         match &source {
             ContentSource::File { root } => {
                 let abs = join_rel(root, &desc.path);
-                // Held across the read, the edit and the write. An edit of a
-                // file domain carries no checksum to refuse on, so serializing
-                // is the whole guarantee: two edits, or an agent's edit racing
-                // a browser's save, each compute their result from a version
-                // the other has already replaced, and the later write drops the
-                // earlier change without a word. Under the lock the second one
-                // reads the first's result and applies to that. See
-                // `Engine::write_lock`.
+                // Held across the read, the compare, the edit and the write.
+                // With an expected_checksum the compare below refuses a stale
+                // edit; without one, serializing is the whole guarantee: two
+                // unguarded edits each apply to what the other wrote rather
+                // than silently dropping it. See `Engine::write_lock`.
                 let lock = self.write_lock(&abs);
                 let _guard = lock.lock().await;
                 let current = std::fs::read_to_string(&abs).map_err(|source| EngineError::Io {
                     path: abs.display().to_string(),
                     source,
                 })?;
+                // The CAS token, when the caller presents one: compared inside
+                // the lock, against the bytes just read, exactly as save_engram
+                // compares. Absent stays last-write-wins - the serialized
+                // read-modify-write below is then the whole guarantee.
+                if let Some(expected) = &p.expected_checksum {
+                    let found = sha256_hex(current.as_bytes());
+                    if found != *expected {
+                        return Err(EngineError::Conflict(stale_edit_message(expected, &found)));
+                    }
+                }
                 let edited = self.apply_edit(&current, p, &desc.permalink, &actor)?;
                 let edited = touch_generated(&edited, &actor, now_offset());
                 let edited = Self::enforce_temporal(edited)?;
@@ -6232,16 +6239,16 @@ impl Engine {
     ///   creates the file. Two creates of one title would both find it free and
     ///   both write, and the second would answer 201 over the first's body
     ///   rather than the 409 that says it was already taken.
-    /// - [`Engine::edit_engram_as`] and [`Engine::retire_engram_as`] read the
-    ///   file, apply their operation to that text and write the result. Two
-    ///   edits, or an agent's edit racing a browser's save, would each compute
-    ///   from a version the other has already replaced, and the last write
-    ///   would silently drop the other's change. This is a lost-update guard
-    ///   rather than a conflict report: an edit of a file domain carries no
-    ///   `expected_checksum` to refuse on (that is the MCP contract, see
-    ///   [`crate::params::EditParams`]), so serializing is all that is on
-    ///   offer, and the second edit applies to the first's result instead of to
-    ///   a version that no longer exists. A retirement takes its successor's
+    /// - [`Engine::edit_engram_as`] and [`Engine::retire_engram_as`] serialize
+    ///   their read-modify-write under the lock: each reads the file, applies
+    ///   its operation to that text and writes the result. Two edits, or an
+    ///   agent's edit racing a browser's save, would each compute from a
+    ///   version the other has already replaced, and the last write would
+    ///   silently drop the other's change; under the lock the second one reads
+    ///   the first's result and applies to that instead. `edit_engram_as`
+    ///   additionally compares an `expected_checksum` there when one is
+    ///   supplied (see [`crate::params::EditParams`]), refusing a stale edit
+    ///   rather than merely serializing it. A retirement takes its successor's
     ///   lock too, for the reciprocal line it appends there, but never at the
     ///   same time as its target's.
     ///
@@ -8021,11 +8028,12 @@ mod lock_tests {
     /// An edit reads, applies and writes inside the file's lock, so a
     /// concurrent write is built on rather than dropped.
     ///
-    /// An edit of a file domain has no checksum to refuse on, so serializing is
-    /// the entire guarantee: what must not happen is the edit computing from
-    /// text that has already been replaced and then writing that computation
-    /// over the replacement. Here the other writer's line lands while the edit
-    /// is blocked, and both lines have to survive.
+    /// This edit carries no `expected_checksum`, which is still legal - last
+    /// write wins, and serializing is the entire guarantee: what must not
+    /// happen is the edit computing from text that has already been replaced
+    /// and then writing that computation over the replacement. Here the other
+    /// writer's line lands while the edit is blocked, and both lines have to
+    /// survive.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_edit_reads_and_writes_inside_the_file_lock() {
         let tmp = tempfile::tempdir().unwrap();
