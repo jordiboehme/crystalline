@@ -25,3 +25,15 @@ export type LoginResponse = components["schemas"]["LoginResponse"];
 
 /** The RFC 9457 body every failure on this API carries. */
 export type ProblemDetail = components["schemas"]["ProblemDetail"];
+
+/** The `{"users": [...]}` envelope `GET /users` answers with. */
+export type UsersResponse = components["schemas"]["UsersResponse"];
+
+/** The `{"user": ...}` envelope every user mutation answers with. */
+export type UserResponse = components["schemas"]["UserResponse"];
+
+/** What `POST /users` takes. */
+export type CreateUserBody = components["schemas"]["CreateBody"];
+
+/** What `PATCH /users/{name}` takes. */
+export type PatchUserBody = components["schemas"]["PatchBody"];
