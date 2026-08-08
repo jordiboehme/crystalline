@@ -537,6 +537,9 @@ fn store_error(e: anyhow::Error, subject: &str) -> ApiError {
     if detail.contains("a user name cannot be empty") {
         return ApiError::unprocessable(detail);
     }
+    if detail.contains("cannot contain whitespace") {
+        return ApiError::unprocessable(detail);
+    }
     ApiError::internal(detail)
 }
 
@@ -608,16 +611,19 @@ mod tests {
         assert_eq!(api.status, StatusCode::NOT_FOUND);
         assert!(api.detail.contains("ghost"), "{}", api.detail);
 
-        // A miss stays a miss even when the account name is the phrase the
-        // last-admin refusal is recognized by, which is why that branch is
-        // read second.
+        // The phrase collision the last-admin branch order guards against
+        // ("no such user: 'the last admin'" containing "the last admin") is no
+        // longer reachable through a real name: spaces are refused by
+        // normalize_name before the store ever gets to say "no such user".
+        // The branch order stays anyway, as documentation of the hazard it
+        // once guarded against.
         let named = store
             .set_password("the last admin", "s3cret")
             .await
-            .expect_err("no such account");
+            .expect_err("whitespace is refused before the name is looked up");
         assert_eq!(
             store_error(named, "the last admin").status,
-            StatusCode::NOT_FOUND
+            StatusCode::UNPROCESSABLE_ENTITY
         );
 
         let empty = store

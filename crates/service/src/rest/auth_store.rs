@@ -117,7 +117,9 @@ fn role_from_db(s: &str) -> Role {
 }
 
 /// Fold a supplied user name to the one form this store keys on: trimmed of
-/// surrounding whitespace and lowercased. Empty is rejected.
+/// surrounding whitespace and lowercased. Empty is rejected, and so is any
+/// name with whitespace left after trimming - a login name is space-free, the
+/// readable form belongs in the display name instead.
 ///
 /// This is enforced here rather than left to callers because the store is the
 /// only place every path meets. `name TEXT PRIMARY KEY` byte-compares, so
@@ -133,6 +135,12 @@ fn normalize_name(name: &str) -> Result<String> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
         bail!("a user name cannot be empty");
+    }
+    if trimmed.chars().any(char::is_whitespace) {
+        bail!(
+            "a login name cannot contain whitespace: pick a space-free name \
+             and put the readable form in the display name"
+        );
     }
     Ok(trimmed.to_lowercase())
 }
@@ -1749,12 +1757,41 @@ mod tests {
         assert!(store.list_users().await.unwrap().is_empty());
     }
 
+    /// Login names are space-free: the readable form belongs in the display name.
+    /// Enforced in normalize_name so every path - add, ensure, verify, edit -
+    /// refuses the same way.
+    #[tokio::test]
+    async fn a_name_with_internal_whitespace_is_rejected_on_every_path() {
+        let (_dir, store) = store().await;
+        for name in ["ada lovelace", "ada\tlovelace", "a b c"] {
+            assert!(
+                store
+                    .add_user(name, "Ada", None, Role::Viewer, "pw")
+                    .await
+                    .is_err(),
+                "add_user must reject {name:?}"
+            );
+            assert!(store.ensure_user(name, Role::Viewer).await.is_err());
+            assert!(store.set_role(name, Role::Admin).await.is_err());
+            // A login attempt is a NoHash, not an error, like other bad names.
+            assert!(store.verify_password(name, "pw").await.unwrap().is_none());
+        }
+        assert!(store.list_users().await.unwrap().is_empty());
+        // Surrounding whitespace is still merely trimmed.
+        store
+            .add_user("  ada  ", "Ada Lovelace", None, Role::Viewer, "pw")
+            .await
+            .unwrap();
+        assert_eq!(store.list_users().await.unwrap()[0].name, "ada");
+    }
+
     #[test]
     fn normalize_name_trims_folds_and_rejects_empty() {
         assert_eq!(normalize_name("  AdA  ").unwrap(), "ada");
         assert_eq!(normalize_name("Ada").unwrap(), "ada");
         assert!(normalize_name("").is_err());
         assert!(normalize_name("   ").is_err());
+        assert!(normalize_name("ada lovelace").is_err());
     }
 
     #[tokio::test]
