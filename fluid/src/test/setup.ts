@@ -45,6 +45,28 @@ Object.defineProperty(HTMLElement.prototype, "offsetHeight", {
   value: 600,
 });
 
+// CodeMirror measures text through Ranges, which jsdom leaves layout-less.
+// Zero-size answers are enough: the tests assert on documents and DOM
+// structure, never on pixel geometry.
+const zeroRect = {
+  x: 0,
+  y: 0,
+  top: 0,
+  bottom: 0,
+  left: 0,
+  right: 0,
+  width: 0,
+  height: 0,
+  toJSON: () => ({}),
+} as DOMRect;
+Range.prototype.getBoundingClientRect = () => zeroRect;
+Range.prototype.getClientRects = () =>
+  ({
+    length: 0,
+    item: () => null,
+    *[Symbol.iterator]() {},
+  }) as unknown as DOMRectList;
+
 // Radix measures its content with a ResizeObserver, which jsdom does not have.
 if (!("ResizeObserver" in globalThis)) {
   Object.defineProperty(globalThis, "ResizeObserver", {
