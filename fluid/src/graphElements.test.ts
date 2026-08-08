@@ -12,6 +12,7 @@
 import { describe, expect, it } from "vitest";
 
 import { readGraph } from "./api/graph";
+import { defined } from "./test/assert";
 import type { GraphElement, GraphNodeElement } from "./graphElements";
 import {
   ANCHOR_CLASS,
@@ -101,7 +102,7 @@ describe("the graph elements", () => {
       ANCHOR,
     );
 
-    expect(edges(elements)[0].data.label).toBe("");
+    expect(defined(edges(elements)[0], "the sole edge").data.label).toBe("");
   });
 
   it("fades a retired engram and never leaves it out", () => {
@@ -109,23 +110,23 @@ describe("the graph elements", () => {
     const [alpha, beta, gamma] = nodes(elements);
 
     // Retired is part of what the domain holds: it is drawn, and drawn faded.
-    expect(beta.classes).toContain(FADED_CLASS);
-    expect(alpha.classes).not.toContain(FADED_CLASS);
-    expect(gamma.classes).not.toContain(FADED_CLASS);
+    expect(defined(beta, "beta").classes).toContain(FADED_CLASS);
+    expect(defined(alpha, "alpha").classes).not.toContain(FADED_CLASS);
+    expect(defined(gamma, "gamma").classes).not.toContain(FADED_CLASS);
   });
 
   it("marks the engram the neighborhood was drawn around", () => {
     const elements = graphElements(neighborhood(), ANCHOR);
     const [alpha, beta] = nodes(elements);
 
-    expect(alpha.classes).toContain(ANCHOR_CLASS);
-    expect(beta.classes).not.toContain(ANCHOR_CLASS);
+    expect(defined(alpha, "alpha").classes).toContain(ANCHOR_CLASS);
+    expect(defined(beta, "beta").classes).not.toContain(ANCHOR_CLASS);
   });
 
   it("carries each engram's address, which is what a click needs", () => {
     const elements = graphElements(neighborhood(), ANCHOR);
 
-    expect(nodes(elements)[2].data).toMatchObject({
+    expect(defined(nodes(elements)[2], "the third node").data).toMatchObject({
       domain: "ops",
       permalink: "gamma",
     });
@@ -145,7 +146,9 @@ describe("the graph elements", () => {
     );
 
     expect(edges(elements)).toHaveLength(1);
-    expect(edges(elements)[0].data.label).toBe("supersedes");
+    expect(defined(edges(elements)[0], "the surviving edge").data.label).toBe(
+      "supersedes",
+    );
   });
 
   it("draws one element per id however often the payload repeats it", () => {
@@ -194,7 +197,7 @@ describe("the graph connections", () => {
 
     // The status is what fades a retired end, and the address is what the
     // link points at: both come from the node rather than from the edge.
-    expect(first.to).toMatchObject({
+    expect(defined(first, "the sole connection").to).toMatchObject({
       domain: "eng",
       permalink: "notes/beta",
       status: "deprecated",
@@ -209,8 +212,9 @@ describe("the graph connections", () => {
     );
 
     expect(connections).toHaveLength(1);
-    expect(connections[0].from.title).toBe("Beta");
-    expect(connections[0].to.title).toBe("Gamma");
+    const connection = defined(connections[0], "the sole connection");
+    expect(connection.from.title).toBe("Beta");
+    expect(connection.to.title).toBe("Gamma");
   });
 
   it("agrees with the picture about which arrows there are", () => {
@@ -234,6 +238,6 @@ describe("the graph connections", () => {
       neighborhood({ edges: [{ from: 1, to: 2 }] }),
     );
 
-    expect(connections[0].relType).toBeNull();
+    expect(defined(connections[0], "the sole connection").relType).toBeNull();
   });
 });

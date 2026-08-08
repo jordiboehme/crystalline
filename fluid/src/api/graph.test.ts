@@ -10,6 +10,7 @@
 
 import { describe, expect, it } from "vitest";
 
+import { defined } from "../test/assert";
 import {
   NEIGHBORHOOD_DEPTH,
   backlinksTo,
@@ -68,7 +69,10 @@ describe("backlinks", () => {
   it("groups one source's several relation types into one entry", () => {
     const [beta] = backlinksTo(neighborhood(), "eng", "alpha");
 
-    expect(beta.relTypes).toEqual(["links_to", "supersedes"]);
+    expect(defined(beta, "the grouped backlink").relTypes).toEqual([
+      "links_to",
+      "supersedes",
+    ]);
   });
 
   it("never counts an engram as pointing at itself", () => {

@@ -149,7 +149,13 @@ function split(text: string, resolve: WikilinkResolver): HastNode[] {
   const parts: HastNode[] = [];
   let taken = 0;
   for (const match of text.matchAll(WIKILINK)) {
-    const resolution = resolve(match[1]);
+    // WIKILINK's one capture group is not optional, so it is always present
+    // in a match; this only documents that guarantee to the checker.
+    const target = match[1];
+    if (target === undefined) {
+      continue;
+    }
+    const resolution = resolve(target);
     // Bracket text carries no parsed reference of its own, so the payload has
     // nothing to say about it here.
     const state = referenceState(resolution, null);

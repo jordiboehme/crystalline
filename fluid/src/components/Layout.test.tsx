@@ -9,6 +9,7 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ApiProblem, api, setCsrfToken } from "../api/client";
+import { defined } from "../test/assert";
 import {
   answersFor,
   domainsResponse,
@@ -280,10 +281,14 @@ describe("the layout", () => {
     const probes = apiMock.mock.calls
       .map((call, index) => ({
         path: call[0],
-        order: apiMock.mock.invocationCallOrder[index],
+        order: defined(
+          apiMock.mock.invocationCallOrder[index],
+          "the call's invocation order",
+        ),
       }))
       .filter((call) => call.path === "/auth/me");
-    expect(droppedAt).toBeLessThan(probes[probes.length - 1].order);
+    const lastProbe = defined(probes[probes.length - 1], "the last probe");
+    expect(droppedAt).toBeLessThan(lastProbe.order);
   });
 });
 

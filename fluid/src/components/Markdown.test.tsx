@@ -32,7 +32,7 @@ async function renderMarkdown(source: string, wikilinks?: WikilinkResolver) {
   const result = render(
     <MemoryRouter>
       <ThemeProvider>
-        <Markdown source={source} wikilinks={wikilinks} />
+        <Markdown source={source} {...(wikilinks ? { wikilinks } : {})} />
       </ThemeProvider>
     </MemoryRouter>,
   );
