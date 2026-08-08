@@ -227,7 +227,7 @@
             }
           },
           "403": {
-            "description": "A cookie session did not echo its CSRF token, or the trusted-header identity names a disabled account.",
+            "description": "The identity did not echo its CSRF token, or carries none yet and must call `/auth/me` first, or the trusted-header identity names a disabled account.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -245,11 +245,19 @@
           "auth"
         ],
         "summary": "The capability probe a client calls before anything else: who it is, whether\nit is being served anonymously, whether this instance refuses content\nmutations, and which server version it is talking to, so a mismatched UI can\nsay so instead of failing later.",
-        "description": "Answers without an identity on purpose. `user: null, anonymous: false` is\nwhat tells a browser to show a login form; `anonymous: true` tells it to\nbrowse instead.\n\nIt also reissues the session's CSRF token, which is the only way a reloaded\nbrowser gets it back: see `MeResponse::csrf`.",
+        "description": "Who the caller is, whether it is being served anonymously, whether this instance refuses content mutations, and which server version it is talking to. Also issues the CSRF token every later mutating request must echo in `x-csrf-token`: a cookie session has its token reissued here, and a trusted-header identity is minted a session on the first call, which is the only way that mode obtains a token.",
         "operationId": "get_me",
         "responses": {
           "200": {
             "description": "Who the caller is and what this instance allows. Answered without an identity too, which is how a client learns it has to log in.",
+            "headers": {
+              "set-cookie": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "The `fluid_session` session cookie, HttpOnly and SameSite=Lax. Set only when this call mints a session, which is the first call from a trusted-header identity."
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1814,7 +1822,7 @@
               "string",
               "null"
             ],
-            "description": "The CSRF token of the session this request arrived on, or null when it\narrived on no session.\n\nReissued here, not only by login, because the session cookie is\n`HttpOnly` and the token is not stored anywhere a reload survives: a\nbrowser that refreshes holds a live session whose token it can no longer\nproduce, and would be unable to log out or to write until it logged in\nagain. This probe is what a client opens on, so it is where the token\nbelongs.\n\nNull for the anonymous viewer, which has no session, and null for a\ntrusted-header identity, which has none either: what protects those\nrequests is the shape they are allowed to have, not a token. See the\n`check_csrf` invariant.\n\nHanding the token back on a `GET` is safe for the same reason handing it\nback from login is: no CORS layer exists on this surface, so another\norigin can send the request but cannot read the answer. **That is load\nbearing - a CORS layer must not be added without revisiting this.**",
+            "description": "The CSRF token of the session this request arrived on, or null when it\narrived on no session.\n\nReissued here, not only by login, because the session cookie is\n`HttpOnly` and the token is not stored anywhere a reload survives: a\nbrowser that refreshes holds a live session whose token it can no longer\nproduce, and would be unable to log out or to write until it logged in\nagain. This probe is what a client opens on, so it is where the token\nbelongs.\n\nNull only for the anonymous viewer, which has no account and can never\nwrite; trusted-header identities are minted a session here on first\ncall, so every identity that can mutate anything carries a token. See\nthe `check_csrf` rule.\n\nHanding the token back on a `GET` is safe for the same reason handing it\nback from login is: no CORS layer exists on this surface, so another\norigin can send the request but cannot read the answer. **That is load\nbearing - a CORS layer must not be added without revisiting this.**",
             "example": "9f2c1d7e4b6a8035"
           },
           "read_only": {

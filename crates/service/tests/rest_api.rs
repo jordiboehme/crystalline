@@ -706,23 +706,25 @@ async fn trusted_header_maps_identity() {
         ..AuthOptions::default()
     })
     .await;
-    let me: serde_json::Value = client()
+    let probe = client()
         .get(format!("http://{}/api/v1/auth/me", fixture.addr))
         .header("remote-user", "Bob")
         .send()
         .await
-        .unwrap()
-        .json()
-        .await
         .unwrap();
+    assert!(
+        session_cookie(&probe).is_some(),
+        "the probe mints a session for a trusted-header identity too"
+    );
+    let me: serde_json::Value = probe.json().await.unwrap();
     assert_eq!(me["user"]["name"], "bob", "the name is folded by the store");
     assert_eq!(me["user"]["display"], "Bob");
     assert_eq!(me["user"]["role"], "viewer");
     assert!(
-        me["csrf"].is_null(),
-        "a trusted-header identity carries no session and so no token; what \
-         keeps its mutating requests off another origin is the shape they are \
-         allowed to have. See `check_csrf`. Body: {me}"
+        me["csrf"].as_str().is_some_and(|tok| !tok.is_empty()),
+        "one CSRF rule for every identity mode: the probe hands a \
+         trusted-header identity the token its mutating requests must echo. \
+         See `check_csrf`. Body: {me}"
     );
 
     let users = fixture.auth.list_users().await.unwrap();
@@ -2277,13 +2279,15 @@ async fn creating_an_account_needs_the_csrf_token() {
     assert_eq!(ok.status(), 201, "with the token it goes through");
 }
 
-/// The invariant the trusted-header path leans on, asserted rather than
-/// assumed: that identity carries no CSRF token, so what keeps a cross-site
-/// form off these routes is the JSON content type this API demands. A form or
-/// text body - all a cross-site form can send without a CORS preflight, and no
-/// CORS layer exists on this surface - is refused by the extractor.
+/// The settlement, from the other side: a trusted-header admin that has not
+/// called `/auth/me` carries no token, and every mutating request it sends is
+/// refused - the JSON one it means to send as much as the form-shaped one a
+/// cross-site page could. Before this task the header alone was enough and what
+/// kept a cross-site form off these routes was the JSON content type the API
+/// demands; that argument is now a second line of defence rather than the only
+/// one, so a request that clears it is still refused without the token.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_cross_site_shaped_body_is_refused_on_the_trusted_header_path() {
+async fn a_trusted_header_mutation_without_a_token_is_refused() {
     let fixture = serve_with_auth(AuthOptions {
         trusted_header: Some("remote-user"),
         ..AuthOptions::default()
@@ -2298,7 +2302,11 @@ async fn a_cross_site_shaped_body_is_refused_on_the_trusted_header_path() {
     fixture.auth.set_role("proxy", Role::Admin).await.unwrap();
     let url = format!("http://{addr}/api/v1/users");
 
-    for content_type in ["application/x-www-form-urlencoded", "text/plain"] {
+    for content_type in [
+        "application/x-www-form-urlencoded",
+        "text/plain",
+        "application/json",
+    ] {
         let resp = client()
             .post(&url)
             .header("remote-user", "proxy")
@@ -2309,10 +2317,15 @@ async fn a_cross_site_shaped_body_is_refused_on_the_trusted_header_path() {
             .unwrap();
         assert_eq!(
             resp.status(),
-            415,
-            "a {content_type} body must not be acted on"
+            403,
+            "a {content_type} body must not be acted on without the token"
         );
         assert_eq!(resp.headers()["content-type"], "application/problem+json");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(
+            body["detail"].as_str().unwrap().contains("/auth/me"),
+            "the refusal says where the token comes from: {body}"
+        );
     }
     let names: Vec<String> = fixture
         .auth
@@ -2323,15 +2336,70 @@ async fn a_cross_site_shaped_body_is_refused_on_the_trusted_header_path() {
         .map(|u| u.name)
         .collect();
     assert_eq!(names, vec!["proxy".to_string()], "nothing was created");
+}
 
-    let ok = client()
-        .post(&url)
-        .header("remote-user", "proxy")
-        .json(&serde_json::json!({"name": "bob", "role": "viewer", "password": "hunter2"}))
+/// The settlement end to end: a trusted-header admin is minted a session by
+/// the probe, and only the minted token authorizes a mutation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_trusted_header_identity_is_minted_a_csrf_token_by_the_probe() {
+    let fixture = serve_with_auth(AuthOptions {
+        trusted_header: Some("x-forwarded-user"),
+        ..AuthOptions::default()
+    })
+    .await;
+    fixture
+        .auth
+        .add_user("root", "Root", None, Role::Admin, "rootpw")
+        .await
+        .unwrap();
+
+    // Without the probe: refused, told where the token comes from.
+    let refused = client()
+        .post(format!("http://{}/api/v1/users", fixture.addr))
+        .header("x-forwarded-user", "root")
+        .json(&serde_json::json!({"name": "bob", "role": "viewer", "password": "pw"}))
         .send()
         .await
         .unwrap();
-    assert_eq!(ok.status(), 201, "the JSON request is served");
+    assert_eq!(refused.status(), 403);
+
+    // The probe mints a session and hands the token back.
+    let probe = client()
+        .get(format!("http://{}/api/v1/auth/me", fixture.addr))
+        .header("x-forwarded-user", "root")
+        .send()
+        .await
+        .unwrap();
+    let cookie = session_cookie(&probe).expect("the probe set a session cookie");
+    let body: serde_json::Value = probe.json().await.unwrap();
+    let csrf = body["csrf"].as_str().expect("the probe carries the token");
+
+    // Header + cookie + token: the mutation goes through.
+    let created = client()
+        .post(format!("http://{}/api/v1/users", fixture.addr))
+        .header("x-forwarded-user", "root")
+        .header("cookie", format!("fluid_session={cookie}"))
+        .header("x-csrf-token", csrf)
+        .json(&serde_json::json!({"name": "bob", "role": "viewer", "password": "pw"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201);
+
+    // A second probe with the cookie reissues the same token, not a new session.
+    let again = client()
+        .get(format!("http://{}/api/v1/auth/me", fixture.addr))
+        .header("x-forwarded-user", "root")
+        .header("cookie", format!("fluid_session={cookie}"))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        session_cookie(&again).is_none(),
+        "no second mint while the session lives"
+    );
+    let again: serde_json::Value = again.json().await.unwrap();
+    assert_eq!(again["csrf"].as_str().unwrap(), csrf);
 }
 
 /// The anonymous viewer never reaches these routes, which is what keeps the

@@ -80,12 +80,7 @@ export interface paths {
          *     it is being served anonymously, whether this instance refuses content
          *     mutations, and which server version it is talking to, so a mismatched UI can
          *     say so instead of failing later.
-         * @description Answers without an identity on purpose. `user: null, anonymous: false` is
-         *     what tells a browser to show a login form; `anonymous: true` tells it to
-         *     browse instead.
-         *
-         *     It also reissues the session's CSRF token, which is the only way a reloaded
-         *     browser gets it back: see `MeResponse::csrf`.
+         * @description Who the caller is, whether it is being served anonymously, whether this instance refuses content mutations, and which server version it is talking to. Also issues the CSRF token every later mutating request must echo in `x-csrf-token`: a cookie session has its token reissued here, and a trusted-header identity is minted a session on the first call, which is the only way that mode obtains a token.
          */
         get: operations["get_me"];
         put?: never;
@@ -502,10 +497,10 @@ export interface components {
              *     again. This probe is what a client opens on, so it is where the token
              *     belongs.
              *
-             *     Null for the anonymous viewer, which has no session, and null for a
-             *     trusted-header identity, which has none either: what protects those
-             *     requests is the shape they are allowed to have, not a token. See the
-             *     `check_csrf` invariant.
+             *     Null only for the anonymous viewer, which has no account and can never
+             *     write; trusted-header identities are minted a session here on first
+             *     call, so every identity that can mutate anything carries a token. See
+             *     the `check_csrf` rule.
              *
              *     Handing the token back on a `GET` is safe for the same reason handing it
              *     back from login is: no CORS layer exists on this surface, so another
@@ -591,6 +586,12 @@ export interface components {
              * @example ada@example.com
              */
             email?: string | null;
+            /**
+             * @description When this account last resolved a session or arrived through the
+             *     trusted header, RFC 3339. Null for an account never seen.
+             * @example 2026-08-08T09:14:22Z
+             */
+            last_seen?: string | null;
             /**
              * @description The login name and primary key. Also the identity the trusted-header
              *     mode provisions against.
@@ -799,7 +800,7 @@ export interface operations {
                     "application/json": components["schemas"]["LogoutResponse"];
                 };
             };
-            /** @description A cookie session did not echo its CSRF token, or the trusted-header identity names a disabled account. */
+            /** @description The identity did not echo its CSRF token, or carries none yet and must call `/auth/me` first, or the trusted-header identity names a disabled account. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -822,6 +823,8 @@ export interface operations {
             /** @description Who the caller is and what this instance allows. Answered without an identity too, which is how a client learns it has to log in. */
             200: {
                 headers: {
+                    /** @description The `fluid_session` session cookie, HttpOnly and SameSite=Lax. Set only when this call mints a session, which is the first call from a trusted-header identity. */
+                    "set-cookie"?: string;
                     [name: string]: unknown;
                 };
                 content: {

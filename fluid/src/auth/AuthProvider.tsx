@@ -16,7 +16,10 @@
  * The probe is also where the CSRF token comes from. The session cookie is
  * `HttpOnly`, so a reloaded tab cannot read its token back out; the server
  * reissues it here, and handing it straight to the client on the way past is
- * what keeps a reload from locking the tab out of every write.
+ * what keeps a reload from locking the tab out of every write. Behind an SSO
+ * proxy the same call mints the session outright, so the trusted-header mode
+ * gets its token from here too: there is one CSRF rule for every identity
+ * mode, and no write goes out without a token whichever mode the app is in.
  */
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";

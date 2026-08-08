@@ -131,7 +131,9 @@ pub struct Identity {
     /// The account behind the request, if any. Anonymous access has none.
     pub user: Option<User>,
     /// The CSRF token of the session this identity came from. `None` for the
-    /// trusted-header and anonymous paths, which carry no session.
+    /// anonymous path, which has no session, and for a trusted-header identity
+    /// that has not called `/auth/me` yet: that probe mints it one, and this
+    /// adopts the token whenever the cookie names the same account.
     pub csrf: Option<String>,
     /// Whether this request is being served as the anonymous viewer.
     pub anonymous: bool,
@@ -182,6 +184,14 @@ impl Identity {
     /// 401 when the request carries no identity at all.
     pub fn require_viewer(&self) -> Result<Caller, ApiError> {
         self.require(Role::Viewer)
+    }
+
+    /// The caller, when the request may mutate content. 403 for a viewer
+    /// account, 401 for the anonymous viewer and for no identity at all:
+    /// anonymous identities can NEVER write, whatever the deployment mode,
+    /// and logging in is what would change that.
+    pub fn require_editor(&self) -> Result<Caller, ApiError> {
+        self.require(Role::Editor)
     }
 
     /// The caller, when the request may be served at admin level. 403 when an
@@ -275,9 +285,21 @@ async fn resolve(state: &RestState, headers: &HeaderMap) -> Result<Identity, Api
         if user.disabled {
             return Err(ApiError::forbidden("this account is disabled"));
         }
+        // The settlement gives trusted-header identities a real session too:
+        // /auth/me mints it, the cookie carries it, and this adopts its CSRF
+        // token when the cookie belongs to the same account the header names.
+        // A cookie for anyone else (the proxy re-mapped the identity) is
+        // ignored: the header is the authority in this mode.
+        let csrf = match CookieJar::from_headers(headers).get(SESSION_COOKIE) {
+            Some(cookie) => match state.auth.session_user(cookie.value()).await? {
+                Some((session_user, csrf)) if session_user.name == user.name => Some(csrf),
+                _ => None,
+            },
+            None => None,
+        };
         return Ok(Identity {
             user: Some(user),
-            csrf: None,
+            csrf,
             anonymous: false,
         });
     }
@@ -299,33 +321,45 @@ async fn resolve(state: &RestState, headers: &HeaderMap) -> Result<Identity, Api
 
 /// Refuse a mutating request that does not echo its session's CSRF token.
 ///
-/// Only a session can be ridden by another origin, because only a cookie is
-/// attached by the browser on its own: the trusted-header and anonymous paths
-/// have no token to compare against, and for the trusted header the proxy that
-/// injects the identity owns that boundary. Login is exempt because it is what
-/// mints the token.
+/// One rule, for every identity mode: every unsafe request from an
+/// account-bearing identity echoes its session's token. A cookie session has
+/// one from login; a trusted-header identity is minted one by [`me`], which is
+/// the probe every client opens on. Neither is waved through, so there is no
+/// mode whose writes are protected by something other than this check. Login is
+/// exempt because it is what mints the token, and the identities with no account
+/// at all pass through here only because they can never reach a write:
+/// [`Identity::require_editor`] and [`Identity::require_admin`] refuse the
+/// anonymous viewer before any handler runs.
 ///
-/// Passing the tokenless identities through is a deliberate invariant rather
-/// than an accident, and the mutating routes lean on it:
+/// Historically the trusted-header path carried no token and leaned on the shape
+/// a cross-site request is allowed to have instead: `PATCH` and `DELETE` are not
+/// simple methods, so another origin cannot send them without a CORS preflight,
+/// and the `POST` it can send is refused by [`ApiJson`], which demands
+/// `application/json` while a cross-site form can only send
+/// `application/x-www-form-urlencoded`, `text/plain` or `multipart/form-data`.
+/// That argument is now a second line of defence rather than the only one.
 ///
-/// - The anonymous viewer is a viewer and nothing else, so it never reaches a
-///   route that changes anything - `require_admin` answers it 401 first.
-/// - A trusted-header caller can be an admin, and its request carries a header
-///   a browser attaches on its own for any origin. What keeps a cross-site
-///   request off those routes is the shape it is allowed to have instead:
-///   `PATCH` and `DELETE` are not simple methods, so another origin cannot send
-///   them without a CORS preflight, and the `POST` it can send is refused by
-///   [`ApiJson`], which demands `application/json` while a cross-site form can
-///   only send `application/x-www-form-urlencoded`, `text/plain` or
-///   `multipart/form-data`. **No CORS layer exists on this surface and one must
-///   not be added without revisiting this check**: allowing a cross-origin
-///   preflight would remove the only thing standing between another origin and
-///   a trusted-header admin's account.
+/// **No CORS layer exists on this surface and one must not be added without
+/// revisiting this check**: allowing a cross-origin preflight would remove the
+/// only thing standing between another origin and a trusted-header admin's
+/// account.
 fn check_csrf(identity: &Identity, req: &Request) -> Result<(), ApiError> {
     if req.method().is_safe() || req.uri().path() == LOGIN_PATH {
         return Ok(());
     }
     let Some(expected) = identity.csrf.as_deref() else {
+        if identity.user.is_some() {
+            // An account with no token cannot prove the request came from a
+            // same-origin client. A cookie session always has one; this is a
+            // trusted-header identity that has not been minted one yet.
+            return Err(ApiError::forbidden(format!(
+                "this identity carries no CSRF token yet: call GET /auth/me \
+                 to obtain one, then echo it in {CSRF_HEADER}"
+            )));
+        }
+        // No account behind the request: there is nothing for another origin
+        // to ride. The anonymous viewer never passes require_editor, and a
+        // cookie the server has forgotten makes logout a no-op.
         return Ok(());
     };
     // An empty expected token is not a token: it would match an absent header
@@ -420,10 +454,10 @@ pub struct MeResponse {
     /// again. This probe is what a client opens on, so it is where the token
     /// belongs.
     ///
-    /// Null for the anonymous viewer, which has no session, and null for a
-    /// trusted-header identity, which has none either: what protects those
-    /// requests is the shape they are allowed to have, not a token. See the
-    /// `check_csrf` invariant.
+    /// Null only for the anonymous viewer, which has no account and can never
+    /// write; trusted-header identities are minted a session here on first
+    /// call, so every identity that can mutate anything carries a token. See
+    /// the `check_csrf` rule.
     ///
     /// Handing the token back on a `GET` is safe for the same reason handing it
     /// back from login is: no CORS layer exists on this surface, so another
@@ -624,9 +658,9 @@ pub(super) async fn with_login_slot<F: Future>(
         ),
         (
             status = 403,
-            description = "A cookie session did not echo its CSRF token, or \
-                           the trusted-header identity names a disabled \
-                           account.",
+            description = "The identity did not echo its CSRF token, or carries \
+                           none yet and must call `/auth/me` first, or the \
+                           trusted-header identity names a disabled account.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -654,13 +688,21 @@ pub async fn logout(
 /// what tells a browser to show a login form; `anonymous: true` tells it to
 /// browse instead.
 ///
-/// It also reissues the session's CSRF token, which is the only way a reloaded
-/// browser gets it back: see `MeResponse::csrf`.
+/// It also issues and reissues the session's CSRF token, which is the only way
+/// a reloaded browser gets it back and the only way a trusted-header identity
+/// ever gets one: see `MeResponse::csrf`.
 #[utoipa::path(
     get,
     path = "/api/v1/auth/me",
     tag = "auth",
     operation_id = "get_me",
+    description = "Who the caller is, whether it is being served anonymously, \
+                   whether this instance refuses content mutations, and which \
+                   server version it is talking to. Also issues the CSRF token \
+                   every later mutating request must echo in `x-csrf-token`: a \
+                   cookie session has its token reissued here, and a \
+                   trusted-header identity is minted a session on the first \
+                   call, which is the only way that mode obtains a token.",
     responses(
         (
             status = 200,
@@ -668,6 +710,10 @@ pub async fn logout(
                            Answered without an identity too, which is how a \
                            client learns it has to log in.",
             body = MeResponse,
+            headers(("set-cookie" = String, description = "The `fluid_session` \
+                     session cookie, HttpOnly and SameSite=Lax. Set only when \
+                     this call mints a session, which is the first call from a \
+                     trusted-header identity.")),
         ),
         (
             status = 403,
@@ -680,14 +726,51 @@ pub async fn logout(
         ),
     ),
 )]
-pub async fn me(State(state): State<RestState>, identity: Identity) -> axum::Json<MeResponse> {
-    axum::Json(MeResponse {
-        user: identity.user,
-        csrf: identity.csrf,
-        anonymous: identity.anonymous,
-        read_only: state.engine.read_only(),
-        version: crystalline_core::VERSION,
-    })
+pub async fn me(
+    State(state): State<RestState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+    identity: Identity,
+) -> Result<(CookieJar, axum::Json<MeResponse>), ApiError> {
+    let mut jar = jar;
+    let mut csrf = identity.csrf.clone();
+    // A trusted-header identity arrives with an account and no session (a
+    // cookie session always carries its token). Mint one here: this probe is
+    // what a client opens on, so it is where the token belongs - for the
+    // trusted-header mode exactly as for a reloaded cookie session.
+    if csrf.is_none()
+        && let Some(user) = &identity.user
+    {
+        // Whatever session the caller presented resolves to someone else or
+        // to nothing; retire it rather than leave a planted token beside the
+        // new one, the same fixation rule login applies.
+        if let Some(presented) = jar.get(SESSION_COOKIE) {
+            state.auth.delete_session(presented.value()).await?;
+        }
+        let session = state
+            .auth
+            .create_session(&user.name, SESSION_TTL_SECS)
+            .await?;
+        let cookie = Cookie::build((SESSION_COOKIE, session.token))
+            .path("/")
+            .http_only(true)
+            .same_site(SameSite::Lax)
+            .secure(cookie_needs_secure(&headers))
+            .max_age(time::Duration::seconds(SESSION_TTL_SECS))
+            .build();
+        jar = jar.add(cookie);
+        csrf = Some(session.csrf);
+    }
+    Ok((
+        jar,
+        axum::Json(MeResponse {
+            user: identity.user,
+            csrf,
+            anonymous: identity.anonymous,
+            read_only: state.engine.read_only(),
+            version: crystalline_core::VERSION,
+        }),
+    ))
 }
 
 /// Whether the session cookie is marked `Secure`, which is to say: is there any
@@ -1059,15 +1142,15 @@ mod tests {
         assert!(!constant_time_eq(b"", b"a"));
     }
 
-    /// The CSRF rule, without a server: safe methods and login pass, a session
-    /// must echo its token, and an identity that has no session has nothing to
-    /// echo.
+    /// The settled CSRF rule, one for every identity mode: safe methods and
+    /// login pass; an unsafe request from ANY identity with an account behind it
+    /// must echo a valid token - a session that has one, and a trusted-header
+    /// identity that has not yet been minted one (csrf: None) is refused
+    /// outright, told to call /auth/me. Only the identities with no account
+    /// (nobody, the anonymous viewer) pass through, because they cannot reach a
+    /// write at all: require_editor refuses them before any handler runs.
     #[test]
-    fn csrf_is_required_of_sessions_on_unsafe_methods_only() {
-        let session = Identity {
-            csrf: Some("tok".to_string()),
-            ..Identity::default()
-        };
+    fn unsafe_methods_require_the_token_of_any_account_bearing_identity() {
         let request = |method: &str, path: &str, csrf: Option<&str>| {
             let mut builder = Request::builder().method(method).uri(path);
             if let Some(csrf) = csrf {
@@ -1075,40 +1158,92 @@ mod tests {
             }
             builder.body(axum::body::Body::empty()).unwrap()
         };
+        let account = |csrf: Option<&str>| Identity {
+            user: Some(User {
+                name: "ada".to_string(),
+                display: "Ada".to_string(),
+                email: None,
+                role: Role::Admin,
+                disabled: false,
+                last_seen: None,
+            }),
+            csrf: csrf.map(str::to_string),
+            anonymous: false,
+        };
 
+        // A session with a token: the double-submit check as before.
+        let session = account(Some("tok"));
         assert!(check_csrf(&session, &request("GET", "/domains", None)).is_ok());
         assert!(check_csrf(&session, &request("HEAD", "/domains", None)).is_ok());
         assert!(check_csrf(&session, &request("POST", LOGIN_PATH, None)).is_ok());
         assert!(check_csrf(&session, &request("POST", "/auth/logout", Some("tok"))).is_ok());
-
+        for csrf in [None, Some(""), Some("wrong"), Some("tok ")] {
+            assert!(check_csrf(&session, &request("POST", "/auth/logout", csrf)).is_err());
+        }
+        // Every unsafe method, not only the one the loop above spells out.
         for method in ["POST", "PUT", "PATCH", "DELETE"] {
-            for csrf in [None, Some(""), Some("wrong"), Some("tok ")] {
-                let err = check_csrf(&session, &request(method, "/auth/logout", csrf))
-                    .expect_err("{method} with {csrf:?} must be refused");
-                assert_eq!(err.status, axum::http::StatusCode::FORBIDDEN);
-            }
+            assert!(check_csrf(&session, &request(method, "/auth/logout", None)).is_err());
         }
 
-        // No session, no token to compare: the trusted-header and anonymous
-        // paths are not ridable by another origin's cookie.
-        let headerless = Identity::default();
-        assert!(check_csrf(&headerless, &request("POST", "/auth/logout", None)).is_ok());
+        // The settlement: an account WITHOUT a token (a trusted-header identity
+        // that has not called /auth/me yet) is refused on unsafe methods rather
+        // than waved through on request-shape arguments.
+        let tokenless_account = account(None);
+        assert!(check_csrf(&tokenless_account, &request("GET", "/domains", None)).is_ok());
+        let err = check_csrf(&tokenless_account, &request("POST", "/users", None)).unwrap_err();
+        assert_eq!(err.status, axum::http::StatusCode::FORBIDDEN);
+        assert!(
+            err.detail.contains("/auth/me"),
+            "told where the token comes from: {}",
+            err.detail
+        );
 
-        // An empty stored token must not match an absent header. `None` (no
-        // session) and `Some("")` (a session whose token went missing) are
-        // opposite answers: the first has nothing to protect, the second has
-        // something to protect and no way to check it.
-        let tokenless_session = Identity {
-            csrf: Some(String::new()),
+        // No account: nothing to ride. Logout with a forgotten cookie stays a
+        // no-op success, and every data route 401s at the role guard anyway.
+        let nobody = Identity::default();
+        assert!(check_csrf(&nobody, &request("POST", "/auth/logout", None)).is_ok());
+        let anonymous = Identity {
+            anonymous: true,
             ..Identity::default()
         };
-        for csrf in [None, Some(""), Some("anything")] {
-            let err = check_csrf(&tokenless_session, &request("POST", "/auth/logout", csrf))
-                .expect_err("an empty expected token must fail closed");
-            assert_eq!(err.status, axum::http::StatusCode::FORBIDDEN);
-        }
+        assert!(check_csrf(&anonymous, &request("POST", "/auth/logout", None)).is_ok());
+
+        // An empty stored token still fails closed.
+        let empty = account(Some(""));
+        assert!(check_csrf(&empty, &request("POST", "/auth/logout", Some(""))).is_err());
         // A safe method is still safe, and login is still exempt.
-        assert!(check_csrf(&tokenless_session, &request("GET", "/domains", None)).is_ok());
-        assert!(check_csrf(&tokenless_session, &request("POST", LOGIN_PATH, None)).is_ok());
+        assert!(check_csrf(&empty, &request("GET", "/domains", None)).is_ok());
+        assert!(check_csrf(&empty, &request("POST", LOGIN_PATH, None)).is_ok());
+    }
+
+    #[test]
+    fn require_editor_separates_roles_the_same_way() {
+        let account = |role| Identity {
+            user: Some(User {
+                name: "ada".to_string(),
+                display: "Ada".to_string(),
+                email: None,
+                role,
+                disabled: false,
+                last_seen: None,
+            }),
+            csrf: None,
+            anonymous: false,
+        };
+        assert!(account(Role::Editor).require_editor().is_ok());
+        assert!(account(Role::Admin).require_editor().is_ok());
+        assert_eq!(
+            account(Role::Viewer).require_editor().unwrap_err().status,
+            axum::http::StatusCode::FORBIDDEN
+        );
+        let anonymous = Identity {
+            anonymous: true,
+            ..Identity::default()
+        };
+        assert_eq!(
+            anonymous.require_editor().unwrap_err().status,
+            axum::http::StatusCode::UNAUTHORIZED,
+            "the anonymous viewer is told to log in: anonymous identities never write"
+        );
     }
 }
