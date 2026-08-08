@@ -601,6 +601,112 @@ async fn a_read_only_instance_refuses_before_the_precondition_check() {
     assert_eq!(created.status(), 403);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retire_move_and_delete_run_through_their_endpoints() {
+    let fx = serve(Options::default()).await;
+    let editor = login(fx.addr, "eddy", "eddypw").await;
+
+    // Seed a successor through the create endpoint.
+    let created = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/eng/engrams",
+        &editor,
+    )
+    .json(&serde_json::json!({"title": "Beta", "content": "# Beta\n\nSharper.\n"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(created.status(), 201);
+
+    // Retire alpha in favor of beta.
+    let retired = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/eng/retire",
+        &editor,
+    )
+    .json(&serde_json::json!({
+        "permalink": "alpha",
+        "status": "superseded",
+        "successor": "beta"
+    }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(retired.status(), 200);
+    let alpha = std::fs::read_to_string(fx._tmp.path().join("eng/alpha.md")).unwrap();
+    assert!(alpha.contains("status: superseded"), "{alpha}");
+    assert!(alpha.contains("- superseded_by [[Beta]]"), "{alpha}");
+
+    // An invalid retirement status is a 422 with the engine's words.
+    let bad = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/eng/retire",
+        &editor,
+    )
+    .json(&serde_json::json!({"permalink": "alpha", "status": "stable"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(bad.status(), 422);
+
+    // Move beta into a folder.
+    let moved = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/eng/move",
+        &editor,
+    )
+    .json(&serde_json::json!({"permalink": "beta", "destination": "guides/beta"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(moved.status(), 200);
+    assert!(fx._tmp.path().join("eng/guides/beta.md").exists());
+    assert!(!fx._tmp.path().join("eng/beta.md").exists());
+
+    // Hard delete demands If-Match, then honors it.
+    let bare = as_session(
+        fx.addr,
+        reqwest::Method::DELETE,
+        "/api/v1/domains/eng/engrams/alpha",
+        &editor,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(bare.status(), 428);
+    let (etag, _) = read_alpha(fx.addr, &editor).await;
+    let stale = as_session(
+        fx.addr,
+        reqwest::Method::DELETE,
+        "/api/v1/domains/eng/engrams/alpha",
+        &editor,
+    )
+    .header(
+        "if-match",
+        "\"0000000000000000000000000000000000000000000000000000000000000000\"",
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(stale.status(), 412);
+    let gone = as_session(
+        fx.addr,
+        reqwest::Method::DELETE,
+        "/api/v1/domains/eng/engrams/alpha",
+        &editor,
+    )
+    .header("if-match", format!("\"{etag}\""))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(gone.status(), 204);
+    assert!(!fx._tmp.path().join("eng/alpha.md").exists());
+}
+
 /// The trusted-header mode, end to end on a write: a proxy identity is
 /// provisioned at viewer and so cannot write, the CSRF token it needs comes
 /// from `/auth/me` and is required here like anywhere else, and promoting the

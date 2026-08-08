@@ -82,6 +82,9 @@ use crate::engine::Engine;
         engrams::detail,
         engrams::create,
         engrams::save,
+        engrams::retire,
+        engrams::move_action,
+        engrams::remove,
         discovery::search,
         discovery::vocabulary,
         discovery::context,
@@ -99,6 +102,8 @@ use crate::engine::Engine;
         Role,
         engrams::CreateEngramBody,
         engrams::SaveEngramBody,
+        engrams::RetireBody,
+        engrams::MoveBody,
         auth::LoginBody,
         auth::LoginResponse,
         auth::LogoutResponse,
@@ -212,8 +217,15 @@ pub fn router(state: RestState) -> Router {
         // subfolder carries the slashes with it.
         .route(
             "/domains/{domain}/engrams/{*permalink}",
-            get(engrams::detail).put(engrams::save),
+            get(engrams::detail)
+                .put(engrams::save)
+                .delete(engrams::remove),
         )
+        // Actions rather than sub-paths of `/engrams/{*permalink}`, whose
+        // wildcard cannot be followed by another segment: the permalink of
+        // the engram being retired or moved rides in the body instead.
+        .route("/domains/{domain}/retire", post(engrams::retire))
+        .route("/domains/{domain}/move", post(engrams::move_action))
         .route("/search", get(discovery::search))
         .route("/vocabulary", get(discovery::vocabulary))
         .route("/context", get(discovery::context))

@@ -343,6 +343,34 @@ async fn retirement_validates_status_successor_and_date() {
     assert!(alpha.contains("status: stable"), "{alpha}");
 }
 
+/// A successor that resolves to the target itself is refused rather than
+/// appended as a supersedes-self relation: no deadlock (the target's lock is
+/// released before a successor's would be taken), just a nonsense pair
+/// nothing should ever produce.
+#[tokio::test]
+async fn a_self_referential_retirement_is_refused() {
+    let (tmp, engine) = engine_fixture().await;
+    let err = engine
+        .retire_engram(&RetireParams {
+            domain: "eng".to_string(),
+            identifier: "alpha".to_string(),
+            status: "superseded".to_string(),
+            successor: Some("alpha".to_string()),
+            valid_to: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, crystalline_service::EngineError::Invalid(_)),
+        "{err}"
+    );
+    let alpha = std::fs::read_to_string(tmp.path().join("eng/alpha.md")).unwrap();
+    assert!(
+        alpha.contains("status: stable"),
+        "the refusal must not have written anything: {alpha}"
+    );
+}
+
 #[tokio::test]
 async fn plain_deprecation_needs_no_successor() {
     let (tmp, engine) = engine_fixture().await;

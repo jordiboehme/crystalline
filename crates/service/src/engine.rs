@@ -1668,6 +1668,20 @@ impl Engine {
             Some(identifier) => Some(self.resolve(identifier, Some(&p.domain)).await?),
             None => None,
         };
+        // A successor that resolves to the target itself would append a
+        // supersedes-self relation: no deadlock (the target's lock is
+        // released before the successor's is taken), just a nonsense pair
+        // that verify would then have to make sense of. Refused before
+        // anything is written rather than left to produce that pair.
+        if let Some((succ_desc, _)) = &successor
+            && succ_desc.id == desc.id
+        {
+            return Err(EngineError::Invalid(format!(
+                "successor '{}' resolves to the same engram being retired; \
+                 a retirement needs a different engram to supersede it",
+                p.successor.as_deref().unwrap_or_default()
+            )));
+        }
         let successor_title = successor.as_ref().map(|(d, _)| d.title.clone());
 
         // -- target: status, optional valid_to, optional superseded_by line --
@@ -6252,9 +6266,13 @@ impl Engine {
     /// **In-process only.** Two Crystalline processes over one domain root are
     /// not held apart by this; the host-lock machinery governs that.
     fn write_lock(&self, abs: &Path) -> Arc<tokio::sync::Mutex<()>> {
+        // Computed before the map-wide guard is taken: `canonicalize` is a
+        // blocking stat, and every other file's lookup would otherwise queue
+        // behind it while it resolves this one's path.
+        let key = lock_key(abs);
         let mut locks = self.write_locks.lock().unwrap();
         locks
-            .entry(lock_key(abs))
+            .entry(key)
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
     }

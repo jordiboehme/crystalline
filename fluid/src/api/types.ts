@@ -194,7 +194,11 @@ export interface paths {
          */
         put: operations["save_engram"];
         post?: never;
-        delete?: never;
+        /**
+         * Hard delete an engram, guarded by If-Match.
+         * @description A file domain removes the file from disk; a virtual domain drops the database rows. Guarded the same way `save` is: 428 with no `If-Match`, 412 when the token is stale (carrying the version the server holds now), 204 once it lands. A read-only instance answers 403 ahead of the precondition check, so it is never 428.
+         */
+        delete: operations["delete_engram"];
         options?: never;
         head?: never;
         patch?: never;
@@ -215,6 +219,50 @@ export interface paths {
         get: operations["get_domain_manifest"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/domains/{domain}/move": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Move an engram to a new path, or into another domain.
+         * @description A same-domain move is a rename; a cross-domain move reads the source content and re-indexes it into the destination's source, rewriting inbound bare links from other domains to the domain-prefixed form.
+         *
+         *     The permalink rides in the body for the same reason `RetireBody`'s does: the engram route's wildcard cannot be followed by an action segment.
+         */
+        post: operations["move_engram"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/domains/{domain}/retire": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Guided retirement of one engram.
+         * @description Sets a retirement `status` (deprecated, superseded or archived), optionally closes out `valid_to`, and for `superseded` wires the reciprocal `superseded_by` / `supersedes` relation pair so verify's T005 and the evolve sweep see a live pair rather than a dangling one.
+         *
+         *     The permalink rides in the body rather than the path: a permalink is a path of its own and the engram route's wildcard cannot be followed by an action segment.
+         */
+        post: operations["retire_engram"];
         delete?: never;
         options?: never;
         head?: never;
@@ -583,6 +631,24 @@ export interface components {
              */
             version: string;
         };
+        /** @description Move an engram to a new path, or into another registered domain. Inbound bare links are rewritten to the domain-prefixed form on a cross-domain move. */
+        MoveBody: {
+            /**
+             * @description The new domain-relative path, with or without `.md`.
+             * @example guides/beta
+             */
+            destination: string;
+            /**
+             * @description Move into another registered domain. Inbound bare links are rewritten
+             *     to the domain-prefixed form.
+             */
+            destination_domain?: string | null;
+            /**
+             * @description The engram to move, by permalink.
+             * @example notes/beta
+             */
+            permalink: string;
+        };
         /** @description Whichever of the three an admin wants to change. All absent is refused with a 422 rather than served as a no-op, so a client sending the wrong field names hears about it. */
         PatchBody: {
             /**
@@ -624,6 +690,26 @@ export interface components {
              * @example about:blank
              */
             type: string;
+        };
+        /** @description Guided retirement of one engram: a `status` from a fixed set, an optional close-out date, and, for `superseded`, the successor that wires the reciprocal relation pair. */
+        RetireBody: {
+            /**
+             * @description The engram to retire, by permalink.
+             * @example notes/beta
+             */
+            permalink: string;
+            /**
+             * @description The retirement status: deprecated, superseded or archived.
+             * @example superseded
+             */
+            status: string;
+            /**
+             * @description The successor's permalink, wiring superseded_by / supersedes. Required
+             *     for superseded, refused otherwise.
+             */
+            successor?: string | null;
+            /** @description The date validity ends, plain ISO (YYYY-MM-DD). Absent means unknown. */
+            valid_to?: string | null;
         };
         /**
          * @description What a user may do. Ordered least to most privileged; the REST layer maps
@@ -1520,6 +1606,83 @@ export interface operations {
             };
         };
     };
+    delete_engram: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description The quoted `ETag` of the version being deleted, from the detail read.
+                 * @example "3f8a1c05e2"
+                 */
+                "If-Match": string;
+            };
+            path: {
+                /** @description The registered domain. */
+                domain: string;
+                /**
+                 * @description The engram permalink. A permalink is a path, so this segment may contain slashes: `notes/deep/gamma`.
+                 * @example notes/deep/gamma
+                 */
+                permalink: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted. No body. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No identity, or an anonymous one: an identity with no account behind it never writes. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The caller is not an editor, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. A read-only instance answers this ahead of the precondition check, so it is never 428. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No such domain or engram. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The `If-Match` token is stale. The body carries the version the server holds now, so a client can decide whether losing it is really what it meant. */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ConflictDetail"];
+                };
+            };
+            /** @description No `If-Match` arrived. The token comes from the detail read. */
+            428: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
     get_domain_manifest: {
         parameters: {
             query?: never;
@@ -1567,6 +1730,191 @@ export interface operations {
             };
             /** @description No such domain, or the domain carries no MANIFEST yet. */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    move_engram: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The engram's current domain. */
+                domain: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MoveBody"];
+            };
+        };
+        responses: {
+            /** @description The move receipt: where the engram came from, where it landed, whether the move crossed domains and how many inbound links were rewritten. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "cross_domain": false,
+                     *       "from": {
+                     *         "domain": "eng",
+                     *         "path": "beta.md",
+                     *         "permalink": "beta"
+                     *       },
+                     *       "links_rewritten": 0,
+                     *       "to": {
+                     *         "domain": "eng",
+                     *         "path": "guides/beta.md"
+                     *       }
+                     *     }
+                     */
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description No identity, or an anonymous one: an identity with no account behind it never writes. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The caller is not an editor, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No such domain or engram. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The destination already exists in the target domain. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The body is not `application/json`. */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The destination path is empty, or resolves to one of the reserved OKF names (`index.md`, `log.md`). */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    retire_engram: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The registered domain. */
+                domain: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RetireBody"];
+            };
+        };
+        responses: {
+            /** @description The retirement receipt: domain, permalink, the status now set and the resolved successor permalink, if any. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "domain": "eng",
+                     *       "permalink": "alpha",
+                     *       "status": "superseded",
+                     *       "successor": "beta"
+                     *     }
+                     */
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description No identity, or an anonymous one: an identity with no account behind it never writes. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The caller is not an editor, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No such domain, engram, or - when status is superseded - successor. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description A conflict the engine's retirement rule raises, answered 409 like the collision this API's other writes raise. Reserved for classification parity with create and move; guided retirement raises no conflict from any input this route accepts today. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The body is not `application/json`. */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The status is not deprecated, superseded or archived; a successor is missing for superseded or given for another status; the successor resolves to the same engram being retired; or valid_to is not a plain ISO date. */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };

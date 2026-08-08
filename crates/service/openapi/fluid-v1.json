@@ -1049,6 +1049,100 @@
             }
           }
         }
+      },
+      "delete": {
+        "tags": [
+          "engrams"
+        ],
+        "summary": "Hard delete an engram, guarded by If-Match.",
+        "description": "A file domain removes the file from disk; a virtual domain drops the database rows. Guarded the same way `save` is: 428 with no `If-Match`, 412 when the token is stale (carrying the version the server holds now), 204 once it lands. A read-only instance answers 403 ahead of the precondition check, so it is never 428.",
+        "operationId": "delete_engram",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The registered domain.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "permalink",
+            "in": "path",
+            "description": "The engram permalink. A permalink is a path, so this segment may contain slashes: `notes/deep/gamma`.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "notes/deep/gamma"
+          },
+          {
+            "name": "If-Match",
+            "in": "header",
+            "description": "The quoted `ETag` of the version being deleted, from the detail read.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "\"3f8a1c05e2\""
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted. No body."
+          },
+          "401": {
+            "description": "No identity, or an anonymous one: an identity with no account behind it never writes.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an editor, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. A read-only instance answers this ahead of the precondition check, so it is never 428.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain or engram.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "The `If-Match` token is stale. The body carries the version the server holds now, so a client can decide whether losing it is really what it meant.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConflictDetail"
+                }
+              }
+            }
+          },
+          "428": {
+            "description": "No `If-Match` arrived. The token comes from the detail read.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
       }
     },
     "/api/v1/domains/{domain}/manifest": {
@@ -1106,6 +1200,231 @@
           },
           "404": {
             "description": "No such domain, or the domain carries no MANIFEST yet.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/domains/{domain}/move": {
+      "post": {
+        "tags": [
+          "engrams"
+        ],
+        "summary": "Move an engram to a new path, or into another domain.",
+        "description": "A same-domain move is a rename; a cross-domain move reads the source content and re-indexes it into the destination's source, rewriting inbound bare links from other domains to the domain-prefixed form.\n\nThe permalink rides in the body for the same reason `RetireBody`'s does: the engram route's wildcard cannot be followed by an action segment.",
+        "operationId": "move_engram",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The engram's current domain.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MoveBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The move receipt: where the engram came from, where it landed, whether the move crossed domains and how many inbound links were rewritten.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                },
+                "example": {
+                  "cross_domain": false,
+                  "from": {
+                    "domain": "eng",
+                    "path": "beta.md",
+                    "permalink": "beta"
+                  },
+                  "links_rewritten": 0,
+                  "to": {
+                    "domain": "eng",
+                    "path": "guides/beta.md"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or an anonymous one: an identity with no account behind it never writes.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an editor, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain or engram.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The destination already exists in the target domain.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body is not `application/json`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The destination path is empty, or resolves to one of the reserved OKF names (`index.md`, `log.md`).",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/domains/{domain}/retire": {
+      "post": {
+        "tags": [
+          "engrams"
+        ],
+        "summary": "Guided retirement of one engram.",
+        "description": "Sets a retirement `status` (deprecated, superseded or archived), optionally closes out `valid_to`, and for `superseded` wires the reciprocal `superseded_by` / `supersedes` relation pair so verify's T005 and the evolve sweep see a live pair rather than a dangling one.\n\nThe permalink rides in the body rather than the path: a permalink is a path of its own and the engram route's wildcard cannot be followed by an action segment.",
+        "operationId": "retire_engram",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The registered domain.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RetireBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The retirement receipt: domain, permalink, the status now set and the resolved successor permalink, if any.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                },
+                "example": {
+                  "domain": "eng",
+                  "permalink": "alpha",
+                  "status": "superseded",
+                  "successor": "beta"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or an anonymous one: an identity with no account behind it never writes.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an editor, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain, engram, or - when status is superseded - successor.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A conflict the engine's retirement rule raises, answered 409 like the collision this API's other writes raise. Reserved for classification parity with create and move; guided retirement raises no conflict from any input this route accepts today.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body is not `application/json`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The status is not deprecated, superseded or archived; a successor is missing for superseded or given for another status; the successor resolves to the same engram being retired; or valid_to is not a plain ISO date.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -2242,6 +2561,33 @@
           }
         }
       },
+      "MoveBody": {
+        "type": "object",
+        "description": "Move an engram to a new path, or into another registered domain. Inbound bare links are rewritten to the domain-prefixed form on a cross-domain move.",
+        "required": [
+          "permalink",
+          "destination"
+        ],
+        "properties": {
+          "destination": {
+            "type": "string",
+            "description": "The new domain-relative path, with or without `.md`.",
+            "example": "guides/beta"
+          },
+          "destination_domain": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Move into another registered domain. Inbound bare links are rewritten\nto the domain-prefixed form."
+          },
+          "permalink": {
+            "type": "string",
+            "description": "The engram to move, by permalink.",
+            "example": "notes/beta"
+          }
+        }
+      },
       "PatchBody": {
         "type": "object",
         "description": "Whichever of the three an admin wants to change. All absent is refused with a 422 rather than served as a no-op, so a client sending the wrong field names hears about it.",
@@ -2304,6 +2650,40 @@
             "type": "string",
             "description": "The problem type URI. Always `about:blank`: `status` and `title` carry\nthe classification, and this surface publishes no per-problem pages to\npoint at.",
             "example": "about:blank"
+          }
+        }
+      },
+      "RetireBody": {
+        "type": "object",
+        "description": "Guided retirement of one engram: a `status` from a fixed set, an optional close-out date, and, for `superseded`, the successor that wires the reciprocal relation pair.",
+        "required": [
+          "permalink",
+          "status"
+        ],
+        "properties": {
+          "permalink": {
+            "type": "string",
+            "description": "The engram to retire, by permalink.",
+            "example": "notes/beta"
+          },
+          "status": {
+            "type": "string",
+            "description": "The retirement status: deprecated, superseded or archived.",
+            "example": "superseded"
+          },
+          "successor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The successor's permalink, wiring superseded_by / supersedes. Required\nfor superseded, refused otherwise."
+          },
+          "valid_to": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The date validity ends, plain ISO (YYYY-MM-DD). Absent means unknown."
           }
         }
       },

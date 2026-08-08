@@ -40,7 +40,9 @@ use super::{
     precondition_failed,
 };
 use crate::engine::EngineError;
-use crate::params::{ReadParams, SaveParams, SearchParams, WriteParams};
+use crate::params::{
+    DeleteParams, MoveParams, ReadParams, RetireParams, SaveParams, SearchParams, WriteParams,
+};
 
 /// The query string `GET /domains/{domain}/engrams` takes: the filter side of
 /// [`SearchParams`], minus the domain the path already names and minus the
@@ -319,6 +321,52 @@ pub struct SaveEngramBody {
     /// The full markdown text as the editor holds it.
     #[schema(example = "---\ntitle: Alpha\npermalink: alpha\n---\n\nA sharper rule.\n")]
     content: String,
+}
+
+/// What `POST /domains/{domain}/retire` takes: guided retirement of one
+/// engram. The permalink rides in the body rather than the path, because a
+/// permalink is a path of its own and the engram route's wildcard cannot be
+/// followed by an action segment - `/engrams/{*permalink}/retire` would eat
+/// `retire` as part of the permalink instead of routing to this handler.
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+#[schema(description = "Guided retirement of one engram: a `status` from a \
+                        fixed set, an optional close-out date, and, for \
+                        `superseded`, the successor that wires the \
+                        reciprocal relation pair.")]
+pub struct RetireBody {
+    /// The engram to retire, by permalink.
+    #[schema(example = "notes/beta")]
+    permalink: String,
+    /// The retirement status: deprecated, superseded or archived.
+    #[schema(example = "superseded")]
+    status: String,
+    /// The successor's permalink, wiring superseded_by / supersedes. Required
+    /// for superseded, refused otherwise.
+    #[serde(default)]
+    successor: Option<String>,
+    /// The date validity ends, plain ISO (YYYY-MM-DD). Absent means unknown.
+    #[serde(default)]
+    valid_to: Option<String>,
+}
+
+/// What `POST /domains/{domain}/move` takes: the engram to move, by
+/// permalink, and where it goes. The permalink rides in the body for the same
+/// reason [`RetireBody`]'s does.
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+#[schema(description = "Move an engram to a new path, or into another \
+                        registered domain. Inbound bare links are rewritten \
+                        to the domain-prefixed form on a cross-domain move.")]
+pub struct MoveBody {
+    /// The engram to move, by permalink.
+    #[schema(example = "notes/beta")]
+    permalink: String,
+    /// The new domain-relative path, with or without `.md`.
+    #[schema(example = "guides/beta")]
+    destination: String,
+    /// Move into another registered domain. Inbound bare links are rewritten
+    /// to the domain-prefixed form.
+    #[serde(default)]
+    destination_domain: Option<String>,
 }
 
 /// `POST /domains/{domain}/engrams` - create an engram from a title and a
@@ -670,6 +718,358 @@ pub async fn save(
         // virtual one in the database's compare-and-swap, and each reports the
         // same sentence. Any other conflict is somebody else's rule and keeps
         // its own status.
+        Err(EngineError::Conflict(message)) if message.starts_with(STALE_EDIT) => {
+            let current = state
+                .engine
+                .read_engram(&ReadParams {
+                    identifier: permalink,
+                    domain: Some(domain),
+                })
+                .await?;
+            let checksum = current["checksum"].as_str().ok_or_else(|| {
+                ApiError::internal("the engram read carried no checksum to version it by")
+            })?;
+            let content = current["content"].as_str().unwrap_or_default().to_string();
+            Ok(precondition_failed(message, checksum, content))
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// `POST /domains/{domain}/retire` - guided retirement of one engram: set a
+/// retirement `status`, optionally close out `valid_to`, and, for
+/// `superseded`, wire the supersede pair as body relations.
+///
+/// No `If-Match` here: this is a guided edit rather than a full-document
+/// replace, the same reason the MCP verb behind it takes none, so nothing on
+/// this route depends on a version the caller read first.
+#[utoipa::path(
+    post,
+    path = "/api/v1/domains/{domain}/retire",
+    tag = "engrams",
+    operation_id = "retire_engram",
+    summary = "Guided retirement of one engram.",
+    description = "Sets a retirement `status` (deprecated, superseded or \
+                   archived), optionally closes out `valid_to`, and for \
+                   `superseded` wires the reciprocal `superseded_by` / \
+                   `supersedes` relation pair so verify's T005 and the \
+                   evolve sweep see a live pair rather than a dangling one.\n\n\
+                   The permalink rides in the body rather than the path: a \
+                   permalink is a path of its own and the engram route's \
+                   wildcard cannot be followed by an action segment.",
+    params(("domain" = String, Path, description = "The registered domain.")),
+    request_body = RetireBody,
+    responses(
+        (
+            status = 200,
+            description = "The retirement receipt: domain, permalink, the \
+                           status now set and the resolved successor \
+                           permalink, if any.",
+            body = Object,
+            example = json!({
+                "domain": "eng",
+                "permalink": "alpha",
+                "status": "superseded",
+                "successor": "beta"
+            }),
+        ),
+        (
+            status = 401,
+            description = "No identity, or an anonymous one: an identity with \
+                           no account behind it never writes.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "The caller is not an editor, the request did not \
+                           echo its CSRF token, this instance is read-only, or \
+                           the trusted-header identity names a disabled account.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 404,
+            description = "No such domain, engram, or - when status is \
+                           superseded - successor.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 409,
+            description = "A conflict the engine's retirement rule raises, \
+                           answered 409 like the collision this API's other \
+                           writes raise. Reserved for classification parity \
+                           with create and move; guided retirement raises no \
+                           conflict from any input this route accepts today.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 415,
+            description = "The body is not `application/json`.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 422,
+            description = "The status is not deprecated, superseded or \
+                           archived; a successor is missing for superseded or \
+                           given for another status; the successor resolves \
+                           to the same engram being retired; or valid_to is \
+                           not a plain ISO date.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+pub async fn retire(
+    State(state): State<RestState>,
+    identity: Identity,
+    ApiPath(domain): ApiPath<String>,
+    ApiJson(body): ApiJson<RetireBody>,
+) -> Result<Json<Value>, ApiError> {
+    let caller = identity.require_editor()?;
+    let value = state
+        .engine
+        .retire_engram_as(
+            &RetireParams {
+                domain,
+                identifier: body.permalink,
+                status: body.status,
+                successor: body.successor,
+                valid_to: body.valid_to,
+            },
+            Some(&format!("human:{}", caller.name())),
+        )
+        .await
+        // Classified 409 like `create`'s collision, for parity across this
+        // API's write endpoints even though this verb raises no conflict
+        // today; see the 409 response doc above.
+        .map_err(|e| match e {
+            EngineError::Conflict(message) => ApiError::conflict(message),
+            other => other.into(),
+        })?;
+    Ok(Json(value))
+}
+
+/// `POST /domains/{domain}/move` - move an engram to a new path, or into
+/// another registered domain.
+///
+/// Named `move_action` because `move` is a keyword; the operation id served
+/// to clients stays `move_engram`, matching the engine verb behind it.
+///
+/// No `If-Match` here, for the same reason [`retire`] takes none: this
+/// carries content between two truths rather than replacing a version the
+/// caller read.
+#[utoipa::path(
+    post,
+    path = "/api/v1/domains/{domain}/move",
+    tag = "engrams",
+    operation_id = "move_engram",
+    summary = "Move an engram to a new path, or into another domain.",
+    description = "A same-domain move is a rename; a cross-domain move reads \
+                   the source content and re-indexes it into the \
+                   destination's source, rewriting inbound bare links from \
+                   other domains to the domain-prefixed form.\n\nThe \
+                   permalink rides in the body for the same reason \
+                   `RetireBody`'s does: the engram route's wildcard cannot be \
+                   followed by an action segment.",
+    params(("domain" = String, Path, description = "The engram's current domain.")),
+    request_body = MoveBody,
+    responses(
+        (
+            status = 200,
+            description = "The move receipt: where the engram came from, \
+                           where it landed, whether the move crossed domains \
+                           and how many inbound links were rewritten.",
+            body = Object,
+            example = json!({
+                "from": { "domain": "eng", "permalink": "beta", "path": "beta.md" },
+                "to": { "domain": "eng", "path": "guides/beta.md" },
+                "cross_domain": false,
+                "links_rewritten": 0
+            }),
+        ),
+        (
+            status = 401,
+            description = "No identity, or an anonymous one: an identity with \
+                           no account behind it never writes.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "The caller is not an editor, the request did not \
+                           echo its CSRF token, this instance is read-only, or \
+                           the trusted-header identity names a disabled account.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 404,
+            description = "No such domain or engram.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 409,
+            description = "The destination already exists in the target \
+                           domain.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 415,
+            description = "The body is not `application/json`.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 422,
+            description = "The destination path is empty, or resolves to one \
+                           of the reserved OKF names (`index.md`, `log.md`).",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+pub async fn move_action(
+    State(state): State<RestState>,
+    identity: Identity,
+    ApiPath(domain): ApiPath<String>,
+    ApiJson(body): ApiJson<MoveBody>,
+) -> Result<Json<Value>, ApiError> {
+    identity.require_editor()?;
+    let value = state
+        .engine
+        .move_engram(&MoveParams {
+            identifier: body.permalink,
+            domain,
+            destination: body.destination,
+            destination_domain: body.destination_domain,
+            update_links: None,
+        })
+        .await
+        // The one collision this verb can hit: a destination already taken.
+        // Answered 409 rather than the generic 422 caller-error class, same
+        // reasoning as `create`'s own translation.
+        .map_err(|e| match e {
+            EngineError::Conflict(message) => ApiError::conflict(message),
+            other => other.into(),
+        })?;
+    Ok(Json(value))
+}
+
+/// `DELETE /domains/{domain}/engrams/{*permalink}` - hard delete an engram,
+/// guarded by the `If-Match` token of the version being removed.
+///
+/// The same three answers [`save`] is held to, because the guard is the same
+/// contract: 428 with no `If-Match`, 412 with a stale one (carrying the
+/// version the server holds now, so a client can decide whether losing it is
+/// really what it meant), 204 once it lands.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/domains/{domain}/engrams/{permalink}",
+    tag = "engrams",
+    operation_id = "delete_engram",
+    summary = "Hard delete an engram, guarded by If-Match.",
+    description = "A file domain removes the file from disk; a virtual \
+                   domain drops the database rows. Guarded the same way \
+                   `save` is: 428 with no `If-Match`, 412 when the token is \
+                   stale (carrying the version the server holds now), 204 \
+                   once it lands. A read-only instance answers 403 ahead of \
+                   the precondition check, so it is never 428.",
+    params(
+        ("domain" = String, Path, description = "The registered domain."),
+        (
+            "permalink" = String,
+            Path,
+            description = "The engram permalink. A permalink is a path, so this \
+                           segment may contain slashes: `notes/deep/gamma`.",
+            example = "notes/deep/gamma",
+        ),
+        (
+            "If-Match" = String,
+            Header,
+            description = "The quoted `ETag` of the version being deleted, \
+                           from the detail read.",
+            example = "\"3f8a1c05e2\"",
+        ),
+    ),
+    responses(
+        (
+            status = 204,
+            description = "Deleted. No body.",
+        ),
+        (
+            status = 401,
+            description = "No identity, or an anonymous one: an identity with \
+                           no account behind it never writes.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "The caller is not an editor, the request did not \
+                           echo its CSRF token, this instance is read-only, or \
+                           the trusted-header identity names a disabled \
+                           account. A read-only instance answers this ahead of \
+                           the precondition check, so it is never 428.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 404,
+            description = "No such domain or engram.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 412,
+            description = "The `If-Match` token is stale. The body carries the \
+                           version the server holds now, so a client can \
+                           decide whether losing it is really what it meant.",
+            body = ConflictDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 428,
+            description = "No `If-Match` arrived. The token comes from the \
+                           detail read.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+pub async fn remove(
+    State(state): State<RestState>,
+    identity: Identity,
+    headers: HeaderMap,
+    ApiPath((domain, permalink)): ApiPath<(String, String)>,
+) -> Result<Response, ApiError> {
+    identity.require_editor()?;
+    // Before the If-Match parse, not after: the same reasoning as `save`'s
+    // own read-only check, repeated here rather than shared, since the two
+    // handlers are not yet worth abstracting over.
+    if state.engine.read_only() {
+        return Err(ApiError::forbidden(
+            "this instance is read-only; content mutations are disabled",
+        ));
+    }
+    let token = if_match(&headers)?;
+    match state
+        .engine
+        .delete_engram(&DeleteParams {
+            identifier: permalink.clone(),
+            domain: domain.clone(),
+            expected_checksum: Some(token),
+        })
+        .await
+    {
+        Ok(_) => Ok(StatusCode::NO_CONTENT.into_response()),
+        // The same stale-edit translation `save` makes, repeated rather than
+        // shared for the same reason.
         Err(EngineError::Conflict(message)) if message.starts_with(STALE_EDIT) => {
             let current = state
                 .engine
