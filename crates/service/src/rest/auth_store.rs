@@ -561,6 +561,33 @@ impl AuthStore {
         .await
     }
 
+    /// Set or clear an account's display name. Clearing (None, or a value that
+    /// trims to nothing) resets it to the folded login name, so a row is never
+    /// nameless: the column is NOT NULL and the UI always has something to
+    /// print. No last-admin guard applies - a display name changes nothing
+    /// about what the account may do.
+    pub async fn set_display(&self, name: &str, display: Option<&str>) -> Result<()> {
+        let name = normalize_name(name)?;
+        let display = display
+            .map(str::trim)
+            .filter(|d| !d.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| name.clone());
+        let _guard = self.guard.lock().await;
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE users SET display = ?2 WHERE name = ?1",
+                vec![Value::Text(name.clone()), Value::Text(display)],
+            )
+            .await
+            .with_context(|| format!("updating user '{name}'"))?;
+        if changed == 0 {
+            bail!("no such user: '{name}'");
+        }
+        Ok(())
+    }
+
     /// Disable or re-enable an account. Disabling deletes every session it
     /// holds, in the same transaction as the flag.
     ///
@@ -1419,6 +1446,36 @@ mod tests {
         // The rollback left the unrelated account and its session intact.
         assert!(store.session_user(&live.token).await.unwrap().is_some());
         assert_eq!(store.list_users().await.unwrap().len(), 1);
+    }
+
+    /// The display name is editable, and clearing it falls back to the login
+    /// name: "optional" means a client may always unset it, never that a row
+    /// goes nameless.
+    #[tokio::test]
+    async fn display_names_are_editable_and_clearing_resets_to_the_login_name() {
+        let (_dir, store) = store().await;
+        store
+            .add_user("ada", "Ada", None, Role::Viewer, "pw")
+            .await
+            .unwrap();
+
+        store
+            .set_display("ada", Some("Ada Lovelace"))
+            .await
+            .unwrap();
+        assert_eq!(store.list_users().await.unwrap()[0].display, "Ada Lovelace");
+
+        store.set_display("ADA", None).await.unwrap();
+        assert_eq!(store.list_users().await.unwrap()[0].display, "ada");
+
+        store.set_display("ada", Some("   ")).await.unwrap();
+        assert_eq!(
+            store.list_users().await.unwrap()[0].display,
+            "ada",
+            "blank is a clear, not a display name of spaces"
+        );
+
+        assert!(store.set_display("ghost", Some("Ghost")).await.is_err());
     }
 
     /// Two `AuthStore` handles on one file see each other's writes as they
