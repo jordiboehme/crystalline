@@ -514,17 +514,80 @@ async fn the_write_routes_refuse_viewers_the_anonymous_and_the_tokenless() {
     .await
     .unwrap();
     assert_eq!(saved.status(), 403);
+    let retired = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/eng/retire",
+        &viewer,
+    )
+    .json(&serde_json::json!({"permalink": "alpha", "status": "deprecated"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(retired.status(), 403);
+    let moved = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/eng/move",
+        &viewer,
+    )
+    .json(&serde_json::json!({"permalink": "alpha", "destination": "moved"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(moved.status(), 403);
+    let deleted = as_session(
+        fx.addr,
+        reqwest::Method::DELETE,
+        "/api/v1/domains/eng/engrams/alpha",
+        &viewer,
+    )
+    .header("if-match", format!("\"{etag}\""))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(deleted.status(), 403);
+
+    // Each route's own valid body, so a schema mismatch never masks the
+    // identity check: `ApiJson` extraction runs ahead of the handler and
+    // would otherwise answer 422 before `require_editor` is ever reached.
+    let bodies = || {
+        [
+            (
+                reqwest::Method::POST,
+                "/api/v1/domains/eng/engrams",
+                serde_json::json!({"title": "Gamma", "content": "no"}),
+            ),
+            (
+                reqwest::Method::PUT,
+                "/api/v1/domains/eng/engrams/alpha",
+                serde_json::json!({"content": "no"}),
+            ),
+            (
+                reqwest::Method::POST,
+                "/api/v1/domains/eng/retire",
+                serde_json::json!({"permalink": "alpha", "status": "deprecated"}),
+            ),
+            (
+                reqwest::Method::POST,
+                "/api/v1/domains/eng/move",
+                serde_json::json!({"permalink": "alpha", "destination": "moved"}),
+            ),
+            (
+                reqwest::Method::DELETE,
+                "/api/v1/domains/eng/engrams/alpha",
+                serde_json::json!({}),
+            ),
+        ]
+    };
 
     // The anonymous viewer is told to log in: an anonymous identity never
     // writes, whatever the deployment mode allows it to read.
-    for (method, path) in [
-        (reqwest::Method::POST, "/api/v1/domains/eng/engrams"),
-        (reqwest::Method::PUT, "/api/v1/domains/eng/engrams/alpha"),
-    ] {
+    for (method, path, body) in bodies() {
         let resp = client()
             .request(method.clone(), format!("http://{}{path}", fx.addr))
             .header("if-match", "\"deadbeef\"")
-            .json(&serde_json::json!({"title": "Gamma", "content": "no"}))
+            .json(&body)
             .send()
             .await
             .unwrap();
@@ -534,15 +597,12 @@ async fn the_write_routes_refuse_viewers_the_anonymous_and_the_tokenless() {
     // A real editor session that does not echo its token is refused ahead of
     // the handler, so the CSRF rule covers the content routes like every other
     // unsafe method.
-    for (method, path) in [
-        (reqwest::Method::POST, "/api/v1/domains/eng/engrams"),
-        (reqwest::Method::PUT, "/api/v1/domains/eng/engrams/alpha"),
-    ] {
+    for (method, path, body) in bodies() {
         let resp = client()
             .request(method.clone(), format!("http://{}{path}", fx.addr))
             .header("cookie", format!("fluid_session={}", editor.0))
             .header("if-match", format!("\"{etag}\""))
-            .json(&serde_json::json!({"title": "Gamma", "content": "no"}))
+            .json(&body)
             .send()
             .await
             .unwrap();
