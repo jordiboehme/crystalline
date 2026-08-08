@@ -2,6 +2,8 @@
 //! move/delete, manifest save, the validation dry-run, user admin, and the
 //! auth/CSRF and If-Match matrices over all of them.
 
+mod support;
+
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
@@ -1231,10 +1233,9 @@ struct WriteOp {
 }
 
 /// Every mutating route the `/api/v1` surface mounts, spec section 10's write
-/// matrix as data. A route added to the router without a row here is caught
-/// only by the pointer comment above `MOUNTED_OPERATIONS` in
-/// `openapi_snapshot.rs` - there is no automatic cross-check, so keep the two
-/// lists in step by hand.
+/// matrix as data. A route added to the router without a row here fails
+/// `write_ops_covers_every_mutating_route_mounted` below, by name, rather
+/// than depending on a reviewer noticing anything.
 fn write_ops() -> Vec<WriteOp> {
     use reqwest::Method;
     vec![
@@ -1436,4 +1437,85 @@ async fn the_write_matrix_holds_on_every_route() {
             op.path
         );
     }
+}
+
+/// Maps a matrix fixture's concrete path to the template form
+/// `support::MOUNTED_OPERATIONS` spells operation paths in, e.g.
+/// `/api/v1/domains/eng/engrams/alpha` becomes
+/// `/api/v1/domains/{domain}/engrams/{permalink}`. `write_ops()` has exactly
+/// three fixture names in play - `eng` the one domain, `alpha` the one
+/// engram, `mark`/`tina` the two user-admin targets - so a fixed per-segment
+/// substitution is enough; nothing here needs to be a general router.
+fn canonicalize(path: &str) -> String {
+    path.split('/')
+        .map(|segment| match segment {
+            "eng" => "{domain}",
+            "alpha" => "{permalink}",
+            "mark" | "tina" => "{name}",
+            other => other,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// The enumeration property: `write_ops()` covers every mutating route this
+/// surface mounts, and nothing else.
+///
+/// Built from `support::MOUNTED_OPERATIONS` - the same list
+/// `openapi_snapshot.rs`'s `the_document_covers_every_mounted_path` already
+/// checks against the served document - rather than a second hand-kept copy.
+/// A route added to the router is forced into that list by the OpenAPI
+/// coverage check already; this test then forces it into `write_ops()` too,
+/// so a write route that lands without a matrix row fails here by name
+/// instead of relying on a reviewer noticing a pointer comment (this is
+/// exactly how Task 13 shipped three routes uncovered by the matrix).
+///
+/// Two mounted mutating routes are named exemptions rather than matrix rows,
+/// both resting on `check_csrf` in `rest/auth.rs`:
+/// - `POST /auth/login` is CSRF-exempt by design: `check_csrf` waves through
+///   any request whose path is `LOGIN_PATH` unconditionally, because login is
+///   what mints the token a later request would echo - there is no session
+///   yet to carry one.
+/// - `POST /auth/logout` is a safe no-op for a tokenless caller: `check_csrf`
+///   only demands a token when `identity.user.is_some()`; an identity with no
+///   resolved account (no cookie, or a cookie the server has forgotten)
+///   passes with no token at all, and logout has nothing to revoke for it
+///   either way. A *real* session's logout still enforces the same token
+///   match as every other unsafe request - only the account-less case is
+///   exempt, which is why this is a logout-specific carve-out and not a
+///   second CSRF-exempt path in `check_csrf` itself.
+#[test]
+fn write_ops_covers_every_mutating_route_mounted() {
+    use std::collections::BTreeSet;
+
+    const EXEMPT: &[&str] = &["POST /api/v1/auth/login", "POST /api/v1/auth/logout"];
+
+    let mutating: BTreeSet<String> = support::MOUNTED_OPERATIONS
+        .iter()
+        .filter(|op| {
+            op.starts_with("POST ")
+                || op.starts_with("PUT ")
+                || op.starts_with("PATCH ")
+                || op.starts_with("DELETE ")
+        })
+        .filter(|op| !EXEMPT.contains(op))
+        .map(|op| op.to_string())
+        .collect();
+
+    let covered: BTreeSet<String> = write_ops()
+        .iter()
+        .map(|op| format!("{} {}", op.method, canonicalize(op.path)))
+        .collect();
+
+    let missing: Vec<&String> = mutating.difference(&covered).collect();
+    assert!(
+        missing.is_empty(),
+        "these mounted write routes have no write_ops() row in the auth/CSRF \
+         matrix: {missing:?}"
+    );
+    let extra: Vec<&String> = covered.difference(&mutating).collect();
+    assert!(
+        extra.is_empty(),
+        "these write_ops() rows match no mounted route: {extra:?}"
+    );
 }

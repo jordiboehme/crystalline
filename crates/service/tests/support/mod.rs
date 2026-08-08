@@ -27,6 +27,53 @@ use flate2::write::GzEncoder;
 use sha2::{Digest, Sha256};
 use tar::Header;
 
+/// Every operation the `/api/v1` router mounts, as `METHOD path`, spelled the
+/// way the OpenAPI document spells it (the engram wildcard becomes an ordinary
+/// `{permalink}` template, which is the only notation OpenAPI has for it).
+///
+/// This list is the contract rather than a convenience, and it is shared
+/// rather than duplicated on purpose: `openapi_snapshot.rs`'s
+/// `the_document_covers_every_mounted_path` compares it against the served
+/// OpenAPI document in *both* directions, so a route the router mounts but
+/// nobody annotated, and an annotation for a route nobody mounts, each fail
+/// there; `rest_write_api.rs`'s `write_ops_covers_every_mutating_route_mounted`
+/// filters it down to the unsafe methods and checks that list against the
+/// auth/CSRF matrix's own route set, so a write route mounted without a
+/// matching matrix row fails there too. One list feeding two checks is the
+/// point: a hand-kept second copy is exactly the kind of thing that drifts
+/// unnoticed (Task 13 shipped three routes uncovered by the matrix this way).
+/// The method is part of the string because a documented method the router
+/// does not serve would generate a client function that compiles and then
+/// answers 405.
+pub const MOUNTED_OPERATIONS: &[&str] = &[
+    "GET /api/v1/openapi.json",
+    "POST /api/v1/auth/login",
+    "POST /api/v1/auth/logout",
+    "GET /api/v1/auth/me",
+    "GET /api/v1/domains",
+    "GET /api/v1/domains/{domain}/tree",
+    "GET /api/v1/domains/{domain}/manifest",
+    "PUT /api/v1/domains/{domain}/manifest",
+    "GET /api/v1/domains/{domain}/engrams",
+    "POST /api/v1/domains/{domain}/engrams",
+    "GET /api/v1/domains/{domain}/engrams/{permalink}",
+    "PUT /api/v1/domains/{domain}/engrams/{permalink}",
+    "DELETE /api/v1/domains/{domain}/engrams/{permalink}",
+    "POST /api/v1/domains/{domain}/retire",
+    "POST /api/v1/domains/{domain}/move",
+    "POST /api/v1/validate",
+    "GET /api/v1/search",
+    "GET /api/v1/vocabulary",
+    "GET /api/v1/context",
+    "GET /api/v1/activity",
+    "GET /api/v1/graph",
+    "GET /api/v1/users",
+    "POST /api/v1/users",
+    "PATCH /api/v1/users/{name}",
+    "DELETE /api/v1/users/{name}",
+    "POST /api/v1/users/{name}/password",
+];
+
 /// The lowercase hex SHA-256 digest of `bytes`.
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
