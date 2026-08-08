@@ -138,6 +138,22 @@ pub struct EditParams {
     pub expected_checksum: Option<String>,
 }
 
+/// Parameters for `save_engram`, the full-document save behind the HTTP PUT.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct SaveParams {
+    /// The engram's domain.
+    pub domain: String,
+    /// A bare permalink, title or `crystalline://` URL. Without the scheme
+    /// the identifier is domain-relative: never prefix it with a domain name.
+    pub identifier: String,
+    /// The complete markdown text, frontmatter included, written verbatim.
+    pub content: String,
+    /// The checksum from the read this save is based on. The save is refused
+    /// as a conflict when the stored version no longer matches, on file and
+    /// virtual domains alike.
+    pub expected_checksum: String,
+}
+
 /// Parameters for `move_engram`.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct MoveParams {

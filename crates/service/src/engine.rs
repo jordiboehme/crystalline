@@ -32,7 +32,7 @@ use crystalline_core::emit::{
 use crystalline_core::schema::{self, Schema};
 use crystalline_core::{
     CrystallineUrl, Engram, Frontmatter, HarnessKind, LinkTarget, Manifest, YamlValue,
-    is_lower_hyphen, parse_engram, slugify,
+    is_lower_hyphen, parse_engram, parse_engram_lossless, slugify,
 };
 use crystalline_index::{
     ChunkParams, DEFAULT_RETIRED_WEIGHT, DEFAULT_SALIENCE_WEIGHT, DomainHost, DomainId, DomainKind,
@@ -247,6 +247,19 @@ impl From<crystalline_remote::RemoteError> for EngineError {
     }
 }
 
+/// The one sentence a refused compare-and-swap speaks, wherever the comparison
+/// happened. It opens with the store's own `stale edit` wording (see
+/// `IndexError::StaleEdit`) because that phrase is the seam: the database
+/// enforces the swap for virtual domains and [`Engine::save_engram`] enforces
+/// it by hand for file domains, and the HTTP layer classifies both as the same
+/// conflict by looking for it. Keep the prefix stable.
+fn stale_edit_message(expected: &str, found: &str) -> String {
+    format!(
+        "stale edit: engram changed since it was read \
+         (expected {expected}, found {found}); re-read and retry"
+    )
+}
+
 impl From<crystalline_index::IndexError> for EngineError {
     fn from(e: crystalline_index::IndexError) -> Self {
         match e {
@@ -256,9 +269,7 @@ impl From<crystalline_index::IndexError> for EngineError {
             // A stale compare-and-swap surfaces as a conflict, mirroring the
             // expected_replacements ergonomics: re-read and retry.
             crystalline_index::IndexError::StaleEdit { expected, found } => {
-                EngineError::Conflict(format!(
-                    "engram changed since you last read it (expected checksum {expected}, found {found}); re-read and retry"
-                ))
+                EngineError::Conflict(stale_edit_message(&expected, &found))
             }
             other => EngineError::Internal(other.to_string()),
         }
@@ -1407,6 +1418,96 @@ impl Engine {
             "type": engram_type,
             "status": status,
             "action": if p.overwrite { "written" } else { "created" },
+        }))
+    }
+
+    /// Save an engram's complete markdown text verbatim, guarded by the
+    /// checksum of the version the caller read.
+    ///
+    /// The full-document counterpart of [`Engine::edit_engram`], for the HTTP
+    /// PUT: the client edited the whole file, so the whole file is what lands.
+    /// Nothing is rebuilt and `generated` is not touched - a save of what was
+    /// read must be byte-identical, which is the editor's fidelity contract,
+    /// and the text already carries whatever provenance its author put there.
+    ///
+    /// `expected_checksum` is enforced on BOTH storage kinds. File domains get
+    /// the comparison here (read, hash, compare, write), virtual domains get
+    /// it in the store's compare-and-swap (`upsert_engram_checked`); both
+    /// failure paths speak the store's own "stale edit" language so the HTTP
+    /// layer classifies them as one conflict.
+    pub async fn save_engram(&self, p: &SaveParams) -> Result<Value> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        // A document that is not an engram would poison the index on reindex,
+        // so it is refused before anything is written. This is the one hard
+        // gate, and it is deliberately narrow: the text must parse (clean
+        // UTF-8, frontmatter that is a YAML mapping) and must actually carry a
+        // frontmatter block, because a save that drops it silently strips the
+        // engram's type, title, tags and status. Everything a document can get
+        // wrong while still being an engram - a missing tag, a permalink that
+        // is not a slug, an inverted validity window - is the validation
+        // endpoint's business to report, not this path's to refuse: an engram
+        // that already carries such a flaw must stay editable, since fixing it
+        // here is what the editor is for.
+        let parsed =
+            parse_engram_lossless(&p.content).map_err(|e| EngineError::Invalid(e.to_string()))?;
+        if !parsed.has_frontmatter {
+            return Err(EngineError::Invalid(
+                "the document carries no frontmatter block, so it is not an engram; \
+                 keep the --- delimited frontmatter at the top of the file"
+                    .into(),
+            ));
+        }
+        let (desc, source) = self.resolve(&p.identifier, Some(&p.domain)).await?;
+
+        match &source {
+            ContentSource::File { root } => {
+                let abs = join_rel(root, &desc.path);
+                let current = std::fs::read_to_string(&abs).map_err(|source| EngineError::Io {
+                    path: abs.display().to_string(),
+                    source,
+                })?;
+                let found = sha256_hex(current.as_bytes());
+                if found != p.expected_checksum {
+                    return Err(EngineError::Conflict(stale_edit_message(
+                        &p.expected_checksum,
+                        &found,
+                    )));
+                }
+                write_file(&abs, &p.content)?;
+                let store = self.store.lock().await;
+                self.reindex_file(&*store, desc.domain_id, root, &desc.path)
+                    .await?;
+            }
+            ContentSource::Virtual => {
+                let stamp = virtual_stamp(&p.content);
+                let store = self.store.lock().await;
+                self.index_markdown(
+                    &*store,
+                    desc.domain_id,
+                    &desc.path,
+                    &p.content,
+                    stamp,
+                    Some(&p.expected_checksum),
+                    true,
+                )
+                .await?;
+            }
+        }
+
+        // A save can rewrite the MANIFEST engram of a virtual domain or the
+        // titles a folder index lists, same as an edit.
+        if matches!(source, ContentSource::Virtual) {
+            self.refresh_routing_cache().await;
+        }
+        self.refresh_index_files(&desc.domain).await;
+
+        Ok(json!({
+            "domain": desc.domain,
+            "permalink": desc.permalink,
+            "path": desc.path,
+            "checksum": sha256_hex(p.content.as_bytes()),
         }))
     }
 
