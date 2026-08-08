@@ -13,7 +13,7 @@ import { screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { api } from "../api/client";
+import { ApiProblem, api } from "../api/client";
 import {
   answersFor,
   domainsResponse,
@@ -207,5 +207,94 @@ describe("the engram editor", () => {
     await userEvent.click(screen.getByRole("button", { name: "Save" }));
     await screen.findByText("Saved");
     expect(localStorage.getItem("fluid.draft.ada.eng/alpha")).toBeNull();
+  });
+
+  function conflictAnswer() {
+    return new ApiProblem(
+      412,
+      "precondition failed",
+      "stale edit: engram changed since it was read",
+      {
+        current_etag: '"srv999"',
+        current_content: CONTENT.replace("A rule.", "Somebody else's rule."),
+      },
+    );
+  }
+
+  it("a stale save opens the conflict view with both versions", async () => {
+    serveEditor({
+      "/domains/eng/engrams/alpha": (_path, init) => {
+        if (init?.method === "PUT") {
+          throw conflictAnswer();
+        }
+        return detailResponse();
+      },
+    });
+    renderApp("/d/eng/edit/alpha");
+    await screen.findByLabelText("Engram source");
+    await userEvent.click(screen.getByRole("button", { name: "Save" }));
+    expect(
+      await screen.findByRole("dialog", { name: /someone else saved/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/Somebody else's rule\./)).toBeInTheDocument();
+    // The refusal itself, in the server's words.
+    expect(
+      screen.getByText(/stale edit: engram changed since it was read/),
+    ).toBeInTheDocument();
+  });
+
+  it("overwrite retries with the server's current token and keeps my text", async () => {
+    let puts = 0;
+    const seen: Array<Record<string, string>> = [];
+    serveEditor({
+      "/domains/eng/engrams/alpha": (_path, init) => {
+        if (init?.method === "PUT") {
+          seen.push((init.headers ?? {}) as Record<string, string>);
+          puts += 1;
+          if (puts === 1) {
+            throw conflictAnswer();
+          }
+          return detailResponse({ checksum: "after99" });
+        }
+        return detailResponse();
+      },
+    });
+    renderApp("/d/eng/edit/alpha");
+    await screen.findByLabelText("Engram source");
+    await userEvent.click(screen.getByRole("button", { name: "Save" }));
+    await screen.findByRole("dialog", { name: /someone else saved/i });
+    await userEvent.click(
+      screen.getByRole("button", { name: "Save mine over it" }),
+    );
+    await screen.findByText("Saved");
+    expect(seen[1]).toEqual({ "If-Match": '"srv999"' });
+  });
+
+  it("taking the server version snapshots my text as a draft first", async () => {
+    serveEditor({
+      "/domains/eng/engrams/alpha": (_path, init) => {
+        if (init?.method === "PUT") {
+          throw conflictAnswer();
+        }
+        return detailResponse();
+      },
+    });
+    renderApp("/d/eng/edit/alpha");
+    await screen.findByLabelText("Engram source");
+    await userEvent.click(screen.getByRole("button", { name: "Save" }));
+    await screen.findByRole("dialog", { name: /someone else saved/i });
+    await userEvent.click(
+      screen.getByRole("button", { name: "Take the server version" }),
+    );
+    await waitFor(() => {
+      expect(screen.getByLabelText("Engram source").textContent).toContain(
+        "Somebody else's rule.",
+      );
+    });
+    // Mine is not gone: it is the draft now.
+    const draft = localStorage.getItem("fluid.draft.ada.eng/alpha");
+    expect(draft).not.toBeNull();
+    const parsedDraft = JSON.parse(draft ?? "{}") as { content: string };
+    expect(parsedDraft.content).toEqual(expect.stringContaining("A rule."));
   });
 });

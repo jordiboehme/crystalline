@@ -18,9 +18,11 @@ import { Link, useNavigate, useParams } from "react-router";
 import { problemDetail } from "../api/client";
 import type { EngramDetail } from "../api/engram";
 import { engramDetailKey, fetchEngramDetail } from "../api/engram";
-import { saveEngram } from "../api/writes";
+import type { SaveConflict } from "../api/writes";
+import { conflictOf, saveEngram } from "../api/writes";
 import { useAuth } from "../auth/AuthContext";
 import CmEditor from "../editor/CmEditor";
+import { ConflictDialog } from "../editor/ConflictDialog";
 import {
   clearDraft,
   DRAFT_DEBOUNCE_MS,
@@ -118,6 +120,8 @@ function EditorSurface({ engram }: { engram: EngramDetail }) {
   const [savedText, setSavedText] = useState(engram.content);
   const [buffer, setBuffer] = useState(engram.content);
   const [notice, setNotice] = useState<Notice | null>(null);
+  // The 412 view: set on a stale save, cleared by every one of its exits.
+  const [conflict, setConflict] = useState<SaveConflict | null>(null);
   const dirty = buffer !== savedText;
   // A browser-stored draft newer than what the server sent, read once per
   // mount and offered through the recovery banner below.
@@ -127,8 +131,13 @@ function EditorSurface({ engram }: { engram: EngramDetail }) {
   });
 
   const save = useMutation({
-    mutationFn: (content: string) =>
-      saveEngram(engram.domain, engram.permalink, content, checksum),
+    // The token travels with the content rather than being read from
+    // `checksum` inside the mutation: a conflict's overwrite moves the
+    // checksum state and fires the retry in the same handler, and a mutation
+    // that read `checksum` from its closure would still see the pre-update
+    // value on that first tick.
+    mutationFn: ({ content, token }: { content: string; token: string }) =>
+      saveEngram(engram.domain, engram.permalink, content, token),
     onSuccess: (saved) => {
       clearDraft(account, engram.domain, engram.permalink);
       setChecksum(saved.checksum ?? "");
@@ -147,6 +156,11 @@ function EditorSurface({ engram }: { engram: EngramDetail }) {
       }
     },
     onError: (error: Error) => {
+      const stale = conflictOf(error);
+      if (stale) {
+        setConflict(stale);
+        return;
+      }
       setNotice({ kind: "problem", text: problemDetail(error) });
     },
   });
@@ -157,7 +171,7 @@ function EditorSurface({ engram }: { engram: EngramDetail }) {
       setNotice(null);
       // `docText` rather than `doc.toString()`: what goes on the wire is the
       // file's own bytes, line endings included.
-      save.mutate(docText(view.state));
+      save.mutate({ content: docText(view.state), token: checksum });
     }
   };
   // The keymap's request, answered here where the current save is in scope.
@@ -318,6 +332,52 @@ function EditorSurface({ engram }: { engram: EngramDetail }) {
           onDocChanged={setBuffer}
         />
       </div>
+      {conflict && (
+        <ConflictDialog
+          conflict={conflict}
+          mine={buffer}
+          onClose={() => {
+            setConflict(null);
+          }}
+          onOverwrite={() => {
+            setChecksum(conflict.currentChecksum);
+            setConflict(null);
+            const view = viewRef.current;
+            if (view) {
+              // The explicit token, not `checksum`: the state update above
+              // has not landed yet on this tick, and the mutation would
+              // otherwise retry with the token that just got refused.
+              save.mutate({
+                content: docText(view.state),
+                token: conflict.currentChecksum,
+              });
+            }
+          }}
+          onTakeServer={() => {
+            // Mine is not discarded, it becomes the draft - the same store a
+            // crash or a closed tab would have used, so it survives the
+            // buffer being overwritten below.
+            writeDraft(account, engram.domain, engram.permalink, {
+              content: buffer,
+              baseChecksum: checksum,
+              savedAt: new Date().toISOString(),
+            });
+            const view = viewRef.current;
+            if (view) {
+              view.dispatch({
+                changes: {
+                  from: 0,
+                  to: view.state.doc.length,
+                  insert: conflict.currentContent,
+                },
+              });
+            }
+            setChecksum(conflict.currentChecksum);
+            setSavedText(conflict.currentContent);
+            setConflict(null);
+          }}
+        />
+      )}
     </div>
   );
 }
