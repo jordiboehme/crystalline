@@ -547,6 +547,18 @@ async fn the_write_routes_refuse_viewers_the_anonymous_and_the_tokenless() {
     .await
     .unwrap();
     assert_eq!(deleted.status(), 403);
+    let manifest_saved = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/eng/manifest",
+        &viewer,
+    )
+    .header("if-match", "\"deadbeef\"")
+    .json(&serde_json::json!({"markdown": "no"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(manifest_saved.status(), 403);
 
     // Each route's own valid body, so a schema mismatch never masks the
     // identity check: `ApiJson` extraction runs ahead of the handler and
@@ -577,6 +589,11 @@ async fn the_write_routes_refuse_viewers_the_anonymous_and_the_tokenless() {
                 reqwest::Method::DELETE,
                 "/api/v1/domains/eng/engrams/alpha",
                 serde_json::json!({}),
+            ),
+            (
+                reqwest::Method::PUT,
+                "/api/v1/domains/eng/manifest",
+                serde_json::json!({"markdown": "no"}),
             ),
         ]
     };
@@ -765,6 +782,91 @@ async fn retire_move_and_delete_run_through_their_endpoints() {
     .unwrap();
     assert_eq!(gone.status(), 204);
     assert!(!fx._tmp.path().join("eng/alpha.md").exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_manifest_reads_with_an_etag_and_saves_under_if_match() {
+    let fx = serve(Options::default()).await;
+    let editor = login(fx.addr, "eddy", "eddypw").await;
+
+    let read = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/domains/eng/manifest",
+        &editor,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(read.status(), 200);
+    let etag = read.headers()["etag"]
+        .to_str()
+        .unwrap()
+        .trim_matches('"')
+        .to_string();
+    let body: serde_json::Value = read.json().await.unwrap();
+    assert_eq!(
+        body["checksum"].as_str().unwrap(),
+        etag,
+        "header and body agree"
+    );
+    let markdown = body["markdown"].as_str().unwrap().to_string();
+
+    // No header: 428. Stale: 412 with the current manifest. Fresh: 200.
+    let missing = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/eng/manifest",
+        &editor,
+    )
+    .json(&serde_json::json!({"markdown": markdown}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(missing.status(), 428);
+
+    let edited = markdown.replace(
+        "Route here for eng questions",
+        "Route here for all things eng",
+    );
+    let saved = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/eng/manifest",
+        &editor,
+    )
+    .header("if-match", format!("\"{etag}\""))
+    .json(&serde_json::json!({"markdown": edited}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(saved.status(), 200);
+    let saved_body: serde_json::Value = saved.json().await.unwrap();
+    assert_ne!(saved_body["checksum"].as_str().unwrap(), etag);
+    assert_eq!(
+        std::fs::read_to_string(fx._tmp.path().join("eng/MANIFEST.md")).unwrap(),
+        edited
+    );
+
+    let stale = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/eng/manifest",
+        &editor,
+    )
+    .header("if-match", format!("\"{etag}\""))
+    .json(&serde_json::json!({"markdown": "---\ntitle: hijack\n---\n"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(stale.status(), 412);
+    let conflict: serde_json::Value = stale.json().await.unwrap();
+    assert!(
+        conflict["current_content"]
+            .as_str()
+            .unwrap()
+            .contains("all things eng")
+    );
 }
 
 /// The trusted-header mode, end to end on a write: a proxy identity is

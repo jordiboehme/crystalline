@@ -78,6 +78,7 @@ use crate::engine::Engine;
         domains::list,
         domains::tree,
         domains::manifest,
+        domains::save_manifest,
         engrams::list,
         engrams::detail,
         engrams::create,
@@ -100,6 +101,7 @@ use crate::engine::Engine;
         ConflictDetail,
         User,
         Role,
+        domains::SaveManifestBody,
         engrams::CreateEngramBody,
         engrams::SaveEngramBody,
         engrams::RetireBody,
@@ -208,7 +210,10 @@ pub fn router(state: RestState) -> Router {
         .route("/auth/me", get(auth::me))
         .route("/domains", get(domains::list))
         .route("/domains/{domain}/tree", get(domains::tree))
-        .route("/domains/{domain}/manifest", get(domains::manifest))
+        .route(
+            "/domains/{domain}/manifest",
+            get(domains::manifest).put(domains::save_manifest),
+        )
         .route(
             "/domains/{domain}/engrams",
             get(engrams::list).post(engrams::create),

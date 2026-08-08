@@ -212,12 +212,17 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * `GET /domains/{domain}/manifest` - the domain's MANIFEST markdown as
-         *     written, so a client can render or edit the source rather than a reduction
-         *     of it.
+         * The domain's MANIFEST markdown as written.
+         * @description The source, not a reduction of it, so a client can render or edit it directly.
+         *
+         *     The response carries an `ETag` over the markdown, the same strong validator a later `PUT` compares an `If-Match` against.
          */
         get: operations["get_domain_manifest"];
-        put?: never;
+        /**
+         * Save a domain's MANIFEST markdown, guarded by If-Match.
+         * @description The text lands verbatim, frontmatter included, guarded the same way an engram save is: 428 with no `If-Match`, 412 when the token is stale (carrying the version the server holds now), 200 once it lands. A read-only instance answers 403 ahead of the precondition check, so it is never 428.
+         */
+        put: operations["save_domain_manifest"];
         post?: never;
         delete?: never;
         options?: never;
@@ -729,6 +734,20 @@ export interface components {
              *     A sharper rule.
              */
             content: string;
+        };
+        /** @description The full MANIFEST markdown as the editor holds it, written verbatim: nothing here rebuilds the frontmatter or stamps provenance. */
+        SaveManifestBody: {
+            /**
+             * @description The full MANIFEST markdown as the editor holds it.
+             * @example ---
+             *     title: eng
+             *     ---
+             *
+             *     ## When to Use
+             *
+             *     - Route here for eng questions.
+             */
+            markdown: string;
         };
         /**
          * @description One account. Carries no password material, so it is safe to hand to a
@@ -1698,11 +1717,14 @@ export interface operations {
             /** @description The manifest source beside the domain it belongs to. */
             200: {
                 headers: {
+                    /** @description The quoted checksum of the manifest as read, the token a later `PUT` carries in `If-Match`. */
+                    etag?: string;
                     [name: string]: unknown;
                 };
                 content: {
                     /**
                      * @example {
+                     *       "checksum": "3f8a1c05e2",
                      *       "domain": "eng",
                      *       "markdown": "---\ntitle: eng\n---\n\n## When to Use\n\n- Route here for eng questions.\n"
                      *     }
@@ -1730,6 +1752,120 @@ export interface operations {
             };
             /** @description No such domain, or the domain carries no MANIFEST yet. */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    save_domain_manifest: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description The quoted `ETag` of the version being replaced, from the manifest read.
+                 * @example "3f8a1c05e2"
+                 */
+                "If-Match": string;
+            };
+            path: {
+                /** @description The registered domain. */
+                domain: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SaveManifestBody"];
+            };
+        };
+        responses: {
+            /** @description The manifest as saved, mirroring the GET shape. */
+            200: {
+                headers: {
+                    /** @description The quoted checksum of the manifest as saved, the token the next save carries. */
+                    etag?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "checksum": "3f8a1c05e2",
+                     *       "domain": "eng",
+                     *       "markdown": "---\ntitle: eng\n---\n\n## When to Use\n\n- Route here for eng questions.\n"
+                     *     }
+                     */
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description No identity, or an anonymous one: an identity with no account behind it never writes. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The caller is not an editor, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. A read-only instance answers this ahead of the precondition check, so it is never 428. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No such domain, or the domain carries no MANIFEST yet. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The `If-Match` token is stale. The body carries the version the server holds now, so a client can merge. */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ConflictDetail"];
+                };
+            };
+            /** @description The document is over the 10 MiB limit this API accepts. */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The body is not `application/json`. */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The document carries no frontmatter block, so it is not a MANIFEST. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No `If-Match` arrived. The token comes from the manifest read. */
+            428: {
                 headers: {
                     [name: string]: unknown;
                 };

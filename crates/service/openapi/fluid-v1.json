@@ -1150,7 +1150,8 @@
         "tags": [
           "domains"
         ],
-        "summary": "`GET /domains/{domain}/manifest` - the domain's MANIFEST markdown as\nwritten, so a client can render or edit the source rather than a reduction\nof it.",
+        "summary": "The domain's MANIFEST markdown as written.",
+        "description": "The source, not a reduction of it, so a client can render or edit it directly.\n\nThe response carries an `ETag` over the markdown, the same strong validator a later `PUT` compares an `If-Match` against.",
         "operationId": "get_domain_manifest",
         "parameters": [
           {
@@ -1166,12 +1167,21 @@
         "responses": {
           "200": {
             "description": "The manifest source beside the domain it belongs to.",
+            "headers": {
+              "etag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "The quoted checksum of the manifest as read, the token a later `PUT` carries in `If-Match`."
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
                   "type": "object"
                 },
                 "example": {
+                  "checksum": "3f8a1c05e2",
                   "domain": "eng",
                   "markdown": "---\ntitle: eng\n---\n\n## When to Use\n\n- Route here for eng questions.\n"
                 }
@@ -1200,6 +1210,150 @@
           },
           "404": {
             "description": "No such domain, or the domain carries no MANIFEST yet.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "domains"
+        ],
+        "summary": "Save a domain's MANIFEST markdown, guarded by If-Match.",
+        "description": "The text lands verbatim, frontmatter included, guarded the same way an engram save is: 428 with no `If-Match`, 412 when the token is stale (carrying the version the server holds now), 200 once it lands. A read-only instance answers 403 ahead of the precondition check, so it is never 428.",
+        "operationId": "save_domain_manifest",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The registered domain.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "If-Match",
+            "in": "header",
+            "description": "The quoted `ETag` of the version being replaced, from the manifest read.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "\"3f8a1c05e2\""
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SaveManifestBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The manifest as saved, mirroring the GET shape.",
+            "headers": {
+              "etag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "The quoted checksum of the manifest as saved, the token the next save carries."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                },
+                "example": {
+                  "checksum": "3f8a1c05e2",
+                  "domain": "eng",
+                  "markdown": "---\ntitle: eng\n---\n\n## When to Use\n\n- Route here for eng questions.\n"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or an anonymous one: an identity with no account behind it never writes.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an editor, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. A read-only instance answers this ahead of the precondition check, so it is never 428.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain, or the domain carries no MANIFEST yet.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "The `If-Match` token is stale. The body carries the version the server holds now, so a client can merge.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConflictDetail"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The document is over the 10 MiB limit this API accepts.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body is not `application/json`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The document carries no frontmatter block, so it is not a MANIFEST.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "428": {
+            "description": "No `If-Match` arrived. The token comes from the manifest read.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -2707,6 +2861,20 @@
             "type": "string",
             "description": "The full markdown text as the editor holds it.",
             "example": "---\ntitle: Alpha\npermalink: alpha\n---\n\nA sharper rule.\n"
+          }
+        }
+      },
+      "SaveManifestBody": {
+        "type": "object",
+        "description": "The full MANIFEST markdown as the editor holds it, written verbatim: nothing here rebuilds the frontmatter or stamps provenance.",
+        "required": [
+          "markdown"
+        ],
+        "properties": {
+          "markdown": {
+            "type": "string",
+            "description": "The full MANIFEST markdown as the editor holds it.",
+            "example": "---\ntitle: eng\n---\n\n## When to Use\n\n- Route here for eng questions.\n"
           }
         }
       },
