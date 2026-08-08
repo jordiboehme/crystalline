@@ -86,6 +86,16 @@ impl ApiError {
         internal_error(detail.into())
     }
 
+    /// A 428 for a write that arrived without its `If-Match`. The detail names
+    /// the header and where its token comes from (the detail read's ETag).
+    pub fn precondition_required(detail: impl Into<String>) -> ApiError {
+        ApiError {
+            status: StatusCode::PRECONDITION_REQUIRED,
+            title: "precondition required",
+            detail: detail.into(),
+        }
+    }
+
     /// A 405 for a path that exists but does not serve this method. Mounted as
     /// the router's `method_not_allowed_fallback`, which is the one answer axum
     /// would otherwise produce with an empty body; the `Allow` header axum adds
@@ -237,25 +247,95 @@ impl IntoResponse for ApiError {
     }
 }
 
+/// The If-Match token: the unquoted strong checksum a write compares against.
+///
+/// 428 when the header is absent - the client forgot the contract, and the
+/// answer says where the token comes from. `*`, a weak `W/` validator and an
+/// empty token are 422: this surface versions by strong content checksum only,
+/// and matching "any version" would make If-Match decorative.
+pub fn if_match(headers: &axum::http::HeaderMap) -> Result<String, ApiError> {
+    let raw = headers
+        .get(axum::http::header::IF_MATCH)
+        .ok_or_else(|| {
+            ApiError::precondition_required(
+                "this write requires an If-Match header carrying the ETag \
+                 from the detail read, so a stale save is refused instead of \
+                 clobbering someone else's change",
+            )
+        })?
+        .to_str()
+        .map_err(|_| ApiError::unprocessable("the If-Match header is not readable text"))?
+        .trim();
+    if raw == "*" || raw.starts_with("W/") {
+        return Err(ApiError::unprocessable(
+            "If-Match must carry the strong content checksum from the detail \
+             read, not a wildcard or a weak validator",
+        ));
+    }
+    let token = raw.trim_matches('"');
+    if token.is_empty() {
+        return Err(ApiError::unprocessable("the If-Match token is empty"));
+    }
+    Ok(token.to_string())
+}
+
+/// The wire form of a 412: a problem detail carrying the version the server
+/// holds now, so a client can show a merge view instead of just failing.
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct ConflictDetail {
+    #[serde(rename = "type")]
+    pub problem_type: &'static str, // "about:blank"
+    pub status: u16,         // 412
+    pub title: &'static str, // "precondition failed"
+    pub detail: String,
+    /// The ETag of the version the server holds now, quoted.
+    pub current_etag: String,
+    /// The full markdown the server holds now, so a client can merge.
+    pub current_content: String,
+}
+
+/// A 412 for a write whose `If-Match` no longer matches the server's copy,
+/// carrying that copy so the caller can merge instead of retrying blind.
+pub fn precondition_failed(detail: String, checksum: &str, content: String) -> Response {
+    let body = ConflictDetail {
+        problem_type: "about:blank",
+        status: StatusCode::PRECONDITION_FAILED.as_u16(),
+        title: "precondition failed",
+        detail,
+        current_etag: format!("\"{checksum}\""),
+        current_content: content,
+    };
+    let mut resp = (StatusCode::PRECONDITION_FAILED, axum::Json(body)).into_response();
+    // `axum::Json` writes `application/json`; RFC 9457 requires the problem
+    // media type, so the header is replaced rather than appended.
+    resp.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/problem+json"),
+    );
+    resp
+}
+
 impl From<EngineError> for ApiError {
     /// Mirror `mcp::to_error`'s classification, projected onto HTTP: the
     /// variants it calls caller errors split into "the thing is not there"
     /// (404) and "the request was wrong" (422), and the variants it calls
-    /// internal errors become 500. `ReadOnly` stays in the caller-error class
-    /// it has on the MCP side rather than becoming a 403, so the two surfaces
-    /// keep one classification; the task that adds write endpoints owns any
-    /// refinement. The match is exhaustive so a new variant must be
-    /// classified here instead of silently defaulting.
+    /// internal errors become 500. `ReadOnly` is the one divergence from
+    /// `mcp::to_error`: HTTP has a status for "the server knows you and
+    /// refuses" that MCP does not reach for, and a browser client already
+    /// learns `read_only` from `/auth/me`, so this surface answers 403
+    /// instead of folding it into the generic 422 caller-error class. The
+    /// match is exhaustive so a new variant must be classified here instead
+    /// of silently defaulting.
     fn from(e: EngineError) -> ApiError {
         let detail = e.to_string();
         match e {
             EngineError::UnknownDomain { .. } | EngineError::NotFound(_) => {
                 ApiError::not_found(detail)
             }
+            EngineError::ReadOnly => ApiError::forbidden(detail),
             EngineError::Ambiguous(_)
             | EngineError::Conflict(_)
             | EngineError::Invalid(_)
-            | EngineError::ReadOnly
             | EngineError::EnvTokenConnect => unprocessable_error(detail),
             EngineError::Remote(remote) => remote_to_api_error(remote, detail),
             EngineError::Io { .. } | EngineError::Internal(_) => internal_error(detail),
@@ -341,6 +421,75 @@ mod tests {
         assert_eq!(
             ApiError::from(EngineError::Internal("store blew up".into())).status,
             StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    /// The write-endpoint refinement: a read-only instance answers 403, matching
+    /// the /auth/me read_only flag a client already branches on. MCP keeps its own
+    /// classification; this is the HTTP projection only.
+    #[test]
+    fn read_only_is_forbidden_on_this_surface() {
+        let api = ApiError::from(EngineError::ReadOnly);
+        assert_eq!(api.status, StatusCode::FORBIDDEN);
+        assert!(api.detail.contains("read-only"), "{}", api.detail);
+    }
+
+    /// If-Match parsing: 428 without the header, the unquoted checksum with it,
+    /// and the shapes RFC 9110 allows but a strong-checksum contract refuses.
+    #[test]
+    fn if_match_demands_one_quoted_strong_validator() {
+        use axum::http::{HeaderMap, HeaderValue, header};
+        let with = |raw: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(header::IF_MATCH, HeaderValue::from_str(raw).unwrap());
+            h
+        };
+
+        assert_eq!(
+            if_match(&HeaderMap::new()).unwrap_err().status,
+            StatusCode::PRECONDITION_REQUIRED
+        );
+        assert_eq!(if_match(&with("\"abc123\"")).unwrap(), "abc123");
+        assert_eq!(
+            if_match(&with("abc123")).unwrap(),
+            "abc123",
+            "quotes optional on the way in"
+        );
+        for bad in ["*", "W/\"abc\"", "\"\"", ""] {
+            assert_eq!(
+                if_match(&with(bad)).unwrap_err().status,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{bad:?} is not a strong checksum"
+            );
+        }
+    }
+
+    /// The 412 payload is a problem detail with extension members, sent as
+    /// application/problem+json like every other failure here.
+    #[tokio::test]
+    async fn a_precondition_failure_carries_the_current_version() {
+        let resp = precondition_failed(
+            "the engram changed since it was read".to_string(),
+            "abc123",
+            "---\ntitle: Now\n---\n".to_string(),
+        );
+        assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);
+        assert_eq!(
+            resp.headers()[axum::http::header::CONTENT_TYPE],
+            "application/problem+json"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["status"], 412);
+        assert_eq!(body["title"], "precondition failed");
+        assert_eq!(body["current_etag"], "\"abc123\"");
+        assert!(
+            body["current_content"]
+                .as_str()
+                .unwrap()
+                .contains("title: Now")
         );
     }
 

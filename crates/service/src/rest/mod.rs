@@ -22,7 +22,10 @@ pub use auth::{
     AuthCfg, CSRF_HEADER, Caller, Identity, LOGIN_SLOTS, SESSION_COOKIE, SESSION_TTL_SECS,
 };
 pub use auth_store::*;
-pub use error::{ApiError, ApiJson, ApiPath, ApiQuery, ProblemDetail};
+pub use error::{
+    ApiError, ApiJson, ApiPath, ApiQuery, ConflictDetail, ProblemDetail, if_match,
+    precondition_failed,
+};
 
 use crate::engine::Engine;
 
