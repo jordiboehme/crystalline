@@ -1606,6 +1606,7 @@ impl Engine {
                     successor_title.as_deref(),
                     &actor,
                 );
+                let edited = Self::enforce_temporal(edited)?;
                 write_file(&abs, &edited)?;
                 let store = self.store.lock().await;
                 self.reindex_file(&*store, desc.domain_id, root, &desc.path)
@@ -1631,6 +1632,7 @@ impl Engine {
                     successor_title.as_deref(),
                     &actor,
                 );
+                let edited = Self::enforce_temporal(edited)?;
                 let stamp = virtual_stamp(&edited);
                 let store = self.store.lock().await;
                 self.index_markdown(
@@ -1717,8 +1719,13 @@ impl Engine {
 
     /// Build the target engram's retirement edit: set `status`, set
     /// `valid_to` when given, append the `superseded_by` relation when a
-    /// successor title is given, then stamp `generated` provenance. Shared by
-    /// the file and virtual arms of [`Engine::retire_engram_as`].
+    /// successor title is given and the line is not already there, then
+    /// stamp `generated` provenance. Shared by the file and virtual arms of
+    /// [`Engine::retire_engram_as`]. The `contains` guard, checked against
+    /// `current` rather than the frontmatter-edited text (the two never
+    /// disagree on body content), matches the successor side's guard so a
+    /// retry after a timeout, say, retires idempotently instead of
+    /// duplicating the relation.
     fn build_retirement_edit(
         current: &str,
         status: &str,
@@ -1732,7 +1739,10 @@ impl Engine {
                 set_frontmatter_field(&edited, "valid_to", &date.format("%Y-%m-%d").to_string());
         }
         if let Some(title) = successor_title {
-            edited = append_body(&edited, &format!("- superseded_by [[{title}]]"));
+            let line = format!("- superseded_by [[{title}]]");
+            if !current.contains(&line) {
+                edited = append_body(&edited, &line);
+            }
         }
         touch_generated(&edited, actor, now_offset())
     }

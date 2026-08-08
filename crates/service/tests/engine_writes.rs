@@ -363,3 +363,57 @@ async fn plain_deprecation_needs_no_successor() {
         "no sentinel dates, ever: {alpha}"
     );
 }
+
+#[tokio::test]
+async fn retirement_strips_a_sentinel_valid_to_instead_of_writing_it() {
+    let (tmp, engine) = engine_fixture().await;
+    engine
+        .retire_engram(&RetireParams {
+            domain: "eng".to_string(),
+            identifier: "alpha".to_string(),
+            status: "archived".to_string(),
+            successor: None,
+            valid_to: Some("9999-12-31".to_string()),
+        })
+        .await
+        .unwrap();
+    let alpha = std::fs::read_to_string(tmp.path().join("eng/alpha.md")).unwrap();
+    assert!(alpha.contains("status: archived"), "{alpha}");
+    assert!(
+        !alpha.contains("valid_to"),
+        "a sentinel valid_to must be stripped, exactly as edit_engram's set_frontmatter \
+         strips it, never written verbatim: {alpha}"
+    );
+}
+
+#[tokio::test]
+async fn retiring_the_same_engram_twice_is_idempotent() {
+    let (tmp, engine) = engine_fixture().await;
+    std::fs::write(
+        tmp.path().join("eng/beta.md"),
+        "---\ntype: engram\ntitle: Beta\npermalink: beta\ntags:\n  - eng\nstatus: stable\nrecorded_at: 2026-02-01\n---\n\n# Beta\n\nThe sharper rule.\n",
+    )
+    .unwrap();
+    engine.sync(None).await.unwrap();
+
+    let params = RetireParams {
+        domain: "eng".to_string(),
+        identifier: "alpha".to_string(),
+        status: "superseded".to_string(),
+        successor: Some("beta".to_string()),
+        valid_to: None,
+    };
+    engine.retire_engram(&params).await.unwrap();
+    // A retry (after a timeout, say) must not duplicate the relation on
+    // either side, and must still succeed rather than error.
+    engine.retire_engram(&params).await.unwrap();
+
+    let alpha = std::fs::read_to_string(tmp.path().join("eng/alpha.md")).unwrap();
+    assert_eq!(
+        alpha.matches("- superseded_by [[Beta]]").count(),
+        1,
+        "{alpha}"
+    );
+    let beta = std::fs::read_to_string(tmp.path().join("eng/beta.md")).unwrap();
+    assert_eq!(beta.matches("- supersedes [[Alpha]]").count(), 1, "{beta}");
+}
