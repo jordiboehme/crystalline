@@ -72,6 +72,53 @@ const saveKeymap = keymap.of([
   },
 ]);
 
+/**
+ * Replace the whole buffer with `content`, preserving whichever line ending
+ * `content` actually uses - the mechanism both "take the server version"
+ * (after a conflict) and "restore draft" share, since both swap in text that
+ * was never typed into this session's own state.
+ *
+ * A plain `view.dispatch` splits an inserted string using the STATE's
+ * existing line separator (`ChangeSet.of` reads
+ * `state.facet(EditorState.lineSeparator)`), not the one the string itself
+ * uses, so swapping a CRLF-mounted buffer for LF content - or the reverse -
+ * through a dispatch alone collapses the result onto one line rather than
+ * splitting it correctly. When the separators agree, the dispatch is fine
+ * and cheaper; when they don't, the state is rebuilt fresh with `content`'s
+ * own separator via `view.setState`, in place on the same view rather than a
+ * full component remount, so the rest of the screen's state - `notice`,
+ * `offeredDraft`, `conflict` and the rest - survives untouched.
+ *
+ * `setState` does not run the transaction pipeline, so the rebuilt state's
+ * own doc-changed subscription never fires for the swap itself:
+ * `onDocChanged` is called directly afterward so the caller's buffer state
+ * reflects the swap right away.
+ */
+function replaceBuffer(
+  view: EditorView,
+  content: string,
+  dark: boolean,
+  onDocChanged: (doc: string) => void,
+): void {
+  const mountedSeparator = view.state.facet(EditorState.lineSeparator) ?? "\n";
+  const nextSeparator = content.includes("\r\n") ? "\r\n" : "\n";
+  if (nextSeparator === mountedSeparator) {
+    view.dispatch({
+      changes: { from: 0, to: view.state.doc.length, insert: content },
+    });
+    return;
+  }
+  view.setState(
+    buildEditorState(
+      content,
+      [...lineSeparatorFor(content), ...baseExtensions(dark), saveKeymap],
+      ARIA_LABEL,
+      onDocChanged,
+    ),
+  );
+  onDocChanged(content);
+}
+
 export default function EngramEditor() {
   const params = useParams();
   const domain = params.domain ?? "";
@@ -305,13 +352,12 @@ function EditorSurface({ engram }: { engram: EngramDetail }) {
             onClick={() => {
               const view = viewRef.current;
               if (view) {
-                view.dispatch({
-                  changes: {
-                    from: 0,
-                    to: view.state.doc.length,
-                    insert: offeredDraft.content,
-                  },
-                });
+                replaceBuffer(
+                  view,
+                  offeredDraft.content,
+                  resolved === "dark",
+                  setBuffer,
+                );
               }
               setOfferedDraft(null);
             }}
@@ -373,46 +419,12 @@ function EditorSurface({ engram }: { engram: EngramDetail }) {
             });
             const view = viewRef.current;
             if (view) {
-              const mountedSeparator =
-                view.state.facet(EditorState.lineSeparator) ?? "\n";
-              const serverSeparator = conflict.currentContent.includes("\r\n")
-                ? "\r\n"
-                : "\n";
-              if (serverSeparator === mountedSeparator) {
-                view.dispatch({
-                  changes: {
-                    from: 0,
-                    to: view.state.doc.length,
-                    insert: conflict.currentContent,
-                  },
-                });
-              } else {
-                // A dispatch splits the inserted string with the STATE's
-                // existing separator, not the one the text itself uses: a
-                // CRLF-mounted session taking LF server content would
-                // collapse the whole buffer onto one line. Rebuilding the
-                // state fresh - in place, on the same view, rather than the
-                // route's keyed remount - swaps only the editor's own
-                // document and config; `notice`, `offeredDraft` and every
-                // other piece of this screen's state survive untouched.
-                view.setState(
-                  buildEditorState(
-                    conflict.currentContent,
-                    [
-                      ...lineSeparatorFor(conflict.currentContent),
-                      ...baseExtensions(resolved === "dark"),
-                      saveKeymap,
-                    ],
-                    ARIA_LABEL,
-                    setBuffer,
-                  ),
-                );
-                // `setState` does not run the transaction pipeline, so the
-                // new state's own doc-changed subscription never fires for
-                // the swap itself - reflect the new buffer here so `dirty`
-                // and a later conflict's `mine` both see it.
-                setBuffer(conflict.currentContent);
-              }
+              replaceBuffer(
+                view,
+                conflict.currentContent,
+                resolved === "dark",
+                setBuffer,
+              );
             }
             setChecksum(conflict.currentChecksum);
             setSavedText(conflict.currentContent);

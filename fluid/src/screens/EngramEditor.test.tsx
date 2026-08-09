@@ -184,6 +184,86 @@ describe("the engram editor", () => {
     });
   });
 
+  it("restoring a draft rebuilds the buffer when the line separator differs", async () => {
+    const crlfContent = CONTENT.replace(/\n/g, "\r\n");
+    const lfDraftContent = CONTENT.replace("A rule.", "A recovered rule.");
+    localStorage.setItem(
+      "fluid.draft.ada.eng/alpha",
+      JSON.stringify({
+        content: lfDraftContent,
+        baseChecksum: "3f8a1c05e2",
+        savedAt: "2026-08-09T10:00:00Z",
+      }),
+    );
+    serveEditor({
+      "/domains/eng/engrams/alpha": (_path, init) =>
+        init?.method === "PUT"
+          ? detailResponse({ checksum: "after99" })
+          : detailResponse({ content: crlfContent }),
+    });
+    renderApp("/d/eng/edit/alpha");
+    await screen.findByText(/unsaved draft/i);
+    await userEvent.click(
+      screen.getByRole("button", { name: "Restore draft" }),
+    );
+    await waitFor(() => {
+      expect(screen.getByLabelText("Engram source").textContent).toContain(
+        "A recovered rule.",
+      );
+    });
+    // One buffer line per "\n" in the draft's own content: a dispatch that
+    // kept splitting on the CRLF-mounted state's own separator would
+    // collapse the whole thing onto a single line instead.
+    const expectedLines = lfDraftContent.split("\n").length;
+    expect(
+      screen.getByLabelText("Engram source").querySelectorAll(".cm-line"),
+    ).toHaveLength(expectedLines);
+    await userEvent.click(screen.getByRole("button", { name: "Save" }));
+    await screen.findByText("Saved");
+    // What went on the wire is the draft's exact bytes, not a corrupted
+    // round trip through the wrong separator.
+    expect(putBody(0)).toEqual({ content: lfDraftContent });
+  });
+
+  it("restoring a draft with a matching line separator still uses the cheap dispatch", async () => {
+    const crlfContent = CONTENT.replace(/\n/g, "\r\n");
+    const crlfDraftContent = crlfContent.replace(
+      "A rule.\r\n",
+      "A recovered rule.\r\n",
+    );
+    localStorage.setItem(
+      "fluid.draft.ada.eng/alpha",
+      JSON.stringify({
+        content: crlfDraftContent,
+        baseChecksum: "3f8a1c05e2",
+        savedAt: "2026-08-09T10:00:00Z",
+      }),
+    );
+    serveEditor({
+      "/domains/eng/engrams/alpha": (_path, init) =>
+        init?.method === "PUT"
+          ? detailResponse({ checksum: "after99" })
+          : detailResponse({ content: crlfContent }),
+    });
+    renderApp("/d/eng/edit/alpha");
+    await screen.findByText(/unsaved draft/i);
+    await userEvent.click(
+      screen.getByRole("button", { name: "Restore draft" }),
+    );
+    await waitFor(() => {
+      expect(screen.getByLabelText("Engram source").textContent).toContain(
+        "A recovered rule.",
+      );
+    });
+    const expectedLines = crlfDraftContent.split("\r\n").length;
+    expect(
+      screen.getByLabelText("Engram source").querySelectorAll(".cm-line"),
+    ).toHaveLength(expectedLines);
+    await userEvent.click(screen.getByRole("button", { name: "Save" }));
+    await screen.findByText("Saved");
+    expect(putBody(0)).toEqual({ content: crlfDraftContent });
+  });
+
   it("discarding the draft keeps the server text and drops the banner", async () => {
     localStorage.setItem(
       "fluid.draft.ada.eng/alpha",
