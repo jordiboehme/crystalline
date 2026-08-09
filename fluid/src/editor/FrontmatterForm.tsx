@@ -5,8 +5,9 @@
  * holds its own copy of a value, so a hand edit in the text is on the form a
  * render later, and a form edit is one ordinary undoable transaction.
  *
- * Temporal semantics: an empty date input IS the unbounded state. Clearing
- * removes the key; nothing here ever writes a placeholder date.
+ * Temporal semantics: an empty date input IS the unbounded state. The Clear
+ * button removes the key and is the only thing that does; nothing here ever
+ * writes a placeholder date.
  *
  * The recommended `type` and `status` values are the app's one list, offered
  * through a datalist beside a plain text field. Anything can be typed and
@@ -236,8 +237,9 @@ export function FrontmatterForm({
       />
       <DateRow label="Valid to" keyName="valid_to" doc={doc} onEdit={apply} />
       <p className={NOTE_CLASSES}>
-        An empty date means unbounded validity. Recommended types and statuses
-        are suggestions; any value is allowed.
+        An empty date means unbounded validity, and Clear is what removes a
+        bound. Recommended types and statuses are suggestions; any value is
+        allowed.
       </p>
     </section>
   );
@@ -247,6 +249,15 @@ export function FrontmatterForm({
  * One temporal bound. Empty is not a missing answer, it is the answer: the
  * knowledge has always been valid, or is valid forever. Clearing the field
  * removes the key rather than writing anything in its place.
+ *
+ * Only a complete date is written, and the Clear button is the one thing that
+ * removes the key. A date control reports every partly entered date as the
+ * empty string, so a field that treated empty as "remove" would delete the
+ * line the moment somebody started retyping a date and re-add it at the
+ * bottom of the block when they finished - line churn in the one module whose
+ * whole purpose is not making any, and a savable intermediate state where the
+ * engram has silently lost its bound. Removal stays an act somebody performs
+ * rather than a state their typing passes through.
  */
 function DateRow({
   label,
@@ -268,13 +279,9 @@ function DateRow({
           className={`w-full ${FIELD_CLASSES}`}
           value={value}
           onChange={(event) => {
-            onEdit(
-              writeScalar(
-                doc,
-                keyName,
-                event.target.value === "" ? null : event.target.value,
-              ),
-            );
+            if (event.target.value !== "") {
+              onEdit(writeScalar(doc, keyName, event.target.value));
+            }
           }}
         />
       </Row>

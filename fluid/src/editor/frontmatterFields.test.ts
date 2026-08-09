@@ -65,6 +65,67 @@ describe("scalar fields", () => {
   });
 });
 
+/**
+ * Every YAML shape this module does not understand, in one block, plus the
+ * decoys each of them can plant: a comment, a block scalar whose text is a
+ * `status:` line, an anchor and its alias, a flow map with a `status` inside
+ * it, a key with no value. Nothing here has to be edited through the form -
+ * the raw buffer is always there for that - but everything here has to
+ * survive an edit to the one key that is a plain top-level scalar.
+ */
+const HOSTILE = `---
+# a note about status: not this one
+title: Alpha
+description: |
+  status: decoy inside a block scalar
+  and a second line of it
+base: &shared
+  status: nested under an anchor
+other: *shared
+flow: { status: mapped, keep: true }
+empty:
+status: stable
+tags: []
+---
+
+status: body decoy
+`;
+
+describe("frontmatter this module does not pretend to parse", () => {
+  it("reads the top-level scalar and none of the decoys", () => {
+    expect(readScalar(HOSTILE, "status")).toBe("stable");
+    expect(readScalar(HOSTILE, "empty")).toBeNull();
+    expect(readTagList(HOSTILE)).toEqual([]);
+  });
+
+  it("changes exactly one line and leaves every other byte alone", () => {
+    const next = applied(HOSTILE, writeScalar(HOSTILE, "status", "draft"));
+    expect(next).toContain("\nstatus: draft\n");
+    expect(next.replace("\nstatus: draft\n", "\nstatus: stable\n")).toBe(
+      HOSTILE,
+    );
+    // The decoys are all still exactly where they were.
+    expect(next).toContain("# a note about status: not this one");
+    expect(next).toContain("  status: decoy inside a block scalar");
+    expect(next).toContain("  status: nested under an anchor");
+    expect(next).toContain("flow: { status: mapped, keep: true }");
+    expect(next).toContain("\nstatus: body decoy\n");
+  });
+});
+
+describe("an empty but present block", () => {
+  const EMPTY = "---\n---\n\n# Alpha\n";
+
+  it("takes a first scalar and a first tag list", () => {
+    expect(applied(EMPTY, writeScalar(EMPTY, "status", "draft"))).toBe(
+      "---\nstatus: draft\n---\n\n# Alpha\n",
+    );
+    expect(applied(EMPTY, writeTagList(EMPTY, ["eng"]))).toBe(
+      "---\ntags:\n  - eng\n---\n\n# Alpha\n",
+    );
+  });
+});
+
 describe("tag lists", () => {
   it("reads block and inline forms", () => {
     expect(readTagList(DOC)).toEqual(["eng", "deep"]);

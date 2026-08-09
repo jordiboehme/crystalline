@@ -12,7 +12,7 @@
 
 import { EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useState } from "react";
 import { afterEach, describe, expect, it } from "vitest";
@@ -102,6 +102,48 @@ describe("the frontmatter form", () => {
       screen.getByRole("button", { name: "Clear valid from" }),
     );
     expect(view.state.doc.toString()).not.toContain("valid_from");
+  });
+
+  it("keyboard-editing a date leaves its line where it is, never removing it", async () => {
+    render(<Live content={DOC} />);
+    await screen.findByLabelText("Engram source");
+    const view = liveView();
+    const lineOf = (text: string, key: string) =>
+      text.split("\n").findIndex((line) => line.startsWith(key));
+    const before = lineOf(view.state.sliceDoc(), "valid_from:");
+
+    // A date control reports every partly entered date as the empty string.
+    // That is somebody typing, not somebody asking for the bound to go.
+    fireEvent.change(screen.getByLabelText("Valid from"), {
+      target: { value: "" },
+    });
+    expect(view.state.sliceDoc()).toContain("valid_from: 2026-01-01");
+
+    fireEvent.change(screen.getByLabelText("Valid from"), {
+      target: { value: "2027-02-03" },
+    });
+    const after = view.state.sliceDoc();
+    // One value, on the line it was already on: no removal, no relocation to
+    // the bottom of the block, and no other byte touched.
+    expect(after).toBe(DOC.replace("2026-01-01", "2027-02-03"));
+    expect(lineOf(after, "valid_from:")).toBe(before);
+  });
+
+  it("setting an absent bound adds its line before the closing fence", async () => {
+    render(<Live content={DOC} />);
+    await screen.findByLabelText("Engram source");
+    const view = liveView();
+    fireEvent.change(screen.getByLabelText("Valid to"), {
+      target: { value: "2027-02-03" },
+    });
+    expect(view.state.sliceDoc()).toBe(
+      DOC.replace("---\n\nBody.", "valid_to: 2027-02-03\n---\n\nBody."),
+    );
+    // And the Clear control, the one removal path, takes it away again.
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Clear valid to" }),
+    );
+    expect(view.state.sliceDoc()).toBe(DOC);
   });
 
   it("adds and removes tags as a block list", async () => {
