@@ -26,7 +26,12 @@ import { NEIGHBORHOOD_DEPTH, fetchGraph, graphKey } from "../api/graph";
 import type { Vocabulary } from "../api/vocabulary";
 import { fetchVocabulary, fullVocabularyKey } from "../api/vocabulary";
 import type { SaveConflict } from "../api/writes";
-import { conflictOf, saveEngram } from "../api/writes";
+import {
+  conflictOf,
+  saveEngram,
+  validateDocument,
+  validateKey,
+} from "../api/writes";
 import { useAuth } from "../auth/AuthContext";
 import CmEditor from "../editor/CmEditor";
 import { ConflictDialog } from "../editor/ConflictDialog";
@@ -41,6 +46,7 @@ import {
   writeDraft,
 } from "../editor/drafts";
 import { fencePreviews } from "../editor/fencePreviews";
+import { FindingsPanel, jumpToLine } from "../editor/FindingsPanel";
 import { FrontmatterForm } from "../editor/FrontmatterForm";
 import { livePreview } from "../editor/preview";
 import {
@@ -70,6 +76,12 @@ const SAVE_EVENT = "crystalline:save";
 
 /** The buffer's accessible name - shared with the state a conflict rebuilds. */
 const ARIA_LABEL = "Engram source";
+
+/**
+ * How long a pause in typing waits before a dry-run validate fires - one
+ * request per pause, never one per keystroke. Exported for the tests.
+ */
+export const VALIDATE_DEBOUNCE_MS = 500;
 
 /**
  * Mod-S inside the buffer, as an extension fixed at module level.
@@ -347,6 +359,40 @@ function EditorSurface({ engram }: { engram: EngramDetail }) {
     });
   }, [resolver, resolverBox]);
 
+  // The dry run: a pause in typing, not every keystroke, is what fires it -
+  // `debouncedBuffer` only catches up with `buffer` once typing has paused
+  // for `VALIDATE_DEBOUNCE_MS`, and it is that settled value which becomes
+  // part of the query key, mirroring how the search screen debounces typed
+  // text into the value a query actually keys on.
+  const [debouncedBuffer, setDebouncedBuffer] = useState(buffer);
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setDebouncedBuffer(buffer);
+    }, VALIDATE_DEBOUNCE_MS);
+    return () => {
+      clearTimeout(timer);
+    };
+  }, [buffer]);
+  const validation = useQuery({
+    queryKey: validateKey(engram.domain, engram.path, debouncedBuffer),
+    queryFn: () =>
+      validateDocument({
+        content: debouncedBuffer,
+        domain: engram.domain,
+        ...(engram.path !== null ? { path: engram.path } : {}),
+      }),
+  });
+  // A transport failure never blocks writing - the save path has its own
+  // errors - so a failed dry run reads as "nothing to report" rather than as
+  // a hard error: `report` falls back to null, and `hardErrors` falls back
+  // to zero right behind it.
+  const report = validation.data ?? null;
+  const hardErrors = report?.errors ?? 0;
+  // True from the moment a keystroke outruns the last check that landed,
+  // not only while a request is actually in flight - a stale clean report
+  // never gets to look current while newer, unverified text sits above it.
+  const checking = validation.isFetching || buffer !== debouncedBuffer;
+
   const save = useMutation({
     // The token travels with the content rather than being read from
     // `checksum` inside the mutation: a conflict's overwrite moves the
@@ -384,7 +430,10 @@ function EditorSurface({ engram }: { engram: EngramDetail }) {
 
   const requestSave = () => {
     const view = viewRef.current;
-    if (view && !save.isPending) {
+    // Hard errors gate both paths a save can start from, the button and the
+    // keyboard, because both call this function rather than dispatching a
+    // mutation of their own: a check here is a check for either.
+    if (view && !save.isPending && hardErrors === 0) {
       setNotice(null);
       // `docText` rather than `doc.toString()`: what goes on the wire is the
       // file's own bytes, line endings included.
@@ -552,7 +601,7 @@ function EditorSurface({ engram }: { engram: EngramDetail }) {
           <button
             type="button"
             onClick={requestSave}
-            disabled={save.isPending}
+            disabled={save.isPending || hardErrors > 0}
             className="rounded border border-slate-300 px-3 py-1 text-sm hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:outline-none disabled:opacity-50 dark:border-slate-700 dark:hover:bg-slate-800"
           >
             Save
@@ -565,6 +614,12 @@ function EditorSurface({ engram }: { engram: EngramDetail }) {
           </Link>
         </div>
       </header>
+      {hardErrors > 0 && (
+        <p role="alert" className="text-sm text-red-800 dark:text-red-200">
+          {String(hardErrors)} hard {hardErrors === 1 ? "error" : "errors"}{" "}
+          block saving; see Findings.
+        </p>
+      )}
       {offeredDraft && (
         <aside
           role="note"
@@ -628,6 +683,16 @@ function EditorSurface({ engram }: { engram: EngramDetail }) {
             doc={buffer}
             view={view}
             vocabulary={vocabulary.data ?? null}
+          />
+          <FindingsPanel
+            report={report}
+            pending={checking}
+            onJump={(line) => {
+              const view = viewRef.current;
+              if (view) {
+                jumpToLine(view, line);
+              }
+            }}
           />
         </aside>
       </div>

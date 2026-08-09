@@ -256,6 +256,9 @@ describe("the engram editor", () => {
     });
     renderApp("/d/eng/edit/alpha");
     await screen.findByLabelText("Engram source");
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Save" })).toBeEnabled();
+    });
     await userEvent.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() => {
       expect(put).toHaveBeenCalled();
@@ -293,6 +296,9 @@ describe("the engram editor", () => {
     });
     renderApp("/d/eng/edit/alpha");
     await screen.findByLabelText("Engram source");
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Save" })).toBeEnabled();
+    });
     await userEvent.click(screen.getByRole("button", { name: "Save" }));
     // The header echoes the address the engram now answers at.
     expect(await screen.findByText("sharper-alpha")).toBeInTheDocument();
@@ -659,5 +665,28 @@ describe("the engram editor", () => {
     expect(putIfMatch(1)).toBe('"3f8a1c05e2"');
     expect(putBody(0)).toEqual({ content: CONTENT });
     expect(putBody(1)).toEqual({ content: CONTENT });
+  });
+
+  it("hard errors disable saving and rule warnings do not", async () => {
+    serveEditor({
+      "/validate": () => ({
+        errors: 1,
+        findings: [
+          {
+            rule: "E001",
+            severity: "error",
+            message: "frontmatter will not parse",
+            line: 1,
+            fix: null,
+          },
+        ],
+      }),
+    });
+    renderApp("/d/eng/edit/alpha");
+    await screen.findByLabelText("Engram source");
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
+    });
+    expect(screen.getByText(/block saving/i)).toBeInTheDocument();
   });
 });

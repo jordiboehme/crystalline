@@ -169,3 +169,17 @@ export async function validateDocument(
     body: JSON.stringify(body),
   });
 }
+
+/**
+ * The cache key of one dry run: the content decides the answer as much as
+ * the address does, so it is part of the key rather than a value the
+ * `queryFn` closes over - two different buffers must never share one
+ * cached report.
+ */
+export function validateKey(
+  domain: string,
+  path: string | null,
+  content: string,
+): readonly unknown[] {
+  return ["validate", domain, path, content];
+}
