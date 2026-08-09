@@ -74,15 +74,20 @@ export function EngramActions({ engram }: EngramActionsProps): ReactElement {
         type="button"
         className={BUTTON_CLASSES}
         onClick={() => {
-          const link = `${window.location.origin}${engramRoute(engram.domain, engram.permalink)}`;
-          void navigator.clipboard
-            .writeText(link)
-            .then(() => {
+          void (async () => {
+            try {
+              // `navigator.clipboard` is absent on an insecure or older
+              // context, and reading `.writeText` off it throws
+              // synchronously rather than rejecting a promise - the same
+              // reason CopyAddressButton wraps its call in try/catch rather
+              // than chaining `.then`/`.catch` off it directly.
+              const link = `${window.location.origin}${engramRoute(engram.domain, engram.permalink)}`;
+              await navigator.clipboard.writeText(link);
               setSaid("Link copied");
-            })
-            .catch(() => {
+            } catch {
               setSaid("Copy refused");
-            });
+            }
+          })();
         }}
       >
         Share link
@@ -99,6 +104,7 @@ export function EngramActions({ engram }: EngramActionsProps): ReactElement {
       <span
         role="status"
         aria-live="polite"
+        aria-label="Share link result"
         className="text-xs text-slate-500 dark:text-slate-400"
       >
         {said ?? ""}
