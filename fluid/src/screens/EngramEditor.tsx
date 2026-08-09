@@ -40,6 +40,7 @@ import {
   readDraft,
   writeDraft,
 } from "../editor/drafts";
+import { fencePreviews } from "../editor/fencePreviews";
 import { livePreview } from "../editor/preview";
 import {
   baseExtensions,
@@ -98,8 +99,10 @@ const saveKeymap = keymap.of([
  * layer added to only one of them would vanish on whichever path was missed.
  * Later layers are appended to this array and reach both at once.
  */
-function previewConfig(off: boolean): Extension {
-  return off ? [] : [livePreview(), wikilinkChips(), crystallineLines()];
+function previewConfig(off: boolean, dark: boolean): Extension {
+  return off
+    ? []
+    : [livePreview(), wikilinkChips(), crystallineLines(), fencePreviews(dark)];
 }
 
 /** Preview is on when the editor opens. */
@@ -156,7 +159,7 @@ function surfaceExtensions(options: SurfaceOptions): Extension[] {
     options.resolverBox.of(wikilinkResolverFacet.of(options.resolver)),
     // Every later flip goes through the compartment rather than through this
     // array, which is read once per state.
-    options.preview.of(previewConfig(options.raw)),
+    options.preview.of(previewConfig(options.raw, options.dark)),
   ];
 }
 
@@ -525,7 +528,9 @@ function EditorSurface({ engram }: { engram: EngramDetail }) {
               const next = !raw;
               setRaw(next);
               viewRef.current?.dispatch({
-                effects: preview.reconfigure(previewConfig(next)),
+                effects: preview.reconfigure(
+                  previewConfig(next, resolved === "dark"),
+                ),
               });
             }}
             className={
