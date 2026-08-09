@@ -45,9 +45,14 @@ export const NO_COMMANDS: readonly PaletteCommand[] = Object.freeze([]);
  */
 export type CommandScope = "screen" | "frame";
 
+/** One registered command, with the scope its owner registered under. */
+export interface RegisteredCommand extends PaletteCommand {
+  scope: CommandScope;
+}
+
 /** What the provider holds, and the two ways an owner changes it. */
 export interface Registry {
-  commands: PaletteCommand[];
+  commands: RegisteredCommand[];
   register: (
     owner: symbol,
     commands: readonly PaletteCommand[],
@@ -86,7 +91,13 @@ export function useRegisterCommands(
   }, [owner, commands, scope, register, unregister]);
 }
 
-/** What is currently registered, for the palette. */
-export function usePaletteCommands(): PaletteCommand[] {
+/**
+ * What is currently registered, for the palette.
+ *
+ * Scope rides along rather than being flattened away: the palette draws the
+ * screen's own actions and the frame's in two different places, and only the
+ * screen's may take the highlight the moment the palette opens.
+ */
+export function usePaletteCommands(): RegisteredCommand[] {
   return useRegistry().commands;
 }

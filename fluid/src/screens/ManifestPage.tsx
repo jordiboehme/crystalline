@@ -37,12 +37,14 @@ export default function ManifestPage() {
     queryFn: () => fetchManifestDetail(domain),
   });
 
-  // Behind the same gate as the Edit MANIFEST link this screen draws: a
+  // Behind both gates the Edit MANIFEST link this screen draws is behind: a
   // MANIFEST is the domain's own description, only an admin may rewrite it,
-  // and the palette offers no door that will not open.
+  // and a read that failed is nothing to edit - the screen shows an alert and
+  // no link there, so the palette offers no door that will not open either.
+  const loaded = detail.data;
   const commands = useMemo<readonly PaletteCommand[]>(
     () =>
-      capabilities.canAdminister
+      capabilities.canAdminister && loaded !== undefined
         ? [
             {
               id: "manifest-edit",
@@ -53,7 +55,7 @@ export default function ManifestPage() {
             },
           ]
         : NO_COMMANDS,
-    [capabilities.canAdminister, domain, navigate],
+    [capabilities.canAdminister, loaded, domain, navigate],
   );
   useRegisterCommands(commands);
 

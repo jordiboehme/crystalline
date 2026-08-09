@@ -13,6 +13,11 @@
  * the thing a reader most often opens the palette for is the thing in front of
  * them.
  *
+ * What the frame registers is the exception, and it goes last. A row that is
+ * identical on every screen is chrome rather than "what you are looking at",
+ * and putting it first would have made the app's least specific action the
+ * default Enter on the screens that offer nothing of their own.
+ *
  * Titles only, on purpose. A palette is for reaching something whose name you
  * half remember, and a body-text match dressed as a title would send a reader
  * somewhere they did not ask for. What that leaves out is the last row: a query
@@ -212,9 +217,15 @@ export function CommandPalette() {
   // are already in hand, and a reader holding shift is asking the same
   // question. Nothing typed matches everything, so an empty palette opens on
   // what this screen can do.
-  const matchingActions = actions.filter((command) =>
+  const matching = actions.filter((command) =>
     command.title.toLowerCase().includes(typed.toLowerCase()),
   );
+  // Split by who offered them: the screen's own lead the list, the frame's
+  // trail it. Only the first group can take the highlight below.
+  const matchingActions = matching.filter(
+    (command) => command.scope === "screen",
+  );
+  const frameActions = matching.filter((command) => command.scope === "frame");
 
   // The top row, in the order they are drawn in. Enter follows the highlight,
   // and the highlight is the top row until somebody moves it off: an answer
@@ -371,6 +382,29 @@ export function CommandPalette() {
                 titles and text
               </span>
             </Command.Item>
+          </Command.Group>
+        )}
+
+        {/*
+          Last, and never the highlight on an opening palette: these rows are
+          the same wherever a reader is, so they are the app rather than the
+          place, and the row Enter lands on should be about the place.
+        */}
+        {frameActions.length > 0 && (
+          <Command.Group heading={<Heading>App</Heading>}>
+            {frameActions.map((command) => (
+              <Command.Item
+                key={command.id}
+                value={actionValue(command.id)}
+                onSelect={() => {
+                  close();
+                  command.run();
+                }}
+                className={ROW_CLASSES}
+              >
+                <span className="truncate">{command.title}</span>
+              </Command.Item>
+            ))}
           </Command.Group>
         )}
 

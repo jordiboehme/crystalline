@@ -11,9 +11,9 @@
 
 import { screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { api } from "./api/client";
+import { ApiProblem, api } from "./api/client";
 import type { Role } from "./api/model";
 import {
   answersFor,
@@ -50,11 +50,15 @@ function detailResponse() {
 }
 
 /** Everything the engram screen and the editor behind it ask for. */
-function serveEngramAs(role: Role) {
+function serveEngramAs(
+  role: Role,
+  routes: Record<string, (path: string) => unknown> = {},
+) {
   apiMock.mockImplementation(
     answersFor({
       "/auth/me": () => meResponse({ user: userFixture({ role }) }),
       "/domains": domainsResponse,
+      "/activity": () => ({ timeframe: "7d", count: 0, engrams: [] }),
       "/domains/eng/tree": () => ({ folders: [], engrams: [] }),
       "/domains/eng/manifest": () => ({ markdown: "# eng\n" }),
       "/domains/eng/engrams/alpha": () => detailResponse(),
@@ -69,17 +73,22 @@ function serveEngramAs(role: Role) {
       "/graph": () => ({ nodes: [], edges: [], truncated: false }),
       "/vocabulary": () => ({ tags: [], types: [], statuses: [] }),
       "/validate": () => ({ findings: [], errors: 0 }),
+      ...routes,
     }),
   );
 }
 
 /** The common case: an editor, who may write. */
-function serveEngram() {
-  serveEngramAs("editor");
+function serveEngram(routes: Record<string, (path: string) => unknown> = {}) {
+  serveEngramAs("editor", routes);
 }
 
 beforeEach(() => {
   apiMock.mockReset();
+});
+
+afterEach(() => {
+  vi.restoreAllMocks();
 });
 
 describe("the palette's actions", () => {
@@ -148,6 +157,112 @@ describe("the palette's actions", () => {
     expect(
       await screen.findByRole("dialog", { name: /new engram/i }),
     ).toBeInTheDocument();
+  });
+
+  it("runs the very handler the button runs", async () => {
+    serveEngram();
+    // The utility three do not act themselves: they reach through a ref into
+    // the handlers `EngramActions` published. A ref that stopped being filled
+    // would turn all three into rows that quietly do nothing, and every
+    // assertion about the rows existing would still pass, so one of them is
+    // run end to end here.
+    const print = vi.spyOn(window, "print").mockImplementation(() => undefined);
+    const user = userEvent.setup();
+
+    renderApp("/d/eng/e/alpha");
+    await screen.findByRole("heading", { name: "Alpha" });
+    await user.keyboard("{Meta>}k{/Meta}");
+    await user.click(
+      await screen.findByRole("option", { name: /print this engram/i }),
+    );
+
+    expect(print).toHaveBeenCalledTimes(1);
+  });
+
+  it("shares through the same live region the button announces in", async () => {
+    serveEngram();
+    const user = userEvent.setup();
+    // After `setup()`, which installs a clipboard stub of its own, and defined
+    // rather than assigned because that stub is a getter-only property.
+    const write = vi.fn(() => Promise.resolve());
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText: write },
+    });
+
+    renderApp("/d/eng/e/alpha");
+    await screen.findByRole("heading", { name: "Alpha" });
+    await user.keyboard("{Meta>}k{/Meta}");
+    await user.click(
+      await screen.findByRole("option", { name: /share link to this engram/i }),
+    );
+
+    expect(write).toHaveBeenCalledWith(
+      expect.stringContaining("/d/eng/e/alpha"),
+    );
+    // The one live region, which is the whole reason the palette reaches for
+    // the button's handler instead of copying the three lines: a share that
+    // copied silently would be a share nobody could tell had happened.
+    expect(await screen.findByText("Link copied")).toBeInTheDocument();
+  });
+
+  it("offers no write on a domain that does not exist", async () => {
+    serveEngram({
+      "/domains/eng/tree": () => {
+        throw new ApiProblem(404, "not found", "no domain named eng");
+      },
+    });
+    const user = userEvent.setup();
+
+    renderApp("/d/eng");
+    await screen.findByRole("heading", { name: /domain not found/i });
+    await user.keyboard("{Meta>}k{/Meta}");
+    await screen.findByPlaceholderText(/jump to a domain/i);
+
+    // The screen draws no "New engram" button on this branch and mounts no
+    // dialog, so a palette row here would be a door that does not open.
+    expect(
+      screen.queryByRole("option", { name: /new engram/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("offers no MANIFEST edit on a read that failed", async () => {
+    // A refusal rather than a server error, so the query layer treats it as an
+    // answer and does not retry: what is under test is the registration, not
+    // how long a retry takes.
+    serveEngramAs("admin", {
+      "/domains/eng/manifest": () => {
+        throw new ApiProblem(403, "forbidden", "this instance refuses that");
+      },
+    });
+    const user = userEvent.setup();
+
+    renderApp("/d/eng/manifest");
+    await screen.findByRole("alert");
+    await user.keyboard("{Meta>}k{/Meta}");
+    await screen.findByPlaceholderText(/jump to a domain/i);
+
+    expect(
+      screen.queryByRole("option", { name: /edit manifest/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("leaves the first domain the default where a screen offers nothing", async () => {
+    serveEngram();
+    const user = userEvent.setup();
+
+    renderApp("/");
+    await screen.findByRole("heading", { name: "Home" });
+    await user.keyboard("{Meta>}k{/Meta}");
+
+    // The frame's own row is chrome, identical on every screen, so it never
+    // takes the top slot from the jumps: Cmd+K then Enter goes where it went
+    // before there were actions at all.
+    const domain = await screen.findByRole("option", { name: /eng/ });
+    expect(domain).toHaveAttribute("aria-selected", "true");
+    expect(
+      screen.getByRole("option", { name: /keyboard shortcuts/i }),
+    ).toHaveAttribute("aria-selected", "false");
   });
 
   it("highlights the screen's own action rather than the frame's", async () => {

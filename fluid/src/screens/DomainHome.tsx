@@ -74,12 +74,21 @@ export default function DomainHome() {
     queryFn: () => fetchTags(domain),
   });
 
-  // The one write this screen offers, on the palette under the same gate as
-  // the button. The dialog it opens picks its own folder from the URL, so the
-  // keyboard route lands exactly where the pointer route does.
+  // A domain nobody registered is a wrong address, not an empty shelf. The
+  // tree is what says so: a 404 from the manifest also means a domain that
+  // simply has not been introduced yet.
+  const unknownDomain = isMissing(tree.error);
+
+  // The one write this screen offers, on the palette under both of the gates
+  // the button is under: what this session may do, and whether this screen is
+  // showing a domain at all. The not-found branch below draws no button and
+  // mounts no dialog, so a row there would set a flag nothing reads.
+  //
+  // The dialog it opens picks its own folder from the URL, so the keyboard
+  // route lands exactly where the pointer route does.
   const commands = useMemo<readonly PaletteCommand[]>(
     () =>
-      capabilities.canWrite
+      capabilities.canWrite && !unknownDomain
         ? [
             {
               id: "create",
@@ -90,7 +99,7 @@ export default function DomainHome() {
             },
           ]
         : NO_COMMANDS,
-    [capabilities.canWrite],
+    [capabilities.canWrite, unknownDomain],
   );
   useRegisterCommands(commands);
 
@@ -116,10 +125,7 @@ export default function DomainHome() {
   /** The folder's own rows, once the tree has answered. */
   const folderRows = tree.data?.engrams;
 
-  // A domain nobody registered is a wrong address, not an empty shelf. The
-  // tree is what says so: a 404 from the manifest also means a domain that
-  // simply has not been introduced yet.
-  if (isMissing(tree.error)) {
+  if (unknownDomain) {
     return <DomainNotFound domain={domain} />;
   }
 

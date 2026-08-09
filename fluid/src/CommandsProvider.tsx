@@ -16,7 +16,11 @@ import type { ReactElement, ReactNode } from "react";
 import { useCallback, useMemo, useState } from "react";
 
 import { CommandsContext } from "./commands";
-import type { CommandScope, PaletteCommand } from "./commands";
+import type {
+  CommandScope,
+  PaletteCommand,
+  RegisteredCommand,
+} from "./commands";
 
 interface Entry {
   owner: symbol;
@@ -57,9 +61,14 @@ export function CommandsProvider({
   return <CommandsContext value={value}>{children}</CommandsContext>;
 }
 
-/** Everything one scope offers, in the order its owners registered. */
-function flatten(entries: Entry[], scope: CommandScope): PaletteCommand[] {
+/**
+ * Everything one scope offers, in the order its owners registered, each row
+ * carrying the scope it came from so the palette can draw the two apart.
+ */
+function flatten(entries: Entry[], scope: CommandScope): RegisteredCommand[] {
   return entries
     .filter((entry) => entry.scope === scope)
-    .flatMap((entry) => [...entry.commands]);
+    .flatMap((entry) =>
+      entry.commands.map((command) => ({ ...command, scope })),
+    );
 }
