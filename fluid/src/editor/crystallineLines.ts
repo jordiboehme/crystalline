@@ -7,6 +7,7 @@
  */
 
 import type { CompletionSource } from "@codemirror/autocomplete";
+import { syntaxTree } from "@codemirror/language";
 import type { Extension, Range } from "@codemirror/state";
 import type { DecorationSet, ViewUpdate } from "@codemirror/view";
 import { Decoration, EditorView, ViewPlugin } from "@codemirror/view";
@@ -14,19 +15,71 @@ import { Decoration, EditorView, ViewPlugin } from "@codemirror/view";
 import type { Vocabulary } from "../api/vocabulary";
 import { frontmatterRegion } from "./frontmatterRegion";
 
-export const OBSERVATION_LINE = /^-\s+\[([^\]\s][^\]]*)\]\s/;
-export const RELATION_LINE = /^-\s+([a-z][\w-]*)\s+\[\[/;
+// The literal "- " `top_level_bullet` strips (parse.rs) - not "-\s+": a tab
+// or a second space after the dash is a line the server's parser never reads
+// as a bullet at all, so marking it as one would be a UI claim the engine
+// does not honor.
+//
+// The relation type mirrors `parse_relation` (parse.rs): a quoted string
+// (any run of non-quote characters between a literal pair of `"`) or a bare
+// token of any non-whitespace characters, letter case included - the server
+// neither requires a lowercase start nor forbids one, so requiring it here
+// understated what a line can mean. `[` is excluded from the bare token only
+// to keep this regex's own greediness from eating into the `[[` delimiter;
+// the server's `content.find("[[")` has no such need because it searches
+// rather than matching greedily.
+export const OBSERVATION_LINE = /^- \[([^\]\s][^\]]*)\]\s/;
+export const RELATION_LINE = /^- ("[^"]*"|[^\s"[]+)\s*\[\[/;
 const TRAILING_TAG = /#[\w-]+/g;
+
+/**
+ * The subtrees a bullet is code inside rather than an observation or
+ * relation line in. Mirrors `wikilinkChips.ts`'s `codeRanges`: the server's
+ * `scan_body` skips a `body_lines` entry whose `in_fence` is set
+ * (parse.rs), and a line inside a fence is exactly what `FencedCode` (or an
+ * inline span) marks here. One pass over the outer tree rather than
+ * resolved per line, since a fenced block with a language mounts a nested
+ * tree and the block's own node is what has to be seen whether or not that
+ * inner parse has landed.
+ */
+const CODE_CONTEXTS = new Set([
+  "InlineCode",
+  "FencedCode",
+  "CodeBlock",
+  "CodeText",
+]);
+
+function codeRanges(
+  view: EditorView,
+  from: number,
+  to: number,
+): { from: number; to: number }[] {
+  const ranges: { from: number; to: number }[] = [];
+  syntaxTree(view.state).iterate({
+    from,
+    to,
+    enter: (node) => {
+      if (CODE_CONTEXTS.has(node.name)) {
+        ranges.push({ from: node.from, to: node.to });
+      }
+    },
+  });
+  return ranges;
+}
 
 function buildMarks(view: EditorView): DecorationSet {
   const marks: Range<Decoration>[] = [];
   const doc = view.state.doc;
   const fmEnd = frontmatterRegion(doc)?.to ?? -1;
   for (const { from, to } of view.visibleRanges) {
+    const code = codeRanges(view, from, to);
     let position = from;
     while (position <= to) {
       const line = doc.lineAt(position);
-      if (line.from > fmEnd) {
+      const inCode = code.some(
+        (range) => line.from >= range.from && line.from < range.to,
+      );
+      if (line.from > fmEnd && !inCode) {
         const observation = OBSERVATION_LINE.exec(line.text);
         if (observation) {
           const category = observation[1] ?? "";

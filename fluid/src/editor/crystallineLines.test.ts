@@ -47,6 +47,62 @@ describe("line affordances", () => {
   });
 });
 
+describe("grammar fidelity", () => {
+  it("draws nothing for an observation or relation line inside a fence", () => {
+    const doc =
+      "---\nt: x\n---\n\n- [decision] outside the fence #tag\n\n```\n- [decision] inside the fence #tag\n- relates_to [[Beta]]\n```\n";
+    const view = new EditorView({
+      doc,
+      selection: EditorSelection.cursor(0),
+      extensions: [...baseExtensions(false), crystallineLines()],
+      parent: document.body,
+    });
+    const categories = [...view.dom.querySelectorAll(".cm-obs-category")].map(
+      (el) => el.textContent,
+    );
+    expect(categories).toEqual(["[decision]"]);
+    expect(view.dom.querySelector(".cm-rel-type")).toBeNull();
+    // The fenced line's own tag is left alone too - it belongs to the whole
+    // skipped line, not to a reference somebody wrote about one.
+    expect(
+      [...view.dom.querySelectorAll(".cm-line-tag")].map(
+        (el) => el.textContent,
+      ),
+    ).toEqual(["#tag"]);
+    view.destroy();
+  });
+
+  it("does not draw for a bullet the server's literal '- ' prefix would reject", () => {
+    const doc =
+      "---\nt: x\n---\n\n-  [decision] two spaces\n-\t[decision] a tab\n-  relates_to [[Beta]]\n";
+    const view = new EditorView({
+      doc,
+      selection: EditorSelection.cursor(0),
+      extensions: [...baseExtensions(false), crystallineLines()],
+      parent: document.body,
+    });
+    expect(view.dom.querySelector(".cm-obs-category")).toBeNull();
+    expect(view.dom.querySelector(".cm-rel-type")).toBeNull();
+    view.destroy();
+  });
+
+  it("recognizes a quoted relation type and a mixed-case bare one", () => {
+    const doc =
+      '---\nt: x\n---\n\n- "relates to" [[Beta]]\n- SupersedesV2 [[Gamma]]\n';
+    const view = new EditorView({
+      doc,
+      selection: EditorSelection.cursor(0),
+      extensions: [...baseExtensions(false), crystallineLines()],
+      parent: document.body,
+    });
+    const relTypes = [...view.dom.querySelectorAll(".cm-rel-type")].map(
+      (el) => el.textContent,
+    );
+    expect(relTypes).toEqual(['"relates to"', "SupersedesV2"]);
+    view.destroy();
+  });
+});
+
 async function completionsAt(doc: string): Promise<string[] | null> {
   const state = EditorState.create({
     doc,
