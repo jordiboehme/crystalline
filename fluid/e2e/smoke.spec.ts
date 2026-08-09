@@ -165,3 +165,44 @@ test("the command palette opens on the keyboard and jumps", async ({
     page.getByRole("heading", { name: DOMAIN, level: 1 }),
   ).toBeVisible();
 });
+
+test("an engram is created, edited, saved and retired", async ({ page }) => {
+  await page
+    .locator("main")
+    .getByRole("link", { name: DOMAIN, exact: true })
+    .click();
+  await page.getByRole("button", { name: "New engram" }).click();
+  await page.getByLabel("Title").fill("Smoke Journey");
+  await page.getByRole("button", { name: "Create" }).click();
+
+  // Straight into the editor; the buffer opens on the minimal document.
+  const source = page.getByLabel("Engram source");
+  await expect(source).toBeVisible();
+  await source.click();
+  await page.keyboard.press("ControlOrMeta+End");
+  await page.keyboard.type("A smoke-written line.");
+
+  // A tag is a hard requirement (E004), and a freshly created engram carries
+  // none: the frontmatter form's own field is what clears it, the same way
+  // an author would.
+  const addTag = page.getByLabel("Add tag");
+  await addTag.fill("smoke");
+  await addTag.press("Enter");
+
+  // Save waits for the validation gate to clear, then lands.
+  const saveButton = page.getByRole("button", { name: "Save" });
+  await expect(saveButton).toBeEnabled();
+  await saveButton.click();
+  await expect(page.getByText("Saved")).toBeVisible();
+
+  // The read view shows what was written.
+  await page.getByRole("link", { name: "Done" }).click();
+  await expect(engramTitle(page)).toHaveText("Smoke Journey");
+  await expect(page.locator("article")).toContainText("A smoke-written line.");
+
+  // And the guided retirement fades it.
+  await page.getByRole("button", { name: "Retire" }).click();
+  await page.getByRole("radio", { name: "archived" }).click();
+  await page.getByRole("button", { name: "Retire engram" }).click();
+  await expect(page.getByRole("note")).toContainText(/archived/i);
+});
