@@ -25,8 +25,8 @@
  */
 
 import { useQuery } from "@tanstack/react-query";
-import { useEffect, useMemo, useState } from "react";
-import { Link, useParams } from "react-router";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { Link, useNavigate, useParams } from "react-router";
 
 import { ApiProblem, problemDetail } from "../api/client";
 import { DOMAINS_QUERY_KEY, fetchDomains } from "../api/domains";
@@ -44,9 +44,12 @@ import {
   graphKey,
 } from "../api/graph";
 import { useAuth } from "../auth/AuthContext";
+import { NO_COMMANDS, useRegisterCommands } from "../commands";
+import type { PaletteCommand } from "../commands";
 import { AgentsEye } from "../components/AgentsEye";
 import { BacklinksPanel } from "../components/BacklinksPanel";
 import { EngramActions } from "../components/EngramActions";
+import type { EngramActionHandlers } from "../components/EngramActions";
 import { FrontmatterPanel } from "../components/FrontmatterPanel";
 import { LifecycleBanner } from "../components/LifecycleBanner";
 import type { LifecycleLink } from "../components/LifecycleBanner";
@@ -73,8 +76,12 @@ export default function EngramPage() {
   // A permalink is a path of its own, so it arrives through the splat.
   const permalink = params["*"] ?? "";
   const { capabilities } = useAuth();
+  const navigate = useNavigate();
   const [retiring, setRetiring] = useState(false);
   const [moving, setMoving] = useState(false);
+  // The utility three, as `EngramActions` runs them: the palette rows below
+  // reach through this rather than repeating the clipboard and blob calls.
+  const utilities = useRef<EngramActionHandlers | null>(null);
 
   // The listing the sidebar already read, under the same key: opening the
   // move dialog's domain picker costs nothing on the wire.
@@ -100,6 +107,71 @@ export default function EngramPage() {
       detail.data ? buildWikilinkResolver(detail.data, graph.data) : undefined,
     [detail.data, graph.data],
   );
+
+  /*
+   * What this screen offers the palette: the same things its own buttons do,
+   * gated the same way. Built here rather than below the guards because a
+   * hook may not sit behind a return, and nothing is registered until there
+   * is an engram for the actions to act on.
+   */
+  const loaded = detail.data;
+  const commands = useMemo<readonly PaletteCommand[]>(() => {
+    if (!loaded) {
+      return NO_COMMANDS;
+    }
+    // The writes lead, because they are what somebody opens a palette to do
+    // that a link would not already have done for them.
+    const writes: PaletteCommand[] = capabilities.canWrite
+      ? [
+          {
+            id: "edit",
+            title: "Edit engram",
+            run: () => {
+              void navigate(editRoute(loaded.domain, loaded.permalink));
+            },
+          },
+          {
+            id: "retire",
+            title: "Retire engram",
+            run: () => {
+              setRetiring(true);
+            },
+          },
+          {
+            id: "move",
+            title: "Move engram",
+            run: () => {
+              setMoving(true);
+            },
+          },
+        ]
+      : [];
+    return [
+      ...writes,
+      {
+        id: "download",
+        title: "Download this engram as Markdown",
+        run: () => {
+          utilities.current?.download();
+        },
+      },
+      {
+        id: "share",
+        title: "Share link to this engram",
+        run: () => {
+          utilities.current?.share();
+        },
+      },
+      {
+        id: "print",
+        title: "Print this engram",
+        run: () => {
+          utilities.current?.print();
+        },
+      },
+    ];
+  }, [capabilities.canWrite, loaded, navigate]);
+  useRegisterCommands(commands);
 
   if (isMissing(detail.error)) {
     return <EngramNotFound domain={domain} permalink={permalink} />;
@@ -176,7 +248,7 @@ export default function EngramPage() {
                 </button>
               </>
             )}
-            <EngramActions engram={engram} />
+            <EngramActions engram={engram} handlers={utilities} />
           </span>
         </p>
       </header>

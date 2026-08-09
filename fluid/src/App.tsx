@@ -11,6 +11,7 @@
  * test mount the same tree on an in-memory history.
  */
 
+import { CommandsProvider } from "./CommandsProvider";
 import { AuthProvider } from "./auth/AuthProvider";
 import { VersionSkewToast } from "./components/VersionSkewToast";
 import { QueryProvider } from "./query/QueryProvider";
@@ -23,7 +24,15 @@ export default function App() {
       <ThemeProvider>
         <AuthProvider>
           <VersionSkewToast />
-          <AppRoutes />
+          {/*
+            Inside the auth provider, because what a screen registers depends
+            on what this session may do, and above the routes, because the
+            palette that lists the actions outlives the screen that offered
+            them.
+          */}
+          <CommandsProvider>
+            <AppRoutes />
+          </CommandsProvider>
         </AuthProvider>
       </ThemeProvider>
     </QueryProvider>

@@ -7,6 +7,12 @@
  * and engrams by title, which the server answers because only the index knows
  * what is in the other domains.
  *
+ * Above both sits what the screen behind the palette can do right now, which
+ * the screen itself registers (`commands.tsx`). It leads because it is the one
+ * group that does not leave: every row under it is a jump somewhere else, and
+ * the thing a reader most often opens the palette for is the thing in front of
+ * them.
+ *
  * Titles only, on purpose. A palette is for reaching something whose name you
  * half remember, and a body-text match dressed as a title would send a reader
  * somewhere they did not ask for. What that leaves out is the last row: a query
@@ -32,6 +38,7 @@ import {
   fetchSearch,
   titleMatchesKey,
 } from "../api/search";
+import { usePaletteCommands } from "../commands";
 import { RETIRED_CLASS, isRetired } from "../lifecycle";
 import { domainRoute, engramRoute, searchRoute } from "../paths";
 
@@ -74,8 +81,16 @@ function searchValue(term: string): string {
   return `search:${term}`;
 }
 
+function actionValue(id: string): string {
+  return `action:${id}`;
+}
+
 export function CommandPalette() {
   const navigate = useNavigate();
+  // What the screen behind the palette can do, which is why the palette is
+  // more than a way around: a write is reachable from the keyboard without
+  // ever finding the button that also runs it.
+  const actions = usePaletteCommands();
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   // What the last pause settled on, which is what the server was asked for.
@@ -193,20 +208,30 @@ export function CommandPalette() {
   // question nobody is asking any more.
   const hits =
     term === typed ? (titles.data?.hits ?? []).slice(0, PALETTE_HITS) : [];
+  // The actions, matched here for the same reason the domain names are: they
+  // are already in hand, and a reader holding shift is asking the same
+  // question. Nothing typed matches everything, so an empty palette opens on
+  // what this screen can do.
+  const matchingActions = actions.filter((command) =>
+    command.title.toLowerCase().includes(typed.toLowerCase()),
+  );
 
   // The top row, in the order they are drawn in. Enter follows the highlight,
   // and the highlight is the top row until somebody moves it off: an answer
   // landing above a highlighted row takes the highlight with it.
+  const firstAction = matchingActions[0];
   const firstDomain = domains[0];
   const firstHit = hits[0];
   const top =
-    firstDomain !== undefined
-      ? domainValue(firstDomain.name)
-      : firstHit !== undefined
-        ? engramValue(firstHit)
-        : typed === ""
-          ? ""
-          : searchValue(typed);
+    firstAction !== undefined
+      ? actionValue(firstAction.id)
+      : firstDomain !== undefined
+        ? domainValue(firstDomain.name)
+        : firstHit !== undefined
+          ? engramValue(firstHit)
+          : typed === ""
+            ? ""
+            : searchValue(typed);
   const highlighted = choice.top === top ? choice.value : top;
 
   /** Go, and get out of the way. */
@@ -248,6 +273,31 @@ export function CommandPalette() {
         label="Jump to"
         className="max-h-80 overflow-y-auto p-1.5 text-slate-900 dark:text-slate-100"
       >
+        {/*
+          First, above the jumps: what the reader is already looking at is
+          what they most likely opened the palette to act on, and everything
+          below this leaves the screen the actions belong to.
+        */}
+        {matchingActions.length > 0 && (
+          <Command.Group heading={<Heading>Actions</Heading>}>
+            {matchingActions.map((command) => (
+              <Command.Item
+                key={command.id}
+                value={actionValue(command.id)}
+                onSelect={() => {
+                  // Shut first, then act: an action that opens a dialog of its
+                  // own would otherwise open it behind this one.
+                  close();
+                  command.run();
+                }}
+                className={ROW_CLASSES}
+              >
+                <span className="truncate">{command.title}</span>
+              </Command.Item>
+            ))}
+          </Command.Group>
+        )}
+
         {domains.length > 0 && (
           <Command.Group heading={<Heading>Domains</Heading>}>
             {domains.map((domain) => (

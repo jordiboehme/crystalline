@@ -30,6 +30,8 @@ import {
 import { fetchTags, vocabularyKey } from "../api/vocabulary";
 import type { TagCount } from "../api/vocabulary";
 import { useAuth } from "../auth/AuthContext";
+import { NO_COMMANDS, useRegisterCommands } from "../commands";
+import type { PaletteCommand } from "../commands";
 import { CreateEngramDialog } from "../components/CreateEngramDialog";
 import { EngramList } from "../components/EngramList";
 import { FilterFields, TagChips } from "../components/FilterControls";
@@ -71,6 +73,26 @@ export default function DomainHome() {
     queryKey: vocabularyKey(domain),
     queryFn: () => fetchTags(domain),
   });
+
+  // The one write this screen offers, on the palette under the same gate as
+  // the button. The dialog it opens picks its own folder from the URL, so the
+  // keyboard route lands exactly where the pointer route does.
+  const commands = useMemo<readonly PaletteCommand[]>(
+    () =>
+      capabilities.canWrite
+        ? [
+            {
+              id: "create",
+              title: "New engram",
+              run: () => {
+                setCreating(true);
+              },
+            },
+          ]
+        : NO_COMMANDS,
+    [capabilities.canWrite],
+  );
+  useRegisterCommands(commands);
 
   /** Change the URL, which is the whole of this screen's state. */
   function apply(next: {

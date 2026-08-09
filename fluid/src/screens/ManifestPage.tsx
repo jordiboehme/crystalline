@@ -11,11 +11,14 @@
  */
 
 import { useQuery } from "@tanstack/react-query";
-import { Link, useParams } from "react-router";
+import { useMemo } from "react";
+import { Link, useNavigate, useParams } from "react-router";
 
 import { problemDetail } from "../api/client";
 import { fetchManifestDetail, manifestDetailKey } from "../api/domain";
 import { useAuth } from "../auth/AuthContext";
+import { NO_COMMANDS, useRegisterCommands } from "../commands";
+import type { PaletteCommand } from "../commands";
 import { Markdown } from "../components/Markdown";
 import { manifestEditRoute } from "../paths";
 
@@ -27,11 +30,32 @@ function prefetchEditor(): void {
 export default function ManifestPage() {
   const { domain = "" } = useParams();
   const { capabilities } = useAuth();
+  const navigate = useNavigate();
 
   const detail = useQuery({
     queryKey: manifestDetailKey(domain),
     queryFn: () => fetchManifestDetail(domain),
   });
+
+  // Behind the same gate as the Edit MANIFEST link this screen draws: a
+  // MANIFEST is the domain's own description, only an admin may rewrite it,
+  // and the palette offers no door that will not open.
+  const commands = useMemo<readonly PaletteCommand[]>(
+    () =>
+      capabilities.canAdminister
+        ? [
+            {
+              id: "manifest-edit",
+              title: "Edit MANIFEST",
+              run: () => {
+                void navigate(manifestEditRoute(domain));
+              },
+            },
+          ]
+        : NO_COMMANDS,
+    [capabilities.canAdminister, domain, navigate],
+  );
+  useRegisterCommands(commands);
 
   if (detail.error) {
     return (

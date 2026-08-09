@@ -12,10 +12,14 @@
  * Down to tablet width the frame is unchanged. Narrower than that the sidebar
  * folds behind a disclosure rather than shrinking into a column too narrow to
  * read, because a domain name that wraps three times is worse than one tap.
+ *
+ * The keyboard lives here too, because the frame is what every screen is drawn
+ * inside: the palette is mounted once, and so is the map of the keys that
+ * reach it, which "?" opens from anywhere no field has the focus.
  */
 
 import { useQuery } from "@tanstack/react-query";
-import { useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { DropdownMenu } from "radix-ui";
 import { Link, NavLink, Outlet, useMatch, useNavigate } from "react-router";
 
@@ -23,11 +27,14 @@ import { problemDetail } from "../api/client";
 import { DOMAINS_QUERY_KEY, fetchDomains } from "../api/domains";
 import type { DomainSummary } from "../api/domains";
 import { useAuth } from "../auth/AuthContext";
+import { useRegisterCommands } from "../commands";
+import type { PaletteCommand } from "../commands";
 import { domainRoute, searchRoute, usersRoute } from "../paths";
 import { useTheme } from "../theme/context";
 import type { ThemePreference } from "../theme/context";
 import { CommandPalette } from "./CommandPalette";
 import { DomainNav } from "./DomainNav";
+import { HelpOverlay } from "./HelpOverlay";
 import { ITEM_CLASSES, MENU_CLASSES } from "./menu";
 
 /**
@@ -42,6 +49,48 @@ const PALETTE_HINT = /Mac|iPhone|iPad/.test(navigator.userAgent)
 
 export function Layout() {
   const [navOpen, setNavOpen] = useState(false);
+  const [helpOpen, setHelpOpen] = useState(false);
+
+  // The one action that is offered on every screen, because the frame is on
+  // every screen: a reader who found the palette can find everything else
+  // from inside it. Registered as the frame's, so it sits under whatever the
+  // screen in front of the reader offers rather than above it.
+  const commands = useMemo<PaletteCommand[]>(
+    () => [
+      {
+        id: "help",
+        title: "Keyboard shortcuts",
+        run: () => {
+          setHelpOpen(true);
+        },
+      },
+    ],
+    [],
+  );
+  useRegisterCommands(commands, "frame");
+
+  useEffect(() => {
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key !== "?") {
+        return;
+      }
+      // Not while somebody is writing one. A bare key is only a shortcut
+      // where no field has the focus, which includes the editor's own
+      // contenteditable surface as much as it does a search box.
+      const target = event.target;
+      if (
+        target instanceof HTMLElement &&
+        target.closest("input, textarea, [contenteditable=true]") !== null
+      ) {
+        return;
+      }
+      setHelpOpen(true);
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, []);
 
   return (
     <div className="min-h-screen bg-white text-slate-900 dark:bg-slate-950 dark:text-slate-100">
@@ -62,6 +111,15 @@ export function Layout() {
         palette outlives the screen a jump leaves behind.
       */}
       <CommandPalette />
+      {/*
+        And the map of the keys that drive it, one press away from anywhere.
+      */}
+      <HelpOverlay
+        open={helpOpen}
+        onClose={() => {
+          setHelpOpen(false);
+        }}
+      />
     </div>
   );
 }
