@@ -13,11 +13,12 @@
 import { CompletionContext } from "@codemirror/autocomplete";
 import { EditorSelection, EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
+import { QueryClient } from "@tanstack/react-query";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { EngramRow } from "../api/engrams";
 import { singlePage } from "../api/engrams";
-import { fetchSearch } from "../api/search";
+import { fetchSearch, titleMatchesKey } from "../api/search";
 import type { WikilinkResolution } from "../wikilinks";
 import { baseExtensions, docText, lineSeparatorFor } from "./setup";
 import {
@@ -80,6 +81,20 @@ function stateOf(doc: string): EditorState {
   });
 }
 
+/** A completion source with a cache of its own, the way the screen builds it. */
+function completions(client = new QueryClient()) {
+  return wikilinkCompletions("eng", client);
+}
+
+/** Ask the source about `doc` with the cursor at `at`, the end by default. */
+function ask(
+  source: ReturnType<typeof completions>,
+  doc: string,
+  at = doc.length,
+) {
+  return source(new CompletionContext(stateOf(doc), at, false));
+}
+
 beforeEach(() => {
   searchMock.mockReset();
 });
@@ -135,6 +150,21 @@ describe("wikilink chips", () => {
     view.destroy();
   });
 
+  it("leaves brackets inside code alone and still draws the prose beside them", () => {
+    const view = editor(
+      () => ({ kind: "unresolved" }),
+      "Write `[[literal]]` for [[real]].\n\n```\n[[fenced]]\n```\n",
+    );
+    // The one reference on the page is the one written as prose.
+    const chips = view.dom.querySelectorAll(".cm-wikilink");
+    expect([...chips].map((chip) => chip.textContent)).toEqual(["real"]);
+    // What is inside code is the text somebody wrote about a wikilink, and it
+    // reads exactly as written - the same call the reader surface makes.
+    expect(view.contentDOM.textContent).toContain("[[literal]]");
+    expect(view.contentDOM.textContent).toContain("[[fenced]]");
+    view.destroy();
+  });
+
   it("decorates without touching the document, line endings included", () => {
     for (const doc of [DOC, DOC.replace(/\n/g, "\r\n")]) {
       const view = editor(() => ({ kind: "unresolved" }), doc);
@@ -159,7 +189,7 @@ describe("the [[ completion", () => {
     );
     const doc = "See [[Bet";
     const state = stateOf(doc);
-    const result = await wikilinkCompletions("eng")(
+    const result = await completions()(
       new CompletionContext(state, doc.length, false),
     );
     expect(result).not.toBeNull();
@@ -197,9 +227,7 @@ describe("the [[ completion", () => {
     const doc = "See [[Bet]] here";
     const at = doc.indexOf("]]");
     const state = stateOf(doc);
-    const result = await wikilinkCompletions("eng")(
-      new CompletionContext(state, at, false),
-    );
+    const result = await completions()(new CompletionContext(state, at, false));
     const beta = result?.options[0];
     const view = new EditorView({ state, parent: document.body });
     (beta?.apply as (v: EditorView, c: unknown, f: number, t: number) => void)(
@@ -215,19 +243,68 @@ describe("the [[ completion", () => {
   });
 
   it("asks for nothing on a bare [[ and stays quiet outside one", async () => {
-    const opened = await wikilinkCompletions("eng")(
-      new CompletionContext(stateOf("See [["), 6, false),
-    );
+    const source = completions();
+    const opened = await ask(source, "See [[");
     expect(opened?.options).toEqual([]);
     expect(searchMock).not.toHaveBeenCalled();
 
     for (const doc of ["See Bet", "See [[done]] and more"]) {
-      expect(
-        await wikilinkCompletions("eng")(
-          new CompletionContext(stateOf(doc), doc.length, false),
-        ),
-      ).toBeNull();
+      expect(await ask(source, doc)).toBeNull();
     }
     expect(searchMock).not.toHaveBeenCalled();
+  });
+
+  /**
+   * The refinement contract, tested on the source itself.
+   *
+   * CodeMirror's completion state machine cannot be driven honestly under
+   * jsdom - it debounces on timers, measures the popup and reads a live
+   * selection - so what is pinned here is the contract that machine acts on:
+   * the result carries no `validFor`, which is what makes it re-invoke the
+   * source on the next keystroke rather than filtering the first answer
+   * forever, and a re-invocation with a longer term really does ask again and
+   * really does return the narrower answer.
+   */
+  it("refines as the term grows, because no answer claims to cover the next keystroke", async () => {
+    searchMock.mockResolvedValueOnce(
+      singlePage([hit("eng", "runbook", "Runbook")]),
+    );
+    searchMock.mockResolvedValueOnce(
+      singlePage([hit("eng", "runbook-v2", "Runbook v2")]),
+    );
+    const source = completions();
+
+    const first = await ask(source, "See [[Run");
+    expect(first?.options.map((option) => option.label)).toEqual(["Runbook"]);
+    // Nothing in the answer tells CodeMirror it still holds for later text.
+    expect(first?.validFor).toBeUndefined();
+
+    const second = await ask(source, "See [[Runbook v");
+    expect(searchMock).toHaveBeenCalledTimes(2);
+    expect(searchMock).toHaveBeenLastCalledWith(
+      expect.objectContaining({ q: "Runbook v", mode: "title" }),
+      1,
+    );
+    // The narrower target the first answer never carried.
+    expect(second?.options.map((option) => option.label)).toEqual([
+      "Runbook v2",
+    ]);
+  });
+
+  it("asks the cache rather than the server for a term already looked up", async () => {
+    searchMock.mockResolvedValue(singlePage([hit("eng", "beta", "Beta Note")]));
+    const client = new QueryClient();
+    const source = completions(client);
+
+    // The same term twice - a backspace back onto it, say - and once on the
+    // wire, under the key the palette reads.
+    await ask(source, "See [[Bet");
+    await ask(source, "See [[Bet");
+    expect(searchMock).toHaveBeenCalledTimes(1);
+    expect(client.getQueryData(titleMatchesKey("Bet"))).toBeDefined();
+
+    // And two sources asking at once share the one request in flight.
+    await Promise.all([ask(source, "See [[Gam"), ask(source, "See [[Gam")]);
+    expect(searchMock).toHaveBeenCalledTimes(2);
   });
 });

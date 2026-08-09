@@ -17,8 +17,10 @@
  */
 
 import type { CompletionSource } from "@codemirror/autocomplete";
+import { syntaxTree } from "@codemirror/language";
 import type { Extension, Range } from "@codemirror/state";
 import { Facet } from "@codemirror/state";
+import type { QueryClient } from "@tanstack/react-query";
 import type { DecorationSet, ViewUpdate } from "@codemirror/view";
 import {
   Decoration,
@@ -27,7 +29,7 @@ import {
   WidgetType,
 } from "@codemirror/view";
 
-import { NO_SEARCH, fetchSearch } from "../api/search";
+import { NO_SEARCH, fetchSearch, titleMatchesKey } from "../api/search";
 import type { ReferenceState, WikilinkResolver } from "../wikilinks";
 import { WIKILINK, parseWikiTarget, referenceState } from "../wikilinks";
 import { frontmatterRegion } from "./frontmatterRegion";
@@ -81,6 +83,45 @@ class ChipWidget extends WidgetType {
   }
 }
 
+/**
+ * The subtrees a `[[...]]` is content rather than a reference in: code of
+ * either kind, where the brackets are what somebody wrote ABOUT a wikilink.
+ * The same call the reader surface makes, where `MarkdownBody` skips its
+ * `code` and `pre` elements, so a snippet reads as a snippet on both.
+ */
+const CODE_CONTEXTS = new Set([
+  "InlineCode",
+  "FencedCode",
+  "CodeBlock",
+  "CodeText",
+]);
+
+/**
+ * Where the parser says code sits inside `from`..`to`.
+ *
+ * Collected in one pass over the outer tree rather than resolved per match:
+ * a fenced block with a language mounts a whole nested tree, and the block's
+ * own node is the thing that has to be seen whether or not that inner parse
+ * has landed yet.
+ */
+function codeRanges(
+  view: EditorView,
+  from: number,
+  to: number,
+): { from: number; to: number }[] {
+  const ranges: { from: number; to: number }[] = [];
+  syntaxTree(view.state).iterate({
+    from,
+    to,
+    enter: (node) => {
+      if (CODE_CONTEXTS.has(node.name)) {
+        ranges.push({ from: node.from, to: node.to });
+      }
+    },
+  });
+  return ranges;
+}
+
 function buildChips(view: EditorView): DecorationSet {
   const resolve = view.state.facet(wikilinkResolverFacet);
   const doc = view.state.doc;
@@ -90,10 +131,15 @@ function buildChips(view: EditorView): DecorationSet {
   const chips: Range<Decoration>[] = [];
   for (const { from, to } of view.visibleRanges) {
     const text = doc.sliceString(from, to);
+    const code = codeRanges(view, from, to);
     for (const match of text.matchAll(WIKILINK)) {
       const start = from + match.index;
       const end = start + match[0].length;
       if (start <= fmEnd) {
+        continue;
+      }
+      // Inside code it is text about a wikilink rather than one.
+      if (code.some((range) => start >= range.from && start < range.to)) {
         continue;
       }
       // An atom a selection touches is text being edited, not a chip.
@@ -187,16 +233,37 @@ const COMPLETION_HITS = 10;
 /** The text between an opening `[[` and the cursor, with nothing closing it. */
 const OPEN_BRACKETS = /\[\[[^\][]*$/;
 
-/** What the offered list stays valid for while the typing continues. */
-const STILL_INSIDE = /^[^\][]*$/;
+/**
+ * How long an answer to one term is reused before it is asked again, in ms.
+ *
+ * The lookup is the palette's, under the palette's key, so a term either of
+ * them has already asked about is free for the other within this window.
+ */
+const TITLE_MATCH_FRESH_MS = 30_000;
 
 /**
  * The `[[` completion source, fed by title search across the domains.
  *
  * `currentDomain` is the engram's own: a hit from anywhere else is inserted
  * prefixed, because a bare title only resolves within the engram's domain.
+ *
+ * No `validFor` is returned, deliberately. A pattern that matched any
+ * bracket-free text would tell CodeMirror the first answer covers every later
+ * keystroke, and the list would keep offering the matches for `Be` while
+ * somebody typed `Beta Note` - the source would never be asked again. Without
+ * one, every keystroke re-asks, and three things keep that from becoming a
+ * request storm: CodeMirror waits out `activateOnTypingDelay` before starting
+ * a query, it never runs a second query for a source while one is still in
+ * flight (further keystrokes ride along on the running one and it restarts
+ * once, afterwards, if the answer no longer fits), and the fetch itself goes
+ * through the query cache, where an in-flight term is shared rather than
+ * refetched and a term asked again inside the freshness window is not asked
+ * at all.
  */
-export function wikilinkCompletions(currentDomain: string): CompletionSource {
+export function wikilinkCompletions(
+  currentDomain: string,
+  client: QueryClient,
+): CompletionSource {
   return async (context) => {
     const match = context.matchBefore(OPEN_BRACKETS);
     if (!match) {
@@ -207,14 +274,20 @@ export function wikilinkCompletions(currentDomain: string): CompletionSource {
     const from = match.from + 2;
     const term = context.state.sliceDoc(from, context.pos);
     if (term === "") {
-      // Opened on the bare `[[`: nothing to look up yet, but stay active so
-      // the first typed character asks.
-      return { from, options: [], validFor: STILL_INSIDE };
+      // Opened on the bare `[[`: nothing to look up yet, but an answer rather
+      // than nothing, so the session stays open for the first typed
+      // character to ask.
+      return { from, options: [] };
     }
-    const page = await fetchSearch({ ...NO_SEARCH, q: term, mode: "title" }, 1);
+    const page = await client.fetchQuery({
+      // The palette's own key: the two lookups are the same question, and one
+      // having asked it already spares the other the request.
+      queryKey: titleMatchesKey(term),
+      queryFn: () => fetchSearch({ ...NO_SEARCH, q: term, mode: "title" }, 1),
+      staleTime: TITLE_MATCH_FRESH_MS,
+    });
     return {
       from,
-      validFor: STILL_INSIDE,
       options: page.hits.slice(0, COMPLETION_HITS).map((hit) => {
         const foreign = hit.domain !== currentDomain;
         return {

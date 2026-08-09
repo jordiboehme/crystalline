@@ -14,6 +14,7 @@ import type { Extension } from "@codemirror/state";
 import { Compartment, EditorState } from "@codemirror/state";
 import type { EditorView } from "@codemirror/view";
 import { keymap } from "@codemirror/view";
+import type { QueryClient } from "@tanstack/react-query";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router";
@@ -105,6 +106,8 @@ const NO_RESOLUTION: WikilinkResolver = () => null;
 interface SurfaceOptions {
   /** The text the buffer opens with, whose line endings it inherits. */
   content: string;
+  /** The cache the completion's title lookup goes through. */
+  client: QueryClient;
   dark: boolean;
   /** The engram's own domain, which decides what a completion prefixes. */
   domain: string;
@@ -131,7 +134,9 @@ function surfaceExtensions(options: SurfaceOptions): Extension[] {
     saveKeymap,
     // Typing help rather than preview, so it stays on in raw mode: outside
     // the compartment the Raw toggle empties.
-    autocompletion({ override: [wikilinkCompletions(options.domain)] }),
+    autocompletion({
+      override: [wikilinkCompletions(options.domain, options.client)],
+    }),
     options.resolverBox.of(wikilinkResolverFacet.of(options.resolver)),
     // Every later flip goes through the compartment rather than through this
     // array, which is read once per state.
@@ -394,6 +399,7 @@ function EditorSurface({ engram }: { engram: EngramDetail }) {
     () =>
       surfaceExtensions({
         content: engram.content,
+        client: queryClient,
         dark: resolved === "dark",
         domain: engram.domain,
         preview,
@@ -406,7 +412,14 @@ function EditorSurface({ engram }: { engram: EngramDetail }) {
     // Read once: `CmEditor` snapshots the extensions at mount, so a later
     // theme change reaches the buffer through a remount rather than through
     // this array.
-    [engram.content, engram.domain, resolved, preview, resolverBox],
+    [
+      engram.content,
+      engram.domain,
+      queryClient,
+      resolved,
+      preview,
+      resolverBox,
+    ],
   );
 
   /**
@@ -417,6 +430,7 @@ function EditorSurface({ engram }: { engram: EngramDetail }) {
   const extensionsFor = (content: string) =>
     surfaceExtensions({
       content,
+      client: queryClient,
       dark: resolved === "dark",
       domain: engram.domain,
       preview,
