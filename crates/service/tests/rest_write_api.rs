@@ -662,6 +662,12 @@ async fn a_read_only_instance_refuses_before_the_precondition_check() {
     })
     .await;
     let editor = login(fx.addr, "eddy", "eddypw").await;
+    // The manifest route now requires admin (spec section 5: MANIFEST editing
+    // is a domain-management, admin-only screen), so its own probe below
+    // needs a caller that clears that gate - an editor would 403 there
+    // regardless of read_only, which would not exercise the ordering this
+    // test is actually about.
+    let admin = login(fx.addr, "root", "rootpw").await;
 
     let no_if_match = as_session(
         fx.addr,
@@ -690,7 +696,7 @@ async fn a_read_only_instance_refuses_before_the_precondition_check() {
         fx.addr,
         reqwest::Method::PUT,
         "/api/v1/domains/eng/manifest",
-        &editor,
+        &admin,
     )
     .json(&serde_json::json!({"markdown": "---\ntitle: hijack\n---\n"}))
     .send()
@@ -840,6 +846,10 @@ async fn retire_move_and_delete_run_through_their_endpoints() {
 async fn the_manifest_reads_with_an_etag_and_saves_under_if_match() {
     let fx = serve(Options::default()).await;
     let editor = login(fx.addr, "eddy", "eddypw").await;
+    // Manifest saves are admin, not editor (spec section 5: MANIFEST editing
+    // is a domain-management screen); reads stay open to any account, so the
+    // GET below still goes through the editor session.
+    let admin = login(fx.addr, "root", "rootpw").await;
 
     let read = as_session(
         fx.addr,
@@ -864,12 +874,31 @@ async fn the_manifest_reads_with_an_etag_and_saves_under_if_match() {
     );
     let markdown = body["markdown"].as_str().unwrap().to_string();
 
+    // An editor clears every other precondition here but not the role gate:
+    // refused before the If-Match check ever runs, which is why this carries
+    // no header at all.
+    let editor_refused = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/eng/manifest",
+        &editor,
+    )
+    .json(&serde_json::json!({"markdown": markdown}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(
+        editor_refused.status(),
+        403,
+        "an editor is not enough to save the MANIFEST"
+    );
+
     // No header: 428. Stale: 412 with the current manifest. Fresh: 200.
     let missing = as_session(
         fx.addr,
         reqwest::Method::PUT,
         "/api/v1/domains/eng/manifest",
-        &editor,
+        &admin,
     )
     .json(&serde_json::json!({"markdown": markdown}))
     .send()
@@ -885,7 +914,7 @@ async fn the_manifest_reads_with_an_etag_and_saves_under_if_match() {
         fx.addr,
         reqwest::Method::PUT,
         "/api/v1/domains/eng/manifest",
-        &editor,
+        &admin,
     )
     .header("if-match", format!("\"{etag}\""))
     .json(&serde_json::json!({"markdown": edited}))
@@ -904,7 +933,7 @@ async fn the_manifest_reads_with_an_etag_and_saves_under_if_match() {
         fx.addr,
         reqwest::Method::PUT,
         "/api/v1/domains/eng/manifest",
-        &editor,
+        &admin,
     )
     .header("if-match", format!("\"{etag}\""))
     .json(&serde_json::json!({"markdown": "---\ntitle: hijack\n---\n"}))
@@ -970,6 +999,11 @@ async fn serve_with_a_virtual_domain() -> Fixture {
     auth.add_user("eddy", "Eddy", None, Role::Editor, "eddypw")
         .await
         .unwrap();
+    // The manifest save below needs admin (spec section 5): domain
+    // management, MANIFEST editing included, is held to that role.
+    auth.add_user("root", "Root", None, Role::Admin, "rootpw")
+        .await
+        .unwrap();
 
     let router = http_router(engine, Arc::new(AtomicUsize::new(0)), &[], auth.clone()).unwrap();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -995,6 +1029,8 @@ async fn serve_with_a_virtual_domain() -> Fixture {
 async fn the_manifest_round_trip_holds_for_a_virtual_domain() {
     let fx = serve_with_a_virtual_domain().await;
     let editor = login(fx.addr, "eddy", "eddypw").await;
+    // Reads stay open to any account; the save below is admin-only.
+    let admin = login(fx.addr, "root", "rootpw").await;
 
     let read = as_session(
         fx.addr,
@@ -1027,7 +1063,7 @@ async fn the_manifest_round_trip_holds_for_a_virtual_domain() {
         fx.addr,
         reqwest::Method::PUT,
         "/api/v1/domains/docs/manifest",
-        &editor,
+        &admin,
     )
     .header("if-match", format!("\"{etag}\""))
     .json(&serde_json::json!({"markdown": edited}))
@@ -1416,7 +1452,10 @@ fn write_ops() -> Vec<WriteOp> {
             method: Method::PUT,
             path: "/api/v1/domains/eng/manifest",
             body: Some(serde_json::json!({"markdown": "x"})),
-            admin_only: false,
+            // Domain management, not content editing (spec section 5:
+            // MANIFEST editing sits among the admin-only domain screens,
+            // alongside creating and unregistering a domain).
+            admin_only: true,
         },
         WriteOp {
             method: Method::POST,

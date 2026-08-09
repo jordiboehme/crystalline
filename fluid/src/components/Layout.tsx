@@ -309,6 +309,12 @@ function DomainSidebar({ open }: { open: boolean }) {
     : rest.startsWith("edit/")
       ? rest.slice(5)
       : "";
+  // The MANIFEST page and its editor both live outside the splat's engram
+  // shapes above - `manifest` is its own reserved segment (`routes.tsx`),
+  // never a permalink the splat would otherwise swallow - so this is the
+  // you-are-here cue the pinned tree row needs, the same thing `permalink`
+  // already gives the ordinary rows.
+  const onManifest = rest === "manifest" || rest.startsWith("manifest/");
 
   return (
     <nav
@@ -334,6 +340,7 @@ function DomainSidebar({ open }: { open: boolean }) {
           <DomainNav
             domain={domain}
             permalink={permalink}
+            onManifest={onManifest}
             domains={listing.data?.domains ?? []}
           />
         </>

@@ -46,11 +46,18 @@ export interface DomainNavProps {
    * own home screen, where there is none.
    */
   permalink: string;
+  /** Whether the MANIFEST page or its editor is the screen open right now. */
+  onManifest: boolean;
   /** Every registered domain, for the switcher. */
   domains: DomainSummary[];
 }
 
-export function DomainNav({ domain, permalink, domains }: DomainNavProps) {
+export function DomainNav({
+  domain,
+  permalink,
+  onManifest,
+  domains,
+}: DomainNavProps) {
   const { capabilities } = useAuth();
   const [creating, setCreating] = useState(false);
 
@@ -69,11 +76,16 @@ export function DomainNav({ domain, permalink, domains }: DomainNavProps) {
         Pinned ahead of the tree and styled apart from it - a dashed border
         and mono caps rather than the engram rows' plain text - because a
         MANIFEST is not an engram: it is what introduces the domain, not
-        something filed inside it.
+        something filed inside it. The you-are-here cue is `EngramLink`'s own
+        mechanism, `aria-current` plus a highlight class, so a reader on
+        either page gets the same signal regardless of which row it marks.
       */}
       <Link
         to={manifestRoute(domain)}
-        className="mx-2 block truncate rounded border border-dashed border-slate-300 px-2 py-1 font-mono text-xs tracking-wide uppercase hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800"
+        aria-current={onManifest ? "page" : undefined}
+        className={`mx-2 block truncate rounded border border-dashed border-slate-300 px-2 py-1 font-mono text-xs tracking-wide uppercase hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800 ${
+          onManifest ? "bg-slate-100 font-medium dark:bg-slate-800" : ""
+        }`}
       >
         MANIFEST
       </Link>

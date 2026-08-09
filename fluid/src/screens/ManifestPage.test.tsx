@@ -116,6 +116,8 @@ describe("the MANIFEST", () => {
     renderApp("/d/eng/e/alpha");
     const nav = await screen.findByRole("link", { name: "MANIFEST" });
     expect(nav).toHaveAttribute("href", "/d/eng/manifest");
+    // Not the current screen here - an engram page is open, not the manifest.
+    expect(nav).not.toHaveAttribute("aria-current");
   });
 
   it("the manifest page renders the markdown and offers Edit to an admin only", async () => {
@@ -130,6 +132,11 @@ describe("the MANIFEST", () => {
     expect(
       screen.getByRole("link", { name: "Edit MANIFEST" }),
     ).toBeInTheDocument();
+    // The pinned row marks itself current the same way an engram row does.
+    expect(screen.getByRole("link", { name: "MANIFEST" })).toHaveAttribute(
+      "aria-current",
+      "page",
+    );
   });
 
   it("no Edit below admin", async () => {

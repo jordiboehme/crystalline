@@ -252,6 +252,12 @@ pub struct SaveManifestBody {
 /// `PUT /domains/{domain}/manifest` - save a domain's MANIFEST markdown
 /// verbatim, guarded by the `If-Match` token of the version being replaced.
 ///
+/// Admin, not editor: the spec's domain-management section (slice 3, section
+/// 5) places MANIFEST editing among the admin-only domain screens, alongside
+/// creating and unregistering a domain - a MANIFEST is what routes an agent
+/// into a domain rather than a document inside it, and the Fluid UI gates its
+/// own Edit affordance on `canAdminister` to match.
+///
 /// The same three answers `engrams::save` is held to, because the guard is
 /// the same contract: 428 with no `If-Match`, 412 with a stale one (carrying
 /// the version the server holds now, so a client can merge), 200 with the new
@@ -310,7 +316,7 @@ pub struct SaveManifestBody {
         ),
         (
             status = 403,
-            description = "The caller is not an editor, the request did not \
+            description = "The caller is not an admin, the request did not \
                            echo its CSRF token, this instance is read-only, or \
                            the trusted-header identity names a disabled \
                            account. A read-only instance answers this ahead of \
@@ -369,7 +375,9 @@ pub async fn save_manifest(
     ApiPath(domain): ApiPath<String>,
     ApiJson(body): ApiJson<SaveManifestBody>,
 ) -> Result<Response, ApiError> {
-    identity.require_editor()?;
+    // Admin, not editor: see this function's doc comment for why domain
+    // management, MANIFEST editing included, is held to the stronger role.
+    identity.require_admin()?;
     // Before the If-Match parse, not after: the same reasoning as
     // `engrams::save`'s own read-only check, repeated here rather than
     // shared, since the handlers are not yet worth abstracting over.

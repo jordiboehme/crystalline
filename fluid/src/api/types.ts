@@ -1938,7 +1938,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
-            /** @description The caller is not an editor, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. A read-only instance answers this ahead of the precondition check, so it is never 428. */
+            /** @description The caller is not an admin, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. A read-only instance answers this ahead of the precondition check, so it is never 428. */
             403: {
                 headers: {
                     [name: string]: unknown;
