@@ -179,6 +179,47 @@ describe("wikilink chips", () => {
   });
 });
 
+/** Ask with the markdown language mounted, so the syntax tree is real. */
+function askInParsed(doc: string, at: number) {
+  const state = EditorState.create({
+    doc,
+    selection: EditorSelection.cursor(at),
+    extensions: [...lineSeparatorFor(doc), ...baseExtensions(false)],
+  });
+  return completions()(new CompletionContext(state, at, false));
+}
+
+describe("the [[ completion stays out of code and frontmatter", () => {
+  it("offers nothing inside a fenced code block", async () => {
+    const doc = "```\n[[Bet\n```\n";
+    expect(await askInParsed(doc, doc.indexOf("Bet") + 3)).toBeNull();
+    expect(searchMock).not.toHaveBeenCalled();
+  });
+
+  it("offers nothing inside inline code", async () => {
+    const doc = "a `[[Bet` span";
+    expect(await askInParsed(doc, doc.indexOf("Bet") + 3)).toBeNull();
+    expect(searchMock).not.toHaveBeenCalled();
+  });
+
+  it("offers nothing inside the frontmatter block", async () => {
+    const doc = "---\nsee: [[Bet\n---\n\nprose\n";
+    expect(await askInParsed(doc, doc.indexOf("Bet") + 3)).toBeNull();
+    expect(searchMock).not.toHaveBeenCalled();
+  });
+
+  it("still answers in prose with the syntax tree mounted", async () => {
+    searchMock.mockResolvedValueOnce(
+      singlePage([hit("eng", "beta", "Beta Note")]),
+    );
+    const doc = "---\nt: x\n---\n\nSee [[Bet";
+    const result = await askInParsed(doc, doc.length);
+    expect(result?.options.map((option) => option.label)).toEqual([
+      "Beta Note",
+    ]);
+  });
+});
+
 describe("the [[ completion", () => {
   it("offers title matches, domain-prefixed when the hit lives elsewhere", async () => {
     searchMock.mockResolvedValueOnce(

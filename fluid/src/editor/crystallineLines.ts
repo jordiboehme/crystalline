@@ -14,6 +14,7 @@ import { Decoration, EditorView, ViewPlugin } from "@codemirror/view";
 
 import type { Vocabulary } from "../api/vocabulary";
 import { frontmatterRegion } from "./frontmatterRegion";
+import { CODE_CONTEXTS, inCompletableProse } from "./prose";
 
 // The literal "- " `top_level_bullet` strips (parse.rs) - not "-\s+": a tab
 // or a second space after the dash is a line the server's parser never reads
@@ -33,22 +34,14 @@ export const RELATION_LINE = /^- ("[^"]*"|[^\s"[]+)\s*\[\[/;
 const TRAILING_TAG = /#[\w-]+/g;
 
 /**
- * The subtrees a bullet is code inside rather than an observation or
- * relation line in. Mirrors `wikilinkChips.ts`'s `codeRanges`: the server's
- * `scan_body` skips a `body_lines` entry whose `in_fence` is set
- * (parse.rs), and a line inside a fence is exactly what `FencedCode` (or an
- * inline span) marks here. One pass over the outer tree rather than
- * resolved per line, since a fenced block with a language mounts a nested
- * tree and the block's own node is what has to be seen whether or not that
- * inner parse has landed.
+ * Where a bullet is code rather than an observation or relation line.
+ * Mirrors `wikilinkChips.ts`'s `codeRanges`: the server's `scan_body` skips
+ * a `body_lines` entry whose `in_fence` is set (parse.rs), and a line
+ * inside a fence is exactly what a `CODE_CONTEXTS` node marks here. One
+ * pass over the outer tree rather than resolved per line, since a fenced
+ * block with a language mounts a nested tree and the block's own node is
+ * what has to be seen whether or not that inner parse has landed.
  */
-const CODE_CONTEXTS = new Set([
-  "InlineCode",
-  "FencedCode",
-  "CodeBlock",
-  "CodeText",
-]);
-
 function codeRanges(
   view: EditorView,
   from: number,
@@ -172,6 +165,9 @@ export function crystallineCompletions(
   vocab: () => Vocabulary | null,
 ): CompletionSource {
   return (context) => {
+    if (!inCompletableProse(context.state, context.pos)) {
+      return null;
+    }
     const words = vocab();
     if (!words) {
       return null;

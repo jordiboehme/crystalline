@@ -122,3 +122,44 @@ describe("vocabulary completion", () => {
     expect(await completionsAt("plain prose")).toBeNull();
   });
 });
+
+/** Ask with the markdown language mounted, so the syntax tree is real. */
+async function completionsInParsed(
+  doc: string,
+  at: number,
+): Promise<string[] | null> {
+  const state = EditorState.create({
+    doc,
+    selection: EditorSelection.cursor(at),
+    extensions: baseExtensions(false),
+  });
+  const result = await crystallineCompletions(() => VOCAB)(
+    new CompletionContext(state, at, false),
+  );
+  return result?.options.map((option) => option.label) ?? null;
+}
+
+describe("completion stays out of code and frontmatter", () => {
+  it("offers nothing for a YAML bullet inside a fenced code block", async () => {
+    const doc = "```yaml\n- rel\n```\n";
+    expect(await completionsInParsed(doc, doc.indexOf("rel") + 3)).toBeNull();
+  });
+
+  it("offers nothing for a comment tag inside a fenced code block", async () => {
+    const doc = "```sh\n# ar\n```\n";
+    expect(await completionsInParsed(doc, doc.indexOf("ar") + 2)).toBeNull();
+  });
+
+  it("offers nothing for a bullet inside the frontmatter block", async () => {
+    const doc = "---\ntags:\n- e\n---\n\nprose\n";
+    expect(await completionsInParsed(doc, doc.indexOf("- e") + 3)).toBeNull();
+  });
+
+  it("still completes a relation line in prose below the frontmatter", async () => {
+    const doc = "---\nt: x\n---\n\n- rel";
+    expect(await completionsInParsed(doc, doc.length)).toEqual([
+      "relates_to",
+      "supersedes",
+    ]);
+  });
+});

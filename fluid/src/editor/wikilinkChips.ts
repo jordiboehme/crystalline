@@ -33,6 +33,7 @@ import { NO_SEARCH, fetchSearch, titleMatchesKey } from "../api/search";
 import type { ReferenceState, WikilinkResolver } from "../wikilinks";
 import { WIKILINK, parseWikiTarget, referenceState } from "../wikilinks";
 import { frontmatterRegion } from "./frontmatterRegion";
+import { CODE_CONTEXTS, inCompletableProse } from "./prose";
 
 /**
  * The one resolver this editor session answers reference questions with.
@@ -84,20 +85,11 @@ class ChipWidget extends WidgetType {
 }
 
 /**
- * The subtrees a `[[...]]` is content rather than a reference in: code of
- * either kind, where the brackets are what somebody wrote ABOUT a wikilink.
- * The same call the reader surface makes, where `MarkdownBody` skips its
- * `code` and `pre` elements, so a snippet reads as a snippet on both.
- */
-const CODE_CONTEXTS = new Set([
-  "InlineCode",
-  "FencedCode",
-  "CodeBlock",
-  "CodeText",
-]);
-
-/**
- * Where the parser says code sits inside `from`..`to`.
+ * Where the parser says code sits inside `from`..`to` - the subtrees a
+ * `[[...]]` is content rather than a reference in, where the brackets are
+ * what somebody wrote ABOUT a wikilink. The same call the reader surface
+ * makes, where `MarkdownBody` skips its `code` and `pre` elements, so a
+ * snippet reads as a snippet on both.
  *
  * Collected in one pass over the outer tree rather than resolved per match:
  * a fenced block with a language mounts a whole nested tree, and the block's
@@ -265,6 +257,9 @@ export function wikilinkCompletions(
   client: QueryClient,
 ): CompletionSource {
   return async (context) => {
+    if (!inCompletableProse(context.state, context.pos)) {
+      return null;
+    }
     const match = context.matchBefore(OPEN_BRACKETS);
     if (!match) {
       return null;
