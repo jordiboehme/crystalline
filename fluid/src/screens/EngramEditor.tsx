@@ -9,6 +9,7 @@
  * editing a page that now 404s.
  */
 
+import { autocompletion } from "@codemirror/autocomplete";
 import type { Extension } from "@codemirror/state";
 import { Compartment, EditorState } from "@codemirror/state";
 import type { EditorView } from "@codemirror/view";
@@ -20,6 +21,7 @@ import { Link, useNavigate, useParams } from "react-router";
 import { problemDetail } from "../api/client";
 import type { EngramDetail } from "../api/engram";
 import { engramDetailKey, fetchEngramDetail } from "../api/engram";
+import { NEIGHBORHOOD_DEPTH, fetchGraph, graphKey } from "../api/graph";
 import type { SaveConflict } from "../api/writes";
 import { conflictOf, saveEngram } from "../api/writes";
 import { useAuth } from "../auth/AuthContext";
@@ -38,8 +40,15 @@ import {
   docText,
   lineSeparatorFor,
 } from "../editor/setup";
+import {
+  wikilinkChips,
+  wikilinkCompletions,
+  wikilinkResolverFacet,
+} from "../editor/wikilinkChips";
 import { editRoute, engramRoute } from "../paths";
 import { useTheme } from "../theme/context";
+import type { WikilinkResolver } from "../wikilinks";
+import { buildWikilinkResolver } from "../wikilinks";
 import NotFound from "./NotFound";
 
 interface Notice {
@@ -77,17 +86,58 @@ const saveKeymap = keymap.of([
 /**
  * What the preview compartment holds, in the one place it is ever spelled.
  *
- * Three sites configure that compartment - the mount extensions, the Raw
- * toggle and the buffer rebuild in `replaceBuffer` - and a decoration layer
- * added to only two of them would vanish on whichever path was missed. Later
- * layers are appended to this array and reach all three at once.
+ * Two sites configure that compartment - `surfaceExtensions`, which every
+ * state this screen builds goes through, and the Raw toggle - and a decoration
+ * layer added to only one of them would vanish on whichever path was missed.
+ * Later layers are appended to this array and reach both at once.
  */
 function previewConfig(off: boolean): Extension {
-  return off ? [] : livePreview();
+  return off ? [] : [livePreview(), wikilinkChips()];
 }
 
 /** Preview is on when the editor opens. */
 const RAW_AT_MOUNT = false;
+
+/** What a reference resolves to before the two requests behind it land. */
+const NO_RESOLUTION: WikilinkResolver = () => null;
+
+/** Everything one buffer on this screen is built from. */
+interface SurfaceOptions {
+  /** The text the buffer opens with, whose line endings it inherits. */
+  content: string;
+  dark: boolean;
+  /** The engram's own domain, which decides what a completion prefixes. */
+  domain: string;
+  /** The layer switch the Raw toggle reconfigures. */
+  preview: Compartment;
+  raw: boolean;
+  /** The resolver's own switch, reconfigured when the graph lands. */
+  resolverBox: Compartment;
+  resolver: WikilinkResolver;
+}
+
+/**
+ * The whole extension set of one buffer, in the one place it is ever spelled.
+ *
+ * Two sites build a state for this screen - the mount and the wholesale
+ * rebuild in `replaceBuffer` - and `setState` replaces the configuration
+ * entirely, so anything listed in only one of them silently disappears the
+ * first time a swap rebuilds the buffer.
+ */
+function surfaceExtensions(options: SurfaceOptions): Extension[] {
+  return [
+    ...lineSeparatorFor(options.content),
+    ...baseExtensions(options.dark),
+    saveKeymap,
+    // Typing help rather than preview, so it stays on in raw mode: outside
+    // the compartment the Raw toggle empties.
+    autocompletion({ override: [wikilinkCompletions(options.domain)] }),
+    options.resolverBox.of(wikilinkResolverFacet.of(options.resolver)),
+    // Every later flip goes through the compartment rather than through this
+    // array, which is read once per state.
+    options.preview.of(previewConfig(options.raw)),
+  ];
+}
 
 /**
  * Replace the whole buffer with `content`, preserving whichever line ending
@@ -111,16 +161,18 @@ const RAW_AT_MOUNT = false;
  * `onDocChanged` is called directly afterward so the caller's buffer state
  * reflects the swap right away.
  *
- * `preview` travels in because `setState` replaces the whole configuration:
- * the decoration compartment has to be rebuilt into the new state at whatever
- * setting the toggle is currently on, or a separator-changing swap would
- * silently drop live preview and leave the toggle lying about it.
+ * `extensionsFor` travels in because `setState` replaces the whole
+ * configuration: every layer has to be rebuilt into the new state as it
+ * stands right now - the decoration compartment at whatever setting the
+ * toggle is on, the resolver at whatever the graph has answered - or a
+ * separator-changing swap would silently drop them and leave the toggle lying
+ * about it. It takes the content because a rebuilt state's line separator
+ * comes from the text being swapped in, not from the one being replaced.
  */
 function replaceBuffer(
   view: EditorView,
   content: string,
-  dark: boolean,
-  preview: Extension,
+  extensionsFor: (content: string) => Extension[],
   onDocChanged: (doc: string) => void,
 ): void {
   const mountedSeparator = view.state.facet(EditorState.lineSeparator) ?? "\n";
@@ -132,17 +184,7 @@ function replaceBuffer(
     return;
   }
   view.setState(
-    buildEditorState(
-      content,
-      [
-        ...lineSeparatorFor(content),
-        ...baseExtensions(dark),
-        saveKeymap,
-        preview,
-      ],
-      ARIA_LABEL,
-      onDocChanged,
-    ),
+    buildEditorState(content, extensionsFor(content), ARIA_LABEL, onDocChanged),
   );
   onDocChanged(content);
 }
@@ -211,6 +253,13 @@ function EditorSurface({ engram }: { engram: EngramDetail }) {
    * never set again.
    */
   const [preview] = useState(() => new Compartment());
+  /**
+   * The resolver's own switch. It is not part of the preview compartment
+   * because it is not a layer: it is the answer the chips inside that layer
+   * ask for, and it arrives once the neighborhood request lands rather than
+   * at mount.
+   */
+  const [resolverBox] = useState(() => new Compartment());
   const [raw, setRaw] = useState(RAW_AT_MOUNT);
   // What the server holds, moved forward on every successful save.
   const [checksum, setChecksum] = useState(engram.checksum ?? "");
@@ -226,6 +275,24 @@ function EditorSurface({ engram }: { engram: EngramDetail }) {
     const stored = readDraft(account, engram.domain, engram.permalink);
     return stored !== null && stored.content !== engram.content ? stored : null;
   });
+
+  // The same pair the engram page reads, under the same cache keys: an author
+  // who arrived from that page pays nothing on the wire for the chips.
+  const graph = useQuery({
+    queryKey: graphKey(engram.domain, engram.permalink, NEIGHBORHOOD_DEPTH),
+    queryFn: () => fetchGraph(engram.domain, engram.permalink),
+  });
+  const resolver = useMemo(
+    () => buildWikilinkResolver(engram, graph.data),
+    [engram, graph.data],
+  );
+  // The resolver reaches the buffer through its compartment rather than
+  // through a remount: the chips redraw, the text and the history stay.
+  useEffect(() => {
+    viewRef.current?.dispatch({
+      effects: resolverBox.reconfigure(wikilinkResolverFacet.of(resolver)),
+    });
+  }, [resolver, resolverBox]);
 
   const save = useMutation({
     // The token travels with the content rather than being read from
@@ -324,19 +391,39 @@ function EditorSurface({ engram }: { engram: EngramDetail }) {
   }, [dirty]);
 
   const extensions = useMemo(
-    () => [
-      ...lineSeparatorFor(engram.content),
-      ...baseExtensions(resolved === "dark"),
-      saveKeymap,
-      // Every later flip goes through the compartment rather than through
-      // this array, which is read once at mount.
-      preview.of(previewConfig(RAW_AT_MOUNT)),
-    ],
+    () =>
+      surfaceExtensions({
+        content: engram.content,
+        dark: resolved === "dark",
+        domain: engram.domain,
+        preview,
+        raw: RAW_AT_MOUNT,
+        resolverBox,
+        // The graph has not landed at mount; the compartment above carries
+        // the real resolver in as soon as it does.
+        resolver: NO_RESOLUTION,
+      }),
     // Read once: `CmEditor` snapshots the extensions at mount, so a later
     // theme change reaches the buffer through a remount rather than through
     // this array.
-    [engram.content, resolved, preview],
+    [engram.content, engram.domain, resolved, preview, resolverBox],
   );
+
+  /**
+   * The extensions a buffer swapped in mid-session is rebuilt with: this
+   * render's resolver, this render's Raw setting, and the incoming text's own
+   * line separator.
+   */
+  const extensionsFor = (content: string) =>
+    surfaceExtensions({
+      content,
+      dark: resolved === "dark",
+      domain: engram.domain,
+      preview,
+      raw,
+      resolverBox,
+      resolver,
+    });
 
   return (
     <div className="flex flex-col gap-4">
@@ -423,8 +510,7 @@ function EditorSurface({ engram }: { engram: EngramDetail }) {
                 replaceBuffer(
                   view,
                   offeredDraft.content,
-                  resolved === "dark",
-                  preview.of(previewConfig(raw)),
+                  extensionsFor,
                   setBuffer,
                 );
               }
@@ -491,8 +577,7 @@ function EditorSurface({ engram }: { engram: EngramDetail }) {
               replaceBuffer(
                 view,
                 conflict.currentContent,
-                resolved === "dark",
-                preview.of(previewConfig(raw)),
+                extensionsFor,
                 setBuffer,
               );
             }

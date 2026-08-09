@@ -50,6 +50,32 @@ function detailResponse(overrides: Record<string, unknown> = {}) {
   };
 }
 
+/** The neighborhood, which is what says where a resolved wikilink landed. */
+function graphResponse() {
+  return {
+    nodes: [
+      {
+        id: 1,
+        domain: "eng",
+        permalink: "alpha",
+        title: "Alpha",
+        status: "stable",
+        type: "engram",
+      },
+      {
+        id: 2,
+        domain: "eng",
+        permalink: "beta",
+        title: "Beta",
+        status: "stable",
+        type: "engram",
+      },
+    ],
+    edges: [{ from: 1, to: 2, rel_type: "links_to" }],
+    truncated: false,
+  };
+}
+
 function serveEditor(
   routes: Record<string, (path: string, init?: RequestInit) => unknown> = {},
 ) {
@@ -58,6 +84,9 @@ function serveEditor(
       "/auth/me": () => meResponse({ user: userFixture() }),
       "/domains": domainsResponse,
       "/domains/eng/engrams/alpha": () => detailResponse(),
+      // The editor asks for the neighborhood too: it is what turns a
+      // reference the index resolved into somewhere the chip can point.
+      "/graph": () => graphResponse(),
       "/validate": () => ({ findings: [], errors: 0 }),
       ...routes,
     }),
@@ -133,6 +162,47 @@ describe("the engram editor", () => {
     await userEvent.click(screen.getByRole("button", { name: "Save" }));
     await screen.findByText("Saved");
     expect(putBody(0)).toEqual({ content: CONTENT });
+  });
+
+  it("draws a resolved wikilink as a chip and hands the brackets back raw", async () => {
+    const linked = CONTENT.replace("A rule.", "A rule about [[Beta]].");
+    serveEditor({
+      "/domains/eng/engrams/alpha": () =>
+        detailResponse({
+          content: linked,
+          links: [
+            {
+              line: 9,
+              resolved: true,
+              target: { domain: null, target: "Beta" },
+            },
+          ],
+        }),
+    });
+    renderApp("/d/eng/edit/alpha");
+    const editor = await screen.findByLabelText("Engram source");
+    // The completion is installed on the buffer whatever the toggle says.
+    expect(editor).toHaveAttribute("aria-autocomplete", "list");
+    // The chip appears once the neighborhood lands, which is what turns the
+    // resolved reference into a place.
+    await waitFor(() => {
+      expect(editor.querySelector(".cm-wikilink-resolved")?.textContent).toBe(
+        "Beta",
+      );
+    });
+    expect(editor.textContent).not.toContain("[[Beta]]");
+
+    // Raw is the file as written, brackets included.
+    await userEvent.click(screen.getByRole("button", { name: "Raw" }));
+    await waitFor(() => {
+      expect(screen.getByLabelText("Engram source").textContent).toContain(
+        "[[Beta]]",
+      );
+    });
+    // And nothing the chips did was an edit.
+    await userEvent.click(screen.getByRole("button", { name: "Save" }));
+    await screen.findByText("Saved");
+    expect(putBody(0)).toEqual({ content: linked });
   });
 
   it("is not offered to a viewer", async () => {
