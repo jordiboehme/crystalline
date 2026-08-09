@@ -29,6 +29,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Link, useParams } from "react-router";
 
 import { ApiProblem, problemDetail } from "../api/client";
+import { DOMAINS_QUERY_KEY, fetchDomains } from "../api/domains";
 import type {
   EngramDetail,
   EngramObservation,
@@ -49,8 +50,10 @@ import { FrontmatterPanel } from "../components/FrontmatterPanel";
 import { LifecycleBanner } from "../components/LifecycleBanner";
 import type { LifecycleLink } from "../components/LifecycleBanner";
 import { Markdown } from "../components/Markdown";
+import { MoveDialog } from "../components/MoveDialog";
 import { NeighborhoodGraph } from "../components/NeighborhoodGraph";
 import { ReferenceLink } from "../components/ReferenceLink";
+import { RetireDialog } from "../components/RetireDialog";
 import { domainRoute, editRoute, engramRoute, graphRoute } from "../paths";
 import type { WikilinkResolver } from "../wikilinks";
 import { buildWikilinkResolver, innerOf, referenceState } from "../wikilinks";
@@ -69,6 +72,15 @@ export default function EngramPage() {
   // A permalink is a path of its own, so it arrives through the splat.
   const permalink = params["*"] ?? "";
   const { capabilities } = useAuth();
+  const [retiring, setRetiring] = useState(false);
+  const [moving, setMoving] = useState(false);
+
+  // The listing the sidebar already read, under the same key: opening the
+  // move dialog's domain picker costs nothing on the wire.
+  const domains = useQuery({
+    queryKey: DOMAINS_QUERY_KEY,
+    queryFn: fetchDomains,
+  });
 
   const detail = useQuery({
     queryKey: engramDetailKey(domain, permalink),
@@ -127,14 +139,34 @@ export default function EngramPage() {
           <span className="font-mono text-xs">{engram.permalink}</span>
           <CopyAddressButton address={engram.url} />
           {capabilities.canWrite && (
-            <Link
-              to={editRoute(engram.domain, engram.permalink)}
-              onPointerEnter={prefetchEditor}
-              onFocus={prefetchEditor}
-              className="rounded border border-slate-300 px-2 py-0.5 text-xs hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800"
-            >
-              Edit
-            </Link>
+            <>
+              <Link
+                to={editRoute(engram.domain, engram.permalink)}
+                onPointerEnter={prefetchEditor}
+                onFocus={prefetchEditor}
+                className="rounded border border-slate-300 px-2 py-0.5 text-xs hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800"
+              >
+                Edit
+              </Link>
+              <button
+                type="button"
+                onClick={() => {
+                  setRetiring(true);
+                }}
+                className="rounded border border-slate-300 px-2 py-0.5 text-xs hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800"
+              >
+                Retire
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setMoving(true);
+                }}
+                className="rounded border border-slate-300 px-2 py-0.5 text-xs hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800"
+              >
+                Move
+              </button>
+            </>
           )}
         </p>
       </header>
@@ -187,6 +219,24 @@ export default function EngramPage() {
           />
         </aside>
       </div>
+      {retiring && (
+        <RetireDialog
+          engram={engram}
+          backlinks={backlinks}
+          onClose={() => {
+            setRetiring(false);
+          }}
+        />
+      )}
+      {moving && (
+        <MoveDialog
+          engram={engram}
+          domains={(domains.data?.domains ?? []).map((entry) => entry.name)}
+          onClose={() => {
+            setMoving(false);
+          }}
+        />
+      )}
     </div>
   );
 }

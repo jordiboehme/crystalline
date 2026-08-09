@@ -392,7 +392,10 @@ describe("the engram page", () => {
     // apart from the same word used as the engram's type.
     expect(screen.getByText("[decision]")).toBeVisible();
     expect(screen.getByText("#tag")).toBeVisible();
-    expect(screen.getByText("superseded_by")).toBeVisible();
+    // Scoped to the Relations panel: the same relation type also opens the
+    // markdown bullet it was declared in, further up the page.
+    const relations = screen.getByRole("region", { name: "Relations" });
+    expect(within(relations).getByText("superseded_by")).toBeVisible();
   });
 
   it("copies the engram's crystalline address", async () => {
