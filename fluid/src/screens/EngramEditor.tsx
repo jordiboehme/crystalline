@@ -16,18 +16,24 @@ import type { EditorView } from "@codemirror/view";
 import { keymap } from "@codemirror/view";
 import type { QueryClient } from "@tanstack/react-query";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router";
 
 import { problemDetail } from "../api/client";
 import type { EngramDetail } from "../api/engram";
 import { engramDetailKey, fetchEngramDetail } from "../api/engram";
 import { NEIGHBORHOOD_DEPTH, fetchGraph, graphKey } from "../api/graph";
+import type { Vocabulary } from "../api/vocabulary";
+import { fetchVocabulary, fullVocabularyKey } from "../api/vocabulary";
 import type { SaveConflict } from "../api/writes";
 import { conflictOf, saveEngram } from "../api/writes";
 import { useAuth } from "../auth/AuthContext";
 import CmEditor from "../editor/CmEditor";
 import { ConflictDialog } from "../editor/ConflictDialog";
+import {
+  crystallineCompletions,
+  crystallineLines,
+} from "../editor/crystallineLines";
 import {
   clearDraft,
   DRAFT_DEBOUNCE_MS,
@@ -93,7 +99,7 @@ const saveKeymap = keymap.of([
  * Later layers are appended to this array and reach both at once.
  */
 function previewConfig(off: boolean): Extension {
-  return off ? [] : [livePreview(), wikilinkChips()];
+  return off ? [] : [livePreview(), wikilinkChips(), crystallineLines()];
 }
 
 /** Preview is on when the editor opens. */
@@ -117,6 +123,13 @@ interface SurfaceOptions {
   /** The resolver's own switch, reconfigured when the graph lands. */
   resolverBox: Compartment;
   resolver: WikilinkResolver;
+  /**
+   * The domain's vocabulary, read fresh on every completion rather than
+   * closed over: the fetch behind it lands after the buffer mounts, and a
+   * plain value captured here would go on answering `null` forever once it
+   * did.
+   */
+  vocab: () => Vocabulary | null;
 }
 
 /**
@@ -135,7 +148,10 @@ function surfaceExtensions(options: SurfaceOptions): Extension[] {
     // Typing help rather than preview, so it stays on in raw mode: outside
     // the compartment the Raw toggle empties.
     autocompletion({
-      override: [wikilinkCompletions(options.domain, options.client)],
+      override: [
+        wikilinkCompletions(options.domain, options.client),
+        crystallineCompletions(options.vocab),
+      ],
     }),
     options.resolverBox.of(wikilinkResolverFacet.of(options.resolver)),
     // Every later flip goes through the compartment rather than through this
@@ -291,6 +307,27 @@ function EditorSurface({ engram }: { engram: EngramDetail }) {
     () => buildWikilinkResolver(engram, graph.data),
     [engram, graph.data],
   );
+  // `fullVocabularyKey` rather than `vocabularyKey`: `DomainHome` caches
+  // `fetchTags` under the latter, a different shape, and the two landing on
+  // one key would mean whichever query resolved second overwrote the other
+  // with data it cannot parse.
+  const vocabulary = useQuery({
+    queryKey: fullVocabularyKey(engram.domain),
+    queryFn: () => fetchVocabulary(engram.domain),
+  });
+  // A ref, not state: `crystallineCompletions` reads this getter fresh on
+  // every completion request rather than once at mount, so the vocabulary
+  // fetch - which lands after the buffer is already on screen - reaches
+  // completions offered later in the session instead of only the ones asked
+  // for after this particular render. Written from an effect rather than
+  // inline during render, and read through a `useCallback`-stable getter
+  // rather than a closure built at each call site: a ref may not be written
+  // or handed to a render-time call while React is still rendering.
+  const vocabRef = useRef<Vocabulary | null>(null);
+  useEffect(() => {
+    vocabRef.current = vocabulary.data ?? null;
+  }, [vocabulary.data]);
+  const readVocab = useCallback(() => vocabRef.current, []);
   // The resolver reaches the buffer through its compartment rather than
   // through a remount: the chips redraw, the text and the history stay.
   useEffect(() => {
@@ -397,6 +434,12 @@ function EditorSurface({ engram }: { engram: EngramDetail }) {
 
   const extensions = useMemo(
     () =>
+      // `readVocab` only ever hands `vocabRef` to `crystallineCompletions`,
+      // which stores it in a `CompletionSource` closure CodeMirror calls later
+      // from typing, not here: nothing on this call stack reads `.current`
+      // during this render, but the checker cannot see through the
+      // `autocompletion` and `crystallineCompletions` calls to confirm that.
+      // eslint-disable-next-line react-hooks/refs
       surfaceExtensions({
         content: engram.content,
         client: queryClient,
@@ -408,6 +451,7 @@ function EditorSurface({ engram }: { engram: EngramDetail }) {
         // The graph has not landed at mount; the compartment above carries
         // the real resolver in as soon as it does.
         resolver: NO_RESOLUTION,
+        vocab: readVocab,
       }),
     // Read once: `CmEditor` snapshots the extensions at mount, so a later
     // theme change reaches the buffer through a remount rather than through
@@ -419,6 +463,7 @@ function EditorSurface({ engram }: { engram: EngramDetail }) {
       resolved,
       preview,
       resolverBox,
+      readVocab,
     ],
   );
 
@@ -437,6 +482,7 @@ function EditorSurface({ engram }: { engram: EngramDetail }) {
       raw,
       resolverBox,
       resolver,
+      vocab: readVocab,
     });
 
   return (

@@ -44,6 +44,19 @@ export function vocabularyKey(domain: string | null): readonly unknown[] {
   return ["vocabulary", domain];
 }
 
+/**
+ * The cache key of one domain's whole vocabulary payload - tags, categories
+ * and relation types together.
+ *
+ * A key of its own rather than `vocabularyKey`: `DomainHome` already caches
+ * `fetchTags` under that key, and the two payloads are different shapes at
+ * the same key would mean whichever query landed second overwrote the first
+ * with data the other reader cannot parse.
+ */
+export function fullVocabularyKey(domain: string | null): readonly unknown[] {
+  return ["vocabulary-full", domain];
+}
+
 /** Fetch the tags in use in one domain, or in every domain for `null`. */
 export async function fetchTags(domain: string | null): Promise<TagCount[]> {
   const path =
