@@ -23,6 +23,7 @@ import { problemDetail } from "../api/client";
 import type { EngramDetail } from "../api/engram";
 import { engramDetailKey, fetchEngramDetail } from "../api/engram";
 import { NEIGHBORHOOD_DEPTH, fetchGraph, graphKey } from "../api/graph";
+import type { ValidateResponse } from "../api/model";
 import type { Vocabulary } from "../api/vocabulary";
 import { fetchVocabulary, fullVocabularyKey } from "../api/vocabulary";
 import type { SaveConflict } from "../api/writes";
@@ -382,16 +383,65 @@ function EditorSurface({ engram }: { engram: EngramDetail }) {
         ...(engram.path !== null ? { path: engram.path } : {}),
       }),
   });
+  // The server does not re-check these rule families on save, so the gate
+  // below is the only enforcement there is - it must never blink open just
+  // because a fresh keystroke changed the query key and `validation.data`
+  // has nothing for the new key yet. `lastLanded` tracks the most recent
+  // verdict that actually arrived, independently of whichever key is
+  // currently in flight, and `report` falls back to it whenever the live
+  // query has nothing of its own.
+  //
+  // Tracked beside the query with a plain `useState`, updated during render
+  // rather than through `placeholderData: keepPreviousData` - react query's
+  // own answer to this exact problem - for two reasons: that import lives in
+  // a module this screen's lazy route already shares with several
+  // eagerly-loaded ones, and pulling in one more named export from it grew
+  // the ENTRY bundle by a few dozen bytes even though the code that calls it
+  // never leaves the lazy chunk; and updating it from a `useEffect` (the
+  // first shape this took) is exactly the "adjust state when a prop
+  // changes" case React's own docs say to do in the render body instead -
+  // an effect-scheduled update here would let one extra render slip through
+  // on the old, wrong verdict before the effect ever ran.
+  // `seen` is what makes that safe: comparing against the previous render's
+  // own `validation.data`/`isError` is what stops this from setting state on
+  // every render forever, the same guard the docs' own example keeps.
+  const [lastLanded, setLastLanded] = useState<ValidateResponse | null>(null);
+  const [seen, setSeen] = useState({
+    data: validation.data,
+    isError: validation.isError,
+  });
+  if (validation.data !== seen.data || validation.isError !== seen.isError) {
+    setSeen({ data: validation.data, isError: validation.isError });
+    if (validation.data !== undefined) {
+      setLastLanded(validation.data);
+    } else if (validation.isError) {
+      // A settled failure, not a still-in-flight revalidation: nothing
+      // kept-previous survives a genuine refusal, so a transport failure
+      // reopens the gate exactly as it always has - see the comment on
+      // `report` below.
+      setLastLanded(null);
+    }
+  }
   // A transport failure never blocks writing - the save path has its own
   // errors - so a failed dry run reads as "nothing to report" rather than as
-  // a hard error: `report` falls back to null, and `hardErrors` falls back
-  // to zero right behind it.
-  const report = validation.data ?? null;
+  // a hard error: `report` falls back to null (through `lastLanded`, cleared
+  // above), and `hardErrors` falls back to zero right behind it. This is why
+  // a settled failure is allowed to drop the gate while a still-pending
+  // revalidation, held by `lastLanded` not yet being cleared, is not.
+  const report = validation.data ?? lastLanded;
   const hardErrors = report?.errors ?? 0;
   // True from the moment a keystroke outruns the last check that landed,
   // not only while a request is actually in flight - a stale clean report
   // never gets to look current while newer, unverified text sits above it.
   const checking = validation.isFetching || buffer !== debouncedBuffer;
+  // The dry run failed outright and there is nothing kept-previous to show
+  // for it - a refused or unreachable `/validate`, not an ordinary pause in
+  // typing. Distinct from "Checking" so the panel never promises a verdict
+  // is still coming when it plainly is not; saves stay allowed regardless,
+  // since `hardErrors` is already 0 whenever there is no report to read one
+  // from.
+  const validationUnavailable =
+    report === null && validation.isError && !checking;
 
   const save = useMutation({
     // The token travels with the content rather than being read from
@@ -687,6 +737,7 @@ function EditorSurface({ engram }: { engram: EngramDetail }) {
           <FindingsPanel
             report={report}
             pending={checking}
+            unavailable={validationUnavailable}
             onJump={(line) => {
               const view = viewRef.current;
               if (view) {

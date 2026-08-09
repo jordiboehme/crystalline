@@ -37,6 +37,15 @@ export interface FindingsPanelProps {
   /** null = nothing run yet. */
   report: ValidateResponse | null;
   pending: boolean;
+  /**
+   * The dry run failed outright and there is no kept-previous report to show
+   * instead - a refused or unreachable `/validate`, not an ordinary pause in
+   * typing. Distinct from `pending` so the panel never promises a verdict is
+   * still coming when it plainly is not; saving is never blocked by this on
+   * its own, since a caller with no report has nothing to read a hard-error
+   * count from either.
+   */
+  unavailable?: boolean;
   onJump: (line: number) => void;
 }
 
@@ -49,6 +58,7 @@ const SEVERITY_CLASSES: Record<string, string> = {
 export function FindingsPanel({
   report,
   pending,
+  unavailable = false,
   onJump,
 }: FindingsPanelProps): ReactElement {
   return (
@@ -56,7 +66,11 @@ export function FindingsPanel({
       <h2 className="text-xs font-semibold tracking-wide text-slate-500 uppercase dark:text-slate-400">
         Findings
       </h2>
-      {report === null || (report.findings.length === 0 && pending) ? (
+      {unavailable ? (
+        <p className="text-sm text-slate-500 dark:text-slate-400">
+          Checking is unavailable right now; saving is not blocked by it.
+        </p>
+      ) : report === null || (report.findings.length === 0 && pending) ? (
         <p className="text-sm text-slate-500 dark:text-slate-400">Checking</p>
       ) : report.findings.length === 0 ? (
         <p className="text-sm text-slate-500 dark:text-slate-400">

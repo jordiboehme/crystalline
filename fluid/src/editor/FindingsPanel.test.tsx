@@ -51,6 +51,19 @@ describe("the findings panel", () => {
     );
     expect(screen.getByText(/nothing to fix/i)).toBeInTheDocument();
   });
+
+  it("says checking is unavailable rather than promising it is still coming", () => {
+    render(
+      <FindingsPanel
+        pending={false}
+        unavailable
+        onJump={() => undefined}
+        report={null}
+      />,
+    );
+    expect(screen.getByText(/unavailable/i)).toBeInTheDocument();
+    expect(screen.queryByText(/^checking$/i)).not.toBeInTheDocument();
+  });
 });
 
 describe("jumpToLine", () => {
@@ -61,6 +74,24 @@ describe("jumpToLine", () => {
     });
     jumpToLine(view, 2);
     expect(view.state.selection.main.head).toBe(4);
+    view.destroy();
+  });
+
+  it("clamps a line past the end of a mixed-ending buffer to its last line", () => {
+    // "one\ntwo\nthree\n" is 14 characters: the trailing newline opens a
+    // fourth, empty line, whose start is the document's own length. A
+    // server line counted against the file's own text can point past what
+    // the buffer holds - a mixed line-ending document is exactly where the
+    // two counts can diverge - and the clamp is what keeps that graceful
+    // rather than throwing on an out-of-range `doc.line` call.
+    const view = new EditorView({
+      state: EditorState.create({ doc: "one\ntwo\nthree\n" }),
+      parent: document.body,
+    });
+    jumpToLine(view, 999);
+    expect(view.state.doc.lines).toBe(4);
+    expect(view.state.selection.main.head).toBe(14);
+    expect(view.state.selection.main.head).toBe(view.state.doc.length);
     view.destroy();
   });
 });

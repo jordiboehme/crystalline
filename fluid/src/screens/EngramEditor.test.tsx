@@ -667,7 +667,7 @@ describe("the engram editor", () => {
     expect(putBody(1)).toEqual({ content: CONTENT });
   });
 
-  it("hard errors disable saving and rule warnings do not", async () => {
+  it("hard errors disable saving", async () => {
     serveEditor({
       "/validate": () => ({
         errors: 1,
@@ -688,5 +688,147 @@ describe("the engram editor", () => {
       expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
     });
     expect(screen.getByText(/block saving/i)).toBeInTheDocument();
+  });
+
+  it("hard errors block the keyboard save too, not only the button", async () => {
+    const put = vi.fn(() => detailResponse({ checksum: "next111" }));
+    serveEditor({
+      "/validate": () => ({
+        errors: 1,
+        findings: [
+          {
+            rule: "E001",
+            severity: "error",
+            message: "frontmatter will not parse",
+            line: 1,
+            fix: null,
+          },
+        ],
+      }),
+      "/domains/eng/engrams/alpha": (_path, init) =>
+        init?.method === "PUT" ? put() : detailResponse(),
+    });
+    renderApp("/d/eng/edit/alpha");
+    const editor = await screen.findByLabelText("Engram source");
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
+    });
+    editor.focus();
+    // Mod-S dispatches the same `requestSave` the button's `onClick` calls;
+    // the hard-error check lives there, not only in the button's `disabled`
+    // attribute, so this exercises the keyboard path rather than the button.
+    await userEvent.keyboard("{Control>}s{/Control}");
+    expect(put).not.toHaveBeenCalled();
+  });
+
+  it("rule warnings never block saving", async () => {
+    const put = vi.fn(() => detailResponse({ checksum: "next111" }));
+    serveEditor({
+      "/validate": () => ({
+        errors: 0,
+        findings: [
+          {
+            rule: "T005",
+            severity: "warning",
+            message: "superseded without successor",
+            line: null,
+            fix: "add - superseded_by [[Target]]",
+          },
+        ],
+      }),
+      "/domains/eng/engrams/alpha": (_path, init) =>
+        init?.method === "PUT" ? put() : detailResponse(),
+    });
+    renderApp("/d/eng/edit/alpha");
+    await screen.findByLabelText("Engram source");
+    await waitFor(() => {
+      expect(
+        screen.getByText(/superseded without successor/),
+      ).toBeInTheDocument();
+    });
+    // The finding is visible, but it never touched the gate.
+    expect(screen.getByRole("button", { name: "Save" })).toBeEnabled();
+    await userEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => {
+      expect(put).toHaveBeenCalled();
+    });
+  });
+
+  it("says checking is unavailable rather than promising forever when /validate is refused", async () => {
+    serveEditor({
+      "/validate": () => {
+        throw new ApiProblem(403, "forbidden", "validation is not available");
+      },
+    });
+    renderApp("/d/eng/edit/alpha");
+    await screen.findByLabelText("Engram source");
+    await waitFor(() => {
+      expect(screen.getByText(/unavailable/i)).toBeInTheDocument();
+    });
+    // No verdict landed at all, hard or otherwise: a dry run that cannot
+    // even be asked never blocks a save.
+    expect(screen.getByRole("button", { name: "Save" })).toBeEnabled();
+  });
+
+  it("the hard-error gate holds through an in-flight revalidation and lifts only when a clean report lands", async () => {
+    // Two `/validate` answers this test controls the timing of, so the
+    // second request can be left hanging while the gate is checked.
+    let resolveFirst: (value: unknown) => void = () => undefined;
+    let resolveSecond: (value: unknown) => void = () => undefined;
+    const first = new Promise((resolve) => {
+      resolveFirst = resolve;
+    });
+    const second = new Promise((resolve) => {
+      resolveSecond = resolve;
+    });
+    let calls = 0;
+    serveEditor({
+      "/validate": () => {
+        calls += 1;
+        return calls === 1 ? first : second;
+      },
+    });
+    renderApp("/d/eng/edit/alpha");
+    await screen.findByLabelText("Engram source");
+    await waitFor(() => {
+      expect(calls).toBe(1);
+    });
+    resolveFirst({
+      errors: 1,
+      findings: [
+        {
+          rule: "E001",
+          severity: "error",
+          message: "frontmatter will not parse",
+          line: 1,
+          fix: null,
+        },
+      ],
+    });
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
+    });
+
+    // A further edit changes the buffer, which - once the debounce settles
+    // - changes the validate query's key and starts a second request that
+    // has not answered yet.
+    const status = screen.getByLabelText("Status");
+    await userEvent.clear(status);
+    await userEvent.type(status, "draft");
+    await userEvent.tab();
+    await waitFor(() => {
+      expect(calls).toBe(2);
+    });
+
+    // The server never re-checks these rule families on save (the verify
+    // ceiling), so this gate is the only enforcement there is: the stale
+    // hard-error verdict must hold through the window where the fresh one
+    // has not landed, or a click here would save invalid content.
+    expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
+
+    resolveSecond({ errors: 0, findings: [] });
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Save" })).toBeEnabled();
+    });
   });
 });
