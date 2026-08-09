@@ -30,6 +30,7 @@ import { ApiProblem, problemDetail } from "../api/client";
 import { crystallineAddress } from "../api/engram";
 import type { GraphNode } from "../api/graph";
 import { fetchGraph, graphKey } from "../api/graph";
+import { plural } from "../format";
 import type { GraphAnchor } from "../graphElements";
 import { graphConnections, graphElements } from "../graphElements";
 import { RETIRED_CLASS, isRetired } from "../lifecycle";
@@ -147,6 +148,16 @@ export function NeighborhoodGraph({
           Showing the first {neighborhood.nodes.length} engrams: a neighborhood
           is capped at what one view can draw, so this is a bounded picture of
           it rather than the whole of it.
+        </p>
+      )}
+
+      {neighborhood.hidden > 0 && (
+        <p className="text-xs text-slate-500 dark:text-slate-400">
+          {plural(
+            neighborhood.hidden,
+            "node beyond the cap is not drawn, retired ones first.",
+            "nodes beyond the cap are not drawn, retired ones first.",
+          )}
         </p>
       )}
 

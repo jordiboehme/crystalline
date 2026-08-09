@@ -276,6 +276,27 @@ describe("the neighborhood graph", () => {
     expect(screen.queryByText(/showing the first/i)).toBeNull();
   });
 
+  it("says how many nodes the cap hid, retired ones first", async () => {
+    apiMock.mockImplementation(() =>
+      Promise.resolve(graphResponse({ truncated: true, hidden: 3 })),
+    );
+
+    mount();
+
+    expect(
+      await screen.findByText(
+        "3 nodes beyond the cap are not drawn, retired ones first.",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("says nothing about hidden nodes when the cap hid none", async () => {
+    mount();
+
+    await screen.findByTestId("canvas");
+    expect(screen.queryByText(/beyond the cap (is|are) not drawn/i)).toBeNull();
+  });
+
   it("says an engram nothing connects to has nothing to draw", async () => {
     apiMock.mockImplementation(() =>
       Promise.resolve(

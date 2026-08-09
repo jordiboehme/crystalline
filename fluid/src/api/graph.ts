@@ -44,6 +44,8 @@ export interface GraphNeighborhood {
   edges: GraphEdge[];
   /** Whether the node cap cut anything out of this answer. */
   truncated: boolean;
+  /** How many nodes the cap cut, retired ones first. Zero on an older payload. */
+  hidden: number;
 }
 
 /** An engram that points at the one being read, and how it points. */
@@ -116,6 +118,7 @@ export function readGraph(payload: unknown): GraphNeighborhood {
       .map(readEdge)
       .filter((edge): edge is GraphEdge => edge !== null),
     truncated: record?.truncated === true,
+    hidden: asNumber(record?.hidden) ?? 0,
   };
 }
 

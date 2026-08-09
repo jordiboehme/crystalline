@@ -101,6 +101,15 @@ describe("backlinks", () => {
     expect(graph.edges).toEqual([{ from: 1, to: 2, relType: "links_to" }]);
     expect(graph.truncated).toBe(false);
   });
+
+  it("reads the hidden count, defaulting to zero for an older payload", () => {
+    expect(
+      readGraph({ nodes: [], edges: [], truncated: true, hidden: 7 }).hidden,
+    ).toBe(7);
+    expect(readGraph({ nodes: [], edges: [], truncated: false }).hidden).toBe(
+      0,
+    );
+  });
 });
 
 /**

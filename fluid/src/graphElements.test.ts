@@ -170,7 +170,10 @@ describe("the graph elements", () => {
 
   it("draws nothing at all from an empty neighborhood", () => {
     expect(
-      graphElements({ nodes: [], edges: [], truncated: false }, ANCHOR),
+      graphElements(
+        { nodes: [], edges: [], truncated: false, hidden: 0 },
+        ANCHOR,
+      ),
     ).toEqual([]);
   });
 });
