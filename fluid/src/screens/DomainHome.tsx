@@ -36,6 +36,7 @@ import { CreateEngramDialog } from "../components/CreateEngramDialog";
 import { EngramList } from "../components/EngramList";
 import { FilterFields, TagChips } from "../components/FilterControls";
 import { Markdown } from "../components/Markdown";
+import { Skeleton } from "../components/Skeleton";
 import { plural } from "../format";
 
 export default function DomainHome() {
@@ -243,9 +244,7 @@ export default function DomainHome() {
             {problemDetail(tree.error)}
           </p>
         ) : (
-          <p className="text-sm text-slate-500 dark:text-slate-400">
-            Loading engrams
-          </p>
+          <Skeleton label="Loading engrams" />
         )}
       </section>
     </div>
@@ -263,11 +262,7 @@ function ManifestPanel({
   error: Error | null;
 }) {
   if (pending) {
-    return (
-      <p className="text-sm text-slate-500 dark:text-slate-400">
-        Loading the manifest
-      </p>
-    );
+    return <Skeleton label="Loading the manifest" />;
   }
   // A missing MANIFEST is a gap in the domain rather than a failure of the
   // screen, and it is the one thing every domain is supposed to have, so it is

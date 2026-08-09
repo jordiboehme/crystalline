@@ -58,6 +58,7 @@ import { MoveDialog } from "../components/MoveDialog";
 import { NeighborhoodGraph } from "../components/NeighborhoodGraph";
 import { ReferenceLink } from "../components/ReferenceLink";
 import { RetireDialog } from "../components/RetireDialog";
+import { Skeleton } from "../components/Skeleton";
 import { domainRoute, editRoute, engramRoute, graphRoute } from "../paths";
 import type { WikilinkResolver } from "../wikilinks";
 import { buildWikilinkResolver, innerOf, referenceState } from "../wikilinks";
@@ -187,11 +188,7 @@ export default function EngramPage() {
     );
   }
   if (!detail.data || !wikilinks) {
-    return (
-      <p className="text-sm text-slate-500 dark:text-slate-400">
-        Loading the engram
-      </p>
-    );
+    return <Skeleton label="Loading the engram" rows={6} />;
   }
 
   const engram = detail.data;

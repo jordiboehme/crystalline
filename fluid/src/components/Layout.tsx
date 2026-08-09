@@ -19,9 +19,17 @@
  */
 
 import { useQuery } from "@tanstack/react-query";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import type { RefObject } from "react";
 import { DropdownMenu } from "radix-ui";
-import { Link, NavLink, Outlet, useMatch, useNavigate } from "react-router";
+import {
+  Link,
+  NavLink,
+  Outlet,
+  useLocation,
+  useMatch,
+  useNavigate,
+} from "react-router";
 
 import { problemDetail } from "../api/client";
 import { DOMAINS_QUERY_KEY, fetchDomains } from "../api/domains";
@@ -50,6 +58,7 @@ const PALETTE_HINT = /Mac|iPhone|iPad/.test(navigator.userAgent)
 export function Layout() {
   const [navOpen, setNavOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
+  const mainRef = useRef<HTMLElement | null>(null);
 
   // The one action that is offered on every screen, because the frame is on
   // every screen: a reader who found the palette can find everything else
@@ -102,10 +111,15 @@ export function Layout() {
       />
       <div className="mx-auto flex w-full max-w-350 gap-6 px-4 py-6">
         <DomainSidebar open={navOpen} />
-        <main className="min-w-0 flex-1">
+        <main
+          ref={mainRef}
+          tabIndex={-1}
+          className="min-w-0 flex-1 focus:outline-none"
+        >
           <Outlet />
         </main>
       </div>
+      <RouteFocus target={mainRef} />
       {/*
         Once for the whole app, so the shortcut works on every screen and the
         palette outlives the screen a jump leaves behind.
@@ -122,6 +136,25 @@ export function Layout() {
       />
     </div>
   );
+}
+
+/**
+ * Register item 18: a route change moves focus to the new screen's main
+ * region. Without this, a keyboard or screen-reader user who followed a link
+ * is left focused on an element of the previous screen - or on nothing.
+ * The first render is exempt: the browser's own document focus is right.
+ */
+function RouteFocus({ target }: { target: RefObject<HTMLElement | null> }) {
+  const { pathname } = useLocation();
+  const first = useRef(true);
+  useEffect(() => {
+    if (first.current) {
+      first.current = false;
+      return;
+    }
+    target.current?.focus();
+  }, [pathname, target]);
+  return null;
 }
 
 function TopBar({

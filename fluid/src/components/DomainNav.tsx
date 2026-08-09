@@ -239,7 +239,9 @@ function TreeBranch({
   if (folders.length === 0 && engrams.length === 0) {
     return (
       <p className="px-2 py-1 text-sm text-slate-500 dark:text-slate-400">
-        {path === "" ? "This domain has no engrams yet." : "Nothing in here."}
+        {path === ""
+          ? "This domain has no engrams yet. New engram starts the first."
+          : "Nothing in here."}
       </p>
     );
   }

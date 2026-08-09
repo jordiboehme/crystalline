@@ -165,6 +165,25 @@ beforeEach(() => {
 });
 
 describe("the layout", () => {
+  it("moves focus to the main region on navigation", async () => {
+    // /auth/me + /domains + a domain tree/engrams, the way the sidebar and
+    // the screen behind it both need it.
+    serveInDomain();
+
+    renderApp("/");
+    // Scoped to the sidebar: the same domain is also named by a card on the
+    // home screen behind it, and an unscoped query would match both.
+    const domains = await screen.findByRole("navigation", { name: "Domains" });
+    const domainLink = await within(domains).findByRole("link", {
+      name: /^eng/,
+    });
+    await userEvent.click(domainLink);
+
+    await waitFor(() => {
+      expect(document.activeElement).toBe(screen.getByRole("main"));
+    });
+  });
+
   it("lists the instance's domains in the sidebar", async () => {
     serveSignedIn();
 

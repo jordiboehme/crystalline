@@ -34,6 +34,7 @@ import {
   validateKey,
 } from "../api/writes";
 import { useAuth } from "../auth/AuthContext";
+import { Skeleton } from "../components/Skeleton";
 import CmEditor from "../editor/CmEditor";
 import { ConflictDialog } from "../editor/ConflictDialog";
 import {
@@ -270,18 +271,7 @@ export default function EngramEditor() {
     );
   }
   if (!detail.data) {
-    return (
-      <div role="status" aria-busy="true" aria-label="Loading the editor">
-        <div aria-hidden="true" className="flex animate-pulse flex-col gap-2">
-          {[0, 1, 2, 3].map((row) => (
-            <div
-              key={row}
-              className="h-6 rounded bg-slate-100 dark:bg-slate-800"
-            />
-          ))}
-        </div>
-      </div>
-    );
+    return <Skeleton label="Loading the editor" rows={8} />;
   }
   // Keyed by address: a different engram is a different editing session.
   return <EditorSurface key={`${domain}/${permalink}`} engram={detail.data} />;
