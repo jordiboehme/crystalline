@@ -51,6 +51,43 @@ export function docText(state: EditorState): string {
   return state.sliceDoc();
 }
 
+/**
+ * Build the state a view opens with, or is later reset to wholesale via
+ * `view.setState` rather than a dispatch - a full document swap across a
+ * changed line separator, say, where a dispatch would split the incoming
+ * text with the separator the state already has rather than the one the
+ * text actually uses.
+ *
+ * The accessible name and the doc-changed subscription live here, not beside
+ * the view: `setState` replaces the whole config, so anything a caller wants
+ * to survive the swap has to travel inside the state it swaps in.
+ */
+export function buildEditorState(
+  doc: string,
+  extensions: Extension[],
+  ariaLabel: string,
+  onDocChanged?: (doc: string) => void,
+): EditorState {
+  return EditorState.create({
+    doc,
+    extensions: [
+      ...extensions,
+      // The name goes on the element that is actually the text box.
+      // CodeMirror gives its content `role="textbox"` and the editing
+      // focus, while the host below is a plain div, and an aria-label on
+      // an element with no role names nothing.
+      EditorView.contentAttributes.of({ "aria-label": ariaLabel }),
+      EditorView.updateListener.of((update) => {
+        if (update.docChanged) {
+          // `docText` rather than `doc.toString()`: what a subscriber
+          // gets is the file's own bytes, endings included.
+          onDocChanged?.(docText(update.state));
+        }
+      }),
+    ],
+  });
+}
+
 /** The one highlight style; colors lean on the app's slate/sky palette. */
 const editorHighlight = HighlightStyle.define([
   { tag: tags.heading1, fontSize: "1.4em", fontWeight: "600" },

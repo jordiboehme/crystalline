@@ -64,6 +64,24 @@ function serveEditor(
   );
 }
 
+/** The parsed body of the `index`th PUT the mock has seen, in call order. */
+function putBody(index: number): unknown {
+  const calls = apiMock.mock.calls.filter(([, init]) => init?.method === "PUT");
+  const body = calls[index]?.[1]?.body;
+  if (typeof body !== "string") {
+    throw new Error(`no PUT body at index ${index}`);
+  }
+  return JSON.parse(body) as unknown;
+}
+
+/** The `If-Match` header of the `index`th PUT the mock has seen. */
+function putIfMatch(index: number): string | undefined {
+  const calls = apiMock.mock.calls.filter(([, init]) => init?.method === "PUT");
+  const headers = calls[index]?.[1]?.headers as
+    Record<string, string> | undefined;
+  return headers?.["If-Match"];
+}
+
 beforeEach(() => {
   apiMock.mockReset();
   localStorage.clear();
@@ -296,5 +314,78 @@ describe("the engram editor", () => {
     expect(draft).not.toBeNull();
     const parsedDraft = JSON.parse(draft ?? "{}") as { content: string };
     expect(parsedDraft.content).toEqual(expect.stringContaining("A rule."));
+  });
+
+  it("taking the server version rebuilds the buffer when the line separator differs", async () => {
+    const crlfContent = CONTENT.replace(/\n/g, "\r\n");
+    const lfServerContent = CONTENT.replace("A rule.", "Somebody else's rule.");
+    serveEditor({
+      "/domains/eng/engrams/alpha": (_path, init) => {
+        if (init?.method === "PUT") {
+          throw new ApiProblem(
+            412,
+            "precondition failed",
+            "stale edit: engram changed since it was read",
+            { current_etag: '"srv999"', current_content: lfServerContent },
+          );
+        }
+        return detailResponse({ content: crlfContent });
+      },
+    });
+    renderApp("/d/eng/edit/alpha");
+    const editor = await screen.findByLabelText("Engram source");
+    await waitFor(() => {
+      expect(editor.textContent).toContain("A rule.");
+    });
+    await userEvent.click(screen.getByRole("button", { name: "Save" }));
+    await screen.findByRole("dialog", { name: /someone else saved/i });
+    await userEvent.click(
+      screen.getByRole("button", { name: "Take the server version" }),
+    );
+    await waitFor(() => {
+      expect(screen.getByLabelText("Engram source").textContent).toContain(
+        "Somebody else's rule.",
+      );
+    });
+    // One buffer line per "\n" in the server's content: a dispatch that kept
+    // splitting on the CRLF-mounted state's own separator would collapse the
+    // whole thing onto a single line instead.
+    const expectedLines = lfServerContent.split("\n").length;
+    expect(
+      screen.getByLabelText("Engram source").querySelectorAll(".cm-line"),
+    ).toHaveLength(expectedLines);
+  });
+
+  it("keep editing closes the dialog without touching the buffer, the draft or the stale token", async () => {
+    serveEditor({
+      "/domains/eng/engrams/alpha": (_path, init) => {
+        if (init?.method === "PUT") {
+          throw conflictAnswer();
+        }
+        return detailResponse();
+      },
+    });
+    renderApp("/d/eng/edit/alpha");
+    const editor = await screen.findByLabelText("Engram source");
+    const beforeText = editor.textContent;
+    await userEvent.click(screen.getByRole("button", { name: "Save" }));
+    await screen.findByRole("dialog", { name: /someone else saved/i });
+    expect(localStorage.getItem("fluid.draft.ada.eng/alpha")).toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: "Keep editing" }));
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    });
+    // The buffer is exactly what it was.
+    expect(screen.getByLabelText("Engram source").textContent).toBe(beforeText);
+    // No draft appeared: cancelling wrote nothing.
+    expect(localStorage.getItem("fluid.draft.ada.eng/alpha")).toBeNull();
+    // The token never moved: the next save meets the same stale checksum and
+    // the same refusal, rather than a fresh If-Match it was never granted.
+    await userEvent.click(screen.getByRole("button", { name: "Save" }));
+    await screen.findByRole("dialog", { name: /someone else saved/i });
+    expect(putIfMatch(0)).toBe('"3f8a1c05e2"');
+    expect(putIfMatch(1)).toBe('"3f8a1c05e2"');
+    expect(putBody(0)).toEqual({ content: CONTENT });
+    expect(putBody(1)).toEqual({ content: CONTENT });
   });
 });

@@ -9,6 +9,7 @@
  * editing a page that now 404s.
  */
 
+import { EditorState } from "@codemirror/state";
 import type { EditorView } from "@codemirror/view";
 import { keymap } from "@codemirror/view";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -29,7 +30,12 @@ import {
   readDraft,
   writeDraft,
 } from "../editor/drafts";
-import { baseExtensions, docText, lineSeparatorFor } from "../editor/setup";
+import {
+  baseExtensions,
+  buildEditorState,
+  docText,
+  lineSeparatorFor,
+} from "../editor/setup";
 import { editRoute, engramRoute } from "../paths";
 import { useTheme } from "../theme/context";
 import NotFound from "./NotFound";
@@ -41,6 +47,9 @@ interface Notice {
 
 /** The DOM event the buffer's save binding raises on the editor's own node. */
 const SAVE_EVENT = "crystalline:save";
+
+/** The buffer's accessible name - shared with the state a conflict rebuilds. */
+const ARIA_LABEL = "Engram source";
 
 /**
  * Mod-S inside the buffer, as an extension fixed at module level.
@@ -325,7 +334,7 @@ function EditorSurface({ engram }: { engram: EngramDetail }) {
         <CmEditor
           initialDoc={engram.content}
           extensions={extensions}
-          ariaLabel="Engram source"
+          ariaLabel={ARIA_LABEL}
           onReady={(view) => {
             viewRef.current = view;
           }}
@@ -364,13 +373,46 @@ function EditorSurface({ engram }: { engram: EngramDetail }) {
             });
             const view = viewRef.current;
             if (view) {
-              view.dispatch({
-                changes: {
-                  from: 0,
-                  to: view.state.doc.length,
-                  insert: conflict.currentContent,
-                },
-              });
+              const mountedSeparator =
+                view.state.facet(EditorState.lineSeparator) ?? "\n";
+              const serverSeparator = conflict.currentContent.includes("\r\n")
+                ? "\r\n"
+                : "\n";
+              if (serverSeparator === mountedSeparator) {
+                view.dispatch({
+                  changes: {
+                    from: 0,
+                    to: view.state.doc.length,
+                    insert: conflict.currentContent,
+                  },
+                });
+              } else {
+                // A dispatch splits the inserted string with the STATE's
+                // existing separator, not the one the text itself uses: a
+                // CRLF-mounted session taking LF server content would
+                // collapse the whole buffer onto one line. Rebuilding the
+                // state fresh - in place, on the same view, rather than the
+                // route's keyed remount - swaps only the editor's own
+                // document and config; `notice`, `offeredDraft` and every
+                // other piece of this screen's state survive untouched.
+                view.setState(
+                  buildEditorState(
+                    conflict.currentContent,
+                    [
+                      ...lineSeparatorFor(conflict.currentContent),
+                      ...baseExtensions(resolved === "dark"),
+                      saveKeymap,
+                    ],
+                    ARIA_LABEL,
+                    setBuffer,
+                  ),
+                );
+                // `setState` does not run the transaction pipeline, so the
+                // new state's own doc-changed subscription never fires for
+                // the swap itself - reflect the new buffer here so `dirty`
+                // and a later conflict's `mine` both see it.
+                setBuffer(conflict.currentContent);
+              }
             }
             setChecksum(conflict.currentChecksum);
             setSavedText(conflict.currentContent);

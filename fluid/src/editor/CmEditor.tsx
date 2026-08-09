@@ -9,12 +9,11 @@
  */
 
 import type { Extension } from "@codemirror/state";
-import { EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import type { ReactElement } from "react";
 import { useEffect, useRef } from "react";
 
-import { docText } from "./setup";
+import { buildEditorState } from "./setup";
 
 export interface CmEditorProps {
   /** The document at mount. The component is keyed by its address; it never
@@ -58,24 +57,7 @@ export default function CmEditor({
       onDocChanged: changed,
     } = initial.current;
     const view = new EditorView({
-      state: EditorState.create({
-        doc,
-        extensions: [
-          ...exts,
-          // The name goes on the element that is actually the text box.
-          // CodeMirror gives its content `role="textbox"` and the editing
-          // focus, while the host below is a plain div, and an aria-label on
-          // an element with no role names nothing.
-          EditorView.contentAttributes.of({ "aria-label": label }),
-          EditorView.updateListener.of((update) => {
-            if (update.docChanged) {
-              // `docText` rather than `doc.toString()`: what a subscriber
-              // gets is the file's own bytes, endings included.
-              changed?.(docText(update.state));
-            }
-          }),
-        ],
-      }),
+      state: buildEditorState(doc, exts, label, changed),
       parent: node,
     });
     ready?.(view);
