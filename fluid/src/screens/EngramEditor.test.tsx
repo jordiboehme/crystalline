@@ -99,6 +99,42 @@ describe("the engram editor", () => {
     expect(editor.textContent).toContain("permalink: alpha");
   });
 
+  it("renders live preview and hands the raw text back on demand", async () => {
+    serveEditor();
+    renderApp("/d/eng/edit/alpha");
+    const editor = await screen.findByLabelText("Engram source");
+    await waitFor(() => {
+      expect(editor.textContent).toContain("A rule.");
+    });
+    // The cursor sits at the top of the document, so the heading line is
+    // inactive and its marker is folded away.
+    expect(editor.textContent).toContain("Alpha");
+    expect(editor.textContent).not.toContain("# Alpha");
+
+    const raw = screen.getByRole("button", { name: "Raw" });
+    expect(raw).toHaveAttribute("aria-pressed", "false");
+    await userEvent.click(raw);
+    expect(raw).toHaveAttribute("aria-pressed", "true");
+    // Decorations off: the same buffer, now showing exactly what is in it.
+    await waitFor(() => {
+      expect(screen.getByLabelText("Engram source").textContent).toContain(
+        "# Alpha",
+      );
+    });
+
+    await userEvent.click(screen.getByRole("button", { name: "Raw" }));
+    await waitFor(() => {
+      expect(screen.getByLabelText("Engram source").textContent).not.toContain(
+        "# Alpha",
+      );
+    });
+    // Nothing the toggle did was an edit: the file is unchanged either way.
+    expect(screen.queryByText("Unsaved changes")).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Save" }));
+    await screen.findByText("Saved");
+    expect(putBody(0)).toEqual({ content: CONTENT });
+  });
+
   it("is not offered to a viewer", async () => {
     apiMock.mockImplementation(
       answersFor({

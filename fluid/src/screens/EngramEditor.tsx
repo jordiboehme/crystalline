@@ -9,7 +9,8 @@
  * editing a page that now 404s.
  */
 
-import { EditorState } from "@codemirror/state";
+import type { Extension } from "@codemirror/state";
+import { Compartment, EditorState } from "@codemirror/state";
 import type { EditorView } from "@codemirror/view";
 import { keymap } from "@codemirror/view";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -30,6 +31,7 @@ import {
   readDraft,
   writeDraft,
 } from "../editor/drafts";
+import { livePreview } from "../editor/preview";
 import {
   baseExtensions,
   buildEditorState,
@@ -93,11 +95,17 @@ const saveKeymap = keymap.of([
  * own doc-changed subscription never fires for the swap itself:
  * `onDocChanged` is called directly afterward so the caller's buffer state
  * reflects the swap right away.
+ *
+ * `preview` travels in because `setState` replaces the whole configuration:
+ * the decoration compartment has to be rebuilt into the new state at whatever
+ * setting the toggle is currently on, or a separator-changing swap would
+ * silently drop live preview and leave the toggle lying about it.
  */
 function replaceBuffer(
   view: EditorView,
   content: string,
   dark: boolean,
+  preview: Extension,
   onDocChanged: (doc: string) => void,
 ): void {
   const mountedSeparator = view.state.facet(EditorState.lineSeparator) ?? "\n";
@@ -111,7 +119,12 @@ function replaceBuffer(
   view.setState(
     buildEditorState(
       content,
-      [...lineSeparatorFor(content), ...baseExtensions(dark), saveKeymap],
+      [
+        ...lineSeparatorFor(content),
+        ...baseExtensions(dark),
+        saveKeymap,
+        preview,
+      ],
       ARIA_LABEL,
       onDocChanged,
     ),
@@ -171,6 +184,21 @@ function EditorSurface({ engram }: { engram: EngramDetail }) {
   // fallback only satisfies the types.
   const account = user?.name ?? "anonymous";
   const viewRef = useRef<EditorView | null>(null);
+  /**
+   * The decoration layer's on/off switch. Raw mode is not a second buffer or
+   * a different document, it is this compartment reconfigured to hold nothing
+   * - there is no second copy of the text to desync. Later layers append
+   * their extensions inside the same compartment call, so the one toggle
+   * turns the whole read-model off.
+   *
+   * State rather than a ref: the compartment is read while rendering the
+   * mount extensions, and it is allocated once by the lazy initializer and
+   * never set again.
+   */
+  const [preview] = useState(() => new Compartment());
+  const [raw, setRaw] = useState(false);
+  const previewConfig = (off: boolean): Extension =>
+    preview.of(off ? [] : livePreview());
   // What the server holds, moved forward on every successful save.
   const [checksum, setChecksum] = useState(engram.checksum ?? "");
   const [savedText, setSavedText] = useState(engram.content);
@@ -287,11 +315,14 @@ function EditorSurface({ engram }: { engram: EngramDetail }) {
       ...lineSeparatorFor(engram.content),
       ...baseExtensions(resolved === "dark"),
       saveKeymap,
+      // On at mount, which is what `raw` starts as; every later flip goes
+      // through the compartment rather than through this array.
+      preview.of(livePreview()),
     ],
     // Read once: `CmEditor` snapshots the extensions at mount, so a later
     // theme change reaches the buffer through a remount rather than through
     // this array.
-    [engram.content, resolved],
+    [engram.content, resolved, preview],
   );
 
   return (
@@ -321,6 +352,30 @@ function EditorSurface({ engram }: { engram: EngramDetail }) {
               Unsaved changes
             </p>
           )}
+          {/*
+            A toggle, so the label names the thing being switched and
+            `aria-pressed` carries the state. A button whose text flipped to
+            "Preview" while announcing itself as pressed would be telling a
+            screen reader the opposite of what it shows.
+          */}
+          <button
+            type="button"
+            aria-pressed={raw}
+            onClick={() => {
+              const next = !raw;
+              setRaw(next);
+              viewRef.current?.dispatch({
+                effects: preview.reconfigure(next ? [] : livePreview()),
+              });
+            }}
+            className={
+              raw
+                ? "rounded border border-sky-500 bg-sky-50 px-3 py-1 text-sm text-sky-800 focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:outline-none dark:bg-sky-950 dark:text-sky-200"
+                : "rounded border border-slate-300 px-3 py-1 text-sm hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800"
+            }
+          >
+            Raw
+          </button>
           <button
             type="button"
             onClick={requestSave}
@@ -356,6 +411,7 @@ function EditorSurface({ engram }: { engram: EngramDetail }) {
                   view,
                   offeredDraft.content,
                   resolved === "dark",
+                  previewConfig(raw),
                   setBuffer,
                 );
               }
@@ -423,6 +479,7 @@ function EditorSurface({ engram }: { engram: EngramDetail }) {
                 view,
                 conflict.currentContent,
                 resolved === "dark",
+                previewConfig(raw),
                 setBuffer,
               );
             }
