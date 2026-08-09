@@ -14,7 +14,7 @@
  */
 
 import { useQuery } from "@tanstack/react-query";
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import { Link, useParams, useSearchParams } from "react-router";
 
 import { ApiProblem, problemDetail } from "../api/client";
@@ -29,6 +29,8 @@ import {
 } from "../api/engrams";
 import { fetchTags, vocabularyKey } from "../api/vocabulary";
 import type { TagCount } from "../api/vocabulary";
+import { useAuth } from "../auth/AuthContext";
+import { CreateEngramDialog } from "../components/CreateEngramDialog";
 import { EngramList } from "../components/EngramList";
 import { FilterFields, TagChips } from "../components/FilterControls";
 import { Markdown } from "../components/Markdown";
@@ -37,6 +39,8 @@ import { plural } from "../format";
 export default function DomainHome() {
   const { domain = "" } = useParams();
   const [params, setParams] = useSearchParams();
+  const { capabilities } = useAuth();
+  const [creating, setCreating] = useState(false);
 
   const path = params.get("path") ?? "";
   const filters: EngramFilters = useMemo(
@@ -125,9 +129,31 @@ export default function DomainHome() {
       </section>
 
       <section aria-labelledby="domain-engrams">
-        <h2 id="domain-engrams" className="mb-3 text-lg font-semibold">
-          Engrams
-        </h2>
+        <div className="mb-3 flex flex-wrap items-baseline justify-between gap-3">
+          <h2 id="domain-engrams" className="text-lg font-semibold">
+            Engrams
+          </h2>
+          {capabilities.canWrite && (
+            <button
+              type="button"
+              onClick={() => {
+                setCreating(true);
+              }}
+              className="rounded border border-slate-300 px-2 py-1 text-sm hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800"
+            >
+              New engram
+            </button>
+          )}
+        </div>
+        {creating && (
+          <CreateEngramDialog
+            domain={domain}
+            initialFolder={path}
+            onClose={() => {
+              setCreating(false);
+            }}
+          />
+        )}
 
         <FolderNav
           domain={domain}

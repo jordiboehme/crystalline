@@ -32,8 +32,10 @@ import { problemDetail } from "../api/client";
 import { fetchTree, treeKey } from "../api/domain";
 import type { DomainSummary } from "../api/domains";
 import type { EngramRow } from "../api/engrams";
+import { useAuth } from "../auth/AuthContext";
 import { RETIRED_CLASS, isRetired } from "../lifecycle";
 import { domainRoute, engramRoute } from "../paths";
+import { CreateEngramDialog } from "./CreateEngramDialog";
 import { ITEM_CLASSES, MENU_CLASSES } from "./menu";
 
 export interface DomainNavProps {
@@ -46,6 +48,9 @@ export interface DomainNavProps {
 }
 
 export function DomainNav({ domain, permalink, domains }: DomainNavProps) {
+  const { capabilities } = useAuth();
+  const [creating, setCreating] = useState(false);
+
   return (
     <div className="flex flex-col gap-3">
       <Link
@@ -62,7 +67,34 @@ export function DomainNav({ domain, permalink, domains }: DomainNavProps) {
           Engrams
         </h2>
         <TreeBranch domain={domain} path="" permalink={permalink} />
+        {/*
+          Left out on the domain's own home screen: that screen carries the
+          same launcher beside its heading, prefilled with the folder being
+          browsed, so the sidebar would otherwise offer a second one right
+          next to the first. Everywhere else inside the domain - an engram,
+          the editor - this is the only launcher on screen.
+        */}
+        {capabilities.canWrite && permalink !== "" && (
+          <button
+            type="button"
+            onClick={() => {
+              setCreating(true);
+            }}
+            className="mt-2 w-full rounded border border-slate-300 px-2 py-1 text-sm hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800"
+          >
+            New engram
+          </button>
+        )}
       </div>
+      {creating && (
+        <CreateEngramDialog
+          domain={domain}
+          initialFolder=""
+          onClose={() => {
+            setCreating(false);
+          }}
+        />
+      )}
     </div>
   );
 }
