@@ -41,6 +41,7 @@ import {
   writeDraft,
 } from "../editor/drafts";
 import { fencePreviews } from "../editor/fencePreviews";
+import { FrontmatterForm } from "../editor/FrontmatterForm";
 import { livePreview } from "../editor/preview";
 import {
   baseExtensions,
@@ -265,6 +266,13 @@ function EditorSurface({ engram }: { engram: EngramDetail }) {
   // fallback only satisfies the types.
   const account = user?.name ?? "anonymous";
   const viewRef = useRef<EditorView | null>(null);
+  /**
+   * The same view as state, for the one consumer that needs it while
+   * rendering: the frontmatter form dispatches into it. A ref read during
+   * render would hand the form `null` forever, because the mount that fills it
+   * schedules no re-render of its own.
+   */
+  const [view, setView] = useState<EditorView | null>(null);
   /**
    * The decoration layer's on/off switch. Raw mode is not a second buffer or
    * a different document, it is this compartment reconfigured to hold nothing
@@ -596,16 +604,32 @@ function EditorSurface({ engram }: { engram: EngramDetail }) {
           </button>
         </aside>
       )}
-      <div className="rounded border border-slate-200 dark:border-slate-800">
-        <CmEditor
-          initialDoc={engram.content}
-          extensions={extensions}
-          ariaLabel={ARIA_LABEL}
-          onReady={(view) => {
-            viewRef.current = view;
-          }}
-          onDocChanged={setBuffer}
-        />
+      {/*
+        The same two-column shape the read page has, so the metadata sits
+        where a reader already expects it. The form is a view over the buffer
+        rather than a second place a value lives: it reads `buffer` and writes
+        back through ordinary transactions on the view.
+      */}
+      <div className="grid gap-8 lg:grid-cols-[minmax(0,1fr)_18rem]">
+        <div className="rounded border border-slate-200 dark:border-slate-800">
+          <CmEditor
+            initialDoc={engram.content}
+            extensions={extensions}
+            ariaLabel={ARIA_LABEL}
+            onReady={(ready) => {
+              viewRef.current = ready;
+              setView(ready);
+            }}
+            onDocChanged={setBuffer}
+          />
+        </div>
+        <aside className="flex flex-col gap-4">
+          <FrontmatterForm
+            doc={buffer}
+            view={view}
+            vocabulary={vocabulary.data ?? null}
+          />
+        </aside>
       </div>
       {conflict && (
         <ConflictDialog

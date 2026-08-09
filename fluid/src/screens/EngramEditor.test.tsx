@@ -205,6 +205,36 @@ describe("the engram editor", () => {
     expect(putBody(0)).toEqual({ content: linked });
   });
 
+  it("assists the frontmatter beside the buffer, writing single lines into it", async () => {
+    serveEditor({
+      "/domains/eng/engrams/alpha": (_path, init) =>
+        init?.method === "PUT"
+          ? detailResponse({ checksum: "next111" })
+          : detailResponse(),
+    });
+    renderApp("/d/eng/edit/alpha");
+    await screen.findByLabelText("Engram source");
+    // The form reads the buffer rather than the detail payload.
+    expect(await screen.findByLabelText("Status")).toHaveValue("stable");
+
+    const status = screen.getByLabelText("Status");
+    await userEvent.clear(status);
+    await userEvent.type(status, "draft");
+    await userEvent.tab();
+    await waitFor(() => {
+      expect(screen.getByLabelText("Engram source").textContent).toContain(
+        "status: draft",
+      );
+    });
+
+    await userEvent.click(screen.getByRole("button", { name: "Save" }));
+    await screen.findByText("Saved");
+    // One line changed; every other byte of the file is what it was.
+    expect(putBody(0)).toEqual({
+      content: CONTENT.replace("status: stable", "status: draft"),
+    });
+  });
+
   it("is not offered to a viewer", async () => {
     apiMock.mockImplementation(
       answersFor({
