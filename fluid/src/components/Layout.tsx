@@ -298,9 +298,17 @@ function DomainSidebar({ open }: { open: boolean }) {
   const match = useMatch("/d/:domain/*");
   const domain = match?.params.domain ?? "";
   // The splat holds whatever follows the domain: `e/<permalink>` on an engram
-  // screen, the empty string on the domain's own.
+  // screen, `edit/<permalink>` in the editor, the empty string on the
+  // domain's own home. Both prefixed forms carry the same permalink, so the
+  // sidebar highlights the right tree row and offers its own launcher on
+  // either screen, and only the domain's own home - where the permalink is
+  // truly absent - is treated as having none.
   const rest = match?.params["*"] ?? "";
-  const permalink = rest.startsWith("e/") ? rest.slice(2) : "";
+  const permalink = rest.startsWith("e/")
+    ? rest.slice(2)
+    : rest.startsWith("edit/")
+      ? rest.slice(5)
+      : "";
 
   return (
     <nav

@@ -122,6 +122,22 @@ function previewConfig(off: boolean, dark: boolean): Extension {
 /** Preview is on when the editor opens. */
 const RAW_AT_MOUNT = false;
 
+/**
+ * How long a detail read stays fresh once it lands in the cache.
+ *
+ * Zero - TanStack Query's own default - would be right for a screen that
+ * only ever reads; this one also writes into the same cache entry from
+ * outside a normal fetch, twice: a save seeds the version it just wrote, and
+ * a create seeds the engram this editor is about to mount onto before the
+ * navigation that mounts it. Either way, an observer subscribing a moment
+ * later would otherwise see already-known data as instantly stale and
+ * re-request it in the background, a self-inflicted round trip for content
+ * this tab watched land. A modest window absorbs that without leaving stale
+ * content on screen for long: switching back to the tab still re-checks
+ * regardless, since `refetchOnWindowFocus` stays on.
+ */
+const DETAIL_STALE_MS = 15_000;
+
 /** What a reference resolves to before the two requests behind it land. */
 const NO_RESOLUTION: WikilinkResolver = () => null;
 
@@ -237,6 +253,7 @@ export default function EngramEditor() {
     queryKey: engramDetailKey(domain, permalink),
     queryFn: () => fetchEngramDetail(domain, permalink),
     enabled: capabilities.canWrite,
+    staleTime: DETAIL_STALE_MS,
   });
 
   if (!capabilities.canWrite) {

@@ -25,7 +25,19 @@ export function CreateEngramDialog(
   props: CreateEngramDialogProps,
 ): ReactElement {
   return (
-    <Suspense fallback={null}>
+    <Suspense
+      fallback={
+        // Plain markup rather than another Radix dialog: reaching for the
+        // primitive here would defeat the point of keeping it out of this
+        // chunk. A slow link still sees something happen instead of a
+        // silent pause between the click and the form.
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40">
+          <p className="rounded border border-slate-200 bg-white px-4 py-2 text-sm text-slate-600 shadow-xl dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300">
+            Opening the new engram form
+          </p>
+        </div>
+      }
+    >
       <CreateEngramDialogBody {...props} />
     </Suspense>
   );

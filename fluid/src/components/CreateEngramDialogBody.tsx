@@ -11,7 +11,7 @@
  * visit's first paint for a feature most loads never touch.
  */
 
-import { useMutation, useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Dialog } from "radix-ui";
 import type { ReactElement } from "react";
 import { useState } from "react";
@@ -19,6 +19,7 @@ import { useNavigate } from "react-router";
 
 import { problemDetail } from "../api/client";
 import { fetchTree, treeKey } from "../api/domain";
+import { engramDetailKey } from "../api/engram";
 import { createEngram } from "../api/writes";
 import {
   RECOMMENDED_STATUSES,
@@ -36,6 +37,7 @@ export default function CreateEngramDialogBody({
   onClose,
 }: CreateEngramDialogProps): ReactElement {
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
   const [title, setTitle] = useState("");
   const [folder, setFolder] = useState(initialFolder);
   const [engramType, setEngramType] = useState("");
@@ -52,6 +54,13 @@ export default function CreateEngramDialogBody({
         ...(status.trim() !== "" ? { status: status.trim() } : {}),
       }),
     onSuccess: (created) => {
+      // The editor reads through the same key: seeded here, the route it is
+      // about to land on opens on what already landed rather than refetching
+      // it and flashing a loading skeleton for a detail already in hand.
+      queryClient.setQueryData(
+        engramDetailKey(created.domain, created.permalink),
+        created,
+      );
       onClose();
       void navigate(editRoute(created.domain, created.permalink));
     },

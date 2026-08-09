@@ -41,7 +41,10 @@ import { ITEM_CLASSES, MENU_CLASSES } from "./menu";
 export interface DomainNavProps {
   /** The domain the route is inside. */
   domain: string;
-  /** The permalink being read, or the empty string when none is. */
+  /**
+   * The permalink being read or edited, or the empty string on the domain's
+   * own home screen, where there is none.
+   */
   permalink: string;
   /** Every registered domain, for the switcher. */
   domains: DomainSummary[];
@@ -68,11 +71,13 @@ export function DomainNav({ domain, permalink, domains }: DomainNavProps) {
         </h2>
         <TreeBranch domain={domain} path="" permalink={permalink} />
         {/*
-          Left out on the domain's own home screen: that screen carries the
-          same launcher beside its heading, prefilled with the folder being
-          browsed, so the sidebar would otherwise offer a second one right
-          next to the first. Everywhere else inside the domain - an engram,
-          the editor - this is the only launcher on screen.
+          Left out on the domain's own home screen only: that screen carries
+          the same launcher beside its heading, prefilled with the folder
+          being browsed, so the sidebar would otherwise offer a second one
+          right next to the first. `permalink` is empty there and there
+          alone - both the engram page and the editor resolve one (see
+          `Layout.tsx`'s `DomainSidebar`) - so this is the only launcher on
+          either of those screens.
         */}
         {capabilities.canWrite && permalink !== "" && (
           <button

@@ -86,6 +86,14 @@ describe("the create flow", () => {
     });
     // Straight into the editor on what landed.
     expect(await screen.findByLabelText("Engram source")).toBeInTheDocument();
+    // The create response seeded the editor's own cache under the same key
+    // it reads, so landing on it is never a second round trip for what the
+    // POST already answered - `created` backs both the POST and the detail
+    // GET, so a second call here would mean a refetch slipped through.
+    await new Promise((resolve) => {
+      setTimeout(resolve, 50);
+    });
+    expect(created).toHaveBeenCalledTimes(1);
   });
 
   it("surfaces a permalink collision in the server's words", async () => {
@@ -120,6 +128,37 @@ describe("the create flow", () => {
     await userEvent.click(screen.getByRole("button", { name: "Create" }));
     expect(
       await screen.findByText(/already exists in 'eng'/),
+    ).toBeInTheDocument();
+  });
+
+  it("offers the sidebar launcher on the editor route, where the page has none of its own", async () => {
+    apiMock.mockImplementation(
+      answersFor({
+        "/auth/me": () => meResponse({ user: userFixture() }),
+        "/domains": domainsResponse,
+        "/domains/eng/tree": (path) => tree(path),
+        "/domains/eng/engrams/notes/beta": () => ({
+          domain: "eng",
+          permalink: "notes/beta",
+          title: "Beta",
+          content: "---\ntitle: Beta\n---\n\n",
+          checksum: "b1",
+          frontmatter: {},
+          observations: [],
+          relations: [],
+          links: [],
+        }),
+        "/graph": () => ({ nodes: [], edges: [], truncated: false, hidden: 0 }),
+        "/validate": () => ({ findings: [], errors: 0 }),
+      }),
+    );
+    renderApp("/d/eng/edit/notes/beta");
+    await screen.findByLabelText("Engram source");
+    // Exactly one launcher: the editor carries no "New engram" of its own,
+    // so the only match is the sidebar's, which the permalink derivation for
+    // `edit/*` routes (Layout.tsx) is what makes visible here.
+    expect(
+      await screen.findByRole("button", { name: "New engram" }),
     ).toBeInTheDocument();
   });
 });
