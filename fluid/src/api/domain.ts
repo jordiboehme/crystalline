@@ -89,6 +89,17 @@ export interface ManifestDetail {
   checksum: string | null;
 }
 
+/**
+ * The cache key of one domain's MANIFEST detail read - a different shape
+ * from `manifestKey`, and its own key rather than a reuse of it: the plain
+ * `fetchManifest` DomainHome reads answers with just the markdown, and a
+ * detail read landing under the same key would overwrite it with a shape the
+ * plain reader cannot parse the checksum out of.
+ */
+export function manifestDetailKey(domain: string): readonly unknown[] {
+  return ["domain-manifest-detail", domain];
+}
+
 /** Fetch a domain's MANIFEST with its checksum, for editing. */
 export async function fetchManifestDetail(
   domain: string,

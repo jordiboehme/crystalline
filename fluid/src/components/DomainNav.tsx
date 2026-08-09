@@ -34,7 +34,7 @@ import type { DomainSummary } from "../api/domains";
 import type { EngramRow } from "../api/engrams";
 import { useAuth } from "../auth/AuthContext";
 import { RETIRED_CLASS, isRetired } from "../lifecycle";
-import { domainRoute, engramRoute } from "../paths";
+import { domainRoute, engramRoute, manifestRoute } from "../paths";
 import { CreateEngramDialog } from "./CreateEngramDialog";
 import { ITEM_CLASSES, MENU_CLASSES } from "./menu";
 
@@ -64,6 +64,19 @@ export function DomainNav({ domain, permalink, domains }: DomainNavProps) {
       </Link>
 
       <DomainSwitcher domain={domain} domains={domains} />
+
+      {/*
+        Pinned ahead of the tree and styled apart from it - a dashed border
+        and mono caps rather than the engram rows' plain text - because a
+        MANIFEST is not an engram: it is what introduces the domain, not
+        something filed inside it.
+      */}
+      <Link
+        to={manifestRoute(domain)}
+        className="mx-2 block truncate rounded border border-dashed border-slate-300 px-2 py-1 font-mono text-xs tracking-wide uppercase hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800"
+      >
+        MANIFEST
+      </Link>
 
       <div>
         <h2 className="px-2 pb-2 text-xs font-semibold tracking-wide text-slate-500 uppercase dark:text-slate-400">

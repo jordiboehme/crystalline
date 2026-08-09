@@ -41,6 +41,20 @@ export function editRoute(domain: string, permalink: string): string {
 }
 
 /**
+ * The MANIFEST page of one domain. Its own segment rather than a permalink
+ * under `/e/`: a MANIFEST is not an engram and carries no permalink of its
+ * own to encode.
+ */
+export function manifestRoute(domain: string): string {
+  return `${domainRoute(domain)}/manifest`;
+}
+
+/** The editor over one domain's MANIFEST. */
+export function manifestEditRoute(domain: string): string {
+  return `${manifestRoute(domain)}/edit`;
+}
+
+/**
  * The neighborhood of one engram, full screen.
  *
  * The anchor is the engram's own `crystalline://` address rather than the two

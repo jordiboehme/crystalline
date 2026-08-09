@@ -22,16 +22,29 @@ import DomainHome from "./screens/DomainHome";
 import EngramPage from "./screens/EngramPage";
 import GraphView from "./screens/GraphView";
 import Home from "./screens/Home";
+import ManifestPage from "./screens/ManifestPage";
 import NotFound from "./screens/NotFound";
 import Search from "./screens/Search";
 import UsersAdmin from "./screens/UsersAdmin";
 
 /**
- * The one lazy screen: everything CodeMirror rides in this chunk, so the app
- * shell never pays for the editor. The fallback matches the screen's own
- * skeleton so a prefetch miss is a quiet moment rather than a flash.
+ * The two lazy screens: everything CodeMirror rides in these chunks, so the
+ * app shell never pays for either editor. Split from one another rather than
+ * shared: a MANIFEST editor has no wikilinks, no frontmatter form and no
+ * vocabulary to fetch, and bundling it with the engram editor's weight would
+ * tax a MANIFEST edit for panels it never draws. The fallback matches the
+ * engram screen's own skeleton so a prefetch miss is a quiet moment rather
+ * than a flash; the MANIFEST editor shares it rather than inventing a second
+ * one.
  */
 const EngramEditor = lazy(() => import("./screens/EngramEditor"));
+const ManifestEditor = lazy(() => import("./screens/ManifestEditor"));
+
+const EDITOR_FALLBACK = (
+  <p className="text-sm text-slate-500 dark:text-slate-400">
+    Loading the editor
+  </p>
+);
 
 export function AppRoutes() {
   return (
@@ -54,14 +67,25 @@ export function AppRoutes() {
           <Route
             path="/d/:domain/edit/*"
             element={
-              <Suspense
-                fallback={
-                  <p className="text-sm text-slate-500 dark:text-slate-400">
-                    Loading the editor
-                  </p>
-                }
-              >
+              <Suspense fallback={EDITOR_FALLBACK}>
                 <EngramEditor />
+              </Suspense>
+            }
+          />
+          {/*
+            Both MANIFEST routes sit above `/d/:domain/e/*` for readability,
+            though nothing here collides: `manifest` is its own segment, not a
+            permalink the splat below would otherwise swallow. The page is a
+            static import - it renders markdown, no editor weight - while the
+            editor rides its own lazy chunk, gated to admins by the screen
+            itself the same way `/users` is.
+          */}
+          <Route path="/d/:domain/manifest" element={<ManifestPage />} />
+          <Route
+            path="/d/:domain/manifest/edit"
+            element={
+              <Suspense fallback={EDITOR_FALLBACK}>
+                <ManifestEditor />
               </Suspense>
             }
           />
