@@ -142,3 +142,15 @@
     color: #fcd34d;
   }
 }
+
+@media print {
+  /* The engram page prints as a document: title, metadata line, content. */
+  main {
+    max-width: none;
+    padding: 0;
+  }
+  a {
+    color: inherit;
+    text-decoration: none;
+  }
+}

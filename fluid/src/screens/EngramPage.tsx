@@ -46,6 +46,7 @@ import {
 import { useAuth } from "../auth/AuthContext";
 import { AgentsEye } from "../components/AgentsEye";
 import { BacklinksPanel } from "../components/BacklinksPanel";
+import { EngramActions } from "../components/EngramActions";
 import { FrontmatterPanel } from "../components/FrontmatterPanel";
 import { LifecycleBanner } from "../components/LifecycleBanner";
 import type { LifecycleLink } from "../components/LifecycleBanner";
@@ -137,37 +138,46 @@ export default function EngramPage() {
             {engram.domain}
           </Link>
           <span className="font-mono text-xs">{engram.permalink}</span>
-          <CopyAddressButton address={engram.url} />
-          {capabilities.canWrite && (
-            <>
-              <Link
-                to={editRoute(engram.domain, engram.permalink)}
-                onPointerEnter={prefetchEditor}
-                onFocus={prefetchEditor}
-                className="rounded border border-slate-300 px-2 py-0.5 text-xs hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800"
-              >
-                Edit
-              </Link>
-              <button
-                type="button"
-                onClick={() => {
-                  setRetiring(true);
-                }}
-                className="rounded border border-slate-300 px-2 py-0.5 text-xs hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800"
-              >
-                Retire
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setMoving(true);
-                }}
-                className="rounded border border-slate-300 px-2 py-0.5 text-xs hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800"
-              >
-                Move
-              </button>
-            </>
-          )}
+          {/*
+            The metadata above prints as part of the page's small metadata
+            line; the controls below are chrome and stay off the printed
+            page, which is why they sit inside their own print:hidden group
+            rather than the row's own.
+          */}
+          <span className="inline-flex flex-wrap items-center gap-x-3 gap-y-1 print:hidden">
+            <CopyAddressButton address={engram.url} />
+            {capabilities.canWrite && (
+              <>
+                <Link
+                  to={editRoute(engram.domain, engram.permalink)}
+                  onPointerEnter={prefetchEditor}
+                  onFocus={prefetchEditor}
+                  className="rounded border border-slate-300 px-2 py-0.5 text-xs hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800"
+                >
+                  Edit
+                </Link>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setRetiring(true);
+                  }}
+                  className="rounded border border-slate-300 px-2 py-0.5 text-xs hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800"
+                >
+                  Retire
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setMoving(true);
+                  }}
+                  className="rounded border border-slate-300 px-2 py-0.5 text-xs hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800"
+                >
+                  Move
+                </button>
+              </>
+            )}
+            <EngramActions engram={engram} />
+          </span>
         </p>
       </header>
 
@@ -202,14 +212,18 @@ export default function EngramPage() {
           </article>
           <Observations observations={engram.observations} />
           <Relations relations={engram.relations} resolve={wikilinks} />
-          <GraphSection domain={engram.domain} permalink={engram.permalink} />
-          <AgentsEye
-            domain={engram.domain}
-            salience={engram.frontmatter.salience}
-            content={engram.content}
-          />
+          <div className="print:hidden">
+            <GraphSection domain={engram.domain} permalink={engram.permalink} />
+          </div>
+          <div className="print:hidden">
+            <AgentsEye
+              domain={engram.domain}
+              salience={engram.frontmatter.salience}
+              content={engram.content}
+            />
+          </div>
         </div>
-        <aside className="flex flex-col gap-4">
+        <aside className="flex flex-col gap-4 print:hidden">
           <FrontmatterPanel frontmatter={engram.frontmatter} />
           <BacklinksPanel
             backlinks={backlinks}

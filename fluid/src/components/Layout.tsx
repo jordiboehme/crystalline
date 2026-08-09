@@ -76,7 +76,7 @@ function TopBar({
   const { capabilities } = useAuth();
 
   return (
-    <header className="sticky top-0 z-40 border-b border-slate-200 bg-white/90 backdrop-blur dark:border-slate-800 dark:bg-slate-950/90">
+    <header className="sticky top-0 z-40 border-b border-slate-200 bg-white/90 backdrop-blur print:hidden dark:border-slate-800 dark:bg-slate-950/90">
       <div className="mx-auto flex w-full max-w-350 items-center gap-3 px-4 py-3">
         <button
           type="button"
@@ -314,7 +314,7 @@ function DomainSidebar({ open }: { open: boolean }) {
     <nav
       id="domain-sidebar"
       aria-label={domain === "" ? "Domains" : `Domain ${domain}`}
-      className={`${open ? "block" : "hidden"} w-56 shrink-0 md:block`}
+      className={`${open ? "block" : "hidden"} w-56 shrink-0 print:hidden md:block`}
     >
       {domain === "" ? (
         <DomainList
