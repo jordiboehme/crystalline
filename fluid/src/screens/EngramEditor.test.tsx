@@ -472,6 +472,62 @@ describe("the engram editor", () => {
     ).toHaveLength(expectedLines);
   });
 
+  it("a buffer rebuilt while raw comes back raw, not silently decorated", async () => {
+    const crlfContent = CONTENT.replace(/\n/g, "\r\n");
+    const lfServerContent = CONTENT.replace("A rule.", "Somebody else's rule.");
+    serveEditor({
+      "/domains/eng/engrams/alpha": (_path, init) => {
+        if (init?.method === "PUT") {
+          throw new ApiProblem(
+            412,
+            "precondition failed",
+            "stale edit: engram changed since it was read",
+            { current_etag: '"srv999"', current_content: lfServerContent },
+          );
+        }
+        return detailResponse({ content: crlfContent });
+      },
+    });
+    renderApp("/d/eng/edit/alpha");
+    const editor = await screen.findByLabelText("Engram source");
+    await waitFor(() => {
+      expect(editor.textContent).toContain("A rule.");
+    });
+    await userEvent.click(screen.getByRole("button", { name: "Raw" }));
+    await waitFor(() => {
+      expect(screen.getByLabelText("Engram source").textContent).toContain(
+        "# Alpha",
+      );
+    });
+    // The separator differs, so this swap rebuilds the whole state rather
+    // than dispatching into it - the path that would drop the compartment.
+    await userEvent.click(screen.getByRole("button", { name: "Save" }));
+    await screen.findByRole("dialog", { name: /someone else saved/i });
+    await userEvent.click(
+      screen.getByRole("button", { name: "Take the server version" }),
+    );
+    await waitFor(() => {
+      expect(screen.getByLabelText("Engram source").textContent).toContain(
+        "Somebody else's rule.",
+      );
+    });
+    // Still raw, in the button's state and in the buffer alike.
+    expect(screen.getByRole("button", { name: "Raw" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    expect(screen.getByLabelText("Engram source").textContent).toContain(
+      "# Alpha",
+    );
+    // And the toggle still reaches the rebuilt state.
+    await userEvent.click(screen.getByRole("button", { name: "Raw" }));
+    await waitFor(() => {
+      expect(screen.getByLabelText("Engram source").textContent).not.toContain(
+        "# Alpha",
+      );
+    });
+  });
+
   it("keep editing closes the dialog without touching the buffer, the draft or the stale token", async () => {
     serveEditor({
       "/domains/eng/engrams/alpha": (_path, init) => {

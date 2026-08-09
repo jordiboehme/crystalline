@@ -19,13 +19,12 @@ import { baseExtensions, docText, lineSeparatorFor } from "./setup";
 const DOC =
   "---\ntitle: Alpha\n---\n\n# Heading\n\nSome *emphasis* here.\n\n- [ ] a task\n";
 
-function editor(doc: string, at = doc.length): EditorView {
-  return new EditorView({
+function editor(doc: string, at?: number): EditorView {
+  const view = new EditorView({
     // A named separator on every state this file builds, tests included: a
     // buffer that names none rewrites a CRLF document to LF on read-back.
     state: EditorState.create({
       doc,
-      selection: EditorSelection.cursor(at),
       extensions: [
         ...lineSeparatorFor(doc),
         ...baseExtensions(false),
@@ -34,6 +33,13 @@ function editor(doc: string, at = doc.length): EditorView {
     }),
     parent: document.body,
   });
+  // The end of the document is asked of the buffer, never of the file string:
+  // positions are offsets into the buffer, and a CRLF document is one unit
+  // shorter per line than the text it was built from.
+  view.dispatch({
+    selection: EditorSelection.cursor(at ?? view.state.doc.length),
+  });
+  return view;
 }
 
 describe("frontmatterRegion", () => {
@@ -93,6 +99,31 @@ describe("live preview", () => {
     expect(checked?.checked).toBe(true);
     checked?.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
     expect(docText(view.state)).toContain("- [ ] a task");
+    view.destroy();
+  });
+
+  it("toggles a task on a CRLF document without disturbing its endings", () => {
+    const crlf = DOC.replace(/\n/g, "\r\n");
+    const view = editor(crlf, 0);
+    view.dom
+      .querySelector<HTMLInputElement>("input.cm-task-toggle")
+      ?.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+    // The edit is the three marker characters and nothing else: every other
+    // byte of the file, line endings included, is where it was.
+    expect(docText(view.state)).toBe(crlf.replace("- [ ]", "- [x]"));
+    view.destroy();
+  });
+
+  it("keeps a fenced block's delimiters and info string visible", () => {
+    const doc = "# Doc\n\n`inline` code.\n\n```ts\nconst a = 1;\n```\n\ntail\n";
+    const view = editor(doc);
+    // The fence is the only thing saying "this is a code block" until a
+    // widget draws one, and folding it would strand `ts` as a paragraph.
+    expect(view.contentDOM.textContent).toContain("```ts");
+    expect(view.contentDOM.textContent).toContain("const a = 1;");
+    // Inline backticks are a different CodeMark and still fold away.
+    expect(view.contentDOM.textContent).toContain("inline");
+    expect(view.contentDOM.textContent).not.toContain("`inline`");
     view.destroy();
   });
 

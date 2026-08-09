@@ -75,6 +75,21 @@ const saveKeymap = keymap.of([
 ]);
 
 /**
+ * What the preview compartment holds, in the one place it is ever spelled.
+ *
+ * Three sites configure that compartment - the mount extensions, the Raw
+ * toggle and the buffer rebuild in `replaceBuffer` - and a decoration layer
+ * added to only two of them would vanish on whichever path was missed. Later
+ * layers are appended to this array and reach all three at once.
+ */
+function previewConfig(off: boolean): Extension {
+  return off ? [] : livePreview();
+}
+
+/** Preview is on when the editor opens. */
+const RAW_AT_MOUNT = false;
+
+/**
  * Replace the whole buffer with `content`, preserving whichever line ending
  * `content` actually uses - the mechanism both "take the server version"
  * (after a conflict) and "restore draft" share, since both swap in text that
@@ -196,9 +211,7 @@ function EditorSurface({ engram }: { engram: EngramDetail }) {
    * never set again.
    */
   const [preview] = useState(() => new Compartment());
-  const [raw, setRaw] = useState(false);
-  const previewConfig = (off: boolean): Extension =>
-    preview.of(off ? [] : livePreview());
+  const [raw, setRaw] = useState(RAW_AT_MOUNT);
   // What the server holds, moved forward on every successful save.
   const [checksum, setChecksum] = useState(engram.checksum ?? "");
   const [savedText, setSavedText] = useState(engram.content);
@@ -315,9 +328,9 @@ function EditorSurface({ engram }: { engram: EngramDetail }) {
       ...lineSeparatorFor(engram.content),
       ...baseExtensions(resolved === "dark"),
       saveKeymap,
-      // On at mount, which is what `raw` starts as; every later flip goes
-      // through the compartment rather than through this array.
-      preview.of(livePreview()),
+      // Every later flip goes through the compartment rather than through
+      // this array, which is read once at mount.
+      preview.of(previewConfig(RAW_AT_MOUNT)),
     ],
     // Read once: `CmEditor` snapshots the extensions at mount, so a later
     // theme change reaches the buffer through a remount rather than through
@@ -365,7 +378,7 @@ function EditorSurface({ engram }: { engram: EngramDetail }) {
               const next = !raw;
               setRaw(next);
               viewRef.current?.dispatch({
-                effects: preview.reconfigure(next ? [] : livePreview()),
+                effects: preview.reconfigure(previewConfig(next)),
               });
             }}
             className={
@@ -411,7 +424,7 @@ function EditorSurface({ engram }: { engram: EngramDetail }) {
                   view,
                   offeredDraft.content,
                   resolved === "dark",
-                  previewConfig(raw),
+                  preview.of(previewConfig(raw)),
                   setBuffer,
                 );
               }
@@ -479,7 +492,7 @@ function EditorSurface({ engram }: { engram: EngramDetail }) {
                 view,
                 conflict.currentContent,
                 resolved === "dark",
-                previewConfig(raw),
+                preview.of(previewConfig(raw)),
                 setBuffer,
               );
             }

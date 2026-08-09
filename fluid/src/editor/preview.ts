@@ -27,6 +27,7 @@ import {
   ViewPlugin,
   WidgetType,
 } from "@codemirror/view";
+import type { SyntaxNodeRef } from "@lezer/common";
 
 import { frontmatterRegion } from "./frontmatterRegion";
 
@@ -113,6 +114,18 @@ class CheckboxWidget extends WidgetType {
   }
 }
 
+/**
+ * A fenced code block's own delimiter line, which stays visible.
+ *
+ * `CodeMark` is both an inline backtick and a fence, and folding the fence
+ * away strands the info string: the language name is left reading as a
+ * paragraph above a block of code with no affordance saying it is one. Until
+ * a widget draws the block properly, the fence is the affordance.
+ */
+function isFence(node: SyntaxNodeRef): boolean {
+  return node.name === "CodeMark" && node.node.parent?.name === "FencedCode";
+}
+
 /** The line numbers any selection range touches. */
 function activeLines(view: EditorView): Set<number> {
   const lines = new Set<number>();
@@ -151,7 +164,7 @@ function buildDecorations(view: EditorView): DecorationSet {
         if (active.has(doc.lineAt(node.from).number)) {
           return;
         }
-        const isMark = FOLDING_MARKS.has(node.name);
+        const isMark = FOLDING_MARKS.has(node.name) && !isFence(node);
         const isTask = node.name === "TaskMarker";
         if (!isMark && !isTask) {
           return;
