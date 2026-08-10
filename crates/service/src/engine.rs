@@ -5412,7 +5412,26 @@ impl Engine {
     /// Files are never touched - for a file domain they stay on disk exactly
     /// as they are (re-adding the folder re-adopts them); a virtual domain's
     /// rows ARE its truth, so callers should export first and their
-    /// confirmation copy must say the knowledge is gone.
+    /// confirmation copy must say the knowledge is gone. "Index rows cleared"
+    /// means the engram rows only: the store's domain row itself is left in
+    /// place (`Store::clear_domain` keeps it by design), so a later re-add of
+    /// the same name adopts the same row rather than minting a new one.
+    ///
+    /// Known race: the config write (name freed) is persisted and both config
+    /// locks release before the tail runs `forget_domain` and `clear_domain`.
+    /// No lock in this engine currently serializes `domain_remove` against a
+    /// concurrent `domain_add_local`/`domain_add_virtual` for the same name
+    /// (the daemon spawns each connection independently, and the admin verbs
+    /// only hold `file_config`/`config` for their brief mutate-and-persist
+    /// step, not the whole call - `origin_lock` exists but serializes only
+    /// the origin verbs against each other, not these). A same-name add
+    /// racing into that window has its fresh watcher registration dropped and
+    /// its freshly-indexed rows wiped by this call's tail, since both resolve
+    /// the same `DomainId` by name. Closing this needs the add verbs to take
+    /// the same per-name lock this verb would need to hold across its own
+    /// tail, which is a cross-verb change out of scope here; a caller that
+    /// cannot tolerate the window should serialize admin mutations for a
+    /// given name at its own layer (tracked for the REST unregister route).
     pub async fn domain_remove(&self, name: &str) -> Result<Value> {
         if self.read_only {
             return Err(EngineError::ReadOnly);
