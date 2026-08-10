@@ -63,6 +63,10 @@ export interface CollabHello {
   checksum: string;
   permalink: string;
   save_state: "ok" | "failed" | "conflict";
+  /** Why saving is refused, when the room greets with "failed" and the server
+   *  has words for it. Absent on a healthy room and on a conflict, whose body
+   *  is re-derived rather than greeted. */
+  detail?: string;
 }
 
 export type CollabControl =

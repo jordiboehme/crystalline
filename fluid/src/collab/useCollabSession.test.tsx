@@ -322,6 +322,22 @@ describe("useCollabSession", () => {
     expect(session().conflict?.theirs).toBeNull();
   });
 
+  it("greets a joiner into a save-blocked room with the server's own words", async () => {
+    // The SaveFailed broadcast went out before this socket was subscribed and
+    // the session never repeats a refusal it has announced, so the greeting is
+    // the only place this tab can learn the room cannot save. Read as "Saved",
+    // it would sit over an engram nothing has written since.
+    joinRoom({ save_state: "failed", detail: "the file is read only" });
+    expect(session().saveState).toBe("failed");
+    expect(session().saveDetail).toBe("the file is read only");
+    // And it is a refusal, not a conflict: nothing is fetched to resolve.
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(detailMock).not.toHaveBeenCalled();
+    expect(session().conflict).toBeNull();
+  });
+
   it("re-derives nothing for a room that greeted it in good order", async () => {
     joinRoom();
     await act(async () => {
@@ -555,6 +571,84 @@ describe("useCollabSession reconnecting", () => {
     expect(session().mode).toBe("collab");
     expect(session().ytext).not.toBe(before);
     expect(session().ytext?.toJSON()).toBe("fresh from the file\n");
+  });
+
+  it("leaves the old session's conflict behind when a new epoch rebuilds the room", () => {
+    // A room in conflict that hits a daemon restart: the rebuilt generation is
+    // a different server session, and the banner the old one raised would
+    // otherwise stand over it with buttons that resolve a room that is gone.
+    const { socket } = joinRoom();
+    act(() => {
+      socket.receive(
+        controlFrame({
+          kind: "conflict",
+          conflict_kind: "edit",
+          theirs: "their text",
+          detail: "an agent rewrote this engram",
+        }),
+      );
+    });
+    expect(session().saveState).toBe("conflict");
+    expect(session().conflict).not.toBeNull();
+
+    act(() => {
+      socket.dropWith(1006);
+    });
+    act(() => {
+      vi.advanceTimersByTime(BACKOFF_CAP_MS);
+    });
+    const fresh = new Y.Doc();
+    fresh.getText(TEXT_NAME).insert(0, SESSION_TEXT);
+    const retry = socketAt(1);
+    act(() => {
+      retry.open();
+      retry.receive(concat(helloFrame("e2"), serverStep1(fresh)));
+    });
+    // Cleared by the rebuild itself, before any greeting could have healed it:
+    // between the gap and the new hello there is no room whose verdict this
+    // could be.
+    expect(session().conflict).toBeNull();
+    expect(session().saveState).toBe("ok");
+    expect(session().saveDetail).toBeNull();
+
+    // And the rebuilt room's own greeting is what stands from there on.
+    const rebuilt = socketAt(2);
+    act(() => {
+      rebuilt.open();
+      rebuilt.receive(
+        helloFrame("e2", { save_state: "failed", detail: "the disk is full" }),
+      );
+    });
+    act(() => {
+      answerStep1(rebuilt, fresh);
+    });
+    expect(session().mode).toBe("collab");
+    expect(session().conflict).toBeNull();
+    expect(session().saveState).toBe("failed");
+    expect(session().saveDetail).toBe("the disk is full");
+  });
+
+  it("never calls this tab's unsaved edits saved on a resync greeting", () => {
+    // save_state "ok" means the SERVER has nothing standing against saving,
+    // not that this tab's text is on disk: the edits made while the socket was
+    // down are still owed, and the unload prompt keys on that.
+    const { socket, server } = joinRoom();
+    act(() => {
+      session().ytext?.insert(0, "offline ");
+    });
+    expect(session().saveState).toBe("pending");
+    act(() => {
+      socket.dropWith(1006);
+    });
+    act(() => {
+      vi.advanceTimersByTime(BACKOFF_CAP_MS);
+    });
+    const retry = socketAt(1);
+    act(() => {
+      retry.open();
+      retry.receive(concat(helloFrame("e1"), serverStep1(server)));
+    });
+    expect(session().saveState).toBe("pending");
   });
 
   it("falls back to solo when sockets keep opening and dropping without a greeting", () => {

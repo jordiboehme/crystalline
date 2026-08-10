@@ -238,11 +238,44 @@ export function useCollabSession(options: CollabSessionOptions): CollabSession {
             separatorRef.current = control.separator;
             checksumRef.current = control.checksum;
             setPermalink(control.permalink);
-            if (control.save_state === "conflict") {
-              // Joined into a suspended room: saving is off from this tab's
-              // first frame, whether or not it ever sees a Conflict of its
-              // own. The body is re-derived below.
-              setSave("conflict");
+            // The greeting is this tab's whole picture of a room it did not
+            // watch start: every verdict the server owns is adopted from it,
+            // because the broadcast that carried each one went out before
+            // this socket was subscribed and none of them is repeated.
+            switch (control.save_state) {
+              case "conflict": {
+                // Joined into a suspended room: saving is off from this tab's
+                // first frame, whether or not it ever sees a Conflict of its
+                // own. The body is re-derived below.
+                setSave("conflict");
+                break;
+              }
+              case "failed": {
+                // A room that cannot save, greeting a tab that would
+                // otherwise read "Saved" over an engram nothing has written
+                // since the refusal. The reason rides the greeting; a server
+                // that does not send one leaves the alert wordless rather
+                // than inventing a cause.
+                setSave("failed");
+                setSaveDetail(control.detail ?? null);
+                break;
+              }
+              case "ok": {
+                // A healthy room: whatever this tab was told before it went
+                // away is over, conflict included - the resolution may have
+                // been somebody else's while the socket was down.
+                clearConflict();
+                // Only a verdict the SERVER owns heals beyond that. "pending"
+                // is this tab's own unsaved text, which no greeting knows
+                // about: a resync after a drop greets with "ok" while the
+                // edits made offline are still owed, and adopting it would
+                // call them saved.
+                if (saveStateRef.current === "failed") {
+                  setSave("ok");
+                  setSaveDetail(null);
+                }
+                break;
+              }
             }
             break;
           }
@@ -342,6 +375,24 @@ export function useCollabSession(options: CollabSessionOptions): CollabSession {
         // anything off it would be reading a corpse.
         setMode("connecting");
         setStatus("connecting");
+        // And the verdict goes with the session that reached it. What the
+        // rebuild lands on is a DIFFERENT server session that greets with a
+        // state of its own, so anything this one left standing - a conflict
+        // banner whose buttons would resolve a room that is gone, a refusal
+        // naming a save nobody is retrying, a merge toast - is cleared here
+        // rather than left up until some later control happens to overwrite
+        // it. Refs as well as state: the handlers of the rebuilt generation
+        // read the refs, and so does the joiner's derivation.
+        //
+        // Here rather than at the top of the build effect below, because this
+        // is the one path that rebuilds a generation in place, and a state
+        // write belongs in the event that causes it rather than in an effect.
+        saveStateRef.current = "ok";
+        conflictRef.current = null;
+        setSaveState("ok");
+        setSaveDetail(null);
+        setConflict(null);
+        setMergeNotice(false);
         setGeneration((current) => current + 1);
       },
     };
