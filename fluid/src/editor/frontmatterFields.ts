@@ -10,12 +10,14 @@
  * maps) is read as its raw text and rewritten as a plain scalar when edited
  * through the form - the raw editor is always there for the fancy cases.
  *
- * String mathematics only, over the buffer's own text: no CodeMirror imports,
- * so the offsets here are offsets into that string. A caller dispatching them
- * into a view translates them through the document's line API first, because
- * a CRLF buffer counts each break as one position and these offsets count it
- * as two.
+ * String mathematics only, over the buffer's own text: nothing here reads a
+ * CodeMirror document, so the offsets are offsets into that string. A caller
+ * dispatching them into a view translates them through the document's line API
+ * first, because a CRLF buffer counts each break as one position and these
+ * offsets count it as two.
  */
+
+import { separatorOf } from "./setup";
 
 /** One edit, as offsets into the string it was computed from. */
 export interface FieldEdit {
@@ -28,11 +30,6 @@ export interface FieldEdit {
 interface LineSpan {
   lineStart: number;
   lineEnd: number;
-}
-
-/** The separator the document uses, by the same rule the buffer mounts with. */
-function separatorOf(doc: string): string {
-  return doc.includes("\r\n") ? "\r\n" : "\n";
 }
 
 /** The block's inner line spans, or null when there is no block to edit. */
