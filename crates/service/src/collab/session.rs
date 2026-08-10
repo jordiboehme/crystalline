@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 use bytes::Bytes;
@@ -29,6 +29,14 @@ pub const MAX_PARTICIPANTS: usize = 16;
 /// Fan-out queue depth per connection; a receiver this far behind is closed
 /// by the socket loop and reconnects rather than silently losing frames.
 const BROADCAST_CAPACITY: usize = 256;
+/// How long a pause in typing lands the save after.
+pub const SAVE_DEBOUNCE_MS: u64 = 2_000;
+/// The longest continuous typing goes without a save landing.
+pub const SAVE_MAX_LAG_MS: u64 = 15_000;
+/// How long a session sits idle before the external-change probe runs.
+pub const IDLE_CHECK_MS: u64 = 10_000;
+/// How often the per-session saver wakes up to ask whether anything is due.
+const SAVER_TICK_MS: u64 = 250;
 
 /// One connection's identity inside a session, minted at join.
 pub type ConnId = u64;
@@ -125,16 +133,26 @@ impl CollabSessions {
         // stampede of joins can neither open the same document twice nor
         // overshoot MAX_PARTICIPANTS between the check and the add.
         let mut sessions = self.sessions.lock().await;
-        let (session, fresh) = match sessions.get(&key) {
-            Some(existing) => (existing.clone(), false),
+        // A disposed session still sitting in the map is a corpse: its saver
+        // loop has ended, so a join that adopted it would edit a room nothing
+        // ever writes back. Treated as absent and replaced.
+        let live = sessions
+            .get(&key)
+            .filter(|session| !session.is_disposed())
+            .cloned();
+        let (session, fresh) = match live {
+            Some(existing) => (existing, false),
             None => {
-                if sessions.len() >= MAX_SESSIONS {
+                // Replacing a corpse under this key does not grow the map, so
+                // capacity is only in question when the key is new.
+                if !sessions.contains_key(&key) && sessions.len() >= MAX_SESSIONS {
                     return Err(JoinError::ServerFull);
                 }
                 let opened =
                     CollabSession::open(self.engine.clone(), key.clone(), self.mint_epoch())
                         .await?;
                 sessions.insert(key.clone(), opened.clone());
+                tokio::spawn(run_saver(opened.clone()));
                 (opened, true)
             }
         };
@@ -148,8 +166,10 @@ impl CollabSessions {
             }),
             Err(err) => {
                 // A document opened for this join that then refused it would
-                // otherwise sit in the registry with nobody in it.
+                // otherwise sit in the registry with nobody in it, its saver
+                // ticking over a room no one will ever edit.
                 if fresh {
+                    session.dispose();
                     sessions.remove(&key);
                 }
                 Err(err)
@@ -163,9 +183,14 @@ impl CollabSessions {
     pub async fn dispose_if_empty(&self, domain: &str, permalink: &str) {
         let key = (domain.to_string(), permalink.to_string());
         let mut sessions = self.sessions.lock().await;
+        // A poisoned session counts as gone whether or not sockets still hang
+        // off it: it saves nothing and its saver has stopped, so it must not
+        // survive in the registry for a later join to find.
         if let Some(session) = sessions.get(&key)
-            && session.is_empty().await
+            && (session.is_disposed() || session.is_empty().await)
         {
+            // Ends the saver loop, and makes every later save path a no-op.
+            session.dispose();
             sessions.remove(&key);
         }
     }
@@ -193,14 +218,17 @@ impl CollabSessions {
 /// channel every connection listens on.
 pub struct CollabSession {
     epoch: String,
-    /// The registry key, (domain, permalink); the address saves write back to
-    /// (Task 6) and external-change checks probe.
-    #[allow(dead_code, reason = "the save path in Task 6 addresses writes with it")]
+    /// The registry key, (domain, permalink); the domain saves write back to
+    /// and external-change checks probe. The permalink half is the address at
+    /// OPEN time: a rename moves `SessionState::permalink`, never this.
     key: (String, String),
-    /// The engine every durable read and write goes through (Tasks 6-7).
-    #[allow(dead_code, reason = "the save path in Task 6 writes through it")]
+    /// The engine every durable read and write goes through.
     engine: Arc<Engine>,
     tx: broadcast::Sender<Frame>,
+    /// The room is over: the registry dropped it, or a saver pass panicked.
+    /// Ends the saver loop and makes every save path a no-op, so nothing can
+    /// write through a session no one owns any more.
+    disposed: AtomicBool,
     state: Mutex<SessionState>,
 }
 
@@ -221,23 +249,20 @@ struct SessionState {
     conns: HashMap<ConnId, HashSet<ClientID>>,
     dirty: bool,
     /// When the most recent update landed: the debounce timer's input.
-    #[allow(dead_code, reason = "the debounce in Task 6 reads it")]
     last_edit: Option<Instant>,
     /// When the first unsaved update landed: the max-wait timer's input.
-    #[allow(dead_code, reason = "the debounce in Task 6 reads it")]
     oldest_unsaved: Option<Instant>,
     /// A client asked for a save now rather than on the debounce.
-    #[allow(dead_code, reason = "the save loop in Task 6 consumes it")]
     flush_requested: bool,
+    /// When the idle external-change probe last ran (Task 7).
+    #[allow(dead_code, reason = "the idle probe in Task 7 reads and sets it")]
+    last_probe: Option<Instant>,
     save_state: SaveStateTag,
 }
 
 /// The wire label in hello/save_state controls ("ok" | "failed" | "conflict").
 #[derive(Clone, Copy, PartialEq)]
-#[allow(
-    dead_code,
-    reason = "Failed and Conflict are set by the save and merge paths in Tasks 6-7"
-)]
+#[allow(dead_code, reason = "Conflict is set by the merge path in Task 7")]
 enum SaveStateTag {
     Ok,
     Failed,
@@ -285,6 +310,7 @@ impl CollabSession {
             key,
             engine,
             tx,
+            disposed: AtomicBool::new(false),
             state: Mutex::new(SessionState {
                 separator: separator_of(&loaded.content),
                 awareness: Awareness::new(doc),
@@ -297,6 +323,7 @@ impl CollabSession {
                 last_edit: None,
                 oldest_unsaved: None,
                 flush_requested: false,
+                last_probe: None,
                 save_state: SaveStateTag::Ok,
             }),
         }))
@@ -466,6 +493,13 @@ impl CollabSession {
     /// fidelity property for open-then-close).
     pub async fn snapshot(&self) -> (String, bool) {
         let state = self.state.lock().await;
+        let file = Self::file_text_locked(&state);
+        let dirty = state.dirty && file != state.last_saved_text;
+        (file, dirty)
+    }
+
+    /// The session text in FILE space, read off the locked state.
+    fn file_text_locked(state: &SessionState) -> String {
         let session = {
             // The text handle is taken before the transaction:
             // `get_or_insert_text` opens one of its own, which would deadlock
@@ -475,8 +509,203 @@ impl CollabSession {
             let txn = doc.transact();
             text.get_string(&txn)
         };
-        let file = file_text(&session, state.separator);
-        let dirty = state.dirty && file != state.last_saved_text;
-        (file, dirty)
+        file_text(&session, state.separator)
+    }
+
+    /// Whether this room is over: disposed by the registry or poisoned by a
+    /// panicked saver pass.
+    pub fn is_disposed(&self) -> bool {
+        self.disposed.load(Ordering::Relaxed)
+    }
+
+    /// End the room: the saver loop stops on its next tick and every save path
+    /// turns into a no-op.
+    pub fn dispose(&self) {
+        self.disposed.store(true, Ordering::Relaxed);
+    }
+
+    /// One saver pass at `now`: decides whether a save is due and runs it.
+    /// Takes `now` so tests drive time synthetically instead of sleeping.
+    pub async fn tick_save(&self, now: Instant) {
+        if self.is_disposed() {
+            return;
+        }
+        let mut state = self.state.lock().await;
+        if matches!(state.save_state, SaveStateTag::Conflict) {
+            return; // saving is suspended until the room resolves (Task 7)
+        }
+        if !state.flush_requested && !state.dirty && state.oldest_unsaved.is_none() {
+            // Nothing has arrived at all since the last save, so there is
+            // nothing to render or compare. A cheap pre-filter that keeps an
+            // idle room free, NOT the debounce: that gates on the text below.
+            return; // Task 7 adds the idle external-change probe here
+        }
+        let elapsed = |since: Option<Instant>, ms: u64| {
+            since.is_some_and(|at| now.saturating_duration_since(at).as_millis() as u64 >= ms)
+        };
+        // What arms the timers is the TEXT comparison, never the `dirty` flag:
+        // a joining provider answers the greeting with a SyncStep2 that marks
+        // the session dirty while carrying no edit, and a flag-gated debounce
+        // would arm a save on every unedited join.
+        let file = Self::file_text_locked(&state);
+        let changed = file != state.last_saved_text;
+        let due = state.flush_requested
+            || (changed && elapsed(state.last_edit, SAVE_DEBOUNCE_MS))
+            || (changed && elapsed(state.oldest_unsaved, SAVE_MAX_LAG_MS));
+        if !due {
+            if changed {
+                return; // the windows are still open; keep typing
+            }
+            // Nothing effective is pending: disarm what a no-op update set, so
+            // the next real edit starts both timers from scratch.
+            state.dirty = false;
+            state.last_edit = None;
+            state.oldest_unsaved = None;
+            if matches!(state.save_state, SaveStateTag::Ok) {
+                return; // Task 7 adds the idle external-change probe here
+            }
+            // A save-blocked session whose text matches the file again has
+            // nothing left to warn about: fall through so the state heals.
+        }
+        self.save_locked(&mut state).await;
+    }
+
+    /// The last participant left, or the daemon is shutting the session down:
+    /// land whatever is unsaved, unconditionally due.
+    pub async fn final_save(&self) {
+        if self.is_disposed() {
+            return; // a disposed or poisoned room never writes again
+        }
+        let mut state = self.state.lock().await;
+        if matches!(state.save_state, SaveStateTag::Conflict) {
+            return; // an unresolved conflict never saves; drafts hold the text
+        }
+        self.save_locked(&mut state).await;
+    }
+
+    /// A panic below yrs killed a saver pass (y-crdt/y-crdt#386): close the
+    /// room permanently instead of stalling saves silently. Every socket sees
+    /// `Closed { reason: "internal" }` and closes with the permanent code, the
+    /// session never saves again, and participants' drafts hold their text.
+    pub async fn poison(&self) {
+        self.dispose();
+        let _ = self.tx.send(Frame {
+            from: None,
+            bytes: Bytes::from(control::encode(&Control::Closed {
+                reason: "internal".to_string(),
+            })),
+        });
+    }
+
+    /// One save attempt over the locked state. Holding the lock across the
+    /// engine call serializes edits against the save, so the text that lands
+    /// is exactly the text recorded as saved; sessions are small and a save is
+    /// milliseconds, so simplicity wins over concurrency here.
+    async fn save_locked(&self, state: &mut SessionState) {
+        if self.is_disposed() {
+            return; // disposed or poisoned: this session is done writing
+        }
+        let file = Self::file_text_locked(state);
+        state.flush_requested = false;
+        if file == state.last_saved_text {
+            // Nothing effective changed: never write, never touch the mtime.
+            state.dirty = false;
+            state.oldest_unsaved = None;
+            if !matches!(state.save_state, SaveStateTag::Ok) {
+                // The document matches the file again, so the standing save
+                // failure is over; the room is told so its alert clears.
+                state.save_state = SaveStateTag::Ok;
+                let _ = self.tx.send(Frame {
+                    from: None,
+                    bytes: Bytes::from(control::encode(&Control::Saved {
+                        checksum: state.checksum.clone(),
+                        permalink: state.permalink.clone(),
+                    })),
+                });
+            }
+            return;
+        }
+        let receipt = self
+            .engine
+            .save_engram(&crate::params::SaveParams {
+                domain: self.key.0.clone(),
+                identifier: state.permalink.clone(),
+                content: file.clone(),
+                expected_checksum: state.checksum.clone(),
+            })
+            .await;
+        match receipt {
+            Ok(receipt) => {
+                let checksum = receipt["checksum"].as_str().unwrap_or_default().to_string();
+                // The permalink the engram answers to AFTER the write: an
+                // author who edited the frontmatter line just moved the
+                // address, and the next save must use the new one.
+                let permalink = receipt["permalink"]
+                    .as_str()
+                    .unwrap_or(&state.permalink)
+                    .to_string();
+                // Checksum and text move together: the checksum is the CAS
+                // token for exactly this text, and it is also what a
+                // reconnecting client is greeted with.
+                state.checksum = checksum.clone();
+                state.last_saved_text = file;
+                state.permalink = permalink.clone();
+                state.dirty = false;
+                state.oldest_unsaved = None;
+                state.save_state = SaveStateTag::Ok;
+                let _ = self.tx.send(Frame {
+                    from: None,
+                    bytes: Bytes::from(control::encode(&Control::Saved {
+                        checksum,
+                        permalink,
+                    })),
+                });
+            }
+            Err(err) => {
+                // Task 7 takes the Conflict("stale edit") and NotFound arms to
+                // the merge flow; until then every refusal is save-blocked.
+                // The session stays open and editable either way, and every
+                // later flush retries: dirty and oldest_unsaved stand.
+                let detail = err.to_string();
+                if !matches!(state.save_state, SaveStateTag::Failed) {
+                    let _ = self.tx.send(Frame {
+                        from: None,
+                        bytes: Bytes::from(control::encode(&Control::SaveFailed {
+                            detail: detail.clone(),
+                        })),
+                    });
+                }
+                tracing::debug!(domain = %self.key.0, permalink = %state.permalink, %detail, "a session save was refused");
+                state.save_state = SaveStateTag::Failed;
+            }
+        }
+    }
+}
+
+/// The per-session saver, spawned by the registry when it opens a session:
+/// ticks [`CollabSession::tick_save`] until the session is disposed.
+///
+/// Each pass runs under `catch_unwind` because yrs can panic on pathological
+/// text shapes (y-crdt/y-crdt#386, ZWJ emoji deletions). Such a panic is
+/// session-fatal, never process-fatal and never a silent stall: a panicked
+/// pass tells the room and ends the session instead of killing this task
+/// quietly and stranding unsaved text.
+async fn run_saver(session: Arc<CollabSession>) {
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(SAVER_TICK_MS));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        if session.is_disposed() {
+            break;
+        }
+        let pass = std::panic::AssertUnwindSafe(session.tick_save(Instant::now()));
+        if futures::FutureExt::catch_unwind(pass).await.is_err() {
+            tracing::error!(
+                epoch = %session.epoch(),
+                "a collab saver pass panicked; closing the session"
+            );
+            session.poison().await;
+            break;
+        }
     }
 }
