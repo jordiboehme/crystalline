@@ -225,6 +225,50 @@ impl CollabSessions {
         }
     }
 
+    /// Close every open session of `domain`: the domain is being
+    /// unregistered, so each room saves its text first (the files stay on
+    /// disk; in-flight edits must not be lost) and is then poisoned so its
+    /// participants get a Closed control and drop cleanly. The registry lock
+    /// is held only to collect and remove the victims - never across a save
+    /// (lock order: registry then session, and an engine save can be slow).
+    /// Returns how many rooms were closed.
+    ///
+    /// A room removed here is gone from the registry before it is saved, so
+    /// the two entry-moving paths leave it alone from that moment on:
+    /// [`CollabSessions::rekey`] and [`CollabSessions::dispose_if_empty`] both
+    /// look the session up by key and find nothing of theirs, so a rename that
+    /// lands during the sweep cannot re-file a swept room.
+    ///
+    /// The sweep closes what is open, it does not lock the domain out: a join
+    /// that takes the registry lock after the victims were collected opens a
+    /// fresh room. Callers therefore unregister the domain in the engine FIRST
+    /// and sweep second, so such a join is refused by the engine read instead
+    /// of reopening a room over a domain the daemon no longer serves.
+    ///
+    /// Note that `poison` broadcasts `Closed { reason: "internal" }`, so a room
+    /// closed by an unregistration reads as an internal error on the client
+    /// side; the visible behavior (the editor closes, the room is unusable) is
+    /// right either way.
+    pub async fn dispose_domain(&self, domain: &str) -> usize {
+        let victims: Vec<Arc<CollabSession>> = {
+            let mut sessions = self.sessions.lock().await;
+            let keys: Vec<(String, String)> = sessions
+                .keys()
+                .filter(|key| key.0 == domain)
+                .cloned()
+                .collect();
+            keys.iter().filter_map(|key| sessions.remove(key)).collect()
+        };
+        let closed = victims.len();
+        for session in victims {
+            // The save comes FIRST: poison disposes the session, and a
+            // disposed session's save paths are all no-ops.
+            session.final_save().await;
+            session.poison().await;
+        }
+        closed
+    }
+
     /// Move a session's registry entry after a frontmatter rename, so the room
     /// is found under the permalink it now answers to and a client that
     /// follows the `Saved { permalink }` broadcast rejoins THIS room instead of

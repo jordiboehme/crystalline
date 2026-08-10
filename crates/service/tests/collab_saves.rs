@@ -18,20 +18,32 @@ use yrs::{Doc, GetString, Options, ReadTxn, Text, Transact, Update};
 
 const ALPHA: &str = "---\ntype: engram\ntitle: Alpha\npermalink: alpha\ntags:\n  - eng\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# Alpha\n\nA rule about alpha.\n";
 
-/// A file domain `eng` holding MANIFEST, alpha and a CRLF engram, synced into
-/// an in-memory store. Mirrors `collab_session.rs::engine_fixture`; integration
-/// test crates share no helpers, so it is copied rather than imported.
+/// The one engram of the second domain, so a sweep over `eng` has a neighbour
+/// it must leave alone.
+const OAK_NOTE: &str = "---\ntype: engram\ntitle: Oak Note\npermalink: oak-note\ntags:\n  - oak\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# Oak Note\n\nA rule about oak.\n";
+
+/// Write `name`'s MANIFEST into `dir`, the routing file every domain needs.
+fn write_manifest(dir: &std::path::Path, name: &str) {
+    std::fs::write(
+        dir.join("MANIFEST.md"),
+        format!(
+            "---\ntype: manifest\ntitle: {name}\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# {name}\n\n## Scope\n\n- Everything about {name}\n\n## When to Use\n\n- Route here for {name} questions\n"
+        ),
+    )
+    .unwrap();
+}
+
+/// Two file domains - `eng` holding MANIFEST, alpha and a CRLF engram, and
+/// `oak` holding MANIFEST and one note - synced into an in-memory store.
+/// Mirrors `collab_session.rs::engine_fixture`; integration test crates share
+/// no helpers, so it is copied rather than imported.
 async fn engine_fixture() -> (tempfile::TempDir, Arc<Engine>) {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
     let mut cfg = GlobalConfig::default();
     let dir = root.join("eng");
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(
-        dir.join("MANIFEST.md"),
-        "---\ntype: manifest\ntitle: eng\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# eng\n\n## Scope\n\n- Everything about eng\n\n## When to Use\n\n- Route here for eng questions\n",
-    )
-    .unwrap();
+    write_manifest(&dir, "eng");
     std::fs::write(dir.join("alpha.md"), ALPHA).unwrap();
     std::fs::write(
         dir.join("crlf.md"),
@@ -40,6 +52,12 @@ async fn engine_fixture() -> (tempfile::TempDir, Arc<Engine>) {
     .unwrap();
     cfg.domains
         .insert("eng".to_string(), DomainEntry::file(dir));
+    let oak = root.join("oak");
+    std::fs::create_dir_all(&oak).unwrap();
+    write_manifest(&oak, "oak");
+    std::fs::write(oak.join("oak-note.md"), OAK_NOTE).unwrap();
+    cfg.domains
+        .insert("oak".to_string(), DomainEntry::file(oak));
     cfg.service = Some(ServiceConfig {
         response_format: Some(ResponseFormat::Json),
         ..ServiceConfig::default()
@@ -625,6 +643,45 @@ async fn a_poisoned_session_closes_the_room_and_never_saves_again() {
     let again = sessions.join("eng", "alpha").await.unwrap();
     assert_ne!(again.session.epoch(), joined.session.epoch());
     assert_eq!(sessions.session_count().await, 1, "the corpse was replaced");
+}
+
+/// Unregistering a domain closes its rooms: the sweep saves each room's
+/// text first (the files stay on disk, so in-flight edits must land),
+/// then poisons so clients get a Closed control. Other domains' rooms
+/// are untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dispose_domain_saves_then_closes_only_that_domains_rooms() {
+    let (tmp, engine) = engine_fixture().await;
+    let sessions = CollabSessions::new(engine.clone());
+    let mut joined_eng = sessions.join("eng", "alpha").await.unwrap();
+    let joined_oak = sessions.join("oak", "oak-note").await.unwrap();
+    assert_eq!(sessions.session_count().await, 2);
+
+    let doc = sync_client(&joined_eng).await;
+    append_line(&joined_eng, &doc, "A swept edit").await;
+
+    let closed = sessions.dispose_domain("eng").await;
+    assert_eq!(closed, 1);
+    assert_eq!(sessions.session_count().await, 1, "oak's room lives on");
+    assert!(joined_eng.session.is_disposed());
+    assert!(!joined_oak.session.is_disposed(), "oak was not swept");
+    // The final save landed in the file that stays on disk.
+    let on_disk = std::fs::read_to_string(tmp.path().join("eng/alpha.md")).unwrap();
+    assert!(on_disk.contains("A swept edit"), "{on_disk}");
+
+    // The room heard the save land and only then heard it close: the order is
+    // what keeps an in-flight edit out of the bin.
+    assert!(matches!(
+        next_control(&mut joined_eng.rx).await,
+        Control::Saved { .. }
+    ));
+    let Control::Closed { reason } = next_control(&mut joined_eng.rx).await else {
+        panic!("the swept room is closed")
+    };
+    assert_eq!(reason, "internal");
+
+    // A domain with no rooms is a quiet zero, not an error.
+    assert_eq!(sessions.dispose_domain("ghost").await, 0);
 }
 
 #[tokio::test]
