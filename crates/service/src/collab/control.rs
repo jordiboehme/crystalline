@@ -47,7 +47,8 @@ pub enum Control {
     Merged,
     /// An external change could not be merged; the client must resolve.
     Conflict {
-        /// What kind of conflict this is ("edit", "delete", ...).
+        /// What kind of conflict this is ("edit" for colliding edits,
+        /// "deleted" for an externally removed engram).
         conflict_kind: String,
         /// The other side's text, when there is one to show.
         theirs: Option<String>,

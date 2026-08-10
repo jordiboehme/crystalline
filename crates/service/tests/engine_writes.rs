@@ -670,3 +670,82 @@ async fn engram_text_reports_exact_bytes_and_the_save_token() {
     let missing = engine.engram_text("eng", "ghost").await.unwrap_err();
     assert!(missing.to_string().contains("ghost"), "{missing}");
 }
+
+/// The collab external-delete resolution: put the exact bytes back and
+/// reindex, no CAS. The same parse gate as save: a restore that would strip
+/// frontmatter is refused.
+#[tokio::test]
+async fn restore_puts_the_exact_bytes_back_and_reindexes() {
+    let (tmp, engine) = engine_fixture().await;
+    std::fs::remove_file(tmp.path().join("eng/alpha.md")).unwrap();
+    engine.sync(None).await.unwrap();
+
+    let receipt = engine
+        .restore_engram("eng", "alpha.md", ALPHA)
+        .await
+        .unwrap();
+    assert_eq!(receipt["permalink"], "alpha");
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("eng/alpha.md")).unwrap(),
+        ALPHA
+    );
+    // Indexed again: the read path resolves it.
+    let (_, content) = checksum_of(&engine, "eng", "alpha").await;
+    assert_eq!(content, ALPHA);
+
+    let refused = engine
+        .restore_engram("eng", "alpha.md", "no frontmatter")
+        .await
+        .unwrap_err();
+    assert!(refused.to_string().contains("frontmatter"), "{refused}");
+}
+
+/// The path-addressed read a collab room needs before it restores: it has no
+/// identifier left to resolve, and it must never write over bytes that came
+/// back at that path under another name.
+#[tokio::test]
+async fn text_at_path_reports_what_is_there_and_nothing_when_it_is_gone() {
+    let (tmp, engine) = engine_fixture().await;
+    let found = engine
+        .engram_text_at_path("eng", "alpha.md")
+        .await
+        .unwrap()
+        .expect("alpha.md is on disk");
+    assert_eq!(found.content, ALPHA);
+    assert_eq!(found.permalink, "alpha");
+    let (checksum, _) = checksum_of(&engine, "eng", "alpha").await;
+    assert_eq!(found.checksum, checksum);
+
+    // Renamed in its frontmatter by somebody else: the path still answers,
+    // with the permalink the index holds for it now.
+    let renamed = ALPHA
+        .replace("permalink: alpha", "permalink: beta")
+        .replace("title: Alpha", "title: Beta");
+    std::fs::write(tmp.path().join("eng/alpha.md"), &renamed).unwrap();
+    engine.sync(None).await.unwrap();
+    let moved = engine
+        .engram_text_at_path("eng", "alpha.md")
+        .await
+        .unwrap()
+        .expect("the file is still there");
+    assert_eq!(moved.content, renamed);
+    assert_eq!(moved.permalink, "beta");
+
+    std::fs::remove_file(tmp.path().join("eng/alpha.md")).unwrap();
+    assert!(
+        engine
+            .engram_text_at_path("eng", "alpha.md")
+            .await
+            .unwrap()
+            .is_none(),
+        "nothing is there any more"
+    );
+    // A virtual domain answers from the store the same way.
+    assert!(
+        engine
+            .engram_text_at_path("scratch", "ghost.md")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}

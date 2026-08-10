@@ -16,8 +16,9 @@ use yrs::updates::encoder::Encode;
 use yrs::{ClientID, Doc, GetString, Options, ReadTxn, Text, Transact, Update};
 
 use super::control::{self, Control};
+use super::merge::{self, MergeOutcome};
 use super::text::{Separator, collab_eligible, file_text, separator_of, session_text};
-use crate::engine::{Engine, EngineError};
+use crate::engine::{Engine, EngineError, EngramText};
 
 /// The name of the one shared Y.Text every session document carries. The
 /// client binds the same name, so the two agree without negotiation.
@@ -200,8 +201,11 @@ impl CollabSessions {
     /// that socket closes. The route holds the [`Joined`] handle, so passing
     /// the session is also the simpler call.
     pub async fn dispose_if_empty(&self, session: &CollabSession) {
-        let key = session.key();
+        // The key is read UNDER the registry lock: a rename between reading it
+        // and taking the lock would look up the old permalink, find nothing of
+        // its own there and leave the emptied room in the map forever.
         let mut sessions = self.sessions.lock().await;
+        let key = session.key();
         // Identity by epoch: a room opened under this key while the last
         // socket of the previous one was closing must not be disposed by its
         // predecessor's teardown.
@@ -307,8 +311,7 @@ struct SessionState {
     awareness: Awareness,
     separator: Separator,
     /// The domain-relative file path, as loaded and as each save receipt
-    /// reports it back.
-    #[allow(dead_code, reason = "the idle probe in Task 7 stats it")]
+    /// reports it back. The address a restore writes back to.
     path: String,
     permalink: String,
     /// The checksum backing last_saved_text: the CAS token of the next save.
@@ -328,15 +331,34 @@ struct SessionState {
     /// reads it, to space its retries out instead of hammering the engine
     /// every tick for as long as the document stays unsaveable.
     last_attempt: Option<Instant>,
-    /// When the idle external-change probe last ran (Task 7).
-    #[allow(dead_code, reason = "the idle probe in Task 7 reads and sets it")]
+    /// When the idle external-change probe last ran.
     last_probe: Option<Instant>,
+    /// The detail of the standing save failure, so a refusal that changes its
+    /// reason re-broadcasts instead of leaving the room reading a stale one.
+    failure_detail: Option<String>,
+    /// The external change the room has to decide about; saving is suspended
+    /// while it stands.
+    pending: Option<PendingConflict>,
+    /// The room accepted an external deletion: the session is over, saves
+    /// included, and the socket loop disconnects everyone.
+    closed: bool,
     save_state: SaveStateTag,
+}
+
+/// The external change a room is being asked to resolve.
+enum PendingConflict {
+    /// Both sides edited: `theirs` is the file's text, `theirs_checksum` the
+    /// CAS token that lets "mine" land over it.
+    Edit {
+        theirs: String,
+        theirs_checksum: String,
+    },
+    /// The file is gone; "mine" restores it, "theirs" closes the room.
+    Deleted,
 }
 
 /// The wire label in hello/save_state controls ("ok" | "failed" | "conflict").
 #[derive(Clone, Copy, PartialEq)]
-#[allow(dead_code, reason = "Conflict is set by the merge path in Task 7")]
 enum SaveStateTag {
     Ok,
     Failed,
@@ -401,7 +423,12 @@ impl CollabSession {
                 oldest_unsaved: None,
                 flush_requested: false,
                 last_attempt: None,
-                last_probe: None,
+                // The probe window starts at open, so a room that sits idle
+                // from its first tick still checks one window later.
+                last_probe: Some(Instant::now()),
+                failure_detail: None,
+                pending: None,
+                closed: false,
                 save_state: SaveStateTag::Ok,
             }),
         }))
@@ -449,6 +476,7 @@ impl CollabSession {
     /// `conn` so the socket loop can skip the echo.
     pub async fn handle_frame(&self, conn: ConnId, bytes: &[u8]) -> Vec<Vec<u8>> {
         let mut replies = Vec::new();
+        let mut renamed = None;
         let mut state = self.state.lock().await;
         let mut decoder = DecoderV1::from(bytes);
         // Collect first: MessageReader borrows the decoder.
@@ -514,21 +542,26 @@ impl CollabSession {
                         replies.push(Message::Awareness(full).encode_v1());
                     }
                 }
-                Message::Custom(control::CONTROL_TAG, payload) => {
-                    match control::decode(&payload) {
-                        Some(Control::Flush) => {
-                            state.flush_requested = true;
-                        }
-                        Some(Control::Resolve { .. }) => {
-                            // Task 7 wires resolution; until then a resolve is
-                            // recorded nowhere and the conflict stands.
-                        }
-                        _ => {}
+                Message::Custom(control::CONTROL_TAG, payload) => match control::decode(&payload) {
+                    Some(Control::Flush) => {
+                        state.flush_requested = true;
                     }
-                }
+                    Some(Control::Resolve { choice }) => {
+                        // Kept rather than overwritten: a frame carrying two
+                        // resolves must not drop the move the first one made.
+                        if let Some(moved) = self.resolve_conflict(&mut state, &choice).await {
+                            renamed = Some(moved);
+                        }
+                    }
+                    _ => {}
+                },
                 _ => {}
             }
         }
+        // The session guard goes before the registry lock a rename takes: a
+        // restore may have landed the engram under a new permalink.
+        drop(state);
+        self.adopt_rename(renamed).await;
         replies
     }
 
@@ -640,7 +673,8 @@ impl CollabSession {
             // Nothing has arrived at all since the last save, so there is
             // nothing to render or compare. A cheap pre-filter that keeps an
             // idle room free, NOT the debounce: that gates on the text below.
-            return None; // Task 7 adds the idle external-change probe here
+            // An idle room is exactly where the external-change probe belongs.
+            return self.maybe_probe(&mut state, now).await;
         }
         let elapsed = |since: Option<Instant>, ms: u64| {
             since.is_some_and(|at| now.saturating_duration_since(at).as_millis() as u64 >= ms)
@@ -664,7 +698,7 @@ impl CollabSession {
             state.last_edit = None;
             state.oldest_unsaved = None;
             if matches!(state.save_state, SaveStateTag::Ok) {
-                return None; // Task 7 adds the idle external-change probe here
+                return self.maybe_probe(&mut state, now).await;
             }
             // A save-blocked session whose text matches the file again has
             // nothing left to warn about: fall through so the state heals.
@@ -697,6 +731,11 @@ impl CollabSession {
             return None; // a disposed or poisoned room never writes again
         }
         let mut state = self.state.lock().await;
+        if state.closed {
+            // The room accepted an external deletion: a final save here would
+            // resurrect the file the author agreed to let go.
+            return None;
+        }
         if matches!(state.save_state, SaveStateTag::Conflict) {
             return None; // an unresolved conflict never saves; drafts hold the text
         }
@@ -729,16 +768,60 @@ impl CollabSession {
         });
     }
 
-    /// One save attempt over the locked state, at `now`. Holding the lock
-    /// across the engine call serializes edits against the save, so the text
-    /// that lands is exactly the text recorded as saved; sessions are small
-    /// and a save is milliseconds, so simplicity wins over concurrency here.
+    /// The save pass over the locked state: one attempt, and - when the file
+    /// moved under the session - the merge flow plus the retry that lands the
+    /// merged text over it.
     ///
     /// Returns the permalink the receipt reports when a frontmatter rename
     /// moved it: the caller re-keys the registry once the guard is gone.
     async fn save_locked(&self, state: &mut SessionState, now: Instant) -> Option<String> {
-        if self.is_disposed() {
-            return None; // disposed or poisoned: this session is done writing
+        // Two attempts at most. The merge adopts the external file's checksum
+        // as the CAS token, so the retry lands unless the file changed AGAIN
+        // inside that window - and then the next tick picks it up rather than
+        // spinning here with the guard held.
+        for _ in 0..2 {
+            match self.save_attempt(state, now).await {
+                SaveOutcome::Done(renamed) => return renamed,
+                SaveOutcome::Deleted(detail) => {
+                    self.raise_deleted(state, detail);
+                    return None;
+                }
+                SaveOutcome::External(detail) => {
+                    let theirs = match self
+                        .engine
+                        .engram_text(&self.domain, &state.permalink)
+                        .await
+                    {
+                        Ok(theirs) => theirs,
+                        // The engram the CAS refused is not there to read: the
+                        // write and the delete raced, so this is the deletion.
+                        Err(EngineError::NotFound(detail)) => {
+                            self.raise_deleted(state, detail);
+                            return None;
+                        }
+                        Err(err) => {
+                            self.fail_save(state, err.to_string());
+                            return None;
+                        }
+                    };
+                    if !self.merge_external(state, theirs, detail).await {
+                        return None; // a conflict the room has to resolve
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// One save attempt over the locked state, at `now`. Holding the lock
+    /// across the engine call serializes edits against the save, so the text
+    /// that lands is exactly the text recorded as saved; sessions are small
+    /// and a save is milliseconds, so simplicity wins over concurrency here.
+    async fn save_attempt(&self, state: &mut SessionState, now: Instant) -> SaveOutcome {
+        if self.is_disposed() || state.closed {
+            // Disposed, poisoned, or closed by an accepted deletion: this
+            // session is done writing.
+            return SaveOutcome::Done(None);
         }
         let file = Self::file_text_locked(state);
         state.flush_requested = false;
@@ -750,6 +833,7 @@ impl CollabSession {
                 // The document matches the file again, so the standing save
                 // failure is over; the room is told so its alert clears.
                 state.save_state = SaveStateTag::Ok;
+                state.failure_detail = None;
                 let _ = self.tx.send(Frame {
                     from: None,
                     bytes: Bytes::from(control::encode(&Control::Saved {
@@ -758,7 +842,7 @@ impl CollabSession {
                     })),
                 });
             }
-            return None;
+            return SaveOutcome::Done(None);
         }
         state.last_attempt = Some(now);
         let receipt = self
@@ -796,6 +880,7 @@ impl CollabSession {
                 state.dirty = false;
                 state.oldest_unsaved = None;
                 state.save_state = SaveStateTag::Ok;
+                state.failure_detail = None;
                 let _ = self.tx.send(Frame {
                     from: None,
                     bytes: Bytes::from(control::encode(&Control::Saved {
@@ -803,28 +888,375 @@ impl CollabSession {
                         permalink,
                     })),
                 });
-                return renamed;
+                SaveOutcome::Done(renamed)
             }
+            // The CAS token no longer matches the file: somebody else wrote
+            // it while this room was editing. Not a failure - the merge flow
+            // pulls their work in.
+            Err(EngineError::Conflict(detail)) if detail.contains("stale edit") => {
+                SaveOutcome::External(detail)
+            }
+            // The engram is not there to save: an external delete, which is
+            // its own conflict kind rather than a save-blocked room.
+            Err(EngineError::NotFound(detail)) => SaveOutcome::Deleted(detail),
             Err(err) => {
-                // Task 7 takes the Conflict("stale edit") and NotFound arms to
-                // the merge flow; until then every refusal is save-blocked.
-                // The session stays open and editable either way, and every
-                // later flush retries: dirty and oldest_unsaved stand.
-                let detail = err.to_string();
-                if !matches!(state.save_state, SaveStateTag::Failed) {
-                    let _ = self.tx.send(Frame {
-                        from: None,
-                        bytes: Bytes::from(control::encode(&Control::SaveFailed {
-                            detail: detail.clone(),
-                        })),
-                    });
-                }
-                tracing::debug!(domain = %self.domain, permalink = %state.permalink, %detail, "a session save was refused");
-                state.save_state = SaveStateTag::Failed;
+                // Every other refusal is save-blocked. The session stays open
+                // and editable, and every later flush retries: dirty and
+                // oldest_unsaved stand.
+                self.fail_save(state, err.to_string());
+                SaveOutcome::Done(None)
             }
         }
-        None
     }
+
+    /// Record and announce a save refusal that is nobody's conflict.
+    ///
+    /// The re-broadcast is guarded on the DETAIL as well as the state: a
+    /// parse refusal replacing an io failure (or either replacing a resolved
+    /// conflict) has to reach the room, or its alert keeps naming a reason
+    /// that no longer applies.
+    fn fail_save(&self, state: &mut SessionState, detail: String) {
+        let repeat = matches!(state.save_state, SaveStateTag::Failed)
+            && state.failure_detail.as_deref() == Some(detail.as_str());
+        if !repeat {
+            let _ = self.tx.send(Frame {
+                from: None,
+                bytes: Bytes::from(control::encode(&Control::SaveFailed {
+                    detail: detail.clone(),
+                })),
+            });
+        }
+        tracing::debug!(domain = %self.domain, permalink = %state.permalink, %detail, "a session save was refused");
+        state.save_state = SaveStateTag::Failed;
+        state.failure_detail = Some(detail);
+    }
+
+    /// Suspend saving on an externally deleted engram and let the room decide
+    /// between restoring its text and accepting the deletion.
+    fn raise_deleted(&self, state: &mut SessionState, detail: String) {
+        state.save_state = SaveStateTag::Conflict;
+        state.failure_detail = None;
+        state.pending = Some(PendingConflict::Deleted);
+        let _ = self.tx.send(Frame {
+            from: None,
+            bytes: Bytes::from(control::encode(&Control::Conflict {
+                conflict_kind: "deleted".to_string(),
+                theirs: None,
+                detail,
+            })),
+        });
+    }
+
+    /// The merge flow for an external write: three-way in LF space against
+    /// the text this session last saw on disk. A clean merge flows straight
+    /// into the live document (true, so the caller writes the result back);
+    /// a collision suspends saving and hands the room both sides (false).
+    ///
+    /// Conflict markers never enter this path: `three_way` discards diffy's
+    /// marked text, so nothing here can carry a marker into the document or
+    /// on to the file.
+    async fn merge_external(
+        &self,
+        state: &mut SessionState,
+        theirs: EngramText,
+        detail: String,
+    ) -> bool {
+        let mine = session_text(&Self::file_text_locked(state));
+        match merge::three_way(&state.last_saved_text, &mine, &theirs.content) {
+            MergeOutcome::Clean(merged) => {
+                self.converge(state, &merged);
+                // Their text is what the file holds now, so it is the base of
+                // the next merge and its checksum is the next CAS token.
+                state.last_saved_text = theirs.content;
+                state.checksum = theirs.checksum;
+                // The save state is deliberately left alone: the save that
+                // follows this merge owns the whole failed/ok lifecycle, and
+                // it is the one that knows whether the merged text lands.
+                true
+            }
+            MergeOutcome::Conflict => {
+                self.raise_edit(state, theirs, detail);
+                false
+            }
+        }
+    }
+
+    /// The idle external-change probe: once a window, while the room is clean
+    /// and saving healthy, ask the engine whether the file moved under it.
+    ///
+    /// ACCEPTED LIMITATION: `engram_text` reads through `load_content`, which
+    /// serves a non-host or virtual read from the store's content column, so
+    /// an external change (a deletion especially) can be detected only after
+    /// the sync engine has reindexed it - the probe may run late, and the save
+    /// CAS remains the hard guard. Do not "fix" the probe by reading the file
+    /// directly; the engine owns path resolution.
+    async fn maybe_probe(&self, state: &mut SessionState, now: Instant) -> Option<String> {
+        if state.closed || state.dirty || !matches!(state.save_state, SaveStateTag::Ok) {
+            return None;
+        }
+        let due = state.last_probe.is_some_and(|at| {
+            now.saturating_duration_since(at).as_millis() as u64 >= IDLE_CHECK_MS
+        });
+        if !due {
+            return None;
+        }
+        state.last_probe = Some(now);
+        match self
+            .engine
+            .engram_text(&self.domain, &state.permalink)
+            .await
+        {
+            Ok(theirs) if theirs.checksum != state.checksum => {
+                let detail = format!(
+                    "'{}' changed on disk while this session was idle",
+                    state.permalink
+                );
+                if self.merge_external(state, theirs, detail).await {
+                    // A clean merge over an unedited room IS their text, so
+                    // this writes nothing; a room that edited between the last
+                    // save and the probe has its merged text landed instead.
+                    return self.save_locked(state, now).await;
+                }
+                None
+            }
+            Ok(_) => None,
+            Err(EngineError::NotFound(detail)) => {
+                self.raise_deleted(state, detail);
+                None
+            }
+            Err(err) => {
+                // A probe is best-effort: a read that fails leaves the session
+                // exactly as it was, and the save CAS still guards the write.
+                tracing::debug!(domain = %self.domain, permalink = %state.permalink, %err, "the idle collab probe could not read the engram");
+                None
+            }
+        }
+    }
+
+    /// Resolve a standing conflict with the room's choice. The first resolve
+    /// wins - it takes the pending conflict - and a resolve with none pending
+    /// is ignored, so a stale button press can never overwrite a file.
+    ///
+    /// Returns the permalink a restore reports when it landed under a new one.
+    async fn resolve_conflict(&self, state: &mut SessionState, choice: &str) -> Option<String> {
+        if !matches!(state.save_state, SaveStateTag::Conflict) {
+            return None;
+        }
+        let pending = state.pending.take()?;
+        match (choice, pending) {
+            (
+                "mine",
+                PendingConflict::Edit {
+                    theirs,
+                    theirs_checksum,
+                },
+            ) => {
+                // Checksum and text move together, as everywhere else: their
+                // version is what the file holds, so it is both the CAS token
+                // my text lands over and the base the next merge diffs
+                // against. Adopting only the checksum would re-offer the very
+                // edit this room just rejected, and would leave a session that
+                // never edited (a mixed-endings theirs) believing its choice
+                // landed while the save found nothing to write.
+                state.checksum = theirs_checksum;
+                state.last_saved_text = theirs;
+                state.save_state = SaveStateTag::Ok;
+                state.failure_detail = None;
+                state.flush_requested = true;
+                None
+            }
+            ("mine", PendingConflict::Deleted) => self.restore_mine(state).await,
+            (
+                "theirs",
+                PendingConflict::Edit {
+                    theirs,
+                    theirs_checksum,
+                },
+            ) => {
+                // Their version wins whole: the live text becomes the file's,
+                // and this room's unsaved edits are what the author gave up.
+                self.converge(state, &session_text(&theirs));
+                state.last_saved_text = theirs;
+                state.checksum = theirs_checksum;
+                state.dirty = false;
+                state.last_edit = None;
+                state.oldest_unsaved = None;
+                state.flush_requested = false;
+                state.save_state = SaveStateTag::Ok;
+                state.failure_detail = None;
+                None
+            }
+            ("theirs", PendingConflict::Deleted) => {
+                // The deletion stands: nothing is written back, the room is
+                // told, and the socket loop closes every connection.
+                state.closed = true;
+                let _ = self.tx.send(Frame {
+                    from: None,
+                    bytes: Bytes::from(control::encode(&Control::Closed {
+                        reason: "deleted".to_string(),
+                    })),
+                });
+                None
+            }
+            (_, pending) => {
+                // An unknown choice decides nothing; the conflict stands.
+                state.pending = Some(pending);
+                None
+            }
+        }
+    }
+
+    /// "Mine" over an external deletion: put this room's text back where the
+    /// engram was, but only over ground that is still empty.
+    ///
+    /// "Deleted" means "the engram is not there to save", which an external
+    /// RENAME, a delete-and-recreate, or a probe reading a stale index all
+    /// produce while a file sits at that path holding somebody else's work.
+    /// Restoring is a plain overwrite with no CAS to stop it, so the path is
+    /// read first and anything that is not the text this room last saved
+    /// re-opens as an edit conflict instead. A session never silently
+    /// overwrites external work.
+    async fn restore_mine(&self, state: &mut SessionState) -> Option<String> {
+        match self
+            .engine
+            .engram_text_at_path(&self.domain, &state.path)
+            .await
+        {
+            Ok(Some(theirs)) if theirs.content != state.last_saved_text => {
+                let detail = format!(
+                    "'{}' is on disk again with somebody else's text, so restoring \
+                     would overwrite it; pick again with their version in view",
+                    state.path
+                );
+                self.raise_edit(state, theirs, detail);
+                return None;
+            }
+            // Nothing there, or exactly the text this room last saved: the
+            // restore puts back what was lost and overwrites nobody.
+            Ok(_) => {}
+            Err(err) => {
+                // The path could not be read, so nothing is known about what
+                // is there: the conflict stands rather than risking a blind
+                // overwrite.
+                state.pending = Some(PendingConflict::Deleted);
+                let _ = self.tx.send(Frame {
+                    from: None,
+                    bytes: Bytes::from(control::encode(&Control::SaveFailed {
+                        detail: err.to_string(),
+                    })),
+                });
+                return None;
+            }
+        }
+        // save_engram refuses a missing file by design, so the room's text
+        // goes back through the restore verb instead.
+        let file = Self::file_text_locked(state);
+        match self
+            .engine
+            .restore_engram(&self.domain, &state.path, &file)
+            .await
+        {
+            Ok(receipt) => {
+                let checksum = receipt["checksum"].as_str().unwrap_or_default().to_string();
+                let permalink = receipt["permalink"]
+                    .as_str()
+                    .unwrap_or(&state.permalink)
+                    .to_string();
+                let renamed = (permalink != state.permalink).then(|| permalink.clone());
+                state.checksum = checksum.clone();
+                state.last_saved_text = file;
+                state.permalink = permalink.clone();
+                if let Some(path) = receipt["path"].as_str() {
+                    state.path = path.to_string();
+                }
+                state.dirty = false;
+                state.oldest_unsaved = None;
+                state.save_state = SaveStateTag::Ok;
+                state.failure_detail = None;
+                let _ = self.tx.send(Frame {
+                    from: None,
+                    bytes: Bytes::from(control::encode(&Control::Saved {
+                        checksum,
+                        permalink,
+                    })),
+                });
+                renamed
+            }
+            Err(err) => {
+                // The restore was refused (a document that is not an engram, a
+                // read-only daemon): the conflict stands so the room can try
+                // the other resolution.
+                state.pending = Some(PendingConflict::Deleted);
+                let _ = self.tx.send(Frame {
+                    from: None,
+                    bytes: Bytes::from(control::encode(&Control::SaveFailed {
+                        detail: err.to_string(),
+                    })),
+                });
+                None
+            }
+        }
+    }
+
+    /// Suspend saving on colliding edits and hand the room both sides.
+    fn raise_edit(&self, state: &mut SessionState, theirs: EngramText, detail: String) {
+        state.save_state = SaveStateTag::Conflict;
+        state.failure_detail = None;
+        state.pending = Some(PendingConflict::Edit {
+            theirs: theirs.content.clone(),
+            theirs_checksum: theirs.checksum,
+        });
+        let _ = self.tx.send(Frame {
+            from: None,
+            bytes: Bytes::from(control::encode(&Control::Conflict {
+                conflict_kind: "edit".to_string(),
+                theirs: Some(theirs.content),
+                detail,
+            })),
+        });
+    }
+
+    /// Morph the live text into `target` (SESSION space) as one minimal edit
+    /// script in ONE transaction - every client sees a single update rather
+    /// than a flicker of half-applied lines - broadcast that update to the
+    /// room and tell it the external change is in.
+    fn converge(&self, state: &mut SessionState, target: &str) {
+        let update = {
+            let doc = state.awareness.doc();
+            // Taken before the transaction: get_or_insert_text opens one of
+            // its own and would deadlock inside ours.
+            let text = doc.get_or_insert_text(TEXT_NAME);
+            let mut txn = doc.transact_mut();
+            let current = text.get_string(&txn);
+            merge::apply_target(&text, &mut txn, &current, target);
+            txn.encode_update_v1()
+        };
+        let _ = self.tx.send(Frame {
+            from: None,
+            bytes: Bytes::from(Message::Sync(SyncMessage::Update(update)).encode_v1()),
+        });
+        let _ = self.tx.send(Frame {
+            from: None,
+            bytes: Bytes::from(control::encode(&Control::Merged)),
+        });
+    }
+
+    /// Whether the room accepted an external deletion: the session is over,
+    /// and the socket loop closes every connection with the permanent code.
+    pub async fn is_closed(&self) -> bool {
+        self.state.lock().await.closed
+    }
+}
+
+/// What one [`CollabSession::save_attempt`] did.
+enum SaveOutcome {
+    /// Nothing needed writing, or the write landed - carrying the permalink a
+    /// frontmatter rename moved the engram to.
+    Done(Option<String>),
+    /// The file changed under the session; the detail is the CAS refusal.
+    External(String),
+    /// The file is gone; the detail says so.
+    Deleted(String),
 }
 
 /// The per-session saver, spawned by the registry when it opens a session:

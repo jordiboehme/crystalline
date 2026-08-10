@@ -585,3 +585,66 @@ async fn a_poisoned_session_closes_the_room_and_never_saves_again() {
     assert_ne!(again.session.epoch(), joined.session.epoch());
     assert_eq!(sessions.session_count().await, 1, "the corpse was replaced");
 }
+
+#[tokio::test]
+async fn a_second_refusal_with_a_new_reason_reaches_the_room() {
+    // The room's alert must name the reason that applies NOW: a save-blocked
+    // session that breaks a different way has to re-broadcast, or the author
+    // keeps reading the refusal before last.
+    let (_tmp, engine) = engine_fixture().await;
+    let sessions = CollabSessions::new(engine);
+    let mut joined = sessions.join("eng", "alpha").await.unwrap();
+    let doc = sync_client(&joined).await;
+
+    // First: a document with no frontmatter at all.
+    replace_all(&joined, &doc, "no frontmatter at all").await;
+    joined
+        .session
+        .handle_frame(joined.conn, &control::encode(&Control::Flush))
+        .await;
+    joined.session.tick_save(Instant::now()).await;
+    let Control::SaveFailed { detail: first } = next_control(&mut joined.rx).await else {
+        panic!("the first refusal")
+    };
+    assert!(first.contains("frontmatter"), "{first}");
+
+    // Then: frontmatter that is there but does not parse. Still refused, for
+    // a different reason, and the flush skips the backoff.
+    replace_all(&joined, &doc, "---\ntitle: [unclosed\n---\n\n# Alpha\n").await;
+    joined
+        .session
+        .handle_frame(joined.conn, &control::encode(&Control::Flush))
+        .await;
+    joined
+        .session
+        .tick_save(Instant::now() + Duration::from_millis(SAVE_DEBOUNCE_MS + 100))
+        .await;
+    let Control::SaveFailed { detail: second } = next_control(&mut joined.rx).await else {
+        panic!("the second refusal is broadcast too")
+    };
+    assert_ne!(first, second, "the room is told the NEW reason");
+
+    // A repeat of the same refusal, though, says nothing new: the next
+    // control the room hears is the save that finally lands.
+    joined
+        .session
+        .handle_frame(joined.conn, &control::encode(&Control::Flush))
+        .await;
+    joined
+        .session
+        .tick_save(Instant::now() + Duration::from_millis(2 * SAVE_DEBOUNCE_MS))
+        .await;
+    replace_all(&joined, &doc, ALPHA).await;
+    joined
+        .session
+        .handle_frame(joined.conn, &control::encode(&Control::Flush))
+        .await;
+    joined
+        .session
+        .tick_save(Instant::now() + Duration::from_millis(3 * SAVE_DEBOUNCE_MS))
+        .await;
+    assert!(matches!(
+        next_control(&mut joined.rx).await,
+        Control::Saved { .. }
+    ));
+}

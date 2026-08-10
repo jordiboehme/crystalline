@@ -5,6 +5,7 @@
 //! the saved file).
 
 pub mod control;
+pub mod merge;
 pub mod session;
 pub mod text;
 

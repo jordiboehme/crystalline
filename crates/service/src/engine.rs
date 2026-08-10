@@ -1609,6 +1609,100 @@ impl Engine {
         }))
     }
 
+    /// Write an engram file back into existence with this exact content, then
+    /// reindex it: the resolution path for "externally deleted while a collab
+    /// session held unsaved work". [`Engine::save_engram`] refuses a missing
+    /// file by design (a save of something that is not there is a miss, not a
+    /// create), so a room whose author keeps their text needs this verb.
+    ///
+    /// Same parse gate as a save and the same receipt shape, addressed by
+    /// PATH rather than by identifier: the engram is gone from the index, so
+    /// there is nothing left to resolve. No CAS token either, for the same
+    /// reason - there is no stored version to compare against.
+    pub async fn restore_engram(&self, domain: &str, path: &str, content: &str) -> Result<Value> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        let parsed =
+            parse_engram_lossless(content).map_err(|e| EngineError::Invalid(e.to_string()))?;
+        if !parsed.has_frontmatter || parsed.raw_frontmatter.trim().is_empty() {
+            return Err(EngineError::Invalid(
+                "the document carries no frontmatter, so it is not an engram; \
+                 keep the --- delimited frontmatter block, and the type, title, \
+                 permalink and tags in it, at the top of the file"
+                    .into(),
+            ));
+        }
+        if crystalline_core::is_reserved_path(path) {
+            return Err(EngineError::Invalid(reserved_name_error(path)));
+        }
+        let (domain_id, source) = self.domain_source(domain).await?;
+        match &source {
+            ContentSource::File { root } => {
+                let abs = join_rel(root, path);
+                // Held across the write and the reindex, like every other
+                // file write. See `Engine::write_lock`.
+                let lock = self.write_lock(&abs);
+                let _guard = lock.lock().await;
+                write_file(&abs, content)?;
+                let store = self.store.lock().await;
+                self.reindex_file(&*store, domain_id, root, path).await?;
+            }
+            ContentSource::Virtual => {
+                let stamp = virtual_stamp(content);
+                let store = self.store.lock().await;
+                self.index_markdown(&*store, domain_id, path, content, stamp, None, true)
+                    .await?;
+            }
+        }
+        if matches!(source, ContentSource::Virtual) {
+            self.refresh_routing_cache().await;
+        }
+        self.refresh_index_files(domain).await;
+
+        // Read back after the reindex, exactly as a save does: the index takes
+        // the permalink from the restored frontmatter, which need not match
+        // the path slug.
+        let permalink = {
+            let store = self.store.lock().await;
+            store
+                .list_engrams(domain, Some(path), None)
+                .await?
+                .into_iter()
+                .find(|found| found.path == path)
+                .map(|found| found.permalink)
+                .unwrap_or_else(|| path.trim_end_matches(".md").to_string())
+        };
+        Ok(json!({
+            "domain": domain,
+            "permalink": permalink,
+            "path": path,
+            "checksum": sha256_hex(content.as_bytes()),
+        }))
+    }
+
+    /// A registered domain's row id and content source, upserting the row the
+    /// way a create does. The domain-addressed half of what
+    /// [`Engine::resolve`] does for an identifier, for a write path whose
+    /// engram is not in the index to resolve.
+    async fn domain_source(&self, domain: &str) -> Result<(DomainId, ContentSource)> {
+        let source = self.content_source(domain)?;
+        let store = self.store.lock().await;
+        let domain_id = match &source {
+            ContentSource::File { root } => {
+                store
+                    .upsert_domain(domain, Some(&root.to_string_lossy()), DomainKind::File)
+                    .await?
+            }
+            ContentSource::Virtual => {
+                store
+                    .upsert_domain(domain, None, DomainKind::Virtual)
+                    .await?
+            }
+        };
+        Ok((domain_id, source))
+    }
+
     /// The retirement statuses [`Engine::retire_engram`] accepts. Any other
     /// status is this verb's business to refuse, not a global rule: the
     /// ordinary save and edit paths accept any status string.
@@ -1885,6 +1979,65 @@ impl Engine {
             content,
             checksum,
         })
+    }
+
+    /// The exact text a domain holds at a domain-relative PATH right now, or
+    /// `None` when nothing is there.
+    ///
+    /// Path-addressed on purpose, and the counterpart of
+    /// [`Engine::restore_engram`]: a collab room whose engram vanished from
+    /// the index has no identifier left to resolve, and before it puts its own
+    /// text back it has to know whether somebody else's bytes are sitting at
+    /// that path (an external rename, or a delete followed by a recreate).
+    /// The `permalink` reported back is what the index answers for this path,
+    /// which an external rename may just have moved; it falls back to the path
+    /// slug when no row holds the path any more.
+    pub async fn engram_text_at_path(
+        &self,
+        domain: &str,
+        path: &str,
+    ) -> Result<Option<EngramText>> {
+        let source = self.content_source(domain)?;
+        let content = match &source {
+            ContentSource::File { root } => {
+                let abs = join_rel(root, path);
+                match std::fs::read_to_string(&abs) {
+                    Ok(text) => text,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                    Err(source) => {
+                        return Err(EngineError::Io {
+                            path: abs.display().to_string(),
+                            source,
+                        });
+                    }
+                }
+            }
+            ContentSource::Virtual => {
+                let (domain_id, _) = self.domain_source(domain).await?;
+                let store = self.store.lock().await;
+                match store.engram_content(domain_id, path).await? {
+                    Some(text) => text,
+                    None => return Ok(None),
+                }
+            }
+        };
+        let permalink = {
+            let store = self.store.lock().await;
+            store
+                .list_engrams(domain, Some(path), None)
+                .await?
+                .into_iter()
+                .find(|found| found.path == path)
+                .map(|found| found.permalink)
+                .unwrap_or_else(|| path.trim_end_matches(".md").to_string())
+        };
+        Ok(Some(EngramText {
+            domain: domain.to_string(),
+            permalink,
+            path: path.to_string(),
+            checksum: sha256_hex(content.as_bytes()),
+            content,
+        }))
     }
 
     /// Read an engram's full markdown and resolved frontmatter. The content
