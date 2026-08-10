@@ -42,6 +42,10 @@ export default defineConfig({
     proxy: {
       "/api": {
         target: DEV_API_TARGET,
+        // The collab session is a WebSocket on the same /api prefix; without
+        // this the dev and preview servers answer the upgrade themselves and
+        // the editor silently falls back to solo.
+        ws: true,
       },
     },
   },

@@ -347,7 +347,7 @@ describe("CollabProvider", () => {
       onStatus: (status) => statuses.push(status),
     });
     // Never opens.
-    vi.advanceTimersByTime(4100);
+    vi.advanceTimersByTime(CONNECT_TIMEOUT_MS + 100);
     expect(statuses.at(-1)).toBe("failed");
     expect(socket.readyState).toBe(3);
     provider.destroy();

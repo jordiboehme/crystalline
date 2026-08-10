@@ -52,7 +52,7 @@ export const MESSAGE_SYNC = 0;
 export const MESSAGE_AWARENESS = 1;
 export const MESSAGE_QUERY_AWARENESS = 3;
 export const MESSAGE_CONTROL = 4;
-export const CONNECT_TIMEOUT_MS = 4000;
+export const CONNECT_TIMEOUT_MS = 8000;
 export const BACKOFF_BASE_MS = 500;
 export const BACKOFF_CAP_MS = 10_000;
 
