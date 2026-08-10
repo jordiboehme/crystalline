@@ -14,8 +14,14 @@ import type { CollabParticipant } from "./useCollabSession";
 
 export function PresenceChips({
   participants,
+  offline = false,
 }: {
   participants: CollabParticipant[];
+  /** True while the socket is down: who is where stopped being current the
+   *  moment the awareness channel went quiet, so the row is dimmed rather
+   *  than emptied - those people have not left, this tab just cannot hear
+   *  them. */
+  offline?: boolean;
 }): ReactElement | null {
   if (participants.length === 0) {
     return null;
@@ -26,7 +32,11 @@ export function PresenceChips({
   return (
     <ul
       aria-label={`In this session: ${names}`}
-      className="flex flex-wrap items-center gap-2"
+      className={
+        offline
+          ? "flex flex-wrap items-center gap-2 opacity-50"
+          : "flex flex-wrap items-center gap-2"
+      }
     >
       {participants.map((one, index) => (
         <li

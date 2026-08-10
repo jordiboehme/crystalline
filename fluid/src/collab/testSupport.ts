@@ -117,6 +117,29 @@ export function answerStep1(socket: FakeSocket, serverDoc: Y.Doc): void {
   socket.receive(encoding.toUint8Array(reply));
 }
 
+/**
+ * Feed everything the client has sent into a server-side doc, the way a real
+ * session's read loop does: a SyncStep1 is answered into a throwaway encoder,
+ * a SyncStep2 or an update lands in `serverDoc`. What it is for is the
+ * resync after a drop - the offline edits ride out on the client's answer to
+ * the server's OWN SyncStep1, so a test that only answers step1 would never
+ * see them arrive.
+ */
+export function applyClientFrames(
+  socket: FakeSocket,
+  serverDoc: Y.Doc,
+  from = 0,
+): void {
+  for (const frame of socket.sent.slice(from)) {
+    const decoder = decoding.createDecoder(frame);
+    if (decoding.readVarUint(decoder) !== MESSAGE_SYNC) {
+      continue;
+    }
+    const reply = encoding.createEncoder();
+    syncProtocol.readSyncMessage(decoder, reply, serverDoc, "test-server");
+  }
+}
+
 /** Every control frame the socket has been sent, decoded, in order. */
 export function sentControls(socket: FakeSocket): { kind: string }[] {
   const controls: { kind: string }[] = [];

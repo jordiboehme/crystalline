@@ -1037,6 +1037,105 @@ describe("the engram editor in a session", () => {
     expect(screen.queryByText(/unsaved draft/i)).not.toBeInTheDocument();
   });
 
+  it("says it is reconnecting and grays the room out while the socket is down", async () => {
+    await openRoom({ status: "reconnecting" });
+    const notice = await screen.findByText(/reconnecting/i);
+    // Announced: the socket dropped without anybody asking, and what the
+    // author needs to know is that their typing is not being lost.
+    expect(notice).toHaveAttribute("role", "status");
+    expect(notice.textContent).toMatch(/kept locally/i);
+    // The chips are still there - those people are still in the room - but
+    // dimmed, because who is where stopped being current the moment the
+    // awareness channel went quiet.
+    const chips = screen.getByRole("list", { name: /in this session/i });
+    expect(chips.className).toContain("opacity");
+  });
+
+  it("says nothing about the connection while the room is connected", async () => {
+    await openRoom();
+    expect(screen.queryByText(/reconnecting/i)).not.toBeInTheDocument();
+    const chips = screen.getByRole("list", { name: /in this session/i });
+    expect(chips.className).not.toContain("opacity");
+  });
+
+  it("prompts on unload while the session still owes a save", async () => {
+    await openRoom({ saveState: "pending" });
+    const event = new Event("beforeunload", { cancelable: true });
+    act(() => {
+      window.dispatchEvent(event);
+    });
+    // The session's own verdict, not the solo dirty flag: in a room the
+    // server saves, and "pending" means it has not said it landed yet.
+    expect(event.defaultPrevented).toBe(true);
+  });
+
+  it("lets an unload through once the session says everything is saved", async () => {
+    await openRoom({ saveState: "ok" });
+    const event = new Event("beforeunload", { cancelable: true });
+    act(() => {
+      window.dispatchEvent(event);
+    });
+    expect(event.defaultPrevented).toBe(false);
+  });
+
+  it("lets a session save through the client's own hard errors", async () => {
+    // The server's parse refusal is the gate in a room, and it answers on
+    // the control channel. Blocking the button while Mod-S and the server's
+    // own debounce save anyway would be a lie told by a disabled control.
+    const { flush } = joinedSession();
+    serveEditor({
+      "/validate": () => ({
+        errors: 1,
+        findings: [
+          {
+            rule: "E001",
+            severity: "error",
+            message: "frontmatter will not parse",
+            line: 1,
+            fix: null,
+          },
+        ],
+      }),
+    });
+    renderApp("/d/eng/edit/alpha");
+    await screen.findByLabelText("Engram source");
+    await waitFor(() => {
+      expect(screen.getByText(/hard error/i)).toBeInTheDocument();
+    });
+    const save = screen.getByRole("button", { name: "Save" });
+    expect(save).toBeEnabled();
+    await userEvent.click(save);
+    expect(flush).toHaveBeenCalled();
+    expect(puts()).toHaveLength(0);
+    // And the wording does not claim a block that is not happening.
+    expect(screen.queryByText(/block saving/i)).not.toBeInTheDocument();
+  });
+
+  it("offers the pre-gap text as a draft once the room rebuilt on a new epoch", async () => {
+    // What the hook writes when a reconnect lands on a restarted daemon:
+    // the text as it stood, in file space, under this author's draft key.
+    // The rebuilt room syncs the file's own text, so the two differ and the
+    // surface's ordinary draft banner is what offers the work back.
+    localStorage.setItem(
+      "fluid.draft.ada.eng/alpha",
+      JSON.stringify({
+        content: CONTENT.replace("A rule.", "A rule I was still writing."),
+        baseChecksum: "3f8a1c05e2",
+        savedAt: "2026-08-09T10:00:00Z",
+      }),
+    );
+    const { ytext } = await openRoom({ epoch: "e2" });
+    expect(await screen.findByText(/unsaved draft/i)).toBeInTheDocument();
+    await userEvent.click(
+      screen.getByRole("button", { name: "Restore draft" }),
+    );
+    // Restored INTO the room: a draft recovered in a session is an ordinary
+    // edit of the shared text, not a private buffer beside it.
+    await waitFor(() => {
+      expect(ytext.toJSON()).toContain("A rule I was still writing.");
+    });
+  });
+
   it("still offers a genuinely different draft on a CRLF file", async () => {
     localStorage.setItem(
       "fluid.draft.ada.eng/alpha",
@@ -1051,6 +1150,39 @@ describe("the engram editor in a session", () => {
     );
     await openRoom({ separator: "\r\n" });
     expect(await screen.findByText(/unsaved draft/i)).toBeInTheDocument();
+  });
+});
+
+describe("the engram editor with no session to join", () => {
+  it("says it is editing solo once the attempt to join gave up", async () => {
+    // The whole Group B surface, plus one quiet line saying why there are no
+    // chips: a server without a session route, an old daemon, a proxy that
+    // will not upgrade. Quiet on purpose - solo editing is not a failure.
+    collabMock.mockReturnValue({
+      ...soloCollabSession(),
+      mode: "solo",
+      status: "failed",
+    });
+    serveEditor();
+    renderApp("/d/eng/edit/alpha");
+    const notice = await screen.findByText(/editing solo/i);
+    expect(notice).toHaveAttribute("role", "status");
+    // And it is the solo surface in full: this tab saves for itself again.
+    await userEvent.click(screen.getByRole("button", { name: "Save" }));
+    await screen.findByText("Saved");
+    expect(putBody(0)).toEqual({ content: CONTENT });
+  });
+
+  it("says nothing about solo when no session was ever attempted", async () => {
+    collabMock.mockReturnValue({
+      ...soloCollabSession(),
+      mode: "solo",
+      status: "connecting",
+    });
+    serveEditor();
+    renderApp("/d/eng/edit/alpha");
+    await screen.findByLabelText("Engram source");
+    expect(screen.queryByText(/editing solo/i)).not.toBeInTheDocument();
   });
 });
 

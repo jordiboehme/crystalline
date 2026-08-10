@@ -17,15 +17,24 @@ import * as Y from "yjs";
 import { ApiProblem } from "../api/client";
 import type { EngramDetail } from "../api/engram";
 import { fetchEngramDetail } from "../api/engram";
+import { readDraft } from "../editor/drafts";
 import type { CollabHello } from "./provider";
-import { CONNECT_TIMEOUT_MS, MESSAGE_AWARENESS, TEXT_NAME } from "./provider";
+import {
+  BACKOFF_CAP_MS,
+  CONNECT_TIMEOUT_MS,
+  MESSAGE_AWARENESS,
+  TEXT_NAME,
+} from "./provider";
 import {
   FakeSocket,
   answerStep1,
+  applyClientFrames,
+  concat,
   controlFrame,
   fakeSocketFactory,
   helloFrame,
   sentControls,
+  serverStep1,
 } from "./testSupport";
 import type { CollabSession } from "./useCollabSession";
 import {
@@ -444,5 +453,162 @@ describe("useCollabSession", () => {
       kind: "resolve",
       choice: "theirs",
     });
+  });
+});
+
+describe("useCollabSession reconnecting", () => {
+  it("resyncs on the same epoch, keeping the buffer and delivering what was typed offline", () => {
+    const { socket, server } = joinRoom();
+    const ytext = session().ytext;
+    expect(session().status).toBe("connected");
+
+    act(() => {
+      socket.dropWith(1006);
+    });
+    expect(session().status).toBe("reconnecting");
+    // The author goes on typing into a document nobody else can see yet.
+    act(() => {
+      session().ytext?.insert(0, "offline ");
+    });
+    expect(session().mode).toBe("collab");
+
+    act(() => {
+      vi.advanceTimersByTime(BACKOFF_CAP_MS);
+    });
+    const retry = socketAt(1);
+    act(() => {
+      retry.open();
+    });
+    // Mute until the greeting: a reconnect that spoke y-sync first would
+    // pour this doc's history into whatever session answered.
+    expect(retry.sent).toHaveLength(0);
+    expect(session().status).toBe("connected");
+
+    act(() => {
+      retry.receive(concat(helloFrame("e1"), serverStep1(server)));
+    });
+    act(() => {
+      applyClientFrames(retry, server);
+    });
+    // The same session, so the same document: no rebuild, and the offline
+    // edit rode out on the answer to the server's own SyncStep1.
+    expect(server.getText(TEXT_NAME).toJSON()).toContain("offline ");
+    expect(session().mode).toBe("collab");
+    expect(session().ytext).toBe(ytext);
+    expect(session().epoch).toBe("e1");
+  });
+
+  it("keeps a joined room editable through a long outage instead of forking to solo", () => {
+    // Ambiguity 8, pinned: a mid-session drop never opens a second history
+    // beside the room's. The author keeps typing; the status line says why.
+    const { socket } = joinRoom();
+    const ytext = session().ytext;
+    act(() => {
+      socket.dropWith(1006);
+    });
+    act(() => {
+      vi.advanceTimersByTime(120_000);
+    });
+    expect(session().mode).toBe("collab");
+    expect(session().ytext).toBe(ytext);
+    expect(session().status).toBe("reconnecting");
+  });
+
+  it("rebuilds around a new epoch, keeping the pre-gap text as a draft first", () => {
+    const { socket } = joinRoom({ separator: "\r\n" });
+    act(() => {
+      session().ytext?.insert(0, "mine\n");
+    });
+    const before = session().ytext;
+    act(() => {
+      socket.dropWith(1006);
+    });
+    act(() => {
+      vi.advanceTimersByTime(BACKOFF_CAP_MS);
+    });
+
+    // The daemon restarted: a fresh session, seeded from the file.
+    const fresh = new Y.Doc();
+    fresh.getText(TEXT_NAME).insert(0, "fresh from the file\n");
+    const retry = socketAt(1);
+    act(() => {
+      retry.open();
+      retry.receive(concat(helloFrame("e2"), serverStep1(fresh)));
+    });
+
+    // The draft is written BEFORE anything is rebuilt: it is the only copy
+    // of the pre-gap text, in the file's own line endings.
+    const draft = readDraft("ada", "eng", "alpha");
+    expect(draft?.content).toBe(fileSpace(`mine\n${SESSION_TEXT}`, "\r\n"));
+    expect(draft?.baseChecksum).toBe("c1");
+    expect(session().mode).not.toBe("collab");
+
+    const rebuilt = socketAt(2);
+    act(() => {
+      rebuilt.open();
+      rebuilt.receive(helloFrame("e2", { separator: "\r\n" }));
+    });
+    act(() => {
+      answerStep1(rebuilt, fresh);
+    });
+    expect(session().epoch).toBe("e2");
+    expect(session().mode).toBe("collab");
+    expect(session().ytext).not.toBe(before);
+    expect(session().ytext?.toJSON()).toBe("fresh from the file\n");
+  });
+
+  it("falls back to solo when sockets keep opening and dropping without a greeting", () => {
+    // The first skeleton wedge: an open socket sets `everConnected`, so a
+    // per-attempt deadline never fires again and the author would hold a
+    // connecting skeleton forever with no escape but a reload.
+    mount();
+    const first = socketAt(0);
+    act(() => {
+      first.open();
+      first.dropWith(1006);
+    });
+    expect(session().mode).toBe("connecting");
+    act(() => {
+      vi.advanceTimersByTime(1000);
+    });
+    const second = socketAt(1);
+    act(() => {
+      second.open();
+      second.dropWith(1006);
+    });
+    act(() => {
+      vi.advanceTimersByTime(CONNECT_TIMEOUT_MS);
+    });
+    expect(session().mode).toBe("solo");
+    expect(session().ytext).toBeNull();
+    // "failed" rather than a lingering "connecting" is what the surface's
+    // quiet solo notice keys on: an attempt that is over, not one running.
+    expect(session().status).toBe("failed");
+  });
+
+  it("falls back to solo when the session rebuilt around a new epoch never lands", () => {
+    // The second skeleton wedge: after a gap the mode would have stayed
+    // "collab" with no document to bind, which renders as a permanent
+    // skeleton. The rebuild is bounded like any first connect.
+    const { socket } = joinRoom();
+    act(() => {
+      socket.dropWith(1006);
+    });
+    act(() => {
+      vi.advanceTimersByTime(BACKOFF_CAP_MS);
+    });
+    const retry = socketAt(1);
+    act(() => {
+      retry.open();
+      retry.receive(helloFrame("e2"));
+    });
+    expect(session().mode).not.toBe("collab");
+    // The rebuilt provider never gets a socket up.
+    act(() => {
+      vi.advanceTimersByTime(CONNECT_TIMEOUT_MS + 100);
+    });
+    expect(session().mode).toBe("solo");
+    expect(session().ytext).toBeNull();
+    expect(session().status).toBe("failed");
   });
 });

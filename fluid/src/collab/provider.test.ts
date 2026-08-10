@@ -6,6 +6,7 @@ import * as encoding from "lib0/encoding";
 import * as decoding from "lib0/decoding";
 
 import {
+  CONNECT_TIMEOUT_MS,
   CollabProvider,
   MESSAGE_CONTROL,
   MESSAGE_SYNC,
@@ -349,6 +350,55 @@ describe("CollabProvider", () => {
     vi.advanceTimersByTime(4100);
     expect(statuses.at(-1)).toBe("failed");
     expect(socket.readyState).toBe(3);
+    provider.destroy();
+    vi.useRealTimers();
+  });
+
+  it("gives up on sockets that open and drop without ever greeting", () => {
+    vi.useFakeTimers();
+    const random = vi.spyOn(Math, "random").mockReturnValue(0);
+    const statuses: string[] = [];
+    const { provider, socket } = makeProvider({
+      onStatus: (status) => statuses.push(status),
+    });
+    // The wedge the deadline is a deadline for: TCP keeps succeeding while
+    // the session never does. Every attempt opens, so a per-attempt timeout
+    // would be cleared every time and the ladder would climb forever with
+    // the author holding a skeleton and no way out but a reload.
+    socket.open();
+    socket.dropWith(1006);
+    vi.advanceTimersByTime(260);
+    const second = FakeSocket.instances[1];
+    if (!second) throw new Error("no second socket");
+    second.open();
+    second.dropWith(1006);
+    vi.advanceTimersByTime(CONNECT_TIMEOUT_MS);
+    // Bounded: the deadline runs from the provider's first breath to its
+    // first usable session, not from each dial.
+    expect(statuses.at(-1)).toBe("failed");
+    const dialled = FakeSocket.instances.length;
+    vi.advanceTimersByTime(60_000);
+    expect(FakeSocket.instances).toHaveLength(dialled);
+    provider.destroy();
+    random.mockRestore();
+    vi.useRealTimers();
+  });
+
+  it("never cuts off a session that did greet, however long it is offline", () => {
+    vi.useFakeTimers();
+    const statuses: string[] = [];
+    const { provider, socket } = makeProvider({
+      onStatus: (status) => statuses.push(status),
+    });
+    socket.open();
+    accept(socket, "e1");
+    // A joined session that drops mid-edit reconnects; it never fails into
+    // the solo fallback, because a second history editing the same engram
+    // is what the whole epoch discipline exists to prevent.
+    socket.dropWith(1006);
+    vi.advanceTimersByTime(120_000);
+    expect(statuses).not.toContain("failed");
+    expect(statuses.at(-1)).toBe("reconnecting");
     provider.destroy();
     vi.useRealTimers();
   });

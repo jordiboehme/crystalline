@@ -7,8 +7,16 @@
  * Reconnect policy: ordinary closes retry with exponential backoff and the
  * same doc (a resync reconciles); close codes 4400-4499 are permanent, the
  * y-websocket convention the server uses for "this session is gone for good".
- * The FIRST connect gets CONNECT_TIMEOUT_MS to succeed; failing that, status
- * goes "failed" and the editor opens solo instead.
+ *
+ * Joining gets CONNECT_TIMEOUT_MS in total, counted from this provider's
+ * first breath to the first hello it accepts, and NOT from each dial: a
+ * daemon that accepts the upgrade and drops before greeting would otherwise
+ * clear a per-attempt deadline every time and climb the ladder forever, with
+ * the author holding a connecting skeleton and no way out but a reload.
+ * Missing that deadline sets status "failed" and the editor opens solo.
+ * Once a session has been accepted the deadline is gone for good: a room that
+ * drops mid-edit reconnects instead, because a solo buffer forked out of a
+ * live room would be a second history of the same engram.
  *
  * The epoch discipline, and why no y-sync leaves before the server's hello is
  * accepted: a daemon restart replaces the session with a fresh doc seeded
@@ -116,10 +124,13 @@ export class CollabProvider {
   private synced = false;
   private retries = 0;
   private timer: ReturnType<typeof setTimeout> | null = null;
-  /** The first connect's deadline, held so a teardown mid-CONNECTING takes
-   *  it down too: a browser closes a connecting socket asynchronously, so
-   *  the close event cannot be relied on to clear it in time. */
+  /** The join deadline: one per provider, armed at construction and cleared
+   *  by the first accepted hello. Held so a teardown mid-CONNECTING takes it
+   *  down too - a browser closes a connecting socket asynchronously, so the
+   *  close event cannot be relied on to clear it in time. */
   private deadline: ReturnType<typeof setTimeout> | null = null;
+  /** Whether ANY connection of this provider ever had a hello accepted. */
+  private everAccepted = false;
   private statusValue: CollabStatus = "connecting";
   /** The server session's epoch, adopted from the first hello. */
   private epoch: string | null = null;
@@ -143,6 +154,16 @@ export class CollabProvider {
     this.socketFactory = socketFactory;
     this.doc.on("update", this.onDocUpdate);
     this.awareness.on("update", this.onAwarenessUpdate);
+    // Armed before the first dial and never re-armed: what it bounds is the
+    // wait for a session, whatever the sockets underneath it are doing.
+    this.deadline = setTimeout(() => {
+      this.deadline = null;
+      if (this.closed || this.everAccepted) {
+        return;
+      }
+      this.stop();
+      this.setStatus("failed");
+    }, CONNECT_TIMEOUT_MS);
     this.connect();
   }
 
@@ -158,23 +179,35 @@ export class CollabProvider {
     this.sendControl({ kind: "resolve", choice });
   }
 
-  destroy(): void {
+  /**
+   * End this provider for good: no more dials, no more frames, no timers
+   * left to fire into an owner that has moved on. What status it ends on is
+   * the caller's to say - a missed deadline is a failure, an epoch gap is a
+   * rebuild - so nothing is announced from here.
+   */
+  private stop(): void {
     this.closed = true;
     if (this.timer !== null) {
       clearTimeout(this.timer);
+      this.timer = null;
     }
     if (this.deadline !== null) {
       clearTimeout(this.deadline);
       this.deadline = null;
     }
+    this.socket?.close();
+    this.socket = null;
+  }
+
+  destroy(): void {
     // The goodbye FIRST, while the awareness listener is still attached to
-    // relay it; the server also nulls this client on close, so this is a
-    // courtesy for the room's latency, not correctness.
+    // relay it and the socket `stop` is about to close is still open; the
+    // server also nulls this client on close, so this is a courtesy for the
+    // room's latency, not correctness.
     removeAwarenessStates(this.awareness, [this.doc.clientID], "destroy");
     this.doc.off("update", this.onDocUpdate);
     this.awareness.off("update", this.onAwarenessUpdate);
-    this.socket?.close();
-    this.socket = null;
+    this.stop();
   }
 
   private setStatus(status: CollabStatus): void {
@@ -193,24 +226,7 @@ export class CollabProvider {
     this.synced = false;
     this.accepted = false; // every connection re-earns it from a hello
     socket.binaryType = "arraybuffer";
-    // The first connect is the solo-fallback gate: no open within the
-    // deadline means the editor should not wait on us.
-    const deadline = this.everConnected
-      ? null
-      : setTimeout(() => {
-          this.deadline = null;
-          if (!this.everConnected) {
-            this.closed = true;
-            socket.close();
-            this.setStatus("failed");
-          }
-        }, CONNECT_TIMEOUT_MS);
-    this.deadline = deadline;
     socket.onopen = () => {
-      if (deadline !== null) {
-        clearTimeout(deadline);
-        this.deadline = null;
-      }
       this.everConnected = true;
       this.setStatus("connected");
       // The retry ladder is NOT reset here: an open socket is only a TCP
@@ -218,7 +234,9 @@ export class CollabProvider {
       // after the upgrade with an ordinary code) would pin the wait at its
       // lowest rung and hammer the server several times a second forever.
       // The reset lives where a hello is accepted, so "success" means a
-      // session this doc can actually use.
+      // session this doc can actually use - and so does the join deadline's
+      // release, or a socket that opens and dies before greeting would buy
+      // itself another full deadline on every retry.
       // Deliberately NOTHING else: the y-sync handshake waits for the
       // server's hello (see greet), or a reconnect onto a restarted daemon
       // would answer the fresh session's SyncStep1 with this doc's whole
@@ -228,17 +246,13 @@ export class CollabProvider {
       this.receive(new Uint8Array(event.data as ArrayBuffer));
     };
     socket.onclose = (event) => {
-      if (deadline !== null) {
-        clearTimeout(deadline);
-        this.deadline = null;
-      }
       this.socket = null;
       if (this.closed) {
         return;
       }
       if (event.code >= 4400 && event.code <= 4499) {
         // Permanent by convention: auth revoked, engram gone.
-        this.closed = true;
+        this.stop();
         this.setStatus("failed");
         return;
       }
@@ -302,15 +316,19 @@ export class CollabProvider {
             // very frame; stop HERE, never answer it, and end this provider
             // for good - the owner rebuilds a fresh doc around the new
             // epoch, and the old text survives in the owner's draft.
-            this.closed = true;
-            this.socket?.close();
-            this.socket = null;
+            this.stop();
             this.handlers.onEpochGap();
             return;
           }
           this.epoch = control.epoch;
           this.accepted = true;
-          // A usable session is what earns the ladder's reset (see onopen).
+          // A usable session is what earns the ladder's reset (see onopen)
+          // and the end of the join deadline.
+          this.everAccepted = true;
+          if (this.deadline !== null) {
+            clearTimeout(this.deadline);
+            this.deadline = null;
+          }
           this.retries = 0;
           this.greet();
         }

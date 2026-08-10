@@ -307,6 +307,15 @@ function EditorSurface({ engram }: { engram: EngramDetail }) {
 function SessionStatus({ collab }: { collab: CollabSession }) {
   return (
     <>
+      {collab.status === "reconnecting" && (
+        // The one thing an author needs to know while the socket is down:
+        // typing is not being thrown away. The buffer stays live and the
+        // session resyncs on the same epoch when it comes back - a drop
+        // never forks the room into a second history.
+        <p role="status" className="text-sm text-amber-700 dark:text-amber-300">
+          Reconnecting - edits are kept locally
+        </p>
+      )}
       {collab.mergeNotice && (
         <p role="status" className="text-sm text-slate-500 dark:text-slate-400">
           A change from outside was folded into this session.
@@ -564,6 +573,34 @@ function Surface({
     };
   }, [closed, engram.domain, navigate]);
 
+  /**
+   * The unload prompt in a room, keyed on the SESSION's verdict.
+   *
+   * The solo prompt is off under the collab transport (see
+   * `useEditorSession`) because its `dirty` flag compares a file-space
+   * mount against an LF buffer and would read true forever on a CRLF file.
+   * What is actually at risk here is work the server has not confirmed:
+   * "pending" is a save in flight, "failed" and "conflict" are saves it
+   * refused. Anything else means the room and the file agree.
+   */
+  const owedSave =
+    inRoom &&
+    (collab.saveState === "pending" ||
+      collab.saveState === "failed" ||
+      collab.saveState === "conflict");
+  useEffect(() => {
+    if (!owedSave) {
+      return;
+    }
+    const prompt = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+    };
+    window.addEventListener("beforeunload", prompt);
+    return () => {
+      window.removeEventListener("beforeunload", prompt);
+    };
+  }, [owedSave]);
+
   // The session's rename receipt, followed the same way the solo save's is.
   useEffect(() => {
     if (inRoom && collab.permalink !== engram.permalink) {
@@ -626,7 +663,12 @@ function Surface({
           <span className="font-mono text-xs text-slate-500 dark:text-slate-400">
             {engram.permalink}
           </span>
-          {inRoom && <PresenceChips participants={collab.participants} />}
+          {inRoom && (
+            <PresenceChips
+              participants={collab.participants}
+              offline={collab.status !== "connected"}
+            />
+          )}
         </div>
         <div className="flex items-center gap-2">
           {/*
@@ -687,7 +729,14 @@ function Surface({
           <button
             type="button"
             onClick={session.requestSave}
-            disabled={session.saving || session.hardErrors > 0}
+            // In a room the client's verdict never gates a save: the server
+            // owns the write, it debounce-saves whatever the shared text
+            // holds regardless of this tab, and its own parse refusal is
+            // the authoritative gate - it comes back as a save-failed
+            // control in the server's words. A button disabled here while
+            // Mod-S flushed and the server saved anyway would be a control
+            // lying about what is happening.
+            disabled={session.saving || (!inRoom && session.hardErrors > 0)}
             className="rounded border border-slate-300 px-3 py-1 text-sm hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:outline-none disabled:opacity-50 dark:border-slate-700 dark:hover:bg-slate-800"
           >
             Save
@@ -703,8 +752,26 @@ function Surface({
       {session.hardErrors > 0 && (
         <p role="alert" className="text-sm text-red-800 dark:text-red-200">
           {String(session.hardErrors)} hard{" "}
-          {session.hardErrors === 1 ? "error" : "errors"} block saving; see
-          Findings.
+          {session.hardErrors === 1 ? "error" : "errors"}{" "}
+          {/*
+            Two different truths about the same findings: on the solo
+            surface they hold the save back, in a room they cannot - the
+            server saves the shared text on its own schedule and refuses
+            what it cannot parse in its own words.
+          */}
+          {inRoom
+            ? "in this engram; see Findings."
+            : "block saving; see Findings."}
+        </p>
+      )}
+      {/*
+        No room to join, and the attempt is over rather than still running:
+        one quiet line, because editing solo is the ordinary older behavior
+        and not a failure the author has to act on.
+      */}
+      {!inRoom && collab.status === "failed" && (
+        <p role="status" className="text-sm text-slate-500 dark:text-slate-400">
+          Editing solo - live collaboration is not available here
         </p>
       )}
       {closed && (

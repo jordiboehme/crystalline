@@ -300,9 +300,14 @@ export function useCollabSession(options: CollabSessionOptions): CollabSession {
       onStatus: (next) => {
         setStatus(next);
         if (next === "failed") {
-          // A first connect that never landed means there is no room to join
-          // and the editor opens solo. A session that HAS been joined keeps
-          // its buffer and its binding; the status line says it is offline.
+          // A connect that never landed a session means there is no room to
+          // join and the editor opens solo - including the rebuild after an
+          // epoch gap, which is a first connect of its own and which reset
+          // the mode out of "collab" for exactly this reason. A session that
+          // HAS been joined keeps its buffer and its binding instead; the
+          // status line says it is offline and the room resyncs. Forking a
+          // live room into a solo buffer would be a second history of the
+          // same engram.
           setMode((current) => (current === "collab" ? "collab" : "solo"));
         }
       },
@@ -329,6 +334,14 @@ export function useCollabSession(options: CollabSessionOptions): CollabSession {
             savedAt: new Date().toISOString(),
           });
         }
+        // Back to connecting, and deliberately not left on "collab": the
+        // room the mode was claiming is gone, its document is about to be
+        // torn down, and a mode that outlived its binding renders as a
+        // skeleton with no bound left to escape into. Status likewise - the
+        // provider that last said "connected" has been discarded, so reading
+        // anything off it would be reading a corpse.
+        setMode("connecting");
+        setStatus("connecting");
         setGeneration((current) => current + 1);
       },
     };
