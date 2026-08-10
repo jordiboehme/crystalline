@@ -7,10 +7,12 @@
  * which is the static server's SPA fallback and the app's per-segment permalink
  * encoding meeting for the first time; a search answered by the index rather
  * than by a fixture; a graph canvas that only a browser with layout can draw;
- * and a keyboard shortcut delivered by the browser itself.
+ * and a keyboard shortcut delivered by the browser itself; and two browsers
+ * co-editing one engram over a real websocket, which needs two of everything
+ * jsdom has one of.
  *
  * The domain behind it is `e2e/fixtures/domain`, copied to a scratch directory
- * and registered by `e2e/run-smoke.sh`, which is also what seeds the account
+ * and registered by `e2e/run-smoke.sh`, which is also what seeds the accounts
  * these tests sign in with. Every title, permalink and tag asserted on below is
  * a line in one of those files.
  */
@@ -23,6 +25,10 @@ const USER = process.env.FLUID_E2E_USER ?? "smoke";
 const PASSWORD = process.env.FLUID_E2E_PASSWORD ?? "smoke-password";
 const DOMAIN = process.env.FLUID_E2E_DOMAIN ?? "fluid-smoke";
 
+/** The second account the same script seeds: the other half of a room. */
+const PEER = process.env.FLUID_E2E_PEER ?? "peer";
+const PEER_PASSWORD = process.env.FLUID_E2E_PEER_PASSWORD ?? "peer-password";
+
 /** The engram three folders down, whose permalink is a path rather than a word. */
 const DEEP_PERMALINK = "notes/deep/gamma";
 
@@ -31,13 +37,20 @@ const DEEP_PERMALINK = "notes/deep/gamma";
  *
  * The unauthenticated app redirects to the login screen on its own, so this
  * starts at the root: what it proves on the way past is that the gate holds.
+ *
+ * The account defaults to the one every other test signs in as, so only the
+ * two-browser journey ever passes the peer's.
  */
-async function signIn(page: Page): Promise<void> {
+async function signIn(
+  page: Page,
+  name: string = USER,
+  password: string = PASSWORD,
+): Promise<void> {
   await page.goto("/");
   await expect(page).toHaveURL(/\/login$/);
 
-  await page.getByLabel("Name", { exact: true }).fill(USER);
-  await page.getByLabel("Password", { exact: true }).fill(PASSWORD);
+  await page.getByLabel("Name", { exact: true }).fill(name);
+  await page.getByLabel("Password", { exact: true }).fill(password);
   await page.getByRole("button", { name: "Log in" }).click();
 
   await expect(
@@ -69,6 +82,20 @@ async function openEngram(page: Page, title: string): Promise<void> {
 
   await page.getByRole("link", { name: new RegExp(`^${title}, `) }).click();
   await expect(engramTitle(page)).toHaveText(title);
+}
+
+/**
+ * The row of presence chips beside a session buffer.
+ *
+ * Scoped by the list's own accessible name rather than reached for by the name
+ * on a chip, because a display name is not a unique string on this screen: the
+ * account is called `smoke` and so are the domain and one of the fixture's
+ * tags, and the remote caret carries its owner's name in a hover label that is
+ * in the DOM from the moment the caret is. The list is where the room's roster
+ * lives, so it is the only place worth asserting a roster against.
+ */
+function presence(page: Page) {
+  return page.getByRole("list", { name: /^In this session:/ });
 }
 
 test.beforeEach(async ({ page }) => {
@@ -205,4 +232,83 @@ test("an engram is created, edited, saved and retired", async ({ page }) => {
   await page.getByRole("radio", { name: "archived" }).click();
   await page.getByRole("button", { name: "Retire engram" }).click();
   await expect(page.getByRole("note")).toContainText(/archived/i);
+});
+
+test("two browsers co-edit one engram and the save lands once", async ({
+  browser,
+}) => {
+  // Two isolated sessions: different accounts, different cookie jars.
+  const contextA = await browser.newContext();
+  const contextB = await browser.newContext();
+  const pageA = await contextA.newPage();
+  const pageB = await contextB.newPage();
+  await signIn(pageA);
+  await signIn(pageB, PEER, PEER_PASSWORD);
+
+  // "Tide Tables" is a fixture engram (permalink tide-tables) nothing else in
+  // the suite mutates, so this test owns its content. The copy under edit is
+  // the scratch one `run-smoke.sh` made; the checked-in fixture is untouched.
+  await openEngram(pageA, "Tide Tables");
+  await pageA.getByRole("link", { name: "Edit" }).click();
+  await openEngram(pageB, "Tide Tables");
+  await pageB.getByRole("link", { name: "Edit" }).click();
+
+  const editorA = pageA.getByRole("textbox", { name: "Engram source" });
+  const editorB = pageB.getByRole("textbox", { name: "Engram source" });
+  await expect(editorA).toBeVisible();
+  await expect(editorB).toBeVisible();
+
+  // Presence: each side lists the other by display name, and BOTH remote
+  // cursors are visible - the spec's own wording. A cursor renders on the
+  // OTHER browser once its owner focuses the buffer.
+  await expect(presence(pageA).getByText(PEER, { exact: true })).toBeVisible();
+  await expect(presence(pageB).getByText(USER, { exact: true })).toBeVisible();
+  await editorA.click();
+  await expect(pageB.locator(".cm-ySelectionCaret")).toBeVisible();
+  await editorB.click();
+  await expect(pageA.locator(".cm-ySelectionCaret")).toBeVisible();
+
+  // The version on disk before anyone types, read now rather than after the
+  // edit: the server saves a room on its own debounce, so a "before" taken
+  // once the text had already moved would be racing that timer for which
+  // checksum it caught.
+  const detail = () =>
+    pageA.request
+      .get(`/api/v1/domains/${DOMAIN}/engrams/tide-tables`)
+      .then(
+        (response) =>
+          response.json() as Promise<{ checksum: string; content: string }>,
+      );
+  const before = await detail();
+
+  // An edit from A appears at B without B doing anything. Typed at the
+  // document END - text ahead of the frontmatter would trip the save gate -
+  // placed deterministically on every platform: select-all, then ArrowRight
+  // collapses the selection to the end (macOS has no reliable Ctrl+End).
+  await editorA.click();
+  await pageA.keyboard.press("ControlOrMeta+A");
+  await pageA.keyboard.press("ArrowRight");
+  await editorA.pressSequentially("smoke-collab line");
+  await expect(editorB).toContainText("smoke-collab line");
+
+  // The save lands once. Do NOT assert on the "Saved" text: saveState starts
+  // "ok", so "Saved" renders before any save ever runs. The served detail is
+  // the truth: the checksum moves off the pre-edit value, the file carries the
+  // typed line exactly once - two copies would be the shared document applied
+  // twice - and then everything holds steady while the room idles past its
+  // debounce.
+  await pageA.getByRole("button", { name: "Save" }).click();
+  await expect
+    .poll(async () => (await detail()).content)
+    .toContain("smoke-collab line");
+  const first = await detail();
+  expect(first.checksum).not.toBe(before.checksum);
+  expect(first.content.split("smoke-collab line").length - 1).toBe(1);
+  await pageA.waitForTimeout(3000); // longer than the server debounce
+  const second = await detail();
+  expect(second.checksum).toBe(first.checksum);
+  expect(second.content).toBe(first.content);
+
+  await contextA.close();
+  await contextB.close();
 });

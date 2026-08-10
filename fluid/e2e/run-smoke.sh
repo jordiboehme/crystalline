@@ -2,7 +2,7 @@
 # Run the Fluid browser smoke against a real Crystalline daemon.
 #
 # One command, the same one locally and in CI: it builds the bundle, stands up
-# a daemon holding a copy of the fixture domain and one seeded account, and
+# a daemon holding a copy of the fixture domain and two seeded accounts, and
 # hands both to Playwright, which serves the bundle with `vite preview` (see
 # playwright.config.ts) and drives a browser against it.
 #
@@ -30,7 +30,12 @@ DAEMON_ADDR="127.0.0.1:7411"
 FLUID_E2E_USER="${FLUID_E2E_USER:-smoke}"
 FLUID_E2E_PASSWORD="${FLUID_E2E_PASSWORD:-smoke-password}"
 FLUID_E2E_DOMAIN="${FLUID_E2E_DOMAIN:-fluid-smoke}"
+# The second account, for the two-browser co-editing journey: a room needs two
+# people, and two people in one room need two logins.
+FLUID_E2E_PEER="${FLUID_E2E_PEER:-peer}"
+FLUID_E2E_PEER_PASSWORD="${FLUID_E2E_PEER_PASSWORD:-peer-password}"
 export FLUID_E2E_USER FLUID_E2E_PASSWORD FLUID_E2E_DOMAIN
+export FLUID_E2E_PEER FLUID_E2E_PEER_PASSWORD
 
 bin="${CRYSTALLINE_BIN:-}"
 if [ -z "$bin" ]; then
@@ -108,6 +113,13 @@ echo "smoke: registering the fixture domain"
 echo "smoke: seeding the account"
 printf '%s' "$FLUID_E2E_PASSWORD" \
     | "${isolated[@]}" "$bin" users add "$FLUID_E2E_USER" --role admin --password-stdin
+
+# An editor rather than a second admin: the co-editing journey only needs to
+# reach the editor, and a peer with no more rights than that is the account a
+# real second author would have.
+echo "smoke: seeding the peer account"
+printf '%s' "$FLUID_E2E_PEER_PASSWORD" \
+    | "${isolated[@]}" "$bin" users add "$FLUID_E2E_PEER" --role editor --password-stdin
 
 # `env` execs, so the pid recorded here is the daemon's own and the trap above
 # signals the daemon rather than a wrapper around it.
