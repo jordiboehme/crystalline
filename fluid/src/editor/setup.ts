@@ -32,9 +32,16 @@ import { tags } from "@lezer/highlight";
  * is line content.
  */
 export function lineSeparatorFor(content: string): Extension[] {
-  return [
-    EditorState.lineSeparator.of(content.includes("\r\n") ? "\r\n" : "\n"),
-  ];
+  return [EditorState.lineSeparator.of(separatorOf(content))];
+}
+
+/**
+ * The one spelling of the separator-detection rule. `lineSeparatorFor` and
+ * every buffer swap decide with this; a second inline `includes("\r\n")` is
+ * the drift this export exists to prevent.
+ */
+export function separatorOf(content: string): "\r\n" | "\n" {
+  return content.includes("\r\n") ? "\r\n" : "\n";
 }
 
 /**
@@ -86,6 +93,50 @@ export function buildEditorState(
       }),
     ],
   });
+}
+
+/**
+ * Replace the whole buffer with `content`, preserving whichever line ending
+ * `content` actually uses - shared by "take the server version", "restore
+ * draft" and the external swaps a session hands in, all of which bring in
+ * text that was never typed into this session's own state.
+ *
+ * A plain `view.dispatch` splits an inserted string using the STATE's
+ * existing line separator (`ChangeSet.of` reads
+ * `state.facet(EditorState.lineSeparator)`), not the one the string itself
+ * uses, so a swap across CRLF and LF rebuilds the state fresh with
+ * `content`'s own separator via `view.setState`, in place on the same view
+ * rather than a full remount, so everything around the buffer survives.
+ * `setState` does not run the transaction pipeline, so the rebuilt state's
+ * own doc-changed subscription never fires for the swap itself and
+ * `onDocChanged` is called directly afterward.
+ *
+ * `extensionsFor` and `ariaLabel` travel in because `setState` replaces the
+ * whole configuration: every layer has to be rebuilt into the new state as it
+ * stands right now - the decoration compartment at whatever the toggle is on,
+ * the resolver at whatever the graph has answered - or a separator-changing
+ * swap would silently drop them. It takes the content because a rebuilt
+ * state's line separator comes from the text being swapped in, not from the
+ * one being replaced.
+ */
+export function replaceBuffer(
+  view: EditorView,
+  content: string,
+  extensionsFor: (content: string) => Extension[],
+  ariaLabel: string,
+  onDocChanged: (doc: string) => void,
+): void {
+  const mounted = view.state.facet(EditorState.lineSeparator) ?? "\n";
+  if (separatorOf(content) === mounted) {
+    view.dispatch({
+      changes: { from: 0, to: view.state.doc.length, insert: content },
+    });
+    return;
+  }
+  view.setState(
+    buildEditorState(content, extensionsFor(content), ariaLabel, onDocChanged),
+  );
+  onDocChanged(content);
 }
 
 /** The one highlight style; colors lean on the app's slate/sky palette. */

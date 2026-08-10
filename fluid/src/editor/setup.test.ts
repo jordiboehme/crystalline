@@ -1,7 +1,15 @@
 import { EditorState } from "@codemirror/state";
+import { EditorView } from "@codemirror/view";
 import { describe, expect, it } from "vitest";
 
-import { baseExtensions, docText, lineSeparatorFor } from "./setup";
+import {
+  baseExtensions,
+  buildEditorState,
+  docText,
+  lineSeparatorFor,
+  replaceBuffer,
+  separatorOf,
+} from "./setup";
 
 /** Documents chosen to break reserializers: none of this may change. */
 const FIXTURES = [
@@ -61,5 +69,47 @@ describe("the buffer is the file", () => {
     // above: `Text` joins with "\n" and knows nothing of the separator.
     const doc = "---\r\ntitle: Windows\r\n---\r\n";
     expect(open(doc).doc.toString()).not.toBe(doc);
+  });
+});
+
+describe("separatorOf and the shared replaceBuffer", () => {
+  it("names CRLF when any CRLF is present, LF otherwise", () => {
+    expect(separatorOf("a\r\nb")).toBe("\r\n");
+    expect(separatorOf("a\nb")).toBe("\n");
+    expect(separatorOf("a\rb")).toBe("\n");
+    expect(separatorOf("")).toBe("\n");
+  });
+
+  it("swaps same-separator content via dispatch and keeps the text byte-exact", () => {
+    const view = new EditorView({
+      state: buildEditorState("a\nb", [...lineSeparatorFor("a\nb")], "test"),
+    });
+    const seen: string[] = [];
+    replaceBuffer(
+      view,
+      "c\nd",
+      (content) => [...lineSeparatorFor(content)],
+      "test",
+      (doc) => seen.push(doc),
+    );
+    expect(docText(view.state)).toBe("c\nd");
+    view.destroy();
+  });
+
+  it("rebuilds across a separator change and reports the swap", () => {
+    const view = new EditorView({
+      state: buildEditorState("a\nb", [...lineSeparatorFor("a\nb")], "test"),
+    });
+    const seen: string[] = [];
+    replaceBuffer(
+      view,
+      "x\r\ny",
+      (content) => [...lineSeparatorFor(content)],
+      "test",
+      (doc) => seen.push(doc),
+    );
+    expect(docText(view.state)).toBe("x\r\ny");
+    expect(seen).toContain("x\r\ny");
+    view.destroy();
   });
 });
