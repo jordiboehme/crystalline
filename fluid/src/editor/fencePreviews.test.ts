@@ -7,6 +7,7 @@
 
 import { EditorSelection } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
+import mermaid from "mermaid";
 import { describe, expect, it, vi } from "vitest";
 
 import { fencePreviews } from "./fencePreviews";
@@ -36,6 +37,22 @@ describe("fence previews", () => {
     });
     // The source is still the buffer, untouched.
     expect(view.state.doc.toString()).toContain("graph TD; A-->B;");
+    view.destroy();
+  });
+
+  it("suppresses mermaid's own error rendering", async () => {
+    // This preview redraws on every keystroke, so it renders half-typed
+    // diagrams constantly and most of those fail. Mermaid's default is to
+    // append its error graphic to `document.body`, outside the editor and
+    // outside anything that ever tears it down: without this flag the bombs
+    // pile up under the page for the whole session.
+    const view = editor("```mermaid\ngraph TD; A-->B;\n```\n");
+    await vi.waitFor(() => {
+      expect(mermaid.initialize).toHaveBeenCalled();
+    });
+    expect(vi.mocked(mermaid.initialize).mock.calls.at(-1)?.[0]).toMatchObject({
+      suppressErrorRendering: true,
+    });
     view.destroy();
   });
 

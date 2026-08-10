@@ -55,6 +55,14 @@ class MermaidPreviewWidget extends WidgetType {
         mermaid.initialize({
           startOnLoad: false,
           securityLevel: "strict",
+          // The live preview renders on every keystroke, so most of what it
+          // asks mermaid to draw is a half-typed diagram that fails. Without
+          // this, each of those failures appends mermaid's error graphic to
+          // `document.body` - outside the editor, outside CodeMirror's own
+          // teardown - and they accumulate under the page for the whole
+          // session. A broken diagram previews as nothing; the source is
+          // right above it.
+          suppressErrorRendering: true,
           theme: dark ? "dark" : "default",
         });
         const rendered = await mermaid.render(id, source);

@@ -31,6 +31,13 @@ export default function MermaidDiagram({ source }: { source: string }) {
     mermaid.initialize({
       startOnLoad: false,
       securityLevel: "strict",
+      // A failed render must leave NOTHING behind. Mermaid's default is to
+      // append its own error graphic to `document.body`, outside React's
+      // tree, where nothing here can ever take it down again: the bombs
+      // stack up at the bottom of the page until a reload. The fallback
+      // below - the source the author wrote - is this component's answer to
+      // a diagram that will not parse.
+      suppressErrorRendering: true,
       theme: resolved === "dark" ? "dark" : "default",
     });
     mermaid
