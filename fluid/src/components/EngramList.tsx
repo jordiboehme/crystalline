@@ -269,6 +269,8 @@ function Snippet({ text, highlight }: { text: string; highlight: string[] }) {
   );
 }
 
+// Superseded by primitives Chip - Task 8 migrates this row's type/status
+// badges to Chip/statusVariant when it touches EngramList's file list.
 function Badge({ children, title }: { children: ReactNode; title?: string }) {
   return (
     <span
