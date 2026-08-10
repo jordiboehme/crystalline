@@ -344,6 +344,47 @@ async fn a_refused_save_blocks_saving_not_editing_and_recovers() {
 }
 
 #[tokio::test]
+async fn a_joiner_into_a_blocked_room_is_greeted_with_the_standing_refusal() {
+    // The refusal was broadcast before this tab had a socket, and the session
+    // never repeats a detail it has already announced: the greeting is the
+    // only place a joiner can learn that the room cannot save. Without it the
+    // second author reads "Saved" over an engram nothing has written since.
+    let (_tmp, engine) = engine_fixture().await;
+    let sessions = CollabSessions::new(engine);
+    let mut first = sessions.join("eng", "alpha").await.unwrap();
+    let doc = sync_client(&first).await;
+    replace_all(&first, &doc, "no frontmatter at all").await;
+    first
+        .session
+        .handle_frame(first.conn, &control::encode(&Control::Flush))
+        .await;
+    first.session.tick_save(Instant::now()).await;
+    let Control::SaveFailed { detail } = next_control(&mut first.rx).await else {
+        panic!("the refusal is broadcast to the room that was there")
+    };
+
+    let second = sessions.join("eng", "alpha").await.unwrap();
+    let Message::Custom(tag, payload) = &messages_of(&second.greeting)[0] else {
+        panic!("the greeting opens with the hello control")
+    };
+    assert_eq!(*tag, control::CONTROL_TAG);
+    let Some(Control::Hello {
+        save_state,
+        detail: greeted,
+        ..
+    }) = control::decode(payload)
+    else {
+        panic!("hello parses")
+    };
+    assert_eq!(save_state, "failed");
+    assert_eq!(
+        greeted.as_deref(),
+        Some(detail.as_str()),
+        "the joiner is told the same reason the room was"
+    );
+}
+
+#[tokio::test]
 async fn a_frontmatter_rename_moves_the_session_and_the_receipt_says_so() {
     let (_tmp, engine) = engine_fixture().await;
     let sessions = CollabSessions::new(engine.clone());

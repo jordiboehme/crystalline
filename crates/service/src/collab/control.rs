@@ -30,6 +30,16 @@ pub enum Control {
         permalink: String,
         /// The session's save state: "ok", "failed" or "conflict".
         save_state: String,
+        /// Why saving is refused, when `save_state` is "failed" and the
+        /// session has words for it. A joiner is told the standing failure
+        /// here or not at all: the SaveFailed broadcast that carried it went
+        /// out before this socket was subscribed, and the session suppresses
+        /// a repeat of a refusal it has already announced.
+        ///
+        /// Skipped when absent so a client from before this field sees the
+        /// greeting it has always seen; decoding is lenient the same way.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
     },
     /// A save landed; the checksum is the new CAS token.
     Saved {
@@ -95,6 +105,15 @@ mod tests {
                 checksum: "abc".into(),
                 permalink: "notes/alpha".into(),
                 save_state: "ok".into(),
+                detail: None,
+            },
+            Control::Hello {
+                epoch: "1a2b.1".into(),
+                separator: "\n".into(),
+                checksum: "abc".into(),
+                permalink: "notes/alpha".into(),
+                save_state: "failed".into(),
+                detail: Some("the document carries no frontmatter".into()),
             },
             Control::Saved {
                 checksum: "def".into(),
@@ -127,6 +146,40 @@ mod tests {
             assert_eq!(tag, CONTROL_TAG);
             assert_eq!(decode(&payload), Some(control));
         }
+    }
+
+    #[test]
+    fn a_healthy_hello_carries_no_detail_key_and_one_without_it_still_parses() {
+        // Both directions of the compatibility the field was added under: a
+        // room with nothing to explain sends the greeting it always sent, and
+        // a greeting written before the field existed still decodes.
+        let healthy = Control::Hello {
+            epoch: "1a2b.1".into(),
+            separator: "\n".into(),
+            checksum: "abc".into(),
+            permalink: "alpha".into(),
+            save_state: "ok".into(),
+            detail: None,
+        };
+        let json = serde_json::to_string(&healthy).unwrap();
+        assert!(
+            !json.contains("detail"),
+            "no empty detail on the wire: {json}"
+        );
+        assert_eq!(decode(json.as_bytes()), Some(healthy));
+        assert_eq!(
+            decode(
+                br#"{"kind":"hello","epoch":"e1","separator":"\n","checksum":"abc","permalink":"alpha","save_state":"failed"}"#
+            ),
+            Some(Control::Hello {
+                epoch: "e1".into(),
+                separator: "\n".into(),
+                checksum: "abc".into(),
+                permalink: "alpha".into(),
+                save_state: "failed".into(),
+                detail: None,
+            })
+        );
     }
 
     #[test]

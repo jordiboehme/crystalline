@@ -458,6 +458,11 @@ impl CollabSession {
             checksum: state.checksum.clone(),
             permalink: state.permalink.clone(),
             save_state: state.save_state.as_str().to_string(),
+            // A room whose save is standing refused says why in its greeting.
+            // The SaveFailed broadcast is not repeated for a detail already
+            // announced, so without this a joiner would read "Saved" over a
+            // room that has not written anything since the refusal.
+            detail: state.failure_detail.clone(),
         });
         let sv = state.awareness.doc().transact().state_vector();
         greeting.extend(Message::Sync(SyncMessage::SyncStep1(sv)).encode_v1());
