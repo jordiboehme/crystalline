@@ -9,16 +9,24 @@
  * leaving somebody editing a page that now 404s.
  */
 
-import { screen, waitFor } from "@testing-library/react";
+import { EditorView } from "@codemirror/view";
+import { act, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { Awareness } from "y-protocols/awareness";
+import * as Y from "yjs";
 
 import { ApiProblem, api } from "../api/client";
+import { TEXT_NAME } from "../collab/provider";
+import type { CollabSession } from "../collab/useCollabSession";
+import { useCollabSession } from "../collab/useCollabSession";
+import { SAVE_EVENT } from "../editor/useEditorSession";
 import {
   answersFor,
   domainsResponse,
   meResponse,
   renderApp,
+  soloCollabSession,
   userFixture,
 } from "../test/harness";
 
@@ -27,7 +35,18 @@ vi.mock("../api/client", async (importOriginal) => {
   return { ...actual, api: vi.fn(), setCsrfToken: vi.fn() };
 });
 
+// The session hook is mocked wholesale rather than driven through a fake
+// socket: what this file is about is the screen's two surfaces, and the hook
+// has its own tests next door. `importOriginal` keeps `fileSpace`, which the
+// screen imports from the same module, real.
+vi.mock("../collab/useCollabSession", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("../collab/useCollabSession")>();
+  return { ...actual, useCollabSession: vi.fn() };
+});
+
 const apiMock = vi.mocked(api);
+const collabMock = vi.mocked(useCollabSession);
 
 const CONTENT =
   "---\ntitle: Alpha\npermalink: alpha\nstatus: stable\ntype: engram\n---\n\n# Alpha\n\nA rule.\n";
@@ -111,8 +130,60 @@ function putIfMatch(index: number): string | undefined {
   return headers?.["If-Match"];
 }
 
+/**
+ * A joined room over a real Y.Text, so the binding under test is the real
+ * `yCollab` one: a remote edit here is an actual Yjs update, not a prop.
+ */
+function joinedSession(overrides: Partial<CollabSession> = {}) {
+  const doc = new Y.Doc();
+  const ytext = doc.getText(TEXT_NAME);
+  ytext.insert(0, CONTENT);
+  const awareness = new Awareness(doc);
+  awareness.setLocalStateField("user", {
+    name: "Ada Lovelace",
+    color: "#0ea5e9",
+    colorLight: "#0ea5e933",
+  });
+  const flush = vi.fn();
+  const session: CollabSession = {
+    ...soloCollabSession(),
+    mode: "collab",
+    ytext,
+    awareness,
+    epoch: "e1",
+    status: "connected",
+    participants: [
+      { name: "Ada Lovelace", color: "#0ea5e9", self: true },
+      { name: "Grace Hopper", color: "#f59e0b", self: false },
+    ],
+    flush,
+    ...overrides,
+  };
+  collabMock.mockReturnValue(session);
+  return { session, doc, ytext, flush };
+}
+
+/** The mounted buffer's own view - `view.dom` is where SAVE_EVENT travels. */
+function mountedView(content: HTMLElement): EditorView {
+  const host = content.closest(".cm-editor");
+  const view = host ? EditorView.findFromDOM(host as HTMLElement) : null;
+  if (!view) {
+    throw new Error("no EditorView is mounted on the buffer");
+  }
+  return view;
+}
+
+/** Every PUT the api mock has seen. */
+function puts() {
+  return apiMock.mock.calls.filter(([, init]) => init?.method === "PUT");
+}
+
 beforeEach(() => {
   apiMock.mockReset();
+  collabMock.mockReset();
+  // Every test that is not about the room runs on the solo surface, exactly
+  // as the screen behaved before there was a session to join.
+  collabMock.mockReturnValue(soloCollabSession());
   localStorage.clear();
 });
 
@@ -830,5 +901,117 @@ describe("the engram editor", () => {
     await waitFor(() => {
       expect(screen.getByRole("button", { name: "Save" })).toBeEnabled();
     });
+  });
+});
+
+describe("the engram editor in a session", () => {
+  /** Mount the editor on a joined room and wait for the bound buffer. */
+  async function openRoom(overrides: Partial<CollabSession> = {}) {
+    const room = joinedSession(overrides);
+    serveEditor();
+    renderApp("/d/eng/edit/alpha");
+    const editor = await screen.findByLabelText("Engram source");
+    await waitFor(() => {
+      expect(editor.textContent).toContain("A rule.");
+    });
+    return { ...room, editor };
+  }
+
+  it("waits on a skeleton while the session is still connecting", async () => {
+    collabMock.mockReturnValue({ ...soloCollabSession(), mode: "connecting" });
+    serveEditor();
+    renderApp("/d/eng/edit/alpha");
+    expect(
+      await screen.findByLabelText("Connecting the session"),
+    ).toBeInTheDocument();
+    expect(screen.queryByLabelText("Engram source")).not.toBeInTheDocument();
+  });
+
+  it("names everybody in the room, the local author included", async () => {
+    await openRoom();
+    const chips = screen.getByRole("list", { name: /in this session/i });
+    expect(chips).toHaveAccessibleName(/Ada Lovelace/);
+    expect(chips).toHaveAccessibleName(/Grace Hopper/);
+    expect(chips.textContent).toContain("Grace Hopper");
+    // The local author is marked rather than listed as a stranger.
+    expect(chips.textContent).toContain("you");
+  });
+
+  it("the Save button asks the session to flush and never PUTs", async () => {
+    const { flush } = await openRoom();
+    await userEvent.click(screen.getByRole("button", { name: "Save" }));
+    expect(flush).toHaveBeenCalled();
+    expect(puts()).toHaveLength(0);
+  });
+
+  it("the keyboard save in a session flushes and never PUTs", async () => {
+    // The exact leak the collab transport exists to prevent: a Mod-S that
+    // still ran the solo mutation would PUT the mount-time checksum at a
+    // server that is debounce-saving the same engram.
+    const { flush, editor } = await openRoom();
+    const view = mountedView(editor);
+    act(() => {
+      view.dom.dispatchEvent(new CustomEvent(SAVE_EVENT));
+    });
+    expect(flush).toHaveBeenCalled();
+    expect(puts()).toHaveLength(0);
+  });
+
+  it("shows a refused session save in the server's own words", async () => {
+    await openRoom({ saveState: "failed", saveDetail: "the file is read only" });
+    // The server's words verbatim, and announced rather than merely shown.
+    const alert = await screen.findByText("the file is read only");
+    expect(alert).toHaveAttribute("role", "alert");
+  });
+
+  it("says so while the session is writing", async () => {
+    await openRoom({ saveState: "pending" });
+    expect(screen.getByText("Saving...")).toBeInTheDocument();
+  });
+
+  it("raises the room's notice when an outside change was folded in", async () => {
+    await openRoom({ mergeNotice: true });
+    const notice = await screen.findByText(/folded into this session/i);
+    expect(notice).toHaveAttribute("role", "status");
+  });
+
+  it("normalizes pasted CRLF text at the end of the document to LF", async () => {
+    const { editor, ytext } = await openRoom();
+    const view = mountedView(editor);
+    const end = view.state.doc.length;
+    const pasted = "x\r\ny\r\n";
+    act(() => {
+      // Shaped like the paste it stands in for, cursor after the insert
+      // included: that selection belongs to the longer, unrewritten text, so
+      // a filter that handed it back would put it past the end of the
+      // document it rewrote and CodeMirror would refuse the transaction.
+      view.dispatch({
+        changes: { from: end, insert: pasted },
+        selection: { anchor: end + pasted.length },
+      });
+    });
+    // Nothing threw, and no stray CR reached the buffer or the shared text -
+    // a CR in LF session space would land in every participant's file.
+    expect(view.state.doc.toString()).toContain("x\ny\n");
+    expect(view.state.doc.toString()).not.toContain("\r");
+    expect(ytext.toJSON()).toContain("x\ny\n");
+    expect(ytext.toJSON()).not.toContain("\r");
+  });
+
+  it("shows a remote edit in the frontmatter form beside the buffer", async () => {
+    const { doc, ytext, editor } = await openRoom();
+    expect(await screen.findByLabelText("Status")).toHaveValue("stable");
+    act(() => {
+      doc.transact(() => {
+        ytext.delete(CONTENT.indexOf("stable"), "stable".length);
+        ytext.insert(CONTENT.indexOf("stable"), "draft");
+      }, "a remote author");
+    });
+    // The binding put it in the buffer, and the form reads the buffer: the
+    // panel beside the text is a view over what the room agreed on.
+    await waitFor(() => {
+      expect(editor.textContent).toContain("status: draft");
+    });
+    expect(await screen.findByLabelText("Status")).toHaveValue("draft");
   });
 });

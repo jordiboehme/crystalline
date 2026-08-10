@@ -3,11 +3,13 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ApiProblem, api } from "../api/client";
+import { useCollabSession } from "../collab/useCollabSession";
 import {
   answersFor,
   domainsResponse,
   meResponse,
   renderApp,
+  soloCollabSession,
   userFixture,
 } from "../test/harness";
 
@@ -16,7 +18,16 @@ vi.mock("../api/client", async (importOriginal) => {
   return { ...actual, api: vi.fn(), setCsrfToken: vi.fn() };
 });
 
+// Creating lands on the editor route; what happens there is the editor's own
+// test. This flow opens it on the solo surface, with no session to wait for.
+vi.mock("../collab/useCollabSession", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("../collab/useCollabSession")>();
+  return { ...actual, useCollabSession: vi.fn() };
+});
+
 const apiMock = vi.mocked(api);
+const collabMock = vi.mocked(useCollabSession);
 
 function tree(path: string) {
   return path.includes("path=notes")
@@ -26,6 +37,8 @@ function tree(path: string) {
 
 beforeEach(() => {
   apiMock.mockReset();
+  collabMock.mockReset();
+  collabMock.mockReturnValue(soloCollabSession());
   localStorage.clear();
 });
 

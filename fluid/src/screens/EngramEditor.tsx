@@ -11,12 +11,16 @@
 
 import { autocompletion } from "@codemirror/autocomplete";
 import type { Extension } from "@codemirror/state";
-import { Compartment } from "@codemirror/state";
+import { Compartment, EditorState } from "@codemirror/state";
 import type { EditorView } from "@codemirror/view";
+import { keymap } from "@codemirror/view";
 import type { QueryClient } from "@tanstack/react-query";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router";
+import { yCollab, yUndoManagerKeymap } from "y-codemirror.next";
+import type { Awareness } from "y-protocols/awareness";
+import * as Y from "yjs";
 
 import { problemDetail } from "../api/client";
 import type { EngramDetail } from "../api/engram";
@@ -26,6 +30,9 @@ import type { Vocabulary } from "../api/vocabulary";
 import { fetchVocabulary, fullVocabularyKey } from "../api/vocabulary";
 import { saveEngram } from "../api/writes";
 import { useAuth } from "../auth/AuthContext";
+import { PresenceChips } from "../collab/PresenceChips";
+import type { CollabSession } from "../collab/useCollabSession";
+import { fileSpace, useCollabSession } from "../collab/useCollabSession";
 import { Skeleton } from "../components/Skeleton";
 import CmEditor from "../editor/CmEditor";
 import { ConflictDialog } from "../editor/ConflictDialog";
@@ -89,6 +96,53 @@ const DETAIL_STALE_MS = 15_000;
 /** What a reference resolves to before the two requests behind it land. */
 const NO_RESOLUTION: WikilinkResolver = () => null;
 
+/** The shared text and the room's presence, once a session has synced. */
+interface Room {
+  ytext: Y.Text;
+  awareness: Awareness;
+}
+
+/**
+ * Keep the shared text in LF space whatever gets pasted into it.
+ *
+ * A session document is LF by construction - the server strips a CRLF file's
+ * endings on the way in and puts them back on the way out - so a CR arriving
+ * through the clipboard is not this author's line ending, it is a stray byte
+ * that would land in every participant's file and in the saved engram.
+ */
+const normalizePastedEndings = EditorState.transactionFilter.of((tr) => {
+  if (!tr.docChanged) {
+    return tr;
+  }
+  let needsRewrite = false;
+  tr.changes.iterChanges((_fromA, _toA, _fromB, _toB, inserted) => {
+    if (inserted.toString().includes("\r")) {
+      needsRewrite = true;
+    }
+  });
+  if (!needsRewrite) {
+    return tr;
+  }
+  const changes: { from: number; to: number; insert: string }[] = [];
+  tr.changes.iterChanges((fromA, toA, _fromB, _toB, inserted) => {
+    changes.push({
+      from: fromA,
+      to: toA,
+      insert: inserted.toString().replace(/\r\n?/g, "\n"),
+    });
+  });
+  // The selection is deliberately omitted rather than carried over: its
+  // positions belong to the unrewritten, longer inserts and can point past
+  // the end of the rewritten document, which CodeMirror refuses outright.
+  // Given no selection of its own, it maps the existing one through these
+  // changes instead, which is the correct place for the cursor anyway.
+  //
+  // Only a frame carrying a CR reaches here, and remote frames never do (the
+  // shared text is LF space), so the annotations dropped by rebuilding the
+  // transaction are always a local edit's.
+  return { changes };
+});
+
 /** Everything one buffer on this screen is built from. */
 interface SurfaceOptions {
   /** The text the buffer opens with, whose line endings it inherits. */
@@ -111,6 +165,8 @@ interface SurfaceOptions {
    * did.
    */
   vocab: () => Vocabulary | null;
+  /** The session this buffer is bound to, or null on the solo surface. */
+  room: Room | null;
 }
 
 /**
@@ -122,9 +178,26 @@ interface SurfaceOptions {
  * disappears the first time a swap rebuilds the buffer.
  */
 function surfaceExtensions(options: SurfaceOptions): Extension[] {
+  const room = options.room;
   return [
-    ...lineSeparatorFor(options.content),
-    ...baseExtensions(options.dark),
+    // A session buffer pins LF rather than deriving a separator from its
+    // text: the shared document is LF space by construction, and deriving it
+    // would let a lone CR that somehow survived upstream pin CRLF and shift
+    // every offset the binding maps between CodeMirror and Yjs.
+    ...(room !== null
+      ? [EditorState.lineSeparator.of("\n")]
+      : lineSeparatorFor(options.content)),
+    // The room's own undo stack replaces CodeMirror's: see `baseExtensions`.
+    ...baseExtensions(options.dark, { history: room === null }),
+    ...(room !== null
+      ? [
+          yCollab(room.ytext, room.awareness, {
+            undoManager: new Y.UndoManager(room.ytext),
+          }),
+          keymap.of(yUndoManagerKeymap),
+          normalizePastedEndings,
+        ]
+      : []),
     saveKeymap,
     // Typing help rather than preview, so it stays on in raw mode: outside
     // the compartment the Raw toggle empties.
@@ -174,14 +247,108 @@ export default function EngramEditor() {
   return <EditorSurface key={`${domain}/${permalink}`} engram={detail.data} />;
 }
 
+/**
+ * The mode switch: try the session first, and open the Group B surface
+ * untouched when there is no room to join.
+ *
+ * The surface below is keyed by the session it is bound to, because that is
+ * what a rebuild has to replace wholesale: a new epoch is a different server
+ * session with a different shared document, and a buffer bound to the old one
+ * cannot be carried across. The skeleton also covers the gap between an epoch
+ * gap and the rebuilt binding - the moment where the room exists but the text
+ * to bind to does not yet - so the surface never renders against a session
+ * that has no document.
+ */
 function EditorSurface({ engram }: { engram: EngramDetail }) {
-  const navigate = useNavigate();
-  const queryClient = useQueryClient();
-  const { resolved } = useTheme();
   const { user } = useAuth();
   // Anonymous can never reach this screen (`canWrite` gates it above); the
   // fallback only satisfies the types.
   const account = user?.name ?? "anonymous";
+  const collab = useCollabSession({
+    domain: engram.domain,
+    permalink: engram.permalink,
+    account,
+    displayName: user?.display ?? user?.name ?? "someone",
+    enabled: true,
+  });
+  if (
+    collab.mode === "connecting" ||
+    (collab.mode === "collab" && collab.ytext === null)
+  ) {
+    return <Skeleton label="Connecting the session" rows={8} />;
+  }
+  return (
+    <Surface
+      key={`${collab.mode}:${collab.epoch ?? ""}`}
+      engram={engram}
+      collab={collab}
+      account={account}
+    />
+  );
+}
+
+/**
+ * What the room says about saving, which in a session is the server's job
+ * rather than this tab's: the control channel's verdict, in its own words
+ * when it refused.
+ */
+function SessionStatus({ collab }: { collab: CollabSession }) {
+  return (
+    <>
+      {collab.mergeNotice && (
+        <p role="status" className="text-sm text-slate-500 dark:text-slate-400">
+          A change from outside was folded into this session.
+        </p>
+      )}
+      {collab.saveState === "failed" && collab.saveDetail !== null && (
+        <p
+          role="alert"
+          className="rounded bg-red-50 px-2 py-1 text-sm text-red-800 dark:bg-red-950 dark:text-red-200"
+        >
+          {collab.saveDetail}
+        </p>
+      )}
+      {collab.saveState === "pending" && (
+        <p className="text-sm text-slate-500 dark:text-slate-400">Saving...</p>
+      )}
+      {collab.saveState === "ok" && (
+        <p className="text-sm text-slate-500 dark:text-slate-400">Saved</p>
+      )}
+    </>
+  );
+}
+
+function Surface({
+  engram,
+  collab,
+  account,
+}: {
+  engram: EngramDetail;
+  collab: CollabSession;
+  account: string;
+}) {
+  const navigate = useNavigate();
+  const queryClient = useQueryClient();
+  const { resolved } = useTheme();
+  const { ytext, awareness } = collab;
+  /**
+   * The session this buffer belongs to, or null on the solo surface. Fixed
+   * for the life of this component: the switch above keys it by the session,
+   * so a room that changes is a different surface.
+   */
+  const room = useMemo<Room | null>(
+    () =>
+      collab.mode === "collab" && ytext !== null && awareness !== null
+        ? { ytext, awareness }
+        : null,
+    [collab.mode, ytext, awareness],
+  );
+  /**
+   * What the buffer opens with. In a session that is the shared text as it
+   * stood at mount - a Y.Text read rather than a CodeMirror read-back - and
+   * it is LF session space, so the session's `dirty` compares like with like.
+   */
+  const [mountText] = useState(() => room?.ytext.toJSON() ?? engram.content);
   /**
    * The same view as state, for the one consumer that needs it while
    * rendering: the frontmatter form dispatches into it. A ref read during
@@ -258,20 +425,45 @@ function EditorSurface({ engram }: { engram: EngramDetail }) {
       resolverBox,
       resolver,
       vocab: readVocab,
+      room,
     });
+
+  /**
+   * How a draft is written. The session buffer is LF space, so a snapshot of
+   * it is put back into the file's own endings before it is stored - the
+   * stored draft is then interchangeable with the solo flow's, whichever
+   * surface wrote it. Stable across renders on purpose: it is what re-arms
+   * the session's draft debounce, and a room re-renders on every remote
+   * keystroke, which an inline closure would let starve the draft to nothing.
+   */
+  const inRoom = room !== null;
+  const separator = collab.separator;
+  const draftContent = useCallback(
+    (buffer: string) => (inRoom ? fileSpace(buffer, separator) : buffer),
+    [inRoom, separator],
+  );
 
   // Everything both editors agree on - the buffer's checksum and dirty state,
   // the dry-run gate, drafts, the Mod-S save and the 412 flow - lives in the
   // shared session; what is engram-specific stays here.
   const session = useEditorSession({
-    initialContent: engram.content,
-    initialChecksum: engram.checksum ?? "",
+    initialContent: mountText,
+    // A session has no token to hold: the PUT path it would be spent on is
+    // unreachable, because the server owns saving in a room.
+    initialChecksum: inRoom ? "" : (engram.checksum ?? ""),
     draftUser: account,
     draftDomain: engram.domain,
     draftSlot: engram.permalink,
     validateDomain: engram.domain,
     validatePath: engram.path,
     save: async (content, token) => {
+      if (inRoom) {
+        // Unreachable by construction, and loud rather than silent if the
+        // transport switch above ever stops holding: a PUT from inside a
+        // session would carry a checksum nobody granted, against a server
+        // already debounce-saving the same engram.
+        throw new Error("unreachable: the collab transport never PUTs");
+      }
       const saved = await saveEngram(
         engram.domain,
         engram.permalink,
@@ -293,7 +485,40 @@ function EditorSurface({ engram }: { engram: EngramDetail }) {
     },
     extensionsFor,
     ariaLabel: ARIA_LABEL,
+    transport: inRoom ? "collab" : "solo",
+    // The one save path in a room: the Save button and Mod-S both call
+    // `requestSave`, which the collab transport routes here. A forgotten
+    // `flush` would be a Save button that silently does nothing.
+    flush: collab.flush,
+    draftContent,
   });
+
+  /**
+   * The session's own save receipt, folded back into the buffer's state: the
+   * draft has done its job and the current text is the saved text.
+   *
+   * Only the transition into "ok" counts. Running on every render while the
+   * state happened to be "ok" would settle `savedText` onto whatever had just
+   * been typed, which would leave `dirty` false forever and stop the draft
+   * debounce from ever writing anything.
+   */
+  const lastSaveState = useRef(collab.saveState);
+  useEffect(() => {
+    const previous = lastSaveState.current;
+    lastSaveState.current = collab.saveState;
+    if (inRoom && collab.saveState === "ok" && previous !== "ok") {
+      session.noteSaved();
+    }
+  }, [inRoom, collab.saveState, session]);
+
+  // The session's rename receipt, followed the same way the solo save's is.
+  useEffect(() => {
+    if (inRoom && collab.permalink !== engram.permalink) {
+      void navigate(editRoute(engram.domain, collab.permalink), {
+        replace: true,
+      });
+    }
+  }, [inRoom, collab.permalink, engram.domain, engram.permalink, navigate]);
 
   // The resolver reaches the buffer through its compartment rather than
   // through a remount: the chips redraw, the text and the history stay.
@@ -312,7 +537,7 @@ function EditorSurface({ engram }: { engram: EngramDetail }) {
       // `autocompletion` and `crystallineCompletions` calls to confirm that.
       // eslint-disable-next-line react-hooks/refs
       surfaceExtensions({
-        content: engram.content,
+        content: mountText,
         client: queryClient,
         dark: resolved === "dark",
         domain: engram.domain,
@@ -323,18 +548,20 @@ function EditorSurface({ engram }: { engram: EngramDetail }) {
         // the real resolver in as soon as it does.
         resolver: NO_RESOLUTION,
         vocab: readVocab,
+        room,
       }),
     // Read once: `CmEditor` snapshots the extensions at mount, so a later
     // theme change reaches the buffer through a remount rather than through
     // this array.
     [
-      engram.content,
+      mountText,
       engram.domain,
       queryClient,
       resolved,
       preview,
       resolverBox,
       readVocab,
+      room,
     ],
   );
 
@@ -346,24 +573,37 @@ function EditorSurface({ engram }: { engram: EngramDetail }) {
           <span className="font-mono text-xs text-slate-500 dark:text-slate-400">
             {engram.permalink}
           </span>
+          {inRoom && <PresenceChips participants={collab.participants} />}
         </div>
         <div className="flex items-center gap-2">
-          {session.notice && (
-            <p
-              role={session.notice.kind === "problem" ? "alert" : "status"}
-              className={
-                session.notice.kind === "problem"
-                  ? "rounded bg-red-50 px-2 py-1 text-sm text-red-800 dark:bg-red-950 dark:text-red-200"
-                  : "text-sm text-slate-500 dark:text-slate-400"
-              }
-            >
-              {session.notice.text}
-            </p>
-          )}
-          {session.dirty && !session.notice && (
-            <p className="text-sm text-slate-500 dark:text-slate-400">
-              Unsaved changes
-            </p>
+          {/*
+            Who reports on saving depends on who does it. In a room the
+            server saves and its control channel is the only truth about
+            whether that worked; on the solo surface it is this tab's own
+            mutation.
+          */}
+          {inRoom ? (
+            <SessionStatus collab={collab} />
+          ) : (
+            <>
+              {session.notice && (
+                <p
+                  role={session.notice.kind === "problem" ? "alert" : "status"}
+                  className={
+                    session.notice.kind === "problem"
+                      ? "rounded bg-red-50 px-2 py-1 text-sm text-red-800 dark:bg-red-950 dark:text-red-200"
+                      : "text-sm text-slate-500 dark:text-slate-400"
+                  }
+                >
+                  {session.notice.text}
+                </p>
+              )}
+              {session.dirty && !session.notice && (
+                <p className="text-sm text-slate-500 dark:text-slate-400">
+                  Unsaved changes
+                </p>
+              )}
+            </>
           )}
           {/*
             A toggle, so the label names the thing being switched and
@@ -449,7 +689,7 @@ function EditorSurface({ engram }: { engram: EngramDetail }) {
       <div className="grid gap-8 lg:grid-cols-[minmax(0,1fr)_18rem]">
         <div className="rounded border border-slate-200 dark:border-slate-800">
           <CmEditor
-            initialDoc={engram.content}
+            initialDoc={mountText}
             extensions={extensions}
             ariaLabel={ARIA_LABEL}
             onReady={(ready) => {

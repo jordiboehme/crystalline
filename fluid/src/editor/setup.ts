@@ -193,12 +193,28 @@ function editorTheme(dark: boolean): Extension {
   );
 }
 
-/** Everything an editor surface starts from. */
-export function baseExtensions(dark: boolean): Extension[] {
+/**
+ * Everything an editor surface starts from.
+ *
+ * `history` is a switch rather than a fixture because a co-editing buffer has
+ * an undo stack already: `Y.UndoManager` is the one that knows which changes
+ * in the shared text were mine, and CodeMirror's own history - which sees the
+ * room's changes as ordinary local edits - would undo other people's typing.
+ * Exactly one of the two is installed on any given buffer.
+ */
+export function baseExtensions(
+  dark: boolean,
+  options: { history?: boolean } = {},
+): Extension[] {
+  const ownHistory = options.history ?? true;
   return [
-    history(),
+    ...(ownHistory ? [history()] : []),
     search({ top: true }),
-    keymap.of([...defaultKeymap, ...historyKeymap, ...searchKeymap]),
+    keymap.of([
+      ...defaultKeymap,
+      ...(ownHistory ? historyKeymap : []),
+      ...searchKeymap,
+    ]),
     EditorView.lineWrapping,
     markdown({ base: markdownLanguage, codeLanguages: languages }),
     syntaxHighlighting(editorHighlight),

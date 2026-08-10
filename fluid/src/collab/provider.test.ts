@@ -12,49 +12,15 @@ import {
   collabSocketUrl,
   collabUrl,
 } from "./provider";
-
-class FakeSocket {
-  static instances: FakeSocket[] = [];
-  url: string;
-  binaryType = "";
-  readyState = 0; // CONNECTING
-  sent: Uint8Array[] = [];
-  onopen: (() => void) | null = null;
-  onmessage: ((event: { data: ArrayBuffer }) => void) | null = null;
-  onclose: ((event: { code: number }) => void) | null = null;
-  onerror: (() => void) | null = null;
-  constructor(url: string) {
-    this.url = url;
-    FakeSocket.instances.push(this);
-  }
-  send(data: Uint8Array) {
-    this.sent.push(new Uint8Array(data));
-  }
-  close() {
-    this.readyState = 3;
-    this.onclose?.({ code: 1000 });
-  }
-  // test drivers
-  open() {
-    this.readyState = 1;
-    this.onopen?.();
-  }
-  receive(bytes: Uint8Array) {
-    const data = bytes.buffer.slice(
-      bytes.byteOffset,
-      bytes.byteOffset + bytes.byteLength,
-    );
-    this.onmessage?.({ data: data as ArrayBuffer });
-  }
-  dropWith(code: number) {
-    this.readyState = 3;
-    this.onclose?.({ code });
-  }
-}
-
-function factory(url: string): WebSocket {
-  return new FakeSocket(url) as unknown as WebSocket;
-}
+import {
+  FakeSocket,
+  accept,
+  concat,
+  controlFrame,
+  fakeSocketFactory as factory,
+  helloFrame,
+  serverStep1,
+} from "./testSupport";
 
 function makeProvider(
   handlers: Partial<import("./provider").ProviderHandlers> = {},
@@ -80,51 +46,6 @@ function makeProvider(
     throw new Error("the provider opened no socket");
   }
   return { doc, awareness, provider, socket };
-}
-
-/** A server frame: the yrs side is byte-compatible with y-protocols. */
-function serverStep1(serverDoc: Y.Doc): Uint8Array {
-  const encoder = encoding.createEncoder();
-  encoding.writeVarUint(encoder, MESSAGE_SYNC);
-  syncProtocol.writeSyncStep1(encoder, serverDoc);
-  return encoding.toUint8Array(encoder);
-}
-
-function controlFrame(control: object): Uint8Array {
-  const encoder = encoding.createEncoder();
-  encoding.writeVarUint(encoder, MESSAGE_CONTROL);
-  encoding.writeVarUint8Array(
-    encoder,
-    new TextEncoder().encode(JSON.stringify(control)),
-  );
-  return encoding.toUint8Array(encoder);
-}
-
-function helloFrame(epoch: string): Uint8Array {
-  return controlFrame({
-    kind: "hello",
-    epoch,
-    separator: "\n",
-    checksum: "c1",
-    permalink: "alpha",
-    save_state: "ok",
-  });
-}
-
-/** Complete the epoch handshake the way the server's greeting does. */
-function accept(socket: FakeSocket, epoch = "e1"): void {
-  socket.receive(helloFrame(epoch));
-}
-
-function concat(...frames: Uint8Array[]): Uint8Array {
-  const total = frames.reduce((sum, frame) => sum + frame.length, 0);
-  const out = new Uint8Array(total);
-  let at = 0;
-  for (const frame of frames) {
-    out.set(frame, at);
-    at += frame.length;
-  }
-  return out;
 }
 
 describe("collabUrl", () => {

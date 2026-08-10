@@ -32,6 +32,14 @@ import * as Y from "yjs";
 
 import { API_BASE, encodePermalink, encodeSegment } from "../api/client";
 
+/**
+ * The name of the shared text inside the session document, matching the
+ * server's own `TEXT_NAME`. The one client-side spelling: a second literal
+ * somewhere else would bind an editor to an empty text and look like a sync
+ * failure rather than a typo.
+ */
+export const TEXT_NAME = "content";
+
 export const MESSAGE_SYNC = 0;
 export const MESSAGE_AWARENESS = 1;
 export const MESSAGE_QUERY_AWARENESS = 3;

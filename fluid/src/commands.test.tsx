@@ -15,11 +15,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ApiProblem, api } from "./api/client";
 import type { Role } from "./api/model";
+import { useCollabSession } from "./collab/useCollabSession";
 import {
   answersFor,
   domainsResponse,
   meResponse,
   renderApp,
+  soloCollabSession,
   userFixture,
 } from "./test/harness";
 
@@ -28,7 +30,16 @@ vi.mock("./api/client", async (importOriginal) => {
   return { ...actual, api: vi.fn(), setCsrfToken: vi.fn() };
 });
 
+// The palette is what this file is about, not co-editing: the editor route it
+// visits opens on its solo surface, the way it does with no session server.
+vi.mock("./collab/useCollabSession", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("./collab/useCollabSession")>();
+  return { ...actual, useCollabSession: vi.fn() };
+});
+
 const apiMock = vi.mocked(api);
+const collabMock = vi.mocked(useCollabSession);
 
 const CONTENT = "---\ntitle: Alpha\n---\n\nA rule.\n";
 
@@ -85,6 +96,8 @@ function serveEngram(routes: Record<string, (path: string) => unknown> = {}) {
 
 beforeEach(() => {
   apiMock.mockReset();
+  collabMock.mockReset();
+  collabMock.mockReturnValue(soloCollabSession());
 });
 
 afterEach(() => {

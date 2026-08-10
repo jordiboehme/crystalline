@@ -15,6 +15,7 @@ import { MemoryRouter } from "react-router";
 import App from "../App";
 import { ApiProblem } from "../api/client";
 import type { MeResponse, User } from "../api/model";
+import type { CollabSession } from "../collab/useCollabSession";
 
 /**
  * What a stubbed route answers. Returning a value resolves the call; throwing
@@ -91,4 +92,34 @@ export function renderApp(entry = "/"): RenderResult {
       <App />
     </MemoryRouter>,
   );
+}
+
+/**
+ * The editing session as it reads when there is no room to join: the solo
+ * surface, exactly as the editor behaved before sessions existed.
+ *
+ * The editor route opens a session of its own now, so a test that lands on
+ * that route without saying otherwise would sit on the connecting skeleton
+ * until the socket's own timeout. Every such file mocks
+ * `useCollabSession` and returns this; the one spelling lives here so the
+ * shape cannot drift file by file.
+ */
+export function soloCollabSession(): CollabSession {
+  return {
+    mode: "solo",
+    ytext: null,
+    awareness: null,
+    epoch: null,
+    separator: "\n",
+    status: "failed",
+    saveState: "ok",
+    saveDetail: null,
+    conflict: null,
+    participants: [],
+    permalink: "alpha",
+    flush: () => undefined,
+    resolve: () => undefined,
+    closed: false,
+    mergeNotice: false,
+  };
 }
