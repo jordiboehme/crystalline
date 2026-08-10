@@ -20,11 +20,9 @@ import { useNavigate } from "react-router";
 import { problemDetail } from "../api/client";
 import { fetchTree, treeKey } from "../api/domain";
 import { engramDetailKey } from "../api/engram";
+import { fetchTags, vocabularyKey } from "../api/vocabulary";
 import { createEngram } from "../api/writes";
-import {
-  RECOMMENDED_STATUSES,
-  RECOMMENDED_TYPES,
-} from "../editor/FrontmatterForm";
+import { SUGGESTED_STATUSES, SUGGESTED_TYPES } from "../filters";
 import { editRoute } from "../paths";
 import type { CreateEngramDialogProps } from "./CreateEngramDialog";
 
@@ -42,17 +40,31 @@ export default function CreateEngramDialogBody({
   const [folder, setFolder] = useState(initialFolder);
   const [engramType, setEngramType] = useState("");
   const [status, setStatus] = useState("");
+  const [tags, setTags] = useState("");
   const [problem, setProblem] = useState<string | null>(null);
 
+  // The domain's tag vocabulary, under the same key DomainHome caches it: an
+  // author who arrived from the domain page pays nothing on the wire.
+  const knownTags = useQuery({
+    queryKey: vocabularyKey(domain),
+    queryFn: () => fetchTags(domain),
+  });
+
   const create = useMutation({
-    mutationFn: () =>
-      createEngram(domain, {
+    mutationFn: () => {
+      const tagList = tags
+        .split(",")
+        .map((tag) => tag.trim())
+        .filter((tag) => tag !== "");
+      return createEngram(domain, {
         title: title.trim(),
         content: "",
         ...(folder !== "" ? { folder } : {}),
         ...(engramType.trim() !== "" ? { type: engramType.trim() } : {}),
         ...(status.trim() !== "" ? { status: status.trim() } : {}),
-      }),
+        ...(tagList.length > 0 ? { tags: tagList } : {}),
+      });
+    },
     onSuccess: (created) => {
       // The editor reads through the same key: seeded here, the route it is
       // about to land on opens on what already landed rather than refetching
@@ -124,6 +136,23 @@ export default function CreateEngramDialogBody({
               onChoose={setFolder}
             />
             <label className="flex flex-col gap-1 text-sm">
+              <span>Tags (optional, comma separated)</span>
+              <input
+                className={FIELD_CLASSES}
+                list="create-tags"
+                value={tags}
+                onChange={(event) => {
+                  setTags(event.target.value);
+                }}
+                placeholder="rust, editing"
+              />
+              <datalist id="create-tags">
+                {(knownTags.data ?? []).map((tag) => (
+                  <option key={tag.name} value={tag.name} />
+                ))}
+              </datalist>
+            </label>
+            <label className="flex flex-col gap-1 text-sm">
               <span>Type (suggestions, free form)</span>
               <input
                 className={FIELD_CLASSES}
@@ -135,7 +164,7 @@ export default function CreateEngramDialogBody({
                 placeholder="engram"
               />
               <datalist id="create-types">
-                {RECOMMENDED_TYPES.map((name) => (
+                {SUGGESTED_TYPES.map((name) => (
                   <option key={name} value={name} />
                 ))}
               </datalist>
@@ -152,7 +181,7 @@ export default function CreateEngramDialogBody({
                 placeholder="stable"
               />
               <datalist id="create-statuses">
-                {RECOMMENDED_STATUSES.map((name) => (
+                {SUGGESTED_STATUSES.map((name) => (
                   <option key={name} value={name} />
                 ))}
               </datalist>

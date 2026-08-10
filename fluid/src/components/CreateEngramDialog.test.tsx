@@ -131,6 +131,113 @@ describe("the create flow", () => {
     ).toBeInTheDocument();
   });
 
+  it("sends trimmed comma-separated tags with the create", async () => {
+    const created = vi.fn(() => ({
+      domain: "eng",
+      permalink: "notes/gamma",
+      title: "Gamma",
+      content: "---\ntitle: Gamma\n---\n\n",
+      checksum: "new222",
+      frontmatter: {},
+      observations: [],
+      relations: [],
+      links: [],
+    }));
+    apiMock.mockImplementation(
+      answersFor({
+        "/auth/me": () => meResponse({ user: userFixture() }),
+        "/domains": domainsResponse,
+        "/domains/eng/manifest": () => ({
+          domain: "eng",
+          markdown: "# eng",
+          checksum: "m1",
+        }),
+        "/domains/eng/tree": (path) => tree(path),
+        "/domains/eng/engrams": (_path, init) =>
+          init?.method === "POST"
+            ? created()
+            : { total: 0, page: 1, limit: 50, count: 0, hits: [] },
+        "/domains/eng/engrams/notes/gamma": () => created(),
+        "/validate": () => ({ findings: [], errors: 0 }),
+        "/vocabulary": () => ({ tags: [], categories: [], relation_types: [] }),
+        "/graph": () => ({ nodes: [], edges: [], truncated: false, hidden: 0 }),
+      }),
+    );
+    renderApp("/d/eng");
+    await userEvent.click(
+      await screen.findByRole("button", { name: "New engram" }),
+    );
+    await userEvent.type(screen.getByLabelText(/Title/), "Gamma");
+    await userEvent.type(
+      screen.getByLabelText(/Tags/),
+      " rust, collab,,editing ",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Create" }));
+    await waitFor(() => {
+      expect(created).toHaveBeenCalled();
+    });
+    const call = apiMock.mock.calls.find(([, init]) => init?.method === "POST");
+    const body = call?.[1]?.body;
+    if (typeof body !== "string") {
+      throw new Error("no POST body");
+    }
+    expect(JSON.parse(body) as unknown).toMatchObject({
+      tags: ["rust", "collab", "editing"],
+    });
+  });
+
+  it("omits the tags key entirely when the field is left empty", async () => {
+    const created = vi.fn(() => ({
+      domain: "eng",
+      permalink: "notes/gamma",
+      title: "Gamma",
+      content: "---\ntitle: Gamma\n---\n\n",
+      checksum: "new222",
+      frontmatter: {},
+      observations: [],
+      relations: [],
+      links: [],
+    }));
+    apiMock.mockImplementation(
+      answersFor({
+        "/auth/me": () => meResponse({ user: userFixture() }),
+        "/domains": domainsResponse,
+        "/domains/eng/manifest": () => ({
+          domain: "eng",
+          markdown: "# eng",
+          checksum: "m1",
+        }),
+        "/domains/eng/tree": (path) => tree(path),
+        "/domains/eng/engrams": (_path, init) =>
+          init?.method === "POST"
+            ? created()
+            : { total: 0, page: 1, limit: 50, count: 0, hits: [] },
+        "/domains/eng/engrams/notes/gamma": () => created(),
+        "/validate": () => ({ findings: [], errors: 0 }),
+        "/vocabulary": () => ({ tags: [], categories: [], relation_types: [] }),
+        "/graph": () => ({ nodes: [], edges: [], truncated: false, hidden: 0 }),
+      }),
+    );
+    renderApp("/d/eng");
+    await userEvent.click(
+      await screen.findByRole("button", { name: "New engram" }),
+    );
+    await userEvent.type(screen.getByLabelText(/Title/), "Gamma");
+    await userEvent.click(screen.getByRole("button", { name: "Create" }));
+    await waitFor(() => {
+      expect(created).toHaveBeenCalled();
+    });
+    // Same lookup the successful-create test above uses: the POST is not
+    // necessarily the first call apiMock ever saw (auth, tree and vocabulary
+    // reads land first), so find it by method rather than assume an index.
+    const call = apiMock.mock.calls.find(([, init]) => init?.method === "POST");
+    const body = call?.[1]?.body;
+    if (typeof body !== "string") {
+      throw new Error("no POST body");
+    }
+    expect(body).not.toContain('"tags"');
+  });
+
   it("offers the sidebar launcher on the editor route, where the page has none of its own", async () => {
     apiMock.mockImplementation(
       answersFor({
