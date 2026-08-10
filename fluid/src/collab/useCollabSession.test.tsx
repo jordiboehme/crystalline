@@ -322,6 +322,94 @@ describe("useCollabSession", () => {
     expect(session().conflict).toBeNull();
   });
 
+  it("clears the conflict when the save the resolution re-armed lands", () => {
+    // "Mine" is announced by its receipt: the server re-arms the flush and
+    // the Saved control is the only word the room gets that it is over.
+    const { socket } = joinRoom();
+    act(() => {
+      socket.receive(
+        controlFrame({
+          kind: "conflict",
+          conflict_kind: "edit",
+          theirs: "their text",
+          detail: "an agent rewrote this engram",
+        }),
+      );
+    });
+    expect(session().conflict).not.toBeNull();
+    act(() => {
+      session().resolve("mine");
+      socket.receive(
+        controlFrame({ kind: "saved", checksum: "c2", permalink: "alpha" }),
+      );
+    });
+    expect(session().conflict).toBeNull();
+    expect(session().saveState).toBe("ok");
+    expect(session().saveDetail).toBeNull();
+  });
+
+  it("clears the conflict when the room converges on their version", () => {
+    // "Theirs" sends no Saved at all: the document converges and the room is
+    // told it merged. Without this the banner would stand forever.
+    const { socket } = joinRoom();
+    act(() => {
+      socket.receive(
+        controlFrame({
+          kind: "conflict",
+          conflict_kind: "edit",
+          theirs: "their text",
+          detail: "an agent rewrote this engram",
+        }),
+      );
+      session().resolve("theirs");
+    });
+    act(() => {
+      socket.receive(controlFrame({ kind: "merged" }));
+    });
+    expect(session().conflict).toBeNull();
+    expect(session().saveState).toBe("ok");
+  });
+
+  it("a merged control in a healthy room leaves the save state alone", () => {
+    const { socket } = joinRoom();
+    act(() => {
+      session().ytext?.insert(0, "x");
+    });
+    expect(session().saveState).toBe("pending");
+    act(() => {
+      socket.receive(controlFrame({ kind: "merged" }));
+    });
+    // Only a conflict-suspended room heals on a merge; a room that is merely
+    // mid-save must not be told it is saved.
+    expect(session().saveState).toBe("pending");
+  });
+
+  it("a derivation that settles after the room healed writes nothing", async () => {
+    // The race the guard exists for: another participant resolves between the
+    // greeting and this tab's read landing, and a late answer would otherwise
+    // plant a conflict on a room that has none.
+    let land: (detail: EngramDetail) => void = () => undefined;
+    detailMock.mockReturnValue(
+      new Promise<EngramDetail>((resolve) => {
+        land = resolve;
+      }),
+    );
+    const { socket } = joinRoom({ save_state: "conflict" });
+    expect(session().saveState).toBe("conflict");
+    act(() => {
+      socket.receive(
+        controlFrame({ kind: "saved", checksum: "c2", permalink: "alpha" }),
+      );
+    });
+    expect(session().saveState).toBe("ok");
+    await act(async () => {
+      land(detailOf("THEIR text"));
+      await Promise.resolve();
+    });
+    expect(session().conflict).toBeNull();
+    expect(session().saveState).toBe("ok");
+  });
+
   it("prefers the broadcast conflict over a re-derived one", async () => {
     detailMock.mockResolvedValue(detailOf("THEIR text"));
     const { socket } = joinRoom({ save_state: "conflict" });

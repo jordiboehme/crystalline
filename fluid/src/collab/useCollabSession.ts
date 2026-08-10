@@ -157,6 +157,18 @@ export function useCollabSession(options: CollabSessionOptions): CollabSession {
   const identity = useRef({ account, displayName });
   const separatorRef = useRef<"\r\n" | "\n">("\n");
   const checksumRef = useRef("");
+  /**
+   * The conflict and the save verdict as they stand RIGHT NOW, written at
+   * every site that changes them rather than mirrored from an effect.
+   *
+   * Two readers need that exactness. The control handlers live as long as one
+   * generation and would otherwise close over a stale render's values, and the
+   * joiner's derivation settles asynchronously: it has to see a conflict that
+   * was broadcast a moment ago even if React has not flushed effects yet, and
+   * it has to see a room that healed while its request was in flight.
+   */
+  const conflictRef = useRef<CollabConflict | null>(null);
+  const saveStateRef = useRef<CollabSession["saveState"]>("ok");
   const mergeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => {
     identity.current = { account, displayName };
@@ -192,6 +204,32 @@ export function useCollabSession(options: CollabSessionOptions): CollabSession {
       }
       setParticipants(room);
     };
+    // The save verdict, kept in a ref beside the state: the conflict
+    // derivation below settles asynchronously and has to judge the room as it
+    // stands when its answer arrives, not as it stood when it asked.
+    const setSave = (next: CollabSession["saveState"]) => {
+      saveStateRef.current = next;
+      setSaveState(next);
+    };
+    /**
+     * The conflict is over: the room converged and saving is live again.
+     *
+     * There is no "conflict over" control to key on, because the server does
+     * not send one - a resolution is announced by what it produced. "Mine"
+     * lands as the Saved receipt of the save it re-armed; "theirs" converges
+     * the document and says Merged, with no save of its own. Both are handled,
+     * and the save state only heals when it was the conflict that suspended
+     * it: a Merged arriving in a room that is merely mid-save must not
+     * overwrite "Saving..." with "Saved".
+     */
+    const clearConflict = () => {
+      conflictRef.current = null;
+      setConflict(null);
+      if (saveStateRef.current === "conflict") {
+        setSave("ok");
+        setSaveDetail(null);
+      }
+    };
     const handlers: ProviderHandlers = {
       onControl: (control) => {
         switch (control.kind) {
@@ -204,19 +242,22 @@ export function useCollabSession(options: CollabSessionOptions): CollabSession {
               // Joined into a suspended room: saving is off from this tab's
               // first frame, whether or not it ever sees a Conflict of its
               // own. The body is re-derived below.
-              setSaveState("conflict");
+              setSave("conflict");
             }
             break;
           }
           case "saved": {
             checksumRef.current = control.checksum;
             setPermalink(control.permalink);
-            setSaveState("ok");
+            setSave("ok");
             setSaveDetail(null);
+            // A save landing IS the end of a conflict resolved as "mine":
+            // the server re-armed the flush and this is its receipt.
+            clearConflict();
             break;
           }
           case "save-failed": {
-            setSaveState("failed");
+            setSave("failed");
             setSaveDetail(control.detail);
             break;
           }
@@ -229,16 +270,25 @@ export function useCollabSession(options: CollabSessionOptions): CollabSession {
               mergeTimer.current = null;
               setMergeNotice(false);
             }, MERGE_NOTICE_MS);
+            // And a converged room IS the end of a conflict resolved as
+            // "theirs", which sends no Saved of its own.
+            clearConflict();
             break;
           }
           case "conflict": {
-            setSaveState("conflict");
+            setSave("conflict");
             setSaveDetail(control.detail);
-            setConflict({
+            const raised: CollabConflict = {
               kind: control.conflict_kind,
               theirs: control.theirs,
               detail: control.detail,
-            });
+            };
+            // The ref is written HERE rather than from an effect mirroring
+            // the state: the derivation below reads it to decide whether to
+            // write, and a broadcast that lands before effects flush would
+            // otherwise be overwritten by a fetch that started earlier.
+            conflictRef.current = raised;
+            setConflict(raised);
             break;
           }
           case "closed": {
@@ -293,7 +343,7 @@ export function useCollabSession(options: CollabSessionOptions): CollabSession {
       if (origin === provider) {
         return; // the server's own text, not an edit waiting to be saved
       }
-      setSaveState("pending");
+      setSave("pending");
       setSaveDetail(null);
     };
     doc.on("update", onUpdate);
@@ -315,17 +365,9 @@ export function useCollabSession(options: CollabSessionOptions): CollabSession {
     };
   }, [generation, domain, address, enabled, socketFactory]);
 
-  // Read from the derivation below, which must not re-run just because a
-  // conflict arrived while it was in flight.
-  const conflictRef = useRef<CollabConflict | null>(null);
-  useEffect(() => {
-    conflictRef.current = conflict;
-  }, [conflict]);
-
   // The mid-conflict joiner (see the JOINED_* details above): a greeting that
   // says "conflict" with nothing on screen to resolve is a dead banner, so
-  // the body is fetched once per greeting, and only while this tab has no
-  // conflict of its own.
+  // the body is fetched once per greeting.
   useEffect(() => {
     if (hello === null || hello.save_state !== "conflict") {
       return;
@@ -350,14 +392,28 @@ export function useCollabSession(options: CollabSessionOptions): CollabSession {
             ? { kind: "deleted", theirs: null, detail: JOINED_DELETED_DETAIL }
             : { kind: "edit", theirs: null, detail: JOINED_UNREADABLE_DETAIL };
       }
-      if (!cancelled && conflictRef.current === null) {
-        setConflict(derived);
+      // Judged as the room stands NOW, not as it stood when the read was
+      // asked for: somebody else may have resolved the whole thing while this
+      // request was in flight, and a late answer must not plant a phantom
+      // conflict on a healthy room. Three conditions, all live: this
+      // generation is still the current one (the cleanup below), no conflict
+      // has been raised meanwhile, and saving is still suspended.
+      if (
+        cancelled ||
+        conflictRef.current !== null ||
+        saveStateRef.current !== "conflict"
+      ) {
+        return;
       }
+      conflictRef.current = derived;
+      setConflict(derived);
     })();
     return () => {
       cancelled = true;
     };
-  }, [hello, domain]);
+    // `generation` is a dependency for its cleanup alone: a rebuilt session is
+    // a different room, and whatever the old one was still fetching is void.
+  }, [hello, domain, generation]);
 
   const flush = useCallback(() => {
     docRef.current?.provider.flush();
