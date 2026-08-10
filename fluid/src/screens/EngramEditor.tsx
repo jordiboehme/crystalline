@@ -30,8 +30,9 @@ import type { Vocabulary } from "../api/vocabulary";
 import { fetchVocabulary, fullVocabularyKey } from "../api/vocabulary";
 import { saveEngram } from "../api/writes";
 import { useAuth } from "../auth/AuthContext";
+import { CollabConflictDialog } from "../collab/CollabConflictDialog";
 import { PresenceChips } from "../collab/PresenceChips";
-import type { CollabSession } from "../collab/useCollabSession";
+import type { CollabConflict, CollabSession } from "../collab/useCollabSession";
 import { fileSpace, useCollabSession } from "../collab/useCollabSession";
 import { Skeleton } from "../components/Skeleton";
 import CmEditor from "../editor/CmEditor";
@@ -51,7 +52,7 @@ import {
   wikilinkCompletions,
   wikilinkResolverFacet,
 } from "../editor/wikilinkChips";
-import { editRoute, engramRoute } from "../paths";
+import { domainRoute, editRoute, engramRoute } from "../paths";
 import { useTheme } from "../theme/context";
 import type { WikilinkResolver } from "../wikilinks";
 import { buildWikilinkResolver } from "../wikilinks";
@@ -95,6 +96,17 @@ const DETAIL_STALE_MS = 15_000;
 
 /** What a reference resolves to before the two requests behind it land. */
 const NO_RESOLUTION: WikilinkResolver = () => null;
+
+/**
+ * How long the "this engram was deleted" notice stays on screen before the
+ * author is walked back to the domain.
+ *
+ * Long enough to be read: the editor they are looking at is about to be
+ * replaced, and "your text is kept as a draft" is the sentence that says
+ * where the work went. The navigation is not optional either - the engram is
+ * gone, so the page they are on now 404s.
+ */
+const CLOSED_NOTICE_MS = 1200;
 
 /** The shared text and the room's presence, once a session has synced. */
 interface Room {
@@ -376,6 +388,16 @@ function Surface({
    */
   const [resolverBox] = useState(() => new Compartment());
   const [raw, setRaw] = useState(RAW_AT_MOUNT);
+  /**
+   * WHICH conflict this tab has the resolution view open on, rather than a
+   * bare open flag. The conflict itself is the server's - it stands until
+   * somebody in the room resolves it, and a resolution the server re-raises
+   * (a "mine" restore that found somebody else's bytes on disk) arrives as a
+   * different one. Holding the conflict itself means the view closes when the
+   * question changes instead of silently re-labelling the panes, and a
+   * conflict raised later never pops a dialog nobody asked for.
+   */
+  const [resolving, setResolving] = useState<CollabConflict | null>(null);
 
   // The same pair the engram page reads, under the same cache keys: an author
   // who arrived from that page pays nothing on the wire for the chips.
@@ -510,6 +532,37 @@ function Surface({
       session.noteSaved();
     }
   }, [inRoom, collab.saveState, session]);
+
+  /**
+   * The room accepted an external deletion. There is nothing left to save
+   * into and nothing left to edit, so the author leaves with their text in
+   * the draft store - the same place a crash would have left it - after a
+   * beat on the notice that says so.
+   */
+  const closed = inRoom && collab.closed;
+  /** The room's standing conflict, if this surface is in a room at all. */
+  const conflict = inRoom ? collab.conflict : null;
+  const walkedOut = useRef(false);
+  useEffect(() => {
+    if (!closed || walkedOut.current) {
+      return;
+    }
+    // Once: this effect re-runs whenever the session object is rebuilt, and a
+    // second snapshot would only restamp the same text.
+    walkedOut.current = true;
+    session.snapshotDraft();
+  }, [closed, session]);
+  useEffect(() => {
+    if (!closed) {
+      return;
+    }
+    const timer = setTimeout(() => {
+      void navigate(domainRoute(engram.domain), { replace: true });
+    }, CLOSED_NOTICE_MS);
+    return () => {
+      clearTimeout(timer);
+    };
+  }, [closed, engram.domain, navigate]);
 
   // The session's rename receipt, followed the same way the solo save's is.
   useEffect(() => {
@@ -654,6 +707,37 @@ function Surface({
           Findings.
         </p>
       )}
+      {closed && (
+        <p
+          role="status"
+          className="rounded border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-100"
+        >
+          This engram was deleted; your text is kept as a draft
+        </p>
+      )}
+      {/*
+        Saving is suspended until the room resolves, so the banner stays put
+        rather than fading: it is the state of the session, not an event.
+      */}
+      {conflict && (
+        <aside
+          role="alert"
+          className="flex flex-wrap items-baseline gap-3 rounded border border-red-300 bg-red-50 px-3 py-2 text-sm text-red-900 dark:border-red-700 dark:bg-red-950 dark:text-red-100"
+        >
+          <span>
+            Saving is paused: this engram changed outside the session.
+          </span>
+          <button
+            type="button"
+            className="rounded underline underline-offset-2 hover:no-underline focus-visible:ring-2 focus-visible:ring-red-500 focus-visible:outline-none"
+            onClick={() => {
+              setResolving(conflict);
+            }}
+          >
+            Resolve
+          </button>
+        </aside>
+      )}
       {session.offeredDraft && (
         <aside
           role="note"
@@ -718,6 +802,28 @@ function Surface({
           />
         </aside>
       </div>
+      {conflict !== null && resolving === conflict && (
+        <CollabConflictDialog
+          conflict={conflict}
+          // The live buffer, in the room's own LF space: what the panes show
+          // side by side is what each side would end up with.
+          mine={session.buffer}
+          onResolve={(choice) => {
+            if (choice === "theirs") {
+              // Their version is about to become the room's text (or, on a
+              // deletion, the file is about to stay gone): the same
+              // writeDraft-then-act order the solo 412 flow uses, so what
+              // this author had is recoverable afterwards.
+              session.snapshotDraft();
+            }
+            collab.resolve(choice);
+            setResolving(null);
+          }}
+          onClose={() => {
+            setResolving(null);
+          }}
+        />
+      )}
       {session.conflict && (
         <ConflictDialog
           conflict={session.conflict}

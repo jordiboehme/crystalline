@@ -14,6 +14,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Awareness, encodeAwarenessUpdate } from "y-protocols/awareness";
 import * as Y from "yjs";
 
+import { ApiProblem } from "../api/client";
+import type { EngramDetail } from "../api/engram";
+import { fetchEngramDetail } from "../api/engram";
 import type { CollabHello } from "./provider";
 import { CONNECT_TIMEOUT_MS, MESSAGE_AWARENESS, TEXT_NAME } from "./provider";
 import {
@@ -30,6 +33,39 @@ import {
   fileSpace,
   useCollabSession,
 } from "./useCollabSession";
+
+// The detail read is the one request this hook makes: what a tab that joined
+// DURING a conflict re-derives the missing conflict body from.
+vi.mock("../api/engram", () => ({ fetchEngramDetail: vi.fn() }));
+const detailMock = vi.mocked(fetchEngramDetail);
+
+/** The engram read the derivation goes through, holding `content`. */
+function detailOf(content: string): EngramDetail {
+  return {
+    domain: "eng",
+    permalink: "alpha",
+    title: "A",
+    url: "crystalline://eng/alpha",
+    path: "alpha.md",
+    content,
+    checksum: "c1",
+    frontmatter: {
+      type: null,
+      status: null,
+      tags: [],
+      salience: null,
+      validFrom: null,
+      validTo: null,
+      staleAfter: null,
+      verified: [],
+    },
+    observations: [],
+    relations: [],
+    links: [],
+    inboundCount: 0,
+    inboundRefs: [],
+  };
+}
 
 const SESSION_TEXT = "---\ntitle: A\n---\n\nbody\n";
 
@@ -102,6 +138,7 @@ beforeEach(() => {
   FakeSocket.instances = [];
   mounted = null;
   localStorage.clear();
+  detailMock.mockReset();
   vi.useFakeTimers();
 });
 
@@ -236,6 +273,78 @@ describe("useCollabSession", () => {
       vi.advanceTimersByTime(MERGE_NOTICE_MS + 100);
     });
     expect(session().mergeNotice).toBe(false);
+  });
+
+  it("re-derives the conflict for a tab that joined while one stood", async () => {
+    // The Conflict broadcast predates this subscription: all the greeting
+    // carries is that saving is suspended, so the body has to be found again
+    // or the room's banner would open onto nothing.
+    detailMock.mockResolvedValue(detailOf("THEIR text"));
+    joinRoom({ save_state: "conflict" });
+    expect(session().saveState).toBe("conflict");
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(detailMock).toHaveBeenCalledWith("eng", "alpha");
+    expect(session().conflict?.kind).toBe("edit");
+    expect(session().conflict?.theirs).toBe("THEIR text");
+    expect(session().conflict?.detail).toMatch(/changed outside the session/);
+  });
+
+  it("reads a joiner's conflict as a deletion when the engram is gone", async () => {
+    detailMock.mockRejectedValue(new ApiProblem(404, "not found", "gone"));
+    joinRoom({ save_state: "conflict" });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(session().conflict?.kind).toBe("deleted");
+    expect(session().conflict?.theirs).toBeNull();
+  });
+
+  it("says their text is unknown rather than guessing when the read fails", async () => {
+    detailMock.mockRejectedValue(new ApiProblem(500, "boom", "the disk went"));
+    joinRoom({ save_state: "conflict" });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    // Not a deletion: nothing was learned, so nothing is claimed. Both
+    // resolutions stay available and the session text is still the session's.
+    expect(session().conflict?.kind).toBe("edit");
+    expect(session().conflict?.theirs).toBeNull();
+  });
+
+  it("re-derives nothing for a room that greeted it in good order", async () => {
+    joinRoom();
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(detailMock).not.toHaveBeenCalled();
+    expect(session().conflict).toBeNull();
+  });
+
+  it("prefers the broadcast conflict over a re-derived one", async () => {
+    detailMock.mockResolvedValue(detailOf("THEIR text"));
+    const { socket } = joinRoom({ save_state: "conflict" });
+    act(() => {
+      socket.receive(
+        controlFrame({
+          kind: "conflict",
+          conflict_kind: "edit",
+          theirs: "the broadcast text",
+          detail: "an agent rewrote this engram",
+        }),
+      );
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    // The server's own account of the conflict wins; the re-derivation is
+    // only there for the tab that never saw it.
+    expect(session().conflict).toEqual({
+      kind: "edit",
+      theirs: "the broadcast text",
+      detail: "an agent rewrote this engram",
+    });
   });
 
   it("asks the server to resolve a conflict the way the room chose", () => {

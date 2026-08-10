@@ -10,7 +10,7 @@
  */
 
 import { EditorView } from "@codemirror/view";
-import { act, screen, waitFor } from "@testing-library/react";
+import { act, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { Awareness } from "y-protocols/awareness";
@@ -18,8 +18,10 @@ import * as Y from "yjs";
 
 import { ApiProblem, api } from "../api/client";
 import { TEXT_NAME } from "../collab/provider";
-import type { CollabSession } from "../collab/useCollabSession";
+import type { CollabConflict, CollabSession } from "../collab/useCollabSession";
 import { useCollabSession } from "../collab/useCollabSession";
+import type { Draft } from "../editor/drafts";
+import { readDraft } from "../editor/drafts";
 import { SAVE_EVENT } from "../editor/useEditorSession";
 import {
   answersFor,
@@ -958,7 +960,10 @@ describe("the engram editor in a session", () => {
   });
 
   it("shows a refused session save in the server's own words", async () => {
-    await openRoom({ saveState: "failed", saveDetail: "the file is read only" });
+    await openRoom({
+      saveState: "failed",
+      saveDetail: "the file is read only",
+    });
     // The server's words verbatim, and announced rather than merely shown.
     const alert = await screen.findByText("the file is read only");
     expect(alert).toHaveAttribute("role", "alert");
@@ -1013,5 +1018,188 @@ describe("the engram editor in a session", () => {
       expect(editor.textContent).toContain("status: draft");
     });
     expect(await screen.findByLabelText("Status")).toHaveValue("draft");
+  });
+
+  it("does not offer a draft that is the room's own text on a CRLF file", async () => {
+    // The room is LF space and the stored draft is file space, so a CRLF
+    // engram whose draft is byte-identical to what everyone is looking at
+    // would otherwise be offered on every mount - and accepting it would
+    // dispatch a whole-document rewrite into the shared text.
+    localStorage.setItem(
+      "fluid.draft.ada.eng/alpha",
+      JSON.stringify({
+        content: CONTENT.replace(/\n/g, "\r\n"),
+        baseChecksum: "3f8a1c05e2",
+        savedAt: "2026-08-09T10:00:00Z",
+      }),
+    );
+    await openRoom({ separator: "\r\n" });
+    expect(screen.queryByText(/unsaved draft/i)).not.toBeInTheDocument();
+  });
+
+  it("still offers a genuinely different draft on a CRLF file", async () => {
+    localStorage.setItem(
+      "fluid.draft.ada.eng/alpha",
+      JSON.stringify({
+        content: CONTENT.replace("A rule.", "A recovered rule.").replace(
+          /\n/g,
+          "\r\n",
+        ),
+        baseChecksum: "3f8a1c05e2",
+        savedAt: "2026-08-09T10:00:00Z",
+      }),
+    );
+    await openRoom({ separator: "\r\n" });
+    expect(await screen.findByText(/unsaved draft/i)).toBeInTheDocument();
+  });
+});
+
+describe("the engram editor resolving a session conflict", () => {
+  /** The room, mid-conflict, with the resolution the room picked recorded. */
+  async function openConflict(conflict: CollabConflict) {
+    const resolve = vi.fn();
+    const room = joinedSession({
+      saveState: "conflict",
+      saveDetail: conflict.detail,
+      conflict,
+      resolve,
+    });
+    serveEditor();
+    renderApp("/d/eng/edit/alpha");
+    const editor = await screen.findByLabelText("Engram source");
+    await waitFor(() => {
+      expect(editor.textContent).toContain("A rule.");
+    });
+    return { ...room, resolve, editor };
+  }
+
+  const EDIT_CONFLICT: CollabConflict = {
+    kind: "edit",
+    theirs: CONTENT.replace("A rule.", "Their rule."),
+    detail: "an agent rewrote this engram",
+  };
+
+  it("pauses saving behind a banner that opens both sides", async () => {
+    await openConflict(EDIT_CONFLICT);
+    const banner = await screen.findByText(
+      "Saving is paused: this engram changed outside the session.",
+    );
+    // Announced, not merely shown: saving stopped without anybody asking.
+    expect(banner.closest("[role='alert']")).not.toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: "Resolve" }));
+    // The server's own words, and both texts, before anybody chooses.
+    const view = within(await screen.findByRole("dialog"));
+    expect(view.getByText("an agent rewrote this engram")).toBeVisible();
+    expect(view.getByText(/Their rule\./)).toBeVisible();
+    expect(view.getByText(/A rule\./)).toBeVisible();
+  });
+
+  it("keeping the session text resolves as mine and leaves the buffer alone", async () => {
+    const { resolve, editor } = await openConflict(EDIT_CONFLICT);
+    await userEvent.click(screen.getByRole("button", { name: "Resolve" }));
+    await userEvent.click(
+      screen.getByRole("button", { name: "Keep the session text" }),
+    );
+    expect(resolve).toHaveBeenCalledWith("mine");
+    // Nothing was thrown away locally: the server applies the choice and the
+    // room's text is still the room's text.
+    expect(editor.textContent).toContain("A rule.");
+    // The dialog closes on the choice; the banner clears when the server says
+    // the conflict is over.
+    await waitFor(() => {
+      expect(
+        screen.queryByRole("button", { name: "Keep the session text" }),
+      ).not.toBeInTheDocument();
+    });
+  });
+
+  it("taking the file version snapshots the session text as a draft first", async () => {
+    // A box rather than a bare variable: what the assertion needs is what the
+    // draft store held AT the moment the choice travelled.
+    const seen: { draft: Draft | null } = { draft: null };
+    const resolve = vi.fn(() => {
+      seen.draft = readDraft("ada", "eng", "alpha");
+    });
+    joinedSession({
+      saveState: "conflict",
+      saveDetail: EDIT_CONFLICT.detail,
+      conflict: EDIT_CONFLICT,
+      resolve,
+    });
+    serveEditor();
+    renderApp("/d/eng/edit/alpha");
+    const editor = await screen.findByLabelText("Engram source");
+    await waitFor(() => {
+      expect(editor.textContent).toContain("A rule.");
+    });
+    await userEvent.click(screen.getByRole("button", { name: "Resolve" }));
+    await userEvent.click(
+      screen.getByRole("button", { name: "Take the file version" }),
+    );
+    expect(resolve).toHaveBeenCalledWith("theirs");
+    // The snapshot is written BEFORE the choice travels, the same order the
+    // solo 412 flow uses: the room's text is about to be replaced by theirs.
+    expect(seen.draft).not.toBeNull();
+    expect(seen.draft?.content).toContain("A rule.");
+  });
+
+  it("keep editing leaves the conflict pending and writes nothing", async () => {
+    const { resolve } = await openConflict(EDIT_CONFLICT);
+    await userEvent.click(screen.getByRole("button", { name: "Resolve" }));
+    await userEvent.click(screen.getByRole("button", { name: "Keep editing" }));
+    expect(resolve).not.toHaveBeenCalled();
+    expect(readDraft("ada", "eng", "alpha")).toBeNull();
+    // The banner stands: saving is still suspended and the way back in is
+    // still on screen.
+    expect(
+      await screen.findByText(
+        "Saving is paused: this engram changed outside the session.",
+      ),
+    ).toBeVisible();
+    expect(screen.getByRole("button", { name: "Resolve" })).toBeVisible();
+  });
+
+  it("offers the deletion its own wording and can restore with the room's text", async () => {
+    const { resolve } = await openConflict({
+      kind: "deleted",
+      theirs: null,
+      detail: "the file was deleted outside this session",
+    });
+    await userEvent.click(screen.getByRole("button", { name: "Resolve" }));
+    const view = within(await screen.findByRole("dialog"));
+    expect(
+      view.getByText("This engram's file was deleted outside the session"),
+    ).toBeVisible();
+    // The room's text is readable while the choice is made, whichever side
+    // wins: accepting the deletion gives it up.
+    expect(view.getByText(/A rule\./)).toBeVisible();
+    await userEvent.click(
+      screen.getByRole("button", { name: "Restore with the session text" }),
+    );
+    expect(resolve).toHaveBeenCalledWith("mine");
+  });
+
+  it("an accepted deletion keeps the text as a draft and walks the author out", async () => {
+    joinedSession({ closed: true });
+    serveEditor({
+      "/domains/eng/manifest": () => ({ content: "# eng\n" }),
+      "/domains/eng/tree": () => ({ folders: [], engrams: [] }),
+      "/domains/eng/tags": () => ({ tags: [] }),
+      "/domains/eng/engrams": () => ({ engrams: [], total: 0 }),
+    });
+    renderApp("/d/eng/edit/alpha");
+    expect(
+      await screen.findByText(
+        "This engram was deleted; your text is kept as a draft",
+      ),
+    ).toBeInTheDocument();
+    // The text survives the engram: the same store a crash would have used.
+    const draft = readDraft("ada", "eng", "alpha");
+    expect(draft?.content).toContain("A rule.");
+    // And the author is not left editing a page that is gone: the notice gets
+    // its beat on screen, then the domain page takes over.
+    expect(
+      await screen.findByRole("heading", { name: "eng" }, { timeout: 3000 }),
+    ).toBeInTheDocument();
   });
 });

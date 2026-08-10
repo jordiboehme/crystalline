@@ -11,7 +11,7 @@ import type { EditorView } from "@codemirror/view";
 import { keymap } from "@codemirror/view";
 import { useMutation } from "@tanstack/react-query";
 import type { RefObject } from "react";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { problemDetail } from "../api/client";
 import type { ValidateResponse } from "../api/model";
@@ -128,6 +128,12 @@ export interface EditorSession {
   offeredDraft: Draft | null;
   restoreDraft: () => void;
   discardDraft: () => void;
+  /**
+   * Store the buffer as a draft right now, in draft space. For the deliberate
+   * snapshots that precede giving the text up: the collab conflict's "take
+   * the file version" and the walk-out from an accepted deletion.
+   */
+  snapshotDraft: () => void;
   /** Swap the buffer wholesale (the conflict and draft paths use it). */
   replaceWith: (content: string) => void;
   /** Collab only: the server reported a landed save - clear the draft and
@@ -161,11 +167,27 @@ export function useEditorSession(options: EditorSessionOptions): EditorSession {
   // The 412 view: set on a stale save, cleared by every one of its exits.
   const [conflict, setConflict] = useState<SaveConflict | null>(null);
   const dirty = buffer !== savedText;
+  /**
+   * The buffer as a draft is stored: file space in both modes, because
+   * `draftContent` maps the collab buffer on the way out. Identity on the
+   * solo surface, where the buffer already carries the file's own endings.
+   */
+  const asStoredDraft = useCallback(
+    (text: string) => (draftContent ? draftContent(text) : text),
+    [draftContent],
+  );
   // A browser-stored draft newer than what the server sent, read once per
   // mount and offered through the screen's recovery banner.
+  //
+  // The comparison happens in DRAFT space, not in buffer space: a session
+  // buffer is LF while its stored draft carries the file's endings, so
+  // comparing the two directly would find every draft of a CRLF file
+  // "different" and offer it on every mount - and accepting one dispatches a
+  // whole-document rewrite into the shared text of a room that never changed.
   const [offeredDraft, setOfferedDraft] = useState(() => {
     const stored = readDraft(draftUser, draftDomain, draftSlot);
-    return stored !== null && stored.content !== initialContent ? stored : null;
+    const mounted = asStoredDraft(initialContent);
+    return stored !== null && stored.content !== mounted ? stored : null;
   });
 
   // The dry run, its debounce and its last-landed rule: one gate, shared with
@@ -235,6 +257,25 @@ export function useEditorSession(options: EditorSessionOptions): EditorSession {
     };
   });
 
+  /**
+   * Store the buffer as it stands, in draft space. The debounce below is the
+   * only writer that runs on its own; the deliberate snapshots - taking the
+   * server's version, handing a room's conflict to the file, walking out of a
+   * deleted engram - go through the same spelling rather than a second one.
+   */
+  const snapshotDraft = useCallback(
+    (text: string) => {
+      writeDraft(draftUser, draftDomain, draftSlot, {
+        // In collab mode the buffer is LF session space; `draftContent` maps
+        // it to file space so the stored draft matches the solo flow's.
+        content: asStoredDraft(text),
+        baseChecksum: checksum,
+        savedAt: new Date().toISOString(),
+      });
+    },
+    [draftUser, draftDomain, draftSlot, checksum, asStoredDraft],
+  );
+
   // The safety net: a pause in typing snapshots the buffer to browser
   // storage, so a crash, a closed tab or an accidental navigation away loses
   // at most a debounce window of work.
@@ -243,26 +284,12 @@ export function useEditorSession(options: EditorSessionOptions): EditorSession {
       return;
     }
     const timer = setTimeout(() => {
-      writeDraft(draftUser, draftDomain, draftSlot, {
-        // In collab mode the buffer is LF session space; `draftContent` maps
-        // it to file space so the stored draft matches the solo flow's.
-        content: (draftContent ?? ((text: string) => text))(buffer),
-        baseChecksum: checksum,
-        savedAt: new Date().toISOString(),
-      });
+      snapshotDraft(buffer);
     }, DRAFT_DEBOUNCE_MS);
     return () => {
       clearTimeout(timer);
     };
-  }, [
-    draftUser,
-    draftDomain,
-    draftSlot,
-    buffer,
-    checksum,
-    dirty,
-    draftContent,
-  ]);
+  }, [buffer, dirty, snapshotDraft]);
 
   // Closing the tab or reloading it loses the draft's covering banner, so it
   // gets its own prompt; in-app navigation is already covered by the draft.
@@ -345,11 +372,7 @@ export function useEditorSession(options: EditorSessionOptions): EditorSession {
       // Mine is not discarded, it becomes the draft - the same store a crash
       // or a closed tab would have used, so it survives the buffer being
       // overwritten below.
-      writeDraft(draftUser, draftDomain, draftSlot, {
-        content: buffer,
-        baseChecksum: checksum,
-        savedAt: new Date().toISOString(),
-      });
+      snapshotDraft(buffer);
       replaceWith(conflict.currentContent);
       setChecksum(conflict.currentChecksum);
       setSavedText(conflict.currentContent);
@@ -365,6 +388,9 @@ export function useEditorSession(options: EditorSessionOptions): EditorSession {
     discardDraft: () => {
       clearDraft(draftUser, draftDomain, draftSlot);
       setOfferedDraft(null);
+    },
+    snapshotDraft: () => {
+      snapshotDraft(buffer);
     },
     replaceWith,
     noteSaved: () => {

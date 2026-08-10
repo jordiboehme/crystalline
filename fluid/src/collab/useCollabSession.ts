@@ -19,6 +19,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Awareness } from "y-protocols/awareness";
 import * as Y from "yjs";
 
+import { ApiProblem } from "../api/client";
+import { fetchEngramDetail } from "../api/engram";
 import { writeDraft } from "../editor/drafts";
 import { presenceColor } from "./colors";
 import type {
@@ -31,6 +33,27 @@ import { CollabProvider, TEXT_NAME, collabUrl } from "./provider";
 
 /** How long the room's "an outside change was merged in" notice stays up. */
 export const MERGE_NOTICE_MS = 4000;
+
+/**
+ * What a tab that joined DURING a conflict is told about it.
+ *
+ * The greeting carries `save_state: "conflict"` but no conflict body: the
+ * Conflict broadcast that carried the other side's bytes went out before this
+ * socket was subscribed, and the session has no way to be asked for it again.
+ * So the body is re-derived from the engram's own read - the file as it
+ * stands is exactly what the room is being asked to choose against - and the
+ * wording says which way that read went. A 404 is the deletion; anything else
+ * unreadable is admitted as unknown rather than guessed at, because "the file
+ * is empty" and "I could not look" are different facts and one of them would
+ * be a lie told beside a button that overwrites.
+ */
+const JOINED_EDIT_DETAIL =
+  "This engram changed outside the session before you joined it.";
+const JOINED_DELETED_DETAIL =
+  "This engram's file was deleted outside the session before you joined it.";
+const JOINED_UNREADABLE_DETAIL =
+  "This engram changed outside the session before you joined it, and its " +
+  "current text could not be read from here.";
 
 /** What a participant's awareness state carries about them. */
 interface PresenceUser {
@@ -96,9 +119,7 @@ export function fileSpace(text: string, separator: "\r\n" | "\n"): string {
   return separator === "\n" ? text : text.replace(/\n/g, separator);
 }
 
-export function useCollabSession(
-  options: CollabSessionOptions,
-): CollabSession {
+export function useCollabSession(options: CollabSessionOptions): CollabSession {
   const {
     domain,
     permalink: address,
@@ -110,13 +131,10 @@ export function useCollabSession(
   // One doc/awareness/provider generation per (address, epoch-reset). The
   // counter is what forces a rebuild after an epoch gap.
   const [generation, setGeneration] = useState(0);
-  const [mode, setMode] = useState<CollabMode>(
-    enabled ? "connecting" : "solo",
-  );
+  const [mode, setMode] = useState<CollabMode>(enabled ? "connecting" : "solo");
   const [status, setStatus] = useState<CollabStatus>("connecting");
   const [hello, setHello] = useState<CollabHello | null>(null);
-  const [saveState, setSaveState] =
-    useState<CollabSession["saveState"]>("ok");
+  const [saveState, setSaveState] = useState<CollabSession["saveState"]>("ok");
   const [saveDetail, setSaveDetail] = useState<string | null>(null);
   const [conflict, setConflict] = useState<CollabConflict | null>(null);
   const [closed, setClosed] = useState(false);
@@ -182,6 +200,12 @@ export function useCollabSession(
             separatorRef.current = control.separator;
             checksumRef.current = control.checksum;
             setPermalink(control.permalink);
+            if (control.save_state === "conflict") {
+              // Joined into a suspended room: saving is off from this tab's
+              // first frame, whether or not it ever sees a Conflict of its
+              // own. The body is re-derived below.
+              setSaveState("conflict");
+            }
             break;
           }
           case "saved": {
@@ -290,6 +314,50 @@ export function useCollabSession(
       setParticipants([]);
     };
   }, [generation, domain, address, enabled, socketFactory]);
+
+  // Read from the derivation below, which must not re-run just because a
+  // conflict arrived while it was in flight.
+  const conflictRef = useRef<CollabConflict | null>(null);
+  useEffect(() => {
+    conflictRef.current = conflict;
+  }, [conflict]);
+
+  // The mid-conflict joiner (see the JOINED_* details above): a greeting that
+  // says "conflict" with nothing on screen to resolve is a dead banner, so
+  // the body is fetched once per greeting, and only while this tab has no
+  // conflict of its own.
+  useEffect(() => {
+    if (hello === null || hello.save_state !== "conflict") {
+      return;
+    }
+    if (conflictRef.current !== null) {
+      return; // the broadcast reached this tab after all; it is the truth
+    }
+    const at = hello.permalink;
+    let cancelled = false;
+    void (async () => {
+      let derived: CollabConflict;
+      try {
+        const theirs = await fetchEngramDetail(domain, at);
+        derived = {
+          kind: "edit",
+          theirs: theirs.content,
+          detail: JOINED_EDIT_DETAIL,
+        };
+      } catch (error) {
+        derived =
+          error instanceof ApiProblem && error.status === 404
+            ? { kind: "deleted", theirs: null, detail: JOINED_DELETED_DETAIL }
+            : { kind: "edit", theirs: null, detail: JOINED_UNREADABLE_DETAIL };
+      }
+      if (!cancelled && conflictRef.current === null) {
+        setConflict(derived);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [hello, domain]);
 
   const flush = useCallback(() => {
     docRef.current?.provider.flush();
