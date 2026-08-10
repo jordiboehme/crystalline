@@ -170,7 +170,7 @@ export default function Search() {
           onChange={(event) => {
             setText(event.target.value);
           }}
-          className="w-full rounded border border-slate-300 bg-white px-3 py-2 text-sm outline-none focus-visible:ring-2 focus-visible:ring-sky-500 dark:border-slate-700 dark:bg-slate-900"
+          className="w-full rounded border border-slate-300 bg-white px-3 py-2 text-sm outline-none focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 dark:border-slate-700 dark:bg-slate-900"
         />
       </form>
 

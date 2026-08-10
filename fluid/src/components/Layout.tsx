@@ -204,7 +204,7 @@ function TopBar({
           <NavLink
             to={usersRoute()}
             className={({ isActive }) =>
-              `rounded border border-slate-300 px-2 py-1 text-sm hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800 ${
+              `rounded border border-slate-300 px-2 py-1 text-sm hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800 ${
                 isActive ? "bg-slate-100 font-medium dark:bg-slate-800" : ""
               }`
             }
@@ -257,7 +257,7 @@ function SearchBox() {
           onChange={(event) => {
             setQuery(event.target.value);
           }}
-          className="w-full rounded border border-slate-300 bg-white py-1.5 pr-16 pl-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-sky-500 dark:border-slate-700 dark:bg-slate-900"
+          className="w-full rounded border border-slate-300 bg-white py-1.5 pr-16 pl-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 dark:border-slate-700 dark:bg-slate-900"
         />
         <kbd
           aria-hidden="true"
@@ -283,7 +283,7 @@ function ThemeMenu() {
     <DropdownMenu.Root>
       <DropdownMenu.Trigger
         aria-label={`Theme: ${preference}`}
-        className="rounded border border-slate-300 px-2 py-1 text-sm hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800"
+        className="rounded border border-slate-300 px-2 py-1 text-sm hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800"
       >
         <span aria-hidden="true">{resolved === "dark" ? "Dark" : "Light"}</span>
       </DropdownMenu.Trigger>
@@ -331,7 +331,7 @@ function UserMenu() {
 
   return (
     <DropdownMenu.Root>
-      <DropdownMenu.Trigger className="max-w-40 truncate rounded border border-slate-300 px-2 py-1 text-sm hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800">
+      <DropdownMenu.Trigger className="max-w-40 truncate rounded border border-slate-300 px-2 py-1 text-sm hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800">
         {label}
       </DropdownMenu.Trigger>
       <DropdownMenu.Portal>

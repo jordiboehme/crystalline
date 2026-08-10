@@ -37,7 +37,7 @@ export function downloadName(permalink: string): string {
 }
 
 const BUTTON_CLASSES =
-  "rounded border border-slate-300 px-2 py-0.5 text-xs hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800";
+  "rounded border border-slate-300 px-2 py-0.5 text-xs hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800";
 
 /** The three, handed out so something other than these buttons can run them. */
 export interface EngramActionHandlers {

@@ -111,7 +111,7 @@ function DomainCard({
       <h3 className="text-base font-semibold">
         <Link
           to={domainRoute(domain.name)}
-          className="hover:underline focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:outline-none"
+          className="hover:underline focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none"
         >
           {domain.name}
         </Link>
@@ -218,7 +218,7 @@ function ActivityFeed({
           >
             <Link
               to={engramRoute(item.domain, item.permalink)}
-              className="flex flex-wrap items-baseline gap-x-3 rounded hover:underline focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:outline-none"
+              className="flex flex-wrap items-baseline gap-x-3 rounded hover:underline focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none"
             >
               <span className="font-medium">{item.title}</span>
               <span className="text-xs text-slate-500 dark:text-slate-400">

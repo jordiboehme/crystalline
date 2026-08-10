@@ -34,7 +34,7 @@ export const FIELD_CLASSES =
 
 /** The classes every chip shares, on or off. */
 const CHIP_CLASSES =
-  "flex items-baseline gap-1 rounded-full border px-2 py-0.5 text-xs focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:outline-none";
+  "flex items-baseline gap-1 rounded-full border px-2 py-0.5 text-xs focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none";
 const CHIP_ON =
   "border-sky-600 bg-sky-50 text-sky-800 dark:bg-sky-950 dark:text-sky-200";
 const CHIP_OFF =
@@ -138,7 +138,7 @@ export function FilterFields({
 
       <button
         type="submit"
-        className="rounded border border-slate-300 px-2 py-1 text-sm hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800"
+        className="rounded border border-slate-300 px-2 py-1 text-sm hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800"
       >
         Apply
       </button>

@@ -65,7 +65,7 @@ export function DomainNav({
     <div className="flex flex-col gap-3">
       <Link
         to="/"
-        className="px-2 text-xs text-slate-500 underline underline-offset-2 hover:no-underline focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:outline-none dark:text-slate-400"
+        className="px-2 text-xs text-slate-500 underline underline-offset-2 hover:no-underline focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:text-slate-400"
       >
         All domains
       </Link>
@@ -83,7 +83,7 @@ export function DomainNav({
       <Link
         to={manifestRoute(domain)}
         aria-current={onManifest ? "page" : undefined}
-        className={`mx-2 block truncate rounded border border-dashed border-slate-300 px-2 py-1 font-mono text-xs tracking-wide uppercase hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800 ${
+        className={`mx-2 block truncate rounded border border-dashed border-slate-300 px-2 py-1 font-mono text-xs tracking-wide uppercase hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800 ${
           onManifest ? "bg-slate-100 font-medium dark:bg-slate-800" : ""
         }`}
       >
@@ -110,7 +110,7 @@ export function DomainNav({
             onClick={() => {
               setCreating(true);
             }}
-            className="mt-2 w-full rounded border border-slate-300 px-2 py-1 text-sm hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800"
+            className="mt-2 w-full rounded border border-slate-300 px-2 py-1 text-sm hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800"
           >
             New engram
           </button>
@@ -150,7 +150,7 @@ function DomainSwitcher({
     <DropdownMenu.Root>
       <DropdownMenu.Trigger
         aria-label={`Domain: ${domain}`}
-        className="flex w-full items-center gap-2 rounded border border-slate-300 px-2 py-1.5 text-sm hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800"
+        className="flex w-full items-center gap-2 rounded border border-slate-300 px-2 py-1.5 text-sm hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800"
       >
         <span className="truncate font-medium">{domain}</span>
         <span aria-hidden="true" className="ml-auto text-xs text-slate-500">
@@ -313,7 +313,7 @@ function Folder({
         onClick={() => {
           setOpen((wasOpen) => !wasOpen);
         }}
-        className="flex w-full items-center gap-1 rounded px-2 py-1 text-left text-sm hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:outline-none dark:hover:bg-slate-800"
+        className="flex w-full items-center gap-1 rounded px-2 py-1 text-left text-sm hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:hover:bg-slate-800"
       >
         <span
           aria-hidden="true"
@@ -345,7 +345,7 @@ function EngramLink({ row, current }: { row: EngramRow; current: boolean }) {
     <Link
       to={engramRoute(row.domain, row.permalink)}
       aria-current={current ? "page" : undefined}
-      className={`block truncate rounded px-2 py-1 text-sm hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:outline-none dark:hover:bg-slate-800 ${
+      className={`block truncate rounded px-2 py-1 text-sm hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:hover:bg-slate-800 ${
         current ? "bg-slate-100 font-medium dark:bg-slate-800" : ""
       } ${retired ? RETIRED_CLASS : ""}`}
     >

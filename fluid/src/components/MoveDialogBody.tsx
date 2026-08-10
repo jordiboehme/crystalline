@@ -18,7 +18,7 @@ import { engramRoute } from "../paths";
 import type { MoveDialogProps } from "./MoveDialog";
 
 const FIELD_CLASSES =
-  "w-full rounded border border-slate-300 bg-transparent px-2 py-1 text-sm focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:outline-none dark:border-slate-700";
+  "w-full rounded border border-slate-300 bg-transparent px-2 py-1 text-sm focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:border-slate-700";
 
 const LABEL_CLASSES =
   "text-xs font-semibold tracking-wide text-slate-500 uppercase dark:text-slate-400";

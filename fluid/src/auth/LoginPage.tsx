@@ -90,7 +90,7 @@ export default function LoginPage() {
               onChange={(event) => {
                 setName(event.target.value);
               }}
-              className="rounded border border-slate-300 bg-white px-3 py-2 text-slate-900 outline-none focus-visible:ring-2 focus-visible:ring-sky-500 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+              className="rounded border border-slate-300 bg-white px-3 py-2 text-slate-900 outline-none focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
             />
           </div>
 
@@ -111,7 +111,7 @@ export default function LoginPage() {
               onChange={(event) => {
                 setPassword(event.target.value);
               }}
-              className="rounded border border-slate-300 bg-white px-3 py-2 text-slate-900 outline-none focus-visible:ring-2 focus-visible:ring-sky-500 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+              className="rounded border border-slate-300 bg-white px-3 py-2 text-slate-900 outline-none focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
             />
           </div>
 

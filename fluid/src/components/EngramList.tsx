@@ -206,7 +206,7 @@ function Row({
         // the row run together, which is what a screen reader would read out
         // for each of a hundred rows.
         aria-label={`${row.title}, ${row.permalink}`}
-        className="flex h-full flex-col justify-center gap-1 rounded px-3 py-2 hover:bg-slate-50 focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:outline-none dark:hover:bg-slate-900"
+        className="flex h-full flex-col justify-center gap-1 rounded px-3 py-2 hover:bg-slate-50 focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:hover:bg-slate-900"
       >
         <span className="flex items-baseline gap-2">
           <span className="truncate font-medium">{row.title}</span>

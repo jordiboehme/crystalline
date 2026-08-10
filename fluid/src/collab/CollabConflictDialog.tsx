@@ -29,7 +29,7 @@ const PANE_CLASSES =
   "max-h-64 overflow-auto rounded border border-slate-200 bg-slate-50 p-2 font-mono text-xs whitespace-pre-wrap dark:border-slate-700 dark:bg-slate-900";
 
 const PLAIN_BUTTON =
-  "rounded border border-slate-300 px-3 py-1 text-sm hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800";
+  "rounded border border-slate-300 px-3 py-1 text-sm hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800";
 
 /** The overwrite-shaped choice, marked as one. */
 const AMBER_BUTTON =
