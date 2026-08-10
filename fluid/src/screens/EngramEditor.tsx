@@ -10,7 +10,7 @@
  */
 
 import { autocompletion } from "@codemirror/autocomplete";
-import type { Extension } from "@codemirror/state";
+import type { Extension, Transaction } from "@codemirror/state";
 import { Compartment, EditorState } from "@codemirror/state";
 import type { EditorView } from "@codemirror/view";
 import { keymap } from "@codemirror/view";
@@ -18,7 +18,8 @@ import type { QueryClient } from "@tanstack/react-query";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router";
-import { yCollab, yUndoManagerKeymap } from "y-codemirror.next";
+import type { YSyncConfig } from "y-codemirror.next";
+import { yCollab, ySyncFacet, yUndoManagerKeymap } from "y-codemirror.next";
 import type { Awareness } from "y-protocols/awareness";
 import * as Y from "yjs";
 
@@ -115,6 +116,37 @@ interface Room {
 }
 
 /**
+ * Whether this transaction is the co-editing binding putting the ROOM's text
+ * into the buffer, which must be handed back exactly as it arrived.
+ *
+ * y-codemirror.next skips its write-back into `Y.Text` only while the
+ * transaction still carries the annotation its sync plugin dispatched with,
+ * and a transaction rebuilt by the filter below has lost it: the plugin would
+ * re-apply a remote insert INTO the shared text and every participant would
+ * end up with it twice, with the buffer and the document permanently apart.
+ * Session text may legitimately hold a lone CR - the server admits a stray-CR
+ * file and broadcasts such lines from a merge - so this is a live path, not a
+ * theoretical one.
+ *
+ * The annotation type is not reachable: y-codemirror.next 0.3.5, the current
+ * release, exports `ySyncFacet` and `YSyncConfig` but not `ySyncAnnotation`,
+ * and its `exports` map admits no deep import. So the binding is recognized by
+ * what it guarantees instead. It dispatches from the `Y.Text` observer, with
+ * the shared text ALREADY carrying the change, so the document this
+ * transaction produces IS the shared text. A local edit runs the other way -
+ * Yjs is written after the transaction lands - so the two still differ here.
+ * A state with no binding has no facet and no write-back to protect.
+ */
+function isRoomWriteBack(tr: Transaction): boolean {
+  const sync = tr.startState.facet(ySyncFacet) as YSyncConfig | undefined;
+  if (sync === undefined) {
+    return false;
+  }
+  const shared = sync.ytext as Y.Text;
+  return tr.newDoc.toString() === shared.toJSON();
+}
+
+/**
  * Keep the shared text in LF space whatever gets pasted into it.
  *
  * A session document is LF by construction - the server strips a CRLF file's
@@ -135,6 +167,12 @@ const normalizePastedEndings = EditorState.transactionFilter.of((tr) => {
   if (!needsRewrite) {
     return tr;
   }
+  // Checked here rather than at the top: the comparison walks the shared
+  // text, and only a frame carrying a CR can reach it at all. A sync
+  // transaction with no CR in it is handed back untouched either way.
+  if (isRoomWriteBack(tr)) {
+    return tr;
+  }
   const changes: { from: number; to: number; insert: string }[] = [];
   tr.changes.iterChanges((fromA, toA, _fromB, _toB, inserted) => {
     changes.push({
@@ -149,9 +187,9 @@ const normalizePastedEndings = EditorState.transactionFilter.of((tr) => {
   // Given no selection of its own, it maps the existing one through these
   // changes instead, which is the correct place for the cursor anyway.
   //
-  // Only a frame carrying a CR reaches here, and remote frames never do (the
-  // shared text is LF space), so the annotations dropped by rebuilding the
-  // transaction are always a local edit's.
+  // Rebuilding drops the transaction's annotations, which is why the room's
+  // own write-back is let through above: this path only ever rebuilds a local
+  // edit, whose annotations nothing downstream depends on.
   return { changes };
 });
 

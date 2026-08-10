@@ -1003,6 +1003,28 @@ describe("the engram editor in a session", () => {
     expect(ytext.toJSON()).not.toContain("\r");
   });
 
+  it("takes a remote line carrying a lone CR exactly as the room sent it", async () => {
+    // The normalization above must never touch the binding's own write-back.
+    // Rebuilding that transaction drops the annotation y-codemirror.next
+    // checks, so its sync plugin would write the remote insert BACK into the
+    // shared text: the whole room ends up with the line twice and the buffer
+    // and the document never agree again. A lone CR is a real line to
+    // receive - the server admits a stray-CR file and broadcasts such lines.
+    const { doc, ytext, editor } = await openRoom();
+    const view = mountedView(editor);
+    act(() => {
+      doc.transact(() => {
+        ytext.insert(ytext.length, "a stray\rcarriage return\n");
+      }, "a remote author");
+    });
+    await waitFor(() => {
+      expect(editor.textContent).toContain("carriage return");
+    });
+    // One copy in the shared text, and the buffer is that text verbatim.
+    expect(ytext.toJSON()).toBe(`${CONTENT}a stray\rcarriage return\n`);
+    expect(view.state.doc.toString()).toBe(ytext.toJSON());
+  });
+
   it("shows a remote edit in the frontmatter form beside the buffer", async () => {
     const { doc, ytext, editor } = await openRoom();
     expect(await screen.findByLabelText("Status")).toHaveValue("stable");
