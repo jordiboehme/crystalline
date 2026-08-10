@@ -1,0 +1,30 @@
+{
+  "compilerOptions": {
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.node-test.tsbuildinfo",
+    "target": "es2023",
+    // Node-context test files: no DOM lib, so a Node global (Timeout,
+    // process, Buffer, ...) never leaks into the app's browser-scoped
+    // program the way it would if this were folded into tsconfig.app.json.
+    "lib": ["ES2023"],
+    "types": ["node"],
+    "skipLibCheck": true,
+
+    /* Bundler mode */
+    "module": "nodenext",
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "moduleDetection": "force",
+    "noEmit": true,
+
+    /* Linting */
+    // Pinned rather than inherited, as in tsconfig.app.json.
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "erasableSyntaxOnly": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true
+  },
+  "include": ["src/theme/tokens.test.ts"]
+}
