@@ -7,9 +7,9 @@
 //! collaboration-gated and work on a fresh instance with GitHub off.
 //!
 //! Every test that touches a GitHub connection injects either
-//! `support::MockProvider` (via `Engine::with_origin_provider`) or a local
-//! `FakeConnectAuth` (via `Engine::with_connect_auth`), and points token and
-//! origin state at a tempdir (`Engine::with_token_store_dir`,
+//! `support::MockProvider` (via `Engine::with_origin_provider`) or
+//! `support::StubConnectAuth` (via `Engine::with_connect_auth`), and points
+//! token and origin state at a tempdir (`Engine::with_token_store_dir`,
 //! `Engine::with_origins_dir`), so nothing here reaches a network, a real
 //! GitHub repository, or the developer's actual OS keychain.
 
@@ -21,16 +21,16 @@ use std::sync::Arc;
 
 use crystalline_core::config::{GitHubConfig, GlobalConfig, ResponseFormat, ServiceConfig};
 use crystalline_index::TursoStore;
-use crystalline_remote::{DeviceFlowStart, RemoteError, StoredToken, TokenStore};
+use crystalline_remote::{RemoteError, StoredToken, TokenStore};
 use crystalline_service::Engine;
 use crystalline_service::EnvOverlay;
-use crystalline_service::engine::{ConnectAuth, EngineError};
+use crystalline_service::engine::EngineError;
 use crystalline_service::mcp::McpServer;
 use rmcp::model::{CallToolRequestParams, ProgressNotificationParam};
 use rmcp::service::{NotificationContext, Peer, RunningService};
 use rmcp::{ClientHandler, RoleClient, RoleServer};
 use serde_json::{Value, json};
-use support::MockProvider;
+use support::{MockProvider, StubConnectAuth, device_flow_start, fake_auth};
 use tokio::sync::Mutex;
 
 // --- shared fixtures ---------------------------------------------------------
@@ -479,83 +479,12 @@ async fn configure_flipping_github_enabled_pushes_a_tool_list_changed_notificati
 }
 
 // --- configure: GitHub connect state machine (engine-level) -----------------
+//
+// The `ConnectAuth` fake (`StubConnectAuth`, `fake_auth`, `device_flow_start`)
+// lives in `support` now, shared with `tests/domain_admin.rs`'s GitHub
+// status/ready/disconnect tests.
 
-/// A fake [`ConnectAuth`] whose three outcomes are set once at construction
-/// and consumed once each, with `run_device_flow` blockable on a `Notify` so
-/// a test can observe the "still waiting on the user" state before letting
-/// the flow land.
-struct FakeConnectAuth {
-    start_result: std::sync::Mutex<Option<Result<DeviceFlowStart, RemoteError>>>,
-    run_gate: tokio::sync::Notify,
-    run_result: std::sync::Mutex<Option<Result<String, RemoteError>>>,
-    validate_result: std::sync::Mutex<Option<Result<String, RemoteError>>>,
-}
-
-fn fake_auth(
-    start: Result<DeviceFlowStart, RemoteError>,
-    run: Result<String, RemoteError>,
-    validate: Result<String, RemoteError>,
-) -> Arc<FakeConnectAuth> {
-    Arc::new(FakeConnectAuth {
-        start_result: std::sync::Mutex::new(Some(start)),
-        run_gate: tokio::sync::Notify::new(),
-        run_result: std::sync::Mutex::new(Some(run)),
-        validate_result: std::sync::Mutex::new(Some(validate)),
-    })
-}
-
-fn device_flow_start() -> DeviceFlowStart {
-    DeviceFlowStart {
-        device_code: "devcode".to_string(),
-        user_code: "ABCD-1234".to_string(),
-        verification_url: "https://github.com/login/device".to_string(),
-        interval_secs: 0,
-        expires_in_secs: 900,
-    }
-}
-
-#[async_trait::async_trait]
-impl ConnectAuth for FakeConnectAuth {
-    async fn start_device_flow(
-        &self,
-        _auth_base: &str,
-        _client_id: &str,
-    ) -> Result<DeviceFlowStart, RemoteError> {
-        self.start_result
-            .lock()
-            .unwrap()
-            .take()
-            .expect("start_device_flow result not set")
-    }
-
-    async fn run_device_flow(
-        &self,
-        _auth_base: &str,
-        _client_id: &str,
-        _start: &DeviceFlowStart,
-    ) -> Result<String, RemoteError> {
-        self.run_gate.notified().await;
-        self.run_result
-            .lock()
-            .unwrap()
-            .take()
-            .expect("run_device_flow result not set")
-    }
-
-    async fn validate_token(
-        &self,
-        _api_url: Option<&str>,
-        _token: &str,
-    ) -> Result<String, RemoteError> {
-        self.validate_result
-            .lock()
-            .unwrap()
-            .take()
-            .expect("validate_token result not set")
-    }
-}
-
-async fn engine_for_connect(auth: Arc<FakeConnectAuth>, dir: &std::path::Path) -> Engine {
+async fn engine_for_connect(auth: Arc<StubConnectAuth>, dir: &std::path::Path) -> Engine {
     engine_for_connect_with(false, auth, dir).await
 }
 
@@ -565,7 +494,7 @@ async fn engine_for_connect(auth: Arc<FakeConnectAuth>, dir: &std::path::Path) -
 /// states, not just the disabled default the other connect fixtures use.
 async fn engine_for_connect_with(
     github_enabled: bool,
-    auth: Arc<FakeConnectAuth>,
+    auth: Arc<StubConnectAuth>,
     dir: &std::path::Path,
 ) -> Engine {
     let store = TursoStore::open_in_memory().await.unwrap();
@@ -584,7 +513,7 @@ async fn engine_for_connect_with(
 /// so a test built this way can prove the environment wins over it rather
 /// than merely being the only option available.
 async fn engine_for_connect_with_env_token(
-    auth: Arc<FakeConnectAuth>,
+    auth: Arc<StubConnectAuth>,
     dir: &std::path::Path,
     token: &str,
 ) -> Engine {
@@ -722,7 +651,7 @@ async fn device_flow_refuses_when_the_environment_owns_the_token() {
 #[tokio::test]
 async fn env_token_wins_over_the_test_token_dir_override() {
     let tmp = tempfile::tempdir().unwrap();
-    // Every FakeConnectAuth outcome is set to fail: if the engine somehow
+    // Every StubConnectAuth outcome is set to fail: if the engine somehow
     // fell through to the test token directory (which has no saved token
     // either), reading the snapshot would still not need any of these, so a
     // wrong resolution would only be caught by the token_store assertion

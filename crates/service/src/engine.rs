@@ -6825,6 +6825,88 @@ impl Engine {
         Ok(github)
     }
 
+    /// The token-store host this connect targets: `github.api_url`'s bare
+    /// Enterprise Server host, or `None` for GitHub.com. The same derivation
+    /// [`Engine::origin_connection_json`] uses, so status, readiness and
+    /// disconnect can never look at a different credential slot than
+    /// team-domain operations do - on a GitHub Enterprise instance the GHES
+    /// token is the one read (and deleted), never an empty github.com slot.
+    fn github_token_host(&self) -> Option<String> {
+        let api_url = self
+            .config
+            .read()
+            .unwrap()
+            .github
+            .as_ref()
+            .and_then(|g| g.api_url.clone());
+        origin::token_host(api_url.as_deref())
+    }
+
+    /// The connection as a settings surface polls it. Mirrors
+    /// configure_connection_block's lifecycle handling (the MCP view) so the
+    /// two surfaces can never disagree about a pending or finished flow: a
+    /// finished failure is reported exactly once via the outcome slot, and a
+    /// finished success is simply visible as connected (the token was saved).
+    pub async fn github_connection(&self) -> Result<GithubConnection> {
+        let error = match self.take_finished_pending() {
+            Some(Err(e)) => Some(e.to_string()),
+            _ => None,
+        };
+        let host = self.github_token_host();
+        let (store, token) = self.github_credential(host.as_deref())?;
+        let pending = self.pending_view().map(|v| GithubPending {
+            user_code: v["user_code"].as_str().unwrap_or_default().to_string(),
+            verification_url: v["verification_url"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            expires_in_secs: v["expires_in_secs"].as_u64().unwrap_or_default(),
+        });
+        Ok(GithubConnection {
+            enabled: self.github_enabled(),
+            connected: token.is_some(),
+            user: token
+                .as_ref()
+                .and_then(|t| t.user_display())
+                .map(str::to_string),
+            token_store: token.is_some().then(|| store.kind().to_string()),
+            pending,
+            error,
+        })
+    }
+
+    /// Whether team-domain registration can succeed right now.
+    pub async fn github_ready(&self) -> bool {
+        if !self.github_enabled() {
+            return false;
+        }
+        let host = self.github_token_host();
+        matches!(self.github_credential(host.as_deref()), Ok((_, Some(_))))
+    }
+
+    /// Forget the stored credential: delete it where it lives, drop the
+    /// in-process cache and cancel any pending device flow. Refuses under an
+    /// environment token (only the environment can retire it) and on a
+    /// read-only instance. github.enabled is untouched: turning the feature
+    /// off stays a configure concern.
+    pub async fn github_disconnect(&self) -> Result<Value> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        let host = self.github_token_host();
+        let (store, token) = self.github_credential(host.as_deref())?;
+        if matches!(store, TokenStore::Env { .. }) {
+            return Err(EngineError::EnvTokenConnect);
+        }
+        let kind = store.kind();
+        if token.is_some() {
+            store.delete().map_err(EngineError::Remote)?;
+        }
+        self.github_tokens.lock().unwrap().clear();
+        *self.pending_connect.lock().unwrap() = None;
+        Ok(json!({ "connected": false, "token_store": kind }))
+    }
+
     /// Wraps a `github` block with the settings registry snapshot, the full
     /// shape the `configure` tool always returns.
     fn configure_snapshot_with(&self, github: Value) -> Result<Value> {
@@ -7073,6 +7155,31 @@ fn connect_enablement_note(enabled: bool, pending: bool) -> &'static str {
             "Connected with github.enabled off; set it to true with configure when you want team domains."
         }
     }
+}
+
+/// The GitHub connection as a settings screen needs it: never any token
+/// material, only where the credential lives and who it authenticates.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GithubConnection {
+    /// The github.enabled switch (team tools and polling).
+    pub enabled: bool,
+    pub connected: bool,
+    /// The account login, when connected.
+    pub user: Option<String>,
+    /// "keyring" | "file" | "environment", when connected.
+    pub token_store: Option<String>,
+    /// A device flow waiting for the browser side.
+    pub pending: Option<GithubPending>,
+    /// The once-reported failure of the last device flow (expired, denied);
+    /// present on exactly one status read, then cleared.
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GithubPending {
+    pub user_code: String,
+    pub verification_url: String,
+    pub expires_in_secs: u64,
 }
 
 /// One in-flight GitHub device-flow sign-in, held by
