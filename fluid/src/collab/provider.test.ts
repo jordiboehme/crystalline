@@ -297,6 +297,68 @@ describe("CollabProvider", () => {
     vi.useRealTimers();
   });
 
+  it("climbs the backoff ladder when a socket opens but never says hello", () => {
+    vi.useFakeTimers();
+    // No jitter, so the ladder's rungs are exact: 250ms, 500ms, 1000ms, ...
+    const random = vi.spyOn(Math, "random").mockReturnValue(0);
+    const { provider, socket } = makeProvider();
+    // A flapping daemon: the TCP connection comes up and dies before the
+    // session is usable. "Connected" is not "accepted", so the ladder must
+    // keep climbing instead of hammering the server twice a second forever.
+    socket.open();
+    socket.dropWith(1006);
+    vi.advanceTimersByTime(260);
+    expect(FakeSocket.instances).toHaveLength(2);
+
+    const second = FakeSocket.instances[1];
+    if (!second) throw new Error("no second socket");
+    second.open();
+    second.dropWith(1006);
+    vi.advanceTimersByTime(260);
+    // Rung two is 500ms: a reset-on-open would already have dialed again.
+    expect(FakeSocket.instances).toHaveLength(2);
+    vi.advanceTimersByTime(260);
+    expect(FakeSocket.instances).toHaveLength(3);
+
+    const third = FakeSocket.instances[2];
+    if (!third) throw new Error("no third socket");
+    third.open();
+    third.dropWith(1006);
+    // Rung three is 1000ms, and five seconds of flapping stays bounded.
+    vi.advanceTimersByTime(5_000);
+    expect(FakeSocket.instances.length).toBeLessThanOrEqual(6);
+    provider.destroy();
+    random.mockRestore();
+    vi.useRealTimers();
+  });
+
+  it("resets the backoff ladder only once a hello is accepted", () => {
+    vi.useFakeTimers();
+    const random = vi.spyOn(Math, "random").mockReturnValue(0);
+    const { provider, socket } = makeProvider();
+    socket.open();
+    socket.dropWith(1006);
+    vi.advanceTimersByTime(260); // rung one, 250ms
+    const second = FakeSocket.instances[1];
+    if (!second) throw new Error("no second socket");
+    second.open();
+    second.dropWith(1006);
+    vi.advanceTimersByTime(520); // rung two, 500ms
+    const third = FakeSocket.instances[2];
+    if (!third) throw new Error("no third socket");
+
+    // This one is a real session: it greets us in our own epoch.
+    third.open();
+    accept(third, "e1");
+    third.dropWith(1006);
+    // Back to rung one, because a usable session is what "success" means.
+    vi.advanceTimersByTime(260);
+    expect(FakeSocket.instances).toHaveLength(4);
+    provider.destroy();
+    random.mockRestore();
+    vi.useRealTimers();
+  });
+
   it("never speaks y-sync into a different epoch: silence, then a rebuild signal", () => {
     vi.useFakeTimers();
     const epochGap = vi.fn();
@@ -329,6 +391,33 @@ describe("CollabProvider", () => {
     vi.useRealTimers();
   });
 
+  it("ignores frames that land after the epoch gap tore the session down", () => {
+    vi.useFakeTimers();
+    const epochGap = vi.fn();
+    const controls: object[] = [];
+    const { provider, socket } = makeProvider({
+      onEpochGap: epochGap,
+      onControl: (control) => controls.push(control),
+    });
+    socket.open();
+    accept(socket, "e1");
+    socket.dropWith(1006);
+    vi.advanceTimersByTime(600);
+    const retry = FakeSocket.instances[1];
+    if (!retry) throw new Error("no retry socket");
+    retry.open();
+    retry.receive(helloFrame("e2"));
+    const after = controls.length;
+    // A frame the browser had already queued when we tore the socket down.
+    // The owner is rebuilding around the new epoch by now; hearing from a
+    // discarded provider would make it rebuild twice.
+    retry.receive(helloFrame("e3"));
+    expect(epochGap).toHaveBeenCalledTimes(1);
+    expect(controls).toHaveLength(after);
+    provider.destroy();
+    vi.useRealTimers();
+  });
+
   it("fails the FIRST connect after the timeout so the editor can go solo", () => {
     vi.useFakeTimers();
     const statuses: string[] = [];
@@ -340,6 +429,41 @@ describe("CollabProvider", () => {
     expect(statuses.at(-1)).toBe("failed");
     expect(socket.readyState).toBe(3);
     provider.destroy();
+    vi.useRealTimers();
+  });
+
+  it("says nothing to an owner that destroyed it while still connecting", () => {
+    vi.useFakeTimers();
+    const statuses: string[] = [];
+    const doc = new Y.Doc();
+    // A browser closes a CONNECTING socket asynchronously, so `close()` here
+    // reports the new state without delivering an event of its own: the
+    // deadline is on its own to be cleared by destroy().
+    const silent = {
+      binaryType: "",
+      readyState: 0,
+      send: () => undefined,
+      close() {
+        this.readyState = 3;
+      },
+    };
+    const provider = new CollabProvider(
+      "/ws-under-test",
+      doc,
+      new Awareness(doc),
+      {
+        onControl: () => undefined,
+        onStatus: (status) => statuses.push(status),
+        onSynced: () => undefined,
+        onEpochGap: () => undefined,
+      },
+      () => silent as unknown as WebSocket,
+    );
+    // Torn down before the socket ever opened: the connect deadline must go
+    // with it, or it fires "failed" into an unmounted owner.
+    provider.destroy();
+    vi.advanceTimersByTime(10_000);
+    expect(statuses).not.toContain("failed");
     vi.useRealTimers();
   });
 });

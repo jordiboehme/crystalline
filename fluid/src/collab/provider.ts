@@ -108,6 +108,10 @@ export class CollabProvider {
   private synced = false;
   private retries = 0;
   private timer: ReturnType<typeof setTimeout> | null = null;
+  /** The first connect's deadline, held so a teardown mid-CONNECTING takes
+   *  it down too: a browser closes a connecting socket asynchronously, so
+   *  the close event cannot be relied on to clear it in time. */
+  private deadline: ReturnType<typeof setTimeout> | null = null;
   private statusValue: CollabStatus = "connecting";
   /** The server session's epoch, adopted from the first hello. */
   private epoch: string | null = null;
@@ -151,6 +155,10 @@ export class CollabProvider {
     if (this.timer !== null) {
       clearTimeout(this.timer);
     }
+    if (this.deadline !== null) {
+      clearTimeout(this.deadline);
+      this.deadline = null;
+    }
     // The goodbye FIRST, while the awareness listener is still attached to
     // relay it; the server also nulls this client on close, so this is a
     // courtesy for the room's latency, not correctness.
@@ -182,19 +190,27 @@ export class CollabProvider {
     const deadline = this.everConnected
       ? null
       : setTimeout(() => {
+          this.deadline = null;
           if (!this.everConnected) {
             this.closed = true;
             socket.close();
             this.setStatus("failed");
           }
         }, CONNECT_TIMEOUT_MS);
+    this.deadline = deadline;
     socket.onopen = () => {
       if (deadline !== null) {
         clearTimeout(deadline);
+        this.deadline = null;
       }
       this.everConnected = true;
-      this.retries = 0;
       this.setStatus("connected");
+      // The retry ladder is NOT reset here: an open socket is only a TCP
+      // success. A daemon that accepts and drops (or a session closed right
+      // after the upgrade with an ordinary code) would pin the wait at its
+      // lowest rung and hammer the server several times a second forever.
+      // The reset lives where a hello is accepted, so "success" means a
+      // session this doc can actually use.
       // Deliberately NOTHING else: the y-sync handshake waits for the
       // server's hello (see greet), or a reconnect onto a restarted daemon
       // would answer the fresh session's SyncStep1 with this doc's whole
@@ -206,6 +222,7 @@ export class CollabProvider {
     socket.onclose = (event) => {
       if (deadline !== null) {
         clearTimeout(deadline);
+        this.deadline = null;
       }
       this.socket = null;
       if (this.closed) {
@@ -251,6 +268,12 @@ export class CollabProvider {
   }
 
   private receive(frame: Uint8Array): void {
+    if (this.closed) {
+      // A frame the browser had already queued when this provider was torn
+      // down. Answering it would fire onEpochGap or onControl into an owner
+      // that has moved on, and make it rebuild a second time.
+      return;
+    }
     const decoder = decoding.createDecoder(frame);
     // Several protocol messages may share one WS frame.
     while (decoding.hasContent(decoder)) {
@@ -279,6 +302,8 @@ export class CollabProvider {
           }
           this.epoch = control.epoch;
           this.accepted = true;
+          // A usable session is what earns the ladder's reset (see onopen).
+          this.retries = 0;
           this.greet();
         }
         this.handlers.onControl(control);
