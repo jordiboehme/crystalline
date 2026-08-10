@@ -10,6 +10,7 @@
 //! commands and the CLI data commands all funnel through that one engine.
 
 pub mod client;
+pub mod collab;
 pub mod control;
 pub mod daemon;
 pub mod engine;
