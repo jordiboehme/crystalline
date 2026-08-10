@@ -241,9 +241,20 @@ impl CollabSessions {
     ///
     /// The sweep closes what is open, it does not lock the domain out: a join
     /// that takes the registry lock after the victims were collected opens a
-    /// fresh room. Callers therefore unregister the domain in the engine FIRST
-    /// and sweep second, so such a join is refused by the engine read instead
-    /// of reopening a room over a domain the daemon no longer serves.
+    /// fresh room. So the caller sweeps FIRST and unregisters second, behind a
+    /// fence of its own that refuses new joins for the closing domain (an admin
+    /// gate in the REST state, or a registry-level fence - the route's choice).
+    /// The order is not free to invert: unregistering first would strand every
+    /// save this verb promises, because the engine can no longer resolve the
+    /// engram (the write is refused outright, and inside the window between the
+    /// config write and the index clear it would resolve as virtual and land in
+    /// the DATABASE rather than in the file that `files_kept` deliberately left
+    /// on disk). Note that the fence is what closes the join window, not luck:
+    /// [`CollabSessions::join`] holds the registry lock ACROSS
+    /// [`CollabSession::open`] (the engine read), so a join either inserts
+    /// before the sweep collects and is swept, or arrives after and is refused
+    /// by the fence - no join is in flight across the sweep. If that lock is
+    /// ever released around the open, this argument silently breaks.
     ///
     /// Note that `poison` broadcasts `Closed { reason: "internal" }`, so a room
     /// closed by an unregistration reads as an internal error on the client
