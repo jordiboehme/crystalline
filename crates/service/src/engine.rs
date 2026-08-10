@@ -298,6 +298,22 @@ mod error_tests {
 /// The result type used across the engine.
 pub type Result<T> = std::result::Result<T, EngineError>;
 
+/// One engram's exact file text and identity, as [`Engine::engram_text`]
+/// returns it. The `checksum` is the same CAS token a save takes back.
+#[derive(Debug, Clone)]
+pub struct EngramText {
+    /// The owning domain name.
+    pub domain: String,
+    /// The engram permalink.
+    pub permalink: String,
+    /// The domain-relative file path, forward-slashed, with the `.md` suffix.
+    pub path: String,
+    /// The engram's full markdown, byte for byte as stored.
+    pub content: String,
+    /// The content checksum: the CAS token of the next save.
+    pub checksum: String,
+}
+
 /// A stage-boundary progress callback for a long connect:
 /// (step, total steps, message). Sync and cheap by contract; the MCP
 /// layer bridges it onto async notifications through a channel.
@@ -1853,6 +1869,23 @@ impl Engine {
     }
 
     // --- read ----------------------------------------------------------------
+
+    /// One engram's exact file text and identity: what the collab session
+    /// layer loads at open and probes with on its idle external-change check.
+    /// Deliberately thin - [`Engine::read_engram`] resolves references and
+    /// builds hints this caller never reads.
+    pub async fn engram_text(&self, domain: &str, identifier: &str) -> Result<EngramText> {
+        let (desc, source) = self.resolve(identifier, Some(domain)).await?;
+        let content = self.load_content(&source, &desc).await?;
+        let checksum = sha256_hex(content.as_bytes());
+        Ok(EngramText {
+            domain: desc.domain,
+            permalink: desc.permalink,
+            path: desc.path,
+            content,
+            checksum,
+        })
+    }
 
     /// Read an engram's full markdown and resolved frontmatter. The content
     /// comes from the local file when a file domain holds it, else from the

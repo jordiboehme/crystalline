@@ -68,6 +68,10 @@ axum = { version = "0.8.9", features = ["ws"] }
 yrs = { version = "0.27.3", features = ["sync"] }
 # Text diffing for collaborative merge conflict surfacing (crates/service).
 similar = "3.1.2"
+# Cheaply cloned byte buffers for the collab broadcast fan-out; also the shape
+# axum's WebSocket binary frames take, so a frame crosses the seam without a
+# copy. Already in the graph through axum and tokio.
+bytes = "1.12.1"
 # Dev-only: a WebSocket client to drive the collab session tests against the
 # real server socket.
 tokio-tungstenite = "0.30.0"

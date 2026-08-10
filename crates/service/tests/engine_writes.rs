@@ -653,3 +653,20 @@ async fn manifest_save_is_guarded_verbatim_and_refreshes_routing() {
         "the stale bullet is gone:\n{after_routing}"
     );
 }
+
+/// The collab layer's thin read: exact bytes, identity, checksum - no
+/// reference resolution. The checksum is the same CAS token a save takes.
+#[tokio::test]
+async fn engram_text_reports_exact_bytes_and_the_save_token() {
+    let (_tmp, engine) = engine_fixture().await;
+    let text = engine.engram_text("eng", "alpha").await.unwrap();
+    assert_eq!(text.domain, "eng");
+    assert_eq!(text.permalink, "alpha");
+    assert_eq!(text.path, "alpha.md");
+    assert_eq!(text.content, ALPHA);
+    let (checksum, _) = checksum_of(&engine, "eng", "alpha").await;
+    assert_eq!(text.checksum, checksum);
+
+    let missing = engine.engram_text("eng", "ghost").await.unwrap_err();
+    assert!(missing.to_string().contains("ghost"), "{missing}");
+}

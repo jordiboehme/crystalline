@@ -4,4 +4,6 @@
 //! truth, and a daemon restart drops sessions by design (clients rejoin from
 //! the saved file).
 
+pub mod control;
+pub mod session;
 pub mod text;

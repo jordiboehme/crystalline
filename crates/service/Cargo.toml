@@ -59,6 +59,7 @@ tracing-subscriber = { workspace = true }
 futures = { workspace = true }
 yrs = { workspace = true }
 similar = { workspace = true }
+bytes = { workspace = true }
 # diffy has a workspace pin already (crates/remote uses it), but this crate
 # does not inherit it automatically: plain-text merge conflict surfacing here
 # needs its own line.
