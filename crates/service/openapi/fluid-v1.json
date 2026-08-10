@@ -297,6 +297,91 @@
         }
       }
     },
+    "/api/v1/collab/{domain}/{permalink}": {
+      "get": {
+        "tags": [
+          "engrams"
+        ],
+        "summary": "Upgrade to a real-time co-editing session on one engram.",
+        "description": "WebSocket upgrade for the y-sync + awareness protocol over the engram's shared text. Editor role, a live session cookie and a same-host Origin header are all required and checked before the upgrade; a read-only instance refuses like every write. CSRF headers do not apply to the upgrade GET. Refusals are problem+json.",
+        "operationId": "collab_join",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The domain.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "permalink",
+            "in": "path",
+            "description": "The engram's permalink; may contain slashes.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "101": {
+            "description": "Switching protocols: the session is joined."
+          },
+          "401": {
+            "description": "No identity.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Viewer role, read-only instance, or a missing/foreign Origin.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such engram.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Mixed line endings: this file cannot hold a shared session; edit solo.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Session or participant capacity reached.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/context": {
       "get": {
         "tags": [

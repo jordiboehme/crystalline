@@ -91,6 +91,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/collab/{domain}/{permalink}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Upgrade to a real-time co-editing session on one engram.
+         * @description WebSocket upgrade for the y-sync + awareness protocol over the engram's shared text. Editor role, a live session cookie and a same-host Origin header are all required and checked before the upgrade; a read-only instance refuses like every write. CSRF headers do not apply to the upgrade GET. Refusals are problem+json.
+         */
+        get: operations["collab_join"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/context": {
         parameters: {
             query?: never;
@@ -1132,6 +1152,74 @@ export interface operations {
             };
             /** @description The trusted-header identity names a disabled account. The guard resolves identity ahead of routing, so this answer reaches even the paths that are served without one. */
             403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    collab_join: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The domain. */
+                domain: string;
+                /** @description The engram's permalink; may contain slashes. */
+                permalink: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Switching protocols: the session is joined. */
+            101: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No identity. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description Viewer role, read-only instance, or a missing/foreign Origin. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No such engram. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description Mixed line endings: this file cannot hold a shared session; edit solo. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description Session or participant capacity reached. */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };

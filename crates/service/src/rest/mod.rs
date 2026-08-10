@@ -87,6 +87,7 @@ use crate::engine::Engine;
         engrams::move_action,
         engrams::remove,
         engrams::validate,
+        crate::collab::ws::join,
         discovery::search,
         discovery::vocabulary,
         discovery::context,
@@ -147,6 +148,10 @@ pub struct RestState {
     pub auth: Arc<AuthStore>,
     /// The auth settings as of startup. See [`AuthCfg`].
     pub auth_cfg: AuthCfg,
+    /// The open co-editing sessions, one registry for this process: the
+    /// collab upgrade route joins rooms in it, and every save it makes goes
+    /// back through the engine above.
+    pub collab: Arc<crate::collab::session::CollabSessions>,
     /// Caps how many password verifications run at once. See
     /// [`LOGIN_SLOTS`].
     login_slots: Arc<Semaphore>,
@@ -160,6 +165,7 @@ impl RestState {
     pub fn new(engine: Arc<Engine>, auth: Arc<AuthStore>) -> anyhow::Result<RestState> {
         let auth_cfg = AuthCfg::resolve(&engine.config())?;
         Ok(RestState {
+            collab: crate::collab::session::CollabSessions::new(engine.clone()),
             engine,
             auth,
             auth_cfg,
@@ -235,6 +241,14 @@ pub fn router(state: RestState) -> Router {
         // Actions rather than sub-paths of `/engrams/{*permalink}`, whose
         // wildcard cannot be followed by another segment: the permalink of
         // the engram being retired or moved rides in the body instead.
+        // The collab upgrade: a GET, so the guard's CSRF exemption applies by
+        // method; role, read_only and Origin are enforced in the handler,
+        // before upgrade. The wildcard is terminal, so nested permalinks ride
+        // the path exactly as the engram detail route takes them.
+        .route(
+            "/collab/{domain}/{*permalink}",
+            get(crate::collab::ws::join),
+        )
         .route("/domains/{domain}/retire", post(engrams::retire))
         .route("/domains/{domain}/move", post(engrams::move_action))
         // Not domain-scoped like the routes above it: the document being
