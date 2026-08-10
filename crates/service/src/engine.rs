@@ -5407,6 +5407,81 @@ impl Engine {
         }))
     }
 
+    /// Unregister a domain: the config entry goes, the watcher and discovery
+    /// forget it and its index rows are cleared so search stops serving it.
+    /// Files are never touched - for a file domain they stay on disk exactly
+    /// as they are (re-adding the folder re-adopts them); a virtual domain's
+    /// rows ARE its truth, so callers should export first and their
+    /// confirmation copy must say the knowledge is gone.
+    pub async fn domain_remove(&self, name: &str) -> Result<Value> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+
+        // Same file-lock persist dance as `domain_add_local`: file_config
+        // write lock, clone, mutate, persist_config, overlay.apply, write
+        // both locks - same order. The miss is classified before persisting
+        // anything. Scoped in a block, mirroring the sibling verbs, so the
+        // guard is released well before the awaits that follow.
+        let removed = {
+            let mut file_guard = self.file_config.write().unwrap();
+            let mut file = file_guard.clone();
+            let removed = match file.domains.shift_remove(name) {
+                Some(entry) => entry,
+                None => {
+                    // A miss in the file config may be an env-defined domain:
+                    // those are immune to `domain_remove` (the variable is
+                    // their source of truth), mirroring `cmd::domain_remove`.
+                    if let Some(env) = self.overlay.env_domain(name) {
+                        return Err(EngineError::Conflict(format!(
+                            "domain '{name}' is defined by the environment variable {}; unset it to manage this domain in the config file",
+                            env.var
+                        )));
+                    }
+                    return Err(EngineError::UnknownDomain {
+                        domain: name.to_string(),
+                        registered: self.known_domain_names(),
+                    });
+                }
+            };
+            self.persist_config(&file)?;
+            let effective = self.overlay.apply(&file);
+            *file_guard = file;
+            *self.config.write().unwrap() = effective;
+            removed
+        };
+        // Record whether the entry was a file domain before removing it.
+        let files_kept = !removed.is_virtual();
+
+        // Tell the runtime: drop it from the discovered overlay and stop
+        // watching its root.
+        self.forget_domain(name);
+
+        // Index rows: resolve the DomainId the way `reindex(full)` does
+        // before it calls `clear_domain` and clear them. The domain row
+        // stays either way (idempotent upsert); only the engram rows matter.
+        let kind = if removed.is_virtual() {
+            DomainKind::Virtual
+        } else {
+            DomainKind::File
+        };
+        let path = removed.file_path();
+        let path_str = path.as_ref().map(|p| p.to_string_lossy());
+        let store = self.store.lock().await;
+        let domain_id = store.upsert_domain(name, path_str.as_deref(), kind).await?;
+        store.clear_domain(domain_id).await?;
+        drop(store);
+
+        self.refresh_routing_cache().await;
+
+        Ok(json!({
+            "domain": name,
+            "unregistered": true,
+            "files_kept": files_kept,
+            "index_cleared": true,
+        }))
+    }
+
     // --- origin (GitHub collaboration) ----------------------------------------
 
     /// Connects a new domain to a GitHub repository: downloads its tracked
