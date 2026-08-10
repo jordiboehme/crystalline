@@ -183,7 +183,7 @@ async fn an_untouched_session_never_writes() {
     // Open, sync, leave: the byte-fidelity property for a no-op session.
     assert!(joined.session.remove_conn(joined.conn).await);
     joined.session.final_save().await;
-    sessions.dispose_if_empty("eng", "crlf").await;
+    sessions.dispose_if_empty(&joined.session).await;
     let after = std::fs::read(tmp.path().join("eng/crlf.md")).unwrap();
     assert_eq!(before, after, "open-then-close is byte-identical");
 }
@@ -233,7 +233,7 @@ async fn the_last_leave_lands_the_final_save() {
     append_line(&joined, &doc, "a final thought").await;
     assert!(joined.session.remove_conn(joined.conn).await);
     joined.session.final_save().await;
-    sessions.dispose_if_empty("eng", "alpha").await;
+    sessions.dispose_if_empty(&joined.session).await;
     let on_disk = std::fs::read_to_string(tmp.path().join("eng/alpha.md")).unwrap();
     assert!(on_disk.ends_with("a final thought\n"));
     assert_eq!(sessions.session_count().await, 0);
@@ -376,6 +376,178 @@ async fn a_frontmatter_rename_moves_the_session_and_the_receipt_says_so() {
         panic!("saved after rename");
     };
     assert_eq!(permalink, "beta");
+}
+
+/// A full frontmatter rename: an author who renames an engram moves its title
+/// with its permalink, so the old identifier stops resolving entirely.
+fn renamed_alpha() -> String {
+    ALPHA
+        .replace("permalink: alpha", "permalink: beta")
+        .replace("title: Alpha", "title: Beta")
+}
+
+/// Rename `alpha` to `beta` through a flushed save on `joined`.
+async fn rename_to_beta(joined: &Joined, doc: &Doc) {
+    replace_all(joined, doc, &renamed_alpha()).await;
+    joined
+        .session
+        .handle_frame(joined.conn, &control::encode(&Control::Flush))
+        .await;
+    joined.session.tick_save(Instant::now()).await;
+}
+
+#[tokio::test]
+async fn a_rename_moves_the_registry_key_so_the_new_permalink_finds_the_same_room() {
+    // Without the re-key a client that follows the Saved { permalink }
+    // broadcast would open a SECOND room over the same file, and the two would
+    // fight over one CAS token.
+    let (_tmp, engine) = engine_fixture().await;
+    let sessions = CollabSessions::new(engine);
+    let joined = sessions.join("eng", "alpha").await.unwrap();
+    let doc = sync_client(&joined).await;
+    rename_to_beta(&joined, &doc).await;
+
+    let rejoined = sessions.join("eng", "beta").await.unwrap();
+    assert!(
+        Arc::ptr_eq(&joined.session, &rejoined.session),
+        "the rename followed the engram, so beta is the live room"
+    );
+    assert_eq!(sessions.session_count().await, 1, "one room, one file");
+}
+
+#[tokio::test]
+async fn the_old_permalink_stops_resolving_after_a_rename() {
+    // The stale key is gone rather than left pointing at the renamed room: a
+    // client that asks for alpha gets the engine's own miss and falls back to
+    // solo editing, instead of adopting a room whose content is now beta.
+    let (_tmp, engine) = engine_fixture().await;
+    let sessions = CollabSessions::new(engine);
+    let joined = sessions.join("eng", "alpha").await.unwrap();
+    let doc = sync_client(&joined).await;
+    rename_to_beta(&joined, &doc).await;
+
+    let refused = sessions.join("eng", "alpha").await.unwrap_err();
+    assert!(
+        matches!(
+            refused,
+            crystalline_service::collab::session::JoinError::Engine(_)
+        ),
+        "alpha is nobody's engram now: {refused:?}"
+    );
+    assert_eq!(sessions.session_count().await, 1, "no second room opened");
+}
+
+#[tokio::test]
+async fn a_renamed_session_still_disposes_cleanly() {
+    let (_tmp, engine) = engine_fixture().await;
+    let sessions = CollabSessions::new(engine);
+    let joined = sessions.join("eng", "alpha").await.unwrap();
+    let doc = sync_client(&joined).await;
+    rename_to_beta(&joined, &doc).await;
+
+    assert!(joined.session.remove_conn(joined.conn).await);
+    joined.session.final_save().await;
+    // Disposal goes by the session, so it finds the room under its NEW key.
+    sessions.dispose_if_empty(&joined.session).await;
+    assert_eq!(
+        sessions.session_count().await,
+        0,
+        "no entry leaks under either permalink"
+    );
+}
+
+#[tokio::test]
+async fn a_blocked_session_backs_off_instead_of_hammering_the_engine() {
+    // The edit timers stay armed while a document is unsaveable, so an
+    // unguarded retry would call the engine on every 250ms tick for as long as
+    // the author leaves the frontmatter broken.
+    let (tmp, engine) = engine_fixture().await;
+    let sessions = CollabSessions::new(engine);
+    let mut joined = sessions.join("eng", "alpha").await.unwrap();
+    let doc = sync_client(&joined).await;
+
+    // The failing attempt happens at a synthetic instant far enough ahead that
+    // every later tick in this test has the debounce behind it.
+    let failed_at = Instant::now() + Duration::from_secs(10);
+    replace_all(&joined, &doc, "no frontmatter at all").await;
+    joined
+        .session
+        .handle_frame(joined.conn, &control::encode(&Control::Flush))
+        .await;
+    joined.session.tick_save(failed_at).await;
+    assert!(matches!(
+        next_control(&mut joined.rx).await,
+        Control::SaveFailed { .. }
+    ));
+
+    // The document becomes saveable again, so any attempt at all would write.
+    let repaired = format!("{ALPHA}a repaired body\n");
+    replace_all(&joined, &doc, &repaired).await;
+    joined
+        .session
+        .tick_save(failed_at + Duration::from_millis(1))
+        .await;
+    joined
+        .session
+        .tick_save(failed_at + Duration::from_millis(2))
+        .await;
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("eng/alpha.md")).unwrap(),
+        ALPHA,
+        "the two ticks inside the backoff window attempted nothing"
+    );
+
+    // One backoff window after the refusal, the retry runs on its own.
+    joined
+        .session
+        .tick_save(failed_at + Duration::from_millis(SAVE_DEBOUNCE_MS + 1))
+        .await;
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("eng/alpha.md")).unwrap(),
+        repaired,
+        "the backoff expires rather than blocking retries forever"
+    );
+}
+
+#[tokio::test]
+async fn a_flush_retries_a_blocked_save_immediately() {
+    let (tmp, engine) = engine_fixture().await;
+    let sessions = CollabSessions::new(engine);
+    let mut joined = sessions.join("eng", "alpha").await.unwrap();
+    let doc = sync_client(&joined).await;
+
+    let failed_at = Instant::now() + Duration::from_secs(10);
+    replace_all(&joined, &doc, "no frontmatter at all").await;
+    joined
+        .session
+        .handle_frame(joined.conn, &control::encode(&Control::Flush))
+        .await;
+    joined.session.tick_save(failed_at).await;
+    assert!(matches!(
+        next_control(&mut joined.rx).await,
+        Control::SaveFailed { .. }
+    ));
+
+    // The Save button, pressed the moment the alert appears: no waiting.
+    let repaired = format!("{ALPHA}repaired and flushed\n");
+    replace_all(&joined, &doc, &repaired).await;
+    joined
+        .session
+        .handle_frame(joined.conn, &control::encode(&Control::Flush))
+        .await;
+    joined
+        .session
+        .tick_save(failed_at + Duration::from_millis(1))
+        .await;
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("eng/alpha.md")).unwrap(),
+        repaired,
+        "an explicit flush skips the backoff"
+    );
+    assert!(matches!(
+        next_control(&mut joined.rx).await,
+        Control::Saved { .. }
+    ));
 }
 
 #[tokio::test]

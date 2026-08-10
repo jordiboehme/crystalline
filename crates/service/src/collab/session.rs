@@ -3,8 +3,8 @@
 //! everything durable flows back through the engine (Tasks 6-7).
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::Instant;
 
 use bytes::Bytes;
@@ -127,7 +127,16 @@ impl CollabSessions {
     }
 
     /// Join a document, opening it from the file on the first join.
-    pub async fn join(&self, domain: &str, permalink: &str) -> Result<Joined, JoinError> {
+    ///
+    /// Takes `&Arc<Self>` because an opened session keeps a [`Weak`] handle
+    /// back to the registry: a frontmatter rename has to move its key, and the
+    /// session is the only one who learns about the rename (from the save
+    /// receipt).
+    pub async fn join(
+        self: &Arc<Self>,
+        domain: &str,
+        permalink: &str,
+    ) -> Result<Joined, JoinError> {
         let key = (domain.to_string(), permalink.to_string());
         // The registry lock is held across open AND the membership check, so a
         // stampede of joins can neither open the same document twice nor
@@ -148,9 +157,13 @@ impl CollabSessions {
                 if !sessions.contains_key(&key) && sessions.len() >= MAX_SESSIONS {
                     return Err(JoinError::ServerFull);
                 }
-                let opened =
-                    CollabSession::open(self.engine.clone(), key.clone(), self.mint_epoch())
-                        .await?;
+                let opened = CollabSession::open(
+                    self.engine.clone(),
+                    key.clone(),
+                    self.mint_epoch(),
+                    Arc::downgrade(self),
+                )
+                .await?;
                 sessions.insert(key.clone(), opened.clone());
                 tokio::spawn(run_saver(opened.clone()));
                 (opened, true)
@@ -178,20 +191,70 @@ impl CollabSessions {
     }
 
     /// Drop the registry entry once a session reports empty. Split from
-    /// [`CollabSession::remove_conn`] so the final save (Task 6) can run
-    /// between the two.
-    pub async fn dispose_if_empty(&self, domain: &str, permalink: &str) {
-        let key = (domain.to_string(), permalink.to_string());
+    /// [`CollabSession::remove_conn`] so the final save can run between the
+    /// two.
+    ///
+    /// Takes the session rather than its address on purpose: a frontmatter
+    /// rename moves the registry key mid-life, so the (domain, permalink) a
+    /// socket joined under is not always the one the room is filed under when
+    /// that socket closes. The route holds the [`Joined`] handle, so passing
+    /// the session is also the simpler call.
+    pub async fn dispose_if_empty(&self, session: &CollabSession) {
+        let key = session.key();
         let mut sessions = self.sessions.lock().await;
+        // Identity by epoch: a room opened under this key while the last
+        // socket of the previous one was closing must not be disposed by its
+        // predecessor's teardown.
+        if sessions
+            .get(&key)
+            .is_none_or(|held| held.epoch() != session.epoch())
+        {
+            return;
+        }
         // A poisoned session counts as gone whether or not sockets still hang
         // off it: it saves nothing and its saver has stopped, so it must not
         // survive in the registry for a later join to find.
-        if let Some(session) = sessions.get(&key)
-            && (session.is_disposed() || session.is_empty().await)
-        {
+        if session.is_disposed() || session.is_empty().await {
             // Ends the saver loop, and makes every later save path a no-op.
             session.dispose();
             sessions.remove(&key);
+        }
+    }
+
+    /// Move a session's registry entry after a frontmatter rename, so the room
+    /// is found under the permalink it now answers to and a client that
+    /// follows the `Saved { permalink }` broadcast rejoins THIS room instead of
+    /// opening a second one over the same file.
+    ///
+    /// Called with no session guard held: the lock order is registry ->
+    /// session, never the reverse. `epoch` identifies the session that renamed
+    /// itself, so an entry that was replaced meanwhile is left alone.
+    async fn rekey(&self, from: &(String, String), to_permalink: &str, epoch: &str) {
+        if from.1 == to_permalink {
+            return;
+        }
+        let to = (from.0.clone(), to_permalink.to_string());
+        let mut sessions = self.sessions.lock().await;
+        if sessions.get(from).is_none_or(|held| held.epoch() != epoch) {
+            return; // disposed or replaced meanwhile: not ours to move
+        }
+        // A live room already at the new key is pathological (two sessions
+        // over one file). Clobbering it would strand its participants, so both
+        // stand and the CAS token settles it: the second save conflicts and
+        // that room goes save-blocked rather than overwriting the first.
+        if let Some(existing) = sessions.get(&to)
+            && !existing.is_disposed()
+        {
+            tracing::warn!(
+                domain = %to.0,
+                permalink = %to.1,
+                "a rename collided with a live session; both rooms stand"
+            );
+            return;
+        }
+        if let Some(session) = sessions.remove(from) {
+            session.adopt_key(to_permalink);
+            sessions.insert(to, session);
         }
     }
 
@@ -218,10 +281,16 @@ impl CollabSessions {
 /// channel every connection listens on.
 pub struct CollabSession {
     epoch: String,
-    /// The registry key, (domain, permalink); the domain saves write back to
-    /// and external-change checks probe. The permalink half is the address at
-    /// OPEN time: a rename moves `SessionState::permalink`, never this.
-    key: (String, String),
+    /// The domain this room's engram lives in; no edit ever moves it.
+    domain: String,
+    /// The permalink this room is REGISTERED under. A frontmatter rename moves
+    /// it together with the registry entry, so `(domain, key_permalink)` is
+    /// always where the registry holds this session. A std mutex, never held
+    /// across an await.
+    key_permalink: std::sync::Mutex<String>,
+    /// The registry this room lives in, for the rename move. Weak because the
+    /// registry owns the session and never the other way round.
+    registry: Weak<CollabSessions>,
     /// The engine every durable read and write goes through.
     engine: Arc<Engine>,
     tx: broadcast::Sender<Frame>,
@@ -237,8 +306,9 @@ struct SessionState {
     /// with OffsetKind::Utf16 so every index agrees with JS clients.
     awareness: Awareness,
     separator: Separator,
-    /// The domain-relative file path, as loaded.
-    #[allow(dead_code, reason = "the save path in Task 6 reports it")]
+    /// The domain-relative file path, as loaded and as each save receipt
+    /// reports it back.
+    #[allow(dead_code, reason = "the idle probe in Task 7 stats it")]
     path: String,
     permalink: String,
     /// The checksum backing last_saved_text: the CAS token of the next save.
@@ -254,6 +324,10 @@ struct SessionState {
     oldest_unsaved: Option<Instant>,
     /// A client asked for a save now rather than on the debounce.
     flush_requested: bool,
+    /// When the engine was last asked to write. Only a save-blocked session
+    /// reads it, to space its retries out instead of hammering the engine
+    /// every tick for as long as the document stays unsaveable.
+    last_attempt: Option<Instant>,
     /// When the idle external-change probe last ran (Task 7).
     #[allow(dead_code, reason = "the idle probe in Task 7 reads and sets it")]
     last_probe: Option<Instant>,
@@ -284,6 +358,7 @@ impl CollabSession {
         engine: Arc<Engine>,
         key: (String, String),
         epoch: String,
+        registry: Weak<CollabSessions>,
     ) -> Result<Arc<CollabSession>, JoinError> {
         let loaded = engine
             .engram_text(&key.0, &key.1)
@@ -307,7 +382,9 @@ impl CollabSession {
         let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         Ok(Arc::new(CollabSession {
             epoch,
-            key,
+            domain: key.0,
+            key_permalink: std::sync::Mutex::new(key.1),
+            registry,
             engine,
             tx,
             disposed: AtomicBool::new(false),
@@ -323,6 +400,7 @@ impl CollabSession {
                 last_edit: None,
                 oldest_unsaved: None,
                 flush_requested: false,
+                last_attempt: None,
                 last_probe: None,
                 save_state: SaveStateTag::Ok,
             }),
@@ -524,21 +602,45 @@ impl CollabSession {
         self.disposed.store(true, Ordering::Relaxed);
     }
 
+    /// The registry key this room is filed under right now: `(domain,
+    /// permalink)`, with the permalink a frontmatter rename may have moved.
+    pub fn key(&self) -> (String, String) {
+        (
+            self.domain.clone(),
+            self.key_permalink.lock().expect("key mutex").clone(),
+        )
+    }
+
+    /// Record the permalink the registry just re-filed this room under.
+    fn adopt_key(&self, permalink: &str) {
+        *self.key_permalink.lock().expect("key mutex") = permalink.to_string();
+    }
+
     /// One saver pass at `now`: decides whether a save is due and runs it.
     /// Takes `now` so tests drive time synthetically instead of sleeping.
     pub async fn tick_save(&self, now: Instant) {
+        let renamed = self.due_save(now).await;
+        // The session guard is dropped by now: the rename move takes the
+        // registry lock, and the lock order is registry -> session.
+        self.adopt_rename(renamed).await;
+    }
+
+    /// The saver pass itself, over the locked state. Returns the permalink a
+    /// frontmatter rename moved this engram to, for the caller to re-key
+    /// outside the guard.
+    async fn due_save(&self, now: Instant) -> Option<String> {
         if self.is_disposed() {
-            return;
+            return None;
         }
         let mut state = self.state.lock().await;
         if matches!(state.save_state, SaveStateTag::Conflict) {
-            return; // saving is suspended until the room resolves (Task 7)
+            return None; // saving is suspended until the room resolves (Task 7)
         }
         if !state.flush_requested && !state.dirty && state.oldest_unsaved.is_none() {
             // Nothing has arrived at all since the last save, so there is
             // nothing to render or compare. A cheap pre-filter that keeps an
             // idle room free, NOT the debounce: that gates on the text below.
-            return; // Task 7 adds the idle external-change probe here
+            return None; // Task 7 adds the idle external-change probe here
         }
         let elapsed = |since: Option<Instant>, ms: u64| {
             since.is_some_and(|at| now.saturating_duration_since(at).as_millis() as u64 >= ms)
@@ -554,7 +656,7 @@ impl CollabSession {
             || (changed && elapsed(state.oldest_unsaved, SAVE_MAX_LAG_MS));
         if !due {
             if changed {
-                return; // the windows are still open; keep typing
+                return None; // the windows are still open; keep typing
             }
             // Nothing effective is pending: disarm what a no-op update set, so
             // the next real edit starts both timers from scratch.
@@ -562,25 +664,55 @@ impl CollabSession {
             state.last_edit = None;
             state.oldest_unsaved = None;
             if matches!(state.save_state, SaveStateTag::Ok) {
-                return; // Task 7 adds the idle external-change probe here
+                return None; // Task 7 adds the idle external-change probe here
             }
             // A save-blocked session whose text matches the file again has
             // nothing left to warn about: fall through so the state heals.
+        } else if !state.flush_requested
+            && matches!(state.save_state, SaveStateTag::Failed)
+            && !elapsed(state.last_attempt, SAVE_DEBOUNCE_MS)
+        {
+            // A refused save must not become a hot loop: the edit timers stay
+            // armed while the document is unsaveable, so without this every
+            // tick would render the document and call the engine again for as
+            // long as the author leaves it broken. Retries are spaced one
+            // debounce window apart - and an explicit Flush skips the wait, so
+            // the Save button always retries at once.
+            return None;
         }
-        self.save_locked(&mut state).await;
+        self.save_locked(&mut state, now).await
     }
 
     /// The last participant left, or the daemon is shutting the session down:
     /// land whatever is unsaved, unconditionally due.
     pub async fn final_save(&self) {
+        let renamed = self.last_save().await;
+        self.adopt_rename(renamed).await;
+    }
+
+    /// [`CollabSession::final_save`] over the locked state; see
+    /// [`CollabSession::due_save`] for why the rename travels outward.
+    async fn last_save(&self) -> Option<String> {
         if self.is_disposed() {
-            return; // a disposed or poisoned room never writes again
+            return None; // a disposed or poisoned room never writes again
         }
         let mut state = self.state.lock().await;
         if matches!(state.save_state, SaveStateTag::Conflict) {
-            return; // an unresolved conflict never saves; drafts hold the text
+            return None; // an unresolved conflict never saves; drafts hold the text
         }
-        self.save_locked(&mut state).await;
+        // The last chance to land this text, so no retry backoff applies.
+        self.save_locked(&mut state, Instant::now()).await
+    }
+
+    /// Move the registry entry after a rename, holding no session guard.
+    async fn adopt_rename(&self, renamed: Option<String>) {
+        let Some(permalink) = renamed else {
+            return;
+        };
+        let Some(registry) = self.registry.upgrade() else {
+            return; // the daemon dropped the registry; nothing left to move
+        };
+        registry.rekey(&self.key(), &permalink, &self.epoch).await;
     }
 
     /// A panic below yrs killed a saver pass (y-crdt/y-crdt#386): close the
@@ -597,13 +729,16 @@ impl CollabSession {
         });
     }
 
-    /// One save attempt over the locked state. Holding the lock across the
-    /// engine call serializes edits against the save, so the text that lands
-    /// is exactly the text recorded as saved; sessions are small and a save is
-    /// milliseconds, so simplicity wins over concurrency here.
-    async fn save_locked(&self, state: &mut SessionState) {
+    /// One save attempt over the locked state, at `now`. Holding the lock
+    /// across the engine call serializes edits against the save, so the text
+    /// that lands is exactly the text recorded as saved; sessions are small
+    /// and a save is milliseconds, so simplicity wins over concurrency here.
+    ///
+    /// Returns the permalink the receipt reports when a frontmatter rename
+    /// moved it: the caller re-keys the registry once the guard is gone.
+    async fn save_locked(&self, state: &mut SessionState, now: Instant) -> Option<String> {
         if self.is_disposed() {
-            return; // disposed or poisoned: this session is done writing
+            return None; // disposed or poisoned: this session is done writing
         }
         let file = Self::file_text_locked(state);
         state.flush_requested = false;
@@ -623,12 +758,13 @@ impl CollabSession {
                     })),
                 });
             }
-            return;
+            return None;
         }
+        state.last_attempt = Some(now);
         let receipt = self
             .engine
             .save_engram(&crate::params::SaveParams {
-                domain: self.key.0.clone(),
+                domain: self.domain.clone(),
                 identifier: state.permalink.clone(),
                 content: file.clone(),
                 expected_checksum: state.checksum.clone(),
@@ -644,12 +780,19 @@ impl CollabSession {
                     .as_str()
                     .unwrap_or(&state.permalink)
                     .to_string();
+                let renamed = (permalink != state.permalink).then(|| permalink.clone());
                 // Checksum and text move together: the checksum is the CAS
                 // token for exactly this text, and it is also what a
                 // reconnecting client is greeted with.
                 state.checksum = checksum.clone();
                 state.last_saved_text = file;
                 state.permalink = permalink.clone();
+                // The path a rename can move too (the receipt is the authority
+                // on where the engram now lives), so Task 7's idle probe never
+                // stats a dead path.
+                if let Some(path) = receipt["path"].as_str() {
+                    state.path = path.to_string();
+                }
                 state.dirty = false;
                 state.oldest_unsaved = None;
                 state.save_state = SaveStateTag::Ok;
@@ -660,6 +803,7 @@ impl CollabSession {
                         permalink,
                     })),
                 });
+                return renamed;
             }
             Err(err) => {
                 // Task 7 takes the Conflict("stale edit") and NotFound arms to
@@ -675,10 +819,11 @@ impl CollabSession {
                         })),
                     });
                 }
-                tracing::debug!(domain = %self.key.0, permalink = %state.permalink, %detail, "a session save was refused");
+                tracing::debug!(domain = %self.domain, permalink = %state.permalink, %detail, "a session save was refused");
                 state.save_state = SaveStateTag::Failed;
             }
         }
+        None
     }
 }
 

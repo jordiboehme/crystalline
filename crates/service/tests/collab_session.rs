@@ -379,7 +379,7 @@ async fn the_last_leave_disposes_the_session() {
     assert_eq!(sessions.session_count().await, 1);
     let last = joined.session.remove_conn(joined.conn).await;
     assert!(last);
-    sessions.dispose_if_empty("eng", "alpha").await;
+    sessions.dispose_if_empty(&joined.session).await;
     assert_eq!(sessions.session_count().await, 0);
     // A fresh join is a fresh epoch: the restart-detection signal.
     let again = sessions.join("eng", "alpha").await.unwrap();
@@ -399,6 +399,6 @@ async fn a_populated_session_survives_dispose_if_empty() {
 
     let last = alice.session.remove_conn(alice.conn).await;
     assert!(!last, "bob is still connected");
-    sessions.dispose_if_empty("eng", "alpha").await;
+    sessions.dispose_if_empty(&alice.session).await;
     assert_eq!(sessions.session_count().await, 1, "bob keeps it alive");
 }
