@@ -61,7 +61,16 @@ serde_json = "1.0.151"
 indexmap = "2.14.0"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json"] }
 fs4 = "1.1.0"
-axum = "0.8.9"
+axum = { version = "0.8.9", features = ["ws"] }
+# The yrs `sync` feature makes observer callbacks Send + Sync for the
+# multi-threaded server; the `yrs::sync` protocol module itself is
+# unconditional. Wire format pinned in crates/service/tests/collab_wire.rs.
+yrs = { version = "0.27.3", features = ["sync"] }
+# Text diffing for collaborative merge conflict surfacing (crates/service).
+similar = "3.1.2"
+# Dev-only: a WebSocket client to drive the collab session tests against the
+# real server socket.
+tokio-tungstenite = "0.30.0"
 # Only the cookie extractor is used (session and CSRF handling in the REST
 # auth layer); default features pull in tracing for unrelated extractors.
 axum-extra = { version = "0.12.6", default-features = false, features = ["cookie"] }
