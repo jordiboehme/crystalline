@@ -26,6 +26,7 @@ import {
   resetPassword,
 } from "../api/users";
 import { useAuth } from "../auth/AuthContext";
+import { BUTTON } from "../components/primitives";
 import { formatDay } from "../format";
 import NotFound from "./NotFound";
 
@@ -38,14 +39,32 @@ interface Notice {
   text: string;
 }
 
-const FIELD_CLASSES =
-  "rounded border border-slate-300 bg-white px-2 py-1 text-sm outline-none focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 dark:border-slate-700 dark:bg-slate-900";
+/**
+ * One height for every control on a row, and for the cells that are not
+ * controls at all.
+ *
+ * A row here is a login name, an input, a select, a word and a handful of
+ * buttons, and left to themselves the browser gives each of those a different
+ * height. `h-8` is what the rest of the app's controls stand at (`IconButton`,
+ * the filter bars), so a row reads as one line rather than as six things that
+ * happen to be next to each other.
+ */
+const CONTROL_HEIGHT = "h-8";
 
-const BUTTON_CLASSES =
-  "rounded border border-slate-300 px-2 py-1 text-sm hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-50 dark:border-slate-700 dark:hover:bg-slate-800";
+const FIELD_CLASSES = `${CONTROL_HEIGHT} rounded border border-slate-300 bg-white px-2 text-sm outline-none focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 dark:border-slate-700 dark:bg-slate-900`;
 
-const DANGER_CLASSES =
-  "rounded border border-red-300 px-2 py-1 text-sm text-red-800 hover:bg-red-50 focus-visible:ring-2 focus-visible:ring-red-500 focus-visible:outline-none dark:border-red-900 dark:text-red-200 dark:hover:bg-red-950";
+/**
+ * The row's own buttons, from the shared tiers rather than hand-rolled here.
+ *
+ * Secondary throughout: every one of them acts on the account whose row it
+ * sits on, and none of them is the thing an admin came to this screen to do -
+ * that is "Add user" at the bottom, which is the only primary on the screen.
+ * The disabled Save reads as waiting for a change rather than as broken,
+ * because the tier says so in the same words everywhere else in the app.
+ */
+const ROW_BUTTON = `${CONTROL_HEIGHT} ${BUTTON.secondary}`;
+
+const DANGER_BUTTON = `${CONTROL_HEIGHT} ${BUTTON.destructive}`;
 
 export default function UsersAdmin() {
   const { capabilities } = useAuth();
@@ -176,7 +195,12 @@ function UsersPanel() {
             <caption className="sr-only">
               Every account on this instance
             </caption>
-            <thead className="text-xs tracking-wide text-slate-500 uppercase dark:text-slate-400">
+            {/*
+              Sentence case: these are six short words a reader glances at
+              once, and setting them in capitals made the quietest row on the
+              screen the loudest thing on it.
+            */}
+            <thead className="text-caption font-semibold text-slate-500 dark:text-slate-400">
               <tr>
                 <th scope="col" className="px-2 py-2">
                   Name
@@ -270,8 +294,16 @@ function AccountRow({
         what every control in the row is about, and marking it up as one is
         what lets a screen reader say whose row a bare "Reset password" is on.
       */}
-      <th scope="row" className="px-2 py-2 font-mono font-normal">
-        {account.name}
+      <th scope="row" className="px-2 py-2 font-normal">
+        {/*
+          Not a control, and still on the row's one line: the login name is
+          what every control beside it is about, so it stands at their height
+          rather than at the top of the cell. The mono face stays - a login
+          name is an identifier, and this column is a column of them.
+        */}
+        <span className={`flex ${CONTROL_HEIGHT} items-center font-mono`}>
+          {account.name}
+        </span>
       </th>
 
       <td className="px-2 py-2">
@@ -297,7 +329,7 @@ function AccountRow({
             type="submit"
             aria-label={`Save display for ${account.name}`}
             disabled={display === account.display}
-            className={BUTTON_CLASSES}
+            className={ROW_BUTTON}
           >
             Save
           </button>
@@ -325,7 +357,7 @@ function AccountRow({
       </td>
 
       <td className="px-2 py-2">
-        <div className="flex items-center gap-2">
+        <div className={`flex ${CONTROL_HEIGHT} items-center gap-2`}>
           <span>{account.disabled ? "Disabled" : "Active"}</span>
           {/*
             Not offered on the caller's own row. The server refuses it anyway;
@@ -339,7 +371,7 @@ function AccountRow({
               onClick={() => {
                 onPatch({ disabled: !account.disabled });
               }}
-              className={BUTTON_CLASSES}
+              className={ROW_BUTTON}
             >
               {account.disabled ? "Reactivate" : "Deactivate"}
             </button>
@@ -348,11 +380,13 @@ function AccountRow({
       </td>
 
       <td className="px-2 py-2 tabular-nums">
-        {lastSeen === null ? (
-          <span className="text-slate-500 dark:text-slate-400">Never</span>
-        ) : (
-          formatDay(lastSeen)
-        )}
+        <span className={`flex ${CONTROL_HEIGHT} items-center`}>
+          {lastSeen === null ? (
+            <span className="text-slate-500 dark:text-slate-400">Never</span>
+          ) : (
+            formatDay(lastSeen)
+          )}
+        </span>
       </td>
 
       <td className="px-2 py-2">
@@ -385,7 +419,7 @@ function AccountRow({
               <button
                 type="submit"
                 aria-label={`Set password for ${account.name}`}
-                className={BUTTON_CLASSES}
+                className={ROW_BUTTON}
               >
                 Set
               </button>
@@ -396,7 +430,7 @@ function AccountRow({
                   setPassword("");
                   setResetting(false);
                 }}
-                className={BUTTON_CLASSES}
+                className={ROW_BUTTON}
               >
                 Cancel
               </button>
@@ -414,7 +448,7 @@ function AccountRow({
               onClick={() => {
                 setResetting(true);
               }}
-              className={BUTTON_CLASSES}
+              className={ROW_BUTTON}
             >
               Reset password
             </button>
@@ -456,7 +490,7 @@ function AccountRow({
               onClick={() => {
                 setConfirming(true);
               }}
-              className={DANGER_CLASSES}
+              className={DANGER_BUTTON}
             >
               Delete
             </button>
@@ -470,7 +504,7 @@ function AccountRow({
                     setConfirming(false);
                     onDelete();
                   }}
-                  className={DANGER_CLASSES}
+                  className={DANGER_BUTTON}
                 >
                   Confirm delete
                 </button>
@@ -478,7 +512,7 @@ function AccountRow({
                   type="button"
                   aria-label={`Keep ${account.name}`}
                   onClick={abandonDelete}
-                  className={BUTTON_CLASSES}
+                  className={ROW_BUTTON}
                 >
                   Keep
                 </button>
@@ -591,7 +625,7 @@ function CreateForm({
             htmlFor={roleField}
             className="text-xs text-slate-500 dark:text-slate-400"
           >
-            Role for the new account
+            Role
           </label>
           <select
             id={roleField}
@@ -629,10 +663,14 @@ function CreateForm({
           />
         </div>
 
+        {/*
+          The one primary on the screen, in the app's own accent rather than
+          the stray blue this was written in before the tiers existed.
+        */}
         <button
           type="submit"
           disabled={pending}
-          className="rounded bg-sky-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-sky-500 focus-visible:ring-2 focus-visible:ring-sky-400 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-60"
+          className={`${CONTROL_HEIGHT} ${BUTTON.primary}`}
         >
           Add user
         </button>

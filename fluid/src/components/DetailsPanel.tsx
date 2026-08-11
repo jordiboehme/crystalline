@@ -148,7 +148,6 @@ function CopyAddress({ address }: { address: string }) {
       <IconButton
         label="Copy address"
         icon={Copy}
-        className="h-6 w-6"
         onClick={() => {
           void (async () => {
             try {

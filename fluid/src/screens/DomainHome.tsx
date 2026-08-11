@@ -237,6 +237,16 @@ export default function DomainHome() {
             queryKey={["folder-engrams", domain, path]}
             loadPage={() => Promise.resolve(singlePage(folderRows))}
             label={`Engrams in ${domain}`}
+            // The count this list would draw on its own is "4 of 4 shown",
+            // which is a tautology here - the folder arrives in one page, so
+            // shown is always the total - and reads as a contradiction of the
+            // "5 engrams" under the domain's name, which counts the whole
+            // domain. Naming the scope is what settles it.
+            summary={(page) => (
+              <p className="text-caption pb-2 text-slate-500 tabular-nums dark:text-slate-400">
+                {plural(page.total, "engram", "engrams")} in this folder
+              </p>
+            )}
             emptyMessage={
               path === ""
                 ? "This domain has no engrams yet."
@@ -437,7 +447,10 @@ function FilterBar({
   }) => void;
 }) {
   return (
-    <div className="flex flex-col gap-3">
+    // Set off from the folder row above it: browsing and filtering are two
+    // ways of asking, and stacked flush they read as one dense block of small
+    // grey labels, which is worst in dark.
+    <div className="mt-4 flex flex-col gap-3">
       <FilterFields
         type={filters.type}
         status={filters.status}

@@ -95,6 +95,14 @@ function clearOfFoldedFrontmatter(view: EditorView): boolean {
  *
  * Every marker this is used with is one character repeated, which is what
  * makes "one longer" spellable as the marker plus that character.
+ *
+ * The price of that rule, accepted rather than overlooked: inside `***hello***`
+ * neither italic nor bold unwraps. The run on each side is three characters
+ * long, no exact-length match is found, and the command nests instead, so the
+ * text becomes `****hello****` - additive junk markup rather than the removal
+ * that was asked for. Attributing that third character to one of the two
+ * emphases is a guess this refuses to make, because guessing wrong strips the
+ * emphasis a writer did not touch, and the cost of refusing is one undo.
  */
 function wrappedIn(
   state: EditorState,

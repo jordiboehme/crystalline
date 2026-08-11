@@ -13,8 +13,8 @@
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Dialog } from "radix-ui";
-import type { ReactElement } from "react";
-import { useState } from "react";
+import type { ReactElement, ReactNode } from "react";
+import { useId, useState } from "react";
 import { useNavigate } from "react-router";
 
 import { problemDetail } from "../api/client";
@@ -25,9 +25,48 @@ import { createEngram } from "../api/writes";
 import { SUGGESTED_STATUSES, SUGGESTED_TYPES } from "../filters";
 import { editRoute } from "../paths";
 import type { CreateEngramDialogProps } from "./CreateEngramDialog";
+import { BUTTON } from "./primitives";
 
 const FIELD_CLASSES =
   "w-full rounded border border-slate-300 bg-transparent px-2 py-1 text-sm focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:border-slate-700";
+
+/**
+ * One labelled field, with what the field is called kept apart from what is
+ * worth knowing about it.
+ *
+ * The parenthetical the labels used to carry - "Tags (optional, comma
+ * separated)" - was help wearing a label's clothes: it made the name a reader
+ * hears longer than the thing it names, and it made every label a different
+ * length for no reason a reader could see. The helper is a description
+ * instead, tied on with `aria-describedby`, so the name stays the word and the
+ * advice still reaches a screen reader - after the name rather than inside it.
+ */
+function Field({
+  id,
+  label,
+  helper,
+  children,
+}: {
+  id: string;
+  label: string;
+  helper?: string;
+  children: ReactNode;
+}): ReactElement {
+  return (
+    <div className="flex flex-col gap-1 text-sm">
+      <label htmlFor={id}>{label}</label>
+      {helper !== undefined && (
+        <p
+          id={`${id}-help`}
+          className="text-caption text-slate-500 dark:text-slate-400"
+        >
+          {helper}
+        </p>
+      )}
+      {children}
+    </div>
+  );
+}
 
 export default function CreateEngramDialogBody({
   domain,
@@ -35,6 +74,10 @@ export default function CreateEngramDialogBody({
   onClose,
 }: CreateEngramDialogProps): ReactElement {
   const navigate = useNavigate();
+  const titleField = useId();
+  const tagsField = useId();
+  const typeField = useId();
+  const statusField = useId();
   const queryClient = useQueryClient();
   const [title, setTitle] = useState("");
   const [folder, setFolder] = useState(initialFolder);
@@ -118,9 +161,9 @@ export default function CreateEngramDialogBody({
                 {problem}
               </p>
             )}
-            <label className="flex flex-col gap-1 text-sm">
-              <span>Title</span>
+            <Field id={titleField} label="Title">
               <input
+                id={titleField}
                 className={FIELD_CLASSES}
                 value={title}
                 onChange={(event) => {
@@ -129,15 +172,20 @@ export default function CreateEngramDialogBody({
                 // The first field a fresh dialog wants filled.
                 autoFocus
               />
-            </label>
+            </Field>
             <FolderPicker
               domain={domain}
               chosen={folder}
               onChoose={setFolder}
             />
-            <label className="flex flex-col gap-1 text-sm">
-              <span>Tags (optional, comma separated)</span>
+            <Field
+              id={tagsField}
+              label="Tags"
+              helper="Optional, comma separated."
+            >
               <input
+                id={tagsField}
+                aria-describedby={`${tagsField}-help`}
                 className={FIELD_CLASSES}
                 list="create-tags"
                 value={tags}
@@ -151,10 +199,15 @@ export default function CreateEngramDialogBody({
                   <option key={tag.name} value={tag.name} />
                 ))}
               </datalist>
-            </label>
-            <label className="flex flex-col gap-1 text-sm">
-              <span>Type (suggestions, free form)</span>
+            </Field>
+            <Field
+              id={typeField}
+              label="Type"
+              helper="Suggestions; any value is allowed."
+            >
               <input
+                id={typeField}
+                aria-describedby={`${typeField}-help`}
                 className={FIELD_CLASSES}
                 list="create-types"
                 value={engramType}
@@ -168,10 +221,17 @@ export default function CreateEngramDialogBody({
                   <option key={name} value={name} />
                 ))}
               </datalist>
-            </label>
-            <label className="flex flex-col gap-1 text-sm">
-              <span>Status (suggestions, free form)</span>
+            </Field>
+            {/* The same treatment as Type, because it is the same kind of
+                field: a free-form value with a list of usual ones beside it. */}
+            <Field
+              id={statusField}
+              label="Status"
+              helper="Suggestions; any value is allowed."
+            >
               <input
+                id={statusField}
+                aria-describedby={`${statusField}-help`}
                 className={FIELD_CLASSES}
                 list="create-statuses"
                 value={status}
@@ -185,19 +245,25 @@ export default function CreateEngramDialogBody({
                   <option key={name} value={name} />
                 ))}
               </datalist>
-            </label>
+            </Field>
             <div className="flex justify-end gap-2">
               <button
                 type="button"
                 onClick={onClose}
-                className="rounded border border-slate-300 px-3 py-1 text-sm hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800"
+                className={BUTTON.secondary}
               >
                 Cancel
               </button>
+              {/*
+                The primary tier, which is also what makes the wait for a title
+                legible: its disabled face is a filled button gone grey rather
+                than an outline at half opacity, so a Create that cannot run
+                yet reads as waiting rather than as broken.
+              */}
               <button
                 type="submit"
                 disabled={title.trim() === "" || create.isPending}
-                className="rounded border border-slate-300 px-3 py-1 text-sm hover:bg-slate-100 disabled:opacity-50 dark:border-slate-700 dark:hover:bg-slate-800"
+                className={BUTTON.primary}
               >
                 Create
               </button>
@@ -235,7 +301,9 @@ function FolderPicker({
             onChoose("");
           }}
         />
-        <span className="font-mono text-xs">(root)</span>
+        {/* The proportional face the other options wear: this is one choice
+            in a list of folder names, not a path being quoted. */}
+        <span>(root)</span>
       </label>
       <PickerBranch
         domain={domain}

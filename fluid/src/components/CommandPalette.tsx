@@ -31,6 +31,14 @@
 
 import { useQuery } from "@tanstack/react-query";
 import { Command } from "cmdk";
+import {
+  Compass,
+  FileText,
+  Library,
+  Search,
+  Command as Shortcut,
+} from "lucide-react";
+import type { LucideIcon } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router";
 
@@ -71,6 +79,27 @@ const HEADING_CLASSES =
 /** One group heading, drawn the same way wherever it appears. */
 function Heading({ children }: { children: string }) {
   return <span className={HEADING_CLASSES}>{children}</span>;
+}
+
+/**
+ * The glyph on a row, which says what kind of thing the row is.
+ *
+ * Decorative, and deliberately so: the group heading above already names the
+ * kind in words, so this is the same fact for the eye scanning a mixed list
+ * rather than a fact only the eye gets. The row's accessible name is its text,
+ * unchanged. `self-center` opts the icon out of the row's baseline, which is
+ * set for text of two sizes and would hang a square glyph off the bottom of
+ * it.
+ */
+function Glyph({ icon: Icon }: { icon: LucideIcon }) {
+  return (
+    <Icon
+      aria-hidden="true"
+      size={16}
+      strokeWidth={1.75}
+      className="shrink-0 self-center text-slate-500 dark:text-slate-400"
+    />
+  );
 }
 
 /** What one row is called, which is how the highlight keeps track of it. */
@@ -271,7 +300,9 @@ export function CommandPalette() {
       onValueChange={(value) => {
         setChoice({ top, value });
       }}
-      overlayClassName="fixed inset-0 z-50 bg-slate-900/40"
+      // Behind the panel rather than level with it, and darker in dark: a
+      // palette that floats over the screen has to look like it does.
+      overlayClassName="fixed inset-0 z-40 bg-slate-950/25 dark:bg-slate-950/50"
       contentClassName="fixed top-24 left-1/2 z-50 w-[min(36rem,calc(100vw-2rem))] -translate-x-1/2 overflow-hidden rounded border border-slate-200 bg-white shadow-xl dark:border-slate-700 dark:bg-slate-900"
     >
       <Command.Input
@@ -303,6 +334,7 @@ export function CommandPalette() {
                 }}
                 className={ROW_CLASSES}
               >
+                <Glyph icon={Shortcut} />
                 <span className="truncate">{command.title}</span>
               </Command.Item>
             ))}
@@ -320,6 +352,7 @@ export function CommandPalette() {
                 }}
                 className={ROW_CLASSES}
               >
+                <Glyph icon={Library} />
                 <span className="truncate">{domain.name}</span>
                 {domain.engrams !== null && (
                   <span className="text-xs text-slate-500 tabular-nums dark:text-slate-400">
@@ -348,6 +381,7 @@ export function CommandPalette() {
                   isRetired(hit.status) ? RETIRED_CLASS : ""
                 }`}
               >
+                <Glyph icon={FileText} />
                 <span className="truncate">{hit.title}</span>
                 {/*
                   And the word itself, only where it changes what the row
@@ -377,6 +411,7 @@ export function CommandPalette() {
               }}
               className={ROW_CLASSES}
             >
+              <Glyph icon={Search} />
               <span className="truncate">Search for {`"${typed}"`}</span>
               <span className="text-xs text-slate-500 dark:text-slate-400">
                 titles and text
@@ -402,6 +437,7 @@ export function CommandPalette() {
                 }}
                 className={ROW_CLASSES}
               >
+                <Glyph icon={Compass} />
                 <span className="truncate">{command.title}</span>
               </Command.Item>
             ))}

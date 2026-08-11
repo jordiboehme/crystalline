@@ -78,6 +78,15 @@ describe("DetailsPanel", () => {
     expect(screen.getByRole("region", { name: "Details" })).toBeInTheDocument();
   });
 
+  test("a salience of zero is a field the engram carries", () => {
+    // Zero is a written salience, not a missing one: the row is drawn only
+    // where the engram states the field, and the check that decides it has to
+    // be about absence rather than about truthiness.
+    draw({ salience: 0 });
+    expect(screen.getByText("Salience")).toBeInTheDocument();
+    expect(screen.getByText("0")).toBeInTheDocument();
+  });
+
   test("the address is shown and copiable", () => {
     draw();
     expect(

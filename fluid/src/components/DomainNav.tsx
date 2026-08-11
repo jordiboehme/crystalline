@@ -86,7 +86,10 @@ export function DomainNav({
       <Link
         to={manifestRoute(domain)}
         aria-current={onManifest ? "page" : undefined}
-        className={`block truncate rounded px-2 py-1.5 text-sm hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:hover:bg-slate-800 ${
+        // The tree rows' own padding, to the half unit: "drawn as an ordinary
+        // row" is the rule above, and a row a shade taller than the ones under
+        // it is precisely the second treatment that rule turns down.
+        className={`block truncate rounded px-2 py-1 text-sm hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:hover:bg-slate-800 ${
           onManifest ? "bg-slate-100 font-medium dark:bg-slate-800" : ""
         }`}
       >
@@ -244,9 +247,13 @@ function TreeBranch({
   if (folders.length === 0 && engrams.length === 0) {
     return (
       <p className="px-2 py-1 text-sm text-slate-500 dark:text-slate-400">
-        {path === ""
-          ? "This domain has no engrams yet. New engram starts the first."
-          : "Nothing in here."}
+        {/*
+          One sentence, and no instruction attached to it: the launcher the
+          second half used to name is drawn only while an engram is open (see
+          below), so on the domain's own home screen - which is exactly where
+          an empty tree is read - it pointed at a control that was not there.
+        */}
+        {path === "" ? "This domain has no engrams yet." : "Nothing in here."}
       </p>
     );
   }

@@ -164,7 +164,10 @@ function EditorSurface({
     <div className="flex flex-col gap-4">
       <header className="flex flex-wrap items-baseline justify-between gap-3">
         <div className="flex flex-wrap items-baseline gap-3">
-          <h1 className="text-xl font-semibold">Editing {domain} MANIFEST</h1>
+          {/* The engram editor's own heading scale: the two editors are one
+              screen with two subjects, and a heading that changed size
+              between them would say they were different places. */}
+          <h1 className="text-title">Editing {domain} MANIFEST</h1>
         </div>
         <div className="flex items-center gap-2">
           {session.notice && (

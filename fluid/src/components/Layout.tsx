@@ -30,7 +30,13 @@ import {
   Sun,
   Users as UsersIcon,
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import type { RefObject } from "react";
 import { DropdownMenu } from "radix-ui";
 import {
@@ -89,9 +95,56 @@ function storedRail(): boolean {
   }
 }
 
+/** Tailwind's `md`, which is where the sidebar stops being a drawer. */
+const WIDE_QUERY = "(min-width: 48rem)";
+
+/** Whether there is a column beside the reading surface at all. */
+function wideNow(): boolean {
+  // An environment with no media queries to ask - jsdom, an old embedded view -
+  // is answered the way the stylesheet's own default answers it, which is the
+  // desktop frame; below `md` the sheet takes the sidebar over anyway.
+  return (
+    typeof window.matchMedia !== "function" ||
+    window.matchMedia(WIDE_QUERY).matches
+  );
+}
+
+/**
+ * Whether the frame is wide enough to have a sidebar rather than a drawer.
+ *
+ * The rail is a choice about a column that only exists from `md` up. Below it
+ * the sidebar is a drawer the top bar opens over the screen, and a stored rail
+ * applied there would be three faults at once: a three-rem strip of icons
+ * where a full-width drawer belongs, a way out of it that the stylesheet hides
+ * (`hidden md:inline-flex`) so the keyboard handoff lands on nothing, and two
+ * disclosures of one sidebar disagreeing about whether it is open. Gating the
+ * rail on the same breakpoint the stylesheet uses closes all three, because
+ * below it there is only ever the expanded drawer.
+ */
+function useWide(): boolean {
+  // Subscribed rather than held in state: the width of the window is somebody
+  // else's value, and React reads it on every render it does, so a window
+  // resized between a render and the effect that would have caught it cannot
+  // leave a stale answer behind.
+  return useSyncExternalStore(subscribeWide, wideNow);
+}
+
+/** Watch the breakpoint, where there is anything to watch it with. */
+function subscribeWide(onChange: () => void): () => void {
+  if (typeof window.matchMedia !== "function") {
+    return () => undefined;
+  }
+  const query = window.matchMedia(WIDE_QUERY);
+  query.addEventListener("change", onChange);
+  return () => {
+    query.removeEventListener("change", onChange);
+  };
+}
+
 export function Layout() {
   const [navOpen, setNavOpen] = useState(false);
   const [rail, setRail] = useState(storedRail);
+  const wide = useWide();
   const [helpOpen, setHelpOpen] = useState(false);
   const mainRef = useRef<HTMLElement | null>(null);
 
@@ -160,7 +213,15 @@ export function Layout() {
         }}
       />
       <div className="mx-auto flex w-full max-w-350 gap-6 px-4 py-6">
-        <DomainSidebar open={navOpen} rail={rail} onToggleRail={toggleRail} />
+        {/*
+          The stored width only reaches the sidebar where there is a sidebar to
+          apply it to: below `md` this is a drawer, and it is always expanded.
+        */}
+        <DomainSidebar
+          open={navOpen}
+          rail={rail && wide}
+          onToggleRail={toggleRail}
+        />
         <main
           ref={mainRef}
           tabIndex={-1}
@@ -664,7 +725,7 @@ function DomainLink({ domain }: { domain: DomainSummary }) {
     <NavLink
       to={domainRoute(domain.name)}
       className={({ isActive }) =>
-        `flex items-baseline justify-between gap-2 rounded px-2 py-1.5 text-sm hover:bg-slate-100 dark:hover:bg-slate-800 ${
+        `flex items-baseline justify-between gap-2 rounded px-2 py-1.5 text-sm hover:bg-slate-100 dark:hover:bg-slate-800 ${FOCUS_RING} ${
           isActive ? "bg-slate-100 font-medium dark:bg-slate-800" : ""
         }`
       }

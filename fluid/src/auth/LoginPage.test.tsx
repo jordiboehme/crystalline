@@ -46,6 +46,17 @@ beforeEach(() => {
 });
 
 describe("the login screen", () => {
+  it("introduces the app here, and nowhere else", async () => {
+    serve({ "/auth/me": () => meResponse() });
+
+    renderApp("/login");
+
+    // The way in is where the app gets to say what it is for; every screen
+    // after it belongs to the reader's own work. `Home.test` holds the other
+    // half of this: the same line must not reappear there.
+    expect(await screen.findByText(/think as one/)).toBeVisible();
+  });
+
   it("shows the server's own words when the credentials are refused", async () => {
     serve({
       "/auth/me": () => meResponse(),

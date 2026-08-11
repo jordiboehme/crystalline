@@ -168,10 +168,35 @@ function requested(): string[] {
   return apiMock.mock.calls.map((call) => call[0]);
 }
 
+/**
+ * A window narrower than the medium breakpoint.
+ *
+ * jsdom answers no media queries at all - it ships no `matchMedia` - so a
+ * frame asking about the viewport is told, by default, that it is on the wide
+ * side, and a test that wants a phone says so by installing an API that
+ * answers no to everything: narrow, and light while it is at it, which is what
+ * the theme provider asks the same call.
+ */
+function stubNarrowWindow() {
+  // On `window` itself rather than through `vi.stubGlobal`: this environment
+  // keeps jsdom's window beside the Node globals rather than as them (see
+  // `test/setup.ts`), and the frame asks `window`.
+  Object.defineProperty(window, "matchMedia", {
+    configurable: true,
+    value: (query: string) => ({
+      matches: false,
+      media: query,
+      addEventListener: () => undefined,
+      removeEventListener: () => undefined,
+    }),
+  });
+}
+
 beforeEach(() => {
   apiMock.mockReset();
   setCsrfTokenMock.mockReset();
   document.documentElement.removeAttribute("data-theme");
+  Reflect.deleteProperty(window, "matchMedia");
   // The sidebar's own width is remembered across sessions, so each test
   // starts from a browser that has never been told anything.
   localStorage.clear();
@@ -617,6 +642,34 @@ describe("the sidebar's own width", () => {
     expect(
       screen.queryByRole("button", { name: "Collapse the sidebar" }),
     ).toBeNull();
+  });
+
+  it("ignores a stored rail below the medium breakpoint", async () => {
+    // The stored width is a choice about a column beside the reading surface,
+    // and below `md` there is no such column: the sidebar is a drawer the top
+    // bar opens over the screen. A rail applied there would hand a phone a
+    // three-rem strip of icons, put the way out of it behind a control the
+    // stylesheet hides, and leave the two disclosures of one sidebar saying
+    // different things about whether it is open.
+    localStorage.setItem("fluid.nav", "rail");
+    stubNarrowWindow();
+    serveSignedIn();
+
+    renderApp("/");
+
+    const nav = await screen.findByRole("navigation", { name: "Domains" });
+    expect(
+      await within(nav).findByRole("link", { name: /^eng/ }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Expand the sidebar" }),
+    ).toBeNull();
+    // And the one control a narrow window does offer says what the drawer is
+    // doing, with nothing beside it to contradict it.
+    expect(screen.getByRole("button", { name: "Domains" })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
   });
 
   it("survives a move to another screen", async () => {
