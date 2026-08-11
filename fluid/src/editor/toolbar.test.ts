@@ -15,6 +15,7 @@ import { yCollab } from "y-codemirror.next";
 import { Awareness } from "y-protocols/awareness";
 import * as Y from "yjs";
 
+import { frontmatterFold, unfoldEffect } from "./frontmatterFold";
 import { baseExtensions, docText, lineSeparatorFor } from "./setup";
 import {
   MERMAID_SKELETON,
@@ -59,6 +60,30 @@ describe("toggleInline", () => {
     const v = solo("**hello** world", 2, 7);
     toggleInline(v, "**");
     expect(docText(v.state)).toBe("hello world");
+  });
+
+  test("italic over a bold word nests instead of eating the bold", () => {
+    // What a double-click inside `**hello**` selects. A neighbour sniff that
+    // only looked one character out would see a `*` on each side, take it for
+    // its own italic pair and unwrap it - the bold silently gone.
+    const v = solo("**hello** world", 2, 7);
+    toggleInline(v, "*");
+    expect(docText(v.state)).toBe("***hello*** world");
+    expect(
+      v.state.sliceDoc(v.state.selection.main.from, v.state.selection.main.to),
+    ).toBe("hello");
+  });
+
+  test("bold over an italic word nests too", () => {
+    const v = solo("*hello* world", 1, 6);
+    toggleInline(v, "**");
+    expect(docText(v.state)).toBe("***hello*** world");
+  });
+
+  test("a fence beside inline code is not read as a code span", () => {
+    const v = solo("``a`` b", 2, 3);
+    toggleInline(v, "`");
+    expect(docText(v.state)).toBe("```a``` b");
   });
 });
 
@@ -132,6 +157,70 @@ describe("formattingKeymap", () => {
       }),
     );
     expect(docText(view.state)).toBe("*hello* world");
+  });
+});
+
+/**
+ * The buffer as the engram editor draws it in preview mode: a frontmatter
+ * block behind its summary chip, and - because `CmEditor` sets no initial
+ * selection - a caret sitting at position 0, INSIDE that folded block.
+ */
+const FOLDED_DOC = "---\ntitle: T\nstatus: draft\n---\n\nBody line\n";
+const YAML = "---\ntitle: T\nstatus: draft\n---\n";
+
+function folded(doc: string, anchor: number, head = anchor): EditorView {
+  view = new EditorView({
+    state: EditorState.create({
+      doc,
+      selection: EditorSelection.single(anchor, head),
+      extensions: [...lineSeparatorFor(doc), frontmatterFold()],
+    }),
+    parent: document.body,
+  });
+  return view;
+}
+
+describe("the folded frontmatter", () => {
+  test("a verb run from the mount-time caret lands in the body", () => {
+    const v = folded(FOLDED_DOC, 0);
+    cycleHeading(v, 2);
+    // The yaml is untouched and the mark went onto the first line the author
+    // can actually see.
+    expect(docText(v.state)).toBe(`${YAML}## \nBody line\n`);
+  });
+
+  test("a table from the mount-time caret lands after the block", () => {
+    const v = folded(FOLDED_DOC, 0);
+    insertBlock(v, TABLE_SKELETON);
+    expect(docText(v.state)).toBe(
+      `${YAML}| Column | Column |\n| --- | --- |\n|  |  |\n\nBody line\n`,
+    );
+  });
+
+  test("a selection spanning the block is refused rather than moved", () => {
+    // Select-all then bold. Silently relocating a selection somebody made on
+    // purpose would be worse than doing nothing.
+    const v = folded(FOLDED_DOC, 0, FOLDED_DOC.length);
+    expect(toggleInline(v, "**")).toBe(false);
+    expect(docText(v.state)).toBe(FOLDED_DOC);
+  });
+
+  test("nothing is guarded once the block is unfolded", () => {
+    const v = folded(FOLDED_DOC, 0);
+    v.dispatch({ effects: unfoldEffect.of(true) });
+    cycleHeading(v, 2);
+    // The yaml is on screen now, so it is ordinary text to format.
+    expect(docText(v.state)).toBe(`## ${FOLDED_DOC}`);
+  });
+
+  test("Raw mode has no fold and formats the frontmatter like any text", () => {
+    // Raw is the same buffer with the preview layers - the fold among them -
+    // reconfigured away, so the guard must not fire from mode assumptions.
+    const v = solo(FOLDED_DOC, 4, 9);
+    expect(toggleInline(v, "**")).toBe(true);
+    expect(docText(v.state)).toBe(
+      "---\n**title**: T\nstatus: draft\n---\n\nBody line\n",
+    );
   });
 });
 

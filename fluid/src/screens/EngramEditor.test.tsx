@@ -294,6 +294,30 @@ describe("the engram editor", () => {
     expect(docText(view.state)).toBe(CONTENT);
   });
 
+  it("keeps a format-bar insertion out of the folded frontmatter", async () => {
+    // The mount-time caret sits at position 0, inside the block the summary
+    // chip is hiding, and nothing has clicked into the buffer yet - the fold
+    // is atomic for cursor MOTION only, so without a guard in the command the
+    // table would land between the opening fence and the first key, invisible
+    // behind the chip, and the file would stop parsing.
+    serveEditor();
+    renderApp("/d/eng/edit/alpha");
+    const editor = await screen.findByLabelText("Engram source");
+    await waitFor(() => {
+      expect(editor.textContent).toContain("A rule.");
+    });
+    const view = mountedView(editor);
+
+    await userEvent.click(screen.getByRole("button", { name: "Insert table" }));
+
+    expect(docText(view.state)).toBe(
+      CONTENT.replace(
+        "---\n\n# Alpha",
+        "---\n| Column | Column |\n| --- | --- |\n|  |  |\n\n# Alpha",
+      ),
+    );
+  });
+
   it("runs format-bar buttons from the keyboard", async () => {
     serveEditor();
     renderApp("/d/eng/edit/alpha");

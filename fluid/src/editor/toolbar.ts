@@ -16,10 +16,106 @@
  * and never merges into the typing around it.
  */
 
-import type { Extension, Line } from "@codemirror/state";
+import type { EditorState, Extension, Line } from "@codemirror/state";
 import { EditorSelection, Prec } from "@codemirror/state";
 import type { EditorView } from "@codemirror/view";
 import { keymap } from "@codemirror/view";
+
+import { frontmatterHidden } from "./frontmatterFold";
+import { frontmatterRegion } from "./frontmatterRegion";
+
+/**
+ * Keep a command off a frontmatter block that is currently folded away.
+ *
+ * The fold is atomic, but atomicity constrains cursor MOTION only - it is read
+ * by the movement commands and by pointer selection, never by a dispatched
+ * change - so nothing stops a toolbar verb from writing into text nobody can
+ * see. And the caret starts there: `CmEditor` sets no initial selection, so a
+ * freshly opened engram has its caret at position 0, inside the block. A
+ * heading run before the author has clicked anywhere would turn the opening
+ * fence into `## ---`, and a table would land between the fence and the first
+ * key where the chip keeps it invisible - a button that looks like it did
+ * nothing while the file stops parsing.
+ *
+ * Two cases, deliberately answered differently:
+ *
+ * - A bare caret in the region is not a decision, it is where the buffer put
+ *   it. The whole selection is REPLACED by one cursor on the first line after
+ *   the block, because clicking a format button means "put this in my
+ *   document" and the document starts there.
+ * - A selection that spans the block was made on purpose - select-all then
+ *   bold is the ordinary way in - so the command REFUSES and returns false
+ *   rather than quietly formatting something else. Returning false leaves the
+ *   key unhandled, which is the honest answer for a command that declined.
+ *
+ * The question asked is the fold's own live state, never the mode: in Raw mode
+ * the field is not installed, after the chip is clicked its set is empty, and
+ * the MANIFEST surface never carries it. In all three the frontmatter is text
+ * on screen like any other and formatting it is legitimate.
+ */
+function clearOfFoldedFrontmatter(view: EditorView): boolean {
+  const { state } = view;
+  if (!frontmatterHidden(state)) {
+    return true;
+  }
+  const region = frontmatterRegion(state.doc);
+  if (region === null) {
+    return true;
+  }
+  const touching = state.selection.ranges.filter(
+    (range) => range.from <= region.to && range.to >= region.from,
+  );
+  if (touching.length === 0) {
+    return true;
+  }
+  if (touching.some((range) => !range.empty)) {
+    return false;
+  }
+  const fence = state.doc.lineAt(region.to);
+  if (fence.number >= state.doc.lines) {
+    // Frontmatter and nothing else: there is no body line to move to, so
+    // there is nowhere honest to put the edit.
+    return false;
+  }
+  view.dispatch({
+    selection: EditorSelection.cursor(state.doc.line(fence.number + 1).from),
+  });
+  return true;
+}
+
+/**
+ * Whether the text on both sides of `from`..`to` is this command's own pair.
+ *
+ * The run of marker characters has to be EXACTLY as long as the marker. A
+ * neighbour that is part of a longer run belongs to a stronger emphasis:
+ * double-clicking the word in `**hello**` and pressing italic sees a `*` on
+ * each side, and a sniff that stopped there would strip the bold off a person
+ * who asked to add italic. Longer runs are therefore left alone and the
+ * command nests instead - `***hello***` - which is what was asked for.
+ *
+ * Every marker this is used with is one character repeated, which is what
+ * makes "one longer" spellable as the marker plus that character.
+ */
+function wrappedIn(
+  state: EditorState,
+  from: number,
+  to: number,
+  marker: string,
+): boolean {
+  const char = marker.slice(0, 1);
+  const longer = char + marker;
+  const before = state.sliceDoc(Math.max(0, from - longer.length), from);
+  const after = state.sliceDoc(
+    to,
+    Math.min(state.doc.length, to + longer.length),
+  );
+  return (
+    before.endsWith(marker) &&
+    !before.endsWith(longer) &&
+    after.startsWith(marker) &&
+    !after.startsWith(longer)
+  );
+}
 
 /**
  * Wrap or unwrap every selection range in `marker` - bold, italic and inline
@@ -30,14 +126,12 @@ import { keymap } from "@codemirror/view";
  * again from that same spot removes the pair it just made.
  */
 export function toggleInline(view: EditorView, marker: string): boolean {
+  if (!clearOfFoldedFrontmatter(view)) {
+    return false;
+  }
   const changes = view.state.changeByRange((range) => {
     const { from, to } = range;
-    const before = view.state.sliceDoc(Math.max(0, from - marker.length), from);
-    const after = view.state.sliceDoc(
-      to,
-      Math.min(view.state.doc.length, to + marker.length),
-    );
-    if (before === marker && after === marker) {
+    if (wrappedIn(view.state, from, to, marker)) {
       return {
         changes: [
           { from: from - marker.length, to: from, insert: "" },
@@ -68,6 +162,10 @@ const HEADING = /^(#{1,6})[ \t]+/;
  * wrappers and the wiki link are the multi-range commands.
  */
 export function cycleHeading(view: EditorView, level: number): boolean {
+  if (!clearOfFoldedFrontmatter(view)) {
+    return false;
+  }
+  // Read AFTER the guard: it may have moved the caret out of the block.
   const { state } = view;
   const line = state.doc.lineAt(state.selection.main.head);
   const match = HEADING.exec(line.text);
@@ -96,6 +194,9 @@ export function cycleHeading(view: EditorView, level: number): boolean {
  * be reasoning about the middle of a break.
  */
 export function toggleLinePrefix(view: EditorView, prefix: string): boolean {
+  if (!clearOfFoldedFrontmatter(view)) {
+    return false;
+  }
   const { state } = view;
   const lines: Line[] = [];
   const seen = new Set<number>();
@@ -128,6 +229,9 @@ export function toggleLinePrefix(view: EditorView, prefix: string): boolean {
 
 /** `[[...]]` around the selection, cursor inside for the target's name. */
 export function insertWikilink(view: EditorView): boolean {
+  if (!clearOfFoldedFrontmatter(view)) {
+    return false;
+  }
   const changes = view.state.changeByRange((range) => ({
     changes: [
       { from: range.from, insert: "[[" },
@@ -168,6 +272,10 @@ export function insertBlock(
   view: EditorView,
   lines: readonly string[],
 ): boolean {
+  if (!clearOfFoldedFrontmatter(view)) {
+    return false;
+  }
+  // Read AFTER the guard: it may have moved the caret out of the block.
   const { state } = view;
   const separator = state.lineBreak;
   const line = state.doc.lineAt(state.selection.main.head);

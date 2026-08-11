@@ -170,6 +170,21 @@ const foldTheme = EditorView.baseTheme({
   },
 });
 
+/**
+ * Whether a frontmatter block is on this state's screen as a chip rather than
+ * as text right now.
+ *
+ * The live state of the fold, not a mode: false where the field was never
+ * installed (Raw mode empties the compartment this rides in, and the MANIFEST
+ * surface never had it), false once the chip has been clicked, and false for a
+ * document with no block to fold. A caller that must not write into hidden
+ * text asks this rather than guessing from the layer it thinks is on.
+ */
+export function frontmatterHidden(state: EditorState): boolean {
+  const decorations = state.field(foldField, false);
+  return decorations !== undefined && decorations.size > 0;
+}
+
 /** The frontmatter block as one summary chip, until somebody unfolds it. */
 export function frontmatterFold(): Extension {
   return [foldField, foldTheme];
