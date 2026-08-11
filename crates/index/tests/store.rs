@@ -1021,6 +1021,65 @@ async fn inbound_page_filters(store: &dyn Store) {
 }
 parity!(inbound_page_filters_by_rel_and_text, inbound_page_filters);
 
+/// A page size or page number no `i64` can hold is arithmetic, not a licence.
+///
+/// `usize::MAX as i64` is `-1`, and a negative bound means three different wrong
+/// answers depending on the backend: SQLite reads a negative `LIMIT` as no limit
+/// and returns the whole set, Postgres refuses a negative `LIMIT` or `OFFSET`
+/// outright, and a wrapped offset silently serves page one under any page
+/// number. All three are pinned here, on both backends, because the numbers come
+/// from a query string.
+async fn inbound_page_absurd_bounds(store: &dyn Store) {
+    let (hub, domain) = hub_fixture(store).await;
+
+    // A page size past `i64`: bounded, and bounded by the set rather than
+    // unbounded by a wrapped negative.
+    let huge_limit = store
+        .inbound_page(&InboundQuery {
+            limit: usize::MAX,
+            ..hub_query(hub, domain)
+        })
+        .await
+        .expect("an absurd page size is arithmetic, not an error");
+    assert_eq!(huge_limit.total, 7, "{huge_limit:?}");
+    assert_eq!(
+        huge_limit.hits.len(),
+        7,
+        "the whole set is seven rows, so a page bigger than it holds seven: {huge_limit:?}"
+    );
+
+    // A page number past `i64`, whose offset would wrap: an empty page carrying
+    // the true total, never the first page's rows.
+    let huge_page = store
+        .inbound_page(&InboundQuery {
+            page: usize::MAX,
+            ..hub_query(hub, domain)
+        })
+        .await
+        .expect("an absurd page number is arithmetic, not an error");
+    assert!(
+        huge_page.hits.is_empty(),
+        "a page past the end is empty rather than page one: {huge_page:?}"
+    );
+    assert_eq!(huge_page.total, 7, "{huge_page:?}");
+
+    // Both at once, which is where the multiplication overflows.
+    let both = store
+        .inbound_page(&InboundQuery {
+            page: usize::MAX,
+            limit: usize::MAX,
+            ..hub_query(hub, domain)
+        })
+        .await
+        .expect("both at once is arithmetic too");
+    assert!(both.hits.is_empty(), "{both:?}");
+    assert_eq!(both.total, 7, "{both:?}");
+}
+parity!(
+    inbound_page_clamps_absurd_bounds,
+    inbound_page_absurd_bounds
+);
+
 /// A `%` in `q` is a percent sign, not a wildcard: the fixture holds both
 /// `Alpha 100%` and `Alpha 1005`, and an unescaped pattern would return both.
 async fn inbound_page_escapes(store: &dyn Store) {

@@ -95,7 +95,7 @@ use crate::store::{
     EngramSummary, FileStamp, FtsMode, GraphSlice, HostClaim, InboundHit, InboundPage,
     InboundQuery, InboundRef, LINKS_TO, NamedCount, NewChunk, OutboundRef, Page, RecentFilter,
     SearchHit, SearchMode, SearchQuery, Store, StoreInfo, StoredEngram, Vocabulary,
-    build_vocabulary, folder_slash,
+    build_vocabulary, folder_slash, page_window,
 };
 use crate::sweep::UnresolvedRef;
 
@@ -1479,11 +1479,10 @@ impl Store for PostgresStore {
         .await?
         .max(0) as usize;
 
-        let limit = query.limit.max(1);
-        let offset = query.page.saturating_sub(1).saturating_mul(limit);
+        let (limit, offset) = page_window(query.page, query.limit);
         let mut paged = filtered();
-        paged.push(Param::Int(limit as i64));
-        paged.push(Param::Int(offset as i64));
+        paged.push(Param::Int(limit));
+        paged.push(Param::Int(offset));
         let rows = query_all(
             conn.as_mut(),
             &format!(

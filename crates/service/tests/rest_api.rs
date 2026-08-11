@@ -1284,6 +1284,25 @@ async fn engram_list_filters_and_carries_the_page_envelope() {
     unique.sort();
     unique.dedup();
     assert_eq!(unique.len(), 4, "the pages do not overlap: {paged:?}");
+
+    // The page size is the server's to bound. This listing is a filter-only
+    // search, whose SQL carries whole engram bodies through a sorter that the
+    // database bounds by exactly this number, so a client-chosen `limit` is a
+    // client-chosen amount of memory. An enormous one is clamped and the
+    // envelope reports the clamp, the same contract the inbound route states.
+    let huge: serde_json::Value = get(
+        fixture.addr,
+        "/api/v1/domains/eng/engrams?limit=18446744073709551615",
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(
+        huge["limit"], 100,
+        "an enormous page size is clamped to the ceiling and reported as clamped: {huge}"
+    );
+    assert_eq!(huge["total"], 4, "and the total is still the truth: {huge}");
 }
 
 /// The listing takes a folder, and a folder is a folder rather than a string:
@@ -1654,6 +1673,61 @@ async fn inbound_references_filter_without_changing_the_summary() {
             "{path} leaves the summary alone: {body}"
         );
     }
+}
+
+/// How much of an index one request may materialize is not the caller's to
+/// choose, and a number too big for the database's own integer is answered
+/// rather than obeyed.
+///
+/// Both halves matter. An enormous `limit` is clamped to the ceiling and the
+/// envelope says so, instead of being cast to a negative bound that SQLite reads
+/// as "no limit" and Postgres refuses; an enormous `page` is an empty page
+/// carrying the true total, instead of a wrapped offset serving page one under
+/// any page number.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbound_paging_bounds_are_the_servers_to_set() {
+    let fixture = serve_anonymous().await;
+
+    let resp = get(
+        fixture.addr,
+        "/api/v1/domains/eng/inbound/alpha?limit=18446744073709551615",
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["limit"], 100,
+        "the page size is clamped to the ceiling, and reported as clamped: {body}"
+    );
+    assert_eq!(body["count"], 1, "{body}");
+    assert_eq!(body["total"], 1, "{body}");
+
+    let resp = get(
+        fixture.addr,
+        "/api/v1/domains/eng/inbound/alpha?page=18446744073709551615&limit=1",
+    )
+    .await;
+    assert_eq!(resp.status(), 200, "a huge page number is not a 500");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["hits"],
+        serde_json::json!([]),
+        "a page past the end is empty, not page one: {body}"
+    );
+    assert_eq!(body["count"], 0, "{body}");
+    assert_eq!(body["total"], 1, "the total is still the truth: {body}");
+
+    // The ordinary page still echoes what it was given, so the clamp above is a
+    // ceiling rather than a fixed answer.
+    let resp = get(
+        fixture.addr,
+        "/api/v1/domains/eng/inbound/alpha?page=2&limit=1",
+    )
+    .await;
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["page"], 2, "{body}");
+    assert_eq!(body["limit"], 1, "{body}");
+    assert_eq!(body["hits"], serde_json::json!([]), "{body}");
 }
 
 /// The same 404s the detail route answers, for the same reasons: a path segment

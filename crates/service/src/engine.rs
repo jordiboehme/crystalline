@@ -89,6 +89,26 @@ const MAX_GRAPH_NODES: usize = 150;
 /// runs into.
 pub const TREE_LEVEL_CAP: usize = 500;
 
+/// The largest page a search or a listing hands back.
+///
+/// The page size is client-controlled and the filter-only path projects whole
+/// bodies through a sorter that turso bounds by exactly this number, so an
+/// unclamped `limit` lets any reader ask the database to hold a hundred
+/// thousand engram bodies at once (the 2026-08-11 query-spill audit, whose
+/// sharpest finding this closes: the bound on that sorter must not be the
+/// caller's to choose). A hundred rows is more than a page anyone reads and far
+/// less than a page anyone can weaponize; a client that wants more pages
+/// through them, which is what the envelope's `total` is for.
+///
+/// Clamped rather than refused, like every other bound on this surface: a hand
+/// written URL asking for too much gets the largest page there is, not a 4xx.
+///
+/// The same number as [`MAX_INBOUND_LIMIT`] and for the same reason, kept as
+/// its own constant because the two bound different queries and either could
+/// move without the other: this one bounds a sorter holding bodies, that one
+/// bounds how much of the reference index a popover materializes.
+const MAX_PAGE_LIMIT: usize = 100;
+
 /// The deepest level [`Engine::browse_domain`] walks.
 ///
 /// The depth cut is pushed into SQL as a pattern that grows one term per level,
@@ -103,6 +123,17 @@ const EVOLVE_DEFAULT_LIMIT: usize = 10;
 
 /// The largest `evolve_engrams` page size.
 const EVOLVE_MAX_LIMIT: usize = 100;
+
+/// The largest `inbound_references` page size.
+///
+/// A ceiling rather than a suggestion, because the bound on how much of an
+/// index one request may materialize must not be the caller's to choose: an
+/// engram a few thousand engrams point at is exactly the case this endpoint
+/// exists for, and `?limit=<enormous>` would turn the endpoint that makes that
+/// engram cheap into the one way to load all of it at once. A hundred is well
+/// past any popover page and small enough that the widest answer is still one
+/// screenful of rows.
+const MAX_INBOUND_LIMIT: usize = 100;
 
 /// The fixed instruction every `evolve_engrams` response carries. It states the
 /// authority the queue does and does not have, so an agent working it never
@@ -2223,6 +2254,9 @@ impl Engine {
     /// `total` is exact under both; `types` ignores both, because a summary that
     /// shrank as it was used would be a map redrawing itself while it is read.
     ///
+    /// `limit` is clamped to [`MAX_INBOUND_LIMIT`] and a page past the end is an
+    /// empty page carrying the true total, never the first page's rows.
+    ///
     /// An engram nobody wrote is [`EngineError::NotFound`], the same resolution
     /// every other read of one identifier opens with.
     pub async fn inbound_references(
@@ -2235,9 +2269,13 @@ impl Engine {
     ) -> Result<Value> {
         let (desc, _) = self.resolve(&p.identifier, p.domain.as_deref()).await?;
         // Clamped rather than refused, the way the listing clamps its own: a
-        // hand-written page number below one is answered with the first page.
+        // hand-written page number below one is answered with the first page,
+        // and a page size past [`MAX_INBOUND_LIMIT`] is answered with that
+        // many. The envelope reports the clamped values, so a caller is told
+        // what it was actually given rather than having its own number read
+        // back at it.
         let page = page.unwrap_or(1).max(1);
-        let limit = limit.unwrap_or(10).max(1);
+        let limit = limit.unwrap_or(10).clamp(1, MAX_INBOUND_LIMIT);
         let found = {
             let store = self.store.lock().await;
             store
@@ -3152,7 +3190,7 @@ impl Engine {
             after: p.after.clone(),
             min_similarity: p.min_similarity,
             path_prefix: folder.and_then(folder_prefix),
-            limit: p.limit.unwrap_or(10).max(1),
+            limit: p.limit.unwrap_or(10).clamp(1, MAX_PAGE_LIMIT),
             page: p.page.unwrap_or(1).max(1),
             ..SearchQuery::default()
         };

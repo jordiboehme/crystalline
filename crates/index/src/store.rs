@@ -817,6 +817,29 @@ pub struct InboundQuery<'a> {
     pub limit: usize,
 }
 
+/// The `LIMIT` and `OFFSET` a one-based page asks for, as numbers a database
+/// integer can actually hold.
+///
+/// Every clamp happens before the cast, which is the whole point. A page size
+/// arriving from an HTTP query is a `usize`, and `usize::MAX as i64` is `-1`:
+/// SQLite reads a negative `LIMIT` as no limit at all and hands back the entire
+/// set, while Postgres refuses it outright. One request would then get three
+/// different wrong answers - every row, the first page under any page number,
+/// or a 500 - all from a number a caller typed. Saturating arithmetic and a
+/// ceiling of [`i64::MAX`] turn all three into the honest one: a page past the
+/// end is empty.
+///
+/// No policy ceiling here on purpose. How much of an index one request may
+/// materialize is the calling surface's decision (the HTTP layer clamps its own
+/// page size), and this is only the arithmetic that keeps that decision from
+/// being undone by a cast.
+pub(crate) fn page_window(page: usize, limit: usize) -> (i64, i64) {
+    let ceiling = i64::MAX as usize;
+    let limit = limit.max(1).min(ceiling);
+    let offset = page.saturating_sub(1).saturating_mul(limit).min(ceiling);
+    (limit as i64, offset as i64)
+}
+
 /// One page of [`Store::inbound_page`], with the counts a client draws its
 /// chips from.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
