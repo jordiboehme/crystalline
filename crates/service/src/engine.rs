@@ -4465,6 +4465,271 @@ impl Engine {
         }))
     }
 
+    /// Import in-memory engram files - an unpacked archive - into a domain of
+    /// either storage kind, classifying every entry as `create`, `overwrite`,
+    /// `skip`, `invalid` or `ignored`.
+    ///
+    /// One verb backs both the preview and the commit: `dry_run` runs the whole
+    /// classification and writes nothing, so what an operator is shown is what
+    /// the same call would then do. Each kind is written through its own normal
+    /// road rather than a shortcut: a file domain gets the exact incoming bytes
+    /// on disk and is indexed by one targeted [`Engine::sync_paths`] after the
+    /// loop, the same pass the watcher runs for an external edit, and a virtual
+    /// domain is indexed directly because the row is its only source of truth.
+    /// Two files must never claim one permalink, so a permalink already held at
+    /// a different path is refused under both policies - `overwrite` decides
+    /// what happens at the SAME path, nothing more.
+    pub async fn import_domain_files(
+        &self,
+        domain: &str,
+        files: &[(String, String)],
+        overwrite: bool,
+        dry_run: bool,
+    ) -> Result<Value> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        // Delta 2 vs `import_domain`: a file domain is served too, so the source
+        // decides how a write lands rather than being refused outright.
+        let source = self.content_source(domain)?;
+        let store = self.store.lock().await;
+        let domain_id = match &source {
+            ContentSource::File { root } => {
+                store
+                    .upsert_domain(domain, Some(&root.to_string_lossy()), DomainKind::File)
+                    .await?
+            }
+            ContentSource::Virtual => {
+                store
+                    .upsert_domain(domain, None, DomainKind::Virtual)
+                    .await?
+            }
+        };
+        let existing = store.all_engram_contents(domain_id).await?;
+        drop(store);
+
+        // The snapshot is taken once, before the loop, and then kept live as the
+        // batch is classified: an entry accepted here claims its path and its
+        // permalink for the rest of the batch, so two files of one archive
+        // claiming one permalink are resolved deterministically in input order
+        // (first wins, second skips) instead of both passing a stale snapshot.
+        let mut path_perms: HashMap<String, String> = HashMap::new();
+        let mut perm_paths: HashMap<String, String> = HashMap::new();
+        for e in &existing {
+            path_perms.insert(e.path.clone(), e.permalink.clone());
+            perm_paths.insert(e.permalink.clone(), e.path.clone());
+        }
+
+        let mut created = 0usize;
+        let mut overwritten = 0usize;
+        let mut skipped = 0usize;
+        let mut invalid = 0usize;
+        let mut ignored = 0usize;
+        // Delta 6: every entry gets a row, whatever became of it.
+        let mut entries: Vec<Value> = Vec::new();
+        let mut changed_paths: Vec<String> = Vec::new();
+
+        // Delta 1: the files arrive in memory, already unpacked by the caller,
+        // so there is no folder to walk and no source directory to validate.
+        for (path, text) in files {
+            // Delta 4: a MANIFEST at any depth is ignored - defense in depth,
+            // the REST layer screens these before the engine ever sees them.
+            if Path::new(path)
+                .file_name()
+                .is_some_and(|n| n == "MANIFEST.md")
+            {
+                entries.push(json!({
+                    "path": path,
+                    "permalink": Value::Null,
+                    "action": "ignored",
+                    "reason": "a MANIFEST belongs to the domain, which keeps its own",
+                }));
+                ignored += 1;
+                continue;
+            }
+            // Only markdown is an engram. Anything else would land in the folder
+            // as junk a sync never walks, or as a row no reader can parse, so it
+            // is reported rather than written.
+            if !path.to_lowercase().ends_with(".md") {
+                entries.push(json!({
+                    "path": path,
+                    "permalink": Value::Null,
+                    "action": "ignored",
+                    "reason": "not a markdown engram file",
+                }));
+                ignored += 1;
+                continue;
+            }
+            // The OKF reserved names are generated, never imported: `index.md`
+            // and `log.md` are rebuilt from the folder they sit in, so writing
+            // one back would be overwritten by the next refresh anyway.
+            if crystalline_core::is_reserved_path(path) {
+                entries.push(json!({
+                    "path": path,
+                    "permalink": Value::Null,
+                    "action": "ignored",
+                    "reason": "a generated OKF index or log is never imported",
+                }));
+                ignored += 1;
+                continue;
+            }
+            // An archive is untrusted input and `join_rel` joins segment by
+            // segment, `..` included, so containment is decided before any path
+            // is built: an entry can never address a byte outside the domain.
+            if !is_contained_rel(path) {
+                entries.push(json!({
+                    "path": path,
+                    "permalink": Value::Null,
+                    "action": "invalid",
+                    "reason": "path escapes the domain root",
+                }));
+                invalid += 1;
+                continue;
+            }
+            // Delta 5: unparseable content is a first-class `invalid` entry
+            // carrying the parse error, not a warning on the side.
+            let engram = match parse_engram(text) {
+                Ok(e) => e,
+                Err(e) => {
+                    entries.push(json!({
+                        "path": path,
+                        "permalink": Value::Null,
+                        "action": "invalid",
+                        "reason": e.to_string(),
+                    }));
+                    invalid += 1;
+                    continue;
+                }
+            };
+            // `parse_engram` is deliberately permissive - a file with no
+            // frontmatter at all parses into an engram with empty fields - so
+            // the required OKF keys are checked here. Without them there is
+            // nothing to import: the permalink would be invented from the file
+            // name and the engram would carry no type.
+            if engram.frontmatter.engram_type.trim().is_empty()
+                || engram.frontmatter.title.trim().is_empty()
+            {
+                entries.push(json!({
+                    "path": path,
+                    "permalink": Value::Null,
+                    "action": "invalid",
+                    "reason": "not an engram: the frontmatter needs a type and a title",
+                }));
+                invalid += 1;
+                continue;
+            }
+            let record = EngramRecord::from_engram(&engram, path, virtual_stamp(text));
+
+            // Delta 3: a permalink held at a different path is refused under
+            // BOTH policies - `overwrite` is a same-path decision only.
+            if let Some(held_at) = perm_paths.get(&record.permalink)
+                && held_at != path
+            {
+                entries.push(json!({
+                    "path": path,
+                    "permalink": record.permalink,
+                    "action": "skip",
+                    "reason": format!(
+                        "permalink '{}' already exists at another path",
+                        record.permalink
+                    ),
+                }));
+                skipped += 1;
+                continue;
+            }
+            // A file domain's truth is the file on disk, so an entry that never
+            // made it into the index still counts as existing there.
+            let exists = path_perms.contains_key(path)
+                || match &source {
+                    ContentSource::File { root } => join_rel(root, path).exists(),
+                    ContentSource::Virtual => false,
+                };
+            if exists && !overwrite {
+                entries.push(json!({
+                    "path": path,
+                    "permalink": record.permalink,
+                    "action": "skip",
+                    "reason": format!("'{path}' already exists"),
+                }));
+                skipped += 1;
+                continue;
+            }
+
+            if !dry_run {
+                let outcome = match &source {
+                    // Delta 2: the exact incoming bytes go to disk and the index
+                    // follows afterwards through the targeted sync, so an import
+                    // takes the same road as any external write.
+                    ContentSource::File { root } => {
+                        write_file(&join_rel(root, path), text).map(|()| {
+                            changed_paths.push(path.clone());
+                        })
+                    }
+                    // A virtual domain has no file: the row is the document, so
+                    // the full markdown is indexed directly.
+                    ContentSource::Virtual => {
+                        let stamp = virtual_stamp(text);
+                        let store = self.store.lock().await;
+                        self.index_markdown(&*store, domain_id, path, text, stamp, None, true)
+                            .await
+                            .map(|_| ())
+                    }
+                };
+                if let Err(e) = outcome {
+                    entries.push(json!({
+                        "path": path,
+                        "permalink": record.permalink,
+                        "action": "skip",
+                        "reason": e.to_string(),
+                    }));
+                    skipped += 1;
+                    continue;
+                }
+            }
+
+            if exists {
+                overwritten += 1;
+            } else {
+                created += 1;
+            }
+            entries.push(json!({
+                "path": path,
+                "permalink": record.permalink,
+                "action": if exists { "overwrite" } else { "create" },
+                "reason": Value::Null,
+            }));
+            // Claim both for the rest of the batch. An overwrite that changes an
+            // engram's permalink releases the one that path used to hold, so a
+            // later entry is judged against what the batch will really leave
+            // behind - in a dry run too, where the preview must match the commit.
+            if let Some(prev) = path_perms.insert(path.clone(), record.permalink.clone())
+                && prev != record.permalink
+            {
+                perm_paths.remove(&prev);
+            }
+            perm_paths.insert(record.permalink, path.clone());
+        }
+
+        // Delta 2, after the loop and only once: one targeted sync for the whole
+        // batch, the pass the watcher runs for a small debounced set of paths,
+        // rather than a full rescan or a per-file reindex. A dry run collected
+        // no path here, so it never reaches the sync either.
+        if !changed_paths.is_empty() {
+            self.sync_paths(domain, changed_paths).await?;
+        }
+
+        Ok(json!({
+            "domain": domain,
+            "dry_run": dry_run,
+            "files": entries,
+            "created": created,
+            "overwritten": overwritten,
+            "skipped": skipped,
+            "invalid": invalid,
+            "ignored": ignored,
+        }))
+    }
+
     /// Every file of a domain as `(domain-relative path, content)`, MANIFEST
     /// included: the portable view an archive download is built from, byte for
     /// byte as the domain holds it.
@@ -7926,6 +8191,21 @@ fn join_rel(root: &Path, rel: &str) -> PathBuf {
         p.push(seg);
     }
     p
+}
+
+/// Whether a domain-relative path may be joined onto a domain root at all:
+/// every segment has to be an ordinary name. [`join_rel`] pushes what it is
+/// given segment by segment and would happily push a `..`, so untrusted input -
+/// an archive entry above all - is screened here before any path is built. A
+/// backslash or a colon inside a segment is refused too: both are separators or
+/// drive and stream markers on Windows, where a name that looks contained on
+/// one platform escapes on another.
+fn is_contained_rel(rel: &str) -> bool {
+    !rel.is_empty()
+        && !Path::new(rel).is_absolute()
+        && rel
+            .split('/')
+            .all(|seg| !seg.is_empty() && seg != "." && seg != ".." && !seg.contains(['\\', ':']))
 }
 
 /// Normalize a destination into a forward-slashed `.md` path.
