@@ -63,6 +63,29 @@ describe("a browse payload", () => {
     expect(alpha.type).toBe("engram");
   });
 
+  it("carries the level's bound: whether it was cut, and what it holds", () => {
+    const tree = readTree(
+      { ...browsePayload(), truncated: true, total: 501 },
+      "eng",
+      "",
+    );
+
+    // The server caps a level rather than answering with a folder of tens of
+    // thousands, and says so. A sidebar that ignored this would draw the first
+    // page of a folder as if it were the folder.
+    expect(tree.truncated).toBe(true);
+    expect(tree.total).toBe(501);
+  });
+
+  it("reads a payload that predates the bound as a whole level", () => {
+    // Additive fields: a daemon that never wrote them answered with everything
+    // it had, so the level is not cut and holds exactly what it carried.
+    const tree = readTree(browsePayload(), "eng", "");
+
+    expect(tree.truncated).toBe(false);
+    expect(tree.total).toBe(2);
+  });
+
   it("leaves the status null when a row does not say", () => {
     const tree = readTree(
       { domain: "eng", path: "/", folders: [], engrams: [{ permalink: "a" }] },

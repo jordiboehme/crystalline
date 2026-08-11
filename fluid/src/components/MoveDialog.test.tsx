@@ -104,4 +104,70 @@ describe("the move dialog", () => {
       expect(within(trail).getByText("guides")).toBeInTheDocument();
     });
   });
+
+  it("moves the tree on, so the sidebar shows the new address", async () => {
+    const moved = vi.fn(() => ({
+      from: { domain: "eng", permalink: "alpha", path: "alpha.md" },
+      to: { domain: "eng", path: "guides/alpha.md" },
+      cross_domain: false,
+      links_rewritten: 0,
+    }));
+    serve({
+      "/domains/eng/move": (_path, init) =>
+        init?.method === "POST" ? moved() : null,
+      "/domains/eng/engrams/guides/alpha": () =>
+        detailResponse({ permalink: "guides/alpha" }),
+      "/domains/eng/tree": () => ({
+        domain: "eng",
+        path: "/",
+        folders: [],
+        engrams: [
+          {
+            permalink: "alpha",
+            title: "Alpha",
+            type: "engram",
+            status: "stable",
+            path: "alpha.md",
+          },
+        ],
+      }),
+    });
+    renderApp("/d/eng/e/alpha");
+    await screen.findByRole("link", { name: "Alpha" });
+    // The tree is fresh for a minute, so nothing but an invalidation can make
+    // it be asked for again.
+    const before = trees().length;
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "More actions" }),
+    );
+    await userEvent.click(
+      await screen.findByRole("menuitem", { name: "Move" }),
+    );
+    const dialog = await screen.findByRole("dialog", { name: /move/i });
+    await userEvent.clear(within(dialog).getByLabelText("Destination path"));
+    await userEvent.type(
+      within(dialog).getByLabelText("Destination path"),
+      "guides/alpha",
+    );
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Move engram" }),
+    );
+
+    await waitFor(() => {
+      expect(moved).toHaveBeenCalled();
+    });
+    // A move is exactly the write that changes the shape of a domain, so the
+    // tree is read again rather than left pointing at where the engram was.
+    await waitFor(() => {
+      expect(trees().length).toBeGreaterThan(before);
+    });
+  });
 });
+
+/** Every read of this domain's tree, in order. */
+function trees(): string[] {
+  return apiMock.mock.calls
+    .map(([path]) => path)
+    .filter((path) => path.startsWith("/domains/eng/tree"));
+}

@@ -12,6 +12,7 @@ import { useState } from "react";
 import { useNavigate } from "react-router";
 
 import { problemDetail } from "../api/client";
+import { domainTreeKey } from "../api/domain";
 import { engramDetailKey } from "../api/engram";
 import { moveEngram } from "../api/writes";
 import { engramRoute } from "../paths";
@@ -51,6 +52,18 @@ export default function MoveDialogBody({
       void queryClient.invalidateQueries({
         queryKey: engramDetailKey(engram.domain, engram.permalink),
       });
+      // A move is the write that changes the shape of a domain, so the tree
+      // the sidebar walks is read again rather than left pointing at where
+      // the engram used to be. Both domains when it crossed one: the row left
+      // one tree and arrived in the other.
+      void queryClient.invalidateQueries({
+        queryKey: domainTreeKey(engram.domain),
+      });
+      if (receipt.domain !== engram.domain) {
+        void queryClient.invalidateQueries({
+          queryKey: domainTreeKey(receipt.domain),
+        });
+      }
       void navigate(engramRoute(receipt.domain, receipt.permalink));
     },
     onError: (error: Error) => {

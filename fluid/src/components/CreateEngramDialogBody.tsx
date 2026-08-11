@@ -18,7 +18,7 @@ import { useId, useState } from "react";
 import { useNavigate } from "react-router";
 
 import { problemDetail } from "../api/client";
-import { fetchTree, treeKey } from "../api/domain";
+import { domainTreeKey, treeQuery } from "../api/domain";
 import { engramDetailKey } from "../api/engram";
 import { fetchTags, vocabularyKey } from "../api/vocabulary";
 import { createEngram } from "../api/writes";
@@ -116,6 +116,13 @@ export default function CreateEngramDialogBody({
         engramDetailKey(created.domain, created.permalink),
         created,
       );
+      // The tree is what the sidebar and this dialog's own folder picker are
+      // drawn from, and a create is a row that was not in it a moment ago.
+      // Every level of the domain at once rather than the one folder: a new
+      // engram can make a folder that no level had listed before.
+      void queryClient.invalidateQueries({
+        queryKey: domainTreeKey(created.domain),
+      });
       onClose();
       void navigate(editRoute(created.domain, created.permalink));
     },
@@ -326,10 +333,7 @@ function PickerBranch({
   chosen: string;
   onChoose: (folder: string) => void;
 }) {
-  const tree = useQuery({
-    queryKey: treeKey(domain, path),
-    queryFn: () => fetchTree(domain, path),
-  });
+  const tree = useQuery(treeQuery(domain, path));
   const folders = tree.data?.folders ?? [];
   if (folders.length === 0) {
     return null;

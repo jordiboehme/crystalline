@@ -17,6 +17,20 @@ export function domainRoute(domain: string): string {
 }
 
 /**
+ * One folder of a domain, browsed on the domain's own screen.
+ *
+ * A query parameter rather than a segment of the path, because the browse view
+ * is one of the states that screen holds in its URL beside the frontmatter
+ * filters, and the root folder is the domain itself rather than a folder named
+ * nothing.
+ */
+export function folderRoute(domain: string, folder: string): string {
+  return folder === ""
+    ? domainRoute(domain)
+    : `${domainRoute(domain)}?path=${encodeURIComponent(folder)}`;
+}
+
+/**
  * The address of one engram.
  *
  * Built from the client's own encoders rather than from its `engramPath`,

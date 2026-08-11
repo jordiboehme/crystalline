@@ -1,16 +1,21 @@
 /**
  * One domain: what it is for, and what is in it.
  *
- * The two ways of looking at what is in it come from two endpoints, and that
- * split is the server's rather than this screen's: the tree owns navigation by
- * folder and knows nothing about frontmatter, while the engram listing owns the
- * frontmatter filters and knows nothing about folders. So the list has two
- * sources, exactly one is on screen at a time, and a line above it says which -
- * blending them would mean showing a folder that quietly contained engrams from
- * elsewhere, or filters that quietly ignored the folder they sit under.
+ * There are two ways of looking at what is in it, and exactly one is on screen
+ * at a time with a line above the list saying which: a folder, or a
+ * frontmatter filter across the whole domain. Blending them would mean filters
+ * that quietly ignored the folder they sit under, or a folder that quietly
+ * dropped what the filter did not match.
+ *
+ * Both are the same endpoint now. The listing pages a folder (`path`) exactly
+ * as it pages a filter, so a folder holding thousands of engrams costs one
+ * page rather than the folder, and the count above the rows is the server's
+ * own. What the tree is still for is navigation: the subfolders of the folder
+ * being browsed and the trail back out of it, which is a level rather than a
+ * list.
  *
  * Both views live in the URL, so a folder or a filter is a link somebody can
- * send.
+ * send, and the back button moves between them.
  */
 
 import { useQuery } from "@tanstack/react-query";
@@ -18,14 +23,14 @@ import { useMemo, useState } from "react";
 import { Link, useParams, useSearchParams } from "react-router";
 
 import { ApiProblem, problemDetail } from "../api/client";
-import { fetchManifest, fetchTree, manifestKey, treeKey } from "../api/domain";
+import { fetchManifest, manifestKey, treeQuery } from "../api/domain";
 import { DOMAINS_QUERY_KEY, fetchDomains } from "../api/domains";
 import type { EngramFilters } from "../api/engrams";
 import {
+  NO_FILTERS,
   domainEngramsKey,
   fetchDomainEngrams,
   hasFilters,
-  singlePage,
 } from "../api/engrams";
 import { fetchTags, vocabularyKey } from "../api/vocabulary";
 import type { TagCount } from "../api/vocabulary";
@@ -48,13 +53,23 @@ export default function DomainHome() {
   const [creating, setCreating] = useState(false);
 
   const path = params.get("path") ?? "";
+  // The frontmatter view, which is the whole domain: no `path`, deliberately.
+  // Scoping a filter to the folder being browsed is a different feature - the
+  // line above the list says "every folder included" and means it - so the
+  // scope is left empty here rather than picked up from the URL by accident.
   const filters: EngramFilters = useMemo(
     () => ({
       type: params.get("type"),
       status: params.get("status"),
       tags: (params.get("tags") ?? "").split(",").filter((tag) => tag !== ""),
+      path: "",
     }),
     [params],
+  );
+  // The browse view: one folder, no frontmatter filter, paged by the server.
+  const browse: EngramFilters = useMemo(
+    () => ({ ...NO_FILTERS, path }),
+    [path],
   );
   const filtering = hasFilters(filters);
 
@@ -68,10 +83,11 @@ export default function DomainHome() {
     queryKey: manifestKey(domain),
     queryFn: () => fetchManifest(domain),
   });
-  const tree = useQuery({
-    queryKey: treeKey(domain, path),
-    queryFn: () => fetchTree(domain, path),
-  });
+  // The tree is what the folder navigation above the list is drawn from - the
+  // subfolders of the folder being browsed, and the trail back out of it. It
+  // no longer carries the listing: a level of it is capped by the server, and
+  // a folder of any size is what the paged listing below is for.
+  const tree = useQuery(treeQuery(domain, path));
   const tags = useQuery({
     queryKey: vocabularyKey(domain),
     queryFn: () => fetchTags(domain),
@@ -124,9 +140,6 @@ export default function DomainHome() {
     }
     setParams(updated);
   }
-
-  /** The folder's own rows, once the tree has answered. */
-  const folderRows = tree.data?.engrams;
 
   if (unknownDomain) {
     return <DomainNotFound domain={domain} />;
@@ -215,11 +228,17 @@ export default function DomainHome() {
         />
 
         <p className="py-3 text-sm text-slate-500 dark:text-slate-400">
+          {/*
+            What the list below is a list of, in one line. The browse view is
+            a folder and everything under it, which is what the endpoint's
+            `path` means, so the line says so rather than letting a reader read
+            "Browsing notes" as the four files sitting directly in it.
+          */}
           {filtering
             ? "Filtered across the whole domain, every folder included."
             : path === ""
-              ? "Browsing the root folder."
-              : `Browsing ${path}.`}
+              ? "Browsing this domain, every folder included."
+              : `Browsing ${path}, subfolders included.`}
         </p>
 
         {filtering ? (
@@ -229,22 +248,23 @@ export default function DomainHome() {
             label={`Engrams in ${domain}`}
             emptyMessage="No engram matches these filters."
           />
-        ) : folderRows ? (
+        ) : (
           <EngramList
-            // The rows are already in hand from the tree, so this loader hands
-            // them over rather than asking the server a second time. The key
-            // carries the folder, so opening another one starts another list.
-            queryKey={["folder-engrams", domain, path]}
-            loadPage={() => Promise.resolve(singlePage(folderRows))}
+            // The same endpoint the filtered view pages, scoped to the folder
+            // instead of filtered: a folder holding thousands of engrams costs
+            // one page here rather than the whole folder, and the key carries
+            // the scope, so opening another folder starts another list.
+            queryKey={domainEngramsKey(domain, browse)}
+            loadPage={(page) => fetchDomainEngrams(domain, browse, page)}
             label={`Engrams in ${domain}`}
-            // The count this list would draw on its own is "4 of 4 shown",
-            // which is a tautology here - the folder arrives in one page, so
-            // shown is always the total - and reads as a contradiction of the
-            // "5 engrams" under the domain's name, which counts the whole
-            // domain. Naming the scope is what settles it.
+            // The count this list would draw on its own is "50 of 620 shown",
+            // which says nothing about where those 620 are, and reads as a
+            // contradiction of the "4 engrams" under the domain's name, which
+            // counts the whole domain. Naming the scope is what settles it.
             summary={(page) => (
               <p className="text-caption pb-2 text-slate-500 tabular-nums dark:text-slate-400">
-                {plural(page.total, "engram", "engrams")} in this folder
+                {plural(page.total, "engram", "engrams")}{" "}
+                {path === "" ? "in this domain" : "in this folder"}
               </p>
             )}
             emptyMessage={
@@ -253,15 +273,6 @@ export default function DomainHome() {
                 : "This folder has no engrams."
             }
           />
-        ) : tree.error ? (
-          <p
-            role="alert"
-            className="rounded bg-red-50 px-3 py-2 text-sm text-red-800 dark:bg-red-950 dark:text-red-200"
-          >
-            {problemDetail(tree.error)}
-          </p>
-        ) : (
-          <Skeleton label="Loading engrams" />
         )}
       </section>
     </div>

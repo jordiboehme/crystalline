@@ -27,6 +27,7 @@ import { useEffect, useState } from "react";
 import { useNavigate } from "react-router";
 
 import { problemDetail } from "../api/client";
+import { domainTreeKey } from "../api/domain";
 import { engramDetailKey } from "../api/engram";
 import type { EngramDetail } from "../api/engram";
 import { NEIGHBORHOOD_DEPTH, graphKey } from "../api/graph";
@@ -154,6 +155,11 @@ export default function RetireDialogBody({
       void queryClient.invalidateQueries({
         queryKey: graphKey(engram.domain, engram.permalink, NEIGHBORHOOD_DEPTH),
       });
+      // So is the tree: a browse row carries its engram's status, which is
+      // what fades a retired one in the sidebar, and that status just moved.
+      void queryClient.invalidateQueries({
+        queryKey: domainTreeKey(engram.domain),
+      });
     },
   });
 
@@ -164,6 +170,11 @@ export default function RetireDialogBody({
       onClose();
       queryClient.removeQueries({
         queryKey: engramDetailKey(engram.domain, engram.permalink),
+      });
+      // The row is gone from the domain, so it goes from the tree the reader
+      // is about to land in front of.
+      void queryClient.invalidateQueries({
+        queryKey: domainTreeKey(engram.domain),
       });
       void navigate(domainRoute(engram.domain));
     },

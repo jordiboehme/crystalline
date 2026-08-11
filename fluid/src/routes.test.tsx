@@ -55,6 +55,27 @@ function serveDomain(domain: string, permalink: string) {
           },
         ],
       }),
+      // The screen's list is the paged listing, scoped to the folder it is
+      // browsing; the tree above it is the folder navigation. The row this
+      // test clicks is a row of the listing.
+      [`/domains/${encoded}/engrams`]: () => ({
+        mode: "text",
+        total: 1,
+        page: 1,
+        limit: 50,
+        count: 1,
+        hits: [
+          {
+            domain,
+            permalink,
+            title: "Gamma",
+            engram_type: "engram",
+            kind: "engram",
+            status: "stable",
+            tags: [],
+          },
+        ],
+      }),
       "/vocabulary": () => ({ domain, tags: [] }),
       [engramPath(domain, permalink)]: () => ({
         domain,

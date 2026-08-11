@@ -5,9 +5,11 @@
  * the screen says which one happened rather than showing one empty box for
  * both.
  *
- * The browse view and the filter view come from two endpoints on purpose: the
- * tree owns navigation by folder, and the engram listing owns the frontmatter
- * filters. The screen names which one is on screen instead of blending them.
+ * The browse view and the filter view are the same paged endpoint asked two
+ * different questions - one folder, or one set of frontmatter filters across
+ * the whole domain - and the screen names which one is on screen instead of
+ * blending them. The tree is what the folder navigation above the list is
+ * drawn from, and nothing else.
  */
 
 import { screen, waitFor, within } from "@testing-library/react";
@@ -72,25 +74,78 @@ function treeResponse(path: string) {
   };
 }
 
-/** The frontmatter view: one retired engram, so the fade has something to do. */
-function engramsResponse() {
+/**
+ * The listing, which is what both views of this screen page: the frontmatter
+ * one across the whole domain, and the folder one scoped by `path`. The
+ * filtered answer carries a retired engram, so the fade has something to do.
+ */
+function engramsResponse(path: string) {
+  if (path.includes("tags=eng")) {
+    return {
+      mode: "text",
+      total: 1,
+      page: 1,
+      limit: 50,
+      count: 1,
+      hits: [
+        {
+          domain: "eng",
+          permalink: "gamma",
+          title: "Gamma",
+          engram_type: "decision",
+          kind: "engram",
+          status: "deprecated",
+          tags: ["eng"],
+          score: 1,
+          snippet: "A decision that no longer holds.",
+        },
+      ],
+    };
+  }
+  if (path.includes("path=notes")) {
+    return {
+      mode: "text",
+      total: 1,
+      page: 1,
+      limit: 50,
+      count: 1,
+      hits: [
+        {
+          domain: "eng",
+          permalink: "notes/beta",
+          title: "Beta",
+          engram_type: "engram",
+          kind: "engram",
+          status: "stable",
+          tags: [],
+        },
+      ],
+    };
+  }
   return {
     mode: "text",
-    total: 1,
+    total: 2,
     page: 1,
     limit: 50,
-    count: 1,
+    count: 2,
     hits: [
       {
         domain: "eng",
-        permalink: "gamma",
-        title: "Gamma",
-        engram_type: "decision",
+        permalink: "alpha",
+        title: "Alpha",
+        engram_type: "engram",
         kind: "engram",
-        status: "deprecated",
-        tags: ["eng"],
-        score: 1,
-        snippet: "A decision that no longer holds.",
+        status: "stable",
+        tags: [],
+      },
+      {
+        domain: "eng",
+        permalink: "notes/beta",
+        title: "Beta",
+        engram_type: "engram",
+        kind: "engram",
+        status: "stable",
+        tags: [],
       },
     ],
   };
@@ -229,11 +284,23 @@ describe("the domain screen", () => {
         folders: [],
         engrams: [],
       }),
+      "/domains/eng/engrams": () => ({
+        mode: "text",
+        total: 0,
+        page: 1,
+        limit: 50,
+        count: 0,
+        hits: [],
+      }),
     });
 
     renderApp("/d/eng");
 
-    expect(await screen.findByText(/no engrams yet/)).toBeVisible();
+    // Scoped to the screen: the sidebar says the same thing about the same
+    // empty domain, which is the frame's own line rather than this one.
+    expect(
+      await within(await screenBody()).findByText(/no engrams yet/),
+    ).toBeVisible();
     expect(
       screen.queryByRole("heading", { name: "Domain not found" }),
     ).toBeNull();
@@ -275,6 +342,80 @@ describe("the domain screen", () => {
         true,
       );
     });
+  });
+
+  it("pages a folder from the listing rather than from the tree", async () => {
+    serve({
+      "/domains/eng/engrams": (path) =>
+        path.includes("path=notes")
+          ? {
+              mode: "text",
+              total: 620,
+              page: 1,
+              limit: 50,
+              count: 1,
+              hits: [
+                {
+                  domain: "eng",
+                  permalink: "notes/beta",
+                  title: "Beta",
+                  engram_type: "engram",
+                  kind: "engram",
+                  status: "stable",
+                  tags: [],
+                },
+              ],
+            }
+          : engramsResponse(path),
+    });
+
+    // Straight to the folder, because the whole of this screen's state is its
+    // URL: the same link somebody sends, and the same address the back button
+    // returns to.
+    renderApp("/d/eng?path=notes");
+    const body = await screenBody();
+
+    expect(
+      await within(body).findByRole("link", { name: /Beta/ }),
+    ).toBeVisible();
+    // The listing endpoint, scoped and paged, rather than the tree's own rows:
+    // a folder of six hundred engrams costs one page here.
+    await waitFor(() => {
+      expect(
+        requested().some(
+          (path) =>
+            path.startsWith("/domains/eng/engrams?") &&
+            path.includes("path=notes") &&
+            path.includes("limit=50"),
+        ),
+      ).toBe(true);
+    });
+    // And the count is the envelope's, not the number of rows in hand.
+    expect(
+      await within(body).findByText(/620 engrams in this folder/),
+    ).toBeVisible();
+  });
+
+  it("keeps a filter across the whole domain while a folder is open", async () => {
+    serve();
+
+    renderApp("/d/eng?path=notes");
+    const body = await screenBody();
+    await within(body).findByRole("link", { name: /Beta/ });
+
+    await userEvent.click(within(body).getByRole("button", { name: /#eng/ }));
+
+    await screen.findByRole("link", { name: /Gamma/ });
+    // The filtered view is the whole domain, every folder included, and it
+    // says so. Scoping it to the folder being browsed would be a different
+    // feature, not a side effect of paging the browse view.
+    expect(screen.getByText(/whole domain/i)).toBeVisible();
+    const filtered = requested().filter(
+      (path) =>
+        path.startsWith("/domains/eng/engrams?") && path.includes("tags=eng"),
+    );
+    expect(filtered.length).toBeGreaterThan(0);
+    expect(filtered.every((path) => !path.includes("path="))).toBe(true);
   });
 
   it("switches to the whole domain when a tag is filtered on", async () => {

@@ -42,6 +42,13 @@ beforeEach(() => {
   localStorage.clear();
 });
 
+/** Every read of this domain's tree, in order. */
+function trees(): string[] {
+  return apiMock.mock.calls
+    .map(([path]) => path)
+    .filter((path) => path.startsWith("/domains/eng/tree"));
+}
+
 describe("the create flow", () => {
   it("creates in the picked folder and lands in the editor", async () => {
     const created = vi.fn(() => ({
@@ -280,5 +287,60 @@ describe("the create flow", () => {
     expect(
       await screen.findByRole("button", { name: "New engram" }),
     ).toBeInTheDocument();
+  });
+
+  it("moves the tree on, so the sidebar holds what was just created", async () => {
+    // Created at the root on purpose: an engram inside a folder opens that
+    // folder in the sidebar on the way to the editor, and the level it then
+    // fetches would look exactly like the invalidation this is about.
+    const created = vi.fn(() => ({
+      domain: "eng",
+      permalink: "fresh-thought",
+      title: "Fresh Thought",
+      content: "---\ntitle: Fresh Thought\n---\n\n",
+      checksum: "new111",
+      frontmatter: {},
+      observations: [],
+      relations: [],
+      links: [],
+    }));
+    apiMock.mockImplementation(
+      answersFor({
+        "/auth/me": () => meResponse({ user: userFixture() }),
+        "/domains": domainsResponse,
+        "/domains/eng/manifest": () => ({
+          domain: "eng",
+          markdown: "# eng",
+          checksum: "m1",
+        }),
+        "/domains/eng/tree": (path) => tree(path),
+        "/domains/eng/engrams": (_path, init) =>
+          init?.method === "POST"
+            ? created()
+            : { total: 0, page: 1, limit: 50, count: 0, hits: [] },
+        "/domains/eng/engrams/fresh-thought": () => created(),
+        "/validate": () => ({ findings: [], errors: 0 }),
+        "/vocabulary": () => ({ tags: [], categories: [], relation_types: [] }),
+        "/graph": () => ({ nodes: [], edges: [], truncated: false, hidden: 0 }),
+      }),
+    );
+    renderApp("/d/eng");
+    await userEvent.click(
+      await screen.findByRole("button", { name: "New engram" }),
+    );
+    await userEvent.type(screen.getByLabelText("Title"), "Fresh Thought");
+    // The tree is fresh for a minute, so nothing but an invalidation can make
+    // it be asked for again - a remount on the way to the editor will not.
+    const before = trees().length;
+    await userEvent.click(screen.getByRole("button", { name: "Create" }));
+
+    await waitFor(() => {
+      expect(created).toHaveBeenCalled();
+    });
+    // A create is a new row in the tree, so the tree is read again rather
+    // than left one engram short until something else happens to move it.
+    await waitFor(() => {
+      expect(trees().length).toBeGreaterThan(before);
+    });
   });
 });

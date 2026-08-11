@@ -20,23 +20,36 @@
  * already looking at it and an expanded folder stays expanded for free.
  *
  * The folders on the way to the engram being read start open, because a mark
- * on a row nobody can see marks nothing.
+ * on a row nobody can see marks nothing. The folder being browsed on the
+ * screen beside the tree counts as being there too: it opens, and its row
+ * carries the same you-are-here mark an engram row does.
+ *
+ * A folder row is two controls rather than one. Its name is a link to that
+ * folder on the domain screen, which is where a folder of any size can be
+ * paged; its chevron is a button that looks inside the sidebar without moving
+ * the screen. They are siblings, never nested: a link inside a button is an
+ * accessibility violation, and a reader would have no way to say which of the
+ * two they meant. A level the server had to cut ends in one more row - the
+ * whole folder, on the screen - because the sidebar is a way around a domain
+ * rather than a place to render ten thousand rows.
  */
 
 import { useQuery } from "@tanstack/react-query";
+import { Folder as FolderIcon } from "lucide-react";
 import { DropdownMenu } from "radix-ui";
 import { useState } from "react";
-import { Link, useNavigate } from "react-router";
+import { Link, useNavigate, useSearchParams } from "react-router";
 
 import { problemDetail } from "../api/client";
-import { fetchTree, treeKey } from "../api/domain";
+import { treeQuery } from "../api/domain";
 import type { DomainSummary } from "../api/domains";
 import type { EngramRow } from "../api/engrams";
 import { useAuth } from "../auth/AuthContext";
 import { RETIRED_CLASS, isRetired } from "../lifecycle";
-import { domainRoute, engramRoute, manifestRoute } from "../paths";
+import { domainRoute, engramRoute, folderRoute, manifestRoute } from "../paths";
 import { CreateEngramDialog } from "./CreateEngramDialog";
 import { ITEM_CLASSES, MENU_CLASSES } from "./menu";
+import { FOCUS_RING } from "./primitives";
 
 export interface DomainNavProps {
   /** The domain the route is inside. */
@@ -60,6 +73,12 @@ export function DomainNav({
 }: DomainNavProps) {
   const { capabilities } = useAuth();
   const [creating, setCreating] = useState(false);
+  const [params] = useSearchParams();
+  // Which folder the screen beside the tree is browsing, so the tree can say
+  // so. Only the domain's own screen writes `path`, and that is also the only
+  // screen where `permalink` is empty, so the pair is read as one state rather
+  // than two that could contradict each other.
+  const browsing = permalink === "" ? (params.get("path") ?? "") : "";
 
   return (
     <div className="flex flex-col gap-3">
@@ -100,7 +119,12 @@ export function DomainNav({
         <h2 className="text-caption px-2 pb-2 font-semibold text-slate-500 dark:text-slate-400">
           Engrams
         </h2>
-        <TreeBranch domain={domain} path="" permalink={permalink} />
+        <TreeBranch
+          domain={domain}
+          path=""
+          permalink={permalink}
+          browsing={browsing}
+        />
         {/*
           Left out on the domain's own home screen only: that screen carries
           the same launcher beside its heading, prefilled with the folder
@@ -212,15 +236,15 @@ function TreeBranch({
   domain,
   path,
   permalink,
+  browsing,
 }: {
   domain: string;
   path: string;
   permalink: string;
+  /** The folder the screen beside the tree is browsing, or the empty string. */
+  browsing: string;
 }) {
-  const tree = useQuery({
-    queryKey: treeKey(domain, path),
-    queryFn: () => fetchTree(domain, path),
-  });
+  const tree = useQuery(treeQuery(domain, path));
 
   if (tree.isPending) {
     return (
@@ -267,6 +291,7 @@ function TreeBranch({
             path={childPath(path, name)}
             name={name}
             permalink={permalink}
+            browsing={browsing}
           />
         </li>
       ))}
@@ -275,7 +300,47 @@ function TreeBranch({
           <EngramLink row={row} current={row.permalink === permalink} />
         </li>
       ))}
+      {tree.data?.truncated === true && (
+        <li>
+          <BrowseAll domain={domain} path={path} total={tree.data.total} />
+        </li>
+      )}
     </ul>
+  );
+}
+
+/**
+ * The last row of a level the server had to cut: the whole folder, on the
+ * screen that pages it.
+ *
+ * The count is the level's own, so the row is a fact about this folder rather
+ * than an apology for the sidebar, and it says out loud that what is drawn
+ * above it is not all there is. Muted and one step down in size, because it is
+ * the only row here that is not a thing in the domain.
+ *
+ * Muted at slate-600 rather than the slate-500 the app's captions usually
+ * wear, because this caption has a hover state under it: slate-500 on the
+ * slate-100 wash is 4.35:1, under the 4.5:1 floor for text this size, while
+ * slate-600 is 7.58:1 on white and 6.92:1 on the wash. Dark needs no such
+ * step: slate-400 is 7.66:1 on slate-950 and 5.56:1 on the slate-800 wash.
+ */
+function BrowseAll({
+  domain,
+  path,
+  total,
+}: {
+  domain: string;
+  path: string;
+  total: number;
+}) {
+  const here = path === "" ? domain : (path.split("/").pop() ?? path);
+  return (
+    <Link
+      to={folderRoute(domain, path)}
+      className={`block truncate rounded px-2 py-1 text-caption text-slate-600 hover:bg-slate-100 dark:text-slate-400 dark:hover:bg-slate-800 ${FOCUS_RING}`}
+    >
+      Browse all {total} engrams in {here}
+    </Link>
   );
 }
 
@@ -294,30 +359,46 @@ function isPinnedManifest(row: EngramRow): boolean {
 }
 
 /**
- * A folder, open or shut.
+ * A folder: a name that goes there, and a chevron that looks inside.
  *
- * A disclosure button rather than a link: opening a folder is a look inside
- * the sidebar, and the screen beside it stays where the reader left it. What
- * is inside is mounted only while it is open, which is what makes the fetch
- * lazy.
+ * The two are separate controls because they do two different things. The name
+ * is a link to this folder on the domain screen, which is the surface that can
+ * page a folder of any size; the chevron is a disclosure that opens the branch
+ * here and leaves the screen beside it where the reader left it. What is
+ * inside is mounted only while it is open, which is what makes the fetch lazy.
  *
- * A folder opens itself when the engram being read moves into it, whether that
- * happened on arrival or by a link somewhere else on the screen. It never
- * closes itself: a reader who folded this branch away meant it, and the state
- * they set is theirs until they leave the folder again.
+ * The chevron is named after what it will do - "Expand notes", "Collapse
+ * notes" - rather than after the folder, for two reasons: two controls in one
+ * row both called `notes` would be indistinguishable to anybody listening
+ * rather than looking, and the name then says the thing `aria-expanded` only
+ * implies. `aria-controls` is left off: the region it would name does not
+ * exist while the branch is shut, and an id pointing at nothing is worse than
+ * a state the button already carries.
+ *
+ * A folder opens itself when the engram being read moves into it, or when the
+ * screen beside it starts browsing it, whether that happened on arrival or by
+ * a link somewhere else. It never closes itself: a reader who folded this
+ * branch away meant it, and the state they set is theirs until they leave the
+ * folder again.
  */
 function Folder({
   domain,
   path,
   name,
   permalink,
+  browsing,
 }: {
   domain: string;
   path: string;
   name: string;
   permalink: string;
+  browsing: string;
 }) {
-  const holdsCurrent = permalink.startsWith(`${path}/`);
+  // Being in this folder is either of two things: reading an engram inside it,
+  // or browsing it (or something under it) on the screen beside the tree.
+  const here = browsing === path;
+  const holdsCurrent =
+    permalink.startsWith(`${path}/`) || here || browsing.startsWith(`${path}/`);
   const [open, setOpen] = useState(holdsCurrent);
   // Adjusted while rendering rather than in an effect, which is what React
   // asks for when state has to follow a prop: the branch opens in the same
@@ -333,25 +414,59 @@ function Folder({
 
   return (
     <>
-      <button
-        type="button"
-        aria-expanded={open}
-        onClick={() => {
-          setOpen((wasOpen) => !wasOpen);
-        }}
-        className="flex w-full items-center gap-1 rounded px-2 py-1 text-left text-sm hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:hover:bg-slate-800"
+      {/*
+        The row's own metrics, split across its two controls rather than
+        dropped: `py-1` on both and the `px-2` shared between them, so a folder
+        row is exactly as tall and as wide as the engram rows under it. The
+        hover wash sits on the row rather than on either control, because what
+        lights up under the pointer is the row.
+      */}
+      <div
+        className={`flex items-center rounded text-sm hover:bg-slate-100 dark:hover:bg-slate-800 ${
+          here ? "bg-slate-100 font-medium dark:bg-slate-800" : ""
+        }`}
       >
-        <span
-          aria-hidden="true"
-          className="w-3 text-xs text-slate-500 dark:text-slate-400"
+        <button
+          type="button"
+          aria-expanded={open}
+          aria-label={`${open ? "Collapse" : "Expand"} ${name}`}
+          onClick={() => {
+            setOpen((wasOpen) => !wasOpen);
+          }}
+          className={`rounded py-1 pr-1 pl-2 text-slate-500 dark:text-slate-400 ${FOCUS_RING}`}
         >
-          {open ? "▾" : "▸"}
-        </span>
-        <span className="truncate">{name}</span>
-      </button>
+          <span aria-hidden="true" className="block w-3 text-xs">
+            {open ? "▾" : "▸"}
+          </span>
+        </button>
+        <Link
+          to={folderRoute(domain, path)}
+          aria-current={here ? "page" : undefined}
+          className={`flex min-w-0 grow items-center gap-1.5 rounded py-1 pr-2 ${FOCUS_RING}`}
+        >
+          {/*
+            Decorative: the row says `notes`, and the icon is what makes a
+            folder legible as a folder at a glance rather than a second name
+            for it. The engram rows stay icon-free on purpose - the icon IS
+            the distinction, and one on every row would say nothing.
+          */}
+          <FolderIcon
+            aria-hidden="true"
+            size={16}
+            strokeWidth={1.75}
+            className="shrink-0"
+          />
+          <span className="truncate">{name}</span>
+        </Link>
+      </div>
       {open && (
         <div className="ml-3 border-l border-slate-200 pl-1 dark:border-slate-800">
-          <TreeBranch domain={domain} path={path} permalink={permalink} />
+          <TreeBranch
+            domain={domain}
+            path={path}
+            permalink={permalink}
+            browsing={browsing}
+          />
         </div>
       )}
     </>

@@ -203,4 +203,63 @@ describe("the retire dialog", () => {
     );
     expect(call?.[1]?.headers).toEqual({ "If-Match": '"3f8a1c05e2"' });
   });
+
+  it("moves the tree on, so the sidebar stops showing what was retired", async () => {
+    const retired = vi.fn(() => ({
+      domain: "eng",
+      permalink: "alpha",
+      status: "archived",
+      successor: null,
+    }));
+    serve({
+      "/domains/eng/retire": (_path, init) =>
+        init?.method === "POST" ? retired() : null,
+      "/domains/eng/tree": () => ({
+        domain: "eng",
+        path: "/",
+        folders: [],
+        engrams: [
+          {
+            permalink: "alpha",
+            title: "Alpha",
+            type: "engram",
+            status: "stable",
+            path: "alpha.md",
+          },
+        ],
+      }),
+    });
+    renderApp("/d/eng/e/alpha");
+    await screen.findByRole("link", { name: "Alpha" });
+    // The tree is fresh for a minute, so nothing but an invalidation can make
+    // it be asked for again while this screen sits still.
+    const before = trees().length;
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "More actions" }),
+    );
+    await userEvent.click(
+      await screen.findByRole("menuitem", { name: "Retire" }),
+    );
+    const dialog = await screen.findByRole("dialog", { name: /retire/i });
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Retire engram" }),
+    );
+
+    await waitFor(() => {
+      expect(retired).toHaveBeenCalled();
+    });
+    // A retirement is a fade in the tree beside the screen, so the tree is
+    // read again rather than left saying the engram is current.
+    await waitFor(() => {
+      expect(trees().length).toBeGreaterThan(before);
+    });
+  });
 });
+
+/** Every read of this domain's tree, in order. */
+function trees(): string[] {
+  return apiMock.mock.calls
+    .map(([path]) => path)
+    .filter((path) => path.startsWith("/domains/eng/tree"));
+}

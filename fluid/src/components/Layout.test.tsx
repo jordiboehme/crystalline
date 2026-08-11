@@ -122,14 +122,29 @@ function serveInDomain(extra: Record<string, (path: string) => unknown> = {}) {
     "/domains": twoDomainsResponse,
     "/domains/eng/tree": treeResponse,
     "/domains/eng/manifest": () => ({ domain: "eng", markdown: "" }),
-    "/domains/eng/engrams": () => ({
-      mode: "text",
-      total: 0,
-      page: 1,
-      limit: 50,
-      count: 0,
-      hits: [],
-    }),
+    // The domain screen behind the frame pages this, scoped to the folder it
+    // is browsing: the tree is navigation, the listing is what is in there.
+    "/domains/eng/engrams": (path) =>
+      path.includes("path=notes")
+        ? {
+            mode: "text",
+            total: 1,
+            page: 1,
+            limit: 50,
+            count: 1,
+            hits: [
+              {
+                domain: "eng",
+                permalink: "notes/beta",
+                title: "Beta",
+                engram_type: "engram",
+                kind: "engram",
+                status: "stable",
+                tags: [],
+              },
+            ],
+          }
+        : { mode: "text", total: 0, page: 1, limit: 50, count: 0, hits: [] },
     "/domains/eng/engrams/alpha": () => ({
       domain: "eng",
       permalink: "alpha",
@@ -402,7 +417,7 @@ describe("the sidebar inside a domain", () => {
     ).toHaveAttribute("href", "/");
     // And below it, what this domain holds: its folders and its engrams.
     expect(
-      await within(nav).findByRole("button", { name: "notes" }),
+      await within(nav).findByRole("button", { name: "Expand notes" }),
     ).toHaveAttribute("aria-expanded", "false");
     expect(within(nav).getByRole("link", { name: "Alpha" })).toHaveAttribute(
       "href",
@@ -452,6 +467,84 @@ describe("the sidebar inside a domain", () => {
     ).toBeVisible();
   });
 
+  it("splits a folder row: the name browses it, the chevron opens it here", async () => {
+    serveInDomain();
+
+    renderApp("/d/eng");
+    const nav = await sidebar();
+
+    // Two controls, side by side rather than one inside the other: a link
+    // nested in a button is an accessibility violation and a guess about
+    // which of the two a click meant.
+    const name = await within(nav).findByRole("link", { name: "notes" });
+    expect(name).toHaveAttribute("href", "/d/eng?path=notes");
+    const chevron = within(nav).getByRole("button", { name: "Expand notes" });
+    expect(chevron.contains(name)).toBe(false);
+    expect(name.contains(chevron)).toBe(false);
+
+    // The chevron looks inside without moving the screen beside it, and says
+    // which of the two things it does next.
+    await userEvent.click(chevron);
+    expect(
+      await within(nav).findByRole("button", { name: "Collapse notes" }),
+    ).toHaveAttribute("aria-expanded", "true");
+    expect(
+      await within(nav).findByRole("link", { name: "Beta" }),
+    ).toBeVisible();
+  });
+
+  it("offers the whole of a folder too big to draw", async () => {
+    serveInDomain({
+      "/domains/eng/tree": (path) =>
+        path.includes("path=notes")
+          ? {
+              domain: "eng",
+              path: "notes",
+              folders: [],
+              engrams: [
+                {
+                  permalink: "notes/beta",
+                  title: "Beta",
+                  type: "engram",
+                  status: "stable",
+                  path: "notes/beta.md",
+                },
+              ],
+              truncated: true,
+              total: 620,
+            }
+          : treeResponse(path),
+    });
+
+    renderApp("/d/eng");
+    const nav = await sidebar();
+    await userEvent.click(
+      await within(nav).findByRole("button", { name: "Expand notes" }),
+    );
+
+    // The sidebar never tries to show a big folder whole: it says how big the
+    // folder is and hands it to the screen, which pages.
+    const all = await within(nav).findByRole("link", {
+      name: "Browse all 620 engrams in notes",
+    });
+    expect(all).toHaveAttribute("href", "/d/eng?path=notes");
+  });
+
+  it("marks the folder being browsed and opens it", async () => {
+    serveInDomain();
+
+    renderApp("/d/eng?path=notes");
+    const nav = await sidebar();
+
+    // Browsing a folder is being somewhere, so the tree says where: the same
+    // mark an engram row wears, on the row that is the place.
+    const name = await within(nav).findByRole("link", { name: "notes" });
+    expect(name).toHaveAttribute("aria-current", "page");
+    expect(
+      within(nav).getByRole("button", { name: "Collapse notes" }),
+    ).toHaveAttribute("aria-expanded", "true");
+  });
+
   it("asks for a folder only when it is opened", async () => {
     serveInDomain();
 
@@ -459,7 +552,7 @@ describe("the sidebar inside a domain", () => {
     // Scoped to the sidebar: the domain screen beside it browses by folder
     // too, and this is about the tree in the frame.
     const folder = await within(await sidebar()).findByRole("button", {
-      name: "notes",
+      name: "Expand notes",
     });
     // Nothing below the root was fetched: the tree is walked, not downloaded.
     expect(requested().some((path) => path.includes("path=notes"))).toBe(false);
@@ -486,7 +579,7 @@ describe("the sidebar inside a domain", () => {
     // The folder on the way to it is open, because a mark nobody can see is
     // not a mark at all.
     expect(
-      await within(nav).findByRole("button", { name: "notes" }),
+      await within(nav).findByRole("button", { name: "Collapse notes" }),
     ).toHaveAttribute("aria-expanded", "true");
     const current = await within(nav).findByRole("link", { name: "Beta" });
     expect(current).toHaveAttribute("aria-current", "page");
@@ -500,7 +593,9 @@ describe("the sidebar inside a domain", () => {
 
     renderApp("/d/eng");
     const nav = await sidebar();
-    const folder = await within(nav).findByRole("button", { name: "notes" });
+    const folder = await within(nav).findByRole("button", {
+      name: "Expand notes",
+    });
     expect(folder).toHaveAttribute("aria-expanded", "false");
 
     // Into the folder the long way round, through the screen's own browse

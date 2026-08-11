@@ -59,10 +59,24 @@ export interface EngramFilters {
   status: string | null;
   /** Tags that must all be present. */
   tags: string[];
+  /**
+   * A folder to list, that folder and everything below it. The empty string is
+   * the whole domain.
+   *
+   * A scope rather than a frontmatter filter, which is why `hasFilters` does
+   * not count it: it is what a folder view pages from, and the screen that
+   * shows one is browsing rather than filtering.
+   */
+  path: string;
 }
 
 /** No filter at all: the whole domain. */
-export const NO_FILTERS: EngramFilters = { type: null, status: null, tags: [] };
+export const NO_FILTERS: EngramFilters = {
+  type: null,
+  status: null,
+  tags: [],
+  path: "",
+};
 
 /** Whether any filter is set, which is what decides which view a screen shows. */
 export function hasFilters(filters: EngramFilters): boolean {
@@ -163,16 +177,28 @@ export function domainEngramsKey(
   domain: string,
   filters: EngramFilters,
 ): readonly unknown[] {
-  return ["domain-engrams", domain, filters.type, filters.status, filters.tags];
+  return [
+    "domain-engrams",
+    domain,
+    filters.type,
+    filters.status,
+    filters.tags,
+    filters.path,
+  ];
 }
 
-/** Fetch one page of a domain's engrams, filtered by frontmatter. */
+/** Fetch one page of a domain's engrams, filtered by frontmatter and scoped. */
 export async function fetchDomainEngrams(
   domain: string,
   filters: EngramFilters,
   page: number,
 ): Promise<EngramPage> {
   const query = new URLSearchParams();
+  // Absent is the whole domain, which is what the endpoint means by no `path`
+  // at all: a folder view sends one and every other caller sends none.
+  if (filters.path !== "") {
+    query.set("path", filters.path);
+  }
   if (filters.type !== null) {
     query.set("type", filters.type);
   }
