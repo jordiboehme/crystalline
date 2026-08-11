@@ -37,6 +37,10 @@ struct Options {
     /// `StubConnectAuth::accepting("octo")`, which validates any token and
     /// runs no device flow.
     connect_auth: Option<Arc<dyn ConnectAuth>>,
+    /// The forge a team-domain registration downloads from. Set for the
+    /// github-mode tests so nothing here dials github.com; unset means no
+    /// override, which is fine for every test that never reaches a provider.
+    origin_provider: Option<Arc<support::MockProvider>>,
 }
 
 struct Fixture {
@@ -86,12 +90,18 @@ async fn serve(opts: Options) -> Fixture {
     // Both overrides are load-bearing, not tidiness: without the token-store
     // dir a disconnect here would delete the developer's REAL keychain GitHub
     // token, and without the stub a connect would dial github.com.
-    let engine = Arc::new(
-        Engine::new(Arc::new(Mutex::new(store)), cfg, None, Some(config_path))
-            .with_read_only(opts.read_only)
-            .with_token_store_dir(root.join("tokens"))
-            .with_connect_auth(connect_auth),
-    );
+    // The origins dir is pinned for the same reason as the token store: a
+    // team-domain registration writes origin state, and it must land in the
+    // temp dir rather than in the developer's real state directory.
+    let mut engine = Engine::new(Arc::new(Mutex::new(store)), cfg, None, Some(config_path))
+        .with_read_only(opts.read_only)
+        .with_token_store_dir(root.join("tokens"))
+        .with_connect_auth(connect_auth)
+        .with_origins_dir(root.join("origins"));
+    if let Some(provider) = opts.origin_provider {
+        engine = engine.with_origin_provider(provider);
+    }
+    let engine = Arc::new(engine);
     engine.sync(None).await.unwrap();
 
     let auth = Arc::new(
@@ -247,6 +257,77 @@ async fn virtual_creates_and_disconnected_github_mode_is_a_conflict() {
         .await
         .unwrap();
     assert_eq!(nonsense.status(), 422);
+}
+
+/// A team domain registers under the name the validator handed back, not the
+/// raw one the body carried: `origin_add` uses what it is given verbatim as
+/// the config key AND as the folder segment under the domains root, so a
+/// padded name would otherwise register a domain called "\tteam " with an
+/// on-disk folder to match - the very thing the name check exists to stop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_team_domain_registers_under_the_trimmed_name() {
+    let mock = Arc::new(support::MockProvider::new());
+    let commit = mock.add_commit(std::collections::BTreeMap::from([(
+        "MANIFEST.md".to_string(),
+        b"---\ntype: manifest\ntitle: Team\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Team\n\n## Scope\n\n- shared knowledge\n\n## When to Use\n\n- Route here for team questions\n".to_vec(),
+    )]));
+    mock.set_branch("main", &commit);
+    let fx = serve(Options {
+        github: true,
+        origin_provider: Some(mock),
+        ..Options::default()
+    })
+    .await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+
+    // A credential has to be on file for `github_ready` to let the mode
+    // through; the stub validates any token without leaving the machine.
+    let connected = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/settings/github/token",
+        &admin,
+    )
+    .json(&serde_json::json!({"token": "pat-secret-123"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(connected.status(), 200);
+
+    let created = as_session(fx.addr, reqwest::Method::POST, "/api/v1/domains", &admin)
+        .json(&serde_json::json!({"mode": "github", "repo": "acme/kb", "name": "\tteam "}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201);
+    let body: serde_json::Value = created.json().await.unwrap();
+    assert_eq!(
+        body["domain"], "team",
+        "the registered name is the trimmed one"
+    );
+    let root = body["root"].as_str().unwrap();
+    assert!(root.ends_with("team"), "and so is the folder: {root}");
+    assert!(
+        fx._tmp
+            .path()
+            .join("domains-root/team/MANIFEST.md")
+            .exists(),
+        "the download landed under the pinned domains root"
+    );
+
+    // And the listing knows it by the trimmed name only.
+    let listing = as_session(fx.addr, reqwest::Method::GET, "/api/v1/domains", &admin)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(listing.contains("\"team\""), "{listing}");
+    assert!(
+        !listing.contains("\\tteam"),
+        "no padded name was ever registered: {listing}"
+    );
 }
 
 /// Unregister: the registration and index rows go, the files stay, and the

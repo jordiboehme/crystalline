@@ -186,9 +186,14 @@ pub async fn create(
                 .ok_or_else(|| {
                     ApiError::unprocessable("a team domain requires repo as owner/name")
                 })?;
-            if let Some(name) = body.name.as_deref() {
-                check_domain_name(name)?;
-            }
+            // The TRIMMED name, and it has to be the one that travels on:
+            // `origin_add` uses what it is handed verbatim as the config key
+            // and as the folder segment under the domains root, so passing
+            // the raw body field would register a domain named "\tnotes "
+            // and create a folder to match - exactly what this validator
+            // exists to prevent, and what the other two modes avoid by
+            // passing on what `check_domain_name` gave back.
+            let name = body.name.as_deref().map(check_domain_name).transpose()?;
             // Checked here rather than left to the engine: without a
             // connection the registration cannot work at all, and this way
             // the refusal names the screen that fixes it instead of arriving
@@ -203,7 +208,7 @@ pub async fn create(
                 .engine
                 .origin_add(
                     repo,
-                    body.name.as_deref(),
+                    name,
                     body.path.as_deref(),
                     body.branch.as_deref(),
                     // Never from this surface: a team domain lands under the
