@@ -5,9 +5,11 @@
  * holds its own copy of a value, so a hand edit in the text is on the form a
  * render later, and a form edit is one ordinary undoable transaction.
  *
- * Temporal semantics: an empty date input IS the unbounded state. The Clear
- * button removes the key and is the only thing that does; nothing here ever
- * writes a placeholder date.
+ * Temporal semantics: an absent bound is an answer rather than a gap, so it is
+ * drawn as one - "Always" for the lower bound, "Forever" for the upper - and
+ * one click swaps that state for a picker with the keyboard already in it.
+ * Clearing the picker is the one thing that removes a key, and nothing here
+ * ever writes a placeholder date.
  *
  * The recommended `type` and `status` values are the app's one list, offered
  * through a datalist beside a plain text field. Anything can be typed and
@@ -17,12 +19,13 @@
 
 import type { Text } from "@codemirror/state";
 import type { EditorView } from "@codemirror/view";
+import { X } from "lucide-react";
 import type { ReactElement, ReactNode } from "react";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import type { Vocabulary } from "../api/vocabulary";
 import { FIELD_CLASSES } from "../components/FilterControls";
-import { FOCUS_RING } from "../components/primitives";
+import { BUTTON, FOCUS_RING, IconButton } from "../components/primitives";
 import { SUGGESTED_STATUSES, SUGGESTED_TYPES } from "../filters";
 import type { FieldEdit } from "./frontmatterFields";
 import {
@@ -171,6 +174,13 @@ export function FrontmatterForm({
         </datalist>
       </Row>
       {/*
+        Beside the two fields it is about, rather than at the foot of the rail
+        where it used to sit half of a note about dates.
+      */}
+      <p className={NOTE_CLASSES}>
+        Recommended types and statuses are suggestions; any value is allowed.
+      </p>
+      {/*
         Not a label element: the row holds a button per tag as well as the
         field, and a label wrapping several controls names none of them
         clearly. The field carries its own name instead.
@@ -237,25 +247,33 @@ export function FrontmatterForm({
       <DateRow
         label="Valid from"
         keyName="valid_from"
+        unbounded="Always"
         doc={doc}
         onEdit={apply}
       />
-      <DateRow label="Valid to" keyName="valid_to" doc={doc} onEdit={apply} />
-      <p className={NOTE_CLASSES}>
-        An empty date means unbounded validity, and Clear is what removes a
-        bound. Recommended types and statuses are suggestions; any value is
-        allowed.
-      </p>
+      <DateRow
+        label="Valid to"
+        keyName="valid_to"
+        unbounded="Forever"
+        doc={doc}
+        onEdit={apply}
+      />
     </section>
   );
 }
 
 /**
- * One temporal bound. Empty is not a missing answer, it is the answer: the
- * knowledge has always been valid, or is valid forever. Clearing the field
- * removes the key rather than writing anything in its place.
+ * One temporal bound, in whichever of its two states it is in.
  *
- * Only a complete date is written, and the Clear button is the one thing that
+ * No date is not a missing answer, it is the answer - the knowledge has always
+ * been valid, or is valid forever - so it is drawn as a named state rather than
+ * as an empty field somebody has to know how to read. That state is a button:
+ * pressing it puts a picker there instead, with the keyboard already in it, and
+ * writes nothing until a date is actually picked. The way back out is a clear
+ * control that is there from the moment the picker is, so an author who opened
+ * one by accident is one click from where they were, as often as they like.
+ *
+ * Only a complete date is written, and the clear control is the one thing that
  * removes the key. A date control reports every partly entered date as the
  * empty string, so a field that treated empty as "remove" would delete the
  * line the moment somebody started retyping a date and re-add it at the
@@ -263,23 +281,67 @@ export function FrontmatterForm({
  * whole purpose is not making any, and a savable intermediate state where the
  * engram has silently lost its bound. Removal stays an act somebody performs
  * rather than a state their typing passes through.
+ *
+ * The buffer is still the only copy of the value: `picking` says nothing about
+ * the document, only that an empty picker is on screen. A hand edit that writes
+ * the key shows the date; one that removes it puts the named state back.
  */
 function DateRow({
   label,
   keyName,
+  unbounded,
   doc,
   onEdit,
 }: {
   label: string;
   keyName: string;
+  /** What this bound's absence is called: "Always" low, "Forever" high. */
+  unbounded: string;
   doc: string;
   onEdit: (edit: FieldEdit | null) => void;
 }) {
   const value = readScalar(doc, keyName) ?? "";
+  const [picking, setPicking] = useState(false);
+  const field = useRef<HTMLInputElement>(null);
+  // The swap hands the keyboard over: the control that was pressed is gone, so
+  // focus would otherwise fall to the body. Keyed on `picking` alone, so it
+  // fires on the swap and never steals focus on an ordinary render - a form
+  // that autofocused its dates would take the caret out of the buffer every
+  // time the editor opened on an engram that has one.
+  useEffect(() => {
+    if (picking) {
+      field.current?.focus();
+    }
+  }, [picking]);
+
+  if (value === "" && !picking) {
+    return (
+      // Not a `label` element: it names a button, and a button takes its name
+      // from what it says. The word is the state, and the accessible name says
+      // which bound is in it.
+      <div className="flex flex-col gap-1 text-sm">
+        <span className={LABEL_CLASSES}>{label}</span>
+        <button
+          type="button"
+          aria-label={`${label}: ${unbounded}`}
+          // The field's own box, quietly: pressing it puts a picker in exactly
+          // this space, so nothing moves when it does.
+          className={`${BUTTON.ghost} inline-flex h-8 w-full items-center justify-start`}
+          onClick={() => {
+            setPicking(true);
+          }}
+        >
+          {unbounded}
+        </button>
+      </div>
+    );
+  }
+
   return (
     <div className="flex items-end gap-2">
       <Row label={label}>
         <input
+          ref={field}
           type="date"
           className={`w-full ${FIELD_CLASSES}`}
           value={value}
@@ -290,19 +352,16 @@ function DateRow({
           }}
         />
       </Row>
-      {value !== "" && (
-        <button
-          type="button"
-          aria-label={`Clear ${label.toLowerCase()}`}
-          // The same h-8 box as the field it clears, so the row lines up.
-          className={`inline-flex h-8 shrink-0 items-center rounded border border-slate-300 px-2 text-caption hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800 ${FOCUS_RING}`}
-          onClick={() => {
-            onEdit(writeScalar(doc, keyName, null));
-          }}
-        >
-          Clear
-        </button>
-      )}
+      <IconButton
+        label={`Clear to ${unbounded.toLowerCase()}`}
+        icon={X}
+        onClick={() => {
+          // Both halves of going back: the key goes, and so does the empty
+          // picker that was opened without one ever being written.
+          setPicking(false);
+          onEdit(writeScalar(doc, keyName, null));
+        }}
+      />
     </div>
   );
 }

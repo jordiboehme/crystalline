@@ -263,7 +263,9 @@ export interface paths {
          * One domain's engrams, filtered by frontmatter and paged.
          * @description A filter-only search, so the answer carries the same page envelope a search does and a client pages it the same way.
          *
-         *     `path` scopes the listing to one folder, the folder and everything below it, and it is a folder rather than a string prefix: `notes` takes `notes/deep/y.md` and never `notes-misc/z.md`. The total stays exact under it, so a folder holding thousands of engrams costs one page rather than the folder. The tree endpoint still owns the navigation view and this one owns the listing.
+         *     `path` scopes the listing to one folder, the folder and everything below it, and it is a folder rather than a string prefix: `notes` takes `notes/deep/y.md` and never `notes-misc/z.md`. The total stays exact under it, so a folder holding thousands of engrams costs one page rather than the folder.
+         *
+         *     Under `path`, `total` counts the folder recursively - every engram below it at any depth - which is the number to show when promising a folder's size. The tree endpoint's `total` counts a single level and is deliberately smaller, because it states a fact about the level it drew rather than a promise about the folder. The tree still owns the navigation view and this one owns the listing.
          *
          *     A domain nobody registered is a 404, while filters that match nothing are an empty page: two states a client can tell apart.
          */
@@ -443,7 +445,9 @@ export interface paths {
          * One level of a domain's folders and engrams.
          * @description The navigation a file tree is built from, one level at a time and bounded: a level holding more engrams than the tree shows is cut, `total` says how many it really holds and `truncated` says the rows were cut, so a client can send its reader to the paged listing instead.
          *
-         *     `folders` is never cut, so a truncated level still names every folder a reader can descend into. A `glob` narrows the engrams this level returned, so on a truncated level it selects within the cut rather than across the whole folder.
+         *     `total` counts this level, not the folder: it moves with `depth` and leaves out everything nested deeper, so a folder of ten engrams holding a subfolder of a thousand reports ten here. `GET /domains/{domain}/engrams?path=...` counts the same folder recursively and reports the larger number. Neither is the other's approximation - a level states a fact about the rows it drew, a folder listing promises the folder - so a client that means to say "N engrams in this folder" takes that number from the listing.
+         *
+         *     `folders` is never cut, so a truncated level still names every folder a reader can descend into. A `glob` narrows the engrams this level returned, so on a truncated level it selects within the cut rather than across the whole folder, and it does not filter `folders` at all.
          */
         get: operations["get_domain_tree"];
         put?: never;
@@ -2138,6 +2142,10 @@ export interface operations {
                  *     everything below it. A folder rather than a string prefix: `notes`
                  *     takes `notes/deep/y.md` and never `notes-misc/z.md`. Absent or empty
                  *     is the whole domain.
+                 *
+                 *     The `total` beside the hits counts this folder recursively, at any
+                 *     depth, which is the number to show when promising a folder's size. The
+                 *     tree endpoint counts one level and reports a smaller one.
                  * @example notes
                  */
                 path?: string;
@@ -2161,7 +2169,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description The engine's page envelope, unchanged. */
+            /** @description The engine's page envelope, unchanged. Under `path`, its `total` is the folder's recursive count, not the tree's per-level one. */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -3264,7 +3272,9 @@ export interface operations {
                  */
                 path?: string;
                 /**
-                 * @description How many folder levels deep to list. Defaults to 1.
+                 * @description How many folder levels deep to list. Defaults to 1. The `total` in the
+                 *     answer counts this depth, so it moves with this parameter and is not
+                 *     the folder's recursive size.
                  * @example 2
                  */
                 depth?: number;

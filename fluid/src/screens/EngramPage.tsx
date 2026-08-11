@@ -203,106 +203,109 @@ export default function EngramPage() {
     <div className="flex flex-col gap-6">
       <header className="flex flex-col gap-2">
         {/*
-          Where this engram lives, above its name. The trail prints: the
-          details panel and every control below are chrome and stay off the
-          page, so this line is what says on paper which domain and which
-          folders this document came out of.
-        */}
-        <Breadcrumbs
-          crumbs={crumbsOf(engram.domain, engram.permalink, engram.title)}
-        />
-        <h1 id="engram-title" className="text-display">
-          {engram.title}
-        </h1>
-        {/*
-          The controls, which are chrome: they stay off the printed page,
-          where the trail above and the body are the whole document.
+          Where this engram lives, and what can be done with it: the address on
+          the left, the controls on the right, the title alone on the line
+          below with nothing competing for it.
 
-          One thing to do and one place to look for the rest. Editing is what
-          somebody came to this header for, so it is the button; everything
-          else is a row in the overflow menu, where the destructive one sits
-          alone below a rule. `EngramActions` builds the three utilities and
-          hands them over through the ref the menu rows and the palette both
-          run; it draws nothing here but the region that announces them.
+          The trail prints: the details panel and the controls beside it are
+          chrome and stay off the page, so this line is what says on paper
+          which domain and which folders this document came out of.
         */}
-        <div className="flex flex-wrap items-center gap-2 print:hidden">
-          {capabilities.canWrite && (
-            <Link
-              to={editRoute(engram.domain, engram.permalink)}
-              onPointerEnter={prefetchEditor}
-              onFocus={prefetchEditor}
-              className={BUTTON.primary}
-            >
-              Edit
-            </Link>
-          )}
-          <DropdownMenu.Root>
-            <DropdownMenu.Trigger asChild>
-              <IconButton label="More actions" icon={MoreHorizontal} />
-            </DropdownMenu.Trigger>
-            <DropdownMenu.Portal>
-              <DropdownMenu.Content
-                align="end"
-                sideOffset={6}
-                className={MENU_CLASSES}
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <Breadcrumbs
+            crumbs={crumbsOf(engram.domain, engram.permalink, engram.title)}
+          />
+          {/*
+            One thing to do and one place to look for the rest. Editing is what
+            somebody came to this page's header for, so it keeps its name and
+            its button; everything else is a row in the overflow menu, where
+            the destructive one sits alone below a rule. `EngramActions` builds
+            the three utilities and hands them over through the ref the menu
+            rows and the palette both run; it draws nothing here but the region
+            that announces them.
+          */}
+          <div className="flex flex-wrap items-center gap-2 print:hidden">
+            {capabilities.canWrite && (
+              <Link
+                to={editRoute(engram.domain, engram.permalink)}
+                onPointerEnter={prefetchEditor}
+                onFocus={prefetchEditor}
+                className={BUTTON.primary}
               >
-                {capabilities.canWrite && (
+                Edit
+              </Link>
+            )}
+            <DropdownMenu.Root>
+              <DropdownMenu.Trigger asChild>
+                <IconButton label="More actions" icon={MoreHorizontal} />
+              </DropdownMenu.Trigger>
+              <DropdownMenu.Portal>
+                <DropdownMenu.Content
+                  align="end"
+                  sideOffset={6}
+                  className={MENU_CLASSES}
+                >
+                  {capabilities.canWrite && (
+                    <DropdownMenu.Item
+                      className={ITEM_CLASSES}
+                      onSelect={() => {
+                        setMoving(true);
+                      }}
+                    >
+                      Move
+                    </DropdownMenu.Item>
+                  )}
                   <DropdownMenu.Item
                     className={ITEM_CLASSES}
                     onSelect={() => {
-                      setMoving(true);
+                      utilities.current?.download();
                     }}
                   >
-                    Move
+                    Download as Markdown
                   </DropdownMenu.Item>
-                )}
-                <DropdownMenu.Item
-                  className={ITEM_CLASSES}
-                  onSelect={() => {
-                    utilities.current?.download();
-                  }}
-                >
-                  Download as Markdown
-                </DropdownMenu.Item>
-                <DropdownMenu.Item
-                  className={ITEM_CLASSES}
-                  onSelect={() => {
-                    utilities.current?.share();
-                  }}
-                >
-                  Share link
-                </DropdownMenu.Item>
-                <DropdownMenu.Item
-                  className={ITEM_CLASSES}
-                  onSelect={() => {
-                    utilities.current?.print();
-                  }}
-                >
-                  Print view
-                </DropdownMenu.Item>
-                {/*
-                  The rule and the retirement are one piece: a reader who may
-                  not write sees neither, rather than a menu ending in a
-                  divider with nothing under it.
-                */}
-                {capabilities.canWrite && (
-                  <>
-                    <DropdownMenu.Separator className="my-1 h-px bg-slate-200 dark:bg-slate-700" />
-                    <DropdownMenu.Item
-                      className={`${ITEM_CLASSES} text-red-700 dark:text-red-300`}
-                      onSelect={() => {
-                        setRetiring(true);
-                      }}
-                    >
-                      Retire
-                    </DropdownMenu.Item>
-                  </>
-                )}
-              </DropdownMenu.Content>
-            </DropdownMenu.Portal>
-          </DropdownMenu.Root>
-          <EngramActions engram={engram} handlers={utilities} />
+                  <DropdownMenu.Item
+                    className={ITEM_CLASSES}
+                    onSelect={() => {
+                      utilities.current?.share();
+                    }}
+                  >
+                    Share link
+                  </DropdownMenu.Item>
+                  <DropdownMenu.Item
+                    className={ITEM_CLASSES}
+                    onSelect={() => {
+                      utilities.current?.print();
+                    }}
+                  >
+                    Print view
+                  </DropdownMenu.Item>
+                  {/*
+                    The rule and the retirement are one piece: a reader who
+                    may not write sees neither, rather than a menu ending in a
+                    divider with nothing under it.
+                  */}
+                  {capabilities.canWrite && (
+                    <>
+                      <DropdownMenu.Separator className="my-1 h-px bg-slate-200 dark:bg-slate-700" />
+                      <DropdownMenu.Item
+                        className={`${ITEM_CLASSES} text-red-700 dark:text-red-300`}
+                        onSelect={() => {
+                          setRetiring(true);
+                        }}
+                      >
+                        Retire
+                      </DropdownMenu.Item>
+                    </>
+                  )}
+                </DropdownMenu.Content>
+              </DropdownMenu.Portal>
+            </DropdownMenu.Root>
+            <EngramActions engram={engram} handlers={utilities} />
+          </div>
         </div>
+        <h1 id="engram-title" className="text-display">
+          {engram.title}
+        </h1>
       </header>
 
       <LifecycleBanner

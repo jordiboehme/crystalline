@@ -540,6 +540,15 @@ function Surface({
    * keystroke, which an inline closure would let starve the draft to nothing.
    */
   const inRoom = room !== null;
+  /**
+   * Whether the save now being asked for is a Done rather than a checkpoint.
+   *
+   * A ref rather than state because nothing renders differently for it: it is
+   * read once, inside the save that answers the request, where the server's
+   * response is what says the write landed. It is set by `finish` below and
+   * cleared by whichever end the save reaches - the navigation, or the throw.
+   */
+  const finishing = useRef(false);
   const separator = collab.separator;
   const draftContent = useCallback(
     (buffer: string) => (inRoom ? fileSpace(buffer, separator) : buffer),
@@ -567,12 +576,22 @@ function Surface({
         // already debounce-saving the same engram.
         throw new Error("unreachable: the collab transport never PUTs");
       }
-      const saved = await saveEngram(
-        engram.domain,
-        engram.permalink,
-        content,
-        token,
-      );
+      let saved;
+      try {
+        saved = await saveEngram(
+          engram.domain,
+          engram.permalink,
+          content,
+          token,
+        );
+      } catch (error) {
+        // A refused save is not a finish. The author stays on the buffer that
+        // caused it, with the notice or the conflict view the session raises,
+        // and the standing request to leave is dropped rather than left armed
+        // for whatever save happens to land next.
+        finishing.current = false;
+        throw error;
+      }
       queryClient.setQueryData(
         engramDetailKey(saved.domain, saved.permalink),
         saved,
@@ -587,7 +606,15 @@ function Surface({
       void queryClient.invalidateQueries({
         queryKey: domainTreeKey(saved.domain),
       });
-      if (saved.permalink !== engram.permalink) {
+      if (finishing.current) {
+        // Done: the server has confirmed the write, so being finished with
+        // this engram ends where reading it does - at the address the save
+        // answered from, which a rename through the frontmatter has already
+        // moved. Nothing navigates before this point: a save the server
+        // refused throws above and leaves the author where they are.
+        finishing.current = false;
+        void navigate(engramRoute(saved.domain, saved.permalink));
+      } else if (saved.permalink !== engram.permalink) {
         // The rename receipt: the engram answers at its new address now, and
         // so does this editor.
         void navigate(editRoute(saved.domain, saved.permalink), {
@@ -605,6 +632,31 @@ function Surface({
     flush: collab.flush,
     draftContent,
   });
+
+  /**
+   * Done on the solo surface: save what there is to save, then leave.
+   *
+   * Two mental models, one for each control - Save is a checkpoint, Done is
+   * being finished - and finished has to mean the work is kept, or the word is
+   * a lie. The navigation happens in the save itself, on the server's receipt,
+   * so a refused write keeps the author here rather than walking them away
+   * from text that never landed.
+   *
+   * Both shortcuts leave immediately rather than doing nothing. A buffer with
+   * hard errors cannot be saved by this button any more than by Save, and that
+   * is the one case where the older behavior is the informative one: the way
+   * out stays open and the draft keeps the text, exactly as it did when Done
+   * was a link. A clean buffer has nothing to write, so a PUT would only be a
+   * round trip for a file that already matches.
+   */
+  const finish = () => {
+    if (session.hardErrors > 0 || !session.dirty) {
+      void navigate(engramRoute(engram.domain, engram.permalink));
+      return;
+    }
+    finishing.current = true;
+    session.requestSave();
+  };
 
   /**
    * The session's own save receipt, folded back into the buffer's state: the
@@ -683,14 +735,28 @@ function Surface({
     };
   }, [owedSave]);
 
-  // The session's rename receipt, followed the same way the solo save's is.
+  // The session's rename receipt, followed the same way the solo save's is -
+  // and the tree moved on the same way too. A room's saves are the server's
+  // own debounce and there is no receipt for most of them, but a rename is a
+  // discrete one, so the sidebar can be told exactly when the thing a row is
+  // drawn from changed: one refetch per rename rather than one per save.
   useEffect(() => {
     if (inRoom && collab.permalink !== engram.permalink) {
+      void queryClient.invalidateQueries({
+        queryKey: domainTreeKey(engram.domain),
+      });
       void navigate(editRoute(engram.domain, collab.permalink), {
         replace: true,
       });
     }
-  }, [inRoom, collab.permalink, engram.domain, engram.permalink, navigate]);
+  }, [
+    inRoom,
+    collab.permalink,
+    engram.domain,
+    engram.permalink,
+    navigate,
+    queryClient,
+  ]);
 
   // The resolver reaches the buffer through its compartment rather than
   // through a remount: the chips redraw, the text and the history stay.
@@ -839,6 +905,10 @@ function Surface({
             <button
               type="button"
               onClick={session.requestSave}
+              // What each of the two verbs promises, in one line, where the
+              // pointer already is. The buttons say what they do; these say
+              // what happens next.
+              title="Save and keep editing"
               // In a room the client's verdict never gates a save: the server
               // owns the write, it debounce-saves whatever the shared text
               // holds regardless of this tab, and its own parse refusal is
@@ -854,13 +924,33 @@ function Surface({
             {/*
               The primary verb of this screen: Save keeps the work, Done is
               the act of being finished with it and the one that leaves.
+
+              What "finished" can promise depends on who saves. On the solo
+              surface this tab owns the write, so Done performs it and then
+              leaves - a button, because a link that refused to navigate when
+              the save was refused would be lying about what it is. In a room
+              the server owns the write and is already making it; there is
+              nothing for this control to do but leave, so it stays the link
+              it has always been.
             */}
-            <Link
-              to={engramRoute(engram.domain, engram.permalink)}
-              className={BUTTON.primary}
-            >
-              Done
-            </Link>
+            {inRoom ? (
+              <Link
+                to={engramRoute(engram.domain, engram.permalink)}
+                title="Finish; the server keeps the room's work"
+                className={BUTTON.primary}
+              >
+                Done
+              </Link>
+            ) : (
+              <button
+                type="button"
+                onClick={finish}
+                title="Save and finish"
+                className={BUTTON.primary}
+              >
+                Done
+              </button>
+            )}
           </div>
         </div>
       </header>

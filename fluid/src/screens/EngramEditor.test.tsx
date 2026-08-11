@@ -580,6 +580,97 @@ describe("the engram editor", () => {
     });
   });
 
+  it("Done saves the buffer and leaves for the reading page", async () => {
+    const put = vi.fn(() => detailResponse({ checksum: "next111" }));
+    serveEditor({
+      "/domains/eng/engrams/alpha": (_path, init) =>
+        init?.method === "PUT" ? put() : detailResponse(),
+    });
+    renderApp("/d/eng/edit/alpha");
+    await screen.findByLabelText("Engram source");
+    // Something to save: the form's own dispatch, which is an edit like any
+    // other as far as the buffer is concerned.
+    const status = await screen.findByLabelText("Status");
+    await userEvent.clear(status);
+    await userEvent.type(status, "draft");
+    await userEvent.tab();
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Save" })).toBeEnabled();
+    });
+
+    await userEvent.click(screen.getByRole("button", { name: "Done" }));
+
+    // Finished means both halves: the write landed, and the reading page is
+    // where being finished ends up.
+    await waitFor(() => {
+      expect(put).toHaveBeenCalled();
+    });
+    expect(putBody(0)).toEqual({
+      content: CONTENT.replace("status: stable", "status: draft"),
+    });
+    expect(
+      await screen.findByRole("heading", { name: "Alpha", level: 1 }),
+    ).toBeInTheDocument();
+    expect(screen.queryByLabelText("Engram source")).not.toBeInTheDocument();
+  });
+
+  it("Done leaves without saving what hard errors refuse, rather than doing nothing", async () => {
+    const put = vi.fn(() => detailResponse({ checksum: "next111" }));
+    serveEditor({
+      "/validate": () => ({
+        errors: 1,
+        findings: [
+          {
+            rule: "E001",
+            severity: "error",
+            message: "frontmatter will not parse",
+            line: 1,
+            fix: null,
+          },
+        ],
+      }),
+      "/domains/eng/engrams/alpha": (_path, init) =>
+        init?.method === "PUT" ? put() : detailResponse(),
+    });
+    renderApp("/d/eng/edit/alpha");
+    await screen.findByLabelText("Engram source");
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
+    });
+
+    await userEvent.click(screen.getByRole("button", { name: "Done" }));
+
+    // The save gate holds here exactly as it holds on Save; what Done falls
+    // back to is what it has always been, a way out - with the buffer kept as
+    // a draft the way every other way out keeps it.
+    expect(
+      await screen.findByRole("heading", { name: "Alpha", level: 1 }),
+    ).toBeInTheDocument();
+    expect(put).not.toHaveBeenCalled();
+  });
+
+  it("Done never saves twice for one press", async () => {
+    const put = vi.fn(() => detailResponse({ checksum: "next111" }));
+    serveEditor({
+      "/domains/eng/engrams/alpha": (_path, init) =>
+        init?.method === "PUT" ? put() : detailResponse(),
+    });
+    renderApp("/d/eng/edit/alpha");
+    await screen.findByLabelText("Engram source");
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Save" })).toBeEnabled();
+    });
+    // Save, then Done - the order the smoke journey presses them in. The
+    // second press has nothing left to write, so it only leaves.
+    await userEvent.click(screen.getByRole("button", { name: "Save" }));
+    await screen.findByText("Saved");
+    await userEvent.click(screen.getByRole("button", { name: "Done" }));
+    expect(
+      await screen.findByRole("heading", { name: "Alpha", level: 1 }),
+    ).toBeInTheDocument();
+    expect(put).toHaveBeenCalledTimes(1);
+  });
+
   it("offers a stored draft and restores it", async () => {
     localStorage.setItem(
       "fluid.draft.ada.eng/alpha",
@@ -1169,6 +1260,70 @@ describe("the engram editor in a session", () => {
     });
     expect(flush).toHaveBeenCalled();
     expect(puts()).toHaveLength(0);
+  });
+
+  it("Done is the plain way out of a room, saving nothing itself", async () => {
+    const { flush } = await openRoom();
+    // The server owns the write in a session, so the promise this control can
+    // keep is leaving - and it keeps it as a link, the way it always has.
+    const done = screen.getByRole("link", { name: "Done" });
+    expect(done).toHaveAttribute("href", "/d/eng/e/alpha");
+    await userEvent.click(done);
+    expect(
+      await screen.findByRole("heading", { name: "Alpha", level: 1 }),
+    ).toBeInTheDocument();
+    expect(puts()).toHaveLength(0);
+    expect(flush).not.toHaveBeenCalled();
+  });
+
+  it("a rename the room reports moves the tree on, so the sidebar stops pointing at nothing", async () => {
+    joinedSession({ permalink: "sharper-alpha" });
+    // The editor is held back until the sidebar has read the tree, so the
+    // count below is the count before the receipt rather than a race with it.
+    let release: () => void = () => undefined;
+    const opened = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    apiMock.mockImplementation(
+      answersFor({
+        "/auth/me": () => meResponse({ user: userFixture() }),
+        "/domains": domainsResponse,
+        "/domains/eng/engrams/alpha": async () => {
+          await opened;
+          return detailResponse();
+        },
+        "/domains/eng/engrams/sharper-alpha": () =>
+          detailResponse({ permalink: "sharper-alpha" }),
+        "/graph": () => graphResponse(),
+        "/validate": () => ({ findings: [], errors: 0 }),
+        "/domains/eng/tree": () => ({
+          domain: "eng",
+          path: "/",
+          folders: [],
+          engrams: [
+            {
+              permalink: "alpha",
+              title: "Alpha",
+              type: "engram",
+              status: "stable",
+              path: "alpha.md",
+            },
+          ],
+        }),
+      }),
+    );
+    renderApp("/d/eng/edit/alpha");
+    await screen.findByRole("link", { name: "Alpha" });
+    const before = trees().length;
+
+    release();
+
+    // The room renamed the engram, which is one of the things a tree row is
+    // drawn from. The server saves a session on its own schedule, so this
+    // discrete receipt is the one moment the sidebar can be told - once.
+    await waitFor(() => {
+      expect(trees().length).toBeGreaterThan(before);
+    });
   });
 
   it("a format-bar insertion reaches the shared text exactly once", async () => {

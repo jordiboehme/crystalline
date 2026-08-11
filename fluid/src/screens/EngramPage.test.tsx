@@ -566,6 +566,34 @@ describe("the engram page", () => {
     }
   });
 
+  it("carries the actions in the trail's own row, leaving the title alone", async () => {
+    serve();
+
+    renderApp("/d/eng/e/alpha");
+
+    const trail = await screen.findByRole("navigation", { name: "Breadcrumb" });
+    const row = trail.parentElement;
+    expect(row).not.toBeNull();
+    // Where this engram is and what can be done with it are one line: the
+    // address reads from the left, the controls sit at its right end.
+    expect(
+      within(row as HTMLElement).getByRole("link", { name: "Edit" }),
+    ).toBeInTheDocument();
+    expect(
+      within(row as HTMLElement).getByRole("button", { name: "More actions" }),
+    ).toBeInTheDocument();
+    expect(row).toHaveClass("justify-between");
+
+    // And the title stands by itself, with nothing in its block to compete
+    // with it - which is the whole point of the row above.
+    const title = screen.getByRole("heading", { name: "Alpha", level: 1 });
+    expect(row).not.toContainElement(title);
+    // The trail's row, then the title, and that is the whole header: no
+    // control row underneath the name any more.
+    expect(title.previousElementSibling).toBe(row);
+    expect(title.parentElement?.lastElementChild).toBe(title);
+  });
+
   it("runs a utility from the menu rather than from a second copy of it", async () => {
     const print = vi.spyOn(window, "print").mockImplementation(() => undefined);
     serve();

@@ -78,11 +78,15 @@ function Live({ content }: { content: string }) {
 }
 
 describe("the frontmatter form", () => {
-  it("shows the fields the block carries, absent dates empty", () => {
+  it("shows the fields the block carries, an absent bound as its own state", () => {
     mounted();
     expect(screen.getByLabelText("Status")).toHaveValue("stable");
     expect(screen.getByLabelText("Valid from")).toHaveValue("2026-01-01");
-    expect(screen.getByLabelText("Valid to")).toHaveValue("");
+    // No date is not a blank field: it is the answer, and it says so.
+    expect(screen.queryByLabelText("Valid to")).toBeNull();
+    expect(
+      screen.getByRole("button", { name: "Valid to: Forever" }),
+    ).toBeInTheDocument();
   });
 
   it("an edit dispatches a single-line change into the buffer", async () => {
@@ -99,9 +103,65 @@ describe("the frontmatter form", () => {
   it("clearing a date removes the key rather than writing a sentinel", async () => {
     const view = mounted();
     await userEvent.click(
-      screen.getByRole("button", { name: "Clear valid from" }),
+      screen.getByRole("button", { name: "Clear to always" }),
     );
     expect(view.state.doc.toString()).not.toContain("valid_from");
+  });
+
+  it("round-trips the upper bound between forever and a date, both ways, twice", async () => {
+    render(<Live content={DOC} />);
+    await screen.findByLabelText("Engram source");
+    const view = liveView();
+
+    // Forever is what an absent upper bound says, and it is one click from a
+    // picker that already has the keyboard.
+    await userEvent.click(
+      screen.getByRole("button", { name: "Valid to: Forever" }),
+    );
+    const picker = screen.getByLabelText("Valid to");
+    expect(picker).toHaveFocus();
+    // Opening the picker is not an answer: nothing is written until a date is.
+    expect(view.state.sliceDoc()).toBe(DOC);
+    // And the way back is open before any date is picked, so the swap is
+    // never a one-way door.
+    expect(
+      screen.getByRole("button", { name: "Clear to forever" }),
+    ).toBeInTheDocument();
+
+    fireEvent.change(picker, { target: { value: "2027-02-03" } });
+    expect(view.state.sliceDoc()).toContain("valid_to: 2027-02-03");
+    // A picked date keeps the way back visible rather than closing it.
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Clear to forever" }),
+    );
+    expect(view.state.sliceDoc()).toBe(DOC);
+    expect(screen.queryByLabelText("Valid to")).toBeNull();
+
+    // Twice: the state the clear returned to is the state that swaps again.
+    await userEvent.click(
+      screen.getByRole("button", { name: "Valid to: Forever" }),
+    );
+    expect(screen.getByLabelText("Valid to")).toHaveFocus();
+  });
+
+  it("round-trips the lower bound between a date and always", async () => {
+    render(<Live content={DOC} />);
+    await screen.findByLabelText("Engram source");
+    const view = liveView();
+
+    await userEvent.click(
+      screen.getByRole("button", { name: "Clear to always" }),
+    );
+    expect(view.state.sliceDoc()).not.toContain("valid_from");
+    expect(screen.queryByLabelText("Valid from")).toBeNull();
+
+    await userEvent.click(
+      screen.getByRole("button", { name: "Valid from: Always" }),
+    );
+    const picker = screen.getByLabelText("Valid from");
+    expect(picker).toHaveFocus();
+    fireEvent.change(picker, { target: { value: "2026-01-01" } });
+    expect(view.state.sliceDoc()).toContain("valid_from: 2026-01-01");
   });
 
   it("keyboard-editing a date leaves its line where it is, never removing it", async () => {
@@ -133,15 +193,18 @@ describe("the frontmatter form", () => {
     render(<Live content={DOC} />);
     await screen.findByLabelText("Engram source");
     const view = liveView();
+    await userEvent.click(
+      screen.getByRole("button", { name: "Valid to: Forever" }),
+    );
     fireEvent.change(screen.getByLabelText("Valid to"), {
       target: { value: "2027-02-03" },
     });
     expect(view.state.sliceDoc()).toBe(
       DOC.replace("---\n\nBody.", "valid_to: 2027-02-03\n---\n\nBody."),
     );
-    // And the Clear control, the one removal path, takes it away again.
+    // And the clear control, the one removal path, takes it away again.
     await userEvent.click(
-      await screen.findByRole("button", { name: "Clear valid to" }),
+      await screen.findByRole("button", { name: "Clear to forever" }),
     );
     expect(view.state.sliceDoc()).toBe(DOC);
   });
@@ -224,7 +287,7 @@ describe("the frontmatter form", () => {
       expect(screen.getByLabelText("Valid from")).toHaveValue("2026-01-01");
     });
     await userEvent.click(
-      screen.getByRole("button", { name: "Clear valid from" }),
+      screen.getByRole("button", { name: "Clear to always" }),
     );
     // The whole file, its own endings intact, minus exactly one line.
     expect(liveView().state.sliceDoc()).toBe(
