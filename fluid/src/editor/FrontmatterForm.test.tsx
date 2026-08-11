@@ -247,14 +247,17 @@ describe("the frontmatter form", () => {
 
   it("offers recommended statuses and types without demanding them", async () => {
     const view = mounted();
-    const listed = (element: HTMLElement) =>
-      [
-        ...(document
-          .getElementById(element.getAttribute("list") as string)
-          ?.querySelectorAll("option") ?? []),
-      ].map((option) => option.value);
-    expect(listed(screen.getByLabelText("Status"))).toContain("deprecated");
-    expect(listed(screen.getByLabelText("Type"))).toContain("runbook");
+
+    // Opened on a status it already holds, the field still shows the whole
+    // vocabulary - and says what each word is for, which is the point.
+    await userEvent.click(screen.getByLabelText("Status"));
+    const statuses = screen
+      .getAllByRole("option")
+      .map((option) => option.dataset.value);
+    expect(statuses).toContain("deprecated");
+    expect(
+      screen.getByRole("option", { name: /superseded/ }),
+    ).toHaveTextContent("replaced by a newer engram");
 
     // A value nobody recommends is written exactly as typed.
     const status = screen.getByLabelText("Status");
@@ -262,6 +265,18 @@ describe("the frontmatter form", () => {
     await userEvent.type(status, "brewing");
     await userEvent.tab();
     expect(view.state.doc.toString()).toContain("status: brewing");
+  });
+
+  it("writes the value that was picked out of the suggestions", async () => {
+    const view = mounted();
+    await userEvent.click(screen.getByLabelText("Type"));
+    expect(screen.getByRole("option", { name: /runbook/ })).toHaveTextContent(
+      "the steps to take when something happens",
+    );
+    await userEvent.click(screen.getByRole("option", { name: /^guide/ }));
+
+    expect(view.state.doc.toString()).toContain("type: guide");
+    expect(screen.getByLabelText("Type")).toHaveValue("guide");
   });
 
   it("follows a hand edit in the text rather than holding its own copy", async () => {

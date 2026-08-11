@@ -22,10 +22,11 @@ import { domainTreeKey, treeQuery } from "../api/domain";
 import { engramDetailKey } from "../api/engram";
 import { fetchTags, vocabularyKey } from "../api/vocabulary";
 import { createEngram } from "../api/writes";
-import { SUGGESTED_STATUSES, SUGGESTED_TYPES } from "../filters";
 import { editRoute } from "../paths";
+import { STATUS_SUGGESTIONS, TYPE_SUGGESTIONS } from "../suggestions";
 import type { CreateEngramDialogProps } from "./CreateEngramDialog";
 import { BUTTON } from "./primitives";
+import { SuggestInput, suggestionsAreOpen } from "./SuggestInput";
 
 const FIELD_CLASSES =
   "w-full rounded border border-slate-300 bg-transparent px-2 py-1 text-sm focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:border-slate-700";
@@ -142,7 +143,19 @@ export default function CreateEngramDialogBody({
     >
       <Dialog.Portal>
         <Dialog.Overlay className="fixed inset-0 z-50 bg-slate-900/40" />
-        <Dialog.Content className="fixed top-1/2 left-1/2 z-50 w-[min(28rem,calc(100vw-2rem))] -translate-x-1/2 -translate-y-1/2 rounded border border-slate-200 bg-white p-4 shadow-xl dark:border-slate-700 dark:bg-slate-900">
+        <Dialog.Content
+          className="fixed top-1/2 left-1/2 z-50 w-[min(28rem,calc(100vw-2rem))] -translate-x-1/2 -translate-y-1/2 rounded border border-slate-200 bg-white p-4 shadow-xl dark:border-slate-700 dark:bg-slate-900"
+          onEscapeKeyDown={(event) => {
+            // Escape belongs to the innermost thing it can close. A suggestion
+            // list is open inside this form often enough that closing the
+            // whole dialog on it would throw away a half-written engram, and
+            // the field cannot claim the key for itself: this layer's listener
+            // runs first, on the document, in the capture phase.
+            if (suggestionsAreOpen()) {
+              event.preventDefault();
+            }
+          }}
+        >
           <Dialog.Title className="text-lg font-semibold">
             New engram in {domain}
           </Dialog.Title>
@@ -207,27 +220,28 @@ export default function CreateEngramDialogBody({
                 ))}
               </datalist>
             </Field>
+            {/*
+              The suggesting input rather than a datalist: focus opens the
+              whole recommended vocabulary with a line each on what the words
+              are for, which is what a field nobody has memorized needs. The
+              helper stays anyway - a list of words is what a closed set looks
+              like, and that anything else is allowed is the one thing the
+              popover cannot say for itself.
+            */}
             <Field
               id={typeField}
               label="Type"
               helper="Suggestions; any value is allowed."
             >
-              <input
+              <SuggestInput
                 id={typeField}
-                aria-describedby={`${typeField}-help`}
+                describedBy={`${typeField}-help`}
                 className={FIELD_CLASSES}
-                list="create-types"
                 value={engramType}
-                onChange={(event) => {
-                  setEngramType(event.target.value);
-                }}
+                suggestions={TYPE_SUGGESTIONS}
+                onChange={setEngramType}
                 placeholder="engram"
               />
-              <datalist id="create-types">
-                {SUGGESTED_TYPES.map((name) => (
-                  <option key={name} value={name} />
-                ))}
-              </datalist>
             </Field>
             {/* The same treatment as Type, because it is the same kind of
                 field: a free-form value with a list of usual ones beside it. */}
@@ -236,22 +250,15 @@ export default function CreateEngramDialogBody({
               label="Status"
               helper="Suggestions; any value is allowed."
             >
-              <input
+              <SuggestInput
                 id={statusField}
-                aria-describedby={`${statusField}-help`}
+                describedBy={`${statusField}-help`}
                 className={FIELD_CLASSES}
-                list="create-statuses"
                 value={status}
-                onChange={(event) => {
-                  setStatus(event.target.value);
-                }}
+                suggestions={STATUS_SUGGESTIONS}
+                onChange={setStatus}
                 placeholder="stable"
               />
-              <datalist id="create-statuses">
-                {SUGGESTED_STATUSES.map((name) => (
-                  <option key={name} value={name} />
-                ))}
-              </datalist>
             </Field>
             <div className="flex justify-end gap-2">
               <button

@@ -12,21 +12,24 @@
  * ever writes a placeholder date.
  *
  * The recommended `type` and `status` values are the app's one list, offered
- * through a datalist beside a plain text field. Anything can be typed and
- * nothing here treats an unlisted value as wrong - the fields are free form
- * by design, and a select would quietly claim otherwise.
+ * through the suggesting input: the words are on screen with a line each on
+ * what they are for, so nobody has to have memorized the set to write one
+ * down. Anything can be typed and nothing here treats an unlisted value as
+ * wrong - the fields are free form by design, and a select would quietly
+ * claim otherwise.
  */
 
 import type { Text } from "@codemirror/state";
 import type { EditorView } from "@codemirror/view";
 import { X } from "lucide-react";
 import type { ReactElement, ReactNode } from "react";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 
 import type { Vocabulary } from "../api/vocabulary";
 import { FIELD_CLASSES } from "../components/FilterControls";
 import { BUTTON, FOCUS_RING, IconButton } from "../components/primitives";
-import { SUGGESTED_STATUSES, SUGGESTED_TYPES } from "../filters";
+import { SuggestInput } from "../components/SuggestInput";
+import { STATUS_SUGGESTIONS, TYPE_SUGGESTIONS } from "../suggestions";
 import type { FieldEdit } from "./frontmatterFields";
 import {
   hasFrontmatterBlock,
@@ -35,14 +38,6 @@ import {
   writeScalar,
   writeTagList,
 } from "./frontmatterFields";
-
-/**
- * Guidance, never enforcement. The same lists the filtering screens offer, so
- * the words this app recommends for a field are one list rather than two that
- * drift apart.
- */
-export const RECOMMENDED_STATUSES: readonly string[] = SUGGESTED_STATUSES;
-export const RECOMMENDED_TYPES: readonly string[] = SUGGESTED_TYPES;
 
 export interface FrontmatterFormProps {
   /** The live buffer text, which is where every value is read from. */
@@ -99,6 +94,9 @@ export function FrontmatterForm({
   vocabulary,
 }: FrontmatterFormProps): ReactElement {
   const [draftTag, setDraftTag] = useState("");
+  const typeField = useId();
+  const statusField = useId();
+  const guidance = useId();
 
   const apply = (edit: FieldEdit | null) => {
     if (!edit || !view) {
@@ -135,49 +133,51 @@ export function FrontmatterForm({
 
   return (
     <section aria-label="Frontmatter form" className="flex flex-col gap-3">
-      <Row label="Type">
-        {/*
-          Uncontrolled with a remounting key: what is on screen while the
-          field has focus is what is being typed, and a hand edit in the text
-          changes the key and brings the new value in. The same
-          state-follows-the-source pattern the filter fields use.
-        */}
-        <input
+      {/*
+        Not a `Row`: a `label` element wrapping the control would also wrap the
+        list it opens, and a click on a suggestion would be a click on the
+        label. The name is tied on with `htmlFor` instead, which is the same
+        name to a reader and to a screen reader.
+
+        The buffer is still the only copy of the value: the field is handed
+        what the document currently says and reports back what settled, so a
+        hand edit in the text arrives here a render later.
+      */}
+      <div className="flex flex-col gap-1 text-sm">
+        <label htmlFor={typeField} className={LABEL_CLASSES}>
+          Type
+        </label>
+        <SuggestInput
+          id={typeField}
           className={`w-full ${FIELD_CLASSES}`}
-          list="fm-types"
-          key={`type:${type}`}
-          defaultValue={type}
-          onBlur={(event) => {
-            scalar("type")(event.target.value);
-          }}
+          value={type}
+          suggestions={TYPE_SUGGESTIONS}
+          onCommit={scalar("type")}
+          describedBy={guidance}
         />
-        <datalist id="fm-types">
-          {RECOMMENDED_TYPES.map((name) => (
-            <option key={name} value={name} />
-          ))}
-        </datalist>
-      </Row>
-      <Row label="Status">
-        <input
+      </div>
+      <div className="flex flex-col gap-1 text-sm">
+        <label htmlFor={statusField} className={LABEL_CLASSES}>
+          Status
+        </label>
+        <SuggestInput
+          id={statusField}
           className={`w-full ${FIELD_CLASSES}`}
-          list="fm-statuses"
-          key={`status:${status}`}
-          defaultValue={status}
-          onBlur={(event) => {
-            scalar("status")(event.target.value);
-          }}
+          value={status}
+          suggestions={STATUS_SUGGESTIONS}
+          onCommit={scalar("status")}
+          describedBy={guidance}
         />
-        <datalist id="fm-statuses">
-          {RECOMMENDED_STATUSES.map((name) => (
-            <option key={name} value={name} />
-          ))}
-        </datalist>
-      </Row>
+      </div>
       {/*
         Beside the two fields it is about, rather than at the foot of the rail
-        where it used to sit half of a note about dates.
+        where it used to sit half of a note about dates. It survives the
+        suggesting input rather than being subsumed by it: a list of words is
+        exactly what a closed set looks like, so the one thing a popover cannot
+        say on its own is that anything else is allowed too. Both fields point
+        at it, so it is read out with either name.
       */}
-      <p className={NOTE_CLASSES}>
+      <p id={guidance} className={NOTE_CLASSES}>
         Recommended types and statuses are suggestions; any value is allowed.
       </p>
       {/*

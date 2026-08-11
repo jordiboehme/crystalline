@@ -1,4 +1,4 @@
-import { screen, waitFor } from "@testing-library/react";
+import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -204,6 +204,75 @@ describe("the create flow", () => {
     expect(JSON.parse(body) as unknown).toMatchObject({
       tags: ["rust", "collab", "editing"],
     });
+  });
+
+  it("sends the type picked out of the suggestions, glosses and all", async () => {
+    const created = vi.fn(() => ({
+      domain: "eng",
+      permalink: "notes/gamma",
+      title: "Gamma",
+      content: "---\ntitle: Gamma\n---\n\n",
+      checksum: "new222",
+      frontmatter: {},
+      observations: [],
+      relations: [],
+      links: [],
+    }));
+    apiMock.mockImplementation(
+      answersFor({
+        "/auth/me": () => meResponse({ user: userFixture() }),
+        "/domains": domainsResponse,
+        "/domains/eng/manifest": () => ({
+          domain: "eng",
+          markdown: "# eng",
+          checksum: "m1",
+        }),
+        "/domains/eng/tree": (path) => tree(path),
+        "/domains/eng/engrams": (_path, init) =>
+          init?.method === "POST"
+            ? created()
+            : { total: 0, page: 1, limit: 50, count: 0, hits: [] },
+        "/domains/eng/engrams/notes/gamma": () => created(),
+        "/validate": () => ({ findings: [], errors: 0 }),
+        "/vocabulary": () => ({ tags: [], categories: [], relation_types: [] }),
+        "/graph": () => ({ nodes: [], edges: [], truncated: false, hidden: 0 }),
+      }),
+    );
+    renderApp("/d/eng");
+    await userEvent.click(
+      await screen.findByRole("button", { name: "New engram" }),
+    );
+    await userEvent.type(screen.getByLabelText(/Title/), "Gamma");
+
+    // The words are on the screen with what they mean beside them; nobody has
+    // to have memorized the set to write one down. Scoped to the dialog: the
+    // domain screen behind it has a Type field of its own, in the filter bar.
+    const form = within(screen.getByRole("dialog"));
+    await userEvent.click(form.getByLabelText("Type"));
+    expect(form.getByRole("option", { name: /^decision/ })).toHaveTextContent(
+      "a choice that was made, and why",
+    );
+    // Escape puts the list away and leaves the form standing: the dialog
+    // closes on Escape too, and dismissing a list must not throw away what
+    // somebody has been typing into it.
+    await userEvent.keyboard("{Escape}");
+    expect(form.queryByRole("listbox")).not.toBeInTheDocument();
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+
+    await userEvent.click(form.getByLabelText("Type"));
+    await userEvent.click(form.getByRole("option", { name: /^decision/ }));
+    expect(form.getByLabelText("Type")).toHaveValue("decision");
+
+    await userEvent.click(screen.getByRole("button", { name: "Create" }));
+    await waitFor(() => {
+      expect(created).toHaveBeenCalled();
+    });
+    const call = apiMock.mock.calls.find(([, init]) => init?.method === "POST");
+    const body = call?.[1]?.body;
+    if (typeof body !== "string") {
+      throw new Error("no POST body");
+    }
+    expect(JSON.parse(body) as unknown).toMatchObject({ type: "decision" });
   });
 
   it("omits the tags key entirely when the field is left empty", async () => {
