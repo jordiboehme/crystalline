@@ -549,7 +549,13 @@ function DomainSidebar({
               void navigate("/");
             }}
           />
-          {domain !== "" && capabilities.canWrite && (
+          {/*
+            The same condition `DomainNav` puts on its own launcher, for the
+            same reason: the domain's home screen carries one beside its
+            heading, prefilled with the folder being browsed, and the frame
+            offering a second one would be two controls for one act.
+          */}
+          {permalink !== "" && capabilities.canWrite && (
             <IconButton
               label="New engram"
               icon={Plus}

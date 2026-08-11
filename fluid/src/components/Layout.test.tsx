@@ -657,6 +657,28 @@ describe("the sidebar's own width", () => {
     ).toBeVisible();
   });
 
+  it("leaves the launcher to the domain's own home screen", async () => {
+    localStorage.setItem("fluid.nav", "rail");
+    serveInDomain();
+
+    renderApp("/d/eng");
+    const nav = await sidebar();
+    await screen.findByRole("heading", { level: 1, name: "eng" });
+
+    // The frame folds to a rail and still keeps out of the way: this screen
+    // carries its own launcher, prefilled with the folder being browsed, and
+    // a second one in the rail beside it would be two controls for one act.
+    // The rule is `DomainNav`'s, unchanged by the fold.
+    expect(
+      within(nav).queryByRole("button", { name: "New engram" }),
+    ).toBeNull();
+    expect(
+      within(await screen.findByRole("main")).getByRole("button", {
+        name: "New engram",
+      }),
+    ).toBeVisible();
+  });
+
   it("unfolds again, and remembers that too", async () => {
     localStorage.setItem("fluid.nav", "rail");
     serveSignedIn();
