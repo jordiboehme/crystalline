@@ -25,6 +25,7 @@ import type { Awareness } from "y-protocols/awareness";
 import * as Y from "yjs";
 
 import { problemDetail } from "../api/client";
+import { domainTreeKey } from "../api/domain";
 import type { EngramDetail } from "../api/engram";
 import { engramDetailKey, fetchEngramDetail } from "../api/engram";
 import { NEIGHBORHOOD_DEPTH, fetchGraph, graphKey } from "../api/graph";
@@ -576,6 +577,16 @@ function Surface({
         engramDetailKey(saved.domain, saved.permalink),
         saved,
       );
+      // A save is the fourth write that moves the tree, after create, move and
+      // retire: the whole file is the document here, so one save can change
+      // the title a row is drawn from, the status that fades it, or - through
+      // the frontmatter permalink - the address it points at. The tree is
+      // fresh for a minute (`TREE_STALE_TIME`), and the sidebar stays mounted
+      // for as long as a reader is inside a domain, so without this a renamed
+      // engram leaves a row in the frame that 404s when it is clicked.
+      void queryClient.invalidateQueries({
+        queryKey: domainTreeKey(saved.domain),
+      });
       if (saved.permalink !== engram.permalink) {
         // The rename receipt: the engram answers at its new address now, and
         // so does this editor.

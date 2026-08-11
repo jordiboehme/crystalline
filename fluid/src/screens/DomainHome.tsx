@@ -42,6 +42,7 @@ import { EngramList } from "../components/EngramList";
 import { FilterFields, TagChips } from "../components/FilterControls";
 import { Skeleton } from "../components/Skeleton";
 import { BUTTON, Chip, FOCUS_RING } from "../components/primitives";
+import { frontmatterFilters } from "../filters";
 import { plural } from "../format";
 import { manifestRoute } from "../paths";
 import { stripSnippetMarkup } from "../snippet";
@@ -53,17 +54,15 @@ export default function DomainHome() {
   const [creating, setCreating] = useState(false);
 
   const path = params.get("path") ?? "";
-  // The frontmatter view, which is the whole domain: no `path`, deliberately.
-  // Scoping a filter to the folder being browsed is a different feature - the
-  // line above the list says "every folder included" and means it - so the
-  // scope is left empty here rather than picked up from the URL by accident.
+  // The frontmatter view, which is the whole domain: the shared reader leaves
+  // `path` empty deliberately, because scoping a filter to the folder being
+  // browsed is a different feature - the line above the list says "every
+  // folder included" and means it. Shared with the sidebar, which reads the
+  // same URL to decide whether any folder may call itself the current page:
+  // one reading, so the frame and the screen cannot disagree about which of
+  // the two views is up.
   const filters: EngramFilters = useMemo(
-    () => ({
-      type: params.get("type"),
-      status: params.get("status"),
-      tags: (params.get("tags") ?? "").split(",").filter((tag) => tag !== ""),
-      path: "",
-    }),
+    () => frontmatterFilters(params),
     [params],
   );
   // The browse view: one folder, no frontmatter filter, paged by the server.

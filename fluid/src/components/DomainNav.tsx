@@ -22,7 +22,10 @@
  * The folders on the way to the engram being read start open, because a mark
  * on a row nobody can see marks nothing. The folder being browsed on the
  * screen beside the tree counts as being there too: it opens, and its row
- * carries the same you-are-here mark an engram row does.
+ * carries the same you-are-here mark an engram row does - until a frontmatter
+ * filter goes on, when the screen leaves the folder for the whole domain and
+ * no row may claim to be the page on screen. Opening and marking are two
+ * questions here, and the second one is the screen's own to answer.
  *
  * A folder row is two controls rather than one. Its name is a link to that
  * folder on the domain screen, which is where a folder of any size can be
@@ -44,7 +47,9 @@ import { problemDetail } from "../api/client";
 import { treeQuery } from "../api/domain";
 import type { DomainSummary } from "../api/domains";
 import type { EngramRow } from "../api/engrams";
+import { hasFilters } from "../api/engrams";
 import { useAuth } from "../auth/AuthContext";
+import { frontmatterFilters } from "../filters";
 import { RETIRED_CLASS, isRetired } from "../lifecycle";
 import { domainRoute, engramRoute, folderRoute, manifestRoute } from "../paths";
 import { CreateEngramDialog } from "./CreateEngramDialog";
@@ -74,11 +79,24 @@ export function DomainNav({
   const { capabilities } = useAuth();
   const [creating, setCreating] = useState(false);
   const [params] = useSearchParams();
-  // Which folder the screen beside the tree is browsing, so the tree can say
-  // so. Only the domain's own screen writes `path`, and that is also the only
-  // screen where `permalink` is empty, so the pair is read as one state rather
-  // than two that could contradict each other.
-  const browsing = permalink === "" ? (params.get("path") ?? "") : "";
+  // Which folder the screen beside the tree was last pointed at. Only the
+  // domain's own screen writes `path`; `permalink` being empty is what says
+  // the screen beside the tree is that one rather than an engram page, so the
+  // pair is read as one state rather than two that could contradict each
+  // other. (The MANIFEST page also has no permalink, and no link in this app
+  // puts `?path=` on that route, so nothing is browsing there either.)
+  const browsing =
+    permalink === "" && !onManifest ? (params.get("path") ?? "") : "";
+  // Which folder may call itself the page the reader is on - not the same
+  // question. Under a frontmatter filter the screen leaves the folder and
+  // lists the whole domain, so no folder is the current page: the mark would
+  // name a page nobody is on, on a link that drops the filter when it is
+  // followed. The predicate is the screen's own (`hasFilters` over
+  // `frontmatterFilters`), read from the same URL, so the frame and the screen
+  // cannot disagree about which view is up. The branch still opens, because a
+  // filter is a lens over the domain rather than a reason to fold away where
+  // the reader just was.
+  const marked = hasFilters(frontmatterFilters(params)) ? "" : browsing;
 
   return (
     <div className="flex flex-col gap-3">
@@ -124,6 +142,7 @@ export function DomainNav({
           path=""
           permalink={permalink}
           browsing={browsing}
+          marked={marked}
         />
         {/*
           Left out on the domain's own home screen only: that screen carries
@@ -237,12 +256,15 @@ function TreeBranch({
   path,
   permalink,
   browsing,
+  marked,
 }: {
   domain: string;
   path: string;
   permalink: string;
-  /** The folder the screen beside the tree is browsing, or the empty string. */
+  /** The folder the screen beside the tree is pointed at, for what opens. */
   browsing: string;
+  /** The folder that may read as the current page, for what is marked. */
+  marked: string;
 }) {
   const tree = useQuery(treeQuery(domain, path));
 
@@ -292,6 +314,7 @@ function TreeBranch({
             name={name}
             permalink={permalink}
             browsing={browsing}
+            marked={marked}
           />
         </li>
       ))}
@@ -302,7 +325,7 @@ function TreeBranch({
       ))}
       {tree.data?.truncated === true && (
         <li>
-          <BrowseAll domain={domain} path={path} total={tree.data.total} />
+          <BrowseAll domain={domain} path={path} />
         </li>
       )}
     </ul>
@@ -313,33 +336,35 @@ function TreeBranch({
  * The last row of a level the server had to cut: the whole folder, on the
  * screen that pages it.
  *
- * The count is the level's own, so the row is a fact about this folder rather
- * than an apology for the sidebar, and it says out loud that what is drawn
- * above it is not all there is. Muted and one step down in size, because it is
- * the only row here that is not a thing in the domain.
+ * It carries no number, deliberately. This is a link, so its words are a
+ * promise about where it goes, and the only count in hand is the wrong one for
+ * that promise: the level knows how many engrams sit DIRECTLY in this folder,
+ * while the screen it opens lists the folder and everything under it and
+ * reports that larger total. Two numbers for one click is worse than none, and
+ * at the root - where the row names the domain - a direct count reads as the
+ * size of the whole domain, which it is not. The payload's `total` stays a
+ * true fact about the level for anything that wants it; if a number is ever
+ * wanted here it has to be the recursive one, which is a server field this
+ * does not have.
  *
- * Muted at slate-600 rather than the slate-500 the app's captions usually
- * wear, because this caption has a hover state under it: slate-500 on the
- * slate-100 wash is 4.35:1, under the 4.5:1 floor for text this size, while
- * slate-600 is 7.58:1 on white and 6.92:1 on the wash. Dark needs no such
- * step: slate-400 is 7.66:1 on slate-950 and 5.56:1 on the slate-800 wash.
+ * Muted and one step down in size, because it is the only row here that is not
+ * a thing in the domain. Muted at slate-600 rather than the slate-500 the
+ * app's captions usually wear, because this caption has a hover state under
+ * it: slate-500 on the slate-100 wash is 4.35:1, under the 4.5:1 floor for
+ * text this size, while slate-600 is 7.58:1 on white and 6.92:1 on the wash.
+ * Dark needs no such step: slate-400 is 7.66:1 on slate-950 and 5.56:1 on the
+ * slate-800 wash.
  */
-function BrowseAll({
-  domain,
-  path,
-  total,
-}: {
-  domain: string;
-  path: string;
-  total: number;
-}) {
-  const here = path === "" ? domain : (path.split("/").pop() ?? path);
+function BrowseAll({ domain, path }: { domain: string; path: string }) {
+  const here = path.split("/").pop() ?? path;
   return (
     <Link
       to={folderRoute(domain, path)}
       className={`block truncate rounded px-2 py-1 text-caption text-slate-600 hover:bg-slate-100 dark:text-slate-400 dark:hover:bg-slate-800 ${FOCUS_RING}`}
     >
-      Browse all {total} engrams in {here}
+      {path === ""
+        ? "Browse all engrams in this domain"
+        : `Browse all of ${here}`}
     </Link>
   );
 }
@@ -387,18 +412,25 @@ function Folder({
   name,
   permalink,
   browsing,
+  marked,
 }: {
   domain: string;
   path: string;
   name: string;
   permalink: string;
   browsing: string;
+  marked: string;
 }) {
-  // Being in this folder is either of two things: reading an engram inside it,
-  // or browsing it (or something under it) on the screen beside the tree.
-  const here = browsing === path;
+  // What opens and what is marked are two questions with two answers. The
+  // branch opens when the reader is anywhere inside it - reading an engram
+  // under it, or pointed at it by the screen beside the tree, filter or no
+  // filter. It says "you are here" only when this folder really is the page
+  // on screen, which is what `marked` already decided.
+  const here = marked === path;
   const holdsCurrent =
-    permalink.startsWith(`${path}/`) || here || browsing.startsWith(`${path}/`);
+    permalink.startsWith(`${path}/`) ||
+    browsing === path ||
+    browsing.startsWith(`${path}/`);
   const [open, setOpen] = useState(holdsCurrent);
   // Adjusted while rendering rather than in an effect, which is what React
   // asks for when state has to follow a prop: the branch opens in the same
@@ -466,6 +498,7 @@ function Folder({
             path={path}
             permalink={permalink}
             browsing={browsing}
+            marked={marked}
           />
         </div>
       )}

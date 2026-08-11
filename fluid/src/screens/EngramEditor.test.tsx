@@ -182,6 +182,13 @@ function puts() {
   return apiMock.mock.calls.filter(([, init]) => init?.method === "PUT");
 }
 
+/** Every read of this domain's tree, in order. */
+function trees(): string[] {
+  return apiMock.mock.calls
+    .map(([path]) => path)
+    .filter((path) => path.startsWith("/domains/eng/tree"));
+}
+
 beforeEach(() => {
   apiMock.mockReset();
   collabMock.mockReset();
@@ -528,6 +535,49 @@ describe("the engram editor", () => {
     await userEvent.click(screen.getByRole("button", { name: "Save" }));
     // The header echoes the address the engram now answers at.
     expect(await screen.findByText("sharper-alpha")).toBeInTheDocument();
+  });
+
+  it("moves the tree on after a save, so a renamed row stops pointing at nothing", async () => {
+    serveEditor({
+      "/domains/eng/engrams/alpha": (_path, init) =>
+        init?.method === "PUT"
+          ? detailResponse({ permalink: "sharper-alpha", checksum: "next222" })
+          : detailResponse(),
+      "/domains/eng/engrams/sharper-alpha": () =>
+        detailResponse({ permalink: "sharper-alpha", checksum: "next222" }),
+      "/domains/eng/tree": () => ({
+        domain: "eng",
+        path: "/",
+        folders: [],
+        engrams: [
+          {
+            permalink: "alpha",
+            title: "Alpha",
+            type: "engram",
+            status: "stable",
+            path: "alpha.md",
+          },
+        ],
+      }),
+    });
+    renderApp("/d/eng/edit/alpha");
+    await screen.findByLabelText("Engram source");
+    await screen.findByRole("link", { name: "Alpha" });
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Save" })).toBeEnabled();
+    });
+    // The tree is fresh for a minute, so nothing but an invalidation can make
+    // it be asked for again while this editor sits still.
+    const before = trees().length;
+
+    await userEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    // A save can rename the engram, retitle it or retire it, and all three are
+    // what a tree row is drawn from. Without this the sidebar keeps a row
+    // pointing at an address that answers 404 until the freshness runs out.
+    await waitFor(() => {
+      expect(trees().length).toBeGreaterThan(before);
+    });
   });
 
   it("offers a stored draft and restores it", async () => {

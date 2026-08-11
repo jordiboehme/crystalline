@@ -493,7 +493,7 @@ describe("the sidebar inside a domain", () => {
     ).toBeVisible();
   });
 
-  it("offers the whole of a folder too big to draw", async () => {
+  it("offers the whole of a folder too big to draw, without quoting a count", async () => {
     serveInDomain({
       "/domains/eng/tree": (path) =>
         path.includes("path=notes")
@@ -513,21 +513,32 @@ describe("the sidebar inside a domain", () => {
               truncated: true,
               total: 620,
             }
-          : treeResponse(path),
+          : { ...treeResponse(path), truncated: true, total: 500 },
     });
 
     renderApp("/d/eng");
     const nav = await sidebar();
+
+    // The root level was cut too, and the row that says so names the domain
+    // rather than a folder, because the root is not a folder somebody opened.
+    const whole = await within(nav).findByRole("link", {
+      name: "Browse all engrams in this domain",
+    });
+    expect(whole).toHaveAttribute("href", "/d/eng");
+
     await userEvent.click(
       await within(nav).findByRole("button", { name: "Expand notes" }),
     );
 
-    // The sidebar never tries to show a big folder whole: it says how big the
-    // folder is and hands it to the screen, which pages.
+    // The sidebar never tries to show a big folder whole: it hands the folder
+    // to the screen, which pages it. No number: this is a link, so its words
+    // are a promise about where it goes, and the count this level knows is the
+    // engrams directly in it while the screen counts everything below it too.
     const all = await within(nav).findByRole("link", {
-      name: "Browse all 620 engrams in notes",
+      name: "Browse all of notes",
     });
     expect(all).toHaveAttribute("href", "/d/eng?path=notes");
+    expect(within(nav).queryByText(/620/)).toBeNull();
   });
 
   it("marks the folder being browsed and opens it", async () => {
@@ -540,6 +551,29 @@ describe("the sidebar inside a domain", () => {
     // mark an engram row wears, on the row that is the place.
     const name = await within(nav).findByRole("link", { name: "notes" });
     expect(name).toHaveAttribute("aria-current", "page");
+    expect(
+      within(nav).getByRole("button", { name: "Collapse notes" }),
+    ).toHaveAttribute("aria-expanded", "true");
+  });
+
+  it("stops calling a folder current once a filter is on", async () => {
+    serveInDomain();
+
+    // Browsing `notes`, then filtering: the screen leaves the folder and
+    // lists the whole domain, and it says so above the rows.
+    renderApp("/d/eng?path=notes&tags=eng");
+    const nav = await sidebar();
+    expect(
+      await screen.findByText(/Filtered across the whole domain/),
+    ).toBeVisible();
+
+    // So the tree does not claim the reader is in that folder. The mark would
+    // be a plain misstatement: it names a page the reader is not on, and the
+    // link under it drops the filter rather than staying put.
+    const name = await within(nav).findByRole("link", { name: "notes" });
+    expect(name).not.toHaveAttribute("aria-current");
+    // The branch stays open, though: the filter is a lens over the domain,
+    // not a reason to fold away where the reader just was.
     expect(
       within(nav).getByRole("button", { name: "Collapse notes" }),
     ).toHaveAttribute("aria-expanded", "true");
