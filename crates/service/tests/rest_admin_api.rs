@@ -15,7 +15,8 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
 use crystalline_core::config::{
-    AuthConfig, DomainEntry, GitHubConfig, GlobalConfig, ResponseFormat, ServiceConfig,
+    AuthConfig, DomainEntry, GitHubConfig, GlobalConfig, OriginConfig, ResponseFormat,
+    ServiceConfig,
 };
 use crystalline_index::TursoStore;
 use crystalline_service::Engine;
@@ -41,6 +42,11 @@ struct Options {
     /// github-mode tests so nothing here dials github.com; unset means no
     /// override, which is fine for every test that never reaches a provider.
     origin_provider: Option<Arc<support::MockProvider>>,
+    /// Register a domain `kb` that carries a GitHub origin in the config
+    /// without ever downloading one. The only way to address a team domain on
+    /// an instance where `github.enabled` is off, which is the state the sync
+    /// endpoints' 409 exists for.
+    origin_domain: bool,
 }
 
 struct Fixture {
@@ -76,6 +82,27 @@ async fn serve(opts: Options) -> Fixture {
     std::fs::write(dir.join("alpha.md"), ALPHA).unwrap();
     cfg.domains
         .insert("eng".to_string(), DomainEntry::file(dir));
+    if opts.origin_domain {
+        let team = root.join("kb");
+        std::fs::create_dir_all(&team).unwrap();
+        std::fs::write(
+            team.join("MANIFEST.md"),
+            "---\ntype: manifest\ntitle: kb\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# kb\n\n## Scope\n\n- shared knowledge\n\n## When to Use\n\n- Route here for team questions\n",
+        )
+        .unwrap();
+        cfg.domains.insert(
+            "kb".to_string(),
+            DomainEntry {
+                origin: Some(OriginConfig {
+                    repo: "acme/kb".to_string(),
+                    path: None,
+                    branch: None,
+                    poll_secs: None,
+                }),
+                ..DomainEntry::file(team)
+            },
+        );
+    }
     cfg.service = Some(ServiceConfig {
         response_format: Some(ResponseFormat::Json),
         read_only: Some(opts.read_only),
@@ -327,6 +354,252 @@ async fn a_team_domain_registers_under_the_trimmed_name() {
     assert!(
         !listing.contains("\\tteam"),
         "no padded name was ever registered: {listing}"
+    );
+}
+
+/// A team instance: GitHub on, a stub-validated credential already on file
+/// and a mock forge serving `acme/kb` at the tracked branch head, so nothing
+/// this fixture's tests do - registering, reading status, pulling - ever
+/// leaves the machine or touches the developer's real GitHub connection.
+async fn serve_team() -> Fixture {
+    let mock = Arc::new(support::MockProvider::new());
+    let commit = mock.add_commit(std::collections::BTreeMap::from([
+        (
+            "MANIFEST.md".to_string(),
+            b"---\ntype: manifest\ntitle: kb\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# kb\n\n## Scope\n\n- shared knowledge\n\n## When to Use\n\n- Route here for team questions\n".to_vec(),
+        ),
+        (
+            "shared.md".to_string(),
+            b"---\ntype: engram\ntitle: Shared\npermalink: shared\ntags:\n  - team\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# Shared\n\nA rule the team agreed on.\n".to_vec(),
+        ),
+    ]));
+    mock.set_branch("main", &commit);
+    let fx = serve(Options {
+        github: true,
+        origin_provider: Some(mock),
+        ..Options::default()
+    })
+    .await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    let connected = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/settings/github/token",
+        &admin,
+    )
+    .json(&serde_json::json!({"token": "pat-secret-123"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(
+        connected.status(),
+        200,
+        "the team fixture needs a credential on file before any registration"
+    );
+    fx
+}
+
+/// The team fixture registers acme/kb through POST /domains, and the sync
+/// endpoints serve its status and pull updates. Non-team and unknown
+/// domains get the honest statuses the spec pins.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn team_sync_status_and_sync_now_walk_the_contract() {
+    let fx = serve_team().await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+
+    let created = as_session(fx.addr, reqwest::Method::POST, "/api/v1/domains", &admin)
+        .json(&serde_json::json!({"mode": "github", "repo": "acme/kb"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201, "{}", created.text().await.unwrap());
+
+    let status = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/domains/kb/sync",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(status.status(), 200);
+    let status: serde_json::Value = status.json().await.unwrap();
+    assert_eq!(status["mode"], "github");
+    assert_eq!(status["domain"], "kb");
+    assert_eq!(status["repo"], "acme/kb");
+    assert!(status["branch"].is_string());
+    assert!(
+        status.get("local_changes").is_some(),
+        "the card's pending count: {status}"
+    );
+    assert!(
+        status.get("domains").is_none(),
+        "one domain was asked for, so one domain is answered, flat: {status}"
+    );
+
+    let pulled = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/kb/sync",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(pulled.status(), 200, "{}", pulled.text().await.unwrap());
+    let pulled: serde_json::Value = pulled.json().await.unwrap();
+    assert_eq!(pulled["domain"], "kb");
+    assert_eq!(
+        pulled["up_to_date"], true,
+        "nothing moved on the mock forge since the registration: {pulled}"
+    );
+
+    // Non-team domain: the status resource does not exist (GET), the action
+    // conflicts (POST). Both details name the reason.
+    let non_team_get = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/domains/eng/sync",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(non_team_get.status(), 404);
+    let problem: serde_json::Value = non_team_get.json().await.unwrap();
+    assert!(
+        problem["detail"].as_str().unwrap().contains("team"),
+        "the 404 says why, so the UI can tell it from an unknown domain: {problem}"
+    );
+    let non_team_post = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/eng/sync",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(non_team_post.status(), 409);
+    let problem: serde_json::Value = non_team_post.json().await.unwrap();
+    assert!(
+        problem["detail"].as_str().unwrap().contains("team"),
+        "and so does the conflict: {problem}"
+    );
+
+    // Unknown domain: 404 on both.
+    let ghost = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/domains/ghost/sync",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(ghost.status(), 404);
+    let ghost_post = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/ghost/sync",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(ghost_post.status(), 404, "no such resource to sync either");
+
+    // The GET is admin-only too (the write matrix covers only the POST).
+    for (name, pw) in [("eddy", "eddypw"), ("vera", "verapw")] {
+        let session = login(fx.addr, name, pw).await;
+        let resp = as_session(
+            fx.addr,
+            reqwest::Method::GET,
+            "/api/v1/domains/kb/sync",
+            &session,
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 403, "{name} must not read sync status");
+    }
+}
+
+/// GitHub switched off on an instance that still has a team domain
+/// registered: both endpoints answer 409 naming the settings screen, rather
+/// than the bare 422 the engine's own NotEnabled would produce - the card
+/// shows that sentence in place of its rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_disabled_github_names_the_fix_on_both_sync_endpoints() {
+    let fx = serve(Options {
+        origin_domain: true,
+        ..Options::default()
+    })
+    .await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+
+    for method in [reqwest::Method::GET, reqwest::Method::POST] {
+        let resp = as_session(fx.addr, method.clone(), "/api/v1/domains/kb/sync", &admin)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 409, "{method} on a disabled instance");
+        let problem: serde_json::Value = resp.json().await.unwrap();
+        assert!(
+            problem["detail"]
+                .as_str()
+                .unwrap()
+                .to_lowercase()
+                .contains("settings"),
+            "the refusal points at the fix: {problem}"
+        );
+    }
+}
+
+/// The read-only ruling on this pair: the status is a pure read and stays
+/// served (a read-only mirror still shows its sync card), the pull is a
+/// mutation of this instance's copy and is refused. The GET is asserted as
+/// "not 403" rather than as a 200, because it is the 403 that would appear if
+/// anyone ever added `refuse_read_only` to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn read_only_serves_the_status_and_refuses_the_pull() {
+    let ro = serve(Options {
+        read_only: true,
+        github: true,
+        ..Options::default()
+    })
+    .await;
+    let admin = login(ro.addr, "root", "rootpw").await;
+
+    let status = as_session(
+        ro.addr,
+        reqwest::Method::GET,
+        "/api/v1/domains/eng/sync",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(
+        status.status(),
+        404,
+        "the read reached the domain check instead of being refused outright"
+    );
+
+    let pull = as_session(
+        ro.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/eng/sync",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(
+        pull.status(),
+        403,
+        "read_only refuses the pull before anything else is decided"
     );
 }
 

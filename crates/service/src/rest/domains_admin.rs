@@ -1,4 +1,5 @@
-//! Domain lifecycle (admin): create in any of the three modes and unregister.
+//! Domain lifecycle (admin): create in any of the three modes, unregister, and
+//! a team domain's sync status and manual pull.
 //! REST is the untrusted surface of the engine verbs MCP and the CLI already
 //! use: names are validated here (an operator typing at the CLI is trusted; a
 //! browser is not), and a local domain is always created under the configured
@@ -8,7 +9,7 @@ use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use super::auth::Identity;
 use super::{ApiError, ApiJson, ApiPath, ProblemDetail, RestState, refuse_read_only};
@@ -349,6 +350,268 @@ pub async fn remove(
     Ok(Json(report))
 }
 
+/// One domain's entry out of an aggregate origin report.
+///
+/// `origin_status` and `origin_update` both answer for a SET of domains -
+/// `{ connection, domains: [...], errors: [...] }` - and collect a per-domain
+/// failure into `errors` rather than failing the call, so one domain going
+/// wrong never aborts the others. Addressed at a single domain in the path,
+/// that collected failure IS this request's failure: it becomes a problem
+/// detail carrying the engine's own message, never a 200 whose body quietly
+/// says the sync did not happen. What comes back is the flat single-domain
+/// object the card reads (`repo`, `branch`, `local_changes` and the rest).
+fn single_domain(
+    mut report: Value,
+    domain: &str,
+    what: &str,
+) -> Result<Map<String, Value>, ApiError> {
+    if let Some(Value::Array(domains)) = report.get_mut("domains")
+        && let Some(Value::Object(entry)) = domains.first_mut()
+    {
+        return Ok(std::mem::take(entry));
+    }
+    let reason = report
+        .get("errors")
+        .and_then(Value::as_array)
+        .and_then(|errors| errors.first())
+        .and_then(|error| error.get("error"))
+        .and_then(Value::as_str)
+        .unwrap_or("the origin reported neither a result nor a reason")
+        .to_string();
+    Err(ApiError::internal(format!(
+        "{what} for '{domain}' failed: {reason}"
+    )))
+}
+
+/// `GET /domains/{domain}/sync` - where a team domain stands relative to its
+/// origin: the repository and branch it tracks, how many local changes are
+/// unshared, how many proposals are open, whether it is behind and when it was
+/// last checked.
+///
+/// A pure read, so it is served on a read-only instance (that mirror still has
+/// a sync card to show) - the engine documents `origin_status` as allowed
+/// there, and the group's ruling is that read_only refuses writes, not reads.
+///
+/// A domain with no origin answers 404 rather than an empty status: the
+/// resource "team sync status" does not exist for a local or virtual domain.
+/// A client can therefore treat any 404 here as "show no card" while the
+/// detail still says which of the two 404s it got.
+#[utoipa::path(
+    get,
+    path = "/api/v1/domains/{domain}/sync",
+    tag = "domains",
+    operation_id = "get_domain_sync_status",
+    summary = "Where a team domain stands relative to its GitHub origin.",
+    description = "Admin only. A pure read, served even on a read-only \
+                   instance. Answers 404 for a domain with no origin - only \
+                   a GitHub team domain has sync status - so a client can \
+                   treat any 404 as `no sync card`.",
+    params(("domain" = String, Path, description = "The registered team domain.")),
+    responses(
+        (
+            status = 200,
+            description = "The engine's own status report for this one \
+                           domain, plus the mode it is synced in. \
+                           `local_changes` is the unshared-work count a \
+                           client shows as pending; `probe_error` is set when \
+                           the live check could not reach GitHub and the rest \
+                           of the report came from local state alone.",
+            body = Object,
+            example = json!({
+                "domain": "eng",
+                "mode": "github",
+                "repo": "acme/knowledge",
+                "branch": "main",
+                "base_commit": "9f3c1a2",
+                "behind": false,
+                "local_changes": 2,
+                "open_proposals": [],
+                "declined_proposals": [],
+                "conflicts": [],
+                "last_checked": "2026-08-10T08:00:00Z",
+                "probe_error": null
+            }),
+        ),
+        (
+            status = 401,
+            description = "No identity, or an anonymous one.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "The caller is not an admin, or the trusted-header \
+                           identity names a disabled account.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 404,
+            description = "No such domain, or a domain with no team origin.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 409,
+            description = "GitHub is switched off on this instance, so no \
+                           origin can be reached - the detail says where to \
+                           turn it on.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+pub async fn sync_status(
+    State(state): State<RestState>,
+    identity: Identity,
+    ApiPath(domain): ApiPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    identity.require_admin()?;
+    // No refuse_read_only: this is a read. See the doc comment.
+    require_team_domain(&state, &domain, Refusal::Missing)?;
+    let mut report = single_domain(
+        state.engine.origin_status(Some(&domain)).await?,
+        &domain,
+        "reading the origin status",
+    )?;
+    // The engine's per-domain report already names the domain; the mode is
+    // this surface's own, since a client that sees a sync card has to know
+    // which kind of origin it is looking at.
+    report.insert("mode".to_string(), Value::from("github"));
+    Ok(Json(Value::Object(report)))
+}
+
+/// `POST /domains/{domain}/sync` - pull this domain's origin now, rather than
+/// waiting for the daemon's next poll.
+///
+/// The pull writes: it applies what the origin has to this instance's copy, so
+/// a read-only instance refuses it even though the status read beside it is
+/// served.
+///
+/// A domain with no origin is a 409 rather than the GET's 404: the resource
+/// addressed here is the ACTION, which exists on every domain path, and the
+/// server state is what refuses it. That asymmetry is deliberate - a client
+/// hides the card on a 404 and shows the reason on a 409.
+#[utoipa::path(
+    post,
+    path = "/api/v1/domains/{domain}/sync",
+    tag = "domains",
+    operation_id = "sync_domain",
+    summary = "Pull a team domain's origin now.",
+    description = "Admin only. Brings this instance's copy up to date with \
+                   the domain's GitHub origin immediately, instead of waiting \
+                   for the daemon's next poll: the same pull the poller runs, \
+                   under the same per-domain lock. Refused on a read-only \
+                   instance, and a conflict on a domain that has no origin to \
+                   pull from.",
+    params(("domain" = String, Path, description = "The registered team domain.")),
+    responses(
+        (
+            status = 200,
+            description = "The engine's own pull report for this one domain: \
+                           whether it was already up to date, which files were \
+                           applied or merged, which conflicts are waiting and \
+                           which proposals changed state.",
+            body = Object,
+            example = json!({
+                "domain": "eng",
+                "up_to_date": false,
+                "applied": ["notes/a.md"],
+                "merged": [],
+                "conflicts": [],
+                "proposals": [],
+                "skipped_large": [],
+                "re_baselined": false
+            }),
+        ),
+        (
+            status = 401,
+            description = "No identity, or an anonymous one.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "The caller is not an admin, the request did not \
+                           echo its CSRF token, this instance is read-only, or \
+                           the trusted-header identity names a disabled \
+                           account.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 404,
+            description = "No such domain.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 409,
+            description = "The domain has no team origin to pull from, or \
+                           GitHub is switched off on this instance - the \
+                           detail says which, and where to fix it.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+pub async fn sync_now(
+    State(state): State<RestState>,
+    identity: Identity,
+    ApiPath(domain): ApiPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    identity.require_admin()?;
+    refuse_read_only(&state)?;
+    require_team_domain(&state, &domain, Refusal::Conflict)?;
+    let report = single_domain(
+        state.engine.origin_update(Some(&domain)).await?,
+        &domain,
+        "the pull",
+    )?;
+    Ok(Json(Value::Object(report)))
+}
+
+/// How a sync endpoint refuses a domain that is not a team domain: the status
+/// resource does not exist there (GET), while the pull action exists on every
+/// domain path and conflicts with the server's state (POST).
+enum Refusal {
+    Missing,
+    Conflict,
+}
+
+/// The shared pre-check both sync endpoints open with: the domain exists (a
+/// 404 straight out of the engine otherwise), it has an origin, and the
+/// feature that reaches origins at all is on.
+///
+/// The GitHub check is here rather than left to the engine because both origin
+/// verbs answer `RemoteError::NotEnabled`, which this surface classifies as a
+/// bare 422: true, but useless to a card that would then have to explain a
+/// state it cannot see. The order matters as much as the checks - a domain
+/// with no origin is refused before the feature flag is consulted, so a local
+/// domain reads as "no sync card" on every instance rather than flipping to a
+/// GitHub complaint when someone turns the feature off.
+fn require_team_domain(state: &RestState, domain: &str, refusal: Refusal) -> Result<(), ApiError> {
+    if !state.engine.domain_has_origin(domain)? {
+        return Err(match refusal {
+            Refusal::Missing => ApiError::not_found(format!(
+                "domain '{domain}' has no team origin; only a GitHub team \
+                 domain has sync status"
+            )),
+            Refusal::Conflict => ApiError::conflict(format!(
+                "domain '{domain}' is not a team domain; syncing applies to \
+                 GitHub team domains only"
+            )),
+        });
+    }
+    if !state.engine.github_enabled() {
+        return Err(ApiError::conflict(
+            "GitHub is switched off on this instance, so its origin cannot be \
+             reached: turn it on under Settings > GitHub",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -378,5 +641,39 @@ mod tests {
         let err = require_absent(&Some("acme/kb".to_string()), "repo", "local").unwrap_err();
         assert_eq!(err.status, StatusCode::UNPROCESSABLE_ENTITY);
         assert!(err.detail.contains("repo"), "{}", err.detail);
+    }
+
+    /// The aggregate the origin verbs answer with is flattened to the one
+    /// domain that was asked for, and a failure they collected instead of
+    /// raising becomes this request's failure rather than a cheerful 200.
+    #[test]
+    fn one_domain_is_unwrapped_and_a_collected_failure_is_raised() {
+        let report = serde_json::json!({
+            "connection": { "connected": true },
+            "domains": [{ "domain": "eng", "repo": "acme/kb", "local_changes": 2 }],
+            "errors": [],
+        });
+        let one = single_domain(report, "eng", "reading the origin status").unwrap();
+        assert_eq!(one["repo"], "acme/kb");
+        assert_eq!(one["local_changes"], 2);
+        assert!(!one.contains_key("domains"), "flattened, not nested");
+
+        let failed = serde_json::json!({
+            "domains": [],
+            "errors": [{ "domain": "eng", "error": "offline" }],
+        });
+        let err = single_domain(failed, "eng", "the pull").unwrap_err();
+        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            err.detail.contains("the pull") && err.detail.contains("offline"),
+            "the detail names what failed and why: {}",
+            err.detail
+        );
+
+        // Neither a result nor a reason: still a failure, never a 200 with an
+        // empty body a client would read as a successful sync.
+        let empty = serde_json::json!({ "domains": [], "errors": [] });
+        let err = single_domain(empty, "eng", "the pull").unwrap_err();
+        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

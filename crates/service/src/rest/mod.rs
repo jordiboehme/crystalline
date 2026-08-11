@@ -81,6 +81,8 @@ use crate::engine::Engine;
         domains::list,
         domains_admin::create,
         domains_admin::remove,
+        domains_admin::sync_status,
+        domains_admin::sync_now,
         domains::tree,
         domains::manifest,
         domains::save_manifest,
@@ -294,6 +296,12 @@ pub fn router(state: RestState) -> Router {
         // here. Registered before the domain sub-paths for readability only;
         // axum's router is order-independent.
         .route("/domains/{domain}", delete(domains_admin::remove))
+        // Admin only as well. The GET is a pure read and stays served on a
+        // read-only instance; the POST is a pull that writes, and does not.
+        .route(
+            "/domains/{domain}/sync",
+            get(domains_admin::sync_status).post(domains_admin::sync_now),
+        )
         .route("/domains/{domain}/tree", get(domains::tree))
         .route(
             "/domains/{domain}/manifest",

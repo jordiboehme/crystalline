@@ -1488,6 +1488,16 @@ fn write_ops() -> Vec<WriteOp> {
             body: Some(serde_json::json!({"mode": "virtual", "name": "matrix-made"})),
             admin_only: true,
         },
+        // `eng` has no origin, so the allowed leg answers 409 - which is
+        // exactly the "anything but 401/403" this matrix asserts, and it needs
+        // no team fixture to prove the gate. The endpoint's own semantics are
+        // tested against a mock forge in `rest_admin_api.rs`.
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/domains/eng/sync",
+            body: None,
+            admin_only: true,
+        },
         // Last among the domain rows, and no later row targets `scrap`: this
         // one unregisters it.
         WriteOp {

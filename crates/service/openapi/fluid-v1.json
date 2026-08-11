@@ -1862,6 +1862,176 @@
         }
       }
     },
+    "/api/v1/domains/{domain}/sync": {
+      "get": {
+        "tags": [
+          "domains"
+        ],
+        "summary": "Where a team domain stands relative to its GitHub origin.",
+        "description": "Admin only. A pure read, served even on a read-only instance. Answers 404 for a domain with no origin - only a GitHub team domain has sync status - so a client can treat any 404 as `no sync card`.",
+        "operationId": "get_domain_sync_status",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The registered team domain.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The engine's own status report for this one domain, plus the mode it is synced in. `local_changes` is the unshared-work count a client shows as pending; `probe_error` is set when the live check could not reach GitHub and the rest of the report came from local state alone.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                },
+                "example": {
+                  "base_commit": "9f3c1a2",
+                  "behind": false,
+                  "branch": "main",
+                  "conflicts": [],
+                  "declined_proposals": [],
+                  "domain": "eng",
+                  "last_checked": "2026-08-10T08:00:00Z",
+                  "local_changes": 2,
+                  "mode": "github",
+                  "open_proposals": [],
+                  "probe_error": null,
+                  "repo": "acme/knowledge"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or an anonymous one.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an admin, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain, or a domain with no team origin.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "GitHub is switched off on this instance, so no origin can be reached - the detail says where to turn it on.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "domains"
+        ],
+        "summary": "Pull a team domain's origin now.",
+        "description": "Admin only. Brings this instance's copy up to date with the domain's GitHub origin immediately, instead of waiting for the daemon's next poll: the same pull the poller runs, under the same per-domain lock. Refused on a read-only instance, and a conflict on a domain that has no origin to pull from.",
+        "operationId": "sync_domain",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The registered team domain.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The engine's own pull report for this one domain: whether it was already up to date, which files were applied or merged, which conflicts are waiting and which proposals changed state.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                },
+                "example": {
+                  "applied": [
+                    "notes/a.md"
+                  ],
+                  "conflicts": [],
+                  "domain": "eng",
+                  "merged": [],
+                  "proposals": [],
+                  "re_baselined": false,
+                  "skipped_large": [],
+                  "up_to_date": false
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or an anonymous one.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an admin, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The domain has no team origin to pull from, or GitHub is switched off on this instance - the detail says which, and where to fix it.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/domains/{domain}/tree": {
       "get": {
         "tags": [

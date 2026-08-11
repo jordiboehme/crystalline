@@ -1001,6 +1001,20 @@ impl Engine {
         Ok(())
     }
 
+    /// Whether `name` is a team domain: a registered domain that carries a
+    /// GitHub origin. [`EngineError::UnknownDomain`] when nobody registered
+    /// it, which is a caller's missing resource rather than a false answer.
+    ///
+    /// The distinction a surface needs before offering anything origin-shaped:
+    /// [`Engine::origin_status`] and [`Engine::origin_update`] both refuse a
+    /// domain with no origin, and their refusal is one message for a request
+    /// that could never have worked. Asking first lets a caller answer in its
+    /// own terms - there is no sync status here, or there is nothing to sync -
+    /// without parsing an error string.
+    pub fn domain_has_origin(&self, name: &str) -> Result<bool> {
+        Ok(self.domain_entry(name)?.origin.is_some())
+    }
+
     /// Resolve a registered domain to its content source: a filesystem root for
     /// a file domain, or the database for a virtual domain. Errors when the
     /// domain is not registered (the write path wants that), the layered lookup
