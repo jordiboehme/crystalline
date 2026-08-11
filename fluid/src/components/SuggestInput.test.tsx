@@ -6,6 +6,7 @@
 
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import type { FormEvent } from "react";
 import { useState } from "react";
 import { describe, expect, it, vi } from "vitest";
 
@@ -37,6 +38,7 @@ function Harness({
       <label htmlFor="status">Status</label>
       <SuggestInput
         id="status"
+        label="Status"
         value={value}
         suggestions={suggestions}
         onChange={setValue}
@@ -86,15 +88,37 @@ describe("the suggesting input", () => {
     ).toEqual(["superseded"]);
   });
 
-  it("fills on Enter and closes", async () => {
+  it("fills on Enter once a row has been walked to", async () => {
     const onCommit = vi.fn();
     render(<Harness onCommit={onCommit} />);
     await userEvent.click(field());
     await userEvent.type(field(), "dra");
+    await userEvent.keyboard("{ArrowDown}");
     await userEvent.keyboard("{Enter}");
 
     expect(field()).toHaveValue("draft");
     expect(onCommit).toHaveBeenCalledWith("draft");
+    expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
+  });
+
+  it("keeps the typed text when Enter finds no row walked to", async () => {
+    // The whole point of the field being free form: `e` is inside `stable`,
+    // `superseded` and every other word on offer, and Enter must still leave
+    // `e` in the field. Nothing is active until an arrow key says so.
+    const onCommit = vi.fn();
+    render(<Harness onCommit={onCommit} />);
+    await userEvent.click(field());
+    await userEvent.type(field(), "e");
+    expect(field()).not.toHaveAttribute("aria-activedescendant");
+    expect(
+      screen
+        .getAllByRole("option")
+        .filter((option) => option.ariaSelected === "true"),
+    ).toEqual([]);
+
+    await userEvent.keyboard("{Enter}");
+    expect(field()).toHaveValue("e");
+    expect(onCommit).toHaveBeenCalledWith("e");
     expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
   });
 
@@ -136,18 +160,80 @@ describe("the suggesting input", () => {
     render(<Harness />);
     await userEvent.click(field());
     const options = screen.getAllByRole("option");
-    expect(field()).toHaveAttribute("aria-activedescendant", options[0]?.id);
-    expect(options[0]).toHaveAttribute("aria-selected", "true");
+    // An open list, and nothing chosen in it yet.
+    expect(field()).not.toHaveAttribute("aria-activedescendant");
+    expect(options[0]).toHaveAttribute("aria-selected", "false");
 
     await userEvent.keyboard("{ArrowDown}");
-    expect(field()).toHaveAttribute("aria-activedescendant", options[1]?.id);
-    expect(screen.getAllByRole("option")[1]).toHaveAttribute(
+    expect(field()).toHaveAttribute("aria-activedescendant", options[0]?.id);
+    expect(screen.getAllByRole("option")[0]).toHaveAttribute(
       "aria-selected",
       "true",
     );
 
+    await userEvent.keyboard("{ArrowDown}");
+    expect(field()).toHaveAttribute("aria-activedescendant", options[1]?.id);
+
     await userEvent.keyboard("{Enter}");
     expect(field()).toHaveValue("draft");
+  });
+
+  it("reaches the last row with an arrow up from no row", async () => {
+    render(<Harness />);
+    await userEvent.click(field());
+    await userEvent.keyboard("{ArrowUp}");
+    const options = screen.getAllByRole("option");
+    expect(field()).toHaveAttribute("aria-activedescendant", options[2]?.id);
+  });
+
+  it("lets one Enter submit the form around it, carrying the typed text", async () => {
+    // The choice, pinned: with no row walked to, Enter is the form's. It was
+    // the form's when these fields were plain inputs with a datalist, one
+    // press submitted then, and one press submits now - no dead keystroke and
+    // nothing substituted on the way.
+    const onSubmit = vi.fn((event: FormEvent) => {
+      event.preventDefault();
+    });
+    render(
+      <form onSubmit={onSubmit}>
+        <Harness />
+        <button type="submit">Create</button>
+      </form>,
+    );
+    await userEvent.click(field());
+    await userEvent.type(field(), "brewing");
+    await userEvent.keyboard("{Enter}");
+
+    expect(onSubmit).toHaveBeenCalledTimes(1);
+    expect(field()).toHaveValue("brewing");
+  });
+
+  it("keeps Enter to itself while a row is walked to", async () => {
+    const onSubmit = vi.fn((event: FormEvent) => {
+      event.preventDefault();
+    });
+    render(
+      <form onSubmit={onSubmit}>
+        <Harness />
+        <button type="submit">Create</button>
+      </form>,
+    );
+    await userEvent.click(field());
+    await userEvent.keyboard("{ArrowDown}");
+    await userEvent.keyboard("{Enter}");
+
+    expect(field()).toHaveValue("stable");
+    expect(onSubmit).not.toHaveBeenCalled();
+  });
+
+  it("gives the list a name of its own, not the field's", async () => {
+    render(<Harness />);
+    await userEvent.click(field());
+    expect(
+      screen.getByRole("listbox", { name: "Status suggestions" }),
+    ).toBeInTheDocument();
+    // And the field is still the one thing called "Status".
+    expect(screen.getByLabelText("Status").tagName).toBe("INPUT");
   });
 
   it("opens on ArrowDown from a closed field", async () => {

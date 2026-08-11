@@ -235,6 +235,7 @@ export default function CreateEngramDialogBody({
             >
               <SuggestInput
                 id={typeField}
+                label="Type"
                 describedBy={`${typeField}-help`}
                 className={FIELD_CLASSES}
                 value={engramType}
@@ -252,6 +253,7 @@ export default function CreateEngramDialogBody({
             >
               <SuggestInput
                 id={statusField}
+                label="Status"
                 describedBy={`${statusField}-help`}
                 className={FIELD_CLASSES}
                 value={status}

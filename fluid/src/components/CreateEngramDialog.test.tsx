@@ -263,6 +263,10 @@ describe("the create flow", () => {
     await userEvent.click(form.getByRole("option", { name: /^decision/ }));
     expect(form.getByLabelText("Type")).toHaveValue("decision");
 
+    // And a word this app has never heard of goes on the wire exactly as
+    // typed: the suggestions are the recommended set, not the allowed one.
+    await userEvent.type(form.getByLabelText("Status"), "brewing");
+
     await userEvent.click(screen.getByRole("button", { name: "Create" }));
     await waitFor(() => {
       expect(created).toHaveBeenCalled();
@@ -272,7 +276,10 @@ describe("the create flow", () => {
     if (typeof body !== "string") {
       throw new Error("no POST body");
     }
-    expect(JSON.parse(body) as unknown).toMatchObject({ type: "decision" });
+    expect(JSON.parse(body) as unknown).toMatchObject({
+      type: "decision",
+      status: "brewing",
+    });
   });
 
   it("omits the tags key entirely when the field is left empty", async () => {

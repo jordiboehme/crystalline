@@ -38,7 +38,7 @@ const STATUS_GLOSSES: Record<string, string> = {
   draft: "still being written",
   proposed: "put forward, not agreed yet",
   idea: "a thought worth keeping",
-  poc: "shown to work once, in a prototype",
+  poc: "a proof of concept: shown to work once, in a prototype",
   deprecated: "still here, no longer advised",
   superseded: "replaced by a newer engram",
   archived: "kept for the record, out of use",

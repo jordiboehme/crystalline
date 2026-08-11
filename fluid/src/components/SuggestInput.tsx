@@ -16,6 +16,14 @@
  * allowed words this app never heard of, and a control that quietly refused
  * them would be lying about the format.
  *
+ * That promise is what decides the keyboard. Nothing in the list is active
+ * until an arrow key makes it so, and Enter on a field with no active row
+ * accepts what was typed rather than the nearest word on offer. The other
+ * variant - a row active as soon as the list opens - is for a field whose
+ * value is expected to come from the list, and taking it here would mean a
+ * house word that happens to contain a recommended one could not be entered
+ * with the key most people finish a field with.
+ *
  * Hand-rolled rather than built on the palette's `cmdk` or on a Radix popover:
  * both own a keyboard that fights a text input (a menu takes the arrow keys
  * and the typeahead for itself), and `cmdk` hard-codes `aria-expanded="true"`
@@ -42,6 +50,12 @@ export interface Suggestion {
 export interface SuggestInputProps {
   /** The field's id, which its label points at. */
   id: string;
+  /**
+   * What the field is called, exactly as its label says it. The list is named
+   * from it ("Status suggestions"), which is a name of its own rather than a
+   * second element answering to "Status".
+   */
+  label: string;
   /** The value the field opens on. */
   value: string;
   /** What it offers, in the order it should read. */
@@ -56,6 +70,9 @@ export interface SuggestInputProps {
   className?: string | undefined;
   placeholder?: string | undefined;
 }
+
+/** No row is active. The position before the first, so `index + 1` is first. */
+const NO_ROW = -1;
 
 /**
  * One row's two faces, each a whole class string.
@@ -83,7 +100,9 @@ const OPTION = {
  * and no `stopPropagation` in here can get ahead of it. The field cannot win
  * the race, so the layer asks instead - and it asks the DOM, which is the same
  * state the person pressing the key can see, rather than a flag two components
- * would have to keep in step.
+ * would have to keep in step. Every dismissable layer that can contain one of
+ * these fields must ask this before it dismisses, or Escape will close the
+ * layer instead of the list every time.
  *
  * Exported from the component's own file rather than from a module of its own,
  * for the reason the primitives make the same exception: the knowledge is
@@ -101,6 +120,7 @@ export function suggestionsAreOpen(): boolean {
 
 export function SuggestInput({
   id,
+  label,
   value,
   suggestions,
   onChange,
@@ -116,7 +136,16 @@ export function SuggestInput({
   // keystroke narrows it. This is the difference between a list worth opening
   // and the datalist behavior this control replaces.
   const [filtering, setFiltering] = useState(false);
-  const [active, setActive] = useState(0);
+  // Which row is active, or NO_ROW for none.
+  //
+  // Nothing is active until an arrow key asks for something, which is the
+  // whole difference between the two combobox variants and the difference
+  // between guidance and enforcement here. With a row active from the moment
+  // the list opens, Enter takes it: typing `e` on the way to `experimental`
+  // would make `stable` active and Enter would write `stable` over what was
+  // typed. That variant is for fields whose value is expected to come from
+  // the list, and these two fields are the opposite of that by design.
+  const [active, setActive] = useState(NO_ROW);
   const focused = useRef(false);
   // What the owner last heard, so a pick followed by a blur is one commit and
   // a blur that changed nothing is none. In the frontmatter rail a commit is a
@@ -145,14 +174,20 @@ export function SuggestInput({
   // A list with nothing in it is not an open list, and `aria-expanded` must
   // not claim otherwise: a typed value nobody recommends simply has no popover.
   const expanded = open && matches.length > 0;
-  const index = Math.min(active, matches.length - 1);
+  // Clamped against a list that may have shrunk under it, and never below
+  // NO_ROW, so an active row is always either a row that exists or none.
+  const index =
+    active === NO_ROW ? NO_ROW : Math.min(active, matches.length - 1);
+  const hasActive = expanded && index >= 0;
   const listId = `${id}-suggestions`;
   const optionId = (position: number) => `${id}-suggestion-${String(position)}`;
 
   const change = (next: string) => {
     setDraft(next);
     setFiltering(true);
-    setActive(0);
+    // Typing narrows the list; it never picks from it. What is in the field is
+    // what the person wrote until they say otherwise with an arrow key.
+    setActive(NO_ROW);
     setOpen(true);
     onChange?.(next);
   };
@@ -181,7 +216,7 @@ export function SuggestInput({
         aria-expanded={expanded}
         aria-controls={listId}
         aria-autocomplete="list"
-        {...(expanded ? { "aria-activedescendant": optionId(index) } : {})}
+        {...(hasActive ? { "aria-activedescendant": optionId(index) } : {})}
         {...(describedBy !== undefined
           ? { "aria-describedby": describedBy }
           : {})}
@@ -194,7 +229,7 @@ export function SuggestInput({
         onFocus={() => {
           focused.current = true;
           setFiltering(false);
-          setActive(0);
+          setActive(NO_ROW);
           setOpen(true);
         }}
         onClick={() => {
@@ -216,27 +251,48 @@ export function SuggestInput({
             event.preventDefault();
             if (!open) {
               setFiltering(false);
-              setActive(0);
+              setActive(NO_ROW);
               setOpen(true);
               return;
             }
-            setActive(Math.min(index + 1, matches.length - 1));
+            // From no row, down is the first one; `index + 1` says exactly
+            // that, since NO_ROW is the position before the first.
+            setActive(Math.max(0, Math.min(index + 1, matches.length - 1)));
             return;
           }
           if (event.key === "ArrowUp") {
             event.preventDefault();
-            setActive(Math.max(index - 1, 0));
+            if (!open) {
+              setFiltering(false);
+              setActive(NO_ROW);
+              setOpen(true);
+              return;
+            }
+            // From no row, up is the last one, which is what a person
+            // reaching upwards into a list beneath the field means.
+            setActive(
+              index === NO_ROW ? matches.length - 1 : Math.max(index - 1, 0),
+            );
             return;
           }
-          if (event.key === "Enter" && expanded) {
-            const chosen = matches[index];
+          if (event.key === "Enter") {
+            const chosen = hasActive ? matches[index] : undefined;
             if (chosen) {
-              // Only when a row is there to take: with the list closed, Enter
-              // belongs to whatever surrounds the field - a dialog's form
-              // submits on it, and this control has no opinion about that.
+              // A row was walked to, so Enter takes it - and only then is the
+              // key this control's to keep.
               event.preventDefault();
               pick(chosen);
+              return;
             }
+            // Nothing was walked to, so what is in the field is what was
+            // typed, and Enter accepts it: the list goes away and the value
+            // is committed as written. The event is DELIBERATELY not stopped,
+            // so a form around the field submits on this same keypress the way
+            // it did when these fields were plain inputs with a datalist. One
+            // Enter, one submit, and the value that submits is the typed one.
+            setOpen(false);
+            setFiltering(false);
+            commit(draft);
             return;
           }
           if (event.key === "Escape" && open) {
@@ -254,10 +310,12 @@ export function SuggestInput({
         <ul
           id={listId}
           role="listbox"
-          // Deliberately unnamed: the combobox that owns it carries the name,
-          // and repeating it here would put two elements on the page answering
-          // to "Status" - which is exactly how a test and a screen reader both
-          // find the field.
+          // Named for what it is, in the field's own words: a listbox must
+          // have an accessible name, and this one must not be the field's own
+          // name. Pointing it back at the label would make a second element on
+          // the page answer to "Status", which is exactly how a screen reader
+          // user and every test in this suite find the field itself.
+          aria-label={`${label} suggestions`}
           className={`absolute top-full left-0 mt-1 max-h-64 w-full overflow-y-auto ${MENU_CLASSES}`}
         >
           {matches.map((suggestion, position) => (
@@ -265,9 +323,11 @@ export function SuggestInput({
               key={suggestion.name}
               id={optionId(position)}
               role="option"
-              aria-selected={position === index}
+              aria-selected={hasActive && position === index}
               data-value={suggestion.name}
-              className={position === index ? OPTION.on : OPTION.off}
+              className={
+                hasActive && position === index ? OPTION.on : OPTION.off
+              }
               onMouseDown={(event) => {
                 // The field keeps the focus through the whole pick: a blur
                 // here would close the list out from under the click.

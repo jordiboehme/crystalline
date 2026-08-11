@@ -149,6 +149,7 @@ export function FrontmatterForm({
         </label>
         <SuggestInput
           id={typeField}
+          label="Type"
           className={`w-full ${FIELD_CLASSES}`}
           value={type}
           suggestions={TYPE_SUGGESTIONS}
@@ -162,6 +163,7 @@ export function FrontmatterForm({
         </label>
         <SuggestInput
           id={statusField}
+          label="Status"
           className={`w-full ${FIELD_CLASSES}`}
           value={status}
           suggestions={STATUS_SUGGESTIONS}
@@ -283,8 +285,12 @@ export function FrontmatterForm({
  * rather than a state their typing passes through.
  *
  * The buffer is still the only copy of the value: `picking` says nothing about
- * the document, only that an empty picker is on screen. A hand edit that writes
- * the key shows the date; one that removes it puts the named state back.
+ * the document, only that a picker is on screen. A hand edit that writes the
+ * key shows the date, whichever state the row is in. A hand edit that REMOVES
+ * the key puts the named state back only while no picker is open - an open
+ * picker outlives it and stands there empty, because `picking` is what somebody
+ * asked for and the text going quiet is not them changing their mind. The clear
+ * control beside it is the way back, and it is there the whole time.
  */
 function DateRow({
   label,
