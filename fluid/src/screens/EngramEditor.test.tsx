@@ -197,8 +197,19 @@ describe("the engram editor", () => {
     await waitFor(() => {
       expect(editor.textContent).toContain("A rule.");
     });
-    // Frontmatter is in the buffer too: the whole file is the document.
-    expect(editor.textContent).toContain("permalink: alpha");
+    // Frontmatter is in the buffer too: the whole file is the document. In
+    // preview mode the block is behind its summary chip - the form beside the
+    // buffer is the metadata surface there - so the plain text of it is what
+    // Raw shows, which is the mode that shows the file as written.
+    expect(editor.querySelector(".cm-frontmatter-chip")?.textContent).toContain(
+      "engram",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Raw" }));
+    await waitFor(() => {
+      expect(screen.getByLabelText("Engram source").textContent).toContain(
+        "permalink: alpha",
+      );
+    });
   });
 
   it("renders live preview and hands the raw text back on demand", async () => {
@@ -334,6 +345,19 @@ describe("the engram editor", () => {
     await userEvent.clear(status);
     await userEvent.type(status, "draft");
     await userEvent.tab();
+    // The edit lands inside the folded block, so what the buffer shows is the
+    // chip - and it has to be a CURRENT chip: a fold that mapped its old
+    // decoration through the change instead of recomputing would leave the
+    // summary saying "stable" over a document that says draft.
+    await waitFor(() => {
+      expect(
+        screen
+          .getByLabelText("Engram source")
+          .querySelector(".cm-frontmatter-chip")?.textContent,
+      ).toContain("draft");
+    });
+    // And the line itself is in the document, which Raw shows unconditionally.
+    await userEvent.click(screen.getByRole("button", { name: "Raw" }));
     await waitFor(() => {
       expect(screen.getByLabelText("Engram source").textContent).toContain(
         "status: draft",
@@ -466,6 +490,10 @@ describe("the engram editor", () => {
         "A recovered rule.",
       );
     });
+    // Counted in Raw mode, where every line of the file is a rendered line:
+    // preview folds the frontmatter block behind one chip, and the question
+    // here is about the document rather than about what decorates it.
+    await userEvent.click(screen.getByRole("button", { name: "Raw" }));
     // One buffer line per "\n" in the draft's own content: a dispatch that
     // kept splitting on the CRLF-mounted state's own separator would
     // collapse the whole thing onto a single line instead.
@@ -510,6 +538,8 @@ describe("the engram editor", () => {
         "A recovered rule.",
       );
     });
+    // Raw for the count, for the same reason as the test above.
+    await userEvent.click(screen.getByRole("button", { name: "Raw" }));
     const expectedLines = crlfDraftContent.split("\r\n").length;
     expect(
       screen.getByLabelText("Engram source").querySelectorAll(".cm-line"),
@@ -682,6 +712,9 @@ describe("the engram editor", () => {
         "Somebody else's rule.",
       );
     });
+    // Raw for the count, so the folded frontmatter block is rendered as its
+    // lines: this is a question about the rebuilt document.
+    await userEvent.click(screen.getByRole("button", { name: "Raw" }));
     // One buffer line per "\n" in the server's content: a dispatch that kept
     // splitting on the CRLF-mounted state's own separator would collapse the
     // whole thing onto a single line instead.
@@ -1075,9 +1108,14 @@ describe("the engram editor in a session", () => {
       }, "a remote author");
     });
     // The binding put it in the buffer, and the form reads the buffer: the
-    // panel beside the text is a view over what the room agreed on.
+    // panel beside the text is a view over what the room agreed on. In the
+    // buffer the block is folded, so the remote edit shows up there as a
+    // refreshed summary chip - derived from the document, so a stale chip
+    // would mean a stale buffer.
     await waitFor(() => {
-      expect(editor.textContent).toContain("status: draft");
+      expect(
+        editor.querySelector(".cm-frontmatter-chip")?.textContent,
+      ).toContain("draft");
     });
     expect(await screen.findByLabelText("Status")).toHaveValue("draft");
   });

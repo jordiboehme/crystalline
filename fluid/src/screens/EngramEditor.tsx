@@ -48,6 +48,7 @@ import {
 import { fenceMono } from "../editor/fenceMono";
 import { fencePreviews } from "../editor/fencePreviews";
 import { FindingsPanel, jumpToLine } from "../editor/FindingsPanel";
+import { frontmatterFold } from "../editor/frontmatterFold";
 import { FrontmatterForm } from "../editor/FrontmatterForm";
 import { livePreview } from "../editor/preview";
 import { RAW_MONO, baseExtensions, lineSeparatorFor } from "../editor/setup";
@@ -85,6 +86,11 @@ function previewConfig(off: boolean, dark: boolean): Extension {
         wikilinkChips(),
         crystallineLines(),
         fencePreviews(dark),
+        // The frontmatter form beside the buffer is the metadata surface, so
+        // the block itself folds to one chip here rather than being shown
+        // twice. The MANIFEST editor deliberately does not get this: it has
+        // no form, so its frontmatter is only ever visible in the buffer.
+        frontmatterFold(),
         // Prose is proportional, code is not. Raw mode does not need this -
         // the whole buffer is mono there - so it rides the preview branch
         // with the rest of the read model.
