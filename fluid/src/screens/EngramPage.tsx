@@ -4,13 +4,20 @@
  * Two requests make it. The detail payload is the engram itself - its markdown,
  * its frontmatter, and every reference the server parsed out of the body with a
  * flag saying whether the index resolved it. The neighborhood graph is where
- * those references landed and what points back, because the detail payload
- * names a target as it was written (a title, usually) and never as an address,
- * and its inbound block is a sample capped at five rather than the set.
+ * those references landed, because the detail payload names a target as it was
+ * written (a title, usually) and never as an address.
  *
  * So the two are read together rather than shown side by side: the resolver
  * that linkifies the body needs a fact from each, and until the graph lands a
  * wikilink the index resolved is prose rather than a link that guesses.
+ *
+ * What points back is no longer among them. The graph is capped at a hundred
+ * and fifty nodes, which is a cap on the backlinks drawn from it; the panel
+ * counts and pages the whole index instead, and asks for nothing when the
+ * detail payload's `inboundCount` is already zero. The graph's inbound edges
+ * are still read here for the two things they are exact about: the supersedes
+ * chain, whose other half only the linker wrote down, and the retire dialog's
+ * warning about what would be left dangling.
  *
  * The detail response is cached under `(domain, permalink)` with the checksum
  * it carries, which is the same token its `ETag` carries and the one a later
@@ -350,10 +357,9 @@ export default function EngramPage() {
         <aside className="flex flex-col gap-6 print:hidden">
           <DetailsPanel frontmatter={engram.frontmatter} address={engram.url} />
           <BacklinksPanel
-            backlinks={backlinks}
-            pending={graph.isPending}
-            error={graph.error}
-            truncated={graph.data?.truncated ?? false}
+            domain={engram.domain}
+            permalink={engram.permalink}
+            inboundCount={engram.inboundCount}
           />
         </aside>
       </div>

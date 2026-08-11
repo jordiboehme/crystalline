@@ -6,9 +6,10 @@
  * one the index looked for and did not find is marked and left unlinked; the
  * details panel shows the fields the engram carries and invents nothing for
  * the ones it does not, which for the temporal fields is the difference between
- * "valid forever" and a date nobody wrote. Backlinks come from the graph rather
- * than from the detail payload's capped sample, and the empty case says so
- * plainly instead of pretending the panel is still loading.
+ * "valid forever" and a date nobody wrote. Backlinks are counted by relation
+ * across the whole index rather than drawn from the capped neighborhood, they
+ * cost no request at all when the detail payload already counted none, and the
+ * empty case says so plainly instead of pretending the panel is still loading.
  */
 
 import { screen, waitFor, within } from "@testing-library/react";
@@ -146,6 +147,37 @@ function graphResponse(overrides: Record<string, unknown> = {}) {
   };
 }
 
+/**
+ * What points at Alpha, as the inbound endpoint answers it: Beta's prose
+ * wikilink, which is the same reference the neighborhood above carries as an
+ * inbound `links_to` edge. The summary and the page come out of one function
+ * because the endpoint answers both, differing only in whether a relation was
+ * named.
+ */
+function inboundResponse(path: string) {
+  const rel = new URLSearchParams(path.split("?")[1] ?? "").get("rel");
+  return {
+    total: 1,
+    page: 1,
+    limit: rel === null ? 1 : 20,
+    count: rel === null ? 0 : 1,
+    types: [{ rel: "links_to", count: 1 }],
+    hits:
+      rel === null
+        ? []
+        : [
+            {
+              domain: "eng",
+              permalink: "notes/beta",
+              title: "Beta",
+              path: "notes/beta.md",
+              rel: "links_to",
+              status: "stable",
+            },
+          ],
+  };
+}
+
 function serve(routes: Record<string, (path: string) => unknown> = {}) {
   apiMock.mockImplementation(
     answersFor({
@@ -169,6 +201,9 @@ function serve(routes: Record<string, (path: string) => unknown> = {}) {
       }),
       "/domains/eng/engrams/alpha": () => detailResponse(),
       "/graph": () => graphResponse(),
+      // What points here, which the backlinks panel reads on its own: the
+      // summary on first paint, one relation's page when a chip is opened.
+      "/domains/eng/inbound/alpha": (path: string) => inboundResponse(path),
       ...routes,
     }),
   );
@@ -354,27 +389,34 @@ describe("the engram page", () => {
     );
   });
 
-  it("lists what points here, from the graph rather than the capped sample", async () => {
+  it("counts what points here by relation, and opens onto them on request", async () => {
     serve();
 
     renderApp("/d/eng/e/alpha");
 
     const panel = await screen.findByRole("region", { name: "Backlinks" });
-    await waitFor(() => {
-      expect(
-        within(panel).getByRole("link", { name: "Beta, notes/beta" }),
-      ).toHaveAttribute("href", "/d/eng/e/notes/beta");
+    // The counts are of the whole index rather than of the capped
+    // neighborhood, so the panel is a chip per relation and no rows at all
+    // until one is opened.
+    const chip = await within(panel).findByRole("button", {
+      name: /links_to/,
     });
-    // How it points, which is what the edge carries beyond the fact of it.
-    expect(panel).toHaveTextContent("links_to");
+    expect(chip).toHaveTextContent("1");
+    expect(within(panel).queryByRole("link")).toBeNull();
+
+    await userEvent.click(chip);
+
+    expect(
+      await screen.findByRole("link", { name: "Beta, eng / notes/beta.md" }),
+    ).toHaveAttribute("href", "/d/eng/e/notes/beta");
   });
 
-  it("says what the server said when the neighborhood could not be read", async () => {
+  it("says what the server said when what points here could not be read", async () => {
     serve({
       // A refusal rather than a server error, so the query layer answers it
       // once instead of retrying: what is pinned here is the message, not the
       // retry policy.
-      "/graph": () => {
+      "/domains/eng/inbound/alpha": () => {
         throw new ApiProblem(403, "forbidden", "this account may not read eng");
       },
     });
@@ -388,27 +430,21 @@ describe("the engram page", () => {
     expect(alert).toHaveTextContent("this account may not read eng");
   });
 
-  it("says plainly when nothing points here yet", async () => {
+  it("says plainly when nothing points here yet, without asking", async () => {
     serve({
-      "/graph": () =>
-        graphResponse({
-          nodes: [
-            {
-              id: 1,
-              domain: "eng",
-              permalink: "alpha",
-              title: "Alpha",
-              status: "stable",
-              type: "decision",
-            },
-          ],
-          edges: [],
-        }),
+      // The detail payload omits the inbound block entirely when nothing
+      // points here, which is exactly the case this panel must answer from
+      // what the page has already read.
+      "/domains/eng/engrams/alpha": () =>
+        detailResponse({ inbound: undefined }),
     });
 
     renderApp("/d/eng/e/alpha");
 
     expect(await screen.findByText(/nothing links here yet/i)).toBeVisible();
+    expect(apiMock.mock.calls.map((call) => String(call[0]))).not.toContain(
+      "/domains/eng/inbound/alpha?page=1&limit=1",
+    );
   });
 
   it("draws an observation once, in the body, as what it is", async () => {
@@ -601,10 +637,10 @@ describe("the engram page", () => {
     serve();
 
     renderApp("/d/eng/e/alpha");
-    // The backlinks panel is drawn from the same neighborhood, so once it has
-    // one the graph section has one too.
-    const panel = await screen.findByRole("region", { name: "Backlinks" });
-    await within(panel).findByRole("link", { name: /Beta/ });
+    // The body's wikilinks are resolved from the same neighborhood, so once
+    // they are links the graph section has one too.
+    const body = await screen.findByRole("article");
+    await within(body).findAllByRole("link", { name: "Beta" });
 
     await userEvent.click(
       screen.getByRole("button", { name: /neighborhood/i }),
