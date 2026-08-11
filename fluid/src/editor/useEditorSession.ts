@@ -195,6 +195,26 @@ export function useEditorSession(options: EditorSessionOptions): EditorSession {
   const { report, hardErrors, checking, validationUnavailable } =
     useValidationGate(validateDomain, validatePath, buffer);
 
+  /**
+   * Store the buffer as it stands, in draft space. The debounce below is the
+   * only writer that runs on its own; the deliberate snapshots - taking the
+   * server's version, handing a room's conflict to the file, walking out of a
+   * deleted engram, keeping what a landed save did not carry - go through the
+   * same spelling rather than a second one.
+   */
+  const snapshotDraft = useCallback(
+    (text: string) => {
+      writeDraft(draftUser, draftDomain, draftSlot, {
+        // In collab mode the buffer is LF session space; `draftContent` maps
+        // it to file space so the stored draft matches the solo flow's.
+        content: asStoredDraft(text),
+        baseChecksum: checksum,
+        savedAt: new Date().toISOString(),
+      });
+    },
+    [draftUser, draftDomain, draftSlot, checksum, asStoredDraft],
+  );
+
   const save = useMutation({
     // The token travels with the content rather than being read from
     // `checksum` inside the mutation: a conflict's overwrite moves the
@@ -203,8 +223,20 @@ export function useEditorSession(options: EditorSessionOptions): EditorSession {
     // value on that first tick.
     mutationFn: ({ content, token }: { content: string; token: string }) =>
       transportSave(content, token),
-    onSuccess: (saved) => {
-      clearDraft(draftUser, draftDomain, draftSlot);
+    onSuccess: (saved, sent) => {
+      const view = viewRef.current;
+      // What the draft is for is the text the server does not have. A save
+      // that carried the buffer as it stands has made the draft redundant and
+      // it goes; a save whose content the buffer has already moved past has
+      // not, and clearing the draft on it would delete the only copy of
+      // everything typed while it was in flight. Read back through `docText`
+      // rather than from `buffer`, which is a render's value and this handler
+      // runs whenever the answer happens to arrive.
+      if (view && docText(view.state) !== sent.content) {
+        snapshotDraft(docText(view.state));
+      } else {
+        clearDraft(draftUser, draftDomain, draftSlot);
+      }
       setChecksum(saved.checksum);
       setSavedText(saved.content);
       setNotice({ kind: "done", text: "Saved" });
@@ -256,25 +288,6 @@ export function useEditorSession(options: EditorSessionOptions): EditorSession {
       view.dom.removeEventListener(SAVE_EVENT, onSaveRequested);
     };
   });
-
-  /**
-   * Store the buffer as it stands, in draft space. The debounce below is the
-   * only writer that runs on its own; the deliberate snapshots - taking the
-   * server's version, handing a room's conflict to the file, walking out of a
-   * deleted engram - go through the same spelling rather than a second one.
-   */
-  const snapshotDraft = useCallback(
-    (text: string) => {
-      writeDraft(draftUser, draftDomain, draftSlot, {
-        // In collab mode the buffer is LF session space; `draftContent` maps
-        // it to file space so the stored draft matches the solo flow's.
-        content: asStoredDraft(text),
-        baseChecksum: checksum,
-        savedAt: new Date().toISOString(),
-      });
-    },
-    [draftUser, draftDomain, draftSlot, checksum, asStoredDraft],
-  );
 
   // The safety net: a pause in typing snapshots the buffer to browser
   // storage, so a crash, a closed tab or an accidental navigation away loses

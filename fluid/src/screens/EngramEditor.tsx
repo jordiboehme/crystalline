@@ -53,7 +53,12 @@ import { FindingsPanel, jumpToLine } from "../editor/FindingsPanel";
 import { frontmatterFold } from "../editor/frontmatterFold";
 import { FrontmatterForm } from "../editor/FrontmatterForm";
 import { livePreview } from "../editor/preview";
-import { RAW_MONO, baseExtensions, lineSeparatorFor } from "../editor/setup";
+import {
+  RAW_MONO,
+  baseExtensions,
+  docText,
+  lineSeparatorFor,
+} from "../editor/setup";
 import { formattingKeymap } from "../editor/toolbar";
 import { saveKeymap, useEditorSession } from "../editor/useEditorSession";
 import {
@@ -606,13 +611,32 @@ function Surface({
       void queryClient.invalidateQueries({
         queryKey: domainTreeKey(saved.domain),
       });
-      if (finishing.current) {
+      /*
+       * Whether this save is the one Done meant.
+       *
+       * The flag rides whichever save consumes it, which is what makes a Done
+       * pressed during a round trip finish on it - but the buffer can have
+       * moved on in the meantime, and then this response is a receipt for text
+       * the author has already left behind. Walking them out on it would take
+       * the newer text off the screen under a button that promises the work is
+       * kept. So the finish is conditional on the buffer still being what went
+       * on the wire, read back through `docText` at the moment the answer
+       * lands. What is compared is the SENT content rather than the returned
+       * content: a server that normalizes what it stores would otherwise make
+       * every save look stale and no Done would ever finish.
+       *
+       * A stale one leaves the author on their newer buffer with the "Saved"
+       * notice standing, and one more press finishes that.
+       */
+      const finished =
+        finishing.current && (view === null || docText(view.state) === content);
+      finishing.current = false;
+      if (finished) {
         // Done: the server has confirmed the write, so being finished with
         // this engram ends where reading it does - at the address the save
         // answered from, which a rename through the frontmatter has already
         // moved. Nothing navigates before this point: a save the server
         // refused throws above and leaves the author where they are.
-        finishing.current = false;
         void navigate(engramRoute(saved.domain, saved.permalink));
       } else if (saved.permalink !== engram.permalink) {
         // The rename receipt: the engram answers at its new address now, and
@@ -643,14 +667,24 @@ function Surface({
    * from text that never landed.
    *
    * Both shortcuts leave immediately rather than doing nothing. A buffer with
-   * hard errors cannot be saved by this button any more than by Save, and that
-   * is the one case where the older behavior is the informative one: the way
-   * out stays open and the draft keeps the text, exactly as it did when Done
-   * was a link. A clean buffer has nothing to write, so a PUT would only be a
-   * round trip for a file that already matches.
+   * hard errors cannot be saved by this button any more than by Save, so the
+   * way out stays open exactly as it did when Done was a link. A clean buffer
+   * has nothing to write, so a PUT would only be a round trip for a file that
+   * already matches.
+   *
+   * Leaving a buffer that could not be saved snapshots it first. Nothing in
+   * this app asks before an in-app navigation - `beforeunload` is for closing
+   * the tab, and there is no route blocker - so the draft store is the whole
+   * safety net here, and its own writer is a debounce a second wide. A
+   * correction typed and then abandoned inside that second would otherwise be
+   * in neither the file nor the draft. This is the same deliberate snapshot
+   * the closed-room walkout takes, for the same reason.
    */
   const finish = () => {
     if (session.hardErrors > 0 || !session.dirty) {
+      if (session.dirty) {
+        session.snapshotDraft();
+      }
       void navigate(engramRoute(engram.domain, engram.permalink));
       return;
     }

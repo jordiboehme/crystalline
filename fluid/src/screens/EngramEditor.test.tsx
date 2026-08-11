@@ -177,6 +177,41 @@ function mountedView(content: HTMLElement): EditorView {
   return view;
 }
 
+/**
+ * A PUT that stays in flight until the test lets it land, which is what makes
+ * "the buffer moved while the save was out" a thing a test can arrange rather
+ * than a race it has to hope for.
+ */
+function gatedPut() {
+  let land = () => undefined as void;
+  const landed = new Promise<void>((resolve) => {
+    land = () => {
+      resolve();
+    };
+  });
+  const put = vi.fn(async () => {
+    await landed;
+    return detailResponse({ checksum: "next111" });
+  });
+  return { put, land: () => land() };
+}
+
+/**
+ * Let everything a landed save scheduled flush, a navigation included.
+ *
+ * An assertion that a screen did NOT leave has to outlast whatever would have
+ * taken it away: the transport navigates before react-query's own success
+ * handler raises the notice, so a check made the moment the notice appears can
+ * beat the router's render and pass while the navigation is still on its way.
+ */
+async function settled(): Promise<void> {
+  await act(async () => {
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0);
+    });
+  });
+}
+
 /** Every PUT the api mock has seen. */
 function puts() {
   return apiMock.mock.calls.filter(([, init]) => init?.method === "PUT");
@@ -647,6 +682,150 @@ describe("the engram editor", () => {
       await screen.findByRole("heading", { name: "Alpha", level: 1 }),
     ).toBeInTheDocument();
     expect(put).not.toHaveBeenCalled();
+  });
+
+  it("Done writes the draft before walking out of a buffer it cannot save", async () => {
+    serveEditor({
+      "/validate": () => ({
+        errors: 1,
+        findings: [
+          {
+            rule: "E001",
+            severity: "error",
+            message: "frontmatter will not parse",
+            line: 1,
+            fix: null,
+          },
+        ],
+      }),
+    });
+    renderApp("/d/eng/edit/alpha");
+    await screen.findByLabelText("Engram source");
+    const status = await screen.findByLabelText("Status");
+    await userEvent.clear(status);
+    await userEvent.type(status, "brewing");
+    await userEvent.tab();
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
+    });
+
+    // Immediately: the draft debounce is a whole second, and nothing in this
+    // app asks before an in-app navigation, so a Done pressed inside that
+    // second is the moment the text has to be put somewhere.
+    await userEvent.click(screen.getByRole("button", { name: "Done" }));
+
+    await screen.findByRole("heading", { name: "Alpha", level: 1 });
+    expect(readDraft("ada", "eng", "alpha")?.content).toContain(
+      "status: brewing",
+    );
+  });
+
+  it("Done rides a save that is already in flight and finishes on it", async () => {
+    const { put, land } = gatedPut();
+    serveEditor({
+      "/domains/eng/engrams/alpha": (_path, init) =>
+        init?.method === "PUT" ? put() : detailResponse(),
+    });
+    renderApp("/d/eng/edit/alpha");
+    await screen.findByLabelText("Engram source");
+    const status = await screen.findByLabelText("Status");
+    await userEvent.clear(status);
+    await userEvent.type(status, "draft");
+    await userEvent.tab();
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Save" })).toBeEnabled();
+    });
+
+    await userEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => {
+      expect(put).toHaveBeenCalledTimes(1);
+    });
+    // Pressed while the round trip is still out: a second save cannot start,
+    // so the press rides the one that is already carrying this text.
+    await userEvent.click(screen.getByRole("button", { name: "Done" }));
+    land();
+
+    expect(
+      await screen.findByRole("heading", { name: "Alpha", level: 1 }),
+    ).toBeInTheDocument();
+    expect(put).toHaveBeenCalledTimes(1);
+  });
+
+  it("Done never finishes on a save that no longer carries what is on screen", async () => {
+    const { put, land } = gatedPut();
+    serveEditor({
+      "/domains/eng/engrams/alpha": (_path, init) =>
+        init?.method === "PUT" ? put() : detailResponse(),
+    });
+    renderApp("/d/eng/edit/alpha");
+    await screen.findByLabelText("Engram source");
+    const status = await screen.findByLabelText("Status");
+    await userEvent.clear(status);
+    await userEvent.type(status, "draft");
+    await userEvent.tab();
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Save" })).toBeEnabled();
+    });
+
+    await userEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => {
+      expect(put).toHaveBeenCalledTimes(1);
+    });
+    // The author keeps working while the round trip is out, and only then asks
+    // to be finished. What is in flight is a version of this engram that has
+    // already been left behind.
+    await userEvent.clear(await screen.findByLabelText("Status"));
+    await userEvent.type(screen.getByLabelText("Status"), "legacy");
+    await userEvent.tab();
+    await waitFor(() => {
+      expect(screen.getByLabelText("Engram source").textContent).toContain(
+        "legacy",
+      );
+    });
+    await userEvent.click(screen.getByRole("button", { name: "Done" }));
+    land();
+
+    // Finished would be a lie about text the server has never seen, so the
+    // save lands, says so, and leaves the author on their own newer buffer.
+    expect(await screen.findByText("Saved")).toBeInTheDocument();
+    await settled();
+    expect(screen.getByLabelText("Engram source")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("heading", { name: "Alpha", level: 1 }),
+    ).toBeNull();
+    // And the newer text is recoverable: the save's own success handler must
+    // not delete the one copy of what it did not carry.
+    expect(readDraft("ada", "eng", "alpha")?.content).toContain(
+      "status: legacy",
+    );
+  });
+
+  it("a refused save disarms Done rather than finishing on the next one", async () => {
+    const put = vi.fn(() => {
+      throw new ApiProblem(500, "server error", "the index is on fire");
+    });
+    serveEditor({
+      "/domains/eng/engrams/alpha": (_path, init) =>
+        init?.method === "PUT" ? put() : detailResponse(),
+    });
+    renderApp("/d/eng/edit/alpha");
+    await screen.findByLabelText("Engram source");
+    const status = await screen.findByLabelText("Status");
+    await userEvent.clear(status);
+    await userEvent.type(status, "draft");
+    await userEvent.tab();
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Save" })).toBeEnabled();
+    });
+
+    await userEvent.click(screen.getByRole("button", { name: "Done" }));
+
+    expect(await screen.findByText(/the index is on fire/)).toBeInTheDocument();
+    await settled();
+    expect(screen.getByLabelText("Engram source")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("heading", { name: "Alpha", level: 1 }),
+    ).toBeNull();
   });
 
   it("Done never saves twice for one press", async () => {
