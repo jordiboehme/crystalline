@@ -31,11 +31,11 @@ use turso::{Builder, Connection, Database, Row, Value};
 use crate::alias::{AliasMap, query_uses_tags};
 use crate::error::{IndexError, Result};
 use crate::store::{
-    ChunkJob, ChunkModelCount, DomainHost, DomainId, DomainKind, DomainStats, EdgeKind,
-    EmbeddingCoverage, EmbeddingRow, EngramDescriptor, EngramId, EngramRecord, EngramSummary,
-    FileStamp, FtsMode, GraphSlice, HostClaim, InboundRef, NewChunk, OutboundRef, Page,
-    RecentFilter, SearchHit, SearchMode, SearchQuery, Store, StoreInfo, StoredEngram, Vocabulary,
-    build_vocabulary,
+    BrowseLevel, ChunkJob, ChunkModelCount, DomainHost, DomainId, DomainKind, DomainStats,
+    EdgeKind, EmbeddingCoverage, EmbeddingRow, EngramDescriptor, EngramId, EngramRecord,
+    EngramSummary, FileStamp, FtsMode, GraphSlice, HostClaim, InboundRef, NewChunk, OutboundRef,
+    Page, RecentFilter, SearchHit, SearchMode, SearchQuery, Store, StoreInfo, StoredEngram,
+    Vocabulary, build_vocabulary,
 };
 use crate::sweep::UnresolvedRef;
 
@@ -930,6 +930,93 @@ impl Store for TursoStore {
         );
         let rows = query_all(&self.conn, &sql, params).await?;
         Ok(rows.iter().map(descriptor_from_row).collect())
+    }
+
+    async fn browse_level(
+        &self,
+        domain: &str,
+        path_prefix: Option<&str>,
+        depth: usize,
+        limit: usize,
+    ) -> Result<BrowseLevel> {
+        let prefix = path_prefix.unwrap_or_default();
+        let depth = depth.max(1);
+        let escaped = like_escape(prefix);
+
+        // Under the prefix. The pattern is escaped, so a folder named `50%` is
+        // a folder rather than a wildcard.
+        let mut clauses = vec!["d.name=?1".to_string()];
+        let mut params = vec![Value::Text(domain.to_string())];
+        let mut n = 2;
+        if !prefix.is_empty() {
+            clauses.push(format!("e.path LIKE ?{n} ESCAPE '\\'"));
+            params.push(Value::Text(format!("{escaped}%")));
+            n += 1;
+        }
+        let under = clauses.join(" AND ");
+
+        // The level itself: no more than `depth` segments below the prefix. A
+        // path with at least `depth` slashes under the prefix matches
+        // `<prefix>%/%` with one `/%` per level, so excluding that pattern is
+        // the depth cut - pushed into SQL rather than applied after the fact,
+        // because a cap over unfiltered rows could otherwise spend the whole
+        // page on engrams too deep to show.
+        let mut level = clauses.clone();
+        let mut level_params = params.clone();
+        level.push(format!("e.path NOT LIKE ?{n} ESCAPE '\\'"));
+        level_params.push(Value::Text(format!("{escaped}%{}", "/%".repeat(depth))));
+        let level = level.join(" AND ");
+
+        // The count runs under exactly the filter the page runs under, so a
+        // truncated level can say how much it is not showing without the two
+        // queries ever disagreeing.
+        let total = scalar_i64(
+            &self.conn,
+            &format!(
+                "SELECT count(*) FROM engram e JOIN domain d ON d.id=e.domain_id WHERE {level}"
+            ),
+            level_params.clone(),
+        )
+        .await?
+        .max(0) as usize;
+
+        let rows = query_all(
+            &self.conn,
+            &format!(
+                "SELECT e.id, e.domain_id, d.name, e.path, e.permalink, e.title, e.engram_type, e.status \
+                 FROM engram e JOIN domain d ON d.id=e.domain_id WHERE {level} \
+                 ORDER BY e.path LIMIT {limit}"
+            ),
+            level_params,
+        )
+        .await?;
+        let engrams: Vec<EngramDescriptor> = rows.iter().map(descriptor_from_row).collect();
+
+        // The folder names come from the path column alone - the distinct first
+        // segment below the prefix - so no body is read to learn that a folder
+        // exists and the row cap above can never hide one. `substr` and `instr`
+        // count characters, so the offset is a character count.
+        let rel = format!("substr(e.path, {})", prefix.chars().count() + 1);
+        let folder_rows = query_all(
+            &self.conn,
+            &format!(
+                "SELECT DISTINCT substr({rel}, 1, instr({rel}, '/') - 1) \
+                 FROM engram e JOIN domain d ON d.id=e.domain_id \
+                 WHERE {under} AND instr({rel}, '/') > 0"
+            ),
+            params,
+        )
+        .await?;
+        let mut folders: Vec<String> = folder_rows.iter().filter_map(|r| cell_text(r, 0)).collect();
+        // Sorted here rather than in SQL, so both backends order folder names
+        // by bytes without either dialect's collation having a say.
+        folders.sort();
+
+        Ok(BrowseLevel {
+            engrams,
+            folders,
+            total,
+        })
     }
 
     async fn engrams_with_tag(

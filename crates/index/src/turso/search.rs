@@ -20,7 +20,7 @@ use crate::store::{
     salience_prior,
 };
 
-use super::{cell_i64, cell_real, cell_text, query_all, query_first, scalar_i64};
+use super::{cell_i64, cell_real, cell_text, like_escape, query_all, query_first, scalar_i64};
 
 const SNIPPET_MARGIN: usize = 70;
 const SNIPPET_LEAD: usize = 200;
@@ -677,6 +677,16 @@ fn build_scalar_filters(
             })
             .collect();
         clauses.push(format!("d.name IN ({})", ph.join(",")));
+    }
+
+    // A folder filter, matched as a literal prefix: the caller hands the folder
+    // with its trailing slash, so `notes/` selects `notes/deep/y.md` and never
+    // the sibling `notes-misc/z.md`, and `like_escape` keeps a folder named
+    // `50%` or `a_b` a name rather than a pattern.
+    if let Some(prefix) = query.path_prefix.as_deref().filter(|p| !p.is_empty()) {
+        clauses.push(format!("e.path LIKE ?{n} ESCAPE '\\'"));
+        params.push(Value::Text(format!("{}%", like_escape(prefix))));
+        *n += 1;
     }
 
     if let Some(t) = &query.engram_type {

@@ -73,6 +73,29 @@ const NEIGHBOR_CHUNK: usize = 5_000;
 /// `truncated` flag rather than pretending to be whole.
 const MAX_GRAPH_NODES: usize = 150;
 
+/// The most engrams one level of [`Engine::browse_domain`] carries.
+///
+/// The tree is a navigation aid, not the listing: a sidebar exists to get a
+/// reader into a folder, and the folder listing - paged, filterable, and
+/// server-side - is what shows a folder holding thousands of engrams. A level
+/// past this cap is cut rather than loaded, and says so through `truncated`
+/// beside the `total` the level really holds, so a client can send its reader
+/// to the listing instead of drawing a tree nobody can read.
+///
+/// The number is generous on purpose: a folder anyone still navigates by tree
+/// is well under it, so in practice the cap is the ceiling that keeps one
+/// window-focus refetch from loading a whole domain, not a limit a real folder
+/// runs into.
+pub const TREE_LEVEL_CAP: usize = 500;
+
+/// The deepest level [`Engine::browse_domain`] walks.
+///
+/// The depth cut is pushed into SQL as a pattern that grows one term per level,
+/// and `depth` arrives from a request, so this is where an absurd number stops
+/// before it builds an absurd pattern. No domain nests folders anywhere near
+/// this deep, which is what makes the clamp invisible to a real tree.
+const TREE_MAX_DEPTH: usize = 64;
+
 /// The default `evolve_engrams` page size. Small on purpose: the queue is meant
 /// to be worked top-down and agreed item by item, not read in bulk.
 const EVOLVE_DEFAULT_LIMIT: usize = 10;
@@ -3019,6 +3042,25 @@ impl Engine {
 
     /// Search across domains, embedding the query when the mode needs it.
     pub async fn search_engrams(&self, p: &SearchParams) -> Result<Value> {
+        self.search_engrams_under(p, None).await
+    }
+
+    /// [`Engine::search_engrams`] narrowed to one domain-relative folder, which
+    /// is what a folder view pages from: the same filter-only search, with the
+    /// folder pushed into SQL beside the other filters, so `total` stays exact
+    /// and paging is unchanged.
+    ///
+    /// The folder is segment-safe - see [`folder_prefix`] - and `None` or an
+    /// empty value searches the whole scope, which is what every caller that
+    /// never names a folder keeps getting. It is a separate verb rather than a
+    /// field on [`SearchParams`] because that struct is the MCP search tool's
+    /// argument schema, and a folder filter is a browsing affordance of this
+    /// API rather than a knob worth spending an agent's context on.
+    pub async fn search_engrams_under(
+        &self,
+        p: &SearchParams,
+        folder: Option<&str>,
+    ) -> Result<Value> {
         let requested = parse_mode(p.search_type.as_deref())?;
         let text = p.query.clone().filter(|s| !s.trim().is_empty());
         let mut query = SearchQuery {
@@ -3029,6 +3071,7 @@ impl Engine {
             tags: Some(p.tags.clone()).filter(|t| !t.is_empty()),
             after: p.after.clone(),
             min_similarity: p.min_similarity,
+            path_prefix: folder.and_then(folder_prefix),
             limit: p.limit.unwrap_or(10).max(1),
             page: p.page.unwrap_or(1).max(1),
             ..SearchQuery::default()
@@ -3766,13 +3809,25 @@ impl Engine {
     /// Browse a domain's engrams under a folder path. Works for any registered
     /// domain, file or virtual, since it lists rows from the store rather than
     /// walking a filesystem.
+    ///
+    /// One level at a time and bounded: at most [`TREE_LEVEL_CAP`] engrams come
+    /// back, with `total` saying how many the level holds and `truncated`
+    /// saying whether the two differ. `folders` is never cut - it is derived
+    /// from the paths themselves rather than from the rows that survived the
+    /// cap, so a truncated level still names every folder a reader can descend
+    /// into.
+    ///
+    /// A `glob` narrows the rows this level returned, so on a truncated level
+    /// it selects within the cap rather than across the whole folder. The tree
+    /// is a navigation aid; a folder too big to draw is what the paged listing
+    /// is for.
     pub async fn browse_domain(&self, p: &BrowseParams) -> Result<Value> {
         // A domain-exists check, not a filesystem-root requirement, so a virtual
         // domain browses.
         self.domain_entry(&p.domain)?;
         let raw = p.path.clone().unwrap_or_else(|| "/".to_string());
-        let prefix = raw.trim_start_matches("./").trim_matches('/').to_string();
-        let depth = p.depth.unwrap_or(1).max(1);
+        let prefix = folder_prefix(&raw);
+        let depth = p.depth.unwrap_or(1).clamp(1, TREE_MAX_DEPTH);
         let matcher = match &p.glob {
             Some(g) => Some(
                 globset::Glob::new(g)
@@ -3782,60 +3837,49 @@ impl Engine {
             None => None,
         };
 
-        let prefix_pat = if prefix.is_empty() {
-            None
-        } else {
-            Some(format!("{prefix}/"))
-        };
+        // Three bounded queries in the store rather than one listing of the
+        // whole domain filtered here: the prefix and the depth cut are pushed
+        // into SQL in every case, the root included, so a client that refetches
+        // its tree can never pull tens of thousands of rows across per request.
         let store = self.store.lock().await;
-        let all = store
-            .list_engrams(&p.domain, prefix_pat.as_deref(), None)
+        let level = store
+            .browse_level(&p.domain, prefix.as_deref(), depth, TREE_LEVEL_CAP)
             .await?;
         drop(store);
 
-        let mut entries = Vec::new();
-        let mut folders: HashSet<String> = HashSet::new();
-        for d in &all {
-            let rel: &str = if prefix.is_empty() {
-                d.path.as_str()
-            } else {
-                d.path
-                    .strip_prefix(&format!("{prefix}/"))
-                    .unwrap_or(&d.path)
-            };
-            if let Some(m) = &matcher
-                && !m.is_match(&d.path)
-            {
-                continue;
-            }
-            let segments: Vec<&str> = rel.split('/').collect();
-            if segments.len() > 1 {
-                folders.insert(segments[0].to_string());
-            }
-            if segments.len() <= depth {
+        // Whether the level was cut is a fact about the rows, decided before the
+        // glob narrows them: a glob that matches two of five hundred rows has
+        // not un-truncated the level, and `total` stays the level's own count so
+        // a client can offer the listing instead.
+        let truncated = level.total > level.engrams.len();
+        let entries: Vec<Value> = level
+            .engrams
+            .iter()
+            .filter(|d| matcher.as_ref().is_none_or(|m| m.is_match(&d.path)))
+            .map(|d| {
                 // `status` rides along with the rest of the descriptor, which
                 // already carries it: a browse row is what a navigation tree is
                 // drawn from, and whether an engram is retired is the one thing
                 // such a tree has to say about a row it is not otherwise
                 // describing. Leaving it out meant every client browsing a
                 // domain had to fetch the listing again to learn it.
-                entries.push(json!({
+                json!({
                     "permalink": d.permalink,
                     "title": d.title,
                     "type": d.engram_type,
                     "status": d.status,
                     "path": d.path,
-                }));
-            }
-        }
-        let mut folders: Vec<String> = folders.into_iter().collect();
-        folders.sort();
+                })
+            })
+            .collect();
 
         Ok(json!({
             "domain": p.domain,
             "path": raw,
-            "folders": folders,
+            "folders": level.folders,
             "engrams": entries,
+            "truncated": truncated,
+            "total": level.total,
         }))
     }
 
@@ -8223,6 +8267,18 @@ fn is_contained_rel(rel: &str) -> bool {
         && rel
             .split('/')
             .all(|seg| !seg.is_empty() && seg != "." && seg != ".." && !seg.contains(['\\', ':']))
+}
+
+/// A domain-relative folder as the store's path prefix: the trailing slash is
+/// what makes the match a folder rather than a string, so `notes` selects
+/// `notes/deep/y.md` and never the sibling `notes-misc/z.md`.
+///
+/// The root - an empty value, `/` or `./` - is `None`, meaning the whole
+/// domain. Written once and shared by the tree and the folder-scoped listing,
+/// so the two can never disagree about what a folder is.
+fn folder_prefix(raw: &str) -> Option<String> {
+    let trimmed = raw.trim_start_matches("./").trim_matches('/');
+    (!trimmed.is_empty()).then(|| format!("{trimmed}/"))
 }
 
 /// Normalize a destination into a forward-slashed `.md` path.

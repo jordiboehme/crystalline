@@ -102,11 +102,24 @@ pub struct TreeQuery {
 
 /// `GET /domains/{domain}/tree` - one domain's engrams and subfolders under a
 /// path, the navigation a file tree in the UI is built from.
+///
+/// One level at a time and bounded: see [`crate::engine::TREE_LEVEL_CAP`] for
+/// what a level that does not fit answers with.
 #[utoipa::path(
     get,
     path = "/api/v1/domains/{domain}/tree",
     tag = "domains",
     operation_id = "get_domain_tree",
+    summary = "One level of a domain's folders and engrams.",
+    description = "The navigation a file tree is built from, one level at a \
+                   time and bounded: a level holding more engrams than the \
+                   tree shows is cut, `total` says how many it really holds \
+                   and `truncated` says the rows were cut, so a client can \
+                   send its reader to the paged listing instead.\n\n`folders` \
+                   is never cut, so a truncated level still names every folder \
+                   a reader can descend into. A `glob` narrows the engrams \
+                   this level returned, so on a truncated level it selects \
+                   within the cut rather than across the whole folder.",
     params(("domain" = String, Path, description = "The registered domain."), TreeQuery),
     responses(
         (
@@ -123,7 +136,9 @@ pub struct TreeQuery {
                     "type": "engram",
                     "status": "stable",
                     "path": "alpha.md"
-                }]
+                }],
+                "truncated": false,
+                "total": 1
             }),
         ),
         (

@@ -35,13 +35,14 @@ pub use embed::{
 pub use error::{IndexError, Result};
 pub use factory::open_store;
 pub use store::{
-    ChunkJob, ChunkModelCount, DEFAULT_RETIRED_WEIGHT, DEFAULT_SALIENCE_WEIGHT, DomainHost,
-    DomainId, DomainKind, DomainStats, EdgeKind, EmbeddingCoverage, EmbeddingRow, EngramDescriptor,
-    EngramId, EngramRecord, EngramSummary, FileStamp, FilterOp, FtsMode, GraphEdge, GraphNode,
-    GraphSlice, HitKind, HostClaim, InboundRef, LEXICAL_CANDIDATE_CAP, MetadataFilter, NamedCount,
-    NewChunk, OutboundRef, Page, RETIRED_STATUSES, RecentFilter, SearchHit, SearchMode,
-    SearchQuery, Store, StoreInfo, StoredEngram, TagAlias, TagCount, Vocabulary, is_current_status,
-    is_retired_status, parse_metadata_filters, retired_factor, salience_prior,
+    BrowseLevel, ChunkJob, ChunkModelCount, DEFAULT_RETIRED_WEIGHT, DEFAULT_SALIENCE_WEIGHT,
+    DomainHost, DomainId, DomainKind, DomainStats, EdgeKind, EmbeddingCoverage, EmbeddingRow,
+    EngramDescriptor, EngramId, EngramRecord, EngramSummary, FileStamp, FilterOp, FtsMode,
+    GraphEdge, GraphNode, GraphSlice, HitKind, HostClaim, InboundRef, LEXICAL_CANDIDATE_CAP,
+    MetadataFilter, NamedCount, NewChunk, OutboundRef, Page, RETIRED_STATUSES, RecentFilter,
+    SearchHit, SearchMode, SearchQuery, Store, StoreInfo, StoredEngram, TagAlias, TagCount,
+    Vocabulary, is_current_status, is_retired_status, parse_metadata_filters, retired_factor,
+    salience_prior,
 };
 pub use sweep::{
     Class, EngramFacts, Family, Finding, RULES, RuleInfo, SweepInput, SweepOptions, SweepReport,

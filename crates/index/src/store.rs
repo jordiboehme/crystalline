@@ -411,6 +411,13 @@ pub struct SearchQuery {
     /// The active provider's model id, paired with `query_embedding` for the
     /// staleness check. Required by the semantic and hybrid modes.
     pub active_model: Option<String>,
+    /// Restrict to engrams filed under this domain-relative folder, given with
+    /// its trailing slash (`notes/`). The slash is what makes the match a
+    /// folder rather than a string: `notes/deep/y.md` is under `notes/` and
+    /// `notes-misc/z.md` is not. `None` or an empty value searches the whole
+    /// domain. The value is a literal path, so `%` and `_` in a folder name are
+    /// escaped rather than matched as wildcards.
+    pub path_prefix: Option<String>,
     /// Page size.
     pub limit: usize,
     /// One-based page number.
@@ -669,6 +676,29 @@ pub struct EngramDescriptor {
     pub engram_type: String,
     /// The engram `status`.
     pub status: String,
+}
+
+/// One level of a domain's folder tree, as [`Store::browse_level`] reports it:
+/// the engrams a navigation view draws at this level, the child folders under
+/// it, and how many engrams the level really holds.
+///
+/// `engrams` is capped by the caller's limit while `folders` and `total` are
+/// not, which is the whole point of the shape: a tree that truncates its rows
+/// must still name every folder a reader can descend into, and must still be
+/// able to say how much it is not showing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BrowseLevel {
+    /// The engrams at this level, ordered by path in byte order, at most the
+    /// caller's limit of them.
+    pub engrams: Vec<EngramDescriptor>,
+    /// Every child folder directly under the browsed path, ordered by name in
+    /// byte order. Derived from the distinct first path segment below the
+    /// prefix rather than from `engrams`, so the cap never hides a folder.
+    pub folders: Vec<String>,
+    /// How many engrams the level holds, counted under exactly the filter that
+    /// selected `engrams`. Larger than `engrams.len()` means the cap cut the
+    /// listing.
+    pub total: usize,
 }
 
 /// A stored engram's addressing plus its full markdown content and checksum.
@@ -1114,6 +1144,33 @@ pub trait Store: Send + Sync {
         path_prefix: Option<&str>,
         engram_type: Option<&str>,
     ) -> Result<Vec<EngramDescriptor>>;
+
+    /// One level of a domain's folder tree: the engrams no more than `depth`
+    /// segments below `path_prefix`, capped at `limit` rows and ordered by path,
+    /// every child folder under the prefix, and the exact number of engrams the
+    /// level holds.
+    ///
+    /// Three bounded queries rather than one unbounded listing, which is what
+    /// keeps a navigation tree affordable on a domain of tens of thousands of
+    /// engrams: the row page is `LIMIT`ed, the count runs under exactly the
+    /// same filter so the two can never disagree, and the folder names come
+    /// from a `DISTINCT` over the path column alone - no bodies are read to
+    /// learn that a folder exists.
+    ///
+    /// `path_prefix` carries its trailing slash (`notes/`) and is matched as a
+    /// literal, so a folder named `50%` or `a_b` is a folder rather than a
+    /// wildcard. `None` or an empty prefix browses the domain root. `depth`
+    /// counts segments below the prefix, so `1` is the direct children and `2`
+    /// reaches one folder further down; it is clamped to at least 1 here, and a
+    /// caller taking it from a request bounds it from above too, since the
+    /// depth cut is a pattern that grows one term per level.
+    async fn browse_level(
+        &self,
+        domain: &str,
+        path_prefix: Option<&str>,
+        depth: usize,
+        limit: usize,
+    ) -> Result<BrowseLevel>;
 
     /// Every engram carrying a tag, on its frontmatter or on one of its
     /// observations, optionally scoped to one domain. The bound tag is

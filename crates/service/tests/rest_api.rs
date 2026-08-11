@@ -33,7 +33,17 @@ struct AuthOptions {
 /// real temp-directory domain (files are the source of truth) synced into an
 /// in-memory Turso store, response format pinned to plain JSON so assertions
 /// don't have to account for TOON framing, and `opts` in the auth block.
-async fn build_engine(opts: AuthOptions) -> (tempfile::TempDir, Arc<Engine>) {
+///
+/// `extra` engrams are seeded into `eng` beyond [`FIXTURE_ENGRAMS`], named by
+/// domain-relative path. The shared fixture is
+/// three engrams because most tests want a small, stable domain; the folder
+/// and tree tests want shapes it deliberately does not have (a sibling folder
+/// whose name starts like another, or more engrams in one folder than a tree
+/// level shows), so they seed their own rather than growing everyone's.
+async fn build_engine_with(
+    opts: AuthOptions,
+    extra: &[String],
+) -> (tempfile::TempDir, Arc<Engine>) {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
     let mut cfg = GlobalConfig {
@@ -57,6 +67,20 @@ async fn build_engine(opts: AuthOptions) -> (tempfile::TempDir, Arc<Engine>) {
         let path = dir.join(engram.path);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, engram.markdown()).unwrap();
+    }
+    for rel in extra {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // The permalink is the path without its suffix, which is what a real
+        // domain writes for an engram in a folder.
+        let permalink = rel.trim_end_matches(".md");
+        std::fs::write(
+            &path,
+            format!(
+                "---\ntype: engram\ntitle: {permalink}\npermalink: {permalink}\ntags:\n  - eng\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# {permalink}\n\nA seeded engram.\n"
+            ),
+        )
+        .unwrap();
     }
     cfg.domains
         .insert("eng".to_string(), DomainEntry::file(dir));
@@ -199,7 +223,13 @@ async fn serve_test_router_with_fixture() -> (std::net::SocketAddr, tempfile::Te
 /// The auth fixture: the production router over an engine carrying `opts`, with
 /// an auth database in the same temp directory the test can seed accounts in.
 async fn serve_with_auth(opts: AuthOptions) -> Fixture {
-    let (tmp, engine) = build_engine(opts).await;
+    serve_with_auth_and(opts, &[]).await
+}
+
+/// [`serve_with_auth`] over a domain carrying `extra` engrams beyond the
+/// shared fixture.
+async fn serve_with_auth_and(opts: AuthOptions, extra: &[String]) -> Fixture {
+    let (tmp, engine) = build_engine_with(opts, extra).await;
     let auth = Arc::new(
         AuthStore::open(&tmp.path().join("web-auth.db"))
             .await
@@ -220,6 +250,19 @@ async fn serve_anonymous() -> Fixture {
         anonymous: true,
         ..AuthOptions::default()
     })
+    .await
+}
+
+/// The anonymous fixture over a domain carrying `extra` engrams beyond the
+/// shared three, for the tests about folder shape and scale.
+async fn serve_anonymous_with(extra: &[String]) -> Fixture {
+    serve_with_auth_and(
+        AuthOptions {
+            anonymous: true,
+            ..AuthOptions::default()
+        },
+        extra,
+    )
     .await
 }
 
@@ -1240,6 +1283,175 @@ async fn engram_list_filters_and_carries_the_page_envelope() {
     unique.sort();
     unique.dedup();
     assert_eq!(unique.len(), 4, "the pages do not overlap: {paged:?}");
+}
+
+/// The listing takes a folder, and a folder is a folder rather than a string:
+/// `path=notes` lists everything under `notes/` and never the sibling
+/// `notes-misc/`, whose name merely starts the same way.
+///
+/// This is what a center pane pages a big folder from: the folder narrows the
+/// same filter-only search the rest of the query string narrows, so `total`
+/// stays exact under it and paging works unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn engram_list_scopes_to_a_folder() {
+    let fixture = serve_anonymous_with(&[
+        "notes-misc/zeta.md".to_string(),
+        "notes/deep/delta.md".to_string(),
+    ])
+    .await;
+
+    let under_notes: serde_json::Value =
+        get(fixture.addr, "/api/v1/domains/eng/engrams?path=notes")
+            .await
+            .json()
+            .await
+            .unwrap();
+    assert_eq!(
+        hit_permalinks(&under_notes),
+        vec![
+            "notes/beta".to_string(),
+            "notes/deep/delta".to_string(),
+            "notes/deep/gamma".to_string()
+        ],
+        "the folder and its descendants, and not notes-misc: {under_notes}"
+    );
+    assert_eq!(
+        under_notes["total"], 3,
+        "the total counts the folder exactly: {under_notes}"
+    );
+
+    // The sibling is reachable under its own name, which is the other half of
+    // the segment-safety contract.
+    let misc: serde_json::Value = get(fixture.addr, "/api/v1/domains/eng/engrams?path=notes-misc")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(hit_permalinks(&misc), vec!["notes-misc/zeta".to_string()]);
+
+    // A nested folder, with or without the slashes a client may send.
+    for path in ["notes/deep", "/notes/deep/", "notes%2Fdeep"] {
+        let deep: serde_json::Value = get(
+            fixture.addr,
+            &format!("/api/v1/domains/eng/engrams?path={path}"),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+        assert_eq!(deep["total"], 2, "path={path}: {deep}");
+    }
+
+    // An absent or empty folder is the whole domain, which is what every
+    // client that never sends the parameter keeps getting.
+    let all: serde_json::Value = get(fixture.addr, "/api/v1/domains/eng/engrams")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(all["total"], 6, "the MANIFEST and five engrams: {all}");
+    let empty: serde_json::Value = get(fixture.addr, "/api/v1/domains/eng/engrams?path=")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(empty["total"], 6, "an empty folder is no folder: {empty}");
+
+    // It narrows the other filters rather than replacing them.
+    let typed: serde_json::Value = get(
+        fixture.addr,
+        "/api/v1/domains/eng/engrams?path=notes&type=guide",
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(hit_permalinks(&typed), vec!["notes/beta".to_string()]);
+
+    // And it pages: the total is the folder's, not the domain's.
+    let page: serde_json::Value = get(
+        fixture.addr,
+        "/api/v1/domains/eng/engrams?path=notes&limit=2&page=2",
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(page["total"], 3, "{page}");
+    assert_eq!(page["count"], 1, "the last page of three: {page}");
+}
+
+/// The tree is a navigation aid, not the listing, so a level it cannot show
+/// whole is cut at `TREE_LEVEL_CAP` and says so.
+///
+/// The two additive fields carry that: `total` is what the level really holds
+/// and `truncated` says the rows were cut. What is never cut is `folders` - a
+/// reader whose level was truncated must still be able to descend into every
+/// folder under it, so the folder list is derived from the paths themselves
+/// rather than from the rows that survived the cap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn domain_tree_caps_a_level_and_keeps_its_folders() {
+    let cap = crystalline_service::engine::TREE_LEVEL_CAP;
+    let mut extra: Vec<String> = (0..cap + 1).map(|i| format!("big/e{i:05}.md")).collect();
+    extra.push("big/inner/deep.md".to_string());
+    let fixture = serve_anonymous_with(&extra).await;
+
+    let big: serde_json::Value = get(fixture.addr, "/api/v1/domains/eng/tree?path=big")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        big["engrams"].as_array().unwrap().len(),
+        cap,
+        "the level is cut at the cap"
+    );
+    assert_eq!(big["truncated"], true, "and says so: {}", big["truncated"]);
+    assert_eq!(
+        big["total"],
+        cap + 1,
+        "the count is the level's own, so a client knows what it is not seeing"
+    );
+    assert_eq!(
+        big["folders"].as_array().unwrap(),
+        &["inner"],
+        "a truncated level still names every folder under it"
+    );
+
+    // A depth nobody could mean is clamped rather than turned into a pattern
+    // proportional to it: the level answers, cut and honest about it.
+    let absurd: serde_json::Value = get(
+        fixture.addr,
+        "/api/v1/domains/eng/tree?path=big&depth=100000",
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(absurd["truncated"], true, "{}", absurd["total"]);
+    assert_eq!(
+        absurd["total"],
+        cap + 2,
+        "everything under big, the nested one included"
+    );
+
+    // A level that fits is not truncated, and carries the same two fields: a
+    // client reads one shape, never two.
+    let root: serde_json::Value = get(fixture.addr, "/api/v1/domains/eng/tree")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(root["truncated"], false, "{root}");
+    assert_eq!(
+        root["total"], 2,
+        "the MANIFEST and the one root engram: {root}"
+    );
+    assert_eq!(
+        root["folders"].as_array().unwrap(),
+        &["big", "notes"],
+        "{root}"
+    );
 }
 
 /// The two states a client must be able to tell apart, which is why the

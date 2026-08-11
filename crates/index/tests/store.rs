@@ -3593,3 +3593,244 @@ parity!(
     lexical_candidate_cap_bounds_and_ranks,
     lexical_candidate_cap
 );
+
+/// A folder filter on a search is a folder filter, not a string prefix.
+///
+/// `notes/` selects `notes/beta.md` and `notes/deep/gamma.md` and refuses
+/// `notes-misc/delta.md`, which is the whole reason the prefix carries its
+/// trailing slash. The `%` and `_` folders are the second half of the contract:
+/// a folder name is a literal, so `50%/` must not reach `50x/` and `a_b/` must
+/// not reach `axb/`. Each decoy exists precisely so an unescaped LIKE pattern
+/// fails this test rather than passing it quietly.
+async fn folder_prefix_filter(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    for (path, permalink) in [
+        ("alpha.md", "alpha"),
+        ("notes/beta.md", "notes/beta"),
+        ("notes/deep/gamma.md", "notes/deep/gamma"),
+        ("notes-misc/delta.md", "notes-misc/delta"),
+        ("50%/pct.md", "50pct/pct"),
+        ("50x/other.md", "50x/other"),
+        ("a_b/under.md", "a_b/under"),
+        ("axb/other.md", "axb/other"),
+    ] {
+        write(
+            root,
+            path,
+            &engram(permalink, permalink, "engram", "", "sharedbodyterm\n"),
+        );
+    }
+    sync_domain(store, "eng", root).await.unwrap();
+
+    // The filter-only path: every engram under `notes/`, and nothing whose
+    // path merely starts with those five letters.
+    let under = |prefix: Option<&str>| SearchQuery {
+        domains: Some(vec!["eng".to_string()]),
+        path_prefix: prefix.map(str::to_string),
+        limit: 50,
+        page: 1,
+        ..SearchQuery::default()
+    };
+    let notes = store.search(&under(Some("notes/"))).await.unwrap();
+    assert_eq!(
+        notes
+            .items
+            .iter()
+            .map(|h| h.permalink.as_str())
+            .collect::<Vec<_>>(),
+        vec!["notes/beta", "notes/deep/gamma"],
+        "a folder filter takes the folder and its descendants, never a sibling \
+         whose name merely starts the same way"
+    );
+    assert_eq!(notes.total, 2, "the total counts the filtered set exactly");
+
+    // No prefix is the whole domain, which is what an absent `path` means.
+    let all = store.search(&under(None)).await.unwrap();
+    assert_eq!(all.total, 8, "an absent folder filter selects everything");
+    let empty = store.search(&under(Some(""))).await.unwrap();
+    assert_eq!(empty.total, 8, "an empty folder filter selects everything");
+
+    // The wildcard characters are literals: each of these has a decoy sibling
+    // that an unescaped pattern would sweep in.
+    let pct = store.search(&under(Some("50%/"))).await.unwrap();
+    assert_eq!(
+        pct.items
+            .iter()
+            .map(|h| h.permalink.as_str())
+            .collect::<Vec<_>>(),
+        vec!["50pct/pct"],
+        "a folder named 50% is a folder, not a wildcard"
+    );
+    let under_score = store.search(&under(Some("a_b/"))).await.unwrap();
+    assert_eq!(
+        under_score
+            .items
+            .iter()
+            .map(|h| h.permalink.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a_b/under"],
+        "a folder named a_b is a folder, not a single-character wildcard"
+    );
+
+    // Paging under the filter: the total stays the filtered total rather than
+    // the domain's, which is what a client pages against.
+    let page_two = store
+        .search(&SearchQuery {
+            limit: 1,
+            page: 2,
+            ..under(Some("notes/"))
+        })
+        .await
+        .unwrap();
+    assert_eq!(page_two.total, 2, "the count query carries the same filter");
+    assert_eq!(page_two.items.len(), 1, "and the page is one row of it");
+
+    // The filter is a scalar filter, so it narrows a text search too rather
+    // than only the filter-only listing.
+    let text = store
+        .search(&SearchQuery {
+            text: Some("sharedbodyterm".to_string()),
+            ..under(Some("notes/"))
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        text.items
+            .iter()
+            .map(|h| h.permalink.as_str())
+            .collect::<Vec<_>>(),
+        vec!["notes/beta", "notes/deep/gamma"],
+        "a text search under a folder stays under it"
+    );
+}
+parity!(
+    search_filters_by_folder_segment_not_string_prefix,
+    folder_prefix_filter
+);
+
+/// `browse_level` bounds a tree level without hiding the tree.
+///
+/// The row page is capped and says so through `total`, while the folder list
+/// is derived separately and stays complete: a reader whose level was
+/// truncated can still descend into every folder under it. The count runs
+/// under the same depth filter as the page, so the two never disagree.
+async fn browse_level_bounds(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    for path in [
+        "a.md",
+        "b.md",
+        "c.md",
+        "notes/n1.md",
+        "notes/n2.md",
+        "notes-misc/m.md",
+        "deep/inner/x.md",
+        "50%/p.md",
+        "50x/q.md",
+    ] {
+        let permalink = path.trim_end_matches(".md");
+        write(
+            root,
+            path,
+            &engram(permalink, permalink, "engram", "", "b\n"),
+        );
+    }
+    sync_domain(store, "eng", root).await.unwrap();
+
+    // A capped root level: two of the three root engrams, the count of all
+    // three, and every folder regardless of the cap.
+    let capped = store.browse_level("eng", None, 1, 2).await.unwrap();
+    assert_eq!(
+        capped
+            .engrams
+            .iter()
+            .map(|d| d.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a.md", "b.md"],
+        "the level is capped at the limit, ordered by path in byte order"
+    );
+    assert_eq!(
+        capped.total, 3,
+        "the count is the level's own, under the same depth filter as the page"
+    );
+    assert_eq!(
+        capped.folders,
+        vec!["50%", "50x", "deep", "notes", "notes-misc"],
+        "every folder is listed even though the rows were cut"
+    );
+
+    // Depth counts segments below the prefix: 2 reaches one folder further
+    // down but not two.
+    let deeper = store.browse_level("eng", None, 2, 50).await.unwrap();
+    assert_eq!(
+        deeper.total, 8,
+        "depth 2 counts everything but the two-folder-deep engram: {:?}",
+        deeper.engrams
+    );
+    assert!(
+        !deeper.engrams.iter().any(|d| d.path == "deep/inner/x.md"),
+        "depth 2 does not reach a third level"
+    );
+
+    // Descending: the prefix is segment-safe here too, and a level with no
+    // subfolders says so with an empty list rather than by omission.
+    let notes = store
+        .browse_level("eng", Some("notes/"), 1, 50)
+        .await
+        .unwrap();
+    assert_eq!(
+        notes
+            .engrams
+            .iter()
+            .map(|d| d.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["notes/n1.md", "notes/n2.md"],
+        "notes-misc is a sibling of notes, not a child"
+    );
+    assert_eq!(notes.total, 2);
+    assert!(notes.folders.is_empty(), "a leaf folder has no children");
+
+    // A folder whose name carries a LIKE wildcard is a folder: `50x/` is a
+    // sibling an unescaped pattern would have swept in.
+    let pct = store
+        .browse_level("eng", Some("50%/"), 1, 50)
+        .await
+        .unwrap();
+    assert_eq!(
+        pct.engrams
+            .iter()
+            .map(|d| d.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["50%/p.md"],
+        "a folder named 50% is browsed literally"
+    );
+
+    // A prefix nothing lives under is an empty level, not an error.
+    let nothing = store
+        .browse_level("eng", Some("nothing/"), 1, 50)
+        .await
+        .unwrap();
+    assert_eq!(nothing.total, 0);
+    assert!(nothing.engrams.is_empty() && nothing.folders.is_empty());
+
+    // A flat domain: every engram at the root and no folders at all.
+    let flat_dir = tempfile::tempdir().unwrap();
+    write(
+        flat_dir.path(),
+        "one.md",
+        &engram("One", "one", "engram", "", "b\n"),
+    );
+    sync_domain(store, "flat", flat_dir.path()).await.unwrap();
+    let flat = store.browse_level("flat", None, 1, 50).await.unwrap();
+    assert_eq!(flat.total, 1);
+    assert!(flat.folders.is_empty(), "a flat domain has no folders");
+
+    // An empty domain answers an empty level rather than nothing at all.
+    let empty_dir = tempfile::tempdir().unwrap();
+    sync_domain(store, "empty", empty_dir.path()).await.unwrap();
+    let empty = store.browse_level("empty", None, 1, 50).await.unwrap();
+    assert_eq!(empty.total, 0);
+    assert!(empty.engrams.is_empty() && empty.folders.is_empty());
+}
+parity!(browse_level_caps_rows_but_not_folders, browse_level_bounds);

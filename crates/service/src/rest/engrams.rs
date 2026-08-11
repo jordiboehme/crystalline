@@ -68,6 +68,13 @@ pub struct ListQuery {
     #[serde(default)]
     #[param(example = "2026-01-31")]
     after: Option<String>,
+    /// Only engrams filed under this domain-relative folder, the folder and
+    /// everything below it. A folder rather than a string prefix: `notes`
+    /// takes `notes/deep/y.md` and never `notes-misc/z.md`. Absent or empty
+    /// is the whole domain.
+    #[serde(default)]
+    #[param(example = "notes")]
+    path: Option<String>,
     /// One-based page number. Defaults to 1.
     #[serde(default)]
     #[param(example = 1)]
@@ -83,9 +90,14 @@ pub struct ListQuery {
 ///
 /// This is `search_engrams` with no query text: a filter-only search, so the
 /// answer carries the engine's own page envelope (`total`, `page`, `limit`,
-/// `count`, `hits`) and a client pages it the way it pages a search. Listing by
-/// folder is not here: the tree endpoint owns the navigation view, this one
-/// owns the frontmatter view, and neither reimplements the other.
+/// `count`, `hits`) and a client pages it the way it pages a search.
+///
+/// `path` scopes it to one folder, which is what a folder view pages from: the
+/// folder is pushed into SQL beside the other filters, so `total` stays exact
+/// under it and a folder holding thousands of engrams costs one page rather
+/// than the folder. The tree endpoint still owns the navigation view - a level
+/// of folders and their children - while this one owns the listing, paged and
+/// filtered; neither reimplements the other.
 ///
 /// A domain nobody registered is a 404, like the tree and manifest routes
 /// beside it: a path segment names a resource, and a resource that does not
@@ -103,9 +115,14 @@ pub struct ListQuery {
     operation_id = "list_engrams",
     summary = "One domain's engrams, filtered by frontmatter and paged.",
     description = "A filter-only search, so the answer carries the same page \
-                   envelope a search does and a client pages it the same way. \
-                   Listing by folder is not here: the tree endpoint owns the \
-                   navigation view and this one owns the frontmatter view.\n\nA \
+                   envelope a search does and a client pages it the same \
+                   way.\n\n`path` scopes the listing to one folder, the folder \
+                   and everything below it, and it is a folder rather than a \
+                   string prefix: `notes` takes `notes/deep/y.md` and never \
+                   `notes-misc/z.md`. The total stays exact under it, so a \
+                   folder holding thousands of engrams costs one page rather \
+                   than the folder. The tree endpoint still owns the \
+                   navigation view and this one owns the listing.\n\nA \
                    domain nobody registered is a 404, while filters that match \
                    nothing are an empty page: two states a client can tell \
                    apart.",
@@ -168,19 +185,22 @@ pub async fn list(
     state.engine.require_domain(&domain)?;
     let value = state
         .engine
-        .search_engrams(&SearchParams {
-            // No text: the filters alone select, and the engine takes that as
-            // the filter-only mode rather than as an empty search.
-            query: None,
-            domains: vec![domain],
-            engram_type: query.engram_type,
-            tags: csv(query.tags.as_deref()),
-            status: query.status,
-            after: query.after,
-            page: query.page,
-            limit: query.limit,
-            ..SearchParams::default()
-        })
+        .search_engrams_under(
+            &SearchParams {
+                // No text: the filters alone select, and the engine takes that
+                // as the filter-only mode rather than as an empty search.
+                query: None,
+                domains: vec![domain],
+                engram_type: query.engram_type,
+                tags: csv(query.tags.as_deref()),
+                status: query.status,
+                after: query.after,
+                page: query.page,
+                limit: query.limit,
+                ..SearchParams::default()
+            },
+            query.path.as_deref(),
+        )
         .await?;
     Ok(Json(value))
 }
