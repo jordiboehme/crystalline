@@ -76,7 +76,14 @@ describe("the move dialog", () => {
         detailResponse({ permalink: "guides/alpha" }),
     });
     renderApp("/d/eng/e/alpha");
-    await userEvent.click(await screen.findByRole("button", { name: "Move" }));
+    // The header carries Edit alone; retirement and the move are rows in
+    // its overflow menu.
+    await userEvent.click(
+      await screen.findByRole("button", { name: "More actions" }),
+    );
+    await userEvent.click(
+      await screen.findByRole("menuitem", { name: "Move" }),
+    );
     const dialog = await screen.findByRole("dialog", { name: /move/i });
     await userEvent.clear(within(dialog).getByLabelText("Destination path"));
     await userEvent.type(

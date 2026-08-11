@@ -4,7 +4,7 @@
  * What is pinned here is what the screen is allowed to claim. A wikilink is a
  * link only where the server resolved it and the graph says where it landed;
  * one the index looked for and did not find is marked and left unlinked; the
- * frontmatter panel shows the fields the engram carries and invents nothing for
+ * details panel shows the fields the engram carries and invents nothing for
  * the ones it does not, which for the temporal fields is the difference between
  * "valid forever" and a date nobody wrote. Backlinks come from the graph rather
  * than from the detail payload's capped sample, and the empty case says so
@@ -176,6 +176,9 @@ function serve(routes: Record<string, (path: string) => unknown> = {}) {
 
 beforeEach(() => {
   apiMock.mockReset();
+  // The folded sections remember whether they were left open, so each test
+  // starts from a browser that has never opened one.
+  localStorage.clear();
 });
 
 describe("the engram page", () => {
@@ -250,7 +253,7 @@ describe("the engram page", () => {
 
     renderApp("/d/eng/e/alpha");
 
-    expect(await screen.findByText("Frontmatter")).toBeVisible();
+    expect(await screen.findByText("Details")).toBeVisible();
     // Absent means always valid and valid forever, so the row is absent too.
     // A placeholder here would be a date nobody wrote.
     expect(screen.queryByText("Valid")).toBeNull();
@@ -499,6 +502,89 @@ describe("the engram page", () => {
     });
   });
 
+  it("puts editing in reach and everything else behind one menu", async () => {
+    serve();
+
+    renderApp("/d/eng/e/alpha");
+
+    // One thing to do in the header, so the row is a button rather than a
+    // shelf of seven equals.
+    expect(await screen.findByRole("link", { name: "Edit" })).toHaveAttribute(
+      "href",
+      "/d/eng/edit/alpha",
+    );
+    expect(screen.queryByRole("button", { name: "Retire" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Move" })).toBeNull();
+
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "More actions" }));
+
+    for (const name of [
+      "Move",
+      "Download as Markdown",
+      "Share link",
+      "Print view",
+      "Retire",
+    ]) {
+      expect(await screen.findByRole("menuitem", { name })).toBeVisible();
+    }
+  });
+
+  it("runs a utility from the menu rather than from a second copy of it", async () => {
+    const print = vi.spyOn(window, "print").mockImplementation(() => undefined);
+    serve();
+
+    renderApp("/d/eng/e/alpha");
+
+    const user = userEvent.setup();
+    await user.click(
+      await screen.findByRole("button", { name: "More actions" }),
+    );
+    await user.click(
+      await screen.findByRole("menuitem", { name: "Print view" }),
+    );
+
+    expect(print).toHaveBeenCalled();
+    print.mockRestore();
+  });
+
+  it("opens the guided retirement from the menu", async () => {
+    serve();
+
+    renderApp("/d/eng/e/alpha");
+
+    const user = userEvent.setup();
+    await user.click(
+      await screen.findByRole("button", { name: "More actions" }),
+    );
+    await user.click(await screen.findByRole("menuitem", { name: "Retire" }));
+
+    expect(
+      await screen.findByRole("button", { name: "Retire engram" }),
+    ).toBeVisible();
+  });
+
+  it("offers a reader who may not write the utilities and nothing else", async () => {
+    serve({ "/auth/me": () => meResponse({ anonymous: true }) });
+
+    renderApp("/d/eng/e/alpha");
+
+    await screen.findByRole("heading", { name: "Alpha" });
+    expect(screen.queryByRole("link", { name: "Edit" })).toBeNull();
+
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "More actions" }));
+
+    // The three utilities are everybody's; the writes are absent, and so is
+    // the rule that would otherwise end the menu with nothing under it.
+    expect(
+      await screen.findByRole("menuitem", { name: "Download as Markdown" }),
+    ).toBeVisible();
+    expect(screen.queryByRole("menuitem", { name: "Retire" })).toBeNull();
+    expect(screen.queryByRole("menuitem", { name: "Move" })).toBeNull();
+    expect(screen.queryByRole("separator")).toBeNull();
+  });
+
   it("keeps the graph folded away until somebody asks for it", async () => {
     serve();
 
@@ -533,6 +619,23 @@ describe("the engram page", () => {
       "href",
       "/graph?anchor=crystalline%3A%2F%2Feng%2Falpha",
     );
+  });
+
+  it("opens the sections a reader left open last time", async () => {
+    // The choice to read this way outlives the visit it was made on, under a
+    // key of each section's own.
+    localStorage.setItem("fluid.section.graph", "open");
+    localStorage.setItem("fluid.section.agents-eye", "open");
+    serve();
+
+    renderApp("/d/eng/e/alpha");
+
+    expect(
+      await screen.findByRole("button", { name: "Hide the neighborhood" }),
+    ).toHaveAttribute("aria-expanded", "true");
+    expect(
+      screen.getByRole("button", { name: /what an agent is taught/i }),
+    ).toHaveAttribute("aria-expanded", "true");
   });
 
   it("keeps the agent's-eye view folded away until somebody asks for it", async () => {

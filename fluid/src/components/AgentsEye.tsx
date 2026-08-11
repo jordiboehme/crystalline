@@ -22,12 +22,17 @@
  */
 
 import { useQuery } from "@tanstack/react-query";
-import { useState } from "react";
+import { ChevronRight } from "lucide-react";
 
 import { DOMAINS_QUERY_KEY, fetchDomains } from "../api/domains";
+import { useRememberedDisclosure } from "../disclosure";
+import { BUTTON } from "./primitives";
 
 /** How many characters one token is worth, as a rule of thumb. */
 const CHARS_PER_TOKEN = 4;
+
+/** Where this section writes down whether it was left open. */
+const SECTION_KEY = "fluid.section.agents-eye";
 
 export interface AgentsEyeProps {
   /** The domain this engram lives in, whose routing lines are read here. */
@@ -39,7 +44,7 @@ export interface AgentsEyeProps {
 }
 
 export function AgentsEye({ domain, salience, content }: AgentsEyeProps) {
-  const [open, setOpen] = useState(false);
+  const [open, toggle] = useRememberedDisclosure(SECTION_KEY);
   // The listing the sidebar already read, under the same key: the routing
   // lines cost nothing on the wire.
   const listing = useQuery({
@@ -53,18 +58,24 @@ export function AgentsEye({ domain, salience, content }: AgentsEyeProps) {
 
   return (
     <section aria-labelledby="engram-agents-eye">
-      <h2 id="engram-agents-eye" className="mb-2 text-lg font-semibold">
+      <h2 id="engram-agents-eye" className="mb-2 text-section">
         Agent&apos;s eye
       </h2>
       <button
         type="button"
         aria-expanded={open}
         aria-controls="engram-agents-eye-panel"
-        onClick={() => {
-          setOpen((was) => !was);
-        }}
-        className="rounded border border-slate-300 px-2 py-1 text-sm hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800"
+        onClick={toggle}
+        className={`${BUTTON.ghost} inline-flex items-center gap-1.5`}
       >
+        <ChevronRight
+          aria-hidden="true"
+          size={14}
+          strokeWidth={1.75}
+          className={
+            open ? "rotate-90 transition-transform" : "transition-transform"
+          }
+        />
         {open ? "Hide what an agent is taught" : "Show what an agent is taught"}
       </button>
       <div id="engram-agents-eye-panel" className="mt-3">

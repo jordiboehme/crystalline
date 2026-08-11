@@ -4,13 +4,15 @@
  * the file with no normalization and checksums those very bytes, so a Blob
  * of it is the file, byte for byte, without a raw-bytes route existing.
  * Share copies the page's own URL - the browser-shaped address, where Copy
- * address next to it copies the crystalline:// name. Print leans on the
- * print stylesheet: chrome carries print:hidden, so what prints is the
- * content, the title and the small metadata line.
+ * address on the details panel copies the crystalline:// name. Print leans on
+ * the print stylesheet: chrome carries print:hidden, so what prints is the
+ * content, the title and the trail above it.
  *
- * All three are handed back through the optional `handlers` ref, which is how
- * the same three appear on the command palette: the palette runs these very
- * actions rather than a second copy of them.
+ * This component draws no controls of its own. The three are handed out
+ * through the optional `handlers` ref and run from the page's overflow menu
+ * and from the command palette, which is what keeps one copy of each: the
+ * clipboard call has an outcome to announce, and the live region that
+ * announces it is here, so a share run from either place says the same thing.
  */
 
 import type { ReactElement, RefObject } from "react";
@@ -36,10 +38,7 @@ export function downloadName(permalink: string): string {
   return `${slug}.md`;
 }
 
-const BUTTON_CLASSES =
-  "rounded border border-slate-300 px-2 py-0.5 text-xs hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800";
-
-/** The three, handed out so something other than these buttons can run them. */
+/** The three, handed out so the menu and the palette can run them. */
 export interface EngramActionHandlers {
   download: () => void;
   share: () => void;
@@ -49,8 +48,7 @@ export interface EngramActionHandlers {
 export interface EngramActionsProps {
   engram: EngramDetail;
   /**
-   * Filled in with the very handlers the buttons run, for the palette's
-   * actions.
+   * Filled in with the handlers the menu rows and the palette run.
    *
    * A ref rather than a second copy of the three bodies in the caller: the
    * clipboard call has a confirmation to announce, and the live region that
@@ -114,25 +112,17 @@ export function EngramActions({
     print,
   ]);
 
+  // The region is in the document from the start and empty, so the text
+  // arriving in it is what gets read out. Nothing else is drawn: the controls
+  // that run these live in the page's overflow menu.
   return (
-    <span className="inline-flex items-center gap-2 print:hidden">
-      <button type="button" className={BUTTON_CLASSES} onClick={download}>
-        Download as Markdown
-      </button>
-      <button type="button" className={BUTTON_CLASSES} onClick={share}>
-        Share link
-      </button>
-      <button type="button" className={BUTTON_CLASSES} onClick={print}>
-        Print view
-      </button>
-      <span
-        role="status"
-        aria-live="polite"
-        aria-label="Share link result"
-        className="text-xs text-slate-500 dark:text-slate-400"
-      >
-        {said ?? ""}
-      </span>
+    <span
+      role="status"
+      aria-live="polite"
+      aria-label="Share link result"
+      className="text-caption text-slate-500 print:hidden dark:text-slate-400"
+    >
+      {said ?? ""}
     </span>
   );
 }

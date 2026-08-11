@@ -23,7 +23,9 @@
  */
 
 import { useQuery } from "@tanstack/react-query";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { ChevronRight, MoreHorizontal } from "lucide-react";
+import { DropdownMenu } from "radix-ui";
+import { useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router";
 
 import { ApiProblem, problemDetail } from "../api/client";
@@ -43,22 +45,25 @@ import type { PaletteCommand } from "../commands";
 import { AgentsEye } from "../components/AgentsEye";
 import { BacklinksPanel } from "../components/BacklinksPanel";
 import { Breadcrumbs, crumbsOf } from "../components/Breadcrumbs";
+import { DetailsPanel } from "../components/DetailsPanel";
 import { EngramActions } from "../components/EngramActions";
 import type { EngramActionHandlers } from "../components/EngramActions";
-import { FrontmatterPanel } from "../components/FrontmatterPanel";
 import { LifecycleBanner } from "../components/LifecycleBanner";
 import type { LifecycleLink } from "../components/LifecycleBanner";
 import { Markdown } from "../components/Markdown";
+import { ITEM_CLASSES, MENU_CLASSES } from "../components/menu";
 import { MoveDialog } from "../components/MoveDialog";
 import { NeighborhoodGraph } from "../components/NeighborhoodGraph";
+import { BUTTON, IconButton } from "../components/primitives";
 import { RetireDialog } from "../components/RetireDialog";
 import { Skeleton } from "../components/Skeleton";
+import { useRememberedDisclosure } from "../disclosure";
 import { domainRoute, editRoute, engramRoute, graphRoute } from "../paths";
 import type { WikilinkResolver } from "../wikilinks";
 import { buildWikilinkResolver, innerOf, referenceState } from "../wikilinks";
 
-/** How long the copy button keeps saying it worked. */
-const COPIED_FOR_MS = 2000;
+/** Where the neighborhood section writes down whether it was left open. */
+const GRAPH_SECTION_KEY = "fluid.section.graph";
 
 /** Warm the editor chunk while the pointer is still on its way to the click. */
 function prefetchEditor(): void {
@@ -205,41 +210,92 @@ export default function EngramPage() {
         {/*
           The controls, which are chrome: they stay off the printed page,
           where the trail above and the body are the whole document.
+
+          One thing to do and one place to look for the rest. Editing is what
+          somebody came to this header for, so it is the button; everything
+          else is a row in the overflow menu, where the destructive one sits
+          alone below a rule. `EngramActions` builds the three utilities and
+          hands them over through the ref the menu rows and the palette both
+          run; it draws nothing here but the region that announces them.
         */}
-        <p className="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm text-slate-500 print:hidden dark:text-slate-400">
-          <CopyAddressButton address={engram.url} />
+        <div className="flex flex-wrap items-center gap-2 print:hidden">
           {capabilities.canWrite && (
-            <>
-              <Link
-                to={editRoute(engram.domain, engram.permalink)}
-                onPointerEnter={prefetchEditor}
-                onFocus={prefetchEditor}
-                className="rounded border border-slate-300 px-2 py-0.5 text-xs hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800"
-              >
-                Edit
-              </Link>
-              <button
-                type="button"
-                onClick={() => {
-                  setRetiring(true);
-                }}
-                className="rounded border border-slate-300 px-2 py-0.5 text-xs hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800"
-              >
-                Retire
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setMoving(true);
-                }}
-                className="rounded border border-slate-300 px-2 py-0.5 text-xs hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800"
-              >
-                Move
-              </button>
-            </>
+            <Link
+              to={editRoute(engram.domain, engram.permalink)}
+              onPointerEnter={prefetchEditor}
+              onFocus={prefetchEditor}
+              className={BUTTON.primary}
+            >
+              Edit
+            </Link>
           )}
+          <DropdownMenu.Root>
+            <DropdownMenu.Trigger asChild>
+              <IconButton label="More actions" icon={MoreHorizontal} />
+            </DropdownMenu.Trigger>
+            <DropdownMenu.Portal>
+              <DropdownMenu.Content
+                align="end"
+                sideOffset={6}
+                className={MENU_CLASSES}
+              >
+                {capabilities.canWrite && (
+                  <DropdownMenu.Item
+                    className={ITEM_CLASSES}
+                    onSelect={() => {
+                      setMoving(true);
+                    }}
+                  >
+                    Move
+                  </DropdownMenu.Item>
+                )}
+                <DropdownMenu.Item
+                  className={ITEM_CLASSES}
+                  onSelect={() => {
+                    utilities.current?.download();
+                  }}
+                >
+                  Download as Markdown
+                </DropdownMenu.Item>
+                <DropdownMenu.Item
+                  className={ITEM_CLASSES}
+                  onSelect={() => {
+                    utilities.current?.share();
+                  }}
+                >
+                  Share link
+                </DropdownMenu.Item>
+                <DropdownMenu.Item
+                  className={ITEM_CLASSES}
+                  onSelect={() => {
+                    utilities.current?.print();
+                  }}
+                >
+                  Print view
+                </DropdownMenu.Item>
+                {/*
+                  The rule and the retirement are one piece: a reader who may
+                  not write sees neither, rather than a menu ending in a
+                  divider with nothing under it.
+                */}
+                {capabilities.canWrite && (
+                  <>
+                    <DropdownMenu.Separator className="my-1 h-px bg-slate-200 dark:bg-slate-700" />
+                    <DropdownMenu.Item
+                      className={`${ITEM_CLASSES} text-red-700 dark:text-red-300`}
+                      onSelect={() => {
+                        setRetiring(true);
+                      }}
+                    >
+                      Retire
+                    </DropdownMenu.Item>
+                  </>
+                )}
+              </DropdownMenu.Content>
+            </DropdownMenu.Portal>
+          </DropdownMenu.Root>
           <EngramActions engram={engram} handlers={utilities} />
-        </p>
+        </div>
       </header>
 
       <LifecycleBanner
@@ -291,8 +347,8 @@ export default function EngramPage() {
             />
           </div>
         </div>
-        <aside className="flex flex-col gap-4 print:hidden">
-          <FrontmatterPanel frontmatter={engram.frontmatter} />
+        <aside className="flex flex-col gap-6 print:hidden">
+          <DetailsPanel frontmatter={engram.frontmatter} address={engram.url} />
           <BacklinksPanel
             backlinks={backlinks}
             pending={graph.isPending}
@@ -387,6 +443,10 @@ function chain(
  * detour from the engram, which is what this page is for. Opened, it costs
  * nothing on the wire either: it reads the same neighborhood under the same
  * cache key the backlinks panel already read.
+ *
+ * A reader who does open it is a reader who reads this way, so the section
+ * remembers: the default is closed, and the choice against it survives the
+ * visit.
  */
 function GraphSection({
   domain,
@@ -395,18 +455,18 @@ function GraphSection({
   domain: string;
   permalink: string;
 }) {
-  const [open, setOpen] = useState(false);
+  const [open, toggle] = useRememberedDisclosure(GRAPH_SECTION_KEY);
 
   return (
     <section aria-labelledby="engram-graph">
       <div className="mb-2 flex flex-wrap items-baseline justify-between gap-3">
-        <h2 id="engram-graph" className="text-lg font-semibold">
+        <h2 id="engram-graph" className="text-section">
           Graph
         </h2>
         {open && (
           <Link
             to={graphRoute(domain, permalink)}
-            className="text-sm text-sky-700 underline underline-offset-2 hover:no-underline dark:text-sky-400"
+            className="text-sm text-accent-700 underline underline-offset-2 hover:no-underline dark:text-accent-300"
           >
             Open the full view
           </Link>
@@ -416,11 +476,17 @@ function GraphSection({
         type="button"
         aria-expanded={open}
         aria-controls="engram-graph-panel"
-        onClick={() => {
-          setOpen((was) => !was);
-        }}
-        className="rounded border border-slate-300 px-2 py-1 text-sm hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800"
+        onClick={toggle}
+        className={`${BUTTON.ghost} inline-flex items-center gap-1.5`}
       >
+        <ChevronRight
+          aria-hidden="true"
+          size={14}
+          strokeWidth={1.75}
+          className={
+            open ? "rotate-90 transition-transform" : "transition-transform"
+          }
+        />
         {open ? "Hide the neighborhood" : "Show the neighborhood"}
       </button>
       <div id="engram-graph-panel" className="mt-3">
@@ -433,72 +499,6 @@ function GraphSection({
         )}
       </div>
     </section>
-  );
-}
-
-/**
- * Hand the engram's address to the clipboard.
- *
- * `crystalline://domain/permalink` rather than the browser's URL: it is what
- * this engram is called everywhere else, so it is what an agent, a MANIFEST or
- * another engram can be given.
- *
- * The outcome is announced in a live region beside the button rather than
- * written into the button's own label. A control that renames itself is a
- * control a reader navigating by name loses track of, and a label that changes
- * silently is no announcement at all: the region is in the document from the
- * start and empty, so the text arriving in it is what gets read out.
- */
-function CopyAddressButton({ address }: { address: string }) {
-  const [state, setState] = useState<"idle" | "copied" | "failed">("idle");
-
-  useEffect(() => {
-    if (state !== "copied") {
-      return;
-    }
-    const timer = setTimeout(() => {
-      setState("idle");
-    }, COPIED_FOR_MS);
-    return () => {
-      clearTimeout(timer);
-    };
-  }, [state]);
-
-  return (
-    <span className="inline-flex items-center gap-2">
-      <button
-        type="button"
-        title={address}
-        className="rounded border border-slate-300 px-2 py-0.5 text-xs hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800"
-        onClick={() => {
-          void (async () => {
-            try {
-              await navigator.clipboard.writeText(address);
-              setState("copied");
-            } catch {
-              // A browser that refuses the clipboard is not a failure of the
-              // page: the address is in the button's tooltip either way, and
-              // saying so beats a button that silently does nothing.
-              setState("failed");
-            }
-          })();
-        }}
-      >
-        Copy address
-      </button>
-      <span
-        role="status"
-        aria-live="polite"
-        aria-label="Copy address result"
-        className="text-xs text-slate-500 dark:text-slate-400"
-      >
-        {state === "copied"
-          ? "Copied"
-          : state === "failed"
-            ? "Copy refused"
-            : ""}
-      </span>
-    </span>
   );
 }
 

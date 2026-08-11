@@ -122,8 +122,13 @@ describe("the retire dialog", () => {
         ]),
     });
     renderApp("/d/eng/e/alpha");
+    // The header carries Edit alone; retirement and the move are rows in
+    // its overflow menu.
     await userEvent.click(
-      await screen.findByRole("button", { name: "Retire" }),
+      await screen.findByRole("button", { name: "More actions" }),
+    );
+    await userEvent.click(
+      await screen.findByRole("menuitem", { name: "Retire" }),
     );
     const dialog = await screen.findByRole("dialog", { name: /retire/i });
     await userEvent.click(
@@ -168,8 +173,13 @@ describe("the retire dialog", () => {
         init?.method === "DELETE" ? deleted() : detailResponse(),
     });
     renderApp("/d/eng/e/alpha");
+    // The header carries Edit alone; retirement and the move are rows in
+    // its overflow menu.
     await userEvent.click(
-      await screen.findByRole("button", { name: "Retire" }),
+      await screen.findByRole("button", { name: "More actions" }),
+    );
+    await userEvent.click(
+      await screen.findByRole("menuitem", { name: "Retire" }),
     );
     const dialog = await screen.findByRole("dialog", { name: /retire/i });
     await userEvent.click(

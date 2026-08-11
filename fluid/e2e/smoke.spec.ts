@@ -227,8 +227,11 @@ test("an engram is created, edited, saved and retired", async ({ page }) => {
   await expect(engramTitle(page)).toHaveText("Smoke Journey");
   await expect(page.locator("article")).toContainText("A smoke-written line.");
 
-  // And the guided retirement fades it.
-  await page.getByRole("button", { name: "Retire" }).click();
+  // And the guided retirement fades it, from the header's overflow menu:
+  // editing is the one control the header carries, everything else is a row
+  // in there.
+  await page.getByRole("button", { name: "More actions" }).click();
+  await page.getByRole("menuitem", { name: "Retire" }).click();
   await page.getByRole("radio", { name: "archived" }).click();
   await page.getByRole("button", { name: "Retire engram" }).click();
   await expect(page.getByRole("note")).toContainText(/archived/i);
