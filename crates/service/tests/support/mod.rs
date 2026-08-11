@@ -74,6 +74,10 @@ pub const MOUNTED_OPERATIONS: &[&str] = &[
     "PATCH /api/v1/users/{name}",
     "DELETE /api/v1/users/{name}",
     "POST /api/v1/users/{name}/password",
+    "GET /api/v1/settings/github",
+    "DELETE /api/v1/settings/github",
+    "POST /api/v1/settings/github/connect",
+    "POST /api/v1/settings/github/token",
 ];
 
 /// The lowercase hex SHA-256 digest of `bytes`.
@@ -661,14 +665,31 @@ impl StubConnectAuth {
         }
     }
 
-    /// A device flow that starts, then blocks on the returned `Notify`
-    /// until released, then fails with `reason`.
-    pub fn denying(reason: RemoteError) -> (Self, Arc<tokio::sync::Notify>) {
+    /// A device flow that starts with a canned code (`ABCD-1234` at
+    /// `https://github.example/device`), blocks on the returned `Notify`
+    /// until released, then fails, reporting `reason` as GitHub's own
+    /// refusal (a `RemoteError::Api`, the shape a declined or expired flow
+    /// arrives in).
+    ///
+    /// The gate is what makes a device-flow test deterministic: the engine
+    /// *spawns* the task that runs the flow, so a stub that failed instantly
+    /// could land - and, on the next status read, clear - its outcome before
+    /// the caller has even read the body of the response that started it.
+    pub fn denying(reason: &str) -> (Self, Arc<tokio::sync::Notify>) {
         let gate = Arc::new(tokio::sync::Notify::new());
         let auth = Self {
-            start_result: Mutex::new(Some(Ok(device_flow_start()))),
+            start_result: Mutex::new(Some(Ok(DeviceFlowStart {
+                device_code: "devcode".to_string(),
+                user_code: "ABCD-1234".to_string(),
+                verification_url: "https://github.example/device".to_string(),
+                interval_secs: 0,
+                expires_in_secs: 900,
+            }))),
             run_gate: gate.clone(),
-            run_result: Mutex::new(Some(Err(reason))),
+            run_result: Mutex::new(Some(Err(RemoteError::Api {
+                status: 403,
+                message: reason.to_string(),
+            }))),
             validate_result: Mutex::new(None),
             accept_any: None,
         };
@@ -683,6 +704,13 @@ impl ConnectAuth for StubConnectAuth {
         _auth_base: &str,
         _client_id: &str,
     ) -> Result<DeviceFlowStart, RemoteError> {
+        if self.accept_any.is_some() {
+            // The acceptor has no device path, and says so repeatably: a
+            // suite that drives the connect route more than once (the write
+            // matrix does) must get the same refusal every time rather than
+            // panic on a used-up one-shot.
+            return Err(RemoteError::NotConnected);
+        }
         self.start_result
             .lock()
             .unwrap()

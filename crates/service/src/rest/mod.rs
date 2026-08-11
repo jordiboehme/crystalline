@@ -9,6 +9,7 @@ mod discovery;
 mod domains;
 mod engrams;
 mod error;
+mod github_settings;
 mod graph;
 mod users_api;
 
@@ -69,6 +70,7 @@ use crate::engine::Engine;
         (name = "discovery", description = "Search, vocabulary, context and recent activity."),
         (name = "graph", description = "The neighborhood graph around an anchor."),
         (name = "users", description = "Account management. Admin only."),
+        (name = "settings", description = "Instance settings. Admin only."),
     ),
     paths(
         openapi_json,
@@ -98,6 +100,10 @@ use crate::engine::Engine;
         users_api::update,
         users_api::reset_password,
         users_api::remove,
+        github_settings::status,
+        github_settings::connect,
+        github_settings::token,
+        github_settings::disconnect,
     ),
     components(schemas(
         ProblemDetail,
@@ -121,6 +127,9 @@ use crate::engine::Engine;
         users_api::PasswordBody,
         users_api::UserResponse,
         users_api::UsersResponse,
+        github_settings::TokenBody,
+        github_settings::GithubStatusResponse,
+        github_settings::GithubPendingView,
     )),
 )]
 struct ApiDoc;
@@ -270,6 +279,15 @@ pub fn router(state: RestState) -> Router {
             patch(users_api::update).delete(users_api::remove),
         )
         .route("/users/{name}/password", post(users_api::reset_password))
+        // Admin only as well, and enforced the same way. The GET is a pure
+        // read and is served on a read-only instance; the three mutations
+        // are refused there, like every other write on this surface.
+        .route(
+            "/settings/github",
+            get(github_settings::status).delete(github_settings::disconnect),
+        )
+        .route("/settings/github/connect", post(github_settings::connect))
+        .route("/settings/github/token", post(github_settings::token))
         .fallback(unknown_path)
         // Applies to every method router registered above it, so it stays
         // below the routes and above the guard.
@@ -340,6 +358,24 @@ async fn unknown_path() -> ApiError {
 /// problem+json rather than axum's empty 405.
 async fn wrong_method() -> ApiError {
     ApiError::method_not_allowed()
+}
+
+/// Refuse a mutation on a read-only instance, ahead of every other check that
+/// would otherwise touch the store, the config or a credential.
+///
+/// One spelling for every admin module rather than one per module, so a
+/// read-only instance answers the same way whichever settings surface was
+/// asked. The `crystalline` CLI on the server that holds the data is the
+/// recovery path - there is no flag that reopens this surface, on purpose
+/// (resolved ambiguity 7 in the plan).
+pub(super) fn refuse_read_only(state: &RestState) -> Result<(), ApiError> {
+    if state.engine.read_only() {
+        return Err(ApiError::forbidden(
+            "this instance is read-only; changes are disabled here - use the \
+             `crystalline` CLI on the server that holds the data",
+        ));
+    }
+    Ok(())
 }
 
 /// Split a comma-separated query parameter into the `Vec<String>` the engine's

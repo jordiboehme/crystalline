@@ -2192,6 +2192,232 @@
         }
       }
     },
+    "/api/v1/settings/github": {
+      "get": {
+        "tags": [
+          "settings"
+        ],
+        "summary": "The GitHub connection, and the device flow's poll.",
+        "description": "Admin only. A pure read, served even on a read-only instance. Also the device flow's poll: while one runs, `pending` carries the short code and its URL; once it ends, `pending` goes null and a failed flow's reason is reported in `error` on exactly one read, then cleared.",
+        "operationId": "get_github_settings",
+        "responses": {
+          "200": {
+            "description": "The connection. No token material.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GithubStatusResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an admin, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "settings"
+        ],
+        "summary": "Forget the stored credential.",
+        "description": "Admin only, and refused on a read-only instance. Idempotent: disconnecting an instance that holds no credential succeeds and answers `connected: false` rather than 404. `github.enabled` is left alone - turning the feature off is a separate intent.",
+        "operationId": "disconnect_github",
+        "responses": {
+          "200": {
+            "description": "The connection as it now stands.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GithubStatusResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an admin, a cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The credential comes from `CRYSTALLINE_GITHUB_TOKEN`: only the environment that set it can retire it.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/settings/github/connect": {
+      "post": {
+        "tags": [
+          "settings"
+        ],
+        "summary": "Start a device-code sign-in.",
+        "description": "Admin only, and refused on a read-only instance. Answers 202 with the short code to confirm in a browser; the flow itself runs in the background and its outcome is read from `GET /settings/github`. A second call while one flow runs reports that same flow rather than starting another. Connecting is the intent to use the feature, so this turns `github.enabled` on.",
+        "operationId": "connect_github_device",
+        "responses": {
+          "202": {
+            "description": "The flow started (or one was already running): `pending` carries the code to confirm. Poll `GET /settings/github` for the outcome.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GithubStatusResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an admin, a cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "This machine's identity is fixed by `CRYSTALLINE_GITHUB_TOKEN`, so no sign-in can be started here, or GitHub refused to start the flow.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/settings/github/token": {
+      "post": {
+        "tags": [
+          "settings"
+        ],
+        "summary": "Connect with a personal access token.",
+        "description": "Admin only, and refused on a read-only instance. The token is validated against GitHub before it is stored, and is never echoed: the answer is the same token-material-free status the GET returns. Connecting is the intent to use the feature, so this turns `github.enabled` on.",
+        "operationId": "connect_github_token",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TokenBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The connection as it now stands.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GithubStatusResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The body is not JSON.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an admin, a cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body is not `application/json`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The body is JSON but not a token, the token is empty, GitHub refused it, or this machine's identity is fixed by `CRYSTALLINE_GITHUB_TOKEN` and no token may be stored here.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/users": {
       "get": {
         "tags": [
@@ -2903,6 +3129,88 @@
           }
         }
       },
+      "GithubPendingView": {
+        "type": "object",
+        "description": "The half of a running device flow a browser has to show: the short code the user types in, where they type it, and how long the code stays valid.",
+        "required": [
+          "user_code",
+          "verification_url",
+          "expires_in_secs"
+        ],
+        "properties": {
+          "expires_in_secs": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many seconds from the flow's start the code stays valid.",
+            "example": 900,
+            "minimum": 0
+          },
+          "user_code": {
+            "type": "string",
+            "description": "The short code the user confirms at `verification_url`.",
+            "example": "ABCD-1234"
+          },
+          "verification_url": {
+            "type": "string",
+            "description": "Where the user confirms the code.",
+            "example": "https://github.com/login/device"
+          }
+        }
+      },
+      "GithubStatusResponse": {
+        "type": "object",
+        "description": "The GitHub connection as the settings screen renders and polls it. No token material, ever: only whether the feature is on, whether a credential is on file, whose it is and where it lives.",
+        "required": [
+          "enabled",
+          "connected"
+        ],
+        "properties": {
+          "connected": {
+            "type": "boolean",
+            "description": "Whether a credential is on file for this instance.",
+            "example": true
+          },
+          "enabled": {
+            "type": "boolean",
+            "description": "Whether `github.enabled` is on: team tools and origin polling.",
+            "example": true
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A device flow's failure (expired, denied), reported on exactly one\nstatus read after the flow ends, then cleared."
+          },
+          "pending": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/GithubPendingView",
+                "description": "A device flow waiting for the browser side. Poll this route until it\ngoes null; the flow either connected or set `error`."
+              }
+            ]
+          },
+          "token_store": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "keyring | file | environment; null when disconnected.",
+            "example": "keyring"
+          },
+          "user": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The account login, when connected.",
+            "example": "octo"
+          }
+        }
+      },
       "LoginBody": {
         "type": "object",
         "description": "What `POST /auth/login` takes.",
@@ -3175,6 +3483,21 @@
           }
         }
       },
+      "TokenBody": {
+        "type": "object",
+        "description": "A GitHub personal access token to connect with. Write-only: no response on this surface ever echoes it, and the status shape carries only where the credential lives and whose it is.",
+        "required": [
+          "token"
+        ],
+        "properties": {
+          "token": {
+            "type": "string",
+            "description": "A GitHub personal access token. Write-only: no response ever echoes it.",
+            "example": "ghp_xxxxxxxxxxxxxxxxxxxx",
+            "writeOnly": true
+          }
+        }
+      },
       "User": {
         "type": "object",
         "description": "One account. Carries no password material, so it is safe to hand to a\nhandler and serialize into a response.",
@@ -3372,6 +3695,10 @@
     {
       "name": "users",
       "description": "Account management. Admin only."
+    },
+    {
+      "name": "settings",
+      "description": "Instance settings. Admin only."
     }
   ]
 }

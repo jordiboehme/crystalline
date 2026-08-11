@@ -53,7 +53,7 @@ use serde::Deserialize;
 
 use super::auth::{Caller, Identity};
 use super::auth_store::{Role, User};
-use super::{ApiError, ApiJson, ApiPath, ProblemDetail, RestState};
+use super::{ApiError, ApiJson, ApiPath, ProblemDetail, RestState, refuse_read_only};
 
 /// What `GET /users` answers with. A wrapper rather than a bare array, matching
 /// the `{"users": [...]}` envelope `crystalline users list --json` prints.
@@ -568,20 +568,6 @@ fn refuse_self(caller: &Caller, target: &str, verb: &str) -> Result<(), ApiError
          or use `crystalline users` on the server",
         caller.name()
     )))
-}
-
-/// Refuse a mutation on a read-only instance, ahead of every other check that
-/// would otherwise touch the store. `crystalline users` on the server that
-/// holds the database is the recovery path - there is no flag that reopens
-/// this surface, on purpose (resolved ambiguity 7 in the plan).
-fn refuse_read_only(state: &RestState) -> Result<(), ApiError> {
-    if state.engine.read_only() {
-        return Err(ApiError::forbidden(
-            "this instance is read-only; account changes are disabled here - \
-             use `crystalline users` on the server",
-        ));
-    }
-    Ok(())
 }
 
 /// Refuse an empty password before it is hashed into an account nobody can log

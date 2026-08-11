@@ -63,9 +63,17 @@ async fn serve(opts: Options) -> Fixture {
     let store = TursoStore::open_in_memory().await.unwrap();
     // `service.read_only` is resolved by the daemon rather than by the engine's
     // constructor, so the fixture applies it the way `serve` does.
+    // Both GitHub overrides are load-bearing rather than tidiness, because the
+    // matrix drives the settings routes for real once it reaches their allowed
+    // leg: without the stub `ConnectAuth` a connect would dial github.com, and
+    // without the token-store dir the `DELETE /settings/github` row would
+    // resolve to `TokenStore::Keyring` and delete the developer's REAL keychain
+    // GitHub token. The override confines the whole matrix to the temp dir.
     let engine = Arc::new(
         Engine::new(Arc::new(Mutex::new(store)), cfg, None, Some(config_path))
-            .with_read_only(opts.read_only),
+            .with_read_only(opts.read_only)
+            .with_token_store_dir(root.join("tokens"))
+            .with_connect_auth(Arc::new(support::StubConnectAuth::accepting("octo"))),
     );
     engine.sync(None).await.unwrap();
 
@@ -1484,6 +1492,26 @@ fn write_ops() -> Vec<WriteOp> {
         WriteOp {
             method: Method::DELETE,
             path: "/api/v1/users/tina",
+            body: None,
+            admin_only: true,
+        },
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/settings/github/connect",
+            body: None,
+            admin_only: true,
+        },
+        // Before the disconnect row, so the disconnect's allowed leg has
+        // something to forget; both legs are state-tolerant either way.
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/settings/github/token",
+            body: Some(serde_json::json!({"token": "matrix-pat"})),
+            admin_only: true,
+        },
+        WriteOp {
+            method: Method::DELETE,
+            path: "/api/v1/settings/github",
             body: None,
             admin_only: true,
         },
