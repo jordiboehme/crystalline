@@ -217,6 +217,13 @@ describe("the engram editor", () => {
     expect(raw).toHaveAttribute("aria-pressed", "false");
     await userEvent.click(raw);
     expect(raw).toHaveAttribute("aria-pressed", "true");
+    // The state is visible as well as announced. Asserted as "the pressed
+    // face brings its own color and drops the unpressed one" rather than as
+    // pixels: accent utilities layered ON TOP of the ghost tier's own color
+    // lose to it in the emitted stylesheet, which is a silent failure with
+    // no other test signal.
+    expect(raw.className).toContain("bg-accent-100");
+    expect(raw.className).not.toContain("text-slate-600");
     // Decorations off: the same buffer, now showing exactly what is in it.
     await waitFor(() => {
       expect(screen.getByLabelText("Engram source").textContent).toContain(
@@ -235,6 +242,39 @@ describe("the engram editor", () => {
     await userEvent.click(screen.getByRole("button", { name: "Save" }));
     await screen.findByText("Saved");
     expect(putBody(0)).toEqual({ content: CONTENT });
+  });
+
+  it("keeps a language-tagged fence in the code face while prose is proportional", async () => {
+    // The scroller is proportional now, and `tags.monospace` cannot hold a
+    // fence that names a language: the nested parser mounts over the body and
+    // the highlighter drops the inherited class on the way in. This asserts
+    // the layer that does hold it is actually installed on the screen, in the
+    // preview branch, rather than only unit-tested next door.
+    const fenced = CONTENT.replace(
+      "A rule.",
+      'A rule.\n\n```json\n{ "answer": 42 }\n```\n',
+    );
+    serveEditor({
+      "/domains/eng/engrams/alpha": () => detailResponse({ content: fenced }),
+    });
+    renderApp("/d/eng/edit/alpha");
+    const editor = await screen.findByLabelText("Engram source");
+    await waitFor(() => {
+      expect(editor.textContent).toContain('{ "answer": 42 }');
+    });
+    const body = Array.from(editor.querySelectorAll(".cm-line")).find(
+      (line) => line.textContent === '{ "answer": 42 }',
+    );
+    expect(body?.className).toContain("cm-fence-mono");
+    // And in Raw mode it is gone, because the whole buffer is mono there:
+    // the face belongs to the preview layer, not to the document.
+    await userEvent.click(screen.getByRole("button", { name: "Raw" }));
+    await waitFor(() => {
+      const raw = Array.from(
+        screen.getByLabelText("Engram source").querySelectorAll(".cm-line"),
+      ).find((line) => line.textContent === '{ "answer": 42 }');
+      expect(raw?.className).not.toContain("cm-fence-mono");
+    });
   });
 
   it("draws a resolved wikilink as a chip and hands the brackets back raw", async () => {

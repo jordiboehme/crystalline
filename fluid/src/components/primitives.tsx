@@ -27,6 +27,33 @@ export const BUTTON = {
 export type ButtonTier = keyof typeof BUTTON;
 
 /**
+ * A two-state toggle's two faces, for a button that carries `aria-pressed`.
+ *
+ * The pressed face is SELF-CONTAINED rather than accent utilities layered on
+ * top of `BUTTON.ghost`, because that layering does not work and fails
+ * silently. Tailwind decides same-specificity conflicts by the order the
+ * utilities are emitted into the stylesheet, not by the order of names in a
+ * class attribute: `.text-slate-600` is written after `.text-accent-800`, so
+ * ghost's own color wins and the pressed label never turns accent. Worse,
+ * ghost's `hover:bg-slate-100` is a (0,2,0) selector and beats a plain
+ * `bg-accent-50` (0,1,0), so a pressed toggle under the pointer would be
+ * pixel-identical to an unpressed one. The two faces therefore share only
+ * the geometry and the focus ring, and every color - background, text and
+ * hover, in both schemes - is declared exactly once, by exactly one of them.
+ *
+ * The pressed face carries a border as well as a wash, because the wash alone
+ * is not a state indicator: accent-100 against a white page is 1.13:1, well
+ * under the 3:1 floor for non-text UI, while the border is 3.74:1 (accent-600
+ * on white) and 10.84:1 (accent-400 on slate-950). The off face reserves the
+ * same border in `transparent`, so pressing changes color and nothing moves.
+ */
+// eslint-disable-next-line react-refresh/only-export-components
+export const TOGGLE = {
+  off: `${BUTTON.ghost} border border-transparent`,
+  on: `rounded border border-accent-600 bg-accent-100 px-2 py-1 text-sm text-accent-900 hover:bg-accent-200 dark:border-accent-400 dark:bg-accent-900 dark:text-accent-50 dark:hover:bg-accent-800 ${FOCUS_RING}`,
+} as const;
+
+/**
  * Every button attribute, `ref` included: a caller that has to move the
  * keyboard onto one of these - a control that replaces the control that was
  * pressed - needs the element itself, and React hands a function component's

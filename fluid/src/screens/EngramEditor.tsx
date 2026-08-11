@@ -37,7 +37,7 @@ import { PresenceChips } from "../collab/PresenceChips";
 import type { CollabConflict, CollabSession } from "../collab/useCollabSession";
 import { fileSpace, useCollabSession } from "../collab/useCollabSession";
 import { Breadcrumbs, crumbsOf } from "../components/Breadcrumbs";
-import { BUTTON } from "../components/primitives";
+import { BUTTON, TOGGLE } from "../components/primitives";
 import { Skeleton } from "../components/Skeleton";
 import CmEditor from "../editor/CmEditor";
 import { ConflictDialog } from "../editor/ConflictDialog";
@@ -45,6 +45,7 @@ import {
   crystallineCompletions,
   crystallineLines,
 } from "../editor/crystallineLines";
+import { fenceMono } from "../editor/fenceMono";
 import { fencePreviews } from "../editor/fencePreviews";
 import { FindingsPanel, jumpToLine } from "../editor/FindingsPanel";
 import { FrontmatterForm } from "../editor/FrontmatterForm";
@@ -79,7 +80,16 @@ function previewConfig(off: boolean, dark: boolean): Extension {
       // mono: the shared theme sets prose proportional, and this is the one
       // place that undoes it.
       [RAW_MONO]
-    : [livePreview(), wikilinkChips(), crystallineLines(), fencePreviews(dark)];
+    : [
+        livePreview(),
+        wikilinkChips(),
+        crystallineLines(),
+        fencePreviews(dark),
+        // Prose is proportional, code is not. Raw mode does not need this -
+        // the whole buffer is mono there - so it rides the preview branch
+        // with the rest of the read model.
+        fenceMono(),
+      ];
 }
 
 /** Preview is on when the editor opens. */
@@ -793,14 +803,11 @@ function Surface({
                   ),
                 });
               }}
-              className={
-                // A quiet control until it is on: the ghost tier is the base,
-                // and the pressed state is the accent wash the filter chips
-                // wear, so "on" reads the same everywhere in the app.
-                raw
-                  ? `${BUTTON.ghost} bg-accent-50 text-accent-800 dark:bg-accent-950 dark:text-accent-200`
-                  : BUTTON.ghost
-              }
+              // Quiet until it is on, then an accent wash. The two faces are
+              // whole strings rather than a base plus overrides: see `TOGGLE`
+              // for why layering accent utilities onto the ghost tier renders
+              // nothing at all.
+              className={raw ? TOGGLE.on : TOGGLE.off}
             >
               Raw
             </button>
