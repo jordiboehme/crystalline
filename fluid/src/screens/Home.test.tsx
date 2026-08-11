@@ -79,6 +79,20 @@ describe("the home screen", () => {
     expect(
       await screenMain.findByText("Route here for eng questions."),
     ).toBeVisible();
+    // What backs the domain is a fact about it, so it wears the same chip
+    // every other fact in this app wears.
+    expect(screenMain.getByText("file").className).toContain("slate");
+  });
+
+  it("leaves the tagline to the screen that owns it", async () => {
+    serve();
+
+    renderApp("/");
+
+    // Said once, on the way in. A subtitle repeating it under every visit is
+    // the kind of line a reader stops seeing.
+    await (await main()).findByRole("heading", { name: "Home", level: 1 });
+    expect(screen.queryByText(/where you think with it/)).toBeNull();
   });
 
   it("dates a card by what was recorded, not by what was guessed", async () => {
@@ -116,5 +130,28 @@ describe("the home screen", () => {
     expect(
       await screen.findByText(/Nothing was recorded in the last 7d/),
     ).toBeVisible();
+    // An empty feed is a state with a way out of it: what fills it, and a
+    // door into the first domain there is.
+    expect(
+      screen.getByText(
+        "Activity appears as engrams are written, edited or verified.",
+      ),
+    ).toBeVisible();
+    const feed = await screen.findByRole("region", { name: /Recent activity/ });
+    expect(
+      within(feed).getByRole("link", { name: "Start in eng" }),
+    ).toHaveAttribute("href", "/d/eng");
+  });
+
+  it("offers no door into a domain when there are none", async () => {
+    serve({
+      "/domains": () => ({ behavior: [], domains: [] }),
+      "/activity": () => ({ timeframe: "7d", count: 0, engrams: [] }),
+    });
+
+    renderApp("/");
+
+    await screen.findByText(/Nothing was recorded in the last 7d/);
+    expect(screen.queryByRole("link", { name: /^Start in/ })).toBeNull();
   });
 });

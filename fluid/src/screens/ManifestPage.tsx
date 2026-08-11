@@ -89,7 +89,18 @@ export default function ManifestPage() {
       */}
       <Breadcrumbs crumbs={crumbsOf(domain, "MANIFEST", "MANIFEST")} />
       <header className="flex flex-wrap items-baseline justify-between gap-3">
-        <h1 className="text-xl font-semibold">{domain} MANIFEST</h1>
+        {/*
+          The trail above already reads "eng > MANIFEST", so a title saying
+          "eng MANIFEST" said the domain twice in two rows. The heading is what
+          this document is; the line under it says whose it is, which is what
+          keeps the page identifiable when it is read on its own or on paper.
+        */}
+        <div>
+          <h1 className="text-display">MANIFEST</h1>
+          <p className="text-caption mt-1 text-slate-500 dark:text-slate-400">
+            {`The ${domain} domain, in its own words.`}
+          </p>
+        </div>
         {/*
           Offered whether the MANIFEST is empty or not: an admin looking at
           nothing needs exactly this link to fix that, and an admin looking

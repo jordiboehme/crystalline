@@ -9,7 +9,7 @@
 
 import { describe, expect, it } from "vitest";
 
-import { searchTerms, snippetParts } from "./snippet";
+import { searchTerms, snippetParts, stripSnippetMarkup } from "./snippet";
 
 /** The pieces, put back together. */
 function rejoined(text: string, terms: string[]): string {
@@ -36,6 +36,37 @@ describe("the query's terms", () => {
 
   it("has no terms for an empty query", () => {
     expect(searchTerms("   ")).toEqual([]);
+  });
+});
+
+describe("a snippet's markup", () => {
+  it("is taken back out, so a reader gets the sentence rather than its source", () => {
+    expect(stripSnippetMarkup("# Lantern Protocol")).toBe("Lantern Protocol");
+    expect(
+      stripSnippetMarkup("## Relations - relates_to [[Lantern Protocol]]"),
+    ).toBe("Relations - relates_to Lantern Protocol");
+    expect(stripSnippetMarkup("uses `docText` and **bold** text")).toBe(
+      "uses docText and bold text",
+    );
+  });
+
+  it("leaves the words a search matches on where they were", () => {
+    // The terms are matched after stripping, so what the mark lands on is the
+    // stripped text: a hit next to a heading marker still marks the word.
+    expect(marked(stripSnippetMarkup("## Lantern rules"), ["lantern"])).toEqual(
+      ["Lantern"],
+    );
+  });
+
+  it("leaves text that is not markdown exactly as it was written", () => {
+    // A snippet quoting HTML is text like any other: nothing here turns it
+    // into markup, and nothing here eats it either.
+    expect(stripSnippetMarkup("<b>rule</b> of thumb")).toBe(
+      "<b>rule</b> of thumb",
+    );
+    expect(stripSnippetMarkup("tagged #eng and issue #42")).toBe(
+      "tagged #eng and issue #42",
+    );
   });
 });
 

@@ -287,6 +287,55 @@ describe("the search screen", () => {
     expect(screen.queryByText(/nothing has been searched for yet/i)).toBeNull();
   });
 
+  it("says how many and what ranked them on one line, not two", async () => {
+    serve({ "/search": () => page([hit()], "title") });
+
+    mount("/search?q=rule&search_type=title");
+
+    expect(await screen.findByText("1 result, ranked by title.")).toBeVisible();
+    // The count and the mode were two stacked lines saying near enough the
+    // same thing; the tally line is gone.
+    expect(screen.queryByText(/shown/)).toBeNull();
+  });
+
+  it("offers a way out of an empty answer under a filter", async () => {
+    serve({ "/search": () => page([]) });
+    const user = userEvent.setup();
+
+    mount("/search?q=rule&domains=eng&tags=ghost");
+
+    await screen.findByText(/no engram matches/i);
+    // Two ways out: widen to every domain, or drop the filters entirely. The
+    // filter bar carries a clear of its own, so the recovery is the second.
+    await user.click(
+      screen.getByRole("button", { name: "Search all domains" }),
+    );
+    await waitFor(() => {
+      expect(url()).not.toContain("domains=eng");
+    });
+    expect(url()).toContain("tags=ghost");
+
+    const clears = screen.getAllByRole("button", { name: "Clear filters" });
+    expect(clears).toHaveLength(2);
+    await user.click(clears[1] as HTMLElement);
+    await waitFor(() => {
+      expect(url()).toBe("/search?q=rule");
+    });
+  });
+
+  it("offers no way out when nothing was narrowed", async () => {
+    serve({ "/search": () => page([]) });
+
+    mount("/search?q=rule");
+
+    await screen.findByText(/no engram matches/i);
+    // Nothing is filtered, so a Clear filters button would do nothing at all.
+    expect(screen.queryByRole("button", { name: "Clear filters" })).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: "Search all domains" }),
+    ).toBeNull();
+  });
+
   it("marks the searched words in a snippet without letting markup through", async () => {
     serve({
       "/search": () => page([hit({ snippet: "<b>rule</b> of thumb" })]),

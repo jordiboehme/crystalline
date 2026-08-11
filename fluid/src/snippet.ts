@@ -1,16 +1,46 @@
 /**
  * Marking the searched-for words inside a search snippet.
  *
- * The engine sends a snippet as plain text: a window cut around the match,
- * with no markup and no highlight markers of any kind. So the marking is done
- * here, by finding the query's own terms in the text the same way the engine
- * found them - whitespace-separated and case insensitively - and handing back
- * the pieces for a component to render as elements.
+ * The engine sends a snippet as text: a window cut around the match, with no
+ * highlight markers of any kind - though the window is cut out of the file, so
+ * whatever markdown syntax it crossed comes along (see
+ * {@link stripSnippetMarkup}). So the marking is done here, by finding the
+ * query's own terms in the text the same way the engine found them -
+ * whitespace-separated and case insensitively - and handing back the pieces for
+ * a component to render as elements.
  *
  * Pieces rather than a string of markup, and that is the point: nothing in this
  * app ever turns a server string into HTML, so a snippet cut out of an engram
  * that happens to contain `<script>` is shown as the text it is.
  */
+
+/**
+ * A snippet with the markdown syntax taken back out.
+ *
+ * The engine cuts its window from the raw file, so a hit near a heading
+ * arrives wearing `#` and a hit near a relation wears its brackets. Readers get
+ * the text, searchers still get the mark - the terms are matched AFTER
+ * stripping, so a word beside a marker is marked where it now sits.
+ *
+ * Only the syntax that survives a one-line cut is handled, and only when it
+ * looks like syntax: a `#` with no space after it is a tag, not a heading, and
+ * anything that is not markdown at all comes back exactly as it was written.
+ */
+export function stripSnippetMarkup(text: string): string {
+  return text
+    .replace(/```[^\n]*/g, " ")
+    .replace(/^#{1,6}[ \t]+/gm, "")
+    .replace(/(^|\s)#{1,6}[ \t]+/g, "$1")
+    .replace(/^\s*>[ \t]?/gm, "")
+    .replace(/\*\*([^*]+)\*\*/g, "$1")
+    .replace(/(^|[^*])\*([^*]+)\*/g, "$1$2")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/\[\[([^\]]+)\]\]/g, "$1")
+    .replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1")
+    .replace(/^---[ \t]*$/gm, "")
+    .replace(/[ \t]+/g, " ")
+    .trim();
+}
 
 /** One piece of a snippet: either matched text, or the text between matches. */
 export interface SnippetPart {

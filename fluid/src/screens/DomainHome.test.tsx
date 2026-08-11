@@ -30,9 +30,20 @@ vi.mock("../api/client", async (importOriginal) => {
 
 const apiMock = vi.mocked(api);
 
-const MANIFEST = ["---", "title: eng", "---", "", "## When to Use", ""].join(
-  "\n",
-);
+const MANIFEST = [
+  "---",
+  "title: eng",
+  "---",
+  "",
+  "# eng",
+  "",
+  "What this domain is for, in one paragraph.",
+  "",
+  "## When to Use",
+  "",
+  "- Route here for eng questions.",
+  "",
+].join("\n");
 
 /** The tree, which answers with the folder that was asked for. */
 function treeResponse(path: string) {
@@ -128,21 +139,58 @@ beforeEach(() => {
 });
 
 describe("the domain screen", () => {
-  it("renders the manifest and the engrams at the root of the domain", async () => {
+  it("renders the manifest's lede and the engrams at the root of the domain", async () => {
     serve();
 
     renderApp("/d/eng");
 
     expect(await screen.findByRole("heading", { name: "eng" })).toBeVisible();
-    // From the manifest markdown, which means it was fetched and rendered
-    // rather than shown as source.
+    // The manifest is one paragraph here and a link to the rest: what a
+    // reader arriving in a domain needs is what it is for, then its engrams,
+    // and a whole document in between put the list below the fold.
     expect(
-      await screen.findByRole("heading", { name: "When to Use" }),
+      await screen.findByText("What this domain is for, in one paragraph."),
     ).toBeVisible();
+    expect(
+      screen.getByRole("link", { name: "Read the MANIFEST" }),
+    ).toHaveAttribute("href", "/d/eng/manifest");
+    expect(screen.queryByRole("heading", { name: "When to Use" })).toBeNull();
     const row = await within(await screenBody()).findByRole("link", {
       name: /Alpha/,
     });
     expect(row).toHaveAttribute("href", "/d/eng/e/alpha");
+  });
+
+  it("says a manifest with no prose at all is there without quoting nothing", async () => {
+    serve({
+      "/domains/eng/manifest": () => ({
+        domain: "eng",
+        markdown: "---\ntitle: eng\n---\n\n# eng\n",
+      }),
+    });
+
+    renderApp("/d/eng");
+
+    // Headings and frontmatter are not a lede. The link is still the way in:
+    // an empty summary is not the same fact as a missing MANIFEST.
+    expect(
+      await screen.findByRole("link", { name: "Read the MANIFEST" }),
+    ).toBeVisible();
+    expect(screen.queryByText(/no MANIFEST yet/)).toBeNull();
+  });
+
+  it("launches a new engram from the heading of the list it lands in", async () => {
+    serve();
+
+    renderApp("/d/eng");
+    const body = await screenBody();
+
+    // The primary tier: it is the one thing a writer comes to a domain to do,
+    // and the sidebar's launcher never co-renders with it.
+    const launcher = await within(body).findByRole("button", {
+      name: "New engram",
+    });
+    expect(launcher.className).toContain("bg-accent-700");
   });
 
   it("says a domain nobody registered is not here", async () => {

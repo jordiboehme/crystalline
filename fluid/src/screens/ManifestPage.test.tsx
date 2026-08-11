@@ -124,7 +124,12 @@ describe("the MANIFEST", () => {
     serveAs("admin");
     renderApp("/d/eng/manifest");
     expect(
-      await screen.findByRole("heading", { name: /manifest/i }),
+      await screen.findByRole("heading", { name: "MANIFEST", level: 1 }),
+    ).toBeInTheDocument();
+    // The trail above says "eng > MANIFEST", so the title does not say the
+    // domain a second time - the line under it does, once.
+    expect(
+      screen.getByText("The eng domain, in its own words."),
     ).toBeInTheDocument();
     expect(
       await screen.findByText(/Route here for eng questions/),

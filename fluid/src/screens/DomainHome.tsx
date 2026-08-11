@@ -35,9 +35,11 @@ import type { PaletteCommand } from "../commands";
 import { CreateEngramDialog } from "../components/CreateEngramDialog";
 import { EngramList } from "../components/EngramList";
 import { FilterFields, TagChips } from "../components/FilterControls";
-import { Markdown } from "../components/Markdown";
 import { Skeleton } from "../components/Skeleton";
+import { BUTTON, Chip, FOCUS_RING } from "../components/primitives";
 import { plural } from "../format";
+import { manifestRoute } from "../paths";
+import { stripSnippetMarkup } from "../snippet";
 
 export default function DomainHome() {
   const { domain = "" } = useParams();
@@ -133,24 +135,26 @@ export default function DomainHome() {
   return (
     <div className="flex flex-col gap-8">
       <header>
-        <h1 className="text-xl font-semibold">{domain}</h1>
+        <h1 className="text-display">{domain}</h1>
         {summary && (
-          <p className="mt-1 flex flex-wrap gap-x-3 text-sm text-slate-500 dark:text-slate-400">
+          <p className="mt-1 flex flex-wrap items-center gap-2 text-sm text-slate-500 dark:text-slate-400">
             {summary.engrams !== null && (
               <span className="tabular-nums">
                 {plural(summary.engrams, "engram", "engrams")}
               </span>
             )}
-            {summary.kind !== null && <span>{summary.kind}</span>}
+            {/* The same fact wears the same chip the home card gives it. */}
+            {summary.kind !== null && <Chip>{summary.kind}</Chip>}
           </p>
         )}
       </header>
 
       <section aria-labelledby="domain-manifest">
-        <h2 id="domain-manifest" className="mb-2 text-lg font-semibold">
+        <h2 id="domain-manifest" className="mb-2 text-section">
           Manifest
         </h2>
         <ManifestPanel
+          domain={domain}
           markdown={manifest.data}
           pending={manifest.isPending}
           error={manifest.error}
@@ -159,7 +163,7 @@ export default function DomainHome() {
 
       <section aria-labelledby="domain-engrams">
         <div className="mb-3 flex flex-wrap items-baseline justify-between gap-3">
-          <h2 id="domain-engrams" className="text-lg font-semibold">
+          <h2 id="domain-engrams" className="text-section">
             Engrams
           </h2>
           {capabilities.canWrite && (
@@ -168,7 +172,10 @@ export default function DomainHome() {
               onClick={() => {
                 setCreating(true);
               }}
-              className="rounded border border-slate-300 px-2 py-1 text-sm hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800"
+              // Primary: writing an engram is what a writer opens a domain to
+              // do. The sidebar's launcher hides on this screen, so the two
+              // never sit on one page competing for the same attention.
+              className={BUTTON.primary}
             >
               New engram
             </button>
@@ -251,12 +258,43 @@ export default function DomainHome() {
   );
 }
 
-/** The MANIFEST, or the fact that there is not one. */
+/**
+ * The first prose paragraph of the manifest, after frontmatter and headings.
+ *
+ * Blocks are split on the blank line rather than parsed: the lede feeds a plain
+ * paragraph, so what comes back has to be prose and never markdown syntax
+ * rendered as text. A manifest that opens with a heading and a list has no
+ * lede, and says so by answering null.
+ */
+function manifestLede(markdown: string): string | null {
+  const body = markdown.replace(/^---\r?\n[\s\S]*?\r?\n---[ \t]*\r?\n?/, "");
+  for (const block of body.split(/\r?\n\s*\r?\n/)) {
+    const line = block.trim();
+    if (line === "" || line.startsWith("#") || PROSE_EXCLUDED.test(line)) {
+      continue;
+    }
+    // The same stripper the search snippets use, for the same reason: this
+    // feeds a plain paragraph, and a lede wearing its own asterisks would be
+    // the raw-markdown bug one screen over.
+    const lede = stripSnippetMarkup(line).replace(/\s+/g, " ").trim();
+    if (lede !== "") {
+      return lede;
+    }
+  }
+  return null;
+}
+
+/** Blocks that are structure rather than prose: lists, quotes, rules, fences. */
+const PROSE_EXCLUDED = /^([-*+>|]|\d+\.|```|---)/;
+
+/** The MANIFEST in one line, and the way to the whole of it. */
 function ManifestPanel({
+  domain,
   markdown,
   pending,
   error,
 }: {
+  domain: string;
   markdown: string | undefined;
   pending: boolean;
   error: Error | null;
@@ -285,9 +323,18 @@ function ManifestPanel({
       </p>
     );
   }
+  const lede = manifestLede(markdown);
   return (
-    <div className="rounded border border-slate-200 px-4 py-1 dark:border-slate-800">
-      <Markdown source={markdown} />
+    // The one measure, from the one class: a lede that ran the width of a
+    // wide monitor would be the reading problem this app fixed elsewhere.
+    <div className="measured flex flex-col items-start gap-2">
+      {lede !== null && <p className="text-sm">{lede}</p>}
+      <Link
+        to={manifestRoute(domain)}
+        className={`text-sm text-accent-700 underline underline-offset-2 hover:no-underline dark:text-accent-400 ${FOCUS_RING}`}
+      >
+        Read the MANIFEST
+      </Link>
     </div>
   );
 }
@@ -417,7 +464,7 @@ function FilterBar({
 function DomainNotFound({ domain }: { domain: string }) {
   return (
     <div className="flex flex-col items-start gap-3">
-      <h1 className="text-xl font-semibold">Domain not found</h1>
+      <h1 className="text-display">Domain not found</h1>
       <p className="text-sm">
         No domain named {`"${domain}"`} is registered on this instance.
       </p>

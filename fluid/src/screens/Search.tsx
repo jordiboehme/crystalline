@@ -40,6 +40,8 @@ import { fetchTags, vocabularyKey } from "../api/vocabulary";
 import { EngramList } from "../components/EngramList";
 import { Facets } from "../components/Facets";
 import type { FacetChange } from "../components/Facets";
+import { BUTTON } from "../components/primitives";
+import { plural } from "../format";
 import { searchTerms } from "../snippet";
 
 export default function Search() {
@@ -145,7 +147,7 @@ export default function Search() {
   return (
     <div className="flex flex-col gap-6">
       <header>
-        <h1 className="text-xl font-semibold">Search</h1>
+        <h1 className="text-display">Search</h1>
       </header>
 
       <form
@@ -192,7 +194,42 @@ export default function Search() {
               : "No engram matches this search."
           }
           highlight={terms}
-          summary={(page) => <ModeNote page={page} asked={request.mode} />}
+          summary={(page, shown) => (
+            <StatusLine page={page} shown={shown} asked={request.mode} />
+          )}
+          emptyActions={
+            filtering ? (
+              <>
+                <button
+                  type="button"
+                  className={BUTTON.secondary}
+                  onClick={() => {
+                    // The query survives: widening a search is not ending it.
+                    apply({
+                      domains: [],
+                      type: null,
+                      status: null,
+                      tags: [],
+                      after: null,
+                    });
+                  }}
+                >
+                  Clear filters
+                </button>
+                {request.domains.length > 0 && (
+                  <button
+                    type="button"
+                    className={BUTTON.secondary}
+                    onClick={() => {
+                      apply({ domains: [] });
+                    }}
+                  >
+                    Search all domains
+                  </button>
+                )}
+              </>
+            ) : undefined
+          }
         />
       ) : (
         <p className="text-sm text-slate-500 dark:text-slate-400">
@@ -205,22 +242,57 @@ export default function Search() {
 }
 
 /**
- * Which mode ran.
+ * How many results there are and what ranked them, on one line.
  *
- * Always on screen rather than only on a fallback, because "this was ranked by
+ * One line rather than the two this used to stack: a tally and a mode note are
+ * both facts about the page, and a reader scanning for "did this find
+ * anything" should not have to read two sentences to learn it. The mode is
+ * always on it rather than only on a fallback, because "this was ranked by
  * text" is what explains the order of the results, and a reader who only ever
  * sees the note when something went wrong learns to read it as an error.
+ *
+ * An empty page says only the mode: the empty message below it already says
+ * there is nothing, so a "0 results" ahead of it would be the same sentence
+ * twice.
  */
-function ModeNote({ page, asked }: { page: EngramPage; asked: SearchMode }) {
+function StatusLine({
+  page,
+  shown,
+  asked,
+}: {
+  page: EngramPage;
+  shown: number;
+  asked: SearchMode;
+}) {
   const ran = page.mode;
-  if (ran === null) {
+  if (ran === null && shown === 0) {
     return null;
   }
+  // The total survives the merge: a page of fifty out of two hundred is a fact
+  // about this search that nothing else on the screen says.
+  const counted =
+    shown === 0
+      ? ""
+      : shown < page.total
+        ? `${String(shown)} of ${String(page.total)} results`
+        : plural(page.total, "result", "results");
+  const mode =
+    ran === null
+      ? ""
+      : ran === asked
+        ? `ranked by ${ran}.`
+        : `Asked for ${asked}, ran as ${ran}: ${asked} needs embeddings and a query to embed them against, so the engine fell back.`;
+  const line =
+    counted === ""
+      ? mode
+      : mode === ""
+        ? `${counted}.`
+        : ran === asked
+          ? `${counted}, ${mode}`
+          : `${counted}. ${mode}`;
   return (
-    <p className="pb-2 text-xs text-slate-500 dark:text-slate-400">
-      {ran === asked
-        ? `Ranked by ${ran}.`
-        : `Asked for ${asked}, ran as ${ran}: ${asked} needs embeddings and a query to embed them against, so the engine fell back.`}
+    <p className="text-caption pb-2 text-slate-500 tabular-nums dark:text-slate-400">
+      {line}
     </p>
   );
 }

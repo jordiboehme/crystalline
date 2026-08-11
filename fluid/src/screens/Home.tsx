@@ -20,6 +20,7 @@ import { ACTIVITY_QUERY_KEY, fetchActivity } from "../api/activity";
 import type { Activity } from "../api/activity";
 import { DOMAINS_QUERY_KEY, fetchDomains } from "../api/domains";
 import type { DomainSummary } from "../api/domains";
+import { Chip, FOCUS_RING } from "../components/primitives";
 import { formatDay, plural } from "../format";
 import { RETIRED_CLASS, isRetired } from "../lifecycle";
 import { domainRoute, engramRoute } from "../paths";
@@ -40,16 +41,16 @@ export default function Home() {
   );
 
   return (
-    <div className="flex flex-col gap-8">
+    // Centered and capped: cards spread across a wide monitor read as a
+    // spreadsheet rather than as a shelf. The tagline that used to sit under
+    // the title belongs to the way in - the login card says it once.
+    <div className="mx-auto flex w-full max-w-5xl flex-col gap-8">
       <header>
-        <h1 className="text-xl font-semibold">Home</h1>
-        <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">
-          Crystalline stores what was learned; Fluid is where you think with it.
-        </p>
+        <h1 className="text-display">Home</h1>
       </header>
 
       <section aria-labelledby="home-domains">
-        <h2 id="home-domains" className="mb-3 text-lg font-semibold">
+        <h2 id="home-domains" className="mb-3 text-section">
           Domains
         </h2>
         {listing.isPending && (
@@ -85,13 +86,14 @@ export default function Home() {
       </section>
 
       <section aria-labelledby="home-activity">
-        <h2 id="home-activity" className="mb-1 text-lg font-semibold">
+        <h2 id="home-activity" className="mb-1 text-section">
           Recent activity
         </h2>
         <ActivityFeed
           activity={activity.data}
           pending={activity.isPending}
           error={activity.error}
+          firstDomain={listing.data?.domains[0]?.name ?? null}
         />
       </section>
     </div>
@@ -116,13 +118,15 @@ function DomainCard({
           {domain.name}
         </Link>
       </h3>
-      <p className="flex flex-wrap items-baseline gap-x-3 text-xs text-slate-500 dark:text-slate-400">
+      {/* The count reads as a number and stays text; what backs the domain is
+          a category, so it wears the chip every category in this app wears. */}
+      <p className="text-caption flex flex-wrap items-center gap-2 text-slate-500 dark:text-slate-400">
         {domain.engrams !== null && (
           <span className="tabular-nums">
             {plural(domain.engrams, "engram", "engrams")}
           </span>
         )}
-        {domain.kind !== null && <span>{domain.kind}</span>}
+        {domain.kind !== null && <Chip>{domain.kind}</Chip>}
       </p>
       {domain.whenToUse.length > 0 ? (
         <p className="line-clamp-3 text-sm">{domain.whenToUse[0]}</p>
@@ -170,10 +174,13 @@ function ActivityFeed({
   activity,
   pending,
   error,
+  firstDomain,
 }: {
   activity: Activity | undefined;
   pending: boolean;
   error: Error | null;
+  /** Where to send a reader with an empty feed, when there is anywhere. */
+  firstDomain: string | null;
 }) {
   if (pending) {
     return (
@@ -195,12 +202,28 @@ function ActivityFeed({
   // The window is the engine's choice, so it is quoted rather than restated.
   const covered = activity?.timeframe ?? null;
   if (!activity || activity.items.length === 0) {
+    // An empty state that says what would fill it, and offers the door: a
+    // reader who arrives before anything was written should not have to guess
+    // whether the feed is broken or the instance is simply new.
     return (
-      <p className="text-sm text-slate-500 dark:text-slate-400">
-        {covered === null
-          ? "Nothing was recorded in this window."
-          : `Nothing was recorded in the last ${covered}.`}
-      </p>
+      <div className="flex flex-col items-start gap-1">
+        <p className="text-sm text-slate-500 dark:text-slate-400">
+          {covered === null
+            ? "Nothing was recorded in this window."
+            : `Nothing was recorded in the last ${covered}.`}
+        </p>
+        <p className="text-caption text-slate-500 dark:text-slate-400">
+          Activity appears as engrams are written, edited or verified.
+        </p>
+        {firstDomain !== null && (
+          <Link
+            to={domainRoute(firstDomain)}
+            className={`mt-1 text-sm text-accent-700 underline underline-offset-2 hover:no-underline dark:text-accent-400 ${FOCUS_RING}`}
+          >
+            {`Start in ${firstDomain}`}
+          </Link>
+        )}
+      </div>
     );
   }
   return (
