@@ -218,10 +218,16 @@ async fn scored_lexical(
     } else {
         format!("WHERE {}", clauses.join(" AND "))
     };
-    // `ORDER BY e.id` is satisfied from the table's own rowid order, so this
-    // wide projection never reaches a sorter (verified by `EXPLAIN QUERY PLAN`:
-    // no `USE SORTER` line). Keep it that way: any other ordering here would
-    // spill every matched body to disk.
+    // `ORDER BY e.id` is the cheapest order this wide projection can be given:
+    // unscoped, or scoped by path alone, it is satisfied from the table's own
+    // rowid order and no sorter opens at all. Scoped to a domain it does sort -
+    // `d.name IN (...)` drives the join from `domain` and reaches `engram`
+    // through `idx_engram_domain`, whose order is not rowid order - and what
+    // holds that sorter down is the `LIMIT` in this same statement, which lets
+    // turso keep `candidate_cap` records rather than the match set. Both
+    // properties are pinned by `EXPLAIN QUERY PLAN` and a source scan in
+    // `tests/turso_only.rs`. Keep the bound and keep the order: any other
+    // ordering here, or a `GROUP BY`, would spill every matched body to disk.
     let sql = format!(
         "SELECT {CANDIDATE_COLUMNS} FROM engram e JOIN domain d ON d.id=e.domain_id {where_sql} \
          ORDER BY e.id LIMIT {candidate_cap}"
