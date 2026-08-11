@@ -34,15 +34,27 @@
 //! `invalid`) is decided before any verify rule runs, and the inner one exists
 //! so an engine caller that is not this surface is safe too.
 //!
-//! The MANIFEST comparison is case-INSENSITIVE, matching the engine's. The
-//! filesystem under a file domain is case-insensitive on macOS and Windows, so
-//! an entry called `manifest.md` lands on the domain's real `MANIFEST.md`: an
-//! exact-string screen would let an uploaded archive replace the one file a
-//! domain cannot regenerate. The OKF reserved names are matched
-//! case-sensitively instead, because `crystalline_core::is_reserved_file`
-//! defines them that way on every platform (`Index.md` is an ordinary
-//! document) and a second, stricter rule here would disagree with the engine
-//! about what a preview promised.
+//! Every name comparison in that screen is case-INSENSITIVE, at both layers,
+//! and the reason is the filesystem rather than the format. A file domain
+//! lives on APFS or NTFS on most installs, where an entry called `manifest.md`
+//! or `Log.md` addresses the existing `MANIFEST.md` or `log.md`: the engine's
+//! existence probe resolves to the real file and, under `policy=overwrite`,
+//! the write renames onto it, replacing its bytes while the on-disk name never
+//! changes. For a MANIFEST and for a log that is permanent damage - neither is
+//! ever regenerated - so an exact-string screen would hand an uploaded archive
+//! the one thing this endpoint must not allow. `index.md` is usually rebuilt
+//! within the same request, but not when an operator has turned `index.files`
+//! off, and a rule that is only safe under one setting is not a rule.
+//!
+//! This is deliberately stricter than `crystalline_core::is_reserved_file`,
+//! whose exact, case-sensitive match stays as it is: that rule is about what
+//! Crystalline generates and exports, where one deterministic answer on every
+//! platform is worth more than filesystem realism. Import is the one direction
+//! that faces a filesystem holding files it did not write, so it screens on
+//! what the filesystem will do rather than on what the format says. Being
+//! stricter here costs nothing in agreement: `preview` and `import` share one
+//! `read_archive`, so both apply the identical rule and a preview can never
+//! promise something the import then contradicts.
 
 use axum::extract::State;
 use axum::http::{StatusCode, header};
@@ -252,6 +264,20 @@ pub struct ImportQuery {
     pub policy: Option<String>,
 }
 
+/// Whether an uploaded entry carries an OKF reserved name at any depth,
+/// compared without regard to case.
+///
+/// Not `crystalline_core::is_reserved_path`, which matches exactly: see the
+/// module docs for why the import direction is deliberately the stricter of
+/// the two. The engine's `import_domain_files` applies the same widened rule
+/// as the inner defense.
+fn is_reserved_upload(path: &str) -> bool {
+    std::path::Path::new(path).file_name().is_some_and(|name| {
+        name.eq_ignore_ascii_case(crystalline_core::INDEX_FILE)
+            || name.eq_ignore_ascii_case(crystalline_core::LOG_FILE)
+    })
+}
+
 /// One entry after the screen: ready to import, or already decided.
 enum Screened {
     /// Markdown this endpoint will hand to the engine.
@@ -335,12 +361,20 @@ fn read_archive(bytes: &[u8]) -> Result<Vec<Screened>, ApiError> {
             });
             continue;
         }
-        // The OKF reserved names are generated from the folder they sit in, so
-        // an imported one would be rewritten by the next refresh anyway.
-        if crystalline_core::is_reserved_path(&raw) {
+        // The OKF reserved names, and case-insensitively for the same reason
+        // the MANIFEST above is: on APFS or NTFS a `Log.md` entry renames onto
+        // the existing `log.md`, and nothing in Crystalline ever regenerates a
+        // log. See the module docs for why this is stricter than
+        // `crystalline_core::is_reserved_file` on purpose.
+        if is_reserved_upload(&raw) {
             out.push(Screened::Ignored {
                 path: raw,
-                reason: "a generated OKF index or log is never imported".to_string(),
+                // Worded differently from the engine's line for the same case,
+                // so a report says which of the two screens answered - and so a
+                // test can tell a regression here from the inner screen quietly
+                // covering for it.
+                reason: "reserved OKF names like index.md and log.md are never imported"
+                    .to_string(),
             });
             continue;
         }

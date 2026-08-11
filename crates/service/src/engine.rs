@@ -4564,15 +4564,28 @@ impl Engine {
                 ignored += 1;
                 continue;
             }
-            // The OKF reserved names are generated, never imported: `index.md`
-            // and `log.md` are rebuilt from the folder they sit in, so writing
-            // one back would be overwritten by the next refresh anyway.
-            if crystalline_core::is_reserved_path(path) {
+            // The OKF reserved names are never imported: `index.md` is rebuilt
+            // from the folder it sits in, and `log.md` is reserved without ever
+            // being generated at all, so an import can only damage it.
+            //
+            // Matched case-insensitively, and deliberately stricter than
+            // `crystalline_core::is_reserved_path` (whose exact match is a
+            // documented rule about what Crystalline generates and exports).
+            // Import faces the filesystem instead, and that filesystem is
+            // case-insensitive on APFS and NTFS: a `Log.md` entry renames onto
+            // the existing `log.md`, replacing its bytes while the on-disk name
+            // stays lowercase. Nothing regenerates a log, so that loss is
+            // permanent - the same argument that makes the MANIFEST screen
+            // above case-insensitive.
+            if Path::new(path).file_name().is_some_and(|name| {
+                name.eq_ignore_ascii_case(crystalline_core::INDEX_FILE)
+                    || name.eq_ignore_ascii_case(crystalline_core::LOG_FILE)
+            }) {
                 entries.push(json!({
                     "path": path,
                     "permalink": Value::Null,
                     "action": "ignored",
-                    "reason": "a generated OKF index or log is never imported",
+                    "reason": "a reserved OKF index or log is never imported",
                 }));
                 ignored += 1;
                 continue;
