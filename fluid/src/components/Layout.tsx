@@ -19,7 +19,17 @@
  */
 
 import { useQuery } from "@tanstack/react-query";
-import { Gem, Moon, PanelLeft, Sun, Users as UsersIcon } from "lucide-react";
+import {
+  Gem,
+  House,
+  Moon,
+  PanelLeft,
+  PanelLeftClose,
+  PanelLeftOpen,
+  Plus,
+  Sun,
+  Users as UsersIcon,
+} from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { RefObject } from "react";
 import { DropdownMenu } from "radix-ui";
@@ -42,6 +52,7 @@ import { domainRoute, searchRoute, usersRoute } from "../paths";
 import { useTheme } from "../theme/context";
 import type { ThemePreference } from "../theme/context";
 import { CommandPalette } from "./CommandPalette";
+import { CreateEngramDialog } from "./CreateEngramDialog";
 import { DomainNav } from "./DomainNav";
 import { HelpOverlay } from "./HelpOverlay";
 import { ITEM_CLASSES, MENU_CLASSES } from "./menu";
@@ -57,10 +68,47 @@ const PALETTE_HINT = /Mac|iPhone|iPad/.test(navigator.userAgent)
   ? "⌘K"
   : "Ctrl K";
 
+/**
+ * Where the sidebar's width is remembered. Its two values are "rail" and
+ * "expanded"; anything else, including nothing at all, reads as expanded.
+ */
+const NAV_STATE_KEY = "fluid.nav";
+
+/**
+ * How wide the sidebar was last left, read once at mount.
+ *
+ * A browser that refuses storage - a private window with cookies off, an
+ * embedded view - is not a reason to fail to draw the frame, so it gets the
+ * default and keeps whatever it chooses for the session.
+ */
+function storedRail(): boolean {
+  try {
+    return localStorage.getItem(NAV_STATE_KEY) === "rail";
+  } catch {
+    return false;
+  }
+}
+
 export function Layout() {
   const [navOpen, setNavOpen] = useState(false);
+  const [rail, setRail] = useState(storedRail);
   const [helpOpen, setHelpOpen] = useState(false);
   const mainRef = useRef<HTMLElement | null>(null);
+
+  // A choice about the shape of the frame outlives the screen it was made on,
+  // and outlives the session too: somebody who wants the reading surface as
+  // wide as it goes should not have to say so again on every visit.
+  const toggleRail = () => {
+    setRail((was) => {
+      const next = !was;
+      try {
+        localStorage.setItem(NAV_STATE_KEY, next ? "rail" : "expanded");
+      } catch {
+        // A browser that refuses storage still gets the session's choice.
+      }
+      return next;
+    });
+  };
 
   // The one action that is offered on every screen, because the frame is on
   // every screen: a reader who found the palette can find everything else
@@ -112,7 +160,7 @@ export function Layout() {
         }}
       />
       <div className="mx-auto flex w-full max-w-350 gap-6 px-4 py-6">
-        <DomainSidebar open={navOpen} />
+        <DomainSidebar open={navOpen} rail={rail} onToggleRail={toggleRail} />
         <main
           ref={mainRef}
           tabIndex={-1}
@@ -402,12 +450,52 @@ function UserMenu() {
  * layout route only sees the params the layout's own pattern declares - none.
  * `useMatch` matches the whole location, so the frame knows the domain and the
  * engram the screen inside it is showing.
+ *
+ * It sticks under the top bar rather than scrolling away with the screen: the
+ * page is the scrolling box, the header is fourteen units of it, and the
+ * sidebar's own overflow starts where that ends. A long tree therefore scrolls
+ * inside the sidebar while the reading surface scrolls the page, which is what
+ * keeps the way around a domain reachable from the bottom of a long engram.
+ * The half-unit of side padding that comes with it is the focus ring's: a box
+ * that scrolls on one axis clips the other one too, and the rows inside fill
+ * this column edge to edge, so without it a focused row's ring would be shaved
+ * off down both sides.
  */
-function DomainSidebar({ open }: { open: boolean }) {
+function DomainSidebar({
+  open,
+  rail,
+  onToggleRail,
+}: {
+  open: boolean;
+  rail: boolean;
+  onToggleRail: () => void;
+}) {
+  const navigate = useNavigate();
+  const { capabilities } = useAuth();
+  const [creating, setCreating] = useState(false);
   const listing = useQuery({
     queryKey: DOMAINS_QUERY_KEY,
     queryFn: fetchDomains,
   });
+
+  // Folding the sidebar unmounts the control that folded it, so the keyboard
+  // is handed to the one that took its place - the same spot on screen, the
+  // opposite verb. Without this, focus lands on the document and a reader is
+  // back at the top of the page. Only after a press: a mount that read the
+  // stored preference must not steal focus from wherever the reader is.
+  const toggleRef = useRef<HTMLButtonElement | null>(null);
+  const pressed = useRef(false);
+  useEffect(() => {
+    if (!pressed.current) {
+      return;
+    }
+    pressed.current = false;
+    toggleRef.current?.focus();
+  }, [rail]);
+  const fold = () => {
+    pressed.current = true;
+    onToggleRail();
+  };
 
   const match = useMatch("/d/:domain/*");
   const domain = match?.params.domain ?? "";
@@ -434,30 +522,95 @@ function DomainSidebar({ open }: { open: boolean }) {
     <nav
       id="domain-sidebar"
       aria-label={domain === "" ? "Domains" : `Domain ${domain}`}
-      className={`${open ? "block" : "hidden"} w-56 shrink-0 print:hidden md:block`}
+      className={`${open ? "block" : "hidden"} ${
+        rail ? "w-12" : "w-56"
+      } shrink-0 print:hidden md:sticky md:top-14 md:block md:max-h-[calc(100vh-3.5rem)] md:self-start md:overflow-y-auto md:px-0.5`}
     >
-      {domain === "" ? (
-        <DomainList
-          domains={listing.data?.domains}
-          pending={listing.isPending}
-          error={listing.error}
-        />
+      {rail ? (
+        /*
+          Folded: the two things somebody in the middle of reading still needs
+          from the frame, and the way back out of the fold. Names rather than
+          bare glyphs, because an icon column is exactly where a keyboard or a
+          screen reader has the least to go on.
+        */
+        <div className="flex flex-col items-center gap-1 py-1">
+          <IconButton
+            ref={toggleRef}
+            label="Expand the sidebar"
+            icon={PanelLeftOpen}
+            aria-expanded={false}
+            aria-controls="domain-sidebar"
+            onClick={fold}
+          />
+          <IconButton
+            label="All domains"
+            icon={House}
+            onClick={() => {
+              void navigate("/");
+            }}
+          />
+          {domain !== "" && capabilities.canWrite && (
+            <IconButton
+              label="New engram"
+              icon={Plus}
+              onClick={() => {
+                setCreating(true);
+              }}
+            />
+          )}
+        </div>
       ) : (
         <>
-          {/*
-            A listing that failed is said here as it is in the flat mode. The
-            switcher is drawn either way: it names the domain the reader is in
-            from the address, so it works even when nothing could be listed to
-            switch to.
-          */}
-          {listing.error && <SidebarProblem error={listing.error} />}
-          <DomainNav
-            domain={domain}
-            permalink={permalink}
-            onManifest={onManifest}
-            domains={listing.data?.domains ?? []}
-          />
+          <div className="flex justify-end pb-1">
+            {/*
+              Only where there is a rail to fold into: below the medium
+              breakpoint the sidebar is a drawer the top bar's own disclosure
+              opens and shuts, and a second control for the same column would
+              be one too many.
+            */}
+            <IconButton
+              ref={toggleRef}
+              label="Collapse the sidebar"
+              icon={PanelLeftClose}
+              aria-expanded={true}
+              aria-controls="domain-sidebar"
+              onClick={fold}
+              className="hidden md:inline-flex"
+            />
+          </div>
+          {domain === "" ? (
+            <DomainList
+              domains={listing.data?.domains}
+              pending={listing.isPending}
+              error={listing.error}
+            />
+          ) : (
+            <>
+              {/*
+                A listing that failed is said here as it is in the flat mode.
+                The switcher is drawn either way: it names the domain the
+                reader is in from the address, so it works even when nothing
+                could be listed to switch to.
+              */}
+              {listing.error && <SidebarProblem error={listing.error} />}
+              <DomainNav
+                domain={domain}
+                permalink={permalink}
+                onManifest={onManifest}
+                domains={listing.data?.domains ?? []}
+              />
+            </>
+          )}
         </>
+      )}
+      {creating && (
+        <CreateEngramDialog
+          domain={domain}
+          initialFolder=""
+          onClose={() => {
+            setCreating(false);
+          }}
+        />
       )}
     </nav>
   );
@@ -475,7 +628,7 @@ function DomainList({
 }) {
   return (
     <>
-      <h2 className="px-2 pb-2 text-xs font-semibold tracking-wide text-slate-500 uppercase dark:text-slate-400">
+      <h2 className="text-caption px-2 pb-2 font-semibold text-slate-500 dark:text-slate-400">
         Domains
       </h2>
       {pending && (

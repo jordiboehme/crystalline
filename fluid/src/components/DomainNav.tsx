@@ -73,17 +73,20 @@ export function DomainNav({
       <DomainSwitcher domain={domain} domains={domains} />
 
       {/*
-        Pinned ahead of the tree and styled apart from it - a dashed border
-        and mono caps rather than the engram rows' plain text - because a
-        MANIFEST is not an engram: it is what introduces the domain, not
-        something filed inside it. The you-are-here cue is `EngramLink`'s own
-        mechanism, `aria-current` plus a highlight class, so a reader on
-        either page gets the same signal regardless of which row it marks.
+        Pinned ahead of the tree, because a MANIFEST is what introduces the
+        domain rather than something filed inside it, and drawn as an ordinary
+        row: position is the thing that says it is different, and a second
+        treatment on top of it would only be decoration. Its name stays in
+        capitals because that is the file's actual name, not a heading style.
+        The you-are-here cue is `EngramLink`'s own mechanism, `aria-current`
+        plus a highlight class, so a reader on either page gets the same signal
+        regardless of which row it marks. The tree drops its duplicate of this
+        row below, so the domain's introduction is offered once.
       */}
       <Link
         to={manifestRoute(domain)}
         aria-current={onManifest ? "page" : undefined}
-        className={`mx-2 block truncate rounded border border-dashed border-slate-300 px-2 py-1 font-mono text-xs tracking-wide uppercase hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800 ${
+        className={`block truncate rounded px-2 py-1.5 text-sm hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:hover:bg-slate-800 ${
           onManifest ? "bg-slate-100 font-medium dark:bg-slate-800" : ""
         }`}
       >
@@ -91,7 +94,7 @@ export function DomainNav({
       </Link>
 
       <div>
-        <h2 className="px-2 pb-2 text-xs font-semibold tracking-wide text-slate-500 uppercase dark:text-slate-400">
+        <h2 className="text-caption px-2 pb-2 font-semibold text-slate-500 dark:text-slate-400">
           Engrams
         </h2>
         <TreeBranch domain={domain} path="" permalink={permalink} />
@@ -235,7 +238,9 @@ function TreeBranch({
   }
 
   const folders = tree.data?.folders ?? [];
-  const engrams = tree.data?.engrams ?? [];
+  const engrams = (tree.data?.engrams ?? []).filter(
+    (row) => !isPinnedManifest(row),
+  );
   if (folders.length === 0 && engrams.length === 0) {
     return (
       <p className="px-2 py-1 text-sm text-slate-500 dark:text-slate-400">
@@ -265,6 +270,20 @@ function TreeBranch({
       ))}
     </ul>
   );
+}
+
+/**
+ * Whether a browse row is the domain's MANIFEST, which is pinned above the
+ * tree and so must not be drawn inside it as well.
+ *
+ * The engine lists the manifest among a domain's engrams like any other file,
+ * and its permalink is either the reserved name itself or whatever the file's
+ * own frontmatter declares - `MANIFEST` on one domain, `manifest` on the next.
+ * Case-insensitive covers both, and only a row at the domain's root can match:
+ * a `notes/manifest` is somebody's own engram and stays in the tree.
+ */
+function isPinnedManifest(row: EngramRow): boolean {
+  return row.permalink.toUpperCase() === "MANIFEST";
 }
 
 /**

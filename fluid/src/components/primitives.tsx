@@ -8,7 +8,7 @@
  */
 
 import type { LucideIcon } from "lucide-react";
-import type { ComponentPropsWithoutRef, ReactElement, ReactNode } from "react";
+import type { ComponentPropsWithRef, ReactElement, ReactNode } from "react";
 
 import { isRetired } from "../lifecycle";
 
@@ -26,7 +26,13 @@ export const BUTTON = {
 
 export type ButtonTier = keyof typeof BUTTON;
 
-export interface IconButtonProps extends ComponentPropsWithoutRef<"button"> {
+/**
+ * Every button attribute, `ref` included: a caller that has to move the
+ * keyboard onto one of these - a control that replaces the control that was
+ * pressed - needs the element itself, and React hands a function component's
+ * `ref` through with the rest of its props.
+ */
+export interface IconButtonProps extends ComponentPropsWithRef<"button"> {
   /** The accessible name; also the tooltip. Mandatory by construction. */
   label: string;
   icon: LucideIcon;
