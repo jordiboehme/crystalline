@@ -325,6 +325,24 @@ describe("the engram page", () => {
     });
   });
 
+  it("says where the engram lives in a trail above its title", async () => {
+    serve();
+
+    renderApp("/d/eng/e/alpha");
+
+    const trail = await screen.findByRole("navigation", { name: "Breadcrumb" });
+    // The domain is the one crumb that leads somewhere: there is no route for
+    // a folder to point at, and the leaf is the page the reader is on.
+    expect(within(trail).getByRole("link", { name: "eng" })).toHaveAttribute(
+      "href",
+      "/d/eng",
+    );
+    expect(within(trail).getByText("Alpha")).toHaveAttribute(
+      "aria-current",
+      "page",
+    );
+  });
+
   it("lists what points here, from the graph rather than the capped sample", async () => {
     serve();
 

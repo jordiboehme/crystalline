@@ -19,6 +19,7 @@ import { fetchManifestDetail, manifestDetailKey } from "../api/domain";
 import { useAuth } from "../auth/AuthContext";
 import { NO_COMMANDS, useRegisterCommands } from "../commands";
 import type { PaletteCommand } from "../commands";
+import { Breadcrumbs, crumbsOf } from "../components/Breadcrumbs";
 import { Markdown } from "../components/Markdown";
 import { manifestEditRoute } from "../paths";
 
@@ -81,6 +82,12 @@ export default function ManifestPage() {
 
   return (
     <div className="flex flex-col gap-4">
+      {/*
+        The same trail the engram screen carries, for the same reason: the
+        MANIFEST is a document inside a domain, and the row above its name is
+        what says which one - on screen and on paper both.
+      */}
+      <Breadcrumbs crumbs={crumbsOf(domain, "MANIFEST", "MANIFEST")} />
       <header className="flex flex-wrap items-baseline justify-between gap-3">
         <h1 className="text-xl font-semibold">{domain} MANIFEST</h1>
         {/*

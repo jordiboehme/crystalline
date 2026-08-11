@@ -48,6 +48,7 @@ import { NO_COMMANDS, useRegisterCommands } from "../commands";
 import type { PaletteCommand } from "../commands";
 import { AgentsEye } from "../components/AgentsEye";
 import { BacklinksPanel } from "../components/BacklinksPanel";
+import { Breadcrumbs, crumbsOf } from "../components/Breadcrumbs";
 import { EngramActions } from "../components/EngramActions";
 import type { EngramActionHandlers } from "../components/EngramActions";
 import { FrontmatterPanel } from "../components/FrontmatterPanel";
@@ -196,57 +197,55 @@ export default function EngramPage() {
   return (
     <div className="flex flex-col gap-6">
       <header className="flex flex-col gap-2">
-        <h1 id="engram-title" className="text-xl font-semibold">
+        {/*
+          Where this engram lives, above its name. The trail prints: the
+          details panel and every control below are chrome and stay off the
+          page, so this line is what says on paper which domain and which
+          folders this document came out of.
+        */}
+        <Breadcrumbs
+          crumbs={crumbsOf(engram.domain, engram.permalink, engram.title)}
+        />
+        <h1 id="engram-title" className="text-display">
           {engram.title}
         </h1>
-        <p className="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm text-slate-500 dark:text-slate-400">
-          <Link
-            to={domainRoute(engram.domain)}
-            className="underline underline-offset-2 hover:no-underline"
-          >
-            {engram.domain}
-          </Link>
-          <span className="font-mono text-xs">{engram.permalink}</span>
-          {/*
-            The metadata above prints as part of the page's small metadata
-            line; the controls below are chrome and stay off the printed
-            page, which is why they sit inside their own print:hidden group
-            rather than the row's own.
-          */}
-          <span className="inline-flex flex-wrap items-center gap-x-3 gap-y-1 print:hidden">
-            <CopyAddressButton address={engram.url} />
-            {capabilities.canWrite && (
-              <>
-                <Link
-                  to={editRoute(engram.domain, engram.permalink)}
-                  onPointerEnter={prefetchEditor}
-                  onFocus={prefetchEditor}
-                  className="rounded border border-slate-300 px-2 py-0.5 text-xs hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800"
-                >
-                  Edit
-                </Link>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setRetiring(true);
-                  }}
-                  className="rounded border border-slate-300 px-2 py-0.5 text-xs hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800"
-                >
-                  Retire
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setMoving(true);
-                  }}
-                  className="rounded border border-slate-300 px-2 py-0.5 text-xs hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800"
-                >
-                  Move
-                </button>
-              </>
-            )}
-            <EngramActions engram={engram} handlers={utilities} />
-          </span>
+        {/*
+          The controls, which are chrome: they stay off the printed page,
+          where the trail above and the body are the whole document.
+        */}
+        <p className="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm text-slate-500 print:hidden dark:text-slate-400">
+          <CopyAddressButton address={engram.url} />
+          {capabilities.canWrite && (
+            <>
+              <Link
+                to={editRoute(engram.domain, engram.permalink)}
+                onPointerEnter={prefetchEditor}
+                onFocus={prefetchEditor}
+                className="rounded border border-slate-300 px-2 py-0.5 text-xs hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800"
+              >
+                Edit
+              </Link>
+              <button
+                type="button"
+                onClick={() => {
+                  setRetiring(true);
+                }}
+                className="rounded border border-slate-300 px-2 py-0.5 text-xs hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800"
+              >
+                Retire
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setMoving(true);
+                }}
+                className="rounded border border-slate-300 px-2 py-0.5 text-xs hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800"
+              >
+                Move
+              </button>
+            </>
+          )}
+          <EngramActions engram={engram} handlers={utilities} />
         </p>
       </header>
 

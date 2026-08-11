@@ -132,14 +132,15 @@ test("a multi-segment permalink loads from the address bar", async ({
   await page.goto(`/d/${DOMAIN}/e/${DEEP_PERMALINK}`);
 
   await expect(engramTitle(page)).toHaveText("Deep Gamma Note");
-  // Scoped to the page's own header, which is where the permalink the address
-  // bar carried is echoed. Unscoped this is a race rather than an assertion:
-  // the body of this fixture quotes its own permalink in a code span, so once
-  // the markdown chunk has landed there are two matches and strict mode is
-  // right to refuse them.
-  await expect(
-    page.locator("main header").getByText(DEEP_PERMALINK, { exact: true }),
-  ).toBeVisible();
+  // The trail is where the address the URL carried is echoed now, one crumb
+  // per folder rather than the permalink as one string. Scoped to the screen:
+  // the body of this fixture quotes its own permalink in a code span, so an
+  // unscoped match would be a race between the two.
+  const trail = page
+    .locator("main")
+    .getByRole("navigation", { name: "Breadcrumb" });
+  await expect(trail).toContainText("deep");
+  await expect(trail.getByText("Deep Gamma Note")).toBeVisible();
 });
 
 test("a search finds an engram by what is in it", async ({ page }) => {

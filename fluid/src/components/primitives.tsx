@@ -52,18 +52,13 @@ export function IconButton({
 }
 
 export type ChipVariant =
-  | "neutral"
-  | "positive"
-  | "caution"
-  | "retired"
-  | "accent";
+  "neutral" | "positive" | "caution" | "retired" | "accent";
 
 const CHIP_VARIANTS: Record<ChipVariant, string> = {
   neutral: "bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300",
   positive:
     "bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300",
-  caution:
-    "bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300",
+  caution: "bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300",
   retired: "bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-400",
   accent:
     "bg-accent-100 text-accent-800 dark:bg-accent-950 dark:text-accent-300",

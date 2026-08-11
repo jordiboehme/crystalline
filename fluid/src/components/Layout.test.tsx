@@ -246,6 +246,35 @@ describe("the layout", () => {
     expect(screen.queryByRole("alert")).toBeNull();
   });
 
+  it("names every control in the top bar, icon-shaped ones included", async () => {
+    // An administrator, because the accounts link is the one control the
+    // frame only offers to a session that may use it.
+    serve({
+      "/auth/me": () => meResponse({ user: userFixture({ role: "admin" }) }),
+      "/domains": domainsResponse,
+      "/activity": () => ({ timeframe: "7d", count: 0, engrams: [] }),
+    });
+
+    renderApp("/");
+    await screen.findByRole("heading", { name: "Home" });
+
+    // The icons carry no text, so the name is the only thing a reader
+    // arriving by keyboard or by screen reader has to go on.
+    expect(screen.getByRole("button", { name: "Domains" })).toHaveAttribute(
+      "aria-controls",
+      "domain-sidebar",
+    );
+    expect(screen.getByRole("link", { name: "Users" })).toHaveAttribute(
+      "href",
+      "/users",
+    );
+    expect(screen.getByRole("button", { name: /^Theme:/ })).toBeVisible();
+    expect(screen.getByRole("link", { name: "Fluid" })).toHaveAttribute(
+      "href",
+      "/",
+    );
+  });
+
   it("writes the chosen theme onto the document", async () => {
     serveSignedIn();
 

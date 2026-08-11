@@ -89,7 +89,12 @@ describe("the move dialog", () => {
     await waitFor(() => {
       expect(moved).toHaveBeenCalled();
     });
-    // Landed on the engram at its new address.
-    expect(await screen.findByText("guides/alpha")).toBeInTheDocument();
+    // Landed on the engram at its new address, which the screen says as the
+    // trail it now lives under: the folder it was moved into is a crumb of
+    // its own rather than half of a permalink string.
+    const trail = await screen.findByRole("navigation", { name: "Breadcrumb" });
+    await waitFor(() => {
+      expect(within(trail).getByText("guides")).toBeInTheDocument();
+    });
   });
 });

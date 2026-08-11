@@ -19,6 +19,7 @@
  */
 
 import { useQuery } from "@tanstack/react-query";
+import { Gem, Moon, PanelLeft, Sun, Users as UsersIcon } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { RefObject } from "react";
 import { DropdownMenu } from "radix-ui";
@@ -44,6 +45,7 @@ import { CommandPalette } from "./CommandPalette";
 import { DomainNav } from "./DomainNav";
 import { HelpOverlay } from "./HelpOverlay";
 import { ITEM_CLASSES, MENU_CLASSES } from "./menu";
+import { BUTTON, Chip, FOCUS_RING, IconButton } from "./primitives";
 
 /**
  * What the command palette's shortcut is called on this keyboard.
@@ -168,29 +170,41 @@ function TopBar({
 
   return (
     <header className="sticky top-0 z-40 border-b border-slate-200 bg-white/90 backdrop-blur print:hidden dark:border-slate-800 dark:bg-slate-950/90">
-      <div className="mx-auto flex w-full max-w-350 items-center gap-3 px-4 py-3">
-        <button
-          type="button"
+      {/*
+        A fixed row rather than one sized by its contents: the sticky offsets
+        below it - the reading surface's own sticky pieces, the editor's
+        toolbar - are measured against this height, so it is a number the rest
+        of the frame can rely on rather than whatever the tallest control in
+        here happens to be today.
+      */}
+      <div className="mx-auto flex h-14 w-full max-w-350 items-center gap-3 px-4">
+        <IconButton
+          label="Domains"
+          icon={PanelLeft}
           onClick={onToggleNav}
           aria-expanded={navOpen}
           aria-controls="domain-sidebar"
-          className="rounded border border-slate-300 px-2 py-1 text-sm md:hidden dark:border-slate-700"
-        >
-          Domains
-        </button>
+          className="md:hidden"
+        />
 
         <Link
           to="/"
-          className="text-lg font-semibold tracking-tight hover:opacity-80"
+          className={`flex items-center gap-1.5 rounded text-lg font-semibold tracking-tight hover:opacity-80 ${FOCUS_RING}`}
         >
+          <Gem
+            aria-hidden="true"
+            size={18}
+            strokeWidth={1.75}
+            className="text-accent-600 dark:text-accent-400"
+          />
           Fluid
         </Link>
 
         <SearchBox />
 
         {capabilities.readOnly && (
-          <span className="hidden rounded bg-slate-100 px-2 py-1 text-xs text-slate-600 sm:inline dark:bg-slate-800 dark:text-slate-300">
-            Read only
+          <span className="hidden sm:inline">
+            <Chip variant="caution">Read only</Chip>
           </span>
         )}
 
@@ -203,13 +217,15 @@ function TopBar({
         {capabilities.canAdminister && (
           <NavLink
             to={usersRoute()}
+            aria-label="Users"
+            title="Users"
             className={({ isActive }) =>
-              `rounded border border-slate-300 px-2 py-1 text-sm hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800 ${
-                isActive ? "bg-slate-100 font-medium dark:bg-slate-800" : ""
+              `inline-flex h-8 w-8 shrink-0 items-center justify-center rounded text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800 ${FOCUS_RING} ${
+                isActive ? "bg-slate-100 dark:bg-slate-800" : ""
               }`
             }
           >
-            Users
+            <UsersIcon aria-hidden="true" size={16} strokeWidth={1.75} />
           </NavLink>
         )}
 
@@ -228,7 +244,7 @@ function SearchBox() {
   return (
     <form
       role="search"
-      className="flex-1"
+      className="mx-auto w-full max-w-xl flex-1"
       onSubmit={(event) => {
         event.preventDefault();
         const trimmed = query.trim();
@@ -261,7 +277,7 @@ function SearchBox() {
         />
         <kbd
           aria-hidden="true"
-          className="pointer-events-none absolute top-1/2 right-2 hidden -translate-y-1/2 rounded border border-slate-300 px-1 py-0.5 text-[10px] text-slate-500 sm:block dark:border-slate-700 dark:text-slate-400"
+          className="text-caption pointer-events-none absolute top-1/2 right-2 hidden -translate-y-1/2 rounded border border-slate-300 px-1 py-0.5 text-slate-500 sm:block dark:border-slate-700 dark:text-slate-400"
         >
           {PALETTE_HINT}
         </kbd>
@@ -283,9 +299,14 @@ function ThemeMenu() {
     <DropdownMenu.Root>
       <DropdownMenu.Trigger
         aria-label={`Theme: ${preference}`}
-        className="rounded border border-slate-300 px-2 py-1 text-sm hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800"
+        title={`Theme: ${preference}`}
+        className={`inline-flex h-8 w-8 shrink-0 items-center justify-center rounded text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800 ${FOCUS_RING}`}
       >
-        <span aria-hidden="true">{resolved === "dark" ? "Dark" : "Light"}</span>
+        {resolved === "dark" ? (
+          <Moon aria-hidden="true" size={16} strokeWidth={1.75} />
+        ) : (
+          <Sun aria-hidden="true" size={16} strokeWidth={1.75} />
+        )}
       </DropdownMenu.Trigger>
       <DropdownMenu.Portal>
         <DropdownMenu.Content
@@ -331,7 +352,9 @@ function UserMenu() {
 
   return (
     <DropdownMenu.Root>
-      <DropdownMenu.Trigger className="max-w-40 truncate rounded border border-slate-300 px-2 py-1 text-sm hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800">
+      <DropdownMenu.Trigger
+        className={`${BUTTON.ghost} max-w-40 truncate border border-slate-300 dark:border-slate-700`}
+      >
         {label}
       </DropdownMenu.Trigger>
       <DropdownMenu.Portal>
