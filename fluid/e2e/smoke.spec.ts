@@ -161,6 +161,10 @@ test("the neighborhood graph draws a canvas", async ({ page }) => {
   // The drawing arrives with a lazy chunk, so the canvas is what says the
   // renderer both loaded and attached.
   await expect(page.locator("canvas").first()).toBeVisible();
+  // The same neighborhood in text sits behind a disclosure, closed to begin
+  // with, so the picture is the answer on the screen and the reading of it is
+  // one click away.
+  await page.getByRole("button", { name: "Edges as text" }).click();
   await expect(
     page.getByRole("list", { name: "Connections in this neighborhood" }),
   ).toBeVisible();

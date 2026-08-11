@@ -16,11 +16,11 @@
  */
 
 import cytoscape from "cytoscape";
-import type { Core, EventObjectNode } from "cytoscape";
+import type { Core, EventObjectEdge, EventObjectNode } from "cytoscape";
 import { useEffect, useRef } from "react";
 
 import type { GraphElement, GraphNodeData } from "../graphElements";
-import { GRAPH_LAYOUT, graphStylesheet } from "../graphStyle";
+import { GRAPH_LAYOUT, HOVERED_CLASS, graphStylesheet } from "../graphStyle";
 import { useTheme } from "../theme/context";
 
 export interface GraphCanvasProps {
@@ -58,10 +58,25 @@ export default function GraphCanvas({ elements, onSelect }: GraphCanvasProps) {
       // around several nodes selects things nothing here acts on.
       boxSelectionEnabled: false,
       autounselectify: true,
+      // The layout fits what it drew to the frame, and a neighborhood of three
+      // engrams fits by magnifying it several times over - which is what made
+      // the labels read as headlines, since canvas text scales with the zoom.
+      // Capping the zoom in is what quiets the picture. Zooming OUT stays free:
+      // a big neighborhood is worth pulling back from.
+      maxZoom: 1.5,
     });
     cy.on("tap", "node", (event: EventObjectNode) => {
       const data = event.target.data() as GraphNodeData;
       select.current(data.domain, data.permalink);
+    });
+    // An arrow says what relation it is while the pointer is on it, rather than
+    // every arrow saying so at once. The handlers belong to this instance and
+    // go with it when it is destroyed below.
+    cy.on("mouseover", "edge", (event: EventObjectEdge) => {
+      event.target.addClass(HOVERED_CLASS);
+    });
+    cy.on("mouseout", "edge", (event: EventObjectEdge) => {
+      event.target.removeClass(HOVERED_CLASS);
     });
     instance.current = cy;
     return () => {

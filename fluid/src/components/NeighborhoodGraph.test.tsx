@@ -117,6 +117,19 @@ function requested(): string[] {
   return apiMock.mock.calls.map((call) => call[0]);
 }
 
+/**
+ * The arrows written out sit behind a disclosure, closed to begin with, so a
+ * test that wants the list opens it the way a reader does.
+ */
+async function openEdges() {
+  await userEvent.click(
+    await screen.findByRole("button", { name: "Edges as text" }),
+  );
+  return screen.findByRole("list", {
+    name: /connections in this neighborhood/i,
+  });
+}
+
 beforeEach(() => {
   apiMock.mockReset();
   apiMock.mockImplementation(() => Promise.resolve(graphResponse()));
@@ -152,14 +165,55 @@ describe("the neighborhood graph", () => {
     });
   });
 
+  it("keeps the written-out arrows folded away until they are asked for", async () => {
+    // The picture is the answer on this screen; the same answer in text is a
+    // second reading of it, one keystroke away rather than a wall under it.
+    mount();
+
+    const toggle = await screen.findByRole("button", { name: "Edges as text" });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(
+      screen.queryByRole("list", {
+        name: /connections in this neighborhood/i,
+      }),
+    ).toBeNull();
+
+    await userEvent.click(toggle);
+
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    expect(
+      screen.getByRole("list", { name: /connections in this neighborhood/i }),
+    ).toBeVisible();
+  });
+
+  it("leaves what the picture is not showing in the open, folded or not", async () => {
+    // A cap and the nodes it swallowed are what the drawing cannot say about
+    // itself, so they are never behind a disclosure somebody has to find.
+    apiMock.mockImplementation(() =>
+      Promise.resolve(graphResponse({ truncated: true, hidden: 3 })),
+    );
+
+    mount();
+
+    expect(
+      await screen.findByText(/showing the first 2 engrams/i),
+    ).toBeVisible();
+    expect(
+      screen.getByText(
+        "3 nodes beyond the cap are not drawn, retired ones first.",
+      ),
+    ).toBeVisible();
+    expect(
+      screen.getByRole("button", { name: "Edges as text" }),
+    ).toHaveAttribute("aria-expanded", "false");
+  });
+
   it("says in text what the picture says, arrows and all", async () => {
     mount();
 
     // Not a bag of names: both ends of the arrow and the relation it is, so a
     // reader who cannot see the canvas learns the same thing from the list.
-    const list = await screen.findByRole("list", {
-      name: /connections in this neighborhood/i,
-    });
+    const list = await openEdges();
     const connection = defined(
       within(list).getAllByRole("listitem")[0],
       "the sole connection row",
@@ -176,9 +230,7 @@ describe("the neighborhood graph", () => {
   it("fades a retired end of a connection, and never leaves it out", async () => {
     mount();
 
-    const list = await screen.findByRole("list", {
-      name: /connections in this neighborhood/i,
-    });
+    const list = await openEdges();
     // Beta is deprecated: it is named, linked, and faded like every other
     // retired thing in this app. Faded per end rather than per line, because
     // the other end of this arrow is live.
@@ -217,9 +269,7 @@ describe("the neighborhood graph", () => {
 
     mount(2);
 
-    const list = await screen.findByRole("list", {
-      name: /connections in this neighborhood/i,
-    });
+    const list = await openEdges();
     const outer = within(list)
       .getAllByRole("listitem")
       .find((item) => item.textContent?.includes("supersedes"));

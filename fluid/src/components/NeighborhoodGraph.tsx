@@ -22,8 +22,9 @@
  */
 
 import { useQuery } from "@tanstack/react-query";
+import { ChevronRight } from "lucide-react";
 import type { ReactNode } from "react";
-import { Suspense, lazy, useCallback, useMemo } from "react";
+import { Suspense, lazy, useCallback, useMemo, useState } from "react";
 import { Link, useNavigate } from "react-router";
 
 import { ApiProblem, problemDetail } from "../api/client";
@@ -35,6 +36,7 @@ import type { GraphAnchor } from "../graphElements";
 import { graphConnections, graphElements } from "../graphElements";
 import { RETIRED_CLASS, isRetired } from "../lifecycle";
 import { engramRoute } from "../paths";
+import { BUTTON } from "./primitives";
 
 const GraphCanvas = lazy(() => import("./GraphCanvas"));
 
@@ -54,6 +56,10 @@ export function NeighborhoodGraph({
 }: NeighborhoodGraphProps) {
   const { domain, permalink } = anchor;
   const navigate = useNavigate();
+  // The same neighborhood written out, folded away to begin with: it is the
+  // picture's own content in the form anything can read, not a second thing to
+  // scroll past every time somebody opens a graph.
+  const [edgesOpen, setEdgesOpen] = useState(false);
 
   const graph = useQuery({
     queryKey: graphKey(domain, permalink, depth),
@@ -130,7 +136,7 @@ export function NeighborhoodGraph({
   return (
     <div className="flex flex-col gap-3">
       <div
-        className={`${height} w-full overflow-hidden rounded border border-slate-200 dark:border-slate-800`}
+        className={`${height} w-full overflow-hidden rounded border border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900`}
       >
         <Suspense
           fallback={
@@ -161,30 +167,60 @@ export function NeighborhoodGraph({
         </p>
       )}
 
-      <ul
-        aria-label="Connections in this neighborhood"
-        className="flex flex-col gap-1 text-sm"
-      >
-        {connections.map((connection) => (
-          <li
-            key={connection.id}
-            className="flex flex-wrap items-baseline gap-x-2"
-          >
-            <EngramName node={connection.from} />
-            {/*
-              Between the two ends, so the line reads as the sentence it is:
-              "Beta supersedes Alpha". A reference the payload gave no type
-              names itself the way the relations list on an engram page names
-              one, rather than leaving the two ends sitting next to each other
-              with nothing between them.
-            */}
-            <span className="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-xs text-slate-600 dark:bg-slate-800 dark:text-slate-300">
-              {connection.relType ?? "relates to"}
-            </span>
-            <EngramName node={connection.to} />
-          </li>
-        ))}
-      </ul>
+      {/*
+        The arrows, one sentence each, behind a disclosure. Everything above it
+        - what the picture had to leave out, and how much of it - stays in the
+        open, because that is what the drawing cannot say about itself.
+      */}
+      <div>
+        <button
+          type="button"
+          aria-expanded={edgesOpen}
+          aria-controls="neighborhood-edges"
+          onClick={() => setEdgesOpen((open) => !open)}
+          className={`${BUTTON.ghost} inline-flex items-center gap-1.5`}
+        >
+          <ChevronRight
+            aria-hidden="true"
+            size={14}
+            strokeWidth={1.75}
+            className={
+              edgesOpen
+                ? "rotate-90 transition-transform"
+                : "transition-transform"
+            }
+          />
+          Edges as text
+        </button>
+        <div id="neighborhood-edges">
+          {edgesOpen && (
+            <ul
+              aria-label="Connections in this neighborhood"
+              className="mt-2 flex flex-col gap-1 text-sm"
+            >
+              {connections.map((connection) => (
+                <li
+                  key={connection.id}
+                  className="flex flex-wrap items-baseline gap-x-2"
+                >
+                  <EngramName node={connection.from} />
+                  {/*
+                    Between the two ends, so the line reads as the sentence it
+                    is: "Beta supersedes Alpha". A reference the payload gave no
+                    type names itself the way the relations list on an engram
+                    page names one, rather than leaving the two ends sitting
+                    next to each other with nothing between them.
+                  */}
+                  <span className="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-xs text-slate-600 dark:bg-slate-800 dark:text-slate-300">
+                    {connection.relType ?? "relates to"}
+                  </span>
+                  <EngramName node={connection.to} />
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      </div>
 
       {stranded.length > 0 && (
         <ul
