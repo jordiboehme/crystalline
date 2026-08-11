@@ -164,6 +164,31 @@ async fn import_files_walks_the_classification_on_a_file_domain() {
         "dry_run writes nothing"
     );
 
+    // A MANIFEST is screened by name, not by spelling: the filesystem under a
+    // domain is case-insensitive on macOS and Windows, so a lowercase entry
+    // would land on the real MANIFEST.md. Committed under overwrite, the
+    // policy that would do the damage.
+    let manifests = engine
+        .import_domain_files(
+            "eng",
+            &[
+                ("manifest.md".to_string(), BETA.to_string()),
+                ("sub/Manifest.md".to_string(), BETA.to_string()),
+            ],
+            true,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(manifests["ignored"], 2, "{manifests}");
+    assert_eq!(manifests["overwritten"], 0);
+    assert_eq!(manifests["created"], 0);
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("eng/MANIFEST.md")).unwrap(),
+        MANIFEST,
+        "the domain's own MANIFEST is untouched"
+    );
+
     // Commit with skip: beta lands and is findable (the index synced).
     engine
         .import_domain_files(

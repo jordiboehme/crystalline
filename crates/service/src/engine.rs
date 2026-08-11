@@ -4534,9 +4534,13 @@ impl Engine {
         for (path, text) in files {
             // Delta 4: a MANIFEST at any depth is ignored - defense in depth,
             // the REST layer screens these before the engine ever sees them.
+            // Matched case-insensitively because the filesystem underneath is:
+            // on APFS or NTFS a `manifest.md` entry lands on the domain's real
+            // MANIFEST.md, so an exact-string screen would let a third-party
+            // archive replace the one file a domain cannot regenerate.
             if Path::new(path)
                 .file_name()
-                .is_some_and(|n| n == "MANIFEST.md")
+                .is_some_and(|n| n.eq_ignore_ascii_case("MANIFEST.md"))
             {
                 entries.push(json!({
                     "path": path,
