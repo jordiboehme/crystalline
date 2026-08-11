@@ -92,6 +92,38 @@ async fn unregister_keeps_files_and_clears_the_index() {
     assert!(engine.domain_remove("eng").await.is_err());
 }
 
+/// The archive source: every file of the domain, MANIFEST included, path
+/// plus exact content - the portable view both storage kinds share.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn domain_files_serves_manifest_and_engrams_verbatim() {
+    let (_tmp, engine) = engine().await;
+    let files = engine.domain_files("eng").await.unwrap();
+    let paths: Vec<&str> = files.iter().map(|(p, _)| p.as_str()).collect();
+    assert!(paths.contains(&"MANIFEST.md"), "{paths:?}");
+    assert!(paths.contains(&"alpha.md"));
+    let alpha = files.iter().find(|(p, _)| p == "alpha.md").unwrap();
+    assert_eq!(alpha.1, ALPHA, "exact bytes, not a re-serialization");
+    assert!(engine.domain_files("ghost").await.is_err());
+}
+
+/// The same contract for a virtual domain, whose files exist nowhere but the
+/// database: the archive of a domain with no folder is just as faithful.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn domain_files_reads_a_virtual_domain_from_the_database() {
+    let (_tmp, engine) = engine().await;
+    engine.domain_add_virtual("scratch").await.unwrap();
+    let src = tempfile::tempdir().unwrap();
+    std::fs::write(src.path().join("alpha.md"), ALPHA).unwrap();
+    engine
+        .import_domain("scratch", src.path(), false, false)
+        .await
+        .unwrap();
+
+    let files = engine.domain_files("scratch").await.unwrap();
+    let alpha = files.iter().find(|(p, _)| p == "alpha.md").unwrap();
+    assert_eq!(alpha.1, ALPHA, "exact bytes for the database-backed kind");
+}
+
 // --- GitHub connection: status, readiness, disconnect -----------------------
 
 /// The base fixture plus GitHub: enabled in config, tokens redirected to a

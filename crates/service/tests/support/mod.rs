@@ -56,6 +56,7 @@ pub const MOUNTED_OPERATIONS: &[&str] = &[
     "DELETE /api/v1/domains/{domain}",
     "GET /api/v1/domains/{domain}/sync",
     "POST /api/v1/domains/{domain}/sync",
+    "GET /api/v1/domains/{domain}/archive",
     "GET /api/v1/domains/{domain}/tree",
     "GET /api/v1/domains/{domain}/manifest",
     "PUT /api/v1/domains/{domain}/manifest",

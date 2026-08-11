@@ -115,6 +115,12 @@ base64 = "0.22.1"
 # dependency is needed; `std` is on so hashing errors carry `std::error::Error`.
 argon2 = { version = "0.5.3", features = ["std"] }
 
+# Zip archives for the domain archive download and import (crates/service).
+# Default features drag aes, bzip2, lzma, ppmd, zstd and xz in; the archives
+# this reads and writes are deflate only, and flate2 is already in the graph
+# through crates/remote, so the lean deflate backend is the whole need.
+zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+
 # The OpenAPI document for the REST surface (crates/service). Default features
 # are exactly the `macros` one the `#[utoipa::path]`, `ToSchema` and
 # `IntoParams` attributes need; `preserve_order` stays off, so nothing here can

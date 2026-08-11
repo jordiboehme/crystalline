@@ -759,6 +759,69 @@
         }
       }
     },
+    "/api/v1/domains/{domain}/archive": {
+      "get": {
+        "tags": [
+          "domains"
+        ],
+        "summary": "Download a whole domain as a zip.",
+        "description": "Admin only. Every file of the domain - MANIFEST included - as one zip, read from whichever source of truth the domain has: markdown on disk for a file domain, the database for a virtual one. A pure read, so it is served even on a read-only instance, which is exactly where an operator wants a backup to take.",
+        "operationId": "download_domain_archive",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The registered domain to archive.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The archive, as an attachment named after the domain.",
+            "content": {
+              "application/zip": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or an anonymous one.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an admin, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/domains/{domain}/engrams": {
       "get": {
         "tags": [

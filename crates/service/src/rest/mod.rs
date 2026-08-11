@@ -3,6 +3,7 @@
 //! the MCP tools and this API stay one source of truth, and every failure is
 //! an [`ApiError`] rendered as RFC 9457 problem detail.
 
+mod archive;
 mod auth;
 mod auth_store;
 mod discovery;
@@ -83,6 +84,7 @@ use crate::engine::Engine;
         domains_admin::remove,
         domains_admin::sync_status,
         domains_admin::sync_now,
+        archive::download,
         domains::tree,
         domains::manifest,
         domains::save_manifest,
@@ -302,6 +304,9 @@ pub fn router(state: RestState) -> Router {
             "/domains/{domain}/sync",
             get(domains_admin::sync_status).post(domains_admin::sync_now),
         )
+        // Admin only as well, and a pure read: the archive download is the
+        // backup story of a read-only mirror, so it stays served there.
+        .route("/domains/{domain}/archive", get(archive::download))
         .route("/domains/{domain}/tree", get(domains::tree))
         .route(
             "/domains/{domain}/manifest",

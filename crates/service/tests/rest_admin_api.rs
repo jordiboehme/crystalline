@@ -1003,3 +1003,101 @@ async fn the_device_flow_polls_over_get_and_reports_failure_once() {
     assert!(again["error"].is_null());
     assert_eq!(again["connected"], false);
 }
+
+/// The download IS the backup story: a zip whose entries reproduce the
+/// domain's files byte for byte, fetched with plain cookie auth (an anchor
+/// click), admin-only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_archive_download_is_a_faithful_zip() {
+    let fx = serve(Options::default()).await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+
+    let resp = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/domains/eng/archive",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()["content-type"], "application/zip");
+    assert!(
+        resp.headers()["content-disposition"]
+            .to_str()
+            .unwrap()
+            .contains("eng-archive.zip")
+    );
+    let bytes = resp.bytes().await.unwrap();
+
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes.as_ref())).unwrap();
+    let mut names: Vec<String> = (0..archive.len())
+        .map(|i| archive.by_index(i).unwrap().name().to_string())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["MANIFEST.md", "alpha.md"]);
+    let mut alpha = String::new();
+    std::io::Read::read_to_string(&mut archive.by_name("alpha.md").unwrap(), &mut alpha).unwrap();
+    assert_eq!(alpha, ALPHA);
+
+    // Editor and viewer are 403 on this GET.
+    for (name, pw) in [("eddy", "eddypw"), ("vera", "verapw")] {
+        let session = login(fx.addr, name, pw).await;
+        let resp = as_session(
+            fx.addr,
+            reqwest::Method::GET,
+            "/api/v1/domains/eng/archive",
+            &session,
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 403, "{name}");
+    }
+
+    // The UI downloads this with an anchor click, which carries the cookie and
+    // no CSRF header at all: a safe method, so the guard exempts it.
+    let anchor = client()
+        .get(format!("http://{}/api/v1/domains/eng/archive", fx.addr))
+        .header("cookie", format!("fluid_session={}", admin.0))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(anchor.status(), 200, "an anchor click sends no csrf header");
+
+    // An unknown domain is an honest 404, not an empty archive.
+    let ghost = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/domains/ghost/archive",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(ghost.status(), 404);
+}
+
+/// The archive download is exactly where a read-only mirror wants it: a pure
+/// read, and the instance's backup story, so read_only serves it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn read_only_still_serves_the_archive_download() {
+    let ro = serve(Options {
+        read_only: true,
+        ..Options::default()
+    })
+    .await;
+    let admin = login(ro.addr, "root", "rootpw").await;
+
+    let resp = as_session(
+        ro.addr,
+        reqwest::Method::GET,
+        "/api/v1/domains/eng/archive",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 200, "the backup of a read-only mirror");
+}

@@ -4465,6 +4465,54 @@ impl Engine {
         }))
     }
 
+    /// Every file of a domain as `(domain-relative path, content)`, MANIFEST
+    /// included: the portable view an archive download is built from, byte for
+    /// byte as the domain holds it.
+    ///
+    /// Each storage kind is read from its own source of truth, which is why
+    /// this is not simply `export_domain`'s read half. A file domain's truth is
+    /// the markdown on disk, walked exactly the way a sync walks it: the index
+    /// keeps only the body there, with the frontmatter shredded into columns,
+    /// so reading the store would hand back headerless engrams and a MANIFEST
+    /// that never indexed would go missing entirely. A virtual domain has no
+    /// disk at all - the row IS the file, and it carries the full text.
+    pub async fn domain_files(&self, domain: &str) -> Result<Vec<(String, String)>> {
+        let entry = self.domain_entry(domain)?;
+        match self.source_of(&entry) {
+            ContentSource::File { root } => {
+                let mut files = Vec::new();
+                for (rel, abs) in walk_markdown(&root) {
+                    // The OKF reserved names are excluded, as everywhere else:
+                    // `index.md` is generated from the folder it sits in and
+                    // regenerates itself wherever this archive is restored,
+                    // and writing either name back is refused by design.
+                    if crystalline_core::is_reserved_path(&rel) {
+                        continue;
+                    }
+                    match std::fs::read_to_string(&abs) {
+                        Ok(text) => files.push((rel, text)),
+                        // One unreadable or non-UTF-8 file must not deny the
+                        // operator the rest of the backup: it is skipped and
+                        // logged rather than failing the whole archive.
+                        Err(e) => {
+                            tracing::warn!("archive of '{domain}' skipped '{rel}': {e}");
+                        }
+                    }
+                }
+                Ok(files)
+            }
+            ContentSource::Virtual => {
+                let store = self.store.lock().await;
+                let domain_id = store
+                    .upsert_domain(domain, None, DomainKind::Virtual)
+                    .await?;
+                let all = store.all_engram_contents(domain_id).await?;
+                drop(store);
+                Ok(all.into_iter().map(|e| (e.path, e.content)).collect())
+            }
+        }
+    }
+
     /// Export every engram of a domain (file or virtual) from the database to
     /// `dest` as a normal filesystem engram folder. Refuses to write into a
     /// non-empty directory unless `force`; `dry_run` reports without writing.
