@@ -92,9 +92,10 @@ use crate::error::{IndexError, Result};
 use crate::store::{
     BrowseLevel, ChunkJob, ChunkModelCount, DomainHost, DomainId, DomainKind, DomainStats,
     EdgeKind, EmbeddingCoverage, EmbeddingRow, EngramDescriptor, EngramId, EngramRecord,
-    EngramSummary, FileStamp, FtsMode, GraphSlice, HostClaim, InboundRef, NewChunk, OutboundRef,
-    Page, RecentFilter, SearchHit, SearchMode, SearchQuery, Store, StoreInfo, StoredEngram,
-    Vocabulary, build_vocabulary,
+    EngramSummary, FileStamp, FtsMode, GraphSlice, HostClaim, InboundHit, InboundPage,
+    InboundQuery, InboundRef, LINKS_TO, NamedCount, NewChunk, OutboundRef, Page, RecentFilter,
+    SearchHit, SearchMode, SearchQuery, Store, StoreInfo, StoredEngram, Vocabulary,
+    build_vocabulary,
 };
 use crate::sweep::UnresolvedRef;
 
@@ -1393,6 +1394,135 @@ impl Store for PostgresStore {
                 },
             })
             .collect())
+    }
+
+    async fn inbound_page(&self, query: &InboundQuery<'_>) -> Result<InboundPage> {
+        // The Turso twin's query, param for param; see it for what the
+        // predicate is and why it is `inbound_refs`'s unchanged. Two things are
+        // this backend's own: the relation label is cast to `text` so the union
+        // of a column and a literal has a type, and every text sort key carries
+        // an explicit `COLLATE "C"`, because a locale collation here would not
+        // merely reorder a page - it would hand a reader a different page than
+        // Turso does under the same offset.
+        let source = format!(
+            "SELECT d.name AS domain, e.permalink AS permalink, e.title AS title, \
+                    e.path AS path, e.status AS status, r.rel_type AS rel \
+             FROM relation r JOIN engram e ON e.id=r.engram_id JOIN domain d ON d.id=e.domain_id \
+             WHERE r.to_id=$1 \
+                OR (r.to_id IS NULL AND r.domain_id=$2 AND r.to_domain IS NULL \
+                    AND (r.to_target=$3 OR lower(r.to_target)=lower($4))) \
+             UNION ALL \
+             SELECT d.name, e.permalink, e.title, e.path, e.status, '{LINKS_TO}'::text \
+             FROM link l JOIN engram e ON e.id=l.engram_id JOIN domain d ON d.id=e.domain_id \
+             WHERE l.to_id=$1 \
+                OR (l.to_id IS NULL AND l.domain_id=$2 AND l.to_domain IS NULL \
+                    AND (l.to_target=$3 OR lower(l.to_target)=lower($4)))"
+        );
+        let target = || {
+            vec![
+                Param::Int(query.engram_id.0),
+                Param::Int(query.domain_id.0),
+                Param::Text(query.permalink.to_string()),
+                Param::Text(query.title.to_string()),
+            ]
+        };
+
+        // The filters are held as values and bound freshly per statement: the
+        // count and the page take the same list, and `Param` is deliberately
+        // not `Clone` (it carries embedding vectors elsewhere).
+        let rel = query.rel.filter(|r| !r.is_empty()).map(str::to_string);
+        let pattern = query
+            .q
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(|text| format!("%{}%", like_escape(&text.to_lowercase())));
+        let mut clauses: Vec<String> = Vec::new();
+        let mut n = 5;
+        if rel.is_some() {
+            clauses.push(format!("i.rel=${n}"));
+            n += 1;
+        }
+        if pattern.is_some() {
+            clauses.push(format!(
+                "(lower(i.title) LIKE ${n} ESCAPE '\\' OR lower(i.path) LIKE ${} ESCAPE '\\')",
+                n + 1
+            ));
+            n += 2;
+        }
+        let where_sql = if clauses.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", clauses.join(" AND "))
+        };
+        let filtered = || {
+            let mut params = target();
+            if let Some(rel) = &rel {
+                params.push(Param::Text(rel.clone()));
+            }
+            if let Some(pattern) = &pattern {
+                params.push(Param::Text(pattern.clone()));
+                params.push(Param::Text(pattern.clone()));
+            }
+            params
+        };
+
+        let mut conn = self.acquire().await?;
+        let total = scalar_i64(
+            conn.as_mut(),
+            &format!("SELECT COUNT(*) FROM ({source}) i{where_sql}"),
+            filtered(),
+        )
+        .await?
+        .max(0) as usize;
+
+        let limit = query.limit.max(1);
+        let offset = query.page.saturating_sub(1).saturating_mul(limit);
+        let mut paged = filtered();
+        paged.push(Param::Int(limit as i64));
+        paged.push(Param::Int(offset as i64));
+        let rows = query_all(
+            conn.as_mut(),
+            &format!(
+                "SELECT i.domain, i.permalink, i.title, i.path, i.status, i.rel \
+                 FROM ({source}) i{where_sql} \
+                 ORDER BY i.title COLLATE \"C\", i.permalink COLLATE \"C\", \
+                          i.domain COLLATE \"C\", i.rel COLLATE \"C\" \
+                 LIMIT ${n} OFFSET ${}",
+                n + 1
+            ),
+            paged,
+        )
+        .await?;
+        let hits = rows
+            .iter()
+            .map(|r| InboundHit {
+                domain: cell_text(r, 0).unwrap_or_default(),
+                permalink: cell_text(r, 1).unwrap_or_default(),
+                title: cell_text(r, 2).unwrap_or_default(),
+                path: cell_text(r, 3).unwrap_or_default(),
+                status: cell_text(r, 4).unwrap_or_default(),
+                rel: cell_text(r, 5).unwrap_or_default(),
+            })
+            .collect();
+
+        let summary = query_all(
+            conn.as_mut(),
+            &format!(
+                "SELECT i.rel, COUNT(*) FROM ({source}) i GROUP BY i.rel \
+                 ORDER BY COUNT(*) DESC, i.rel COLLATE \"C\""
+            ),
+            target(),
+        )
+        .await?;
+        let types = summary
+            .iter()
+            .map(|r| NamedCount {
+                name: cell_text(r, 0).unwrap_or_default(),
+                count: cell_i64(r, 1).unwrap_or(0),
+            })
+            .collect();
+
+        Ok(InboundPage { total, types, hits })
     }
 
     async fn outbound_refs(&self, engram_id: EngramId) -> Result<Vec<OutboundRef>> {

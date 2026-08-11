@@ -37,10 +37,11 @@ use crystalline_core::{
 use crystalline_index::{
     ChunkParams, DEFAULT_RETIRED_WEIGHT, DEFAULT_SALIENCE_WEIGHT, DomainHost, DomainId, DomainKind,
     EMBED_PAGE_SIZE, EdgeKind, EmbeddingProvider, EngramDescriptor, EngramFacts, EngramId,
-    EngramRecord, Family, FileStamp, Finding, GraphNode, GraphSlice, HostClaim, RULES,
-    RecentFilter, SearchMode, SearchQuery, Store, SweepInput, SweepOptions, SyncReport, apply_scan,
-    chunk_engram, configured_model_id, detect, order_jobs_for_batching, parse_metadata_filters,
-    provider_from_config, rank, retired_factor, rule_info, salience_prior, scan_domain, scan_paths,
+    EngramRecord, Family, FileStamp, Finding, GraphNode, GraphSlice, HostClaim, InboundQuery,
+    RULES, RecentFilter, SearchMode, SearchQuery, Store, SweepInput, SweepOptions, SyncReport,
+    apply_scan, chunk_engram, configured_model_id, detect, order_jobs_for_batching,
+    parse_metadata_filters, provider_from_config, rank, retired_factor, rule_info, salience_prior,
+    scan_domain, scan_paths,
 };
 use crystalline_remote::ops;
 use crystalline_remote::{
@@ -2205,6 +2206,80 @@ impl Engine {
         }
 
         Ok(value)
+    }
+
+    /// One page of what points at an engram, with the per-relation summary of
+    /// all of it: the browsing view of the inbound block [`Engine::read_engram`]
+    /// samples.
+    ///
+    /// The read payload's `inbound` stays what it is - an exact count and five
+    /// references, cheap enough to ride every read. This is for the case that
+    /// count implies but cannot serve: hundreds or thousands of engrams pointing
+    /// at one, where the answer is a map to browse rather than a list to print.
+    /// Both are the same rows, so the counts agree.
+    ///
+    /// `q` matches the referencing engram's title or path, case-insensitively,
+    /// and `rel` narrows to one relation type (`links_to` for prose wikilinks).
+    /// `total` is exact under both; `types` ignores both, because a summary that
+    /// shrank as it was used would be a map redrawing itself while it is read.
+    ///
+    /// An engram nobody wrote is [`EngineError::NotFound`], the same resolution
+    /// every other read of one identifier opens with.
+    pub async fn inbound_references(
+        &self,
+        p: &ReadParams,
+        q: Option<&str>,
+        rel: Option<&str>,
+        page: Option<usize>,
+        limit: Option<usize>,
+    ) -> Result<Value> {
+        let (desc, _) = self.resolve(&p.identifier, p.domain.as_deref()).await?;
+        // Clamped rather than refused, the way the listing clamps its own: a
+        // hand-written page number below one is answered with the first page.
+        let page = page.unwrap_or(1).max(1);
+        let limit = limit.unwrap_or(10).max(1);
+        let found = {
+            let store = self.store.lock().await;
+            store
+                .inbound_page(&InboundQuery {
+                    engram_id: desc.id,
+                    domain_id: desc.domain_id,
+                    permalink: &desc.permalink,
+                    title: &desc.title,
+                    q,
+                    rel,
+                    page,
+                    limit,
+                })
+                .await?
+        };
+        let types: Vec<Value> = found
+            .types
+            .iter()
+            .map(|t| json!({ "rel": t.name, "count": t.count }))
+            .collect();
+        let hits: Vec<Value> = found
+            .hits
+            .iter()
+            .map(|h| {
+                json!({
+                    "domain": h.domain,
+                    "permalink": h.permalink,
+                    "title": h.title,
+                    "path": h.path,
+                    "status": h.status,
+                    "rel": h.rel,
+                })
+            })
+            .collect();
+        Ok(json!({
+            "total": found.total,
+            "page": page,
+            "limit": limit,
+            "count": hits.len(),
+            "types": types,
+            "hits": hits,
+        }))
     }
 
     // --- edit ----------------------------------------------------------------

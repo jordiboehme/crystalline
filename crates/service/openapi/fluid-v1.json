@@ -1678,6 +1678,165 @@
         }
       }
     },
+    "/api/v1/domains/{domain}/inbound/{permalink}": {
+      "get": {
+        "tags": [
+          "engrams"
+        ],
+        "summary": "What points at one engram, paged and searchable.",
+        "description": "The browsing view of the detail payload's inbound block: the same references, counted by relation type and answered a page at a time.\n\n`types` is the summary of every reference pointing here, most-used first, and it deliberately ignores `q` and `rel` - it is the map a client filters *with*, so it does not change shape as the filters are used. `total` is exact under both filters. `rel` names a relation type, with `links_to` for prose wikilinks. Hits are ordered by title, then permalink, so paging is stable.",
+        "operationId": "get_inbound_references",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The registered domain.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "permalink",
+            "in": "path",
+            "description": "The engram permalink. A permalink is a path, so this segment may contain slashes: `notes/deep/gamma`.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "notes/deep/gamma"
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "description": "Case-insensitive substring the referencing engram's title or path must\ncontain. Absent or empty selects every reference.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "beta"
+          },
+          {
+            "name": "rel",
+            "in": "query",
+            "description": "Keep only references carrying this relation type. `links_to` selects\nprose wikilinks.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "relates_to"
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "description": "One-based page number. Defaults to 1.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "example": 1
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size. Defaults to 10.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "example": 10
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "One page of references, with the unfiltered per-relation summary.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                },
+                "example": {
+                  "count": 2,
+                  "hits": [
+                    {
+                      "domain": "eng",
+                      "path": "notes/beta.md",
+                      "permalink": "notes/beta",
+                      "rel": "relates_to",
+                      "status": "stable",
+                      "title": "Beta"
+                    },
+                    {
+                      "domain": "eng",
+                      "path": "notes/deep/gamma.md",
+                      "permalink": "notes/deep/gamma",
+                      "rel": "links_to",
+                      "status": "stable",
+                      "title": "Gamma"
+                    }
+                  ],
+                  "limit": 10,
+                  "page": 1,
+                  "total": 2,
+                  "types": [
+                    {
+                      "count": 1,
+                      "rel": "relates_to"
+                    },
+                    {
+                      "count": 1,
+                      "rel": "links_to"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The query string will not parse.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain or engram.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/domains/{domain}/manifest": {
       "get": {
         "tags": [

@@ -296,6 +296,155 @@ pub async fn detail(
     Ok(resp)
 }
 
+/// The query string `GET /domains/{domain}/inbound/{*permalink}` takes: which
+/// references to keep, and which page of them to answer with.
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct InboundQueryParams {
+    /// Case-insensitive substring the referencing engram's title or path must
+    /// contain. Absent or empty selects every reference.
+    #[serde(default)]
+    #[param(example = "beta")]
+    q: Option<String>,
+    /// Keep only references carrying this relation type. `links_to` selects
+    /// prose wikilinks.
+    #[serde(default)]
+    #[param(example = "relates_to")]
+    rel: Option<String>,
+    /// One-based page number. Defaults to 1.
+    #[serde(default)]
+    #[param(example = 1)]
+    page: Option<usize>,
+    /// Page size. Defaults to 10.
+    #[serde(default)]
+    #[param(example = 10)]
+    limit: Option<usize>,
+}
+
+/// `GET /domains/{domain}/inbound/{*permalink}` - what points at one engram,
+/// paged, searchable and counted by relation.
+///
+/// The detail payload above carries an exact `inbound.count` and five sample
+/// references, which is the whole story for most engrams and none of it for the
+/// ones a hundred engrams point at. This route is that case: `types` is the
+/// per-relation summary a client draws chips from, and each chip's own page is
+/// one request with `rel` set. Neither ever loads the set.
+///
+/// Not a sub-path of `/engrams/{*permalink}`, which is a terminal wildcard
+/// nothing may follow, so the permalink rides at the end here instead - the same
+/// shape the collab upgrade route takes for the same reason.
+///
+/// A pure read: viewer is enough, and it stays served on a read-only instance.
+/// An unknown domain or permalink is a 404, so an engram retired out from under
+/// an open page is told plainly rather than answered with an empty panel.
+#[utoipa::path(
+    get,
+    path = "/api/v1/domains/{domain}/inbound/{permalink}",
+    tag = "engrams",
+    operation_id = "get_inbound_references",
+    summary = "What points at one engram, paged and searchable.",
+    description = "The browsing view of the detail payload's inbound block: the \
+                   same references, counted by relation type and answered a \
+                   page at a time.\n\n`types` is the summary of every reference \
+                   pointing here, most-used first, and it deliberately ignores \
+                   `q` and `rel` - it is the map a client filters *with*, so it \
+                   does not change shape as the filters are used. `total` is \
+                   exact under both filters. `rel` names a relation type, with \
+                   `links_to` for prose wikilinks. Hits are ordered by title, \
+                   then permalink, so paging is stable.",
+    params(
+        ("domain" = String, Path, description = "The registered domain."),
+        (
+            "permalink" = String,
+            Path,
+            description = "The engram permalink. A permalink is a path, so this \
+                           segment may contain slashes: `notes/deep/gamma`.",
+            example = "notes/deep/gamma",
+        ),
+        InboundQueryParams,
+    ),
+    responses(
+        (
+            status = 200,
+            description = "One page of references, with the unfiltered \
+                           per-relation summary.",
+            body = Object,
+            example = json!({
+                "total": 2,
+                "page": 1,
+                "limit": 10,
+                "count": 2,
+                "types": [
+                    { "rel": "relates_to", "count": 1 },
+                    { "rel": "links_to", "count": 1 }
+                ],
+                "hits": [
+                    {
+                        "domain": "eng",
+                        "permalink": "notes/beta",
+                        "title": "Beta",
+                        "path": "notes/beta.md",
+                        "status": "stable",
+                        "rel": "relates_to"
+                    },
+                    {
+                        "domain": "eng",
+                        "permalink": "notes/deep/gamma",
+                        "title": "Gamma",
+                        "path": "notes/deep/gamma.md",
+                        "status": "stable",
+                        "rel": "links_to"
+                    }
+                ]
+            }),
+        ),
+        (
+            status = 400,
+            description = "The query string will not parse.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 401,
+            description = "No identity.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "The trusted-header identity names a disabled account.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 404,
+            description = "No such domain or engram.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+pub async fn inbound(
+    State(state): State<RestState>,
+    ApiPath((domain, permalink)): ApiPath<(String, String)>,
+    ApiQuery(query): ApiQuery<InboundQueryParams>,
+) -> Result<Json<Value>, ApiError> {
+    let value = state
+        .engine
+        .inbound_references(
+            &ReadParams {
+                identifier: permalink,
+                domain: Some(domain),
+            },
+            query.q.as_deref(),
+            query.rel.as_deref(),
+            query.page,
+            query.limit,
+        )
+        .await?;
+    Ok(Json(value))
+}
+
 /// What `POST /domains/{domain}/engrams` takes: the create form's fields, fed
 /// to the engine's write verb unchanged.
 #[derive(Debug, Deserialize, utoipa::ToSchema)]

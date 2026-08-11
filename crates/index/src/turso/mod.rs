@@ -33,9 +33,10 @@ use crate::error::{IndexError, Result};
 use crate::store::{
     BrowseLevel, ChunkJob, ChunkModelCount, DomainHost, DomainId, DomainKind, DomainStats,
     EdgeKind, EmbeddingCoverage, EmbeddingRow, EngramDescriptor, EngramId, EngramRecord,
-    EngramSummary, FileStamp, FtsMode, GraphSlice, HostClaim, InboundRef, NewChunk, OutboundRef,
-    Page, RecentFilter, SearchHit, SearchMode, SearchQuery, Store, StoreInfo, StoredEngram,
-    Vocabulary, build_vocabulary,
+    EngramSummary, FileStamp, FtsMode, GraphSlice, HostClaim, InboundHit, InboundPage,
+    InboundQuery, InboundRef, LINKS_TO, NamedCount, NewChunk, OutboundRef, Page, RecentFilter,
+    SearchHit, SearchMode, SearchQuery, Store, StoreInfo, StoredEngram, Vocabulary,
+    build_vocabulary,
 };
 use crate::sweep::UnresolvedRef;
 
@@ -1166,6 +1167,129 @@ impl Store for TursoStore {
                 },
             })
             .collect())
+    }
+
+    async fn inbound_page(&self, query: &InboundQuery<'_>) -> Result<InboundPage> {
+        // Every reference pointing at the target, as one narrow projection: the
+        // referencing engram's address, its status and the relation it points
+        // with. The predicate is `inbound_refs`'s, unchanged, so a total here
+        // and the count `read_engram` reports are the same number - resolved
+        // references by id, plus the unresolved same-domain ones whose text
+        // names this engram. A prose wikilink carries `links_to`, the word the
+        // graph edges and the sweep already use for one.
+        //
+        // Narrow on purpose: nothing here selects a body, so the sort below
+        // never carries one. Sorting wide rows is what made a search spill
+        // gigabytes on this project once, and a reference list is exactly the
+        // shape that tempts a `SELECT *`.
+        let source = format!(
+            "SELECT d.name AS domain, e.permalink AS permalink, e.title AS title, \
+                    e.path AS path, e.status AS status, r.rel_type AS rel \
+             FROM relation r JOIN engram e ON e.id=r.engram_id JOIN domain d ON d.id=e.domain_id \
+             WHERE r.to_id=?1 \
+                OR (r.to_id IS NULL AND r.domain_id=?2 AND r.to_domain IS NULL \
+                    AND (r.to_target=?3 OR lower(r.to_target)=lower(?4))) \
+             UNION ALL \
+             SELECT d.name, e.permalink, e.title, e.path, e.status, '{LINKS_TO}' \
+             FROM link l JOIN engram e ON e.id=l.engram_id JOIN domain d ON d.id=e.domain_id \
+             WHERE l.to_id=?1 \
+                OR (l.to_id IS NULL AND l.domain_id=?2 AND l.to_domain IS NULL \
+                    AND (l.to_target=?3 OR lower(l.to_target)=lower(?4)))"
+        );
+        let target = || {
+            vec![
+                Value::Integer(query.engram_id.0),
+                Value::Integer(query.domain_id.0),
+                Value::Text(query.permalink.to_string()),
+                Value::Text(query.title.to_string()),
+            ]
+        };
+
+        // The filters, appended after the four the target always binds.
+        let mut params = target();
+        let mut clauses: Vec<String> = Vec::new();
+        let mut n = 5;
+        if let Some(rel) = query.rel.filter(|r| !r.is_empty()) {
+            clauses.push(format!("i.rel=?{n}"));
+            params.push(Value::Text(rel.to_string()));
+            n += 1;
+        }
+        if let Some(text) = query.q.map(str::trim).filter(|t| !t.is_empty()) {
+            // Lowercased on both sides and escaped, the established
+            // case-insensitive LIKE of this backend: a `%` a reader typed is a
+            // percent sign, not a wildcard over the whole index.
+            let pattern = format!("%{}%", like_escape(&text.to_lowercase()));
+            clauses.push(format!(
+                "(lower(i.title) LIKE ?{n} ESCAPE '\\' OR lower(i.path) LIKE ?{} ESCAPE '\\')",
+                n + 1
+            ));
+            params.push(Value::Text(pattern.clone()));
+            params.push(Value::Text(pattern));
+            n += 2;
+        }
+        let where_sql = if clauses.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", clauses.join(" AND "))
+        };
+
+        let total = scalar_i64(
+            &self.conn,
+            &format!("SELECT COUNT(*) FROM ({source}) i{where_sql}"),
+            params.clone(),
+        )
+        .await?
+        .max(0) as usize;
+
+        // Ordered by title, then permalink, then domain, then relation, so a
+        // page boundary is stable across calls even where two engrams share a
+        // title. TEXT sorts byte-wise here, which is the ordering the Postgres
+        // twin pins itself to with an explicit `COLLATE "C"`.
+        let limit = query.limit.max(1);
+        let offset = query.page.saturating_sub(1).saturating_mul(limit);
+        let mut paged = params;
+        paged.push(Value::Integer(limit as i64));
+        paged.push(Value::Integer(offset as i64));
+        let rows = query_all(
+            &self.conn,
+            &format!(
+                "SELECT i.domain, i.permalink, i.title, i.path, i.status, i.rel \
+                 FROM ({source}) i{where_sql} \
+                 ORDER BY i.title, i.permalink, i.domain, i.rel LIMIT ?{n} OFFSET ?{}",
+                n + 1
+            ),
+            paged,
+        )
+        .await?;
+        let hits = rows
+            .iter()
+            .map(|r| InboundHit {
+                domain: cell_text(r, 0).unwrap_or_default(),
+                permalink: cell_text(r, 1).unwrap_or_default(),
+                title: cell_text(r, 2).unwrap_or_default(),
+                path: cell_text(r, 3).unwrap_or_default(),
+                status: cell_text(r, 4).unwrap_or_default(),
+                rel: cell_text(r, 5).unwrap_or_default(),
+            })
+            .collect();
+
+        // The summary, deliberately over the unfiltered set: the caller filters
+        // *with* it. One grouped pass, no page.
+        let summary = query_all(
+            &self.conn,
+            &format!("SELECT i.rel, COUNT(*) FROM ({source}) i GROUP BY i.rel ORDER BY 2 DESC, 1"),
+            target(),
+        )
+        .await?;
+        let types = summary
+            .iter()
+            .map(|r| NamedCount {
+                name: cell_text(r, 0).unwrap_or_default(),
+                count: cell_i64(r, 1).unwrap_or(0),
+            })
+            .collect();
+
+        Ok(InboundPage { total, types, hits })
     }
 
     async fn outbound_refs(&self, engram_id: EngramId) -> Result<Vec<OutboundRef>> {

@@ -92,6 +92,7 @@ use crate::engine::Engine;
         domains::save_manifest,
         engrams::list,
         engrams::detail,
+        engrams::inbound,
         engrams::create,
         engrams::save,
         engrams::retire,
@@ -332,6 +333,14 @@ pub fn router(state: RestState) -> Router {
             get(engrams::detail)
                 .put(engrams::save)
                 .delete(engrams::remove),
+        )
+        // What points at one engram: a read, so it sits beside the detail
+        // route rather than among the actions below. The permalink rides last
+        // because a wildcard is terminal - the same shape, for the same
+        // reason, as the collab upgrade further down.
+        .route(
+            "/domains/{domain}/inbound/{*permalink}",
+            get(engrams::inbound),
         )
         // Actions rather than sub-paths of `/engrams/{*permalink}`, whose
         // wildcard cannot be followed by another segment: the permalink of

@@ -13,8 +13,9 @@ use std::path::Path;
 
 use crystalline_index::{
     DomainId, DomainKind, EMBED_PAGE_SIZE, EdgeKind, EmbeddingCoverage, EmbeddingRow, EngramId,
-    EngramRecord, FileStamp, FilterOp, HostClaim, IndexError, MetadataFilter, NamedCount, NewChunk,
-    RecentFilter, SearchMode, SearchQuery, Store, TursoStore, Vocabulary, sync_domain,
+    EngramRecord, FileStamp, FilterOp, HostClaim, InboundPage, InboundQuery, IndexError,
+    MetadataFilter, NamedCount, NewChunk, RecentFilter, SearchMode, SearchQuery, Store, TursoStore,
+    Vocabulary, sync_domain,
 };
 
 fn write(dir: &Path, rel: &str, content: &str) {
@@ -734,6 +735,358 @@ async fn inbound_refs_kinds(store: &dyn Store) {
     );
 }
 parity!(inbound_refs_report_ref_kinds, inbound_refs_kinds);
+
+/// A hub with seven references pointing at it from two domains, for the
+/// `inbound_page` tests: four `cites`, two `part_of` and one prose wikilink.
+///
+/// The titles are chosen so byte order and locale order disagree twice over -
+/// `beta small` sorts last byte-wise and third under a locale collation, and
+/// `Alpha 100%` sorts before `Alpha 1005` byte-wise and after it wherever
+/// punctuation is weighted last - so an ordering that lost `COLLATE "C"` on
+/// either backend is visible rather than merely different. Returns the hub's
+/// ids.
+async fn hub_fixture(store: &dyn Store) -> (EngramId, DomainId) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "hub.md",
+        &engram("Hub", "hub", "engram", "", "the hub body\n"),
+    );
+    for (path, title, permalink, body) in [
+        ("alpha.md", "Alpha 100%", "alpha", "- cites [[Hub]]\n"),
+        ("alpha2.md", "Alpha 1005", "alpha2", "- cites [[Hub]]\n"),
+        ("beta.md", "Beta", "beta", "- part_of [[Hub]]\n"),
+        ("Capital.md", "Capital", "capital", "- cites [[Hub]]\n"),
+        (
+            "notes/gamma.md",
+            "Gamma",
+            "notes/gamma",
+            "See [[Hub]] for the details.\n",
+        ),
+        ("small.md", "beta small", "small", "- part_of [[Hub]]\n"),
+    ] {
+        write(root, path, &engram(title, permalink, "engram", "", body));
+    }
+    sync_domain(store, "d", root).await.unwrap();
+
+    // A second domain pointing across, so a hit carries the domain it came
+    // from rather than assuming one.
+    let other_dir = tempfile::tempdir().unwrap();
+    let other = other_dir.path();
+    write(
+        other,
+        "cross.md",
+        &engram("Cross", "cross", "engram", "", "- cites [[d:Hub]]\n"),
+    );
+    sync_domain(store, "Zed", other).await.unwrap();
+
+    let hub = store.lookup_id("d", "hub").await.unwrap().unwrap();
+    let domain = store
+        .upsert_domain("d", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+    // The temp directories are dropped here on purpose: every assertion runs
+    // against indexed rows, and nothing below reads a file.
+    (hub, domain)
+}
+
+/// The query naming the fixture hub, with no filters and a page of ten.
+fn hub_query(hub: EngramId, domain: DomainId) -> InboundQuery<'static> {
+    InboundQuery {
+        engram_id: hub,
+        domain_id: domain,
+        permalink: "hub",
+        title: "Hub",
+        q: None,
+        rel: None,
+        page: 1,
+        limit: 10,
+    }
+}
+
+/// The titles of a page, in the order it returned them.
+fn hit_titles(page: &InboundPage) -> Vec<&str> {
+    page.hits.iter().map(|h| h.title.as_str()).collect()
+}
+
+/// `inbound_page` answers one page of the references pointing at an engram,
+/// ordered byte-wise by title, with an exact total and a per-relation summary
+/// that counts every reference rather than the page.
+async fn inbound_page_orders_and_summarizes(store: &dyn Store) {
+    let (hub, domain) = hub_fixture(store).await;
+
+    let page = store.inbound_page(&hub_query(hub, domain)).await.unwrap();
+
+    assert_eq!(page.total, 7, "seven references point at the hub: {page:?}");
+    assert_eq!(
+        hit_titles(&page),
+        vec![
+            "Alpha 100%",
+            "Alpha 1005",
+            "Beta",
+            "Capital",
+            "Cross",
+            "Gamma",
+            "beta small",
+        ],
+        "hits are ordered by title in byte order: {page:?}"
+    );
+    assert_eq!(
+        page.types
+            .iter()
+            .map(|t| (t.name.as_str(), t.count))
+            .collect::<Vec<_>>(),
+        vec![("cites", 4), ("part_of", 2), ("links_to", 1)],
+        "the summary counts every relation type, most-used first: {page:?}"
+    );
+    // A prose wikilink is `links_to`, the word the graph edges and the sweep
+    // already use for one.
+    let gamma = page
+        .hits
+        .iter()
+        .find(|h| h.title == "Gamma")
+        .expect("the prose linker is on the page");
+    assert_eq!(gamma.rel, "links_to", "{page:?}");
+    assert_eq!(gamma.permalink, "notes/gamma", "{page:?}");
+    assert_eq!(gamma.path, "notes/gamma.md", "{page:?}");
+    assert_eq!(gamma.domain, "d", "{page:?}");
+    let cross = page
+        .hits
+        .iter()
+        .find(|h| h.title == "Cross")
+        .expect("the cross-domain linker is on the page");
+    assert_eq!(cross.domain, "Zed", "{page:?}");
+    assert_eq!(cross.rel, "cites", "{page:?}");
+}
+parity!(
+    inbound_page_orders_by_title_and_summarizes_types,
+    inbound_page_orders_and_summarizes
+);
+
+/// Paging slices that one order without changing what it is a page of: the
+/// total and the summary describe the whole set on every page.
+async fn inbound_page_pages(store: &dyn Store) {
+    let (hub, domain) = hub_fixture(store).await;
+
+    let first = store
+        .inbound_page(&InboundQuery {
+            limit: 3,
+            ..hub_query(hub, domain)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        hit_titles(&first),
+        vec!["Alpha 100%", "Alpha 1005", "Beta"],
+        "{first:?}"
+    );
+    assert_eq!(first.total, 7, "{first:?}");
+
+    let second = store
+        .inbound_page(&InboundQuery {
+            page: 2,
+            limit: 3,
+            ..hub_query(hub, domain)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        hit_titles(&second),
+        vec!["Capital", "Cross", "Gamma"],
+        "the second page continues the first: {second:?}"
+    );
+    assert_eq!(second.total, 7, "the total is of the set, not the page");
+    assert_eq!(
+        second.types.len(),
+        3,
+        "the summary rides every page: {second:?}"
+    );
+
+    let last = store
+        .inbound_page(&InboundQuery {
+            page: 3,
+            limit: 3,
+            ..hub_query(hub, domain)
+        })
+        .await
+        .unwrap();
+    assert_eq!(hit_titles(&last), vec!["beta small"], "{last:?}");
+
+    let past_the_end = store
+        .inbound_page(&InboundQuery {
+            page: 9,
+            limit: 3,
+            ..hub_query(hub, domain)
+        })
+        .await
+        .unwrap();
+    assert!(
+        past_the_end.hits.is_empty(),
+        "a page past the end is empty rather than an error: {past_the_end:?}"
+    );
+    assert_eq!(past_the_end.total, 7, "{past_the_end:?}");
+}
+parity!(inbound_page_pages_the_same_order, inbound_page_pages);
+
+/// `rel` narrows to one relation type and `q` matches the referencing engram's
+/// title or path, case-insensitively. Both keep the total exact and neither
+/// touches the summary.
+async fn inbound_page_filters(store: &dyn Store) {
+    let (hub, domain) = hub_fixture(store).await;
+
+    let cites = store
+        .inbound_page(&InboundQuery {
+            rel: Some("cites"),
+            ..hub_query(hub, domain)
+        })
+        .await
+        .unwrap();
+    assert_eq!(cites.total, 4, "{cites:?}");
+    assert_eq!(
+        hit_titles(&cites),
+        vec!["Alpha 100%", "Alpha 1005", "Capital", "Cross"],
+        "{cites:?}"
+    );
+    assert_eq!(
+        cites.types.len(),
+        3,
+        "the summary is of every reference, not of the filtered ones: {cites:?}"
+    );
+
+    let prose = store
+        .inbound_page(&InboundQuery {
+            rel: Some("links_to"),
+            ..hub_query(hub, domain)
+        })
+        .await
+        .unwrap();
+    assert_eq!(hit_titles(&prose), vec!["Gamma"], "{prose:?}");
+
+    let by_title = store
+        .inbound_page(&InboundQuery {
+            q: Some("BETA"),
+            ..hub_query(hub, domain)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        hit_titles(&by_title),
+        vec!["Beta", "beta small"],
+        "q matches the title case-insensitively: {by_title:?}"
+    );
+    assert_eq!(by_title.total, 2, "{by_title:?}");
+
+    let by_path = store
+        .inbound_page(&InboundQuery {
+            q: Some("notes/"),
+            ..hub_query(hub, domain)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        hit_titles(&by_path),
+        vec!["Gamma"],
+        "q matches the path too: {by_path:?}"
+    );
+
+    let both = store
+        .inbound_page(&InboundQuery {
+            q: Some("alpha"),
+            rel: Some("cites"),
+            ..hub_query(hub, domain)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        hit_titles(&both),
+        vec!["Alpha 100%", "Alpha 1005"],
+        "the two filters compose: {both:?}"
+    );
+
+    let nothing = store
+        .inbound_page(&InboundQuery {
+            q: Some("nobody"),
+            ..hub_query(hub, domain)
+        })
+        .await
+        .unwrap();
+    assert_eq!(nothing.total, 0, "{nothing:?}");
+    assert!(nothing.hits.is_empty(), "{nothing:?}");
+    assert_eq!(
+        nothing.types.len(),
+        3,
+        "a filter that matches nothing still reports what is there: {nothing:?}"
+    );
+}
+parity!(inbound_page_filters_by_rel_and_text, inbound_page_filters);
+
+/// A `%` in `q` is a percent sign, not a wildcard: the fixture holds both
+/// `Alpha 100%` and `Alpha 1005`, and an unescaped pattern would return both.
+async fn inbound_page_escapes(store: &dyn Store) {
+    let (hub, domain) = hub_fixture(store).await;
+
+    let literal = store
+        .inbound_page(&InboundQuery {
+            q: Some("100%"),
+            ..hub_query(hub, domain)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        hit_titles(&literal),
+        vec!["Alpha 100%"],
+        "the wildcard is escaped: {literal:?}"
+    );
+
+    let underscore = store
+        .inbound_page(&InboundQuery {
+            q: Some("alpha_"),
+            ..hub_query(hub, domain)
+        })
+        .await
+        .unwrap();
+    assert!(
+        underscore.hits.is_empty(),
+        "`_` is a literal underscore, which no title carries: {underscore:?}"
+    );
+}
+parity!(inbound_page_escapes_like_wildcards, inbound_page_escapes);
+
+/// An engram nothing points at reports an empty page rather than an error, and
+/// says so in the summary too.
+async fn inbound_page_empty(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "lonely.md",
+        &engram("Lonely", "lonely", "engram", "", "nobody points here\n"),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+    let lonely = store.lookup_id("d", "lonely").await.unwrap().unwrap();
+    let domain = store
+        .upsert_domain("d", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+
+    let page = store
+        .inbound_page(&InboundQuery {
+            permalink: "lonely",
+            title: "Lonely",
+            ..hub_query(lonely, domain)
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(page.total, 0, "{page:?}");
+    assert!(page.hits.is_empty(), "{page:?}");
+    assert!(page.types.is_empty(), "{page:?}");
+}
+parity!(
+    inbound_page_reports_nothing_pointing_here,
+    inbound_page_empty
+);
 
 /// `unresolved_refs` reports every dangling relation and prose link in a domain,
 /// and nothing else: a relation that resolves never appears, a reference in

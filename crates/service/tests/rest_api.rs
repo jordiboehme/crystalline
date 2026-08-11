@@ -673,6 +673,7 @@ async fn data_routes_401_without_identity_when_not_anonymous() {
         "/api/v1/domains/eng/engrams",
         "/api/v1/domains/eng/engrams/alpha",
         "/api/v1/domains/eng/engrams/notes/deep/gamma",
+        "/api/v1/domains/eng/inbound/alpha",
         "/api/v1/search",
         "/api/v1/vocabulary",
         "/api/v1/context",
@@ -1577,6 +1578,104 @@ async fn an_unknown_permalink_is_a_404_problem_detail() {
     let detail = body["detail"].as_str().unwrap();
     assert!(detail.contains("notes/ghost"), "{detail}");
     assert!(detail.contains("eng"), "{detail}");
+}
+
+/// What points at an engram comes back in the page envelope every listing on
+/// this surface uses, with the referencing engram's address rather than only
+/// its path, and with the per-relation summary a client draws its chips from.
+///
+/// The fixture domain holds one inbound reference - Beta declares
+/// `relates_to [[Alpha]]` - which is enough to pin the shape end to end. What
+/// paging and ordering do across many references is pinned at the store level,
+/// on both backends, where the fixture can hold as many as the assertions need.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbound_references_carry_the_page_envelope_and_the_relation_summary() {
+    let fixture = serve_anonymous().await;
+    let resp = get(fixture.addr, "/api/v1/domains/eng/inbound/alpha").await;
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+
+    assert_eq!(body["total"], 1, "{body}");
+    assert_eq!(body["page"], 1, "{body}");
+    assert_eq!(body["limit"], 10, "{body}");
+    assert_eq!(body["count"], 1, "{body}");
+    assert_eq!(
+        body["types"],
+        serde_json::json!([{ "rel": "relates_to", "count": 1 }]),
+        "the summary is one entry per relation type pointing here: {body}"
+    );
+    let hit = &body["hits"][0];
+    assert_eq!(hit["domain"], "eng", "{body}");
+    assert_eq!(
+        hit["permalink"], "notes/beta",
+        "a hit is addressed, so a client can link to it: {body}"
+    );
+    assert_eq!(hit["title"], "Beta", "{body}");
+    assert_eq!(hit["path"], "notes/beta.md", "{body}");
+    assert_eq!(
+        hit["status"], "current",
+        "with its lifecycle, so a retired linker reads as one: {body}"
+    );
+    assert_eq!(hit["rel"], "relates_to", "{body}");
+}
+
+/// `rel` and `q` narrow the page and its total, and neither touches the
+/// summary: it is the map a reader filters with, so it may not redraw itself
+/// while it is being used.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbound_references_filter_without_changing_the_summary() {
+    let fixture = serve_anonymous().await;
+    let summary = serde_json::json!([{ "rel": "relates_to", "count": 1 }]);
+
+    let matched = get(fixture.addr, "/api/v1/domains/eng/inbound/alpha?q=BET").await;
+    let body: serde_json::Value = matched.json().await.unwrap();
+    assert_eq!(body["total"], 1, "q matches the title, folded: {body}");
+    assert_eq!(body["hits"][0]["permalink"], "notes/beta", "{body}");
+
+    for path in [
+        // A relation type nothing points here with.
+        "/api/v1/domains/eng/inbound/alpha?rel=links_to",
+        // Text no linker's title or path carries.
+        "/api/v1/domains/eng/inbound/alpha?q=nobody",
+        // A page past the end, which is empty rather than an error.
+        "/api/v1/domains/eng/inbound/alpha?page=9",
+    ] {
+        let resp = get(fixture.addr, path).await;
+        assert_eq!(resp.status(), 200, "{path}");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["count"], 0, "{path}: {body}");
+        assert_eq!(
+            body["hits"],
+            serde_json::json!([]),
+            "{path} selects nothing: {body}"
+        );
+        assert_eq!(
+            body["types"], summary,
+            "{path} leaves the summary alone: {body}"
+        );
+    }
+}
+
+/// The same 404s the detail route answers, for the same reasons: a path segment
+/// names a resource, and an engram retired out from under an open page is told
+/// plainly rather than answered with an empty panel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unknown_inbound_targets_are_404_problem_details() {
+    let fixture = serve_anonymous().await;
+    for (path, needle) in [
+        ("/api/v1/domains/eng/inbound/notes/ghost", "notes/ghost"),
+        ("/api/v1/domains/ghost/inbound/alpha", "ghost"),
+    ] {
+        let resp = get(fixture.addr, path).await;
+        assert_eq!(resp.status(), 404, "{path} must be a 404");
+        assert_eq!(resp.headers()["content-type"], "application/problem+json");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["status"], 404, "{path}: {body}");
+        assert!(
+            body["detail"].as_str().unwrap().contains(needle),
+            "{path}: {body}"
+        );
+    }
 }
 
 /// A domain nobody registered is a 404 problem detail that names the domains

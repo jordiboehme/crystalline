@@ -734,6 +734,82 @@ pub struct InboundRef {
     pub kind: EdgeKind,
 }
 
+/// The label a prose wikilink carries wherever inbound references are grouped
+/// or filtered by relation type.
+///
+/// The same word the graph edges and the consolidation sweep already use for a
+/// wikilink, rather than a second name for one thing: a reader who has seen
+/// `links_to` on an edge meets it again on the chip that counts those edges.
+pub const LINKS_TO: &str = "links_to";
+
+/// One row of [`Store::inbound_page`]: an engram that points at the target, and
+/// the relation it points with.
+///
+/// Addressed rather than merely located: [`InboundRef`] carries a path because
+/// the cross-domain move rewrites files, while a reader needs a link, so this
+/// one carries the permalink and title a client renders and navigates with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct InboundHit {
+    /// The referencing engram's domain name.
+    pub domain: String,
+    /// The referencing engram's permalink.
+    pub permalink: String,
+    /// Its title, as indexed. Empty when it carries none.
+    pub title: String,
+    /// Its domain-relative file path.
+    pub path: String,
+    /// Its `status` frontmatter, free form. Empty when it carries none. Here so
+    /// a reader is told that what points at this engram is itself retired,
+    /// which is a fact about the reference worth as much as its existence.
+    pub status: String,
+    /// The relation type of this reference, or [`LINKS_TO`] for a prose
+    /// wikilink.
+    pub rel: String,
+}
+
+/// What [`Store::inbound_page`] takes: which engram is being pointed at, and
+/// how the caller wants the references to it narrowed and paged.
+///
+/// The target is spelled the way [`Store::inbound_refs`] spells it - id, domain
+/// and the permalink and title an unresolved reference is text-matched against -
+/// because both walk the same rows and must agree about what points where.
+#[derive(Debug, Clone)]
+pub struct InboundQuery<'a> {
+    /// The engram being pointed at.
+    pub engram_id: EngramId,
+    /// Its domain, for the unresolved same-domain text match.
+    pub domain_id: DomainId,
+    /// Its permalink, for that same match.
+    pub permalink: &'a str,
+    /// Its title, for that same match.
+    pub title: &'a str,
+    /// Case-insensitive substring the referencing engram's title or path must
+    /// contain. `None` or empty selects every reference.
+    pub q: Option<&'a str>,
+    /// Keep only references carrying this relation type ([`LINKS_TO`] for prose
+    /// wikilinks). `None` selects every relation.
+    pub rel: Option<&'a str>,
+    /// One-based page number.
+    pub page: usize,
+    /// Page size.
+    pub limit: usize,
+}
+
+/// One page of [`Store::inbound_page`], with the counts a client draws its
+/// chips from.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct InboundPage {
+    /// How many references match under the active filters, exactly.
+    pub total: usize,
+    /// Every relation type pointing at this engram with its count, most-used
+    /// first, ties broken by name. Deliberately NOT narrowed by the filters:
+    /// this is the map a client filters *with*, so it must not change shape as
+    /// the reader clicks through it.
+    pub types: Vec<NamedCount>,
+    /// This page of matching references.
+    pub hits: Vec<InboundHit>,
+}
+
 /// One outbound reference from an engram: a relation bullet or a prose wikilink,
 /// with whether it currently resolves to a target in the index. Backs the
 /// `read_engram` resolution flags so a reading agent learns which of its links
@@ -1209,6 +1285,27 @@ pub trait Store: Send + Sync {
         permalink: &str,
         title: &str,
     ) -> Result<Vec<InboundRef>>;
+
+    /// One page of the references that point at an engram, filtered and counted
+    /// in SQL, with the per-relation summary of all of them.
+    ///
+    /// The paged twin of [`Store::inbound_refs`], over exactly the same rows:
+    /// resolved references plus the unresolved same-domain ones whose text names
+    /// this engram, so a total here and the count `read_engram` reports are the
+    /// same number. What differs is what a reader needs - a title and a
+    /// permalink to follow, a page rather than the whole set, and a substring
+    /// filter - none of which the move's rewrite has any use for.
+    ///
+    /// `total` is exact under [`InboundQuery::q`] and [`InboundQuery::rel`], and
+    /// [`InboundPage::types`] ignores both: an engram with thousands of inbound
+    /// references is browsed by picking a relation type and then searching
+    /// inside it, and a summary that shrank as it was used would be a map that
+    /// redraws itself while it is being read.
+    ///
+    /// Ordered by title, then permalink, then domain, then relation, byte-wise
+    /// on both backends, so paging is stable and a page boundary never drops or
+    /// repeats a row.
+    async fn inbound_page(&self, query: &InboundQuery<'_>) -> Result<InboundPage>;
 
     /// Every relation and prose link that points out of the given engram, each
     /// carrying whether it currently resolves to a target in the index. Ordered

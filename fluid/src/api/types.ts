@@ -155,7 +155,97 @@ export interface paths {
          */
         get: operations["list_domains"];
         put?: never;
+        /**
+         * Register a domain: local, virtual or a GitHub team domain.
+         * @description Admin only. A local domain is name-only and always lands at `<domains_root>/<name>` on the server, so no request can place a folder anywhere else; a virtual domain lives in the database; a team domain needs a GitHub connection and downloads the repository inside this request, which can take a while for a large one.
+         */
+        post: operations["create_domain"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/domains/{domain}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
         post?: never;
+        /**
+         * Unregister a domain. Files on disk are never touched.
+         * @description Admin only. The registration and the domain's index rows go; a file domain's files stay exactly where they are (re-adding the folder adopts them again), which is what `files_kept` reports. A virtual domain has no files, so `files_kept` is false and its knowledge is gone - a client must confirm that difference in words. Any open co-editing rooms in the domain are saved and closed first; `rooms_closed` counts them.
+         */
+        delete: operations["unregister_domain"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/domains/{domain}/archive": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Download a whole domain as a zip.
+         * @description Admin only. Every file of the domain - MANIFEST included - as one zip, read from whichever source of truth the domain has: markdown on disk for a file domain, the database for a virtual one. A pure read, so it is served even on a read-only instance, which is exactly where an operator wants a backup to take.
+         */
+        get: operations["download_domain_archive"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/domains/{domain}/archive/import": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Import an uploaded archive into a domain.
+         * @description Admin only. Runs the engine verb the preview dry-ran, so the outcome matches the report that was approved: entries land as `created` or `overwritten`, and `skipped`, `invalid` and `ignored` name everything that did not.
+         *
+         *     `policy=skip` (the default) leaves an existing path alone; `policy=overwrite` replaces it. Overwrite is a same-path decision only - an entry whose permalink is held at another path is refused under either policy, since writing it would leave two files claiming one permalink.
+         *
+         *     The same hygiene the preview enforces applies here: a hostile archive is refused whole rather than partially imported.
+         */
+        post: operations["import_domain_archive"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/domains/{domain}/archive/preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Dry-run an archive upload: what each entry would become.
+         * @description Admin only. Takes the raw bytes of a zip and reports, per entry, what an import would do with it - `new`, `collides`, `invalid` or `ignored` - with the verify findings `POST /validate` would raise over that entry's markdown.
+         *
+         *     Nothing is written. A hostile archive is refused whole with 422 rather than partially imported: more than 1000 entries, an entry over 1 MiB or a whole archive over 32 MiB once decompressed, an entry name that is not UTF-8, or any path that could escape the domain root.
+         */
+        post: operations["preview_domain_archive_import"];
         delete?: never;
         options?: never;
         head?: never;
@@ -171,7 +261,9 @@ export interface paths {
         };
         /**
          * One domain's engrams, filtered by frontmatter and paged.
-         * @description A filter-only search, so the answer carries the same page envelope a search does and a client pages it the same way. Listing by folder is not here: the tree endpoint owns the navigation view and this one owns the frontmatter view.
+         * @description A filter-only search, so the answer carries the same page envelope a search does and a client pages it the same way.
+         *
+         *     `path` scopes the listing to one folder, the folder and everything below it, and it is a folder rather than a string prefix: `notes` takes `notes/deep/y.md` and never `notes-misc/z.md`. The total stays exact under it, so a folder holding thousands of engrams costs one page rather than the folder. The tree endpoint still owns the navigation view and this one owns the listing.
          *
          *     A domain nobody registered is a 404, while filters that match nothing are an empty page: two states a client can tell apart.
          */
@@ -219,6 +311,28 @@ export interface paths {
          * @description A file domain removes the file from disk; a virtual domain drops the database rows. Guarded the same way `save` is: 428 with no `If-Match`, 412 when the token is stale (carrying the version the server holds now), 204 once it lands. A read-only instance answers 403 ahead of the precondition check, so it is never 428.
          */
         delete: operations["delete_engram"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/domains/{domain}/inbound/{permalink}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * What points at one engram, paged and searchable.
+         * @description The browsing view of the detail payload's inbound block: the same references, counted by relation type and answered a page at a time.
+         *
+         *     `types` is the summary of every reference pointing here, most-used first, and it deliberately ignores `q` and `rel` - it is the map a client filters *with*, so it does not change shape as the filters are used. `total` is exact under both filters. `rel` names a relation type, with `links_to` for prose wikilinks. Hits are ordered by title, then permalink, so paging is stable.
+         */
+        get: operations["get_inbound_references"];
+        put?: never;
+        post?: never;
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -294,6 +408,30 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/domains/{domain}/sync": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Where a team domain stands relative to its GitHub origin.
+         * @description Admin only. A pure read, served even on a read-only instance. Answers 404 for a domain with no origin - only a GitHub team domain has sync status - so a client can treat any 404 as `no sync card`.
+         */
+        get: operations["get_domain_sync_status"];
+        put?: never;
+        /**
+         * Pull a team domain's origin now.
+         * @description Admin only. Brings this instance's copy up to date with the domain's GitHub origin immediately, instead of waiting for the daemon's next poll: the same pull the poller runs, under the same per-domain lock. Refused on a read-only instance, and a conflict on a domain that has no origin to pull from.
+         */
+        post: operations["sync_domain"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/domains/{domain}/tree": {
         parameters: {
             query?: never;
@@ -302,8 +440,10 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * `GET /domains/{domain}/tree` - one domain's engrams and subfolders under a
-         *     path, the navigation a file tree in the UI is built from.
+         * One level of a domain's folders and engrams.
+         * @description The navigation a file tree is built from, one level at a time and bounded: a level holding more engrams than the tree shows is cut, `total` says how many it really holds and `truncated` says the rows were cut, so a client can send its reader to the paged listing instead.
+         *
+         *     `folders` is never cut, so a truncated level still names every folder a reader can descend into. A `glob` narrows the engrams this level returned, so on a truncated level it selects within the cut rather than across the whole folder.
          */
         get: operations["get_domain_tree"];
         put?: never;
@@ -396,6 +536,70 @@ export interface paths {
         get: operations["search"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/settings/github": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The GitHub connection, and the device flow's poll.
+         * @description Admin only. A pure read, served even on a read-only instance. Also the device flow's poll: while one runs, `pending` carries the short code and its URL; once it ends, `pending` goes null and a failed flow's reason is reported in `error` on exactly one read, then cleared.
+         */
+        get: operations["get_github_settings"];
+        put?: never;
+        post?: never;
+        /**
+         * Forget the stored credential.
+         * @description Admin only, and refused on a read-only instance. Idempotent: disconnecting an instance that holds no credential succeeds and answers `connected: false` rather than 404. `github.enabled` is left alone - turning the feature off is a separate intent.
+         */
+        delete: operations["disconnect_github"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/settings/github/connect": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Start a device-code sign-in.
+         * @description Admin only, and refused on a read-only instance. Answers 202 with the short code to confirm in a browser; the flow itself runs in the background and its outcome is read from `GET /settings/github`. A second call while one flow runs reports that same flow rather than starting another. Connecting is the intent to use the feature, so this turns `github.enabled` on.
+         */
+        post: operations["connect_github_device"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/settings/github/token": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Connect with a personal access token.
+         * @description Admin only, and refused on a read-only instance. The token is validated against GitHub before it is stored, and is never echoed: the answer is the same token-material-free status the GET returns. Connecting is the intent to use the feature, so this turns `github.enabled` on.
+         */
+        post: operations["connect_github_token"];
         delete?: never;
         options?: never;
         head?: never;
@@ -546,6 +750,62 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /** @description One entry of an uploaded archive and what became of it. A preview reports `new`, `collides`, `invalid` or `ignored`; an import reports `created`, `overwritten`, `skipped`, `invalid` or `ignored`. */
+        ArchiveEntryReport: {
+            /**
+             * @description The verify findings over this entry's markdown, the same families
+             *     `POST /validate` runs. Empty for an entry that was never read.
+             */
+            findings: components["schemas"]["ValidateFinding"][];
+            /**
+             * @description The entry's path inside the archive, domain-relative.
+             * @example alpha.md
+             */
+            path: string;
+            /**
+             * @description The permalink the entry claims, once it parsed far enough to have one.
+             * @example alpha
+             */
+            permalink?: string | null;
+            /** @description Why the entry was not written, in the words of whatever refused it. */
+            reason?: string | null;
+            /**
+             * @description preview: new | collides | invalid | ignored.
+             *     import: created | overwritten | skipped | invalid | ignored.
+             * @example new
+             */
+            status: string;
+        };
+        /** @description The per-entry report of a preview or an import, with the counters a confirmation dialog summarizes. The counters are tallied from the entries above them, so the two can never disagree. */
+        ArchiveReport: {
+            /** @description Preview only: entries whose path or permalink is already taken. */
+            collides: number;
+            /**
+             * @description The domain the archive was aimed at.
+             * @example eng
+             */
+            domain: string;
+            /** @description True for a preview, false for an import that really wrote. */
+            dry_run: boolean;
+            /** @description Every entry of the archive, in the order the archive holds them. */
+            entries: components["schemas"]["ArchiveEntryReport"][];
+            /**
+             * @description Entries an archive may carry but a domain never imports: a MANIFEST, a
+             *     generated OKF index or log, anything that is not markdown.
+             */
+            ignored: number;
+            /**
+             * @description Entries refused as not importable: unparseable, not UTF-8 text, or
+             *     carrying a hard verify error. Never written under either policy.
+             */
+            invalid: number;
+            /** @description Preview only: entries that would be created. */
+            new: number;
+            /** @description Import only: entries an existing path or permalink held back. */
+            skipped: number;
+            /** @description Import only: entries written, created and overwritten together. */
+            written: number;
+        };
         /**
          * @description The wire form of a 412: a problem detail carrying the version the server
          *     holds now, so a client can show a merge view instead of just failing.
@@ -586,6 +846,36 @@ export interface components {
             /** @description What the new account may do. */
             role: components["schemas"]["Role"];
         };
+        /** @description A domain to register. `mode` picks which of the three kinds is meant, and every other field belongs to one of them: a field that does not apply to the mode asked for is refused rather than ignored. */
+        CreateDomainBody: {
+            /**
+             * @description Branch to track; github mode only, defaults to the repo default.
+             * @example main
+             */
+            branch?: string | null;
+            /**
+             * @description local | virtual | github
+             * @example local
+             */
+            mode: string;
+            /**
+             * @description The domain name. Required for local and virtual; optional for github
+             *     (defaults to the repository name). A local domain always lands at
+             *     <domains_root>/<name>; there is no folder parameter on this surface.
+             * @example notes
+             */
+            name?: string | null;
+            /**
+             * @description Subfolder within the repository; github mode only.
+             * @example domains/eng
+             */
+            path?: string | null;
+            /**
+             * @description owner/name; github mode only.
+             * @example acme/knowledge
+             */
+            repo?: string | null;
+        };
         /** @description A new engram. The engine builds the frontmatter from these fields and slugifies the title into the filename and permalink, so the body carries markdown only. */
         CreateEngramBody: {
             /**
@@ -620,6 +910,54 @@ export interface components {
              * @example decision
              */
             type?: string | null;
+        };
+        /** @description The half of a running device flow a browser has to show: the short code the user types in, where they type it, and how long the code stays valid. */
+        GithubPendingView: {
+            /**
+             * Format: int64
+             * @description How many seconds from the flow's start the code stays valid.
+             * @example 900
+             */
+            expires_in_secs: number;
+            /**
+             * @description The short code the user confirms at `verification_url`.
+             * @example ABCD-1234
+             */
+            user_code: string;
+            /**
+             * @description Where the user confirms the code.
+             * @example https://github.com/login/device
+             */
+            verification_url: string;
+        };
+        /** @description The GitHub connection as the settings screen renders and polls it. No token material, ever: only whether the feature is on, whether a credential is on file, whose it is and where it lives. */
+        GithubStatusResponse: {
+            /**
+             * @description Whether a credential is on file for this instance.
+             * @example true
+             */
+            connected: boolean;
+            /**
+             * @description Whether `github.enabled` is on: team tools and origin polling.
+             * @example true
+             */
+            enabled: boolean;
+            /**
+             * @description A device flow's failure (expired, denied), reported on exactly one
+             *     status read after the flow ends, then cleared.
+             */
+            error?: string | null;
+            pending?: null | components["schemas"]["GithubPendingView"];
+            /**
+             * @description keyring | file | environment; null when disconnected.
+             * @example keyring
+             */
+            token_store?: string | null;
+            /**
+             * @description The account login, when connected.
+             * @example octo
+             */
+            user?: string | null;
         };
         /** @description What `POST /auth/login` takes. */
         LoginBody: {
@@ -826,6 +1164,14 @@ export interface components {
              */
             markdown: string;
         };
+        /** @description A GitHub personal access token to connect with. Write-only: no response on this surface ever echoes it, and the status shape carries only where the credential lives and whose it is. */
+        TokenBody: {
+            /**
+             * @description A GitHub personal access token. Write-only: no response ever echoes it.
+             * @example ghp_xxxxxxxxxxxxxxxxxxxx
+             */
+            token: string;
+        };
         /**
          * @description One account. Carries no password material, so it is safe to hand to a
          *     handler and serialize into a response.
@@ -901,7 +1247,12 @@ export interface components {
              */
             path?: string | null;
         };
-        /** @description One finding, and the envelope: the same fields the verify report carries. */
+        /**
+         * @description One finding, and the envelope: the same fields the verify report carries.
+         *
+         *     Shared rather than validation-local: the archive preview reports the same
+         *     findings per entry, and a second shape for the same facts would drift.
+         */
         ValidateFinding: {
             /** @description A suggested fix, when the rule has one. */
             fix?: string | null;
@@ -1408,6 +1759,355 @@ export interface operations {
             };
         };
     };
+    create_domain: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateDomainBody"];
+            };
+        };
+        responses: {
+            /** @description The engine's own registration report, unchanged. Its shape follows the mode: a local domain reports where it landed, a virtual one reports that it was registered, a team domain reports what was fetched. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "adopted": false,
+                     *       "domain": "notes",
+                     *       "kind": "file",
+                     *       "manifest_created": true,
+                     *       "root": "/Users/ada/Documents/Crystalline/notes"
+                     *     }
+                     */
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description No identity, or an anonymous one. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The caller is not an admin, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The name is taken by another domain, or mode `github` was asked for on an instance with no GitHub connection - the detail says where to make one. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The body is not `application/json`. */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description An unknown mode, a name that could escape the domains root, or a field that does not belong to the mode asked for. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    unregister_domain: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The registered domain. */
+                domain: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The engine's own unregistration report, plus the number of co-editing rooms this call closed. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "domain": "eng",
+                     *       "files_kept": true,
+                     *       "index_cleared": true,
+                     *       "rooms_closed": 0,
+                     *       "unregistered": true
+                     *     }
+                     */
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description No identity, or an anonymous one. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The caller is not an admin, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No such domain. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The domain is defined by an environment variable, which owns it: unset the variable instead. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    download_domain_archive: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The registered domain to archive. */
+                domain: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The archive, as an attachment named after the domain. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/zip": string;
+                };
+            };
+            /** @description No identity, or an anonymous one. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The caller is not an admin, or the trusted-header identity names a disabled account. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No such domain. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    import_domain_archive: {
+        parameters: {
+            query?: {
+                /**
+                 * @description How a path that already exists is treated: `skip` (the default) leaves
+                 *     it alone, `overwrite` replaces it. Anything else is refused.
+                 * @example skip
+                 */
+                policy?: string;
+            };
+            header?: never;
+            path: {
+                /** @description The registered domain to import into. */
+                domain: string;
+            };
+            cookie?: never;
+        };
+        /** @description The raw bytes of a zip archive. */
+        requestBody: {
+            content: {
+                "application/zip": string;
+            };
+        };
+        responses: {
+            /** @description The per-entry report of what landed. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ArchiveReport"];
+                };
+            };
+            /** @description No identity, or an anonymous one. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The caller is not an admin, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No such domain. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The upload is past the surface's request-body limit. */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The bytes are not a readable zip, the archive fails hygiene, or `policy` is neither `skip` nor `overwrite`. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    preview_domain_archive_import: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The registered domain the archive is aimed at. */
+                domain: string;
+            };
+            cookie?: never;
+        };
+        /** @description The raw bytes of a zip archive. */
+        requestBody: {
+            content: {
+                "application/zip": string;
+            };
+        };
+        responses: {
+            /** @description The per-entry report, and the counters under it. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ArchiveReport"];
+                };
+            };
+            /** @description No identity, or an anonymous one. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The caller is not an admin, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No such domain. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The upload is past the surface's request-body limit. */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The bytes are not a readable zip, or the archive fails hygiene - the detail names which rule. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
     list_engrams: {
         parameters: {
             query?: {
@@ -1433,6 +2133,14 @@ export interface operations {
                  * @example 2026-01-31
                  */
                 after?: string;
+                /**
+                 * @description Only engrams filed under this domain-relative folder, the folder and
+                 *     everything below it. A folder rather than a string prefix: `notes`
+                 *     takes `notes/deep/y.md` and never `notes-misc/z.md`. Absent or empty
+                 *     is the whole domain.
+                 * @example notes
+                 */
+                path?: string;
                 /**
                  * @description One-based page number. Defaults to 1.
                  * @example 1
@@ -1909,6 +2617,129 @@ export interface operations {
             };
         };
     };
+    get_inbound_references: {
+        parameters: {
+            query?: {
+                /**
+                 * @description Case-insensitive substring the referencing engram's title or path must
+                 *     contain. Absent or empty selects every reference.
+                 * @example beta
+                 */
+                q?: string;
+                /**
+                 * @description Keep only references carrying this relation type. `links_to` selects
+                 *     prose wikilinks.
+                 * @example relates_to
+                 */
+                rel?: string;
+                /**
+                 * @description One-based page number. Defaults to 1.
+                 * @example 1
+                 */
+                page?: number;
+                /**
+                 * @description Page size. Defaults to 10.
+                 * @example 10
+                 */
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                /** @description The registered domain. */
+                domain: string;
+                /**
+                 * @description The engram permalink. A permalink is a path, so this segment may contain slashes: `notes/deep/gamma`.
+                 * @example notes/deep/gamma
+                 */
+                permalink: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description One page of references, with the unfiltered per-relation summary. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "count": 2,
+                     *       "hits": [
+                     *         {
+                     *           "domain": "eng",
+                     *           "path": "notes/beta.md",
+                     *           "permalink": "notes/beta",
+                     *           "rel": "relates_to",
+                     *           "status": "stable",
+                     *           "title": "Beta"
+                     *         },
+                     *         {
+                     *           "domain": "eng",
+                     *           "path": "notes/deep/gamma.md",
+                     *           "permalink": "notes/deep/gamma",
+                     *           "rel": "links_to",
+                     *           "status": "stable",
+                     *           "title": "Gamma"
+                     *         }
+                     *       ],
+                     *       "limit": 10,
+                     *       "page": 1,
+                     *       "total": 2,
+                     *       "types": [
+                     *         {
+                     *           "count": 1,
+                     *           "rel": "relates_to"
+                     *         },
+                     *         {
+                     *           "count": 1,
+                     *           "rel": "links_to"
+                     *         }
+                     *       ]
+                     *     }
+                     */
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description The query string will not parse. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No identity. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The trusted-header identity names a disabled account. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No such domain or engram. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
     get_domain_manifest: {
         parameters: {
             query?: never;
@@ -2276,6 +3107,154 @@ export interface operations {
             };
         };
     };
+    get_domain_sync_status: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The registered team domain. */
+                domain: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The engine's own status report for this one domain, plus the mode it is synced in. `local_changes` is the unshared-work count a client shows as pending; `probe_error` is set when the live check could not reach GitHub and the rest of the report came from local state alone. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "base_commit": "9f3c1a2",
+                     *       "behind": false,
+                     *       "branch": "main",
+                     *       "conflicts": [],
+                     *       "declined_proposals": [],
+                     *       "domain": "eng",
+                     *       "last_checked": "2026-08-10T08:00:00Z",
+                     *       "local_changes": 2,
+                     *       "mode": "github",
+                     *       "open_proposals": [],
+                     *       "probe_error": null,
+                     *       "repo": "acme/knowledge"
+                     *     }
+                     */
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description No identity, or an anonymous one. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The caller is not an admin, or the trusted-header identity names a disabled account. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No such domain, or a domain with no team origin. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description GitHub is switched off on this instance, so no origin can be reached - the detail says where to turn it on. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    sync_domain: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The registered team domain. */
+                domain: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The engine's own pull report for this one domain: whether it was already up to date, which files were applied or merged, which conflicts are waiting and which proposals changed state. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "applied": [
+                     *         "notes/a.md"
+                     *       ],
+                     *       "conflicts": [],
+                     *       "domain": "eng",
+                     *       "merged": [],
+                     *       "proposals": [],
+                     *       "re_baselined": false,
+                     *       "skipped_large": [],
+                     *       "up_to_date": false
+                     *     }
+                     */
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description No identity, or an anonymous one. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The caller is not an admin, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No such domain. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The domain has no team origin to pull from, or GitHub is switched off on this instance - the detail says which, and where to fix it. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
     get_domain_tree: {
         parameters: {
             query?: {
@@ -2325,7 +3304,9 @@ export interface operations {
                      *       "folders": [
                      *         "notes"
                      *       ],
-                     *       "path": "/"
+                     *       "path": "/",
+                     *       "total": 1,
+                     *       "truncated": false
                      *     }
                      */
                     "application/json": Record<string, never>;
@@ -2651,6 +3632,207 @@ export interface operations {
                 };
             };
             /** @description `search_type` names a mode the engine does not know. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    get_github_settings: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The connection. No token material. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GithubStatusResponse"];
+                };
+            };
+            /** @description No identity. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The caller is not an admin, or the trusted-header identity names a disabled account. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    disconnect_github: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The connection as it now stands. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GithubStatusResponse"];
+                };
+            };
+            /** @description No identity. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The caller is not an admin, a cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The credential comes from `CRYSTALLINE_GITHUB_TOKEN`: only the environment that set it can retire it. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    connect_github_device: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The flow started (or one was already running): `pending` carries the code to confirm. Poll `GET /settings/github` for the outcome. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GithubStatusResponse"];
+                };
+            };
+            /** @description No identity. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The caller is not an admin, a cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description This machine's identity is fixed by `CRYSTALLINE_GITHUB_TOKEN`, so no sign-in can be started here, or GitHub refused to start the flow. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    connect_github_token: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TokenBody"];
+            };
+        };
+        responses: {
+            /** @description The connection as it now stands. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GithubStatusResponse"];
+                };
+            };
+            /** @description The body is not JSON. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No identity. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The caller is not an admin, a cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The body is not `application/json`. */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The body is JSON but not a token, the token is empty, GitHub refused it, or this machine's identity is fixed by `CRYSTALLINE_GITHUB_TOKEN` and no token may be stored here. */
             422: {
                 headers: {
                     [name: string]: unknown;
