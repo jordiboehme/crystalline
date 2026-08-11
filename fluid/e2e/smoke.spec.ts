@@ -61,10 +61,9 @@ async function signIn(
 /**
  * The engram page's own title.
  *
- * By its id rather than by role, because an engram body conventionally opens
- * with its own title as a heading, so the page carries two: the header's and
- * the document's. The id is the one the article is labelled by, so it is the
- * page's title by contract rather than by position.
+ * By its id: the header's h1 is the page's single rendering of the title
+ * (a body H1 that repeats it is folded by the reader), and the id is the
+ * one the article is labelled by, so it is the title by contract.
  */
 function engramTitle(page: Page) {
   return page.locator("h1#engram-title");

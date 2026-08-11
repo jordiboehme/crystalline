@@ -28,11 +28,19 @@ import { Markdown } from "./Markdown";
  * Mounted inside a router because a resolved wikilink navigates in place, so
  * it is a router link rather than an anchor.
  */
-async function renderMarkdown(source: string, wikilinks?: WikilinkResolver) {
+async function renderMarkdown(
+  source: string,
+  wikilinks?: WikilinkResolver,
+  foldTitle?: string,
+) {
   const result = render(
     <MemoryRouter>
       <ThemeProvider>
-        <Markdown source={source} {...(wikilinks ? { wikilinks } : {})} />
+        <Markdown
+          source={source}
+          {...(wikilinks ? { wikilinks } : {})}
+          {...(foldTitle === undefined ? {} : { foldTitle })}
+        />
       </ThemeProvider>
     </MemoryRouter>,
   );
@@ -144,6 +152,97 @@ describe("the markdown renderer", () => {
     expect(screen.getByText(/See \[\[Alpha\]\] for the rest\./)).toBeVisible();
     expect(screen.queryByRole("link")).toBeNull();
     expect(screen.queryByTitle("not resolved")).toBeNull();
+  });
+
+  it("folds a leading H1 that repeats the title the page already drew", async () => {
+    await renderMarkdown(
+      ["# Lantern Protocol", "", "Body.", "", "# Another Heading", ""].join(
+        "\n",
+      ),
+      undefined,
+      "Lantern Protocol",
+    );
+
+    expect(screen.getByText("Body.")).toBeVisible();
+    expect(
+      screen.queryByRole("heading", { name: "Lantern Protocol" }),
+    ).toBeNull();
+    // Only the opening one, and only when it repeats: a later heading is the
+    // document's own structure whatever it says.
+    expect(
+      screen.getByRole("heading", { name: "Another Heading" }),
+    ).toBeVisible();
+  });
+
+  it("keeps a leading H1 that says something else", async () => {
+    await renderMarkdown(
+      ["# Different", "", "Body.", ""].join("\n"),
+      undefined,
+      "Lantern Protocol",
+    );
+
+    expect(screen.getByRole("heading", { name: "Different" })).toBeVisible();
+  });
+
+  it("draws an observation bullet's category as a chip", async () => {
+    await renderMarkdown(
+      [
+        "## Observations",
+        "",
+        "- [gotcha] An unsigned handover is not a handover #protocol",
+        "",
+      ].join("\n"),
+    );
+
+    const chip = screen.getByText("[gotcha]");
+    expect(chip.className).toContain("font-mono");
+    // The line itself stays whole beside it, tag and all.
+    expect(
+      screen.getByText(/An unsigned handover is not a handover #protocol/),
+    ).toBeVisible();
+  });
+
+  it("draws a relation bullet's type as a chip", async () => {
+    await renderMarkdown(
+      ["## Relations", "", "- relates_to [[Harbor Signal Log]]", ""].join("\n"),
+    );
+
+    expect(screen.getByText("relates_to")).toBeVisible();
+    // With no resolver the target stays the literal text it was written as.
+    expect(screen.getByText(/\[\[Harbor Signal Log\]\]/)).toBeVisible();
+  });
+
+  it("draws a relation bullet's type as a chip once the target is a link", async () => {
+    await renderMarkdown(["- relates_to [[Alpha]]", ""].join("\n"), (inner) =>
+      inner === "Alpha"
+        ? { kind: "resolved", href: "/d/eng/e/alpha", label: "Alpha" }
+        : null,
+    );
+
+    const chip = screen.getByText("relates_to");
+    expect(chip.className).toContain("font-mono");
+    expect(screen.getByRole("link", { name: "Alpha" })).toHaveAttribute(
+      "href",
+      "/d/eng/e/alpha",
+    );
+  });
+
+  it("leaves an ordinary bullet whose first word precedes a link alone", async () => {
+    // A word before an element is not a relation: the engine reads one only
+    // where a `[[target]]` follows, so a chip here would claim a fact the
+    // index does not hold.
+    await renderMarkdown(
+      ["- See [the guide](https://example.com/guide) first.", ""].join("\n"),
+    );
+
+    expect(screen.queryByText("See")).toBeNull();
+    expect(screen.getByRole("link", { name: "the guide" })).toBeVisible();
+  });
+
+  it("leaves a bullet that is shaped like neither untouched", async () => {
+    await renderMarkdown(["- Just a line.", ""].join("\n"));
+
+    expect(screen.getByText("Just a line.")).toBeVisible();
   });
 
   it("never rewrites a wikilink inside code", async () => {

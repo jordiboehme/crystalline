@@ -36,10 +36,18 @@ vi.mock("../components/GraphCanvas", () => ({
 
 const apiMock = vi.mocked(api);
 
+/**
+ * An engram as one is written: the frontmatter, the title as an opening
+ * heading, prose, and the two structured bullet kinds. The heading and the
+ * bullets are here because what this screen must not do is draw any of them
+ * twice.
+ */
 const BODY = [
   "---",
   "title: Alpha",
   "---",
+  "",
+  "# Alpha",
   "",
   "Body prose linking [[Beta]] and [[Nowhere]] inline.",
   "",
@@ -80,7 +88,7 @@ function detailResponse(overrides: Record<string, unknown> = {}) {
     },
     observations: [
       {
-        line: 7,
+        line: 9,
         category: "decision",
         content: "we chose X",
         tags: ["tag"],
@@ -89,7 +97,7 @@ function detailResponse(overrides: Record<string, unknown> = {}) {
     ],
     relations: [
       {
-        line: 8,
+        line: 10,
         rel_type: "superseded_by",
         resolved: true,
         target: { domain: null, target: "Beta" },
@@ -400,20 +408,47 @@ describe("the engram page", () => {
     expect(await screen.findByText(/nothing links here yet/i)).toBeVisible();
   });
 
-  it("lists the observations and the relations the body declares", async () => {
+  it("draws an observation once, in the body, as what it is", async () => {
     serve();
 
     renderApp("/d/eng/e/alpha");
 
-    expect(await screen.findByText("we chose X")).toBeVisible();
-    // In brackets, the way it was written, which is what tells the category
-    // apart from the same word used as the engram's type.
+    // Once: the written line and its indexed reading are the same line, so a
+    // second list of them would be the same page saying one thing twice.
+    const hits = await screen.findAllByText(/we chose X/);
+    expect(hits).toHaveLength(1);
+    // And nothing is lost by that: in brackets, the way it was written, which
+    // is what tells the category apart from the engram's type, with the tag
+    // and the context still on the line.
+    const [line] = hits;
     expect(screen.getByText("[decision]")).toBeVisible();
-    expect(screen.getByText("#tag")).toBeVisible();
-    // Scoped to the Relations panel: the same relation type also opens the
-    // markdown bullet it was declared in, further up the page.
-    const relations = screen.getByRole("region", { name: "Relations" });
-    expect(within(relations).getByText("superseded_by")).toBeVisible();
+    expect(line).toHaveTextContent("#tag");
+    expect(line).toHaveTextContent("(context)");
+  });
+
+  it("draws a relation once, in the body, as what it is", async () => {
+    serve();
+
+    renderApp("/d/eng/e/alpha");
+
+    const body = await screen.findByRole("article");
+    const relType = await within(body).findByText("superseded_by");
+    expect(relType).toBeVisible();
+    // The type is on the bullet the target is on, and the target is the link
+    // the graph placed rather than a second copy of the same fact.
+    expect(within(body).getAllByText("superseded_by")).toHaveLength(1);
+  });
+
+  it("draws the title once", async () => {
+    serve();
+
+    renderApp("/d/eng/e/alpha");
+
+    // The header's h1 is the page's rendering of the title; the body opens
+    // with the same line and it folds away rather than repeating it.
+    const headings = await screen.findAllByRole("heading", { name: "Alpha" });
+    expect(headings).toHaveLength(1);
+    expect(headings[0]).toHaveAttribute("id", "engram-title");
   });
 
   it("copies the engram's crystalline address", async () => {

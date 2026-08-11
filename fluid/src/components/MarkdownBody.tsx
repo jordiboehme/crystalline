@@ -20,10 +20,16 @@
  * Mermaid is loaded only when a document actually draws one. The library is
  * larger than the rest of this app put together, so it lives behind a lazy
  * import and a fence that never appears never costs a byte.
+ *
+ * And the document renders once. A caller that has already drawn the title as
+ * a page heading says so through `foldTitle`, and the body's opening `# Title`
+ * folds away rather than repeating it; an observation or relation bullet is
+ * drawn here with its category or rel type as a chip, so the page has no
+ * reason to list the same lines a second time somewhere else.
  */
 
-import { Suspense, lazy, useMemo } from "react";
-import type { ComponentProps } from "react";
+import { Children, Suspense, isValidElement, lazy, useMemo } from "react";
+import type { ComponentProps, ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import type { Components } from "react-markdown";
 import rehypeHighlight from "rehype-highlight";
@@ -32,6 +38,7 @@ import remarkGfm from "remark-gfm";
 
 import { WIKILINK, referenceState } from "../wikilinks";
 import type { WikilinkResolution, WikilinkResolver } from "../wikilinks";
+import { Chip } from "./primitives";
 
 const MermaidDiagram = lazy(() => import("./MermaidDiagram"));
 
@@ -51,6 +58,34 @@ type RehypePlugins = ComponentProps<typeof ReactMarkdown>["rehypePlugins"];
  * document, so a thematic break further down is untouched.
  */
 const FRONTMATTER = /^---\r?\n[\s\S]*?\r?\n---[ \t]*(\r?\n|$)/;
+
+/**
+ * The document's opening `# Title`.
+ *
+ * Anchored at the start and ended at the line break, so it is the first line
+ * of the document rather than any `#` further down.
+ */
+const LEADING_H1 = /^\s*#[ \t]+(.+?)[ \t]*(?:\r?\n|$)/;
+
+/**
+ * The document's own opening `# Title`, when it repeats the indexed title the
+ * page header already renders. Fold it and the page says everything once;
+ * an opening H1 that says something ELSE is content and stays.
+ *
+ * A text-level strip beside the frontmatter one rather than a rule in the
+ * component map, because a component is handed one heading at a time and
+ * cannot know which one is first.
+ */
+function foldLeadingTitle(source: string, title: string | undefined): string {
+  if (title === undefined) {
+    return source;
+  }
+  const match = LEADING_H1.exec(source);
+  if (match && match[1] === title.trim()) {
+    return source.slice(match[0].length);
+  }
+  return source;
+}
 
 /**
  * A hast node, narrowed to what this file reads off one.
@@ -213,6 +248,75 @@ function languageOf(node: HastNode | undefined): string | null {
   return null;
 }
 
+/** An observation line's leading `[category]`, as the parser reads one. */
+const OBSERVATION_MARK = /^\[([A-Za-z0-9_-]+)\][ \t]+/;
+
+/** A relation line's type, where its `[[target]]` is still text. */
+const RELATION_MARK = /^([A-Za-z][A-Za-z0-9_-]*)[ \t]+(?=\[\[)/;
+
+/** The same type, where the target beside it is already an element. */
+const RELATION_BEFORE_ELEMENT = /^([A-Za-z][A-Za-z0-9_-]*)[ \t]+$/;
+
+/** Whether a rendered child is one of the wikilink rewrite's own elements. */
+function isWikilink(part: ReactNode): boolean {
+  return (
+    isValidElement<{ node?: unknown }>(part) &&
+    wikilinkKind(part.props.node) !== null
+  );
+}
+
+/** A marked line: the mark as a chip, then the rest of the line as written. */
+function chipped(mark: string, rest: string, parts: ReactNode[]): ReactNode {
+  return [
+    <Chip mono key="mark">
+      {mark}
+    </Chip>,
+    " ",
+    rest,
+    ...parts.slice(1),
+  ];
+}
+
+/**
+ * The merged rendering the editor already does, for the reading page: an
+ * observation bullet's `[category]` and a relation bullet's rel type become
+ * chips in place, and the bullet is the one place the line renders. A bullet
+ * shaped like neither is handed back untouched. So is a LOOSE list item
+ * (blank-line separated, where the renderer wraps the text in a p element):
+ * its head child is an element rather than a string, so it keeps plain
+ * rendering - an accepted degradation, since indexed observation and relation
+ * bullets are tight single-line list items by construction.
+ *
+ * A rel type is claimed only where a `[[target]]` follows it, either as the
+ * text it was written as or as the element the wikilink rewrite made of it.
+ * The engine reads a relation the same way, so a first word before any other
+ * element - a link, an emphasis - is prose and stays prose.
+ */
+function structuredBullet(children: ReactNode): ReactNode {
+  const parts = Children.toArray(children);
+  const head = parts[0];
+  if (typeof head !== "string") {
+    return children;
+  }
+  const observation = OBSERVATION_MARK.exec(head);
+  if (observation) {
+    return chipped(
+      `[${observation[1] ?? ""}]`,
+      head.slice(observation[0].length),
+      parts,
+    );
+  }
+  const relation =
+    RELATION_MARK.exec(head) ??
+    (isWikilink(parts[1]) ? RELATION_BEFORE_ELEMENT.exec(head) : null);
+  if (relation) {
+    // Both shapes end at the whitespace after the type, so what is left of
+    // the head is the rest of the line either way - empty, in the second.
+    return chipped(relation[1] ?? "", head.slice(relation[0].length), parts);
+  }
+  return children;
+}
+
 /**
  * How each element is drawn.
  *
@@ -240,7 +344,7 @@ const components: Components = {
   ol: ({ children }) => (
     <ol className="my-3 list-decimal pl-6 leading-relaxed">{children}</ol>
   ),
-  li: ({ children }) => <li className="my-1">{children}</li>,
+  li: ({ children }) => <li className="my-1">{structuredBullet(children)}</li>,
   a: ({ children, href, node }) => {
     // A resolved wikilink points at a screen of this app, so it navigates
     // in place rather than reloading it. The route was built by the resolver
@@ -355,9 +459,11 @@ function DiagramSource({ source }: { source: string }) {
 export default function MarkdownBody({
   source,
   wikilinks,
+  foldTitle,
 }: {
   source: string;
   wikilinks?: WikilinkResolver;
+  foldTitle?: string;
 }) {
   const rehypePlugins = useMemo<RehypePlugins>(
     () => [
@@ -377,7 +483,7 @@ export default function MarkdownBody({
         rehypePlugins={rehypePlugins}
         components={components}
       >
-        {source.replace(FRONTMATTER, "")}
+        {foldLeadingTitle(source.replace(FRONTMATTER, ""), foldTitle)}
       </ReactMarkdown>
     </div>
   );

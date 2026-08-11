@@ -29,9 +29,15 @@ export interface MarkdownProps {
    * where one goes.
    */
   wikilinks?: WikilinkResolver;
+  /**
+   * The title the caller has already drawn as a page heading, when it has.
+   * The body's own opening `# Title` folds away where it repeats this one, so
+   * the screen says it once; absent, every heading in the document is drawn.
+   */
+  foldTitle?: string;
 }
 
-export function Markdown({ source, wikilinks }: MarkdownProps) {
+export function Markdown({ source, wikilinks, foldTitle }: MarkdownProps) {
   return (
     <Suspense
       fallback={
@@ -42,7 +48,11 @@ export function Markdown({ source, wikilinks }: MarkdownProps) {
         </p>
       }
     >
-      <MarkdownBody source={source} {...(wikilinks ? { wikilinks } : {})} />
+      <MarkdownBody
+        source={source}
+        {...(wikilinks ? { wikilinks } : {})}
+        {...(foldTitle === undefined ? {} : { foldTitle })}
+      />
     </Suspense>
   );
 }

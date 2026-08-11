@@ -17,11 +17,9 @@
  * conditional write presents back as `expected_checksum`. Keeping it is what
  * makes editing from this screen possible without a re-read.
  *
- * The observation and relation bullets appear twice on purpose: once in the
- * body, because they are lines of the markdown somebody wrote and cutting them
- * out would show a document nobody has, and once as lists, which is where the
- * category, the tags, the context and whether the target resolved are legible.
- * The two are the same lines read two ways rather than a duplicate.
+ * The observation and relation bullets render once, in the body, in chip
+ * form: the written line and its indexed reading are the same line drawn
+ * one way, and the details panel deliberately repeats none of it.
  */
 
 import { useQuery } from "@tanstack/react-query";
@@ -30,11 +28,7 @@ import { Link, useNavigate, useParams } from "react-router";
 
 import { ApiProblem, problemDetail } from "../api/client";
 import { DOMAINS_QUERY_KEY, fetchDomains } from "../api/domains";
-import type {
-  EngramDetail,
-  EngramObservation,
-  EngramReference,
-} from "../api/engram";
+import type { EngramDetail } from "../api/engram";
 import { engramDetailKey, fetchEngramDetail } from "../api/engram";
 import type { Backlink } from "../api/graph";
 import {
@@ -57,7 +51,6 @@ import type { LifecycleLink } from "../components/LifecycleBanner";
 import { Markdown } from "../components/Markdown";
 import { MoveDialog } from "../components/MoveDialog";
 import { NeighborhoodGraph } from "../components/NeighborhoodGraph";
-import { ReferenceLink } from "../components/ReferenceLink";
 import { RetireDialog } from "../components/RetireDialog";
 import { Skeleton } from "../components/Skeleton";
 import { domainRoute, editRoute, engramRoute, graphRoute } from "../paths";
@@ -276,10 +269,17 @@ export default function EngramPage() {
       <div className="grid gap-8 lg:grid-cols-[minmax(0,1fr)_18rem]">
         <div className="flex min-w-0 flex-col gap-8">
           <article aria-labelledby="engram-title">
-            <Markdown source={engram.content} wikilinks={wikilinks} />
+            {/*
+              The heading above is the page's rendering of the title, so the
+              body's own opening `# Title` folds away rather than repeating
+              it.
+            */}
+            <Markdown
+              source={engram.content}
+              wikilinks={wikilinks}
+              foldTitle={engram.title}
+            />
           </article>
-          <Observations observations={engram.observations} />
-          <Relations relations={engram.relations} resolve={wikilinks} />
           <div className="print:hidden">
             <GraphSection domain={engram.domain} permalink={engram.permalink} />
           </div>
@@ -376,94 +376,6 @@ function chain(
     }
   }
   return [...merged.values()];
-}
-
-/** The observation bullets, as the structure they are rather than as prose. */
-function Observations({ observations }: { observations: EngramObservation[] }) {
-  if (observations.length === 0) {
-    return null;
-  }
-  return (
-    <section aria-labelledby="engram-observations">
-      <h2 id="engram-observations" className="mb-2 text-lg font-semibold">
-        Observations
-      </h2>
-      <ul className="flex flex-col gap-2 text-sm">
-        {observations.map((observation) => (
-          <li
-            key={`${String(observation.line)}-${observation.content}`}
-            className="flex flex-wrap items-baseline gap-2"
-          >
-            {observation.category !== null && (
-              // In the brackets it was written in, which is what tells it
-              // apart from the same word used as a type or a tag.
-              <span className="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-xs text-slate-600 dark:bg-slate-800 dark:text-slate-300">
-                [{observation.category}]
-              </span>
-            )}
-            <span>{observation.content}</span>
-            {observation.tags.map((tag) => (
-              <span
-                key={tag}
-                className="text-xs text-slate-500 dark:text-slate-400"
-              >
-                #{tag}
-              </span>
-            ))}
-            {observation.context !== null && (
-              <span className="text-xs text-slate-500 dark:text-slate-400">
-                ({observation.context})
-              </span>
-            )}
-          </li>
-        ))}
-      </ul>
-    </section>
-  );
-}
-
-/**
- * The relation bullets. A target the index resolved and the graph placed is a
- * link; one it did not is named and marked, never linked somewhere invented.
- */
-function Relations({
-  relations,
-  resolve,
-}: {
-  relations: EngramReference[];
-  resolve: WikilinkResolver;
-}) {
-  if (relations.length === 0) {
-    return null;
-  }
-  return (
-    <section aria-labelledby="engram-relations">
-      <h2 id="engram-relations" className="mb-2 text-lg font-semibold">
-        Relations
-      </h2>
-      <ul className="flex flex-col gap-2 text-sm">
-        {relations.map((relation) => {
-          const inner = innerOf(relation.target);
-          const resolution = resolve(inner);
-          return (
-            <li
-              key={`${String(relation.line)}-${relation.relType ?? ""}-${inner}`}
-              className="flex flex-wrap items-baseline gap-2"
-            >
-              <span className="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-xs text-slate-600 dark:bg-slate-800 dark:text-slate-300">
-                {relation.relType ?? "relates to"}
-              </span>
-              <ReferenceLink
-                label={relation.target.target}
-                href={resolution?.kind === "resolved" ? resolution.href : null}
-                state={referenceState(resolution, relation.resolved)}
-              />
-            </li>
-          );
-        })}
-      </ul>
-    </section>
-  );
 }
 
 /**
