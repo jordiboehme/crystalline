@@ -73,6 +73,11 @@ describe("MermaidDiagram", () => {
       primaryColor: "#ccfbf1",
       primaryTextColor: "#0f172a",
       primaryBorderColor: "#0f766e",
+      // Named rather than left to `base`, which would otherwise derive a
+      // highlighter-yellow note and an inverted title color.
+      noteBkgColor: "#f1f5f9",
+      noteTextColor: "#0f172a",
+      titleColor: "#0f172a",
     });
   });
 
@@ -87,6 +92,9 @@ describe("MermaidDiagram", () => {
       primaryColor: "#134e4a",
       primaryTextColor: "#e2e8f0",
       primaryBorderColor: "#2dd4bf",
+      noteBkgColor: "#1e293b",
+      noteTextColor: "#e2e8f0",
+      titleColor: "#e2e8f0",
     });
   });
 

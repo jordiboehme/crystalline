@@ -68,6 +68,9 @@ describe("fence previews", () => {
     expect(config?.themeVariables).toMatchObject({
       primaryColor: "#ccfbf1",
       primaryBorderColor: "#0f766e",
+      noteBkgColor: "#f1f5f9",
+      noteTextColor: "#0f172a",
+      titleColor: "#0f172a",
     });
     view.destroy();
   });

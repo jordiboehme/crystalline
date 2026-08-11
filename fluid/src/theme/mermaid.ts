@@ -23,7 +23,20 @@
 
 import type { MermaidConfig } from "mermaid";
 
-/** The diagram palette per scheme: accent fills, slate lines, app text. */
+/**
+ * The diagram palette per scheme: accent fills, slate lines, app text.
+ *
+ * Three of these are here because `base` DERIVES everything it is not told.
+ * Its theme constructor sets `noteBkgColor: "#fff5ad"` and `noteTextColor:
+ * "#333"` outright, so the `||` fallbacks further down never fire and a
+ * sequence or class diagram's notes come out in mermaid's yellow in BOTH
+ * schemes - a highlighter box on a slate page. And `titleColor` falls back to
+ * `tertiaryTextColor`, which is the channel inversion of `tertiaryColor`:
+ * inverting the dark scheme's `#0f172a` gives the warm cream `#f0e8d5`, so
+ * subgraph and cluster titles would be the one thing on the page that is not
+ * teal or slate. Naming all three is what closes that: overrides are applied
+ * again AFTER the derivation pass, so a named variable always wins.
+ */
 const VARIABLES = {
   dark: {
     darkMode: true,
@@ -34,6 +47,9 @@ const VARIABLES = {
     lineColor: "#64748b",
     secondaryColor: "#1e293b",
     tertiaryColor: "#0f172a",
+    noteBkgColor: "#1e293b",
+    noteTextColor: "#e2e8f0",
+    titleColor: "#e2e8f0",
     fontFamily: "ui-sans-serif, system-ui, sans-serif",
   },
   light: {
@@ -44,6 +60,9 @@ const VARIABLES = {
     lineColor: "#475569",
     secondaryColor: "#f1f5f9",
     tertiaryColor: "#ffffff",
+    noteBkgColor: "#f1f5f9",
+    noteTextColor: "#0f172a",
+    titleColor: "#0f172a",
     fontFamily: "ui-sans-serif, system-ui, sans-serif",
   },
 } as const;
