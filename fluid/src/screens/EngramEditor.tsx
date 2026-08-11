@@ -45,6 +45,7 @@ import {
   crystallineCompletions,
   crystallineLines,
 } from "../editor/crystallineLines";
+import { EditorToolbar } from "../editor/EditorToolbar";
 import { fenceMono } from "../editor/fenceMono";
 import { fencePreviews } from "../editor/fencePreviews";
 import { FindingsPanel, jumpToLine } from "../editor/FindingsPanel";
@@ -52,6 +53,7 @@ import { frontmatterFold } from "../editor/frontmatterFold";
 import { FrontmatterForm } from "../editor/FrontmatterForm";
 import { livePreview } from "../editor/preview";
 import { RAW_MONO, baseExtensions, lineSeparatorFor } from "../editor/setup";
+import { formattingKeymap } from "../editor/toolbar";
 import { saveKeymap, useEditorSession } from "../editor/useEditorSession";
 import {
   wikilinkChips,
@@ -271,6 +273,12 @@ function surfaceExtensions(options: SurfaceOptions): Extension[] {
         ]
       : []),
     saveKeymap,
+    // The toolbar's own shortcuts. Beside `saveKeymap` rather than inside the
+    // preview compartment: Mod-b and Mod-i are typing help like the
+    // completions below, and raw mode is still markdown being written. Its
+    // `Prec.high` wrapper - not its position here - is what beats
+    // defaultKeymap's own Mod-i; see `formattingKeymap`.
+    formattingKeymap,
     // Typing help rather than preview, so it stays on in raw mode: outside
     // the compartment the Raw toggle empties.
     autocompletion({
@@ -935,6 +943,13 @@ function Surface({
       */}
       <div className="grid gap-8 lg:grid-cols-[minmax(0,1fr)_18rem]">
         <div className="rounded border border-slate-200 dark:border-slate-800">
+          {/*
+            The format bar sits inside the card, above the text it edits, and
+            takes the live view rather than the session: what it does are
+            transactions on the buffer, which in a room is the shared document
+            and everywhere is the file.
+          */}
+          <EditorToolbar view={view} />
           <CmEditor
             initialDoc={mountText}
             extensions={extensions}

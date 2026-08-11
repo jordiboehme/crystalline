@@ -9,6 +9,7 @@
  * leaving somebody editing a page that now 404s.
  */
 
+import { undo } from "@codemirror/commands";
 import { EditorView } from "@codemirror/view";
 import { act, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -22,6 +23,7 @@ import type { CollabConflict, CollabSession } from "../collab/useCollabSession";
 import { useCollabSession } from "../collab/useCollabSession";
 import type { Draft } from "../editor/drafts";
 import { readDraft } from "../editor/drafts";
+import { docText } from "../editor/setup";
 import { SAVE_EVENT } from "../editor/useEditorSession";
 import {
   answersFor,
@@ -253,6 +255,69 @@ describe("the engram editor", () => {
     await userEvent.click(screen.getByRole("button", { name: "Save" }));
     await screen.findByText("Saved");
     expect(putBody(0)).toEqual({ content: CONTENT });
+  });
+
+  it("inserts a table from the format bar and leaves one undo behind", async () => {
+    serveEditor();
+    renderApp("/d/eng/edit/alpha");
+    const editor = await screen.findByLabelText("Engram source");
+    await waitFor(() => {
+      expect(editor.textContent).toContain("A rule.");
+    });
+
+    const bar = screen.getByRole("toolbar", { name: "Formatting" });
+    const view = mountedView(editor);
+    // The cursor opens at the top of the file, which is inside the
+    // frontmatter; an author inserting a table has it down in the prose.
+    act(() => {
+      view.dispatch({ selection: { anchor: view.state.doc.length } });
+    });
+    await userEvent.click(
+      within(bar).getByRole("button", { name: "Insert table" }),
+    );
+
+    // The skeleton landed once - a second copy would be the command
+    // dispatching twice - and the caret went back to the buffer, which is
+    // where the next thing typed belongs.
+    const text = docText(view.state);
+    expect(text.split("| Column | Column |")).toHaveLength(2);
+    expect(text).toContain("| --- | --- |");
+    expect(view.hasFocus).toBe(true);
+    await screen.findByText("Unsaved changes");
+
+    // One undo takes the whole block back out. The command tags itself
+    // `input` rather than `input.type`, which is what keeps the history from
+    // folding it into the typing around it - or splitting it per character.
+    act(() => {
+      undo(view);
+    });
+    expect(docText(view.state)).toBe(CONTENT);
+  });
+
+  it("runs format-bar buttons from the keyboard", async () => {
+    serveEditor();
+    renderApp("/d/eng/edit/alpha");
+    const editor = await screen.findByLabelText("Engram source");
+    await waitFor(() => {
+      expect(editor.textContent).toContain("A rule.");
+    });
+    const bar = screen.getByRole("toolbar", { name: "Formatting" });
+    const view = mountedView(editor);
+    act(() => {
+      view.dispatch({ selection: { anchor: view.state.doc.length } });
+    });
+
+    // Ordinary tab stops running on the ordinary button keys: Space and
+    // Enter both activate, because nothing here intercepts a key - they are
+    // native buttons in a named toolbar.
+    within(bar).getByRole("button", { name: "Bulleted list" }).focus();
+    await userEvent.keyboard(" ");
+    expect(docText(view.state)).toContain("- ");
+
+    within(bar).getByRole("button", { name: "Insert diagram" }).focus();
+    await userEvent.keyboard("{Enter}");
+    expect(docText(view.state)).toContain("```mermaid");
+    expect(view.hasFocus).toBe(true);
   });
 
   it("keeps a language-tagged fence in the code face while prose is proportional", async () => {
@@ -1030,6 +1095,20 @@ describe("the engram editor in a session", () => {
     });
     expect(flush).toHaveBeenCalled();
     expect(puts()).toHaveLength(0);
+  });
+
+  it("a format-bar insertion reaches the shared text exactly once", async () => {
+    const { editor, ytext } = await openRoom();
+    const view = mountedView(editor);
+    act(() => {
+      view.dispatch({ selection: { anchor: view.state.doc.length } });
+    });
+    await userEvent.click(screen.getByRole("button", { name: "Insert table" }));
+    // The command is a plain transaction on the bound buffer, so the binding
+    // writes it into Y.Text once. A skeleton that had been pushed into the
+    // shared text by hand as well would be in here twice.
+    expect(ytext.toJSON().split("| Column | Column |")).toHaveLength(2);
+    expect(ytext.toJSON()).toBe(docText(view.state));
   });
 
   it("shows a refused session save in the server's own words", async () => {

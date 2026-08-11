@@ -19,7 +19,9 @@
  */
 
 import type { Extension } from "@codemirror/state";
+import type { EditorView } from "@codemirror/view";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useState } from "react";
 import { Link, useParams } from "react-router";
 
 import { problemDetail } from "../api/client";
@@ -31,11 +33,14 @@ import {
   saveManifest,
 } from "../api/domain";
 import { useAuth } from "../auth/AuthContext";
+import { BUTTON } from "../components/primitives";
 import { Skeleton } from "../components/Skeleton";
 import CmEditor from "../editor/CmEditor";
 import { ConflictDialog } from "../editor/ConflictDialog";
+import { EditorToolbar } from "../editor/EditorToolbar";
 import { FindingsPanel, jumpToLine } from "../editor/FindingsPanel";
 import { RAW_MONO, baseExtensions, lineSeparatorFor } from "../editor/setup";
+import { formattingKeymap } from "../editor/toolbar";
 import { saveKeymap, useEditorSession } from "../editor/useEditorSession";
 import { manifestRoute } from "../paths";
 import { useTheme } from "../theme/context";
@@ -71,6 +76,10 @@ function extensionsFor(content: string, dark: boolean): Extension[] {
     ...lineSeparatorFor(content),
     ...baseExtensions(dark),
     saveKeymap,
+    // The format bar's shortcuts. A MANIFEST is markdown like any engram and
+    // its author forgets the syntax just as readily; the `Prec.high` wrapper
+    // inside `formattingKeymap` is what keeps Mod-i off defaultKeymap.
+    formattingKeymap,
     RAW_MONO,
   ];
 }
@@ -119,6 +128,12 @@ function EditorSurface({
   // the fallback only satisfies the types.
   const account = user?.name ?? "anonymous";
   const dark = resolved === "dark";
+  /**
+   * The live view as state rather than through the session's ref: the format
+   * bar is rendered beside the buffer, and a ref read during render would hand
+   * it `null` forever - filling the ref schedules no re-render of its own.
+   */
+  const [view, setView] = useState<EditorView | null>(null);
 
   // The shared shell: buffer, checksum, dirty state, the dry-run gate,
   // drafts, the Mod-S save and the 412 flow. What this screen adds is the
@@ -169,18 +184,22 @@ function EditorSurface({
               Unsaved changes
             </p>
           )}
+          {/*
+            The same two tiers the engram editor's header wears, drawn from
+            the shared primitives rather than hand-rolled here: Save keeps the
+            work, Done is the act of being finished with it and the one that
+            leaves. The classes were a copy of `BUTTON.secondary` for both,
+            which made the two editors' headers drift apart.
+          */}
           <button
             type="button"
             onClick={session.requestSave}
             disabled={session.saving || session.hardErrors > 0}
-            className="rounded border border-slate-300 px-3 py-1 text-sm hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none disabled:opacity-50 dark:border-slate-700 dark:hover:bg-slate-800"
+            className={BUTTON.secondary}
           >
             Save
           </button>
-          <Link
-            to={manifestRoute(domain)}
-            className="rounded border border-slate-300 px-3 py-1 text-sm hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800"
-          >
+          <Link to={manifestRoute(domain)} className={BUTTON.primary}>
             Done
           </Link>
         </div>
@@ -220,11 +239,17 @@ function EditorSurface({
       )}
       <div className="grid gap-8 lg:grid-cols-[minmax(0,1fr)_18rem]">
         <div className="rounded border border-slate-200 dark:border-slate-800">
+          {/* The same bar the engram editor carries, over the same kind of
+              text: this buffer is markdown too. */}
+          <EditorToolbar view={view} />
           <CmEditor
             initialDoc={manifest.markdown}
             extensions={extensionsFor(manifest.markdown, dark)}
             ariaLabel={ARIA_LABEL}
-            onReady={session.onReady}
+            onReady={(ready) => {
+              session.onReady(ready);
+              setView(ready);
+            }}
             onDocChanged={session.setBuffer}
           />
         </div>

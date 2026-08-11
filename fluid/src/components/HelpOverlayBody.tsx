@@ -18,6 +18,8 @@ const SHORTCUTS: { keys: string; does: string }[] = [
   { keys: "?", does: "This help" },
   { keys: "Cmd/Ctrl S", does: "Save (in the editor)" },
   { keys: "Cmd/Ctrl F", does: "Find in the document (in the editor)" },
+  { keys: "Cmd/Ctrl B", does: "Bold (in the editor)" },
+  { keys: "Cmd/Ctrl I", does: "Italic (in the editor)" },
   { keys: "Esc", does: "Close dialogs and menus" },
 ];
 
