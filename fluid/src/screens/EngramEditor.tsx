@@ -16,6 +16,7 @@ import type { EditorView } from "@codemirror/view";
 import { keymap } from "@codemirror/view";
 import type { QueryClient } from "@tanstack/react-query";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { Check } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router";
 import type { YSyncConfig } from "y-codemirror.next";
@@ -35,6 +36,8 @@ import { CollabConflictDialog } from "../collab/CollabConflictDialog";
 import { PresenceChips } from "../collab/PresenceChips";
 import type { CollabConflict, CollabSession } from "../collab/useCollabSession";
 import { fileSpace, useCollabSession } from "../collab/useCollabSession";
+import { Breadcrumbs, crumbsOf } from "../components/Breadcrumbs";
+import { BUTTON } from "../components/primitives";
 import { Skeleton } from "../components/Skeleton";
 import CmEditor from "../editor/CmEditor";
 import { ConflictDialog } from "../editor/ConflictDialog";
@@ -46,7 +49,7 @@ import { fencePreviews } from "../editor/fencePreviews";
 import { FindingsPanel, jumpToLine } from "../editor/FindingsPanel";
 import { FrontmatterForm } from "../editor/FrontmatterForm";
 import { livePreview } from "../editor/preview";
-import { baseExtensions, lineSeparatorFor } from "../editor/setup";
+import { RAW_MONO, baseExtensions, lineSeparatorFor } from "../editor/setup";
 import { saveKeymap, useEditorSession } from "../editor/useEditorSession";
 import {
   wikilinkChips,
@@ -72,7 +75,10 @@ const ARIA_LABEL = "Engram source";
  */
 function previewConfig(off: boolean, dark: boolean): Extension {
   return off
-    ? []
+    ? // Raw is deliberately the source view, so the whole buffer goes back to
+      // mono: the shared theme sets prose proportional, and this is the one
+      // place that undoes it.
+      [RAW_MONO]
     : [livePreview(), wikilinkChips(), crystallineLines(), fencePreviews(dark)];
 }
 
@@ -371,7 +377,10 @@ function SessionStatus({ collab }: { collab: CollabSession }) {
         <p className="text-sm text-slate-500 dark:text-slate-400">Saving...</p>
       )}
       {collab.saveState === "ok" && (
-        <p className="text-sm text-slate-500 dark:text-slate-400">Saved</p>
+        <p className="inline-flex items-center gap-1 text-sm text-slate-500 dark:text-slate-400">
+          <Check aria-hidden="true" size={14} strokeWidth={2} />
+          Saved
+        </p>
       )}
     </>
   );
@@ -695,96 +704,132 @@ function Surface({
 
   return (
     <div className="flex flex-col gap-4">
-      <header className="flex flex-wrap items-baseline justify-between gap-3">
-        <div className="flex flex-wrap items-baseline gap-3">
-          <h1 className="text-xl font-semibold">Editing {engram.title}</h1>
-          <span className="font-mono text-xs text-slate-500 dark:text-slate-400">
-            {engram.permalink}
-          </span>
-          {inRoom && (
-            <PresenceChips
-              participants={collab.participants}
-              offline={collab.status !== "connected"}
-            />
-          )}
-        </div>
-        <div className="flex items-center gap-2">
-          {/*
-            Who reports on saving depends on who does it. In a room the
-            server saves and its control channel is the only truth about
-            whether that worked; on the solo surface it is this tab's own
-            mutation.
-          */}
-          {inRoom ? (
-            <SessionStatus collab={collab} />
-          ) : (
-            <>
-              {session.notice && (
-                <p
-                  role={session.notice.kind === "problem" ? "alert" : "status"}
-                  className={
-                    session.notice.kind === "problem"
-                      ? "rounded bg-red-50 px-2 py-1 text-sm text-red-800 dark:bg-red-950 dark:text-red-200"
-                      : "text-sm text-slate-500 dark:text-slate-400"
-                  }
-                >
-                  {session.notice.text}
-                </p>
-              )}
-              {session.dirty && !session.notice && (
-                <p className="text-sm text-slate-500 dark:text-slate-400">
-                  Unsaved changes
-                </p>
-              )}
-            </>
-          )}
-          {/*
-            A toggle, so the label names the thing being switched and
-            `aria-pressed` carries the state. A button whose text flipped to
-            "Preview" while announcing itself as pressed would be telling a
-            screen reader the opposite of what it shows.
-          */}
-          <button
-            type="button"
-            aria-pressed={raw}
-            onClick={() => {
-              const next = !raw;
-              setRaw(next);
-              session.viewRef.current?.dispatch({
-                effects: preview.reconfigure(
-                  previewConfig(next, resolved === "dark"),
-                ),
-              });
-            }}
-            className={
-              raw
-                ? "rounded border border-sky-500 bg-sky-50 px-3 py-1 text-sm text-sky-800 focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:bg-sky-950 dark:text-sky-200"
-                : "rounded border border-slate-300 px-3 py-1 text-sm hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800"
-            }
-          >
-            Raw
-          </button>
-          <button
-            type="button"
-            onClick={session.requestSave}
-            // In a room the client's verdict never gates a save: the server
-            // owns the write, it debounce-saves whatever the shared text
-            // holds regardless of this tab, and its own parse refusal is
-            // the authoritative gate - it comes back as a save-failed
-            // control in the server's words. A button disabled here while
-            // Mod-S flushed and the server saved anyway would be a control
-            // lying about what is happening.
-            disabled={session.saving || (!inRoom && session.hardErrors > 0)}
-            className="rounded border border-slate-300 px-3 py-1 text-sm hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none disabled:opacity-50 dark:border-slate-700 dark:hover:bg-slate-800"
-          >
-            Save
-          </button>
-          <Link
-            to={engramRoute(engram.domain, engram.permalink)}
-            className="rounded border border-slate-300 px-3 py-1 text-sm hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800"
-          >
-            Done
-          </Link>
+      <header className="flex flex-col gap-2">
+        {/*
+          Where this engram lives, above its name - the same trail the read
+          page carries, so moving between reading and editing does not move
+          the address to a different place on the screen.
+        */}
+        <Breadcrumbs
+          crumbs={crumbsOf(engram.domain, engram.permalink, engram.title)}
+        />
+        <div className="flex flex-wrap items-baseline justify-between gap-3">
+          <div className="flex flex-wrap items-baseline gap-3">
+            <h1 className="text-title">Editing {engram.title}</h1>
+            {/*
+              The permalink stays beside the title rather than folding into
+              the trail above, which carries folders and the title but never
+              the slug. This screen has no details panel to hold the address,
+              and a save that renamed the engram through its frontmatter
+              answers at a new one: this line is where an author sees that
+              happen.
+            */}
+            <span className="font-mono text-caption text-slate-500 dark:text-slate-400">
+              {engram.permalink}
+            </span>
+            {inRoom && (
+              <PresenceChips
+                participants={collab.participants}
+                offline={collab.status !== "connected"}
+              />
+            )}
+          </div>
+          <div className="flex items-center gap-2">
+            {/*
+              Who reports on saving depends on who does it. In a room the
+              server saves and its control channel is the only truth about
+              whether that worked; on the solo surface it is this tab's own
+              mutation.
+            */}
+            {inRoom ? (
+              <SessionStatus collab={collab} />
+            ) : (
+              <>
+                {session.notice && (
+                  <p
+                    role={
+                      session.notice.kind === "problem" ? "alert" : "status"
+                    }
+                    className={
+                      session.notice.kind === "problem"
+                        ? "rounded bg-red-50 px-2 py-1 text-sm text-red-800 dark:bg-red-950 dark:text-red-200"
+                        : "inline-flex items-center gap-1 text-sm text-slate-500 dark:text-slate-400"
+                    }
+                  >
+                    {/*
+                      The done notice is the solo surface's save receipt -
+                      the same "Saved" the room reports, so it wears the same
+                      tick. A problem notice is the server's words and gets
+                      no mark.
+                    */}
+                    {session.notice.kind === "done" && (
+                      <Check aria-hidden="true" size={14} strokeWidth={2} />
+                    )}
+                    {session.notice.text}
+                  </p>
+                )}
+                {session.dirty && !session.notice && (
+                  <p className="text-sm text-slate-500 dark:text-slate-400">
+                    Unsaved changes
+                  </p>
+                )}
+              </>
+            )}
+            {/*
+              A toggle, so the label names the thing being switched and
+              `aria-pressed` carries the state. A button whose text flipped to
+              "Preview" while announcing itself as pressed would be telling a
+              screen reader the opposite of what it shows.
+            */}
+            <button
+              type="button"
+              aria-pressed={raw}
+              onClick={() => {
+                const next = !raw;
+                setRaw(next);
+                session.viewRef.current?.dispatch({
+                  effects: preview.reconfigure(
+                    previewConfig(next, resolved === "dark"),
+                  ),
+                });
+              }}
+              className={
+                // A quiet control until it is on: the ghost tier is the base,
+                // and the pressed state is the accent wash the filter chips
+                // wear, so "on" reads the same everywhere in the app.
+                raw
+                  ? `${BUTTON.ghost} bg-accent-50 text-accent-800 dark:bg-accent-950 dark:text-accent-200`
+                  : BUTTON.ghost
+              }
+            >
+              Raw
+            </button>
+            <button
+              type="button"
+              onClick={session.requestSave}
+              // In a room the client's verdict never gates a save: the server
+              // owns the write, it debounce-saves whatever the shared text
+              // holds regardless of this tab, and its own parse refusal is
+              // the authoritative gate - it comes back as a save-failed
+              // control in the server's words. A button disabled here while
+              // Mod-S flushed and the server saved anyway would be a control
+              // lying about what is happening.
+              disabled={session.saving || (!inRoom && session.hardErrors > 0)}
+              className={BUTTON.secondary}
+            >
+              Save
+            </button>
+            {/*
+              The primary verb of this screen: Save keeps the work, Done is
+              the act of being finished with it and the one that leaves.
+            */}
+            <Link
+              to={engramRoute(engram.domain, engram.permalink)}
+              className={BUTTON.primary}
+            >
+              Done
+            </Link>
+          </div>
         </div>
       </header>
       {session.hardErrors > 0 && (

@@ -13,7 +13,7 @@ import { HighlightStyle, syntaxHighlighting } from "@codemirror/language";
 import { languages } from "@codemirror/language-data";
 import { search, searchKeymap } from "@codemirror/search";
 import type { Extension } from "@codemirror/state";
-import { EditorState } from "@codemirror/state";
+import { EditorState, Prec } from "@codemirror/state";
 import { EditorView, keymap } from "@codemirror/view";
 import { tags } from "@lezer/highlight";
 
@@ -171,6 +171,16 @@ function editorTheme(dark: boolean): Extension {
   return EditorView.theme(
     {
       "&": { fontSize: "0.9375rem" },
+      // Prose, not code: the buffer holds markdown a person reads while they
+      // write it, so the whole scroller wears the app's own sans stack and
+      // the reading line height. Mono survives exactly where the syntax is
+      // mono - fences, inline code, the crystalline:// lines - through the
+      // `tags.monospace` highlight rule, and Raw mode re-pins the lot with
+      // `RAW_MONO`. `.cm-content` inherits from here.
+      ".cm-scroller": {
+        fontFamily: "var(--font-sans, ui-sans-serif, system-ui, sans-serif)",
+        lineHeight: "1.65",
+      },
       ".cm-content": {
         fontFamily: "inherit",
         padding: "0.75rem 0",
@@ -192,6 +202,31 @@ function editorTheme(dark: boolean): Extension {
     { dark },
   );
 }
+
+/**
+ * Raw mode's face: the source view is deliberately a code view, so the whole
+ * buffer re-pins mono while preview mode sets prose proportional and keeps
+ * mono only where the syntax is mono (fences, inline code, permalinks).
+ *
+ * A surface with no preview layer to toggle - the MANIFEST editor - carries
+ * this permanently rather than through a compartment: it is a pure source
+ * view, so mono IS its face rather than a mode it switches into.
+ *
+ * `Prec.high` rather than plain placement, because two themes setting the
+ * same property on the same selector are decided by mount order and not by
+ * where they sit in the array: the view mounts its style modules REVERSED, so
+ * an ordinary extension listed later loses to one listed earlier. This layer
+ * arrives inside a compartment at the end of the array (raw mode) or appended
+ * after `baseExtensions` (the MANIFEST surface) - both positions lose at
+ * default precedence, and both win raised.
+ */
+export const RAW_MONO: Extension = Prec.high(
+  EditorView.theme({
+    ".cm-scroller": {
+      fontFamily: "var(--font-mono, ui-monospace, monospace)",
+    },
+  }),
+);
 
 /**
  * Everything an editor surface starts from.

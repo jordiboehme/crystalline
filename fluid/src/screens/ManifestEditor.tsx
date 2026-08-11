@@ -13,8 +13,9 @@
  *
  * The extension set stays static rather than built from a shared options
  * object: there is no preview layer to toggle and no resolver to reconfigure,
- * so `[...lineSeparatorFor, ...baseExtensions, saveKeymap]` is the whole of
- * it, spelled once at mount and again wherever a swap rebuilds the buffer.
+ * so `[...lineSeparatorFor, ...baseExtensions, saveKeymap, RAW_MONO]` is the
+ * whole of it, spelled once at mount and again wherever a swap rebuilds the
+ * buffer.
  */
 
 import type { Extension } from "@codemirror/state";
@@ -34,7 +35,7 @@ import { Skeleton } from "../components/Skeleton";
 import CmEditor from "../editor/CmEditor";
 import { ConflictDialog } from "../editor/ConflictDialog";
 import { FindingsPanel, jumpToLine } from "../editor/FindingsPanel";
-import { baseExtensions, lineSeparatorFor } from "../editor/setup";
+import { RAW_MONO, baseExtensions, lineSeparatorFor } from "../editor/setup";
 import { saveKeymap, useEditorSession } from "../editor/useEditorSession";
 import { manifestRoute } from "../paths";
 import { useTheme } from "../theme/context";
@@ -54,9 +55,24 @@ const MANIFEST_PATH = "MANIFEST.md";
 /** The buffer's accessible name - shared with the state a conflict rebuilds. */
 const ARIA_LABEL = "MANIFEST source";
 
-/** The whole extension set of this buffer, spelled once. */
+/**
+ * The whole extension set of this buffer, spelled once.
+ *
+ * `RAW_MONO` is a fixture here rather than a mode: the shared theme sets
+ * editor prose proportional for the surfaces that draw a live preview over
+ * it, and this one draws none. It is the source of a file and nothing else,
+ * so mono is its permanent face - the same face the engram editor's Raw
+ * toggle switches into, carried statically because there is no toggle and no
+ * preview compartment to carry it. One function, so the mount and every
+ * buffer swap agree.
+ */
 function extensionsFor(content: string, dark: boolean): Extension[] {
-  return [...lineSeparatorFor(content), ...baseExtensions(dark), saveKeymap];
+  return [
+    ...lineSeparatorFor(content),
+    ...baseExtensions(dark),
+    saveKeymap,
+    RAW_MONO,
+  ];
 }
 
 export default function ManifestEditor() {

@@ -22,6 +22,7 @@ import { useState } from "react";
 
 import type { Vocabulary } from "../api/vocabulary";
 import { FIELD_CLASSES } from "../components/FilterControls";
+import { FOCUS_RING } from "../components/primitives";
 import { SUGGESTED_STATUSES, SUGGESTED_TYPES } from "../filters";
 import type { FieldEdit } from "./frontmatterFields";
 import {
@@ -70,14 +71,20 @@ function positionOf(
   return Math.min(line.from + column, line.to);
 }
 
-const NOTE_CLASSES = "text-xs text-slate-500 dark:text-slate-400";
+const NOTE_CLASSES = "text-caption text-slate-500 dark:text-slate-400";
+
+/**
+ * The rail's field labels: sentence case at the caption step, never shouted.
+ * The words themselves are the accessible names of the controls they sit on,
+ * so they are the one thing here that may not drift.
+ */
+const LABEL_CLASSES =
+  "text-caption font-medium text-slate-600 dark:text-slate-300";
 
 function Row({ label, children }: { label: string; children: ReactNode }) {
   return (
     <label className="flex flex-col gap-1 text-sm">
-      <span className="text-xs font-semibold tracking-wide text-slate-500 uppercase dark:text-slate-400">
-        {label}
-      </span>
+      <span className={LABEL_CLASSES}>{label}</span>
       {children}
     </label>
   );
@@ -169,9 +176,7 @@ export function FrontmatterForm({
         clearly. The field carries its own name instead.
       */}
       <div className="flex flex-col gap-1 text-sm">
-        <span className="text-xs font-semibold tracking-wide text-slate-500 uppercase dark:text-slate-400">
-          Tags
-        </span>
+        <span className={LABEL_CLASSES}>Tags</span>
         {tags.length > 0 && (
           <span className="flex flex-wrap gap-1">
             {tags.map((tag) => (
@@ -179,7 +184,7 @@ export function FrontmatterForm({
                 key={tag}
                 type="button"
                 aria-label={`Remove tag ${tag}`}
-                className="rounded bg-slate-100 px-1.5 py-0.5 text-xs hover:line-through focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:bg-slate-800"
+                className={`rounded bg-slate-100 px-1.5 py-0.5 text-caption hover:line-through dark:bg-slate-800 ${FOCUS_RING}`}
                 onClick={() => {
                   apply(
                     writeTagList(
@@ -289,7 +294,8 @@ function DateRow({
         <button
           type="button"
           aria-label={`Clear ${label.toLowerCase()}`}
-          className="rounded border border-slate-300 px-2 py-1 text-xs hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800"
+          // The same h-8 box as the field it clears, so the row lines up.
+          className={`inline-flex h-8 shrink-0 items-center rounded border border-slate-300 px-2 text-caption hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800 ${FOCUS_RING}`}
           onClick={() => {
             onEdit(writeScalar(doc, keyName, null));
           }}

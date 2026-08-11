@@ -3,6 +3,7 @@ import { EditorView } from "@codemirror/view";
 import { describe, expect, it } from "vitest";
 
 import {
+  RAW_MONO,
   baseExtensions,
   buildEditorState,
   docText,
@@ -111,5 +112,35 @@ describe("separatorOf and the shared replaceBuffer", () => {
     expect(docText(view.state)).toBe("x\r\ny");
     expect(seen).toContain("x\r\ny");
     view.destroy();
+  });
+});
+
+/** The font family a mounted view's scroller actually resolves to. */
+function scrollerFont(view: EditorView): string {
+  const scroller = view.dom.querySelector(".cm-scroller");
+  expect(scroller).not.toBeNull();
+  return getComputedStyle(scroller as Element).fontFamily;
+}
+
+describe("the editor's face", () => {
+  it("sets prose proportional, and re-pins mono under RAW_MONO", () => {
+    const extensions = baseExtensions(false);
+    const view = new EditorView({
+      state: EditorState.create({ doc: "hello", extensions }),
+      parent: document.body,
+    });
+    expect(scrollerFont(view)).not.toMatch(/mono/i);
+    expect(scrollerFont(view)).toMatch(/sans/i);
+    view.destroy();
+
+    const rawView = new EditorView({
+      state: EditorState.create({
+        doc: "hello",
+        extensions: [...extensions, RAW_MONO],
+      }),
+      parent: document.body,
+    });
+    expect(scrollerFont(rawView)).toMatch(/mono/i);
+    rawView.destroy();
   });
 });

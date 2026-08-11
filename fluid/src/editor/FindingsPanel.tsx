@@ -63,7 +63,7 @@ export function FindingsPanel({
 }: FindingsPanelProps): ReactElement {
   return (
     <section aria-label="Validation findings" className="flex flex-col gap-2">
-      <h2 className="text-xs font-semibold tracking-wide text-slate-500 uppercase dark:text-slate-400">
+      <h2 className="text-caption font-semibold text-slate-500 dark:text-slate-400">
         Findings
       </h2>
       {unavailable ? (
@@ -73,10 +73,11 @@ export function FindingsPanel({
       ) : report === null || (report.findings.length === 0 && pending) ? (
         <p className="text-sm text-slate-500 dark:text-slate-400">Checking</p>
       ) : report.findings.length === 0 ? (
-        <p className="text-sm text-slate-500 dark:text-slate-400">
-          Nothing to fix. The format and temporal rules are satisfied; the wider
-          link and schema rules run on `crystalline verify` over the whole
-          domain.
+        // A clean report is a state, not a lesson: one green line under the
+        // heading. The states that need explaining - checking is unavailable,
+        // a run still going, the findings themselves - keep their full words.
+        <p className="text-sm text-emerald-700 dark:text-emerald-300">
+          No findings
         </p>
       ) : (
         <ul className="flex flex-col gap-2 text-sm">

@@ -41,7 +41,7 @@ describe("the findings panel", () => {
     expect(onJump).toHaveBeenCalledWith(2);
   });
 
-  it("teaches when there is nothing to fix", () => {
+  it("says a clean report in one line rather than a paragraph", () => {
     render(
       <FindingsPanel
         pending={false}
@@ -49,7 +49,10 @@ describe("the findings panel", () => {
         report={{ errors: 0, findings: [] }}
       />,
     );
-    expect(screen.getByText(/nothing to fix/i)).toBeInTheDocument();
+    expect(screen.getByText("No findings")).toBeInTheDocument();
+    // The teaching paragraph the clean state used to carry is gone; the
+    // states that still need words - unavailable, checking - keep theirs.
+    expect(screen.queryByText(/crystalline verify/i)).not.toBeInTheDocument();
   });
 
   it("says checking is unavailable rather than promising it is still coming", () => {
