@@ -90,7 +90,9 @@ pub struct TreeQuery {
     #[serde(default)]
     #[param(example = "notes")]
     path: Option<String>,
-    /// How many folder levels deep to list. Defaults to 1.
+    /// How many folder levels deep to list. Defaults to 1. The `total` in the
+    /// answer counts this depth, so it moves with this parameter and is not
+    /// the folder's recursive size.
     #[serde(default)]
     #[param(example = 2)]
     depth: Option<usize>,
@@ -115,11 +117,21 @@ pub struct TreeQuery {
                    time and bounded: a level holding more engrams than the \
                    tree shows is cut, `total` says how many it really holds \
                    and `truncated` says the rows were cut, so a client can \
-                   send its reader to the paged listing instead.\n\n`folders` \
+                   send its reader to the paged listing instead.\n\n`total` \
+                   counts this level, not the folder: it moves with `depth` \
+                   and leaves out everything nested deeper, so a folder of ten \
+                   engrams holding a subfolder of a thousand reports ten here. \
+                   `GET /domains/{domain}/engrams?path=...` counts the same \
+                   folder recursively and reports the larger number. Neither \
+                   is the other's approximation - a level states a fact about \
+                   the rows it drew, a folder listing promises the folder - so \
+                   a client that means to say \"N engrams in this folder\" \
+                   takes that number from the listing.\n\n`folders` \
                    is never cut, so a truncated level still names every folder \
                    a reader can descend into. A `glob` narrows the engrams \
                    this level returned, so on a truncated level it selects \
-                   within the cut rather than across the whole folder.",
+                   within the cut rather than across the whole folder, and it \
+                   does not filter `folders` at all.",
     params(("domain" = String, Path, description = "The registered domain."), TreeQuery),
     responses(
         (

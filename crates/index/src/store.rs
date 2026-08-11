@@ -698,7 +698,29 @@ pub struct BrowseLevel {
     /// How many engrams the level holds, counted under exactly the filter that
     /// selected `engrams`. Larger than `engrams.len()` means the cap cut the
     /// listing.
+    ///
+    /// The level, not the folder: the depth cut applies to this count as it
+    /// does to the rows, so it moves with `depth` and never counts an engram
+    /// nested deeper than the level drawn. A search filtered by the same folder
+    /// counts recursively instead and legitimately reports more. See
+    /// [`Store::browse_level`] for why the two differ and what it would take to
+    /// return both.
     pub total: usize,
+}
+
+/// A folder prefix carrying its trailing slash, whatever the caller passed.
+///
+/// The slash is the whole difference between a folder and a string: without it
+/// `notes` also takes `notes-misc/z.md`, and the first-segment derivation would
+/// cut a folder name out of a `rel` that opens with a slash and report a folder
+/// with no name. An empty prefix stays empty, since the root is the whole domain
+/// rather than a folder.
+pub(crate) fn folder_slash(prefix: &str) -> String {
+    if prefix.is_empty() || prefix.ends_with('/') {
+        prefix.to_string()
+    } else {
+        format!("{prefix}/")
+    }
 }
 
 /// A stored engram's addressing plus its full markdown content and checksum.
@@ -1240,6 +1262,22 @@ pub trait Store: Send + Sync {
     /// reaches one folder further down; it is clamped to at least 1 here, and a
     /// caller taking it from a request bounds it from above too, since the
     /// depth cut is a pattern that grows one term per level.
+    ///
+    /// **What `total` counts.** The level, not the folder. The count runs under
+    /// the depth cut with the page, so it moves with `depth` and excludes
+    /// everything nested deeper - a folder of ten engrams holding a subfolder of
+    /// a thousand reports ten at depth 1. A [`SearchQuery`] carrying the same
+    /// folder as its `path_prefix` counts the other way, recursively, over the
+    /// prefix at any depth, and so reports the larger number. Both are right for
+    /// what they answer: a level states a fact about the rows it just drew,
+    /// while a folder listing promises the folder. Whoever renders "N engrams in
+    /// this folder" wants the second one.
+    ///
+    /// If a tree ever needs the recursive number beside the level's, it is one
+    /// more bounded query on a filter this method already builds: the same
+    /// `count(*)` under the prefix clause alone, without the depth cut. It is
+    /// deliberately not returned today, because nothing drawing a tree has asked
+    /// for it and an unused count is a query per request.
     async fn browse_level(
         &self,
         domain: &str,

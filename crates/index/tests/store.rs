@@ -4144,6 +4144,14 @@ async fn browse_level_bounds(store: &dyn Store) {
     assert_eq!(notes.total, 2);
     assert!(notes.folders.is_empty(), "a leaf folder has no children");
 
+    // A caller that leaves the trailing slash off gets the same folder rather
+    // than a string prefix, and never a folder with no name.
+    let slashless = store
+        .browse_level("eng", Some("notes"), 1, 50)
+        .await
+        .unwrap();
+    assert_eq!(slashless, notes, "the trailing slash is added, not trusted");
+
     // A folder whose name carries a LIKE wildcard is a folder: `50x/` is a
     // sibling an unescaped pattern would have swept in.
     let pct = store

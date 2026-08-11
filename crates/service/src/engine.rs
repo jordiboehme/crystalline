@@ -3127,7 +3127,12 @@ impl Engine {
     ///
     /// The folder is segment-safe - see [`folder_prefix`] - and `None` or an
     /// empty value searches the whole scope, which is what every caller that
-    /// never names a folder keeps getting. It is a separate verb rather than a
+    /// never names a folder keeps getting.
+    ///
+    /// The `total` in the envelope counts the folder recursively: every engram
+    /// under it at any depth, since a folder listing promises the folder. The
+    /// tree's own `total` counts one level and is deliberately smaller; see
+    /// [`Engine::browse_domain`]. It is a separate verb rather than a
     /// field on [`SearchParams`] because that struct is the MCP search tool's
     /// argument schema, and a folder filter is a browsing affordance of this
     /// API rather than a knob worth spending an agent's context on.
@@ -3891,6 +3896,15 @@ impl Engine {
     /// from the paths themselves rather than from the rows that survived the
     /// cap, so a truncated level still names every folder a reader can descend
     /// into.
+    ///
+    /// `total` counts the level, not the folder: it moves with `depth` and
+    /// leaves out everything nested deeper, so a folder of ten engrams holding a
+    /// subfolder of a thousand reports ten here. The paged listing scoped to the
+    /// same folder ([`Engine::search_engrams_under`]) counts recursively and
+    /// reports the larger number. Neither is the other's approximation: a level
+    /// states a fact about the rows it drew, a folder listing promises the
+    /// folder, and a client that means to say "N engrams in this folder" takes
+    /// the number from the listing.
     ///
     /// A `glob` narrows the rows this level returned, so on a truncated level
     /// it selects within the cap rather than across the whole folder. The tree

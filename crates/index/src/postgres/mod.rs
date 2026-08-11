@@ -95,7 +95,7 @@ use crate::store::{
     EngramSummary, FileStamp, FtsMode, GraphSlice, HostClaim, InboundHit, InboundPage,
     InboundQuery, InboundRef, LINKS_TO, NamedCount, NewChunk, OutboundRef, Page, RecentFilter,
     SearchHit, SearchMode, SearchQuery, Store, StoreInfo, StoredEngram, Vocabulary,
-    build_vocabulary,
+    build_vocabulary, folder_slash,
 };
 use crate::sweep::UnresolvedRef;
 
@@ -1147,9 +1147,13 @@ impl Store for PostgresStore {
         depth: usize,
         limit: usize,
     ) -> Result<BrowseLevel> {
-        let prefix = path_prefix.unwrap_or_default();
+        // The trailing slash is what makes the prefix a folder, so it is added
+        // here when a caller left it off rather than trusted: without it the
+        // folder derivation would cut its first segment out of a `rel` that
+        // starts with a slash and report a folder with no name.
+        let prefix = folder_slash(path_prefix.unwrap_or_default());
         let depth = depth.max(1);
-        let escaped = like_escape(prefix);
+        let escaped = like_escape(&prefix);
 
         // Under the prefix. The pattern is escaped, so a folder named `50%` is
         // a folder rather than a wildcard.

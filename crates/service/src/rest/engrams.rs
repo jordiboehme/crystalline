@@ -72,6 +72,10 @@ pub struct ListQuery {
     /// everything below it. A folder rather than a string prefix: `notes`
     /// takes `notes/deep/y.md` and never `notes-misc/z.md`. Absent or empty
     /// is the whole domain.
+    ///
+    /// The `total` beside the hits counts this folder recursively, at any
+    /// depth, which is the number to show when promising a folder's size. The
+    /// tree endpoint counts one level and reports a smaller one.
     #[serde(default)]
     #[param(example = "notes")]
     path: Option<String>,
@@ -121,8 +125,14 @@ pub struct ListQuery {
                    string prefix: `notes` takes `notes/deep/y.md` and never \
                    `notes-misc/z.md`. The total stays exact under it, so a \
                    folder holding thousands of engrams costs one page rather \
-                   than the folder. The tree endpoint still owns the \
-                   navigation view and this one owns the listing.\n\nA \
+                   than the folder.\n\nUnder `path`, `total` counts the folder \
+                   recursively - every engram below it at any depth - which is \
+                   the number to show when promising a folder's size. The tree \
+                   endpoint's `total` counts a single level and is \
+                   deliberately smaller, because it states a fact about the \
+                   level it drew rather than a promise about the folder. The \
+                   tree still owns the navigation view and this one owns the \
+                   listing.\n\nA \
                    domain nobody registered is a 404, while filters that match \
                    nothing are an empty page: two states a client can tell \
                    apart.",
@@ -130,7 +140,9 @@ pub struct ListQuery {
     responses(
         (
             status = 200,
-            description = "The engine's page envelope, unchanged.",
+            description = "The engine's page envelope, unchanged. Under \
+                           `path`, its `total` is the folder's recursive \
+                           count, not the tree's per-level one.",
             body = Object,
             example = json!({
                 "mode": "text",

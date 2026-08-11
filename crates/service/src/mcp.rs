@@ -570,7 +570,7 @@ impl McpServer {
     #[tool(
         name = "browse_domain",
         title = "Browse domain",
-        description = "Browse a domain's engrams by folder to explore how its knowledge is organized. path defaults to the root; depth controls how many folder levels are listed. One level at a time and bounded: a folder holding more engrams than a level shows comes back cut, with truncated true beside a total for the level, so read that as \"descend or search\" rather than as the whole folder. The folder list is never cut, so every subfolder is there to descend into.",
+        description = "Browse a domain's engrams by folder to explore how its knowledge is organized. path defaults to the root; depth controls how many folder levels are listed. One level at a time and bounded: a folder holding more engrams than a level shows comes back cut, with truncated true beside a total for the level, so read that as \"descend or search\" rather than as the whole folder. That total counts the level rather than the folder, so it moves with depth and leaves out anything nested deeper. The folder list is never cut, so every subfolder is there to descend into. A glob narrows only the engrams the level returned - on a cut level that is a choice within the cut - and it does not filter the folder list.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn browse_domain(
