@@ -822,6 +822,204 @@
         }
       }
     },
+    "/api/v1/domains/{domain}/archive/import": {
+      "post": {
+        "tags": [
+          "domains"
+        ],
+        "summary": "Import an uploaded archive into a domain.",
+        "description": "Admin only. Runs the engine verb the preview dry-ran, so the outcome matches the report that was approved: entries land as `created` or `overwritten`, and `skipped`, `invalid` and `ignored` name everything that did not.\n\n`policy=skip` (the default) leaves an existing path alone; `policy=overwrite` replaces it. Overwrite is a same-path decision only - an entry whose permalink is held at another path is refused under either policy, since writing it would leave two files claiming one permalink.\n\nThe same hygiene the preview enforces applies here: a hostile archive is refused whole rather than partially imported.",
+        "operationId": "import_domain_archive",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The registered domain to import into.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "policy",
+            "in": "query",
+            "description": "How a path that already exists is treated: `skip` (the default) leaves\nit alone, `overwrite` replaces it. Anything else is refused.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "skip"
+          }
+        ],
+        "requestBody": {
+          "description": "The raw bytes of a zip archive.",
+          "content": {
+            "application/zip": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The per-entry report of what landed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ArchiveReport"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or an anonymous one.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an admin, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The upload is past the surface's request-body limit.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The bytes are not a readable zip, the archive fails hygiene, or `policy` is neither `skip` nor `overwrite`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/domains/{domain}/archive/preview": {
+      "post": {
+        "tags": [
+          "domains"
+        ],
+        "summary": "Dry-run an archive upload: what each entry would become.",
+        "description": "Admin only. Takes the raw bytes of a zip and reports, per entry, what an import would do with it - `new`, `collides`, `invalid` or `ignored` - with the verify findings `POST /validate` would raise over that entry's markdown.\n\nNothing is written. A hostile archive is refused whole with 422 rather than partially imported: more than 1000 entries, an entry over 1 MiB or a whole archive over 32 MiB once decompressed, an entry name that is not UTF-8, or any path that could escape the domain root.",
+        "operationId": "preview_domain_archive_import",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The registered domain the archive is aimed at.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "The raw bytes of a zip archive.",
+          "content": {
+            "application/zip": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The per-entry report, and the counters under it.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ArchiveReport"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or an anonymous one.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an admin, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The upload is past the surface's request-body limit.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The bytes are not a readable zip, or the archive fails hygiene - the detail names which rule.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/domains/{domain}/engrams": {
       "get": {
         "tags": [
@@ -3399,6 +3597,112 @@
   },
   "components": {
     "schemas": {
+      "ArchiveEntryReport": {
+        "type": "object",
+        "description": "One entry of an uploaded archive and what became of it. A preview reports `new`, `collides`, `invalid` or `ignored`; an import reports `created`, `overwritten`, `skipped`, `invalid` or `ignored`.",
+        "required": [
+          "path",
+          "status",
+          "findings"
+        ],
+        "properties": {
+          "findings": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ValidateFinding"
+            },
+            "description": "The verify findings over this entry's markdown, the same families\n`POST /validate` runs. Empty for an entry that was never read."
+          },
+          "path": {
+            "type": "string",
+            "description": "The entry's path inside the archive, domain-relative.",
+            "example": "alpha.md"
+          },
+          "permalink": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The permalink the entry claims, once it parsed far enough to have one.",
+            "example": "alpha"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the entry was not written, in the words of whatever refused it."
+          },
+          "status": {
+            "type": "string",
+            "description": "preview: new | collides | invalid | ignored.\nimport: created | overwritten | skipped | invalid | ignored.",
+            "example": "new"
+          }
+        }
+      },
+      "ArchiveReport": {
+        "type": "object",
+        "description": "The per-entry report of a preview or an import, with the counters a confirmation dialog summarizes. The counters are tallied from the entries above them, so the two can never disagree.",
+        "required": [
+          "domain",
+          "dry_run",
+          "entries",
+          "new",
+          "collides",
+          "written",
+          "skipped",
+          "invalid",
+          "ignored"
+        ],
+        "properties": {
+          "collides": {
+            "type": "integer",
+            "description": "Preview only: entries whose path or permalink is already taken.",
+            "minimum": 0
+          },
+          "domain": {
+            "type": "string",
+            "description": "The domain the archive was aimed at.",
+            "example": "eng"
+          },
+          "dry_run": {
+            "type": "boolean",
+            "description": "True for a preview, false for an import that really wrote."
+          },
+          "entries": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ArchiveEntryReport"
+            },
+            "description": "Every entry of the archive, in the order the archive holds them."
+          },
+          "ignored": {
+            "type": "integer",
+            "description": "Entries an archive may carry but a domain never imports: a MANIFEST, a\ngenerated OKF index or log, anything that is not markdown.",
+            "minimum": 0
+          },
+          "invalid": {
+            "type": "integer",
+            "description": "Entries refused as not importable: unparseable, not UTF-8 text, or\ncarrying a hard verify error. Never written under either policy.",
+            "minimum": 0
+          },
+          "new": {
+            "type": "integer",
+            "description": "Preview only: entries that would be created.",
+            "minimum": 0
+          },
+          "skipped": {
+            "type": "integer",
+            "description": "Import only: entries an existing path or permalink held back.",
+            "minimum": 0
+          },
+          "written": {
+            "type": "integer",
+            "description": "Import only: entries written, created and overwritten together.",
+            "minimum": 0
+          }
+        }
+      },
       "ConflictDetail": {
         "type": "object",
         "description": "The wire form of a 412: a problem detail carrying the version the server\nholds now, so a client can show a merge view instead of just failing.",
@@ -4051,7 +4355,7 @@
       },
       "ValidateFinding": {
         "type": "object",
-        "description": "One finding, and the envelope: the same fields the verify report carries.",
+        "description": "One finding, and the envelope: the same fields the verify report carries.\n\nShared rather than validation-local: the archive preview reports the same\nfindings per entry, and a second shape for the same facts would drift.",
         "required": [
           "rule",
           "severity",

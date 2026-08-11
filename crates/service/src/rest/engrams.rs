@@ -987,6 +987,9 @@ pub struct ValidateBody {
 }
 
 /// One finding, and the envelope: the same fields the verify report carries.
+///
+/// Shared rather than validation-local: the archive preview reports the same
+/// findings per entry, and a second shape for the same facts would drift.
 #[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct ValidateFinding {
     /// The rule id, for example E002 or T005.
@@ -1108,7 +1111,18 @@ pub async fn validate(
     let rel = body.path.as_deref().unwrap_or("draft.md");
     let issues =
         crystalline_core::verify::check_document(domain, std::path::Path::new(rel), &body.content);
-    let findings: Vec<ValidateFinding> = issues
+    let findings = findings_of(issues);
+    let errors = findings.iter().filter(|f| f.severity == "error").count();
+    Ok(Json(ValidateResponse { findings, errors }))
+}
+
+/// Verify issues as this surface reports them.
+///
+/// One mapping for two callers - this module's `/validate` and the archive
+/// preview's per-entry findings - so a document checked before a save and the
+/// same document checked inside an archive are described identically.
+pub(super) fn findings_of(issues: Vec<crystalline_core::verify::Issue>) -> Vec<ValidateFinding> {
+    issues
         .into_iter()
         .map(|i| ValidateFinding {
             rule: i.rule.to_string(),
@@ -1122,9 +1136,22 @@ pub async fn validate(
             line: i.line,
             fix: i.fix,
         })
-        .collect();
-    let errors = findings.iter().filter(|f| f.severity == "error").count();
-    Ok(Json(ValidateResponse { findings, errors }))
+        .collect()
+}
+
+impl ValidateFinding {
+    /// Whether this is a hard error - the severity that withholds a document
+    /// from a write. A method rather than a comparison at every call site, so
+    /// nothing has to know how the severity is spelled on the wire.
+    pub(super) fn is_error(&self) -> bool {
+        self.severity == "error"
+    }
+
+    /// The finding as one line, for a report that has room for a reason but
+    /// not for a findings list beside it.
+    pub(super) fn summary(&self) -> String {
+        format!("{}: {}", self.rule, self.message)
+    }
 }
 
 /// `DELETE /domains/{domain}/engrams/{*permalink}` - hard delete an engram,

@@ -85,6 +85,8 @@ use crate::engine::Engine;
         domains_admin::sync_status,
         domains_admin::sync_now,
         archive::download,
+        archive::preview,
+        archive::import,
         domains::tree,
         domains::manifest,
         domains::save_manifest,
@@ -119,6 +121,8 @@ use crate::engine::Engine;
         Role,
         domains::SaveManifestBody,
         domains_admin::CreateDomainBody,
+        archive::ArchiveEntryReport,
+        archive::ArchiveReport,
         engrams::CreateEngramBody,
         engrams::SaveEngramBody,
         engrams::RetireBody,
@@ -307,6 +311,11 @@ pub fn router(state: RestState) -> Router {
         // Admin only as well, and a pure read: the archive download is the
         // backup story of a read-only mirror, so it stays served there.
         .route("/domains/{domain}/archive", get(archive::download))
+        // The upload half, and the exception to the line above: both are
+        // writes (a preview is the first half of one), so both are admin-only
+        // AND refused on a read-only instance.
+        .route("/domains/{domain}/archive/preview", post(archive::preview))
+        .route("/domains/{domain}/archive/import", post(archive::import))
         .route("/domains/{domain}/tree", get(domains::tree))
         .route(
             "/domains/{domain}/manifest",

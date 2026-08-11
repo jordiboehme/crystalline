@@ -1498,6 +1498,21 @@ fn write_ops() -> Vec<WriteOp> {
             body: None,
             admin_only: true,
         },
+        // Both archive uploads: admin-only writes, and their allowed legs
+        // answer 422 (an empty body is not a zip), which passes this matrix's
+        // "anything but 401/403" contract while mutating nothing.
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/domains/eng/archive/preview",
+            body: None,
+            admin_only: true,
+        },
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/domains/eng/archive/import",
+            body: None,
+            admin_only: true,
+        },
         // Last among the domain rows, and no later row targets `scrap`: this
         // one unregisters it.
         WriteOp {

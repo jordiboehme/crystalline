@@ -1101,3 +1101,300 @@ async fn read_only_still_serves_the_archive_download() {
     .unwrap();
     assert_eq!(resp.status(), 200, "the backup of a read-only mirror");
 }
+
+/// Build a zip in memory: entry names are arbitrary STRINGS here on purpose -
+/// traversal and Windows-hostile names exist only inside these buffers and
+/// are never written to any disk.
+fn zip_of(entries: &[(&str, &str)]) -> Vec<u8> {
+    use std::io::Write;
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    {
+        let mut writer = zip::ZipWriter::new(&mut cursor);
+        for (name, content) in entries {
+            writer
+                .start_file(*name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(content.as_bytes()).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+    cursor.into_inner()
+}
+
+/// An archive whose headers LIE about the uncompressed size: an honest zip of
+/// a highly compressible 4 MiB entry, then every LE u32 equal to the honest
+/// size (local header and central directory both) patched down to 10. Should
+/// the patch ever hit a coincidental match inside the compressed stream, the
+/// corrupted deflate also answers 422, just with a different detail - the
+/// detail assertion in the test is what pins the metering guard specifically.
+fn lying_zip() -> Vec<u8> {
+    let big = "a".repeat(4 * 1024 * 1024);
+    let mut bytes = zip_of(&[("bomb.md", big.as_str())]);
+    let honest = (big.len() as u32).to_le_bytes();
+    let lie = 10u32.to_le_bytes();
+    let mut at = 0;
+    while at + 4 <= bytes.len() {
+        if bytes[at..at + 4] == honest {
+            bytes[at..at + 4].copy_from_slice(&lie);
+            at += 4;
+        } else {
+            at += 1;
+        }
+    }
+    bytes
+}
+
+async fn post_zip(
+    addr: std::net::SocketAddr,
+    path: &str,
+    session: &(String, String),
+    bytes: Vec<u8>,
+) -> reqwest::Response {
+    client()
+        .post(format!("http://{addr}{path}"))
+        .header("cookie", format!("fluid_session={}", session.0))
+        .header("x-csrf-token", &session.1)
+        .header("content-type", "application/zip")
+        .body(bytes)
+        .send()
+        .await
+        .unwrap()
+}
+
+/// Spec section 10's archive bullet: export then import into an empty domain
+/// reproduces the files; the preview names every entry's fate first (the
+/// archive's own MANIFEST reported as ignored) and writes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_archive_round_trip_reproduces_the_files() {
+    let fx = serve(Options::default()).await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+
+    let exported = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/domains/eng/archive",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap()
+    .bytes()
+    .await
+    .unwrap()
+    .to_vec();
+
+    let created = as_session(fx.addr, reqwest::Method::POST, "/api/v1/domains", &admin)
+        .json(&serde_json::json!({"mode": "local", "name": "restore"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201);
+    let created: serde_json::Value = created.json().await.unwrap();
+    let restore_root = std::path::PathBuf::from(created["root"].as_str().unwrap());
+
+    let preview = post_zip(
+        fx.addr,
+        "/api/v1/domains/restore/archive/preview",
+        &admin,
+        exported.clone(),
+    )
+    .await;
+    assert_eq!(preview.status(), 200);
+    let preview: serde_json::Value = preview.json().await.unwrap();
+    let entry_status = |path: &str| -> String {
+        preview["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["path"] == path)
+            .unwrap_or_else(|| panic!("no entry for {path}: {preview}"))["status"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(entry_status("MANIFEST.md"), "ignored");
+    assert_eq!(entry_status("alpha.md"), "new");
+    assert_eq!(preview["dry_run"], true);
+    assert_eq!(preview["new"], 1, "{preview}");
+    assert_eq!(preview["ignored"], 1, "{preview}");
+    // A preview is a dry run in the strict sense: no file landed.
+    assert!(
+        !restore_root.join("alpha.md").exists(),
+        "the preview wrote nothing"
+    );
+
+    let done = post_zip(
+        fx.addr,
+        "/api/v1/domains/restore/archive/import",
+        &admin,
+        exported,
+    )
+    .await;
+    assert_eq!(done.status(), 200);
+    let done: serde_json::Value = done.json().await.unwrap();
+    assert_eq!(done["written"], 1, "{done}");
+    assert_eq!(done["dry_run"], false);
+
+    // The file arrived byte for byte.
+    let detail = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/domains/restore/engrams/alpha",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(detail.status(), 200);
+    let detail: serde_json::Value = detail.json().await.unwrap();
+    assert_eq!(detail["content"].as_str().unwrap(), ALPHA);
+}
+
+/// Upload hygiene: zip-slip refuses the WHOLE archive (both separators and
+/// the drive-colon shape), garbage bytes are 422, the entry-count cap holds,
+/// and only .md entries are considered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hostile_and_oversized_archives_are_refused() {
+    let fx = serve(Options::default()).await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    let preview_path = "/api/v1/domains/eng/archive/preview";
+
+    for evil in [
+        zip_of(&[("../escape.md", "x")]),
+        zip_of(&[("a/../../escape.md", "x")]),
+        zip_of(&[("back\\slash.md", "x")]),
+        zip_of(&[("c:colon.md", "x")]),
+        zip_of(&[("/absolute.md", "x")]),
+    ] {
+        let resp = post_zip(fx.addr, preview_path, &admin, evil).await;
+        assert_eq!(
+            resp.status(),
+            422,
+            "traversal shapes refuse the archive whole"
+        );
+    }
+    // Nothing landed.
+    assert!(!fx._tmp.path().join("escape.md").exists());
+
+    let garbage = post_zip(fx.addr, preview_path, &admin, b"not a zip".to_vec()).await;
+    assert_eq!(garbage.status(), 422);
+
+    // A LYING header: declared sizes patched tiny while the stream inflates to
+    // 4 MiB. The declared-size gate passes; only actual-byte metering catches
+    // it (zip's readers do not cap output at the declared size).
+    let resp = post_zip(fx.addr, preview_path, &admin, lying_zip()).await;
+    assert_eq!(resp.status(), 422);
+    let problem: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        problem["detail"]
+            .as_str()
+            .unwrap()
+            .contains("decompresses past"),
+        "the metering guard must be the one that fired: {problem}"
+    );
+
+    let mut too_many: Vec<(String, String)> = Vec::new();
+    for i in 0..1001 {
+        too_many.push((format!("e{i}.md"), "x".to_string()));
+    }
+    let refs: Vec<(&str, &str)> = too_many
+        .iter()
+        .map(|(a, b)| (a.as_str(), b.as_str()))
+        .collect();
+    let resp = post_zip(fx.addr, preview_path, &admin, zip_of(&refs)).await;
+    assert_eq!(resp.status(), 422, "the entry-count cap");
+
+    let mixed = zip_of(&[("readme.txt", "not markdown"), ("ok.md", ALPHA)]);
+    let resp = post_zip(fx.addr, preview_path, &admin, mixed).await;
+    let report: serde_json::Value = resp.json().await.unwrap();
+    let txt = report["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["path"] == "readme.txt")
+        .unwrap();
+    assert_eq!(txt["status"], "ignored");
+}
+
+/// The collision policies: a second import skips everything, overwrite
+/// replaces content, and an invalid entry (hard verify errors) is never
+/// written under either policy. A MANIFEST is screened whatever its spelling.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn collision_policies_and_invalid_entries_hold() {
+    let fx = serve(Options::default()).await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    let import_path = "/api/v1/domains/eng/archive/import";
+
+    let edited = ALPHA.replace("A rule about alpha.", "An imported, sharper rule.");
+    let archive = zip_of(&[("alpha.md", edited.as_str())]);
+
+    let skip = post_zip(fx.addr, import_path, &admin, archive.clone()).await;
+    let skip: serde_json::Value = skip.json().await.unwrap();
+    assert_eq!(skip["skipped"], 1, "skip is the default policy: {skip}");
+
+    let over = post_zip(
+        fx.addr,
+        &format!("{import_path}?policy=overwrite"),
+        &admin,
+        archive,
+    )
+    .await;
+    let over: serde_json::Value = over.json().await.unwrap();
+    assert_eq!(over["written"], 1, "{over}");
+    let on_disk = std::fs::read_to_string(fx._tmp.path().join("eng/alpha.md")).unwrap();
+    assert!(on_disk.contains("sharper"));
+
+    let bad_policy = post_zip(
+        fx.addr,
+        &format!("{import_path}?policy=merge"),
+        &admin,
+        zip_of(&[("x.md", "y")]),
+    )
+    .await;
+    assert_eq!(bad_policy.status(), 422);
+    let problem: serde_json::Value = bad_policy.json().await.unwrap();
+    let detail = problem["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("skip") && detail.contains("overwrite"),
+        "the refusal names the two policies there are: {problem}"
+    );
+
+    // A MANIFEST is screened by NAME, not by spelling: the filesystem under a
+    // domain is case-insensitive on macOS and Windows, so a `manifest.md`
+    // entry would land on the domain's real MANIFEST.md - the one file a
+    // domain cannot regenerate. Committed under overwrite, the policy that
+    // would do the damage.
+    let manifest_before = std::fs::read_to_string(fx._tmp.path().join("eng/MANIFEST.md")).unwrap();
+    let manifests = zip_of(&[("manifest.md", ALPHA), ("sub/Manifest.md", ALPHA)]);
+    let resp = post_zip(
+        fx.addr,
+        &format!("{import_path}?policy=overwrite"),
+        &admin,
+        manifests,
+    )
+    .await;
+    let report: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(report["ignored"], 2, "{report}");
+    assert_eq!(report["written"], 0, "{report}");
+    assert_eq!(
+        std::fs::read_to_string(fx._tmp.path().join("eng/MANIFEST.md")).unwrap(),
+        manifest_before,
+        "the domain keeps its own MANIFEST"
+    );
+    assert!(!fx._tmp.path().join("eng/sub/Manifest.md").exists());
+
+    // Unparseable frontmatter = hard error = invalid, withheld from the engine
+    // even under overwrite, with findings attached.
+    let broken = zip_of(&[("broken.md", "---\ntitle: [unclosed\n---\nbody")]);
+    let resp = post_zip(
+        fx.addr,
+        &format!("{import_path}?policy=overwrite"),
+        &admin,
+        broken,
+    )
+    .await;
+    let report: serde_json::Value = resp.json().await.unwrap();
+    let entry = &report["entries"].as_array().unwrap()[0];
+    assert_eq!(entry["status"], "invalid", "{report}");
+    assert!(!fx._tmp.path().join("eng/broken.md").exists());
+}
