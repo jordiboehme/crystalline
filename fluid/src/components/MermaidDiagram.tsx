@@ -15,6 +15,7 @@ import mermaid from "mermaid";
 import { useEffect, useId, useState } from "react";
 
 import { useTheme } from "../theme/context";
+import { mermaidConfig } from "../theme/mermaid";
 
 export default function MermaidDiagram({ source }: { source: string }) {
   const { resolved } = useTheme();
@@ -26,20 +27,13 @@ export default function MermaidDiagram({ source }: { source: string }) {
 
   useEffect(() => {
     let live = true;
-    // `strict` is mermaid's own sanitizing mode: the diagram is drawn from
-    // text somebody wrote into the knowledge base, and labels in it are text.
-    mermaid.initialize({
-      startOnLoad: false,
-      securityLevel: "strict",
-      // A failed render must leave NOTHING behind. Mermaid's default is to
-      // append its own error graphic to `document.body`, outside React's
-      // tree, where nothing here can ever take it down again: the bombs
-      // stack up at the bottom of the page until a reload. The fallback
-      // below - the source the author wrote - is this component's answer to
-      // a diagram that will not parse.
-      suppressErrorRendering: true,
-      theme: resolved === "dark" ? "dark" : "default",
-    });
+    // The shared configuration: sanitizing mode, the app's own palette for
+    // this scheme and `suppressErrorRendering`, which is what keeps a failed
+    // render from leaving mermaid's error graphic on `document.body`, outside
+    // React's tree, where nothing here could ever take it down again. The
+    // fallback below - the source the author wrote - is this component's
+    // answer to a diagram that will not parse.
+    mermaid.initialize(mermaidConfig(resolved === "dark"));
     mermaid
       .render(id, source)
       .then((result) => {
@@ -65,6 +59,13 @@ export default function MermaidDiagram({ source }: { source: string }) {
     );
   }
   // The markup is mermaid's own output, produced by its sanitizing mode from
-  // the source above; nothing from the document reaches here unparsed.
-  return <div dangerouslySetInnerHTML={{ __html: svg }} />;
+  // the source above; nothing from the document reaches here unparsed. A
+  // diagram is usually narrower than the column it sits in, so it is centered,
+  // and mermaid's own width attribute is left to hug its height.
+  return (
+    <div
+      className="flex justify-center [&_svg]:h-auto [&_svg]:max-w-full"
+      dangerouslySetInnerHTML={{ __html: svg }}
+    />
+  );
 }

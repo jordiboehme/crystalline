@@ -282,8 +282,9 @@ function chipped(mark: string, rest: string, parts: ReactNode[]): ReactNode {
  * observation bullet's `[category]` and a relation bullet's rel type become
  * chips in place, and the bullet is the one place the line renders. A bullet
  * shaped like neither is handed back untouched. So is a LOOSE list item
- * (blank-line separated, where the renderer wraps the text in a p element):
- * its head child is an element rather than a string, so it keeps plain
+ * (blank-line separated, where the renderer wraps the text in a p element and
+ * the item's own children become the line break, that p, another break): its
+ * head child is the string "\n", which no mark matches, so it keeps plain
  * rendering - an accepted degradation, since indexed observation and relation
  * bullets are tight single-line list items by construction.
  *
@@ -394,8 +395,9 @@ const components: Components = {
   ),
   hr: () => <hr className="my-6 border-slate-200 dark:border-slate-800" />,
   table: ({ children }) => (
-    // Wide tables scroll inside themselves rather than widening the page.
-    <div className="my-4 overflow-x-auto">
+    // Wide tables scroll inside themselves rather than widening the page, and
+    // keep the full column rather than the reading measure.
+    <div className="breakout my-4 overflow-x-auto">
       <table className="w-full border-collapse text-sm">{children}</table>
     </div>
   ),
@@ -431,7 +433,7 @@ const components: Components = {
       return (
         <figure
           aria-label="Diagram"
-          className="my-4 overflow-x-auto rounded border border-slate-200 p-3 dark:border-slate-800"
+          className="breakout my-4 rounded border border-slate-200 p-3 dark:border-slate-800"
         >
           <Suspense fallback={<DiagramSource source={source} />}>
             <MermaidDiagram source={source} />
@@ -440,7 +442,7 @@ const components: Components = {
       );
     }
     return (
-      <pre className="my-4 overflow-x-auto rounded bg-slate-100 p-3 text-sm dark:bg-slate-900">
+      <pre className="breakout my-4 overflow-x-auto rounded bg-slate-100 p-3 text-sm dark:bg-slate-900">
         {children}
       </pre>
     );
@@ -477,7 +479,13 @@ export default function MarkdownBody({
     [wikilinks],
   );
   return (
-    <div className="text-[0.95rem]">
+    // `measured` here rather than on a page wrapper: the rule is
+    // `.measured > :not(.breakout)`, so it has to sit on the one element
+    // whose direct children are the document's own blocks. A wrapper around
+    // this renderer would see a single child - this div - and cap the tables
+    // and diagrams inside it along with the prose. Hardcoded rather than a
+    // prop, because every markdown surface is a reading surface.
+    <div className="measured text-[0.95rem]">
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         rehypePlugins={rehypePlugins}

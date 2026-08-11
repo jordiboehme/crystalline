@@ -6,9 +6,10 @@
  *
  * Mermaid arrives by dynamic import so the editor chunk does not carry the
  * renderer; the module is the same one MarkdownBody lazy-loads, so the
- * bundler serves one copy. Rendering uses mermaid's strict sanitizing mode,
- * exactly as MermaidDiagram does, and a diagram that will not parse simply
- * shows nothing - its source is right above it.
+ * bundler serves one copy. It is initialized from the shared configuration in
+ * `theme/mermaid`, the one MermaidDiagram uses, so the same fence draws the
+ * same diagram in the same palette here and on the page; a diagram that will
+ * not parse simply shows nothing - its source is right above it.
  *
  * A `StateField` rather than a `ViewPlugin`: CodeMirror refuses block
  * decorations from a plugin's dynamic source outright ("Block decorations
@@ -24,6 +25,8 @@ import type { EditorState, Extension, Range } from "@codemirror/state";
 import { StateField } from "@codemirror/state";
 import type { DecorationSet } from "@codemirror/view";
 import { Decoration, EditorView, WidgetType } from "@codemirror/view";
+
+import { mermaidConfig } from "../theme/mermaid";
 
 let mermaidSequence = 0;
 
@@ -52,19 +55,16 @@ class MermaidPreviewWidget extends WidgetType {
     const id = `cm-mermaid-${String(mermaidSequence)}`;
     void import("mermaid")
       .then(async ({ default: mermaid }) => {
-        mermaid.initialize({
-          startOnLoad: false,
-          securityLevel: "strict",
-          // The live preview renders on every keystroke, so most of what it
-          // asks mermaid to draw is a half-typed diagram that fails. Without
-          // this, each of those failures appends mermaid's error graphic to
-          // `document.body` - outside the editor, outside CodeMirror's own
-          // teardown - and they accumulate under the page for the whole
-          // session. A broken diagram previews as nothing; the source is
-          // right above it.
-          suppressErrorRendering: true,
-          theme: dark ? "dark" : "default",
-        });
+        // The same configuration the reading view uses, so a diagram does
+        // not change palette between the editor and the page. It carries
+        // `suppressErrorRendering`, which this surface needs most: the
+        // preview redraws on every keystroke, so most of what it asks
+        // mermaid to draw is a half-typed diagram that fails, and without
+        // that flag each failure appends mermaid's error graphic to
+        // `document.body` - outside the editor, outside CodeMirror's own
+        // teardown - where they accumulate for the whole session. A broken
+        // diagram previews as nothing; the source is right above it.
+        mermaid.initialize(mermaidConfig(dark));
         const rendered = await mermaid.render(id, source);
         if (box.isConnected || box.childElementCount === 0) {
           box.innerHTML = rendered.svg;

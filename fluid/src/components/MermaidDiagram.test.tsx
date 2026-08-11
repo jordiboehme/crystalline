@@ -37,6 +37,9 @@ function draw(source: string) {
 }
 
 beforeEach(() => {
+  // The theme provider reads its preference out of storage on mount, so each
+  // test starts from "system", which resolves to light here.
+  localStorage.clear();
   initialize.mockClear();
   renderDiagram.mockClear();
   renderDiagram.mockResolvedValue({
@@ -54,6 +57,48 @@ describe("MermaidDiagram", () => {
     expect(initialize.mock.calls.at(-1)?.[0]).toMatchObject({
       suppressErrorRendering: true,
     });
+  });
+
+  it("draws in the app's own palette rather than mermaid's", async () => {
+    // `base` is the theme that takes variables; the built-in `default` and
+    // `dark` themes ignore them and a diagram would arrive in mermaid's own
+    // purple, beside an app that is teal everywhere else.
+    draw("graph TD; A-->B;");
+    await waitFor(() => {
+      expect(initialize).toHaveBeenCalled();
+    });
+    const config = initialize.mock.calls.at(-1)?.[0];
+    expect(config).toMatchObject({ theme: "base" });
+    expect(config?.themeVariables).toMatchObject({
+      primaryColor: "#ccfbf1",
+      primaryTextColor: "#0f172a",
+      primaryBorderColor: "#0f766e",
+    });
+  });
+
+  it("takes the dark palette when the app is dark", async () => {
+    localStorage.setItem("fluid-theme", "dark");
+    draw("graph TD; A-->B;");
+    await waitFor(() => {
+      expect(initialize).toHaveBeenCalled();
+    });
+    expect(initialize.mock.calls.at(-1)?.[0]?.themeVariables).toMatchObject({
+      darkMode: true,
+      primaryColor: "#134e4a",
+      primaryTextColor: "#e2e8f0",
+      primaryBorderColor: "#2dd4bf",
+    });
+  });
+
+  it("centers the diagram it rendered", async () => {
+    const { container } = draw("graph TD; A-->B;");
+    await waitFor(() => {
+      expect(container.querySelector("svg")).not.toBeNull();
+    });
+    // A diagram is narrower than the column more often than not, and one
+    // pinned to the left edge of a wide figure reads as a mistake.
+    const wrapper = container.querySelector("svg")?.parentElement;
+    expect(wrapper?.className).toContain("justify-center");
   });
 
   it("shows the source when the diagram will not parse", async () => {

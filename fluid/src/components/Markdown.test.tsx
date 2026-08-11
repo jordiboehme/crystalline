@@ -108,6 +108,65 @@ describe("the markdown renderer", () => {
     expect(container.querySelector("code.hljs")).toBeNull();
   });
 
+  it("lets wide artifacts break out of the reading measure", async () => {
+    const { container } = await renderMarkdown(
+      [
+        "Prose.",
+        "",
+        "| a | b |",
+        "| - | - |",
+        "| 1 | 2 |",
+        "",
+        "```",
+        "a very wide line of plain code",
+        "```",
+        "",
+        "```mermaid",
+        "graph TD;",
+        "  A-->B;",
+        "```",
+        "",
+      ].join("\n"),
+    );
+
+    const measured = container.querySelector(".measured");
+    expect(measured).not.toBeNull();
+    const breakouts = [...container.querySelectorAll(".breakout")];
+    // The table's scroll box, the plain code block and the diagram figure.
+    expect(breakouts.length).toBe(3);
+    // Load-bearing: the rule is `.measured > :not(.breakout)`, so a breakout
+    // that is not a DIRECT child of the measured container is silently capped
+    // at 70ch along with the prose around it.
+    for (const breakout of breakouts) {
+      expect(breakout.parentElement).toBe(measured);
+    }
+    expect(screen.getByLabelText("Diagram").className).toContain("breakout");
+  });
+
+  it("leaves a task list item as a checkbox rather than chipping it", async () => {
+    // `[x]` at the head of a bullet is GFM's checkbox, not an observation
+    // category: the renderer has already turned it into an input, so the
+    // bullet's text starts after it and there is no mark to chip.
+    const { container } = await renderMarkdown(
+      ["- [x] Ship the handover", ""].join("\n"),
+    );
+
+    expect(container.querySelector('input[type="checkbox"]')).not.toBeNull();
+    expect(screen.queryByText("[x]")).toBeNull();
+    expect(screen.getByText(/Ship the handover/)).toBeVisible();
+  });
+
+  it("draws a rel type written with a hyphen or an underscore as a chip", async () => {
+    // The engine's rel types are identifiers, and both separators occur in
+    // them; the chip has to survive either.
+    await renderMarkdown(
+      ["- superseded_by [[Alpha]]", "- part-of [[Beta]]", ""].join("\n"),
+    );
+
+    expect(screen.getByText("superseded_by")).toBeVisible();
+    expect(screen.getByText("part-of")).toBeVisible();
+  });
+
   it("leaves wikilinks as the text they are written as", async () => {
     // Resolution belongs to the engram page, which has the API's resolved
     // links; here a `[[link]]` is prose.

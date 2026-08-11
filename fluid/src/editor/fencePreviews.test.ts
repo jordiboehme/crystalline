@@ -56,6 +56,22 @@ describe("fence previews", () => {
     view.destroy();
   });
 
+  it("previews in the same palette the reading view draws in", async () => {
+    // One configuration serves both surfaces: a diagram that changed color
+    // between the editor and the page would read as two different diagrams.
+    const view = editor("```mermaid\ngraph TD; A-->B;\n```\n");
+    await vi.waitFor(() => {
+      expect(mermaid.initialize).toHaveBeenCalled();
+    });
+    const config = vi.mocked(mermaid.initialize).mock.calls.at(-1)?.[0];
+    expect(config).toMatchObject({ theme: "base" });
+    expect(config?.themeVariables).toMatchObject({
+      primaryColor: "#ccfbf1",
+      primaryBorderColor: "#0f766e",
+    });
+    view.destroy();
+  });
+
   it("renders a table preview below the pipe syntax", () => {
     const view = editor("| a | b |\n|---|---|\n| 1 | 2 |\n");
     const table = view.dom.querySelector(".cm-table-preview table");
