@@ -5,6 +5,15 @@
  * unconditionally (the fold lives in the preview layer set, which the Raw
  * toggle empties).
  *
+ * The fold is atomic, and the accepted price of that is a Backspace at its
+ * trailing edge - where the left-arrow walk parks the caret - deleting the
+ * whole block in one keypress, because the delete command pulls its target out
+ * of an atomic range to the range's start. Accepted rather than worked around:
+ * it is exactly what CodeMirror's own folded ranges do, it is loud (the chip
+ * goes and no yaml appears in its place, and the rail form drops to its
+ * no-block state), one undo restores it on both surfaces, and a document with
+ * no frontmatter fails the save gate rather than landing on disk.
+ *
  * A decoration source, so the standing guard question is answered here: it
  * decorates exactly the `frontmatterRegion` range and reads no markdown prose
  * context, so `inCompletableProse` is not applicable by construction.

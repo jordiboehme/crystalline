@@ -6,7 +6,12 @@
  * current rather than stale.
  */
 
-import { cursorCharLeft } from "@codemirror/commands";
+import {
+  cursorCharLeft,
+  deleteCharBackward,
+  history,
+  undo,
+} from "@codemirror/commands";
 import type { Extension } from "@codemirror/state";
 import { EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
@@ -55,15 +60,20 @@ describe("frontmatterFold", () => {
 
   test("cursor motion steps over the fold rather than into it", () => {
     const view = mount(DOC);
-    // Put the caret just after the fold, then walk left: an atomic fold
-    // lands the caret at the region boundary, never inside the hidden yaml.
+    // Put the caret just after the fold, then walk left. The first two steps
+    // are ordinary text motion - body start to blank line to the region's
+    // trailing edge - and prove nothing about atomicity: a fold without
+    // `atomicRanges` sits at the same 52. The THIRD step is the one that
+    // discriminates. Atomic, it jumps the whole hidden block and lands at 0;
+    // non-atomic, it walks to 51, one character inside yaml nobody can see.
     view.dispatch({ selection: { anchor: DOC.indexOf("# Body") } });
     cursorCharLeft(view);
     cursorCharLeft(view);
-    const head = view.state.selection.main.head;
-    const yamlStart = DOC.indexOf("type: guide");
-    const yamlEnd = DOC.lastIndexOf("---") + "---".length;
-    expect(head <= yamlStart || head >= yamlEnd).toBe(true);
+    expect(view.state.selection.main.head).toBe(
+      DOC.lastIndexOf("---") + "---".length,
+    );
+    cursorCharLeft(view);
+    expect(view.state.selection.main.head).toBe(0);
     view.destroy();
   });
 
@@ -121,6 +131,31 @@ describe("frontmatterFold", () => {
     const at = view.state.sliceDoc().lastIndexOf("---");
     view.dispatch({ changes: { from: at, to: at + 3, insert: "" } });
     expect(view.dom.querySelector(".cm-frontmatter-chip")).toBeNull();
+    expect(view.contentDOM.textContent).toContain("status: current");
+    view.destroy();
+  });
+
+  test("backspace at the fold's edge takes the whole block, and undo restores it", () => {
+    // The sharp end of atomicity, pinned rather than discovered later: with
+    // the caret at the region's trailing edge - exactly where the left-arrow
+    // walk above parks it - one Backspace deletes all six hidden lines,
+    // because the delete command pulls its target out of the atomic range to
+    // the range's start. This is CodeMirror's own folded-range behavior and
+    // it is accepted (see the module doc); what must not change silently is
+    // that it stays ONE undo away.
+    const view = mount(DOC, [history()]);
+    view.dispatch({
+      selection: { anchor: DOC.lastIndexOf("---") + "---".length },
+    });
+    deleteCharBackward(view);
+    expect(view.state.sliceDoc()).toBe("\n\n# Body\n");
+    // Loudly, rather than quietly: the chip is gone and no yaml took its
+    // place, so nothing about the screen suggests the block is still there.
+    expect(view.dom.querySelector(".cm-frontmatter-chip")).toBeNull();
+    undo(view);
+    expect(view.state.sliceDoc()).toBe(DOC);
+    // Restored as text, not as a chip: the unfolded state is terminal, so
+    // what comes back is the block itself, in full view.
     expect(view.contentDOM.textContent).toContain("status: current");
     view.destroy();
   });
