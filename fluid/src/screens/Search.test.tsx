@@ -298,6 +298,19 @@ describe("the search screen", () => {
     expect(screen.queryByText(/shown/)).toBeNull();
   });
 
+  it("says what ranked an empty answer in a sentence of its own", async () => {
+    // The ordinary empty search: the engine ran the mode that was asked for,
+    // so there is no fallback to explain and no count to lead with. What is
+    // left has to stand up on its own rather than trail off a missing tally.
+    serve({ "/search": () => page([], "hybrid") });
+
+    mount("/search?q=ghost");
+
+    expect(await screen.findByText("Ranked by hybrid.")).toBeVisible();
+    expect(screen.queryByText(/^ranked by/)).toBeNull();
+    expect(screen.queryByText(/0 result/)).toBeNull();
+  });
+
   it("offers a way out of an empty answer under a filter", async () => {
     serve({ "/search": () => page([]) });
     const user = userEvent.setup();

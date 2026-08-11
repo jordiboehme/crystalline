@@ -251,9 +251,11 @@ export default function Search() {
  * text" is what explains the order of the results, and a reader who only ever
  * sees the note when something went wrong learns to read it as an error.
  *
- * An empty page says only the mode: the empty message below it already says
- * there is nothing, so a "0 results" ahead of it would be the same sentence
- * twice.
+ * An empty page counts nothing - the empty message below it already says there
+ * is nothing, and "0 results" ahead of that would be the same sentence twice -
+ * but it still says what ranked the search, as a sentence of its own rather
+ * than as the clause that follows a count. Which mode ran is exactly what
+ * explains an empty answer to a reader whose words were right.
  */
 function StatusLine({
   page,
@@ -265,36 +267,46 @@ function StatusLine({
   asked: SearchMode;
 }) {
   const ran = page.mode;
-  if (ran === null && shown === 0) {
-    return null;
-  }
   // The total survives the merge: a page of fifty out of two hundred is a fact
   // about this search that nothing else on the screen says.
   const counted =
-    shown === 0
-      ? ""
-      : shown < page.total
-        ? `${String(shown)} of ${String(page.total)} results`
-        : plural(page.total, "result", "results");
-  const mode =
-    ran === null
-      ? ""
-      : ran === asked
-        ? `ranked by ${ran}.`
-        : `Asked for ${asked}, ran as ${ran}: ${asked} needs embeddings and a query to embed them against, so the engine fell back.`;
-  const line =
-    counted === ""
-      ? mode
-      : mode === ""
-        ? `${counted}.`
-        : ran === asked
-          ? `${counted}, ${mode}`
-          : `${counted}. ${mode}`;
+    shown < page.total
+      ? `${String(shown)} of ${String(page.total)} results`
+      : plural(page.total, "result", "results");
+  const line = statusText(ran, asked, shown === 0 ? null : counted);
+  if (line === null) {
+    return null;
+  }
   return (
     <p className="text-caption pb-2 text-slate-500 tabular-nums dark:text-slate-400">
       {line}
     </p>
   );
+}
+
+/**
+ * The status line's own words, given what ran, what was asked for, and the
+ * tally when there is one to give. Null when there is nothing to say at all.
+ *
+ * Split out from the component because every branch of it is a sentence
+ * somebody reads: with a count the mode is the clause that finishes it, and
+ * without one the mode has to stand up on its own.
+ */
+function statusText(
+  ran: string | null,
+  asked: SearchMode,
+  counted: string | null,
+): string | null {
+  if (ran === null) {
+    return counted === null ? null : `${counted}.`;
+  }
+  if (ran !== asked) {
+    const explained = `Asked for ${asked}, ran as ${ran}: ${asked} needs embeddings and a query to embed them against, so the engine fell back.`;
+    return counted === null ? explained : `${counted}. ${explained}`;
+  }
+  return counted === null
+    ? `Ranked by ${ran}.`
+    : `${counted}, ranked by ${ran}.`;
 }
 
 /** A comma list from the URL, without the empties. */
