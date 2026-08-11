@@ -112,6 +112,10 @@ async fn serve(opts: Options_) -> Fixture {
     auth.add_user("vera", "Vera", None, Role::Viewer, "verapw")
         .await
         .unwrap();
+    // Domain management is admin-only, so the unregister-sweep test needs one.
+    auth.add_user("root", "Root", None, Role::Admin, "rootpw")
+        .await
+        .unwrap();
 
     let router = http_router(engine, Arc::new(AtomicUsize::new(0)), &[], auth).unwrap();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -462,6 +466,72 @@ async fn two_sockets_sync_edit_and_the_save_lands_once() {
     // Both sockets close; the session disposes; the file stays as saved.
     alice.close(None).await.unwrap();
     bob.close(None).await.unwrap();
+}
+
+/// Unregistering a domain that someone is co-editing right now: the room is
+/// swept while the domain is still registered, so the unsaved text lands in
+/// the file that stays on disk, the participant is told the room closed, and
+/// nobody can open a room in that domain afterwards.
+///
+/// This is the ordering the route is held to (sweep, then unregister, behind
+/// a fence that refuses new joins): inverted, the sweep's final save would
+/// either be refused outright or - inside the window between the config write
+/// and the index clear - resolve as virtual and land in the DATABASE instead
+/// of in the file `files_kept` deliberately left alone. The edit below is
+/// never flushed, and the delete follows it well inside the save debounce, so
+/// the only thing that can have written it is the sweep's own final save.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unregistering_a_domain_closes_its_rooms_and_lands_their_text() {
+    let fx = serve(Options_::default()).await;
+    let editor = login(fx.addr, "eddy", "eddypw").await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    let path = "/api/v1/collab/eng/alpha";
+
+    let mut alice = connect(fx.addr, path, Some(&editor.0), same_host(fx.addr))
+        .await
+        .unwrap();
+    let _greeting = next_binary(&mut alice).await;
+    let doc = client_doc();
+    alice.send(binary(step1(&doc))).await.unwrap();
+    let step2 = next_sync_step2(&mut alice).await;
+    apply(&doc, &step2);
+    let update = append_line(&doc, "typed but never flushed");
+    alice.send(binary(update_frame(&update))).await.unwrap();
+    // A barrier, not a flush: one socket's frames are processed in order, so
+    // a SyncStep2 answering this second SyncStep1 proves the update above was
+    // applied to the room before the unregister below is sent.
+    alice.send(binary(step1(&doc))).await.unwrap();
+    let _ = next_sync_step2(&mut alice).await;
+
+    let resp = client()
+        .delete(format!("http://{}/api/v1/domains/eng", fx.addr))
+        .header("cookie", format!("fluid_session={}", admin.0))
+        .header("x-csrf-token", &admin.1)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["rooms_closed"], 1, "the open room was swept");
+    assert_eq!(body["files_kept"], true);
+
+    // The participant is told, rather than left holding a socket over a
+    // document the server has forgotten.
+    let closed = wait_for_control(&mut alice, "closed").await;
+    assert!(matches!(closed, Control::Closed { .. }), "{closed:?}");
+
+    // And the unflushed text is in the file that stayed on disk.
+    let on_disk = std::fs::read_to_string(fx.domain_dir.join("alpha.md")).unwrap();
+    assert!(
+        on_disk.ends_with("typed but never flushed\n"),
+        "the sweep's final save landed in the file: {on_disk:?}"
+    );
+
+    // No room reopens in a domain that is gone.
+    let err = connect(fx.addr, path, Some(&editor.0), same_host(fx.addr))
+        .await
+        .unwrap_err();
+    assert_eq!(refusal_status(&err), Some(404));
 }
 
 /// Capacity is refused like every other guard: on the plain GET, with a status

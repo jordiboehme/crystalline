@@ -7,6 +7,7 @@ mod auth;
 mod auth_store;
 mod discovery;
 mod domains;
+mod domains_admin;
 mod engrams;
 mod error;
 mod github_settings;
@@ -17,7 +18,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
-use axum::routing::{get, patch, post};
+use axum::routing::{delete, get, patch, post};
 use tokio::sync::Semaphore;
 
 pub use auth::{
@@ -78,6 +79,8 @@ use crate::engine::Engine;
         auth::logout,
         auth::me,
         domains::list,
+        domains_admin::create,
+        domains_admin::remove,
         domains::tree,
         domains::manifest,
         domains::save_manifest,
@@ -111,6 +114,7 @@ use crate::engine::Engine;
         User,
         Role,
         domains::SaveManifestBody,
+        domains_admin::CreateDomainBody,
         engrams::CreateEngramBody,
         engrams::SaveEngramBody,
         engrams::RetireBody,
@@ -164,6 +168,12 @@ pub struct RestState {
     /// Caps how many password verifications run at once. See
     /// [`LOGIN_SLOTS`].
     login_slots: Arc<Semaphore>,
+    /// Serializes domain create against domain unregister, process-wide. See
+    /// [`RestState::domain_admin`].
+    domain_admin: Arc<tokio::sync::Mutex<()>>,
+    /// The fence an unregistration raises against new co-editing joins. See
+    /// [`RestState::fence_joins`].
+    join_fence: Arc<tokio::sync::RwLock<()>>,
 }
 
 impl RestState {
@@ -179,7 +189,57 @@ impl RestState {
             auth,
             auth_cfg,
             login_slots: auth::login_slots(),
+            domain_admin: Arc::new(tokio::sync::Mutex::new(())),
+            join_fence: Arc::new(tokio::sync::RwLock::new(())),
         })
+    }
+
+    /// Hold the domain-admin lock for the whole of a create or an unregister.
+    ///
+    /// The engine has no serialization of its own across a same-name
+    /// `domain_add_*` and `domain_remove` (its `domain_remove` doc comment
+    /// records the race and points here): the remove persists the config,
+    /// releases both config locks and only then forgets the watcher entry and
+    /// clears the index rows, so an add of the same name landing inside that
+    /// window has its fresh registration and its freshly-indexed rows wiped
+    /// by the remove's tail. One lock over both handlers closes it for this
+    /// surface, which is the layer that has more than one caller.
+    ///
+    /// Deliberately NOT the join fence below. A team-domain create downloads
+    /// and indexes a repository inside the request, which can run for
+    /// minutes, and fencing co-editing joins for that long would hang every
+    /// editor on the instance over a registration that closes no rooms. A
+    /// create never sweeps anything, so it has no join window to close.
+    ///
+    /// Lock order where both are taken (unregister): this one, then
+    /// [`RestState::fence_joins`]. Nothing else takes both.
+    pub(super) async fn domain_admin(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.domain_admin.lock().await
+    }
+
+    /// Raise the join fence: while this guard lives, no collab upgrade may
+    /// open a room, because [`RestState::join_pass`] is what the upgrade
+    /// route waits on before it joins.
+    ///
+    /// Held by an unregistration across its sweep and the engine's
+    /// `domain_remove`, which is what makes the sweep final rather than a
+    /// snapshot: a join already in flight finishes and inserts its room
+    /// before the guard is granted (so the sweep collects it), and a join
+    /// that arrives afterwards waits, then finds a domain that no longer
+    /// exists and is refused 404. The fence is process-wide rather than
+    /// per-domain because an unregistration is short and a second primitive
+    /// per domain name would buy nothing measurable.
+    pub(super) async fn fence_joins(&self) -> tokio::sync::RwLockWriteGuard<'_, ()> {
+        self.join_fence.write().await
+    }
+
+    /// The pass a collab upgrade holds across its join, so a join and an
+    /// unregistration of the same domain cannot interleave. See
+    /// [`RestState::fence_joins`] for the argument this half completes; the
+    /// guard is dropped as soon as the join returns, never held across the
+    /// socket's life.
+    pub(crate) async fn join_pass(&self) -> tokio::sync::RwLockReadGuard<'_, ()> {
+        self.join_fence.read().await
     }
 
     /// Run `work` holding one of the [`LOGIN_SLOTS`] password-work permits.
@@ -229,7 +289,11 @@ pub fn router(state: RestState) -> Router {
         .route("/auth/login", post(auth::login))
         .route("/auth/logout", post(auth::logout))
         .route("/auth/me", get(auth::me))
-        .route("/domains", get(domains::list))
+        .route("/domains", get(domains::list).post(domains_admin::create))
+        // Admin only, enforced in the handler like every other admin route
+        // here. Registered before the domain sub-paths for readability only;
+        // axum's router is order-independent.
+        .route("/domains/{domain}", delete(domains_admin::remove))
         .route("/domains/{domain}/tree", get(domains::tree))
         .route(
             "/domains/{domain}/manifest",

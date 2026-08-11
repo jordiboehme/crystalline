@@ -1414,8 +1414,12 @@ async fn a_malformed_query_parameter_is_a_problem_detail() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_wrong_method_is_a_405_problem_detail() {
     let fixture = serve_anonymous().await;
+    // `PUT` rather than `POST`: the domain listing serves a POST now (domain
+    // registration), so the probe has to be a method the path genuinely does
+    // not serve, or this would test a handler's 415 instead of the router's
+    // 405.
     let resp = client()
-        .post(format!("http://{}/api/v1/domains", fixture.addr))
+        .put(format!("http://{}/api/v1/domains", fixture.addr))
         .send()
         .await
         .unwrap();

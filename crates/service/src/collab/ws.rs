@@ -69,11 +69,19 @@ pub async fn join(
         ));
     }
     require_same_host_origin(&headers)?;
-    let joined = state
-        .collab
-        .join(&domain, &permalink)
-        .await
-        .map_err(join_error)?;
+    // The join runs under the state's join pass, and the pass is what makes a
+    // domain unregistration's room sweep final: an unregister holds the same
+    // fence for write across its sweep and the engine's `domain_remove`, so a
+    // join is either complete (and swept) before that starts, or it waits and
+    // then finds a domain that is gone. The guard covers exactly the join -
+    // never the socket's life - and `CollabSessions::join` holding the
+    // registry lock across its open is the other half of the argument (see
+    // `CollabSessions::dispose_domain`).
+    let joined = {
+        let _pass = state.join_pass().await;
+        state.collab.join(&domain, &permalink).await
+    }
+    .map_err(join_error)?;
     let sessions = state.collab.clone();
     // The failure twin of on_upgrade: the connection is REGISTERED in the
     // session already, so a handshake that dies after this handler returns

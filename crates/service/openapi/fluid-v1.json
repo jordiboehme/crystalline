@@ -590,6 +590,173 @@
             }
           }
         }
+      },
+      "post": {
+        "tags": [
+          "domains"
+        ],
+        "summary": "Register a domain: local, virtual or a GitHub team domain.",
+        "description": "Admin only. A local domain is name-only and always lands at `<domains_root>/<name>` on the server, so no request can place a folder anywhere else; a virtual domain lives in the database; a team domain needs a GitHub connection and downloads the repository inside this request, which can take a while for a large one.",
+        "operationId": "create_domain",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateDomainBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "The engine's own registration report, unchanged. Its shape follows the mode: a local domain reports where it landed, a virtual one reports that it was registered, a team domain reports what was fetched.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                },
+                "example": {
+                  "adopted": false,
+                  "domain": "notes",
+                  "kind": "file",
+                  "manifest_created": true,
+                  "root": "/Users/ada/Documents/Crystalline/notes"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or an anonymous one.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an admin, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The name is taken by another domain, or mode `github` was asked for on an instance with no GitHub connection - the detail says where to make one.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body is not `application/json`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "An unknown mode, a name that could escape the domains root, or a field that does not belong to the mode asked for.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/domains/{domain}": {
+      "delete": {
+        "tags": [
+          "domains"
+        ],
+        "summary": "Unregister a domain. Files on disk are never touched.",
+        "description": "Admin only. The registration and the domain's index rows go; a file domain's files stay exactly where they are (re-adding the folder adopts them again), which is what `files_kept` reports. A virtual domain has no files, so `files_kept` is false and its knowledge is gone - a client must confirm that difference in words. Any open co-editing rooms in the domain are saved and closed first; `rooms_closed` counts them.",
+        "operationId": "unregister_domain",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The registered domain.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The engine's own unregistration report, plus the number of co-editing rooms this call closed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                },
+                "example": {
+                  "domain": "eng",
+                  "files_kept": true,
+                  "index_cleared": true,
+                  "rooms_closed": 0,
+                  "unregistered": true
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or an anonymous one.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an admin, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The domain is defined by an environment variable, which owns it: unset the variable instead.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
       }
     },
     "/api/v1/domains/{domain}/engrams": {
@@ -3073,6 +3240,52 @@
           "role": {
             "$ref": "#/components/schemas/Role",
             "description": "What the new account may do."
+          }
+        }
+      },
+      "CreateDomainBody": {
+        "type": "object",
+        "description": "A domain to register. `mode` picks which of the three kinds is meant, and every other field belongs to one of them: a field that does not apply to the mode asked for is refused rather than ignored.",
+        "required": [
+          "mode"
+        ],
+        "properties": {
+          "branch": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Branch to track; github mode only, defaults to the repo default.",
+            "example": "main"
+          },
+          "mode": {
+            "type": "string",
+            "description": "local | virtual | github",
+            "example": "local"
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The domain name. Required for local and virtual; optional for github\n(defaults to the repository name). A local domain always lands at\n<domains_root>/<name>; there is no folder parameter on this surface.",
+            "example": "notes"
+          },
+          "path": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Subfolder within the repository; github mode only.",
+            "example": "domains/eng"
+          },
+          "repo": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "owner/name; github mode only.",
+            "example": "acme/knowledge"
           }
         }
       },

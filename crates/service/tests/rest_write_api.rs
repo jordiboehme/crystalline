@@ -36,6 +36,11 @@ async fn serve(opts: Options) -> Fixture {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
     let mut cfg = GlobalConfig {
+        // Defense in depth: the matrix's domain-create row is mode `virtual`
+        // and touches no disk, but a pin costs nothing and a later row that
+        // creates a local domain would otherwise scaffold folders into the
+        // developer's real `~/Documents/Crystalline`.
+        domains_root: Some(root.join("domains-root")),
         auth: Some(AuthConfig {
             trusted_header: opts.trusted_header.map(str::to_string),
             anonymous: Some(opts.anonymous),
@@ -53,6 +58,18 @@ async fn serve(opts: Options) -> Fixture {
     std::fs::write(dir.join("alpha.md"), ALPHA).unwrap();
     cfg.domains
         .insert("eng".to_string(), DomainEntry::file(dir));
+    // A second file domain whose only job is being unregistered by the
+    // matrix's DELETE row: a MANIFEST is all a domain needs, and nothing else
+    // in this suite reads it, so its disappearance disturbs no other row.
+    let scrap = root.join("scrap");
+    std::fs::create_dir_all(&scrap).unwrap();
+    std::fs::write(
+        scrap.join("MANIFEST.md"),
+        "---\ntype: manifest\ntitle: scrap\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# scrap\n\n## Scope\n\n- Scratch knowledge\n\n## When to Use\n\n- Route here for scrap questions\n",
+    )
+    .unwrap();
+    cfg.domains
+        .insert("scrap".to_string(), DomainEntry::file(scrap));
     cfg.service = Some(ServiceConfig {
         response_format: Some(ResponseFormat::Json),
         read_only: Some(opts.read_only),
@@ -1467,6 +1484,20 @@ fn write_ops() -> Vec<WriteOp> {
         },
         WriteOp {
             method: Method::POST,
+            path: "/api/v1/domains",
+            body: Some(serde_json::json!({"mode": "virtual", "name": "matrix-made"})),
+            admin_only: true,
+        },
+        // Last among the domain rows, and no later row targets `scrap`: this
+        // one unregisters it.
+        WriteOp {
+            method: Method::DELETE,
+            path: "/api/v1/domains/scrap",
+            body: None,
+            admin_only: true,
+        },
+        WriteOp {
+            method: Method::POST,
             path: "/api/v1/validate",
             body: Some(serde_json::json!({"content": "x"})),
             admin_only: false,
@@ -1653,13 +1684,14 @@ async fn the_write_matrix_holds_on_every_route() {
 /// `support::MOUNTED_OPERATIONS` spells operation paths in, e.g.
 /// `/api/v1/domains/eng/engrams/alpha` becomes
 /// `/api/v1/domains/{domain}/engrams/{permalink}`. `write_ops()` has exactly
-/// three fixture names in play - `eng` the one domain, `alpha` the one
-/// engram, `mark`/`tina` the two user-admin targets - so a fixed per-segment
-/// substitution is enough; nothing here needs to be a general router.
+/// four fixture names in play - `eng` the one domain and `scrap` the throwaway
+/// one the unregister row deletes, `alpha` the one engram, `mark`/`tina` the
+/// two user-admin targets - so a fixed per-segment substitution is enough;
+/// nothing here needs to be a general router.
 fn canonicalize(path: &str) -> String {
     path.split('/')
         .map(|segment| match segment {
-            "eng" => "{domain}",
+            "eng" | "scrap" => "{domain}",
             "alpha" => "{permalink}",
             "mark" | "tina" => "{name}",
             other => other,

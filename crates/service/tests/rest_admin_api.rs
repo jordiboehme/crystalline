@@ -1,5 +1,6 @@
 //! Endpoint tests for the admin settings surface: the GitHub connection
-//! status and its device-flow poll, the two connect paths and disconnect.
+//! status and its device-flow poll, the two connect paths and disconnect,
+//! plus domain lifecycle - create in all three modes and unregister.
 //!
 //! A fresh, smaller fixture rather than a share of `rest_write_api.rs`'s: the
 //! engine here is built with the token store pinned into the temp dir and a
@@ -158,6 +159,159 @@ fn as_session(
         .request(method, format!("http://{addr}{path}"))
         .header("cookie", format!("fluid_session={}", session.0))
         .header("x-csrf-token", &session.1)
+}
+
+/// Local create is name-only: the domain lands under the server's domains
+/// root, scaffolded and listed; the response says where. Registration
+/// refusals are honest statuses: 409 for a taken name, 422 for a name that
+/// could escape the root.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_local_domain_is_created_under_the_domains_root() {
+    let fx = serve(Options::default()).await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+
+    let resp = as_session(fx.addr, reqwest::Method::POST, "/api/v1/domains", &admin)
+        .json(&serde_json::json!({"mode": "local", "name": "notes"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["domain"], "notes");
+    let root = body["root"].as_str().unwrap();
+    assert!(
+        root.contains("domains-root"),
+        "under the pinned root: {root}"
+    );
+    assert!(std::path::Path::new(root).join("MANIFEST.md").exists());
+
+    // Listed for everyone now.
+    let listing = as_session(fx.addr, reqwest::Method::GET, "/api/v1/domains", &admin)
+        .send()
+        .await
+        .unwrap();
+    assert!(listing.text().await.unwrap().contains("notes"));
+
+    // Same name again: conflict, not a stack trace.
+    let dup = as_session(fx.addr, reqwest::Method::POST, "/api/v1/domains", &admin)
+        .json(&serde_json::json!({"mode": "virtual", "name": "notes"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(dup.status(), 409);
+
+    // Names that could escape or break Windows are refused up front.
+    for bad in ["../up", "a/b", "a\\b", "a:b", ".hidden", "a b", "", "   "] {
+        let resp = as_session(fx.addr, reqwest::Method::POST, "/api/v1/domains", &admin)
+            .json(&serde_json::json!({"mode": "local", "name": bad}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 422, "{bad:?} must be refused");
+    }
+}
+
+/// Virtual create works with a name alone; mode github without a connection
+/// is a 409 that points at the settings screen.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn virtual_creates_and_disconnected_github_mode_is_a_conflict() {
+    let fx = serve(Options::default()).await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+
+    let resp = as_session(fx.addr, reqwest::Method::POST, "/api/v1/domains", &admin)
+        .json(&serde_json::json!({"mode": "virtual", "name": "scratchpad"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+
+    let team = as_session(fx.addr, reqwest::Method::POST, "/api/v1/domains", &admin)
+        .json(&serde_json::json!({"mode": "github", "repo": "acme/kb"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(team.status(), 409);
+    let problem: serde_json::Value = team.json().await.unwrap();
+    assert!(
+        problem["detail"]
+            .as_str()
+            .unwrap()
+            .to_lowercase()
+            .contains("settings"),
+        "the refusal points at the fix: {problem}"
+    );
+
+    let nonsense = as_session(fx.addr, reqwest::Method::POST, "/api/v1/domains", &admin)
+        .json(&serde_json::json!({"mode": "zeppelin", "name": "x"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(nonsense.status(), 422);
+}
+
+/// Unregister: the registration and index rows go, the files stay, and the
+/// response carries the files_kept flag the confirmation wording leans on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unregister_answers_with_files_kept_and_the_domain_vanishes() {
+    let fx = serve(Options::default()).await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+
+    let resp = as_session(
+        fx.addr,
+        reqwest::Method::DELETE,
+        "/api/v1/domains/eng",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["files_kept"], true);
+    assert_eq!(body["rooms_closed"], 0, "nobody was co-editing this one");
+    assert!(
+        fx._tmp.path().join("eng/alpha.md").exists(),
+        "files stay on disk"
+    );
+
+    let listing = as_session(fx.addr, reqwest::Method::GET, "/api/v1/domains", &admin)
+        .send()
+        .await
+        .unwrap();
+    assert!(!listing.text().await.unwrap().contains("\"eng\""));
+
+    let again = as_session(
+        fx.addr,
+        reqwest::Method::DELETE,
+        "/api/v1/domains/eng",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(again.status(), 404);
+
+    // The virtual arm: a database-backed domain's rows ARE its knowledge, so
+    // its unregistration says files_kept: false and the confirmation wording
+    // the UI shows has to differ. Same route, opposite flag.
+    let made = as_session(fx.addr, reqwest::Method::POST, "/api/v1/domains", &admin)
+        .json(&serde_json::json!({"mode": "virtual", "name": "ephemeral"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(made.status(), 201);
+    let gone = as_session(
+        fx.addr,
+        reqwest::Method::DELETE,
+        "/api/v1/domains/ephemeral",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(gone.status(), 200);
+    let gone: serde_json::Value = gone.json().await.unwrap();
+    assert_eq!(gone["files_kept"], false, "there are no files to keep");
 }
 
 /// The admin gate on the whole settings surface: viewer and editor are 403
