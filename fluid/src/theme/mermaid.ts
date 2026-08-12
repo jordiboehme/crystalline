@@ -26,7 +26,7 @@ import type { MermaidConfig } from "mermaid";
 /**
  * The diagram palette per scheme: accent fills, slate lines, app text.
  *
- * Three of these are here because `base` DERIVES everything it is not told.
+ * Four of these are here because `base` DERIVES everything it is not told.
  * Its theme constructor sets `noteBkgColor: "#fff5ad"` and `noteTextColor:
  * "#333"` outright, so the `||` fallbacks further down never fire and a
  * sequence or class diagram's notes come out in mermaid's yellow in BOTH
@@ -34,8 +34,20 @@ import type { MermaidConfig } from "mermaid";
  * `tertiaryTextColor`, which is the channel inversion of `tertiaryColor`:
  * inverting the dark scheme's `#0f172a` gives the warm cream `#f0e8d5`, so
  * subgraph and cluster titles would be the one thing on the page that is not
- * teal or slate. Naming all three is what closes that: overrides are applied
- * again AFTER the derivation pass, so a named variable always wins.
+ * teal or slate. `arrowheadColor` derives the same way `titleColor` does, but
+ * more directly - `this.arrowheadColor = this.arrowheadColor ||
+ * invert_default(this.background)` inverts `background` itself rather than
+ * routing through `tertiaryColor`, landing on that same warm cream for the
+ * dark scheme's `#0f172a`, so every arrowhead in a flowchart or user journey
+ * would read as the one non-teal, non-slate mark on the page - the wart this
+ * file pins shut by naming it to match `lineColor` per scheme. Naming all
+ * four is what closes that: overrides are applied again AFTER the derivation
+ * pass, so a named variable always wins.
+ *
+ * Ledger: gitGraph's commit-label half of this same derivation wart REMAINS
+ * unfixed here. `base` has no themeVariable for it, so closing it needs a
+ * per-diagram override this config does not carry - not promoted into the
+ * palette by this change.
  */
 const VARIABLES = {
   dark: {
@@ -45,6 +57,7 @@ const VARIABLES = {
     primaryTextColor: "#e2e8f0",
     primaryBorderColor: "#2dd4bf",
     lineColor: "#64748b",
+    arrowheadColor: "#64748b",
     secondaryColor: "#1e293b",
     tertiaryColor: "#0f172a",
     noteBkgColor: "#1e293b",
@@ -58,6 +71,7 @@ const VARIABLES = {
     primaryTextColor: "#0f172a",
     primaryBorderColor: "#0f766e",
     lineColor: "#475569",
+    arrowheadColor: "#475569",
     secondaryColor: "#f1f5f9",
     tertiaryColor: "#ffffff",
     noteBkgColor: "#f1f5f9",
