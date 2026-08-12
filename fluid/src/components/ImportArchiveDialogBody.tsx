@@ -336,9 +336,11 @@ function EntryTable({
           </tr>
         </thead>
         <tbody>
-          {entries.map((entry) => (
+          {entries.map((entry, rowIndex) => (
             <tr
-              key={entry.path}
+              // A zip may carry the same name twice, so the path alone is not
+              // a unique key: the report row's position is what identifies it.
+              key={`${String(rowIndex)}-${entry.path}`}
               className="border-t border-slate-200 align-top dark:border-slate-800"
             >
               <td className="py-1 pr-3 font-mono break-all">{entry.path}</td>
