@@ -26,8 +26,9 @@
  *
  * Defined here rather than imported because the toolbar's own copy (with its
  * `selectToken` helper and the `insertBlock` parameter that takes it) lands in
- * a later task; the shape is the plan's, so the two are the same type and one
- * import replaces this declaration when the toolbar side exists.
+ * Task 3 of this program, which had not landed when this module was written;
+ * the shape is the plan's, so the two are the same type and one import from
+ * ./toolbar replaces this declaration once the toolbar side exists.
  */
 export interface BlockSelection {
   line: number;
@@ -198,8 +199,10 @@ const TECHNICAL: readonly MermaidStarter[] = [
       "        verifymethod: test",
       "    }",
       "    element first_check {",
-      // Not "test case": the grammar lexes `test` as the verifymethod keyword
-      // wherever a value is expected, so an element type has to avoid it.
+      // Not "test case": an element type is lexed word by word, so a LEADING
+      // keyword is rejected - any verifymethod (test, inspection, analysis,
+      // demonstration) and any block field (id, text, risk). Only the first
+      // word is constrained: "testbed" and "unit test" both parse.
       "        type: simulation",
       "    }",
       "    first_check - satisfies -> first_requirement",
@@ -225,7 +228,9 @@ const TECHNICAL: readonly MermaidStarter[] = [
       "    x-axis [jan, feb, mar]",
       '    y-axis "Amount" 0 --> 100',
       "    bar [30, 50, 80]",
-      "    line [30, 50, 80]",
+      // Deliberately not the bar's own numbers: a line drawn on the bar tops
+      // reads as a rendering artifact, not as a second series.
+      "    line [20, 60, 70]",
     ],
     token: "Monthly total",
   },
@@ -254,6 +259,12 @@ export const MERMAID_STARTER_GROUPS: readonly StarterGroup[] = [
  * First occurrence rather than exactly-once by design: a state diagram
  * necessarily repeats a state name, and every starter is written so its
  * first mention is the one a person edits.
+ *
+ * The consequence is real and accepted: where a token recurs (State's "First"
+ * on its transition line, Class's "Order" on its edge), typing over the
+ * selection leaves the later mention behind - a phantom state, a dangling
+ * edge - and it is the person's to follow up. Tokens that occur exactly once
+ * would avoid it at the cost of not selecting the word one edits first.
  */
 function firstOccurrence(
   lines: readonly string[],

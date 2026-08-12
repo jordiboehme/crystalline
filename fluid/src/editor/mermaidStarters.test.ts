@@ -8,6 +8,7 @@ import { beforeAll, describe, expect, test } from "vitest";
 
 import { mermaidConfig } from "../theme/mermaid";
 import { MERMAID_STARTER_GROUPS, mermaidFence } from "./mermaidStarters";
+import { MERMAID_SKELETON } from "./toolbar";
 
 const ALL = MERMAID_STARTER_GROUPS.flatMap((group) => group.starters);
 
@@ -42,6 +43,24 @@ describe("the starter library", () => {
       "XY chart",
       "Radar",
     ]);
+  });
+
+  test("the flowchart fence is the toolbar's skeleton, byte for byte", () => {
+    // Decision 16, pinned rather than merely commented: keyboard-opening the
+    // diagram menu highlights Flowchart first, so Enter Enter through the
+    // picker has to insert exactly what today's mermaid button inserts. If
+    // either side's body moves, this fails instead of the parity silently
+    // dying. It also pins the fence spelling itself - "```mermaid" open, a
+    // closing fence - which nothing else in this file asserts.
+    expect(mermaidFence(ALL[0]!).lines).toEqual([...MERMAID_SKELETON]);
+    // The same spelling for all sixteen, body untouched in between.
+    for (const starter of ALL) {
+      expect(mermaidFence(starter).lines).toEqual([
+        "```mermaid",
+        ...starter.lines,
+        "```",
+      ]);
+    }
   });
 
   test.each(ALL.map((s) => [s.label, s] as const))(
