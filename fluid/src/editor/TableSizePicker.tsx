@@ -18,9 +18,9 @@
  * from the focus would insert a size nobody was looking at. Saying it that
  * way round rather than updating the size at each mover is what makes it hold
  * for movers this component never hears about - the grid is 48 ordinary tab
- * stops in a popover that does not trap focus, so Tab walks it too, and a Tab
- * that changed the focus without changing the size would light four cells,
- * caption "2 x 2" and insert five columns.
+ * stops in a popover that does not trap focus, so Tab walks it too, and three
+ * Tabs that changed the focus without changing the size would light four
+ * cells, caption "2 x 2" and insert five columns.
  */
 
 import type { EditorView } from "@codemirror/view";
