@@ -4,28 +4,40 @@
  * preview and Raw mode - it edits source text, which both modes are.
  *
  * Every button is an ordinary tab stop rather than a roving-tabindex group:
- * there are fourteen of them, they are all named, and native buttons already
- * answer Enter and Space. What they must not do is take the selection away
- * from the buffer they are about to edit, so the bar cancels its own mousedown
- * - the event that would move focus - and every command puts the caret back in
- * the buffer when it is done.
+ * they are all named, and native buttons already answer Enter and Space. What
+ * they must not do is take the selection away from the buffer they are about
+ * to edit, so the bar cancels its own mousedown - the event that would move
+ * focus - and every command puts the caret back in the buffer when it is done.
+ *
+ * The last segment is context rather than chrome: the table verbs are drawn
+ * only while the caret is actually in a table, because they have nothing to
+ * act on anywhere else and six permanently disabled buttons would be six
+ * things to read past. What arrives from the screen is a single boolean; every
+ * verb re-derives the table from the live state when it runs, so a click that
+ * beats a stale render refuses instead of editing the wrong place.
  */
 
 import type { EditorView } from "@codemirror/view";
 import {
+  AlignJustify,
   Bold,
   Brackets,
   Code,
+  Columns3,
+  Grid2X2X,
   Heading,
   Italic,
   Link,
   List,
   ListOrdered,
   ListTodo,
+  Rows3,
   SquareCode,
   Strikethrough,
   Table,
   TextQuote,
+  Trash2,
+  WandSparkles,
   Workflow,
 } from "lucide-react";
 import { DropdownMenu } from "radix-ui";
@@ -33,6 +45,7 @@ import type { MouseEvent, ReactElement } from "react";
 
 import { ITEM_CLASSES, MENU_CLASSES } from "../components/menu";
 import { IconButton } from "../components/primitives";
+import type { Align } from "./tableModel";
 import {
   CODE_SKELETON,
   MERMAID_SKELETON,
@@ -45,14 +58,42 @@ import {
   toggleInline,
   toggleLinePrefix,
 } from "./toolbar";
+import {
+  tableAddColumnAfter,
+  tableAddRowBelow,
+  tableAlignColumn,
+  tableDeleteColumn,
+  tableDeleteRow,
+  tablePrettify,
+} from "./tableVerbs";
 
 /** The heading levels the menu offers - deeper marks stay a typed thing. */
 const HEADING_LEVELS = [1, 2, 3];
 
+/** The alignments a column can be given, in the order they read. */
+const ALIGNMENTS: { align: Align; label: string }[] = [
+  { align: "left", label: "Align left" },
+  { align: "center", label: "Align center" },
+  { align: "right", label: "Align right" },
+];
+
+/** Decoration, not information: the same hairline every menu in the app draws. */
+function Divider(): ReactElement {
+  return (
+    <span
+      aria-hidden="true"
+      className="mx-1 h-4 w-px bg-slate-200 dark:bg-slate-700"
+    />
+  );
+}
+
 export function EditorToolbar({
   view,
+  tableActive = false,
 }: {
   view: EditorView | null;
+  /** Whether the caret is in a table right now; the screen watches for it. */
+  tableActive?: boolean;
 }): ReactElement {
   const off = view === null;
   const act = (run: (view: EditorView) => boolean) => () => {
@@ -162,14 +203,10 @@ export function EditorToolbar({
         onClick={act(insertMarkdownLink)}
       />
       {/*
-        Decoration, not information: the insert verbs are named buttons of
-        their own, and this hairline only says they are a different kind of
-        thing. It is the same separator every menu in the app draws.
+        The insert verbs are named buttons of their own, and this hairline
+        only says they are a different kind of thing.
       */}
-      <span
-        aria-hidden="true"
-        className="mx-1 h-4 w-px bg-slate-200 dark:bg-slate-700"
-      />
+      <Divider />
       <IconButton
         label="Insert table"
         icon={Table}
@@ -188,6 +225,84 @@ export function EditorToolbar({
         disabled={off}
         onClick={act((v) => insertBlock(v, CODE_SKELETON))}
       />
+      {tableActive && (
+        <>
+          {/*
+            The same hairline again, in front of the verbs that act on the
+            table the caret is in rather than on the document at large.
+          */}
+          <Divider />
+          {/*
+            The glyphs are a mnemonic; the labels are the contract. Every one
+            of these is a tooltip as well as an accessible name, because a row
+            of small squares is not self-explanatory whatever is drawn in it.
+          */}
+          <IconButton
+            label="Add row below"
+            icon={Rows3}
+            disabled={off}
+            onClick={act(tableAddRowBelow)}
+          />
+          <IconButton
+            label="Add column after"
+            icon={Columns3}
+            disabled={off}
+            onClick={act(tableAddColumnAfter)}
+          />
+          <IconButton
+            label="Delete row"
+            icon={Trash2}
+            disabled={off}
+            onClick={act(tableDeleteRow)}
+          />
+          <IconButton
+            label="Delete column"
+            icon={Grid2X2X}
+            disabled={off}
+            onClick={act(tableDeleteColumn)}
+          />
+          <DropdownMenu.Root>
+            <DropdownMenu.Trigger asChild>
+              <IconButton
+                label="Align column"
+                icon={AlignJustify}
+                disabled={off}
+              />
+            </DropdownMenu.Trigger>
+            <DropdownMenu.Portal>
+              <DropdownMenu.Content
+                align="start"
+                sideOffset={6}
+                className={MENU_CLASSES}
+                // The heading menu's discipline, for the same reason: Radix
+                // hands focus back to the trigger on close, and this bar
+                // always returns an author to the buffer instead - having
+                // picked an alignment, or having pressed Escape.
+                onCloseAutoFocus={(event) => {
+                  event.preventDefault();
+                  view?.focus();
+                }}
+              >
+                {ALIGNMENTS.map(({ align, label }) => (
+                  <DropdownMenu.Item
+                    key={align}
+                    className={ITEM_CLASSES}
+                    onSelect={act((v) => tableAlignColumn(v, align))}
+                  >
+                    {label}
+                  </DropdownMenu.Item>
+                ))}
+              </DropdownMenu.Content>
+            </DropdownMenu.Portal>
+          </DropdownMenu.Root>
+          <IconButton
+            label="Prettify table"
+            icon={WandSparkles}
+            disabled={off}
+            onClick={act(tablePrettify)}
+          />
+        </>
+      )}
     </div>
   );
 }

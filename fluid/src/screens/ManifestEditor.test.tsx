@@ -104,6 +104,27 @@ describe("the MANIFEST editor", () => {
     expect(await screen.findByText("Saved")).toBeInTheDocument();
   });
 
+  it("carries the format bar's table verbs", async () => {
+    // A MANIFEST is markdown like any engram, and this screen builds its own
+    // extension array: the context listener has to be in THIS one too, or the
+    // segment never appears here however well the engram editor works.
+    serveEditor();
+    renderApp("/d/eng/manifest/edit");
+    const editor = await screen.findByLabelText("MANIFEST source");
+    await waitFor(() => {
+      expect(editor.textContent).toContain("Route here for eng.");
+    });
+    expect(
+      screen.queryByRole("button", { name: "Add column after" }),
+    ).toBeNull();
+
+    // Inserting a table leaves the caret in the header row it just wrote.
+    await userEvent.click(screen.getByRole("button", { name: "Insert table" }));
+    expect(
+      await screen.findByRole("button", { name: "Add column after" }),
+    ).toBeInTheDocument();
+  });
+
   it("saves from inside the buffer, on the keyboard", async () => {
     const put = vi.fn(() => manifestResponse({ checksum: "m2" }));
     serveEditor(savingManifest(put));

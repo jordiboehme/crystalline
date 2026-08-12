@@ -60,6 +60,7 @@ import {
   docText,
   lineSeparatorFor,
 } from "../editor/setup";
+import { tableContextListener } from "../editor/tableVerbs";
 import { formattingKeymap } from "../editor/toolbar";
 import { saveKeymap, useEditorSession } from "../editor/useEditorSession";
 import {
@@ -248,6 +249,14 @@ interface SurfaceOptions {
   vocab: () => Vocabulary | null;
   /** The session this buffer is bound to, or null on the solo surface. */
   room: Room | null;
+  /**
+   * Told when the caret enters or leaves a table, so the format bar can draw
+   * its table verbs. It travels inside the options rather than being added
+   * beside them, because every state this screen builds goes through this
+   * function and a listener added at only one site would go silent the first
+   * time a session rebuilt the buffer.
+   */
+  onTableContext: (inTable: boolean) => void;
 }
 
 /**
@@ -280,6 +289,9 @@ function surfaceExtensions(options: SurfaceOptions): Extension[] {
         ]
       : []),
     saveKeymap,
+    // What the format bar's context segment watches. Outside the preview
+    // compartment: a table is a table in Raw mode too.
+    tableContextListener(options.onTableContext),
     // The toolbar's own shortcuts. Beside `saveKeymap` rather than inside the
     // preview compartment: Mod-b and Mod-i are typing help like the
     // completions below, and raw mode is still markdown being written. Its
@@ -476,6 +488,13 @@ function Surface({
   const [resolverBox] = useState(() => new Compartment());
   const [raw, setRaw] = useState(RAW_AT_MOUNT);
   /**
+   * Whether the caret is in a table, which is what the format bar's context
+   * segment is drawn from. The listener inside the buffer reports crossings
+   * only, and the setter is React's own stable one, so this costs a render
+   * per crossing rather than one per keystroke.
+   */
+  const [tableActive, setTableActive] = useState(false);
+  /**
    * WHICH conflict this tab has the resolution view open on, rather than a
    * bare open flag. The conflict itself is the server's - it stands until
    * somebody in the room resolves it, and a resolution the server re-raises
@@ -535,6 +554,7 @@ function Surface({
       resolver,
       vocab: readVocab,
       room,
+      onTableContext: setTableActive,
     });
 
   /**
@@ -842,6 +862,7 @@ function Surface({
         resolver: NO_RESOLUTION,
         vocab: readVocab,
         room,
+        onTableContext: setTableActive,
       }),
     // Read once: `CmEditor` snapshots the extensions at mount, so a later
     // theme change reaches the buffer through a remount rather than through
@@ -1105,7 +1126,7 @@ function Surface({
             transactions on the buffer, which in a room is the shared document
             and everywhere is the file.
           */}
-          <EditorToolbar view={view} />
+          <EditorToolbar view={view} tableActive={tableActive} />
           <CmEditor
             initialDoc={mountText}
             extensions={extensions}

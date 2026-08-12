@@ -40,6 +40,7 @@ import { ConflictDialog } from "../editor/ConflictDialog";
 import { EditorToolbar } from "../editor/EditorToolbar";
 import { FindingsPanel, jumpToLine } from "../editor/FindingsPanel";
 import { RAW_MONO, baseExtensions, lineSeparatorFor } from "../editor/setup";
+import { tableContextListener } from "../editor/tableVerbs";
 import { formattingKeymap } from "../editor/toolbar";
 import { saveKeymap, useEditorSession } from "../editor/useEditorSession";
 import { manifestRoute } from "../paths";
@@ -71,11 +72,18 @@ const ARIA_LABEL = "MANIFEST source";
  * preview compartment to carry it. One function, so the mount and every
  * buffer swap agree.
  */
-function extensionsFor(content: string, dark: boolean): Extension[] {
+function extensionsFor(
+  content: string,
+  dark: boolean,
+  onTableContext: (inTable: boolean) => void,
+): Extension[] {
   return [
     ...lineSeparatorFor(content),
     ...baseExtensions(dark),
     saveKeymap,
+    // What the format bar's context segment is drawn from: a MANIFEST holds
+    // tables like any other markdown file, so it gets the same verbs.
+    tableContextListener(onTableContext),
     // The format bar's shortcuts. A MANIFEST is markdown like any engram and
     // its author forgets the syntax just as readily; the `Prec.high` wrapper
     // inside `formattingKeymap` is what keeps Mod-i off defaultKeymap.
@@ -134,6 +142,11 @@ function EditorSurface({
    * it `null` forever - filling the ref schedules no re-render of its own.
    */
   const [view, setView] = useState<EditorView | null>(null);
+  /**
+   * Whether the caret is in a table - the format bar's context segment, fed by
+   * the listener inside the buffer, which reports crossings only.
+   */
+  const [tableActive, setTableActive] = useState(false);
 
   // The shared shell: buffer, checksum, dirty state, the dry-run gate,
   // drafts, the Mod-S save and the 412 flow. What this screen adds is the
@@ -156,7 +169,7 @@ function EditorSurface({
       });
       return { content: saved.markdown, checksum: saved.checksum ?? "" };
     },
-    extensionsFor: (content) => extensionsFor(content, dark),
+    extensionsFor: (content) => extensionsFor(content, dark, setTableActive),
     ariaLabel: ARIA_LABEL,
   });
 
@@ -244,10 +257,10 @@ function EditorSurface({
         <div className="rounded border border-slate-200 dark:border-slate-800">
           {/* The same bar the engram editor carries, over the same kind of
               text: this buffer is markdown too. */}
-          <EditorToolbar view={view} />
+          <EditorToolbar view={view} tableActive={tableActive} />
           <CmEditor
             initialDoc={manifest.markdown}
-            extensions={extensionsFor(manifest.markdown, dark)}
+            extensions={extensionsFor(manifest.markdown, dark, setTableActive)}
             ariaLabel={ARIA_LABEL}
             onReady={(ready) => {
               session.onReady(ready);

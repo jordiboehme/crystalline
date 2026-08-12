@@ -52,8 +52,13 @@ import { frontmatterRegion } from "./frontmatterRegion";
  * the field is not installed, after the chip is clicked its set is empty, and
  * the MANIFEST surface never carries it. In all three the frontmatter is text
  * on screen like any other and formatting it is legitimate.
+ *
+ * Exported because it is the shared guard for the assist verbs too, not only
+ * for the formatting commands in this file: `tableVerbs` opens every one of
+ * its dispatches with it, so a table edit and a bold both refuse the same way
+ * over a folded block rather than each having their own idea of the rule.
  */
-function clearOfFoldedFrontmatter(view: EditorView): boolean {
+export function clearOfFoldedFrontmatter(view: EditorView): boolean {
   const { state } = view;
   if (!frontmatterHidden(state)) {
     return true;

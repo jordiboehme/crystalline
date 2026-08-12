@@ -368,6 +368,44 @@ describe("the engram editor", () => {
     expect(docText(view.state)).toBe(CONTENT);
   });
 
+  it("shows the table verbs only while the caret is in a table", async () => {
+    // The wiring, end to end: the listener inside `surfaceExtensions`, the
+    // state it writes and the prop the bar is given. The verbs themselves are
+    // tested next door - what this pins is that the screen carries the
+    // listener at all, which is the piece a buffer rebuild can silently drop.
+    serveEditor();
+    renderApp("/d/eng/edit/alpha");
+    const editor = await screen.findByLabelText("Engram source");
+    await waitFor(() => {
+      expect(editor.textContent).toContain("A rule.");
+    });
+    const bar = screen.getByRole("toolbar", { name: "Formatting" });
+    const view = mountedView(editor);
+    expect(
+      within(bar).queryByRole("button", { name: "Add column after" }),
+    ).toBeNull();
+
+    act(() => {
+      view.dispatch({ selection: { anchor: view.state.doc.length } });
+    });
+    // Inserting a table leaves the caret in the header row of what it wrote,
+    // which is the shortest honest way into a table from this screen.
+    await userEvent.click(
+      within(bar).getByRole("button", { name: "Insert table" }),
+    );
+    await within(bar).findByRole("button", { name: "Add column after" });
+
+    // And leaving it takes them away again.
+    act(() => {
+      view.dispatch({ selection: { anchor: 0 } });
+    });
+    await waitFor(() => {
+      expect(
+        within(bar).queryByRole("button", { name: "Add column after" }),
+      ).toBeNull();
+    });
+  });
+
   it("keeps a format-bar insertion out of the folded frontmatter", async () => {
     // The mount-time caret sits at position 0, inside the block the summary
     // chip is hiding, and nothing has clicked into the buffer yet - the fold
