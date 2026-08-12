@@ -5,7 +5,8 @@
  * sitting in front of a browser, and a personal access token for an instance
  * nobody is sitting in front of. The screen never sees a token again after it
  * is sent - it is held in a field of this component until the server takes it,
- * and no answer on this surface echoes token material back.
+ * in one place and no other (see the mutation below, which deliberately takes
+ * no variables), and no answer on this surface echoes token material back.
  *
  * The device flow finishes somewhere else, so this polls while one is running
  * and stops the moment it is not: the status route is the flow's own poll, and
@@ -87,7 +88,19 @@ function GithubPanel() {
   });
 
   const withToken = useMutation({
-    mutationFn: submitGithubToken,
+    /*
+      A closure over the field rather than `mutationFn: submitGithubToken` with
+      the token passed to `mutate`. What is passed to `mutate` becomes the
+      mutation's `variables`, and query-core writes those into mutation state
+      and never clears them: the `pending` case sets them, no later case takes
+      them back, and the entry only leaves the cache when it is garbage
+      collected - five minutes after this screen unmounts, and not at all while
+      it is open. That would leave the token readable through
+      `getMutationCache()` long after the field said it was gone, which is
+      exactly what the sentence at the top of this file promises it is not.
+      Taking no variables at all means there is nothing to leave behind.
+    */
+    mutationFn: () => submitGithubToken(token),
     onSuccess: () => {
       // Only now: a token the server refused is a token whose owner is about
       // to paste a corrected one, and clearing the field would make the fix
@@ -238,7 +251,9 @@ function GithubPanel() {
           className="flex flex-wrap items-end gap-3"
           onSubmit={(event) => {
             event.preventDefault();
-            withToken.mutate(token);
+            // No argument: the mutation reads the field itself, so the token
+            // never becomes a variable anything keeps.
+            withToken.mutate();
           }}
         >
           <div className="flex flex-col gap-1">

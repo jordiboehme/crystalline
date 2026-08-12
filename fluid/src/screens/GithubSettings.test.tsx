@@ -9,6 +9,7 @@
  * server's own sentence rather than a house message pasted over it.
  */
 
+import type { QueryClient } from "@tanstack/react-query";
 import { screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -28,7 +29,36 @@ vi.mock("../api/client", async (importOriginal) => {
   return { ...actual, api: vi.fn(), setCsrfToken: vi.fn() };
 });
 
+/**
+ * A handle on the data layer the app built for itself.
+ *
+ * The provider makes its own client per mount, which is what keeps a test's
+ * cache from outliving it - so the only way to look inside that cache is to
+ * watch it being made. One test needs to: what the mutation cache holds after
+ * a token is submitted is the whole point of the shape the screen submits in.
+ */
+const built = vi.hoisted(() => ({ client: null as QueryClient | null }));
+
+vi.mock("../query/client", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../query/client")>();
+  return {
+    ...actual,
+    createQueryClient: () => {
+      built.client = actual.createQueryClient();
+      return built.client;
+    },
+  };
+});
+
 const apiMock = vi.mocked(api);
+
+/** The client the app is running on. */
+function queryClient(): QueryClient {
+  if (!built.client) {
+    throw new Error("the app built no query client");
+  }
+  return built.client;
+}
 
 /** The wire shape of a status, in whichever of its states a test needs. */
 function statusPayload(overrides: Record<string, unknown> = {}) {
@@ -221,6 +251,45 @@ describe("the GitHub settings screen", () => {
     });
     expect(await screen.findByText(/connected as octo/i)).toBeInTheDocument();
     expect(screen.getByText(/keyring/i)).toBeInTheDocument();
+  });
+
+  it("leaves no copy of the token in the mutation cache", async () => {
+    serveAs("admin", {
+      "/settings/github/token": () =>
+        statusPayload({
+          enabled: true,
+          connected: true,
+          user: "octo",
+          token_store: "keyring",
+        }),
+    });
+    renderApp("/settings/github");
+
+    await userEvent.type(
+      await screen.findByLabelText(/personal access token/i),
+      "ghp_secret",
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: /connect with token/i }),
+    );
+    await waitFor(() => {
+      expect(sentBody("/settings/github/token", "POST")).toEqual({
+        token: "ghp_secret",
+      });
+    });
+
+    // The data layer keeps a mutation's variables in its state and never
+    // clears them - the entry only leaves on garbage collection, minutes
+    // after this screen is gone. So the token is not passed as a variable at
+    // all: the request went out, and the cache that recorded it holds a
+    // mutation with nothing in it.
+    const mutations = queryClient().getMutationCache().getAll();
+    expect(mutations.length).toBeGreaterThan(0);
+    for (const mutation of mutations) {
+      expect(JSON.stringify(mutation.state.variables ?? null)).not.toContain(
+        "ghp_secret",
+      );
+    }
   });
 
   it("keeps the token when the server refuses it", async () => {
