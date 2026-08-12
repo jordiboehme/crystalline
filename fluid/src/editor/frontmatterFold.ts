@@ -28,7 +28,7 @@ import { readScalar, readTagList } from "./frontmatterFields";
 import { frontmatterRegion } from "./frontmatterRegion";
 import { docText } from "./setup";
 
-/** Dispatched by the chip; the fold stays open for the rest of the session. */
+/** Dispatched by the chip; the fold stays open for the life of this field. */
 export const unfoldEffect = StateEffect.define<boolean>();
 
 /** What the chip says the block holds, in the fields a reader scans for. */
@@ -118,10 +118,21 @@ const foldField = StateField.define<DecorationSet>({
         return Decoration.none;
       }
     }
-    // An empty set is the unfolded state, and it is deliberately terminal:
-    // once the yaml is on screen - because the chip was clicked, because the
-    // document never had a block, or because a hand edit removed the closing
-    // fence - nothing folds it away again under a person who is editing it.
+    // An empty set is the unfolded state, and nothing this field sees puts it
+    // back: once the yaml is on screen - because the chip was clicked, because
+    // the document never had a block, or because a hand edit removed the
+    // closing fence - no edit folds it away again under a person editing it.
+    //
+    // Terminal for this FIELD, which is not the same as terminal for the
+    // session, and the docstring used to overclaim it. The field is what the
+    // decision lives in, and the field is re-created whenever the compartment
+    // it rides in is refilled: a Raw round trip empties and refills it, and
+    // every wholesale buffer replacement (restore a draft, take the server
+    // version) rebuilds the state around it. Each of those re-reads the
+    // document and folds a block the author had explicitly opened. That is
+    // defensible - a fresh preview is a fresh read model, and the chip is one
+    // click from open - and it is the accepted price, recorded here rather
+    // than described as something it is not.
     if (!tr.docChanged || deco === Decoration.none) {
       return deco;
     }

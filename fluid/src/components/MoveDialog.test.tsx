@@ -99,8 +99,13 @@ describe("the move dialog", () => {
     // Landed on the engram at its new address, which the screen says as the
     // trail it now lives under: the folder it was moved into is a crumb of
     // its own rather than half of a permalink string.
-    const trail = await screen.findByRole("navigation", { name: "Breadcrumb" });
+    //
+    // The trail is re-queried on every attempt rather than captured once: a
+    // find that resolves before the navigation completes hands back the OLD
+    // page's breadcrumb, and that node never receives "guides" no matter how
+    // long the assertion waits.
     await waitFor(() => {
+      const trail = screen.getByRole("navigation", { name: "Breadcrumb" });
       expect(within(trail).getByText("guides")).toBeInTheDocument();
     });
   });

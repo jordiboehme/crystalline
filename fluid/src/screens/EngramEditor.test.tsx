@@ -770,6 +770,75 @@ describe("the engram editor", () => {
     expect(screen.getByLabelText("Engram source")).toBeInTheDocument();
   });
 
+  it("Keep editing disarms a Done that is already riding a save", async () => {
+    const { put, land } = gatedPut();
+    let landVerdict = () => {};
+    const verdict = new Promise<void>((resolve) => {
+      landVerdict = () => {
+        resolve();
+      };
+    });
+    serveEditor({
+      // The refusal is held rather than instant, which is the whole shape of
+      // this interleave: the findings lag the buffer by the dry-run debounce,
+      // so there is a window where the text is already unsavable and this
+      // screen does not know it yet.
+      "/validate": async (_path, init) => {
+        const body = typeof init?.body === "string" ? init.body : "";
+        if (!body.includes("status: brewing")) {
+          return { errors: 0, findings: [] };
+        }
+        await verdict;
+        return {
+          errors: 1,
+          findings: [
+            {
+              rule: "E001",
+              severity: "error",
+              message: "frontmatter will not parse",
+              line: 1,
+              fix: null,
+            },
+          ],
+        };
+      },
+      "/domains/eng/engrams/alpha": (_path, init) =>
+        init?.method === "PUT" ? put() : detailResponse(),
+    });
+    renderApp("/d/eng/edit/alpha");
+    await screen.findByLabelText("Engram source");
+    const status = await screen.findByLabelText("Status");
+    await userEvent.clear(status);
+    await userEvent.type(status, "brewing");
+    await userEvent.tab();
+
+    // Done #1 lands inside that window: the gate is still open, so this is an
+    // ordinary save-and-finish and the PUT goes out armed.
+    await userEvent.click(screen.getByRole("button", { name: "Done" }));
+    await waitFor(() => {
+      expect(put).toHaveBeenCalled();
+    });
+
+    // The verdict catches up while the save is still in the air.
+    landVerdict();
+    expect(await screen.findByText(/block saving/)).toBeVisible();
+
+    // Done #2 can only offer the way out now, and the author turns it down.
+    await userEvent.click(screen.getByRole("button", { name: "Done" }));
+    await screen.findByText("This engram cannot be saved");
+    await userEvent.click(screen.getByRole("button", { name: "Keep editing" }));
+
+    // The save that was already on its way lands on a buffer that still
+    // matches what it carried. Nothing may act on the finish request the
+    // author has since withdrawn: choosing to stay means staying.
+    land();
+    await settled();
+    expect(screen.getByLabelText("Engram source")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("heading", { name: "Alpha", level: 1 }),
+    ).toBeNull();
+  });
+
   it("Leave anyway writes the draft before walking out of a buffer it cannot save", async () => {
     serveEditor(refusedByFindings());
     renderApp("/d/eng/edit/alpha");

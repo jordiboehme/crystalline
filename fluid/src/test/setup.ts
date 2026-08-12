@@ -5,12 +5,26 @@
  */
 
 import "@testing-library/jest-dom/vitest";
-import { cleanup } from "@testing-library/react";
+import { cleanup, configure } from "@testing-library/react";
 import { afterEach } from "vitest";
 
 afterEach(() => {
   cleanup();
 });
+
+// The margin every `findBy`/`waitFor` in the suite waits within, raised from
+// the 1000ms default.
+//
+// This is a test-harness value and nothing else: no production timer moved,
+// and the debounces the app actually ships (the 500ms dry run, the 1s draft
+// writer) are untouched. What it buys is headroom on a loaded machine, where
+// a screen that would settle in 1.1s is not a defect but did fail the suite -
+// the three flaky tests this program named all had the same shape, a real
+// wait that occasionally outran the default rather than a wrong assertion.
+// Raising the ceiling does not slow a passing run down by a millisecond,
+// since these helpers return the moment their condition holds; it only
+// lengthens how long a genuinely broken one takes to admit it.
+configure({ asyncUtilTimeout: 3000 });
 
 // Node ships its own global `localStorage`/`sessionStorage`. vitest's jsdom
 // environment only overrides a global that already exists on `globalThis`

@@ -38,6 +38,7 @@ import {
   writeScalar,
   writeTagList,
 } from "./frontmatterFields";
+import { docText } from "./setup";
 
 export interface FrontmatterFormProps {
   /** The live buffer text, which is where every value is read from. */
@@ -98,15 +99,32 @@ export function FrontmatterForm({
   const statusField = useId();
   const guidance = useId();
 
-  const apply = (edit: FieldEdit | null) => {
-    if (!edit || !view) {
+  const apply = (compute: (base: string) => FieldEdit | null) => {
+    if (!view) {
+      return;
+    }
+    // The live text, read here and handed to the caller, rather than the `doc`
+    // prop. The prop is React state and can be one transaction behind the
+    // document inside a nested event turn: the toolbar calls `view.focus()`,
+    // that blurs a rail field with an uncommitted value, and the commit runs
+    // before React has flushed the buffer the toolbar's own edit produced. An
+    // edit computed on the old text and dispatched against the new document
+    // resolves to shifted lines, which is how an Insert table could land
+    // inside the frontmatter block or eat its closing fence.
+    //
+    // One reader, so the two can no longer disagree: whatever `compute`
+    // measures its offsets against is exactly what `positionOf` translates
+    // them through. Every dispatch in this file goes through here.
+    const base = docText(view.state);
+    const edit = compute(base);
+    if (!edit) {
       return;
     }
     const separator = view.state.lineBreak;
     view.dispatch({
       changes: {
-        from: positionOf(view.state.doc, doc, edit.from, separator),
-        to: positionOf(view.state.doc, doc, edit.to, separator),
+        from: positionOf(view.state.doc, base, edit.from, separator),
+        to: positionOf(view.state.doc, base, edit.to, separator),
         // The helpers write the separator they found in the text; the state
         // is the authority on what this buffer's break actually is.
         insert: edit.insert.split(/\r\n|\n/).join(separator),
@@ -114,7 +132,9 @@ export function FrontmatterForm({
     });
   };
   const scalar = (key: string) => (value: string) => {
-    apply(writeScalar(doc, key, value.trim() === "" ? null : value.trim()));
+    apply((base) =>
+      writeScalar(base, key, value.trim() === "" ? null : value.trim()),
+    );
   };
 
   const tags = readTagList(doc);
@@ -198,10 +218,14 @@ export function FrontmatterForm({
                 aria-label={`Remove tag ${tag}`}
                 className={`rounded bg-slate-100 px-1.5 py-0.5 text-caption hover:line-through dark:bg-slate-800 ${FOCUS_RING}`}
                 onClick={() => {
-                  apply(
+                  // The list is re-read from the base too, not closed over
+                  // from the render: the tag to drop is the fact this button
+                  // carries, and everything else about the block is whatever
+                  // the document says at the moment of the dispatch.
+                  apply((base) =>
                     writeTagList(
-                      doc,
-                      tags.filter((existing) => existing !== tag),
+                      base,
+                      readTagList(base).filter((existing) => existing !== tag),
                     ),
                   );
                 }}
@@ -222,7 +246,9 @@ export function FrontmatterForm({
           onKeyDown={(event) => {
             if (event.key === "Enter" && draftTag.trim() !== "") {
               event.preventDefault();
-              apply(writeTagList(doc, [...tags, draftTag.trim()]));
+              apply((base) =>
+                writeTagList(base, [...readTagList(base), draftTag.trim()]),
+              );
               setDraftTag("");
             }
           }}
@@ -303,8 +329,13 @@ function DateRow({
   keyName: string;
   /** What this bound's absence is called: "Always" low, "Forever" high. */
   unbounded: string;
+  /** What the row DISPLAYS, which is a render and may be a render behind. */
   doc: string;
-  onEdit: (edit: FieldEdit | null) => void;
+  /**
+   * What the row WRITES: a thunk handed the live text at dispatch time. The
+   * two are deliberately different sources - see `apply`.
+   */
+  onEdit: (compute: (base: string) => FieldEdit | null) => void;
 }) {
   const value = readScalar(doc, keyName) ?? "";
   const [picking, setPicking] = useState(false);
@@ -364,7 +395,8 @@ function DateRow({
           value={value}
           onChange={(event) => {
             if (event.target.value !== "") {
-              onEdit(writeScalar(doc, keyName, event.target.value));
+              const picked = event.target.value;
+              onEdit((base) => writeScalar(base, keyName, picked));
             }
           }}
         />
@@ -376,7 +408,7 @@ function DateRow({
           // Both halves of going back: the key goes, and so does the empty
           // picker that was opened without one ever being written.
           setPicking(false);
-          onEdit(writeScalar(doc, keyName, null));
+          onEdit((base) => writeScalar(base, keyName, null));
         }}
       />
     </div>

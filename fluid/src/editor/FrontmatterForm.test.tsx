@@ -100,6 +100,38 @@ describe("the frontmatter form", () => {
     expect(ghost.className).toContain("h-8");
   });
 
+  it("writes against the document as it stands, not the render it was drawn from", async () => {
+    // The seam this pins: the rail DISPLAYS a React prop, which inside a
+    // nested event turn can be one transaction behind the document, and it
+    // WRITES through the view. A field committed in the same turn as an edit
+    // that added a line above it - the toolbar's `view.focus()` blurring an
+    // uncommitted field is the real path - resolved its line numbers against
+    // the older text and landed one line high, on somebody else's key.
+    const live = DOC.replace("---\n", "---\ntype: engram\n");
+    const view = new EditorView({
+      state: EditorState.create({
+        doc: live,
+        extensions: lineSeparatorFor(live),
+      }),
+      parent: document.body,
+    });
+    views.push(view);
+    // Deliberately stale: the prop is the text from before that line arrived.
+    render(<FrontmatterForm doc={DOC} view={view} vocabulary={null} />);
+
+    const status = screen.getByLabelText("Status");
+    await userEvent.clear(status);
+    await userEvent.type(status, "draft");
+    await userEvent.tab();
+
+    // The value landed on its own line, and the line that used to hold the
+    // stale text's line number is untouched.
+    expect(view.state.doc.toString()).toContain("status: draft");
+    expect(view.state.doc.toString()).toContain("title: Alpha");
+    expect(view.state.doc.toString()).toContain("type: engram");
+    expect(view.state.doc.toString()).not.toContain("status: stable");
+  });
+
   it("an edit dispatches a single-line change into the buffer", async () => {
     const view = mounted();
     const status = screen.getByLabelText("Status");

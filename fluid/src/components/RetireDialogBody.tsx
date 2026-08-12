@@ -323,7 +323,11 @@ export default function RetireDialogBody({
                 {validTo !== "" && (
                   <button
                     type="button"
-                    aria-label="Clear valid to"
+                    // The rail's own words for the same act: clearing this
+                    // bound is not emptying a field, it is choosing the state
+                    // an absent upper bound means, and the two surfaces that
+                    // offer it must not name it two different things.
+                    aria-label="Clear to forever"
                     className="rounded border border-slate-300 px-2 py-1 text-xs hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800"
                     onClick={() => {
                       setValidTo("");

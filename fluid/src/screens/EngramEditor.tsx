@@ -684,12 +684,23 @@ function Surface({
    * and then abandoned inside that second would otherwise be in neither the
    * file nor the draft. This is the same deliberate snapshot the closed-room
    * walkout takes, for the same reason.
+   *
+   * Every press decides afresh, which is why the standing request is dropped
+   * on the way in rather than left for the next branch to inherit. A save can
+   * be in the air when this runs - the findings lag the buffer by the dry-run
+   * debounce, so a Done inside that window starts a PUT and the refusal lands
+   * behind it - and the second press then reaches the confirm with the first
+   * one's flag still armed. Without this line "Keep editing" would put the
+   * dialog away and the landing save would walk the author out anyway, on a
+   * request they had just withdrawn. The save path re-arms two lines below, so
+   * a Done that really is a save still finishes on its own receipt.
    */
   const [confirmingLeave, setConfirmingLeave] = useState(false);
   const leave = () => {
     void navigate(engramRoute(engram.domain, engram.permalink));
   };
   const finish = () => {
+    finishing.current = false;
     if (session.hardErrors > 0 && session.dirty) {
       setConfirmingLeave(true);
       return;
