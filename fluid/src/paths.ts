@@ -99,6 +99,17 @@ export function usersRoute(): string {
   return "/users";
 }
 
+/**
+ * The GitHub settings screen.
+ *
+ * Under `/settings/` even though it is the only section there: the address
+ * says what kind of screen it is, and the next section will not need every
+ * link that points here rewritten.
+ */
+export function githubSettingsRoute(): string {
+  return "/settings/github";
+}
+
 /** Where the topbar's search box sends a query. */
 export function searchRoute(query: string): string {
   return `/search?q=${encodeURIComponent(query)}`;

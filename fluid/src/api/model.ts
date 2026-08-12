@@ -53,6 +53,23 @@ export type MoveBody = components["schemas"]["MoveBody"];
 /** What `PUT /domains/{domain}/manifest` takes. */
 export type SaveManifestBody = components["schemas"]["SaveManifestBody"];
 
+/** What `GET /settings/github` and every GitHub settings verb answer with. */
+export type GithubStatusResponse =
+  components["schemas"]["GithubStatusResponse"];
+
+/** What an archive preview and an archive import both answer with. */
+export type ArchiveReport = components["schemas"]["ArchiveReport"];
+
+/**
+ * What `POST /domains` takes.
+ *
+ * Named for the wire rather than for the caller, because `api/admin.ts`
+ * exports a `CreateDomainBody` of its own: the screen's version narrows `mode`
+ * to the three modes that exist and leaves out the nulls a JSON body may
+ * carry, and it is checked against this one on its way out.
+ */
+export type CreateDomainWireBody = components["schemas"]["CreateDomainBody"];
+
 /** What `POST /validate` takes. */
 export type ValidateBody = components["schemas"]["ValidateBody"];
 

@@ -21,6 +21,7 @@
 import { useQuery } from "@tanstack/react-query";
 import {
   Gem,
+  GitBranch,
   House,
   Moon,
   PanelLeft,
@@ -54,7 +55,12 @@ import type { DomainSummary } from "../api/domains";
 import { useAuth } from "../auth/AuthContext";
 import { useRegisterCommands } from "../commands";
 import type { PaletteCommand } from "../commands";
-import { domainRoute, searchRoute, usersRoute } from "../paths";
+import {
+  domainRoute,
+  githubSettingsRoute,
+  searchRoute,
+  usersRoute,
+} from "../paths";
 import { useTheme } from "../theme/context";
 import type { ThemePreference } from "../theme/context";
 import { CommandPalette } from "./CommandPalette";
@@ -142,6 +148,8 @@ function subscribeWide(onChange: () => void): () => void {
 }
 
 export function Layout() {
+  const { capabilities } = useAuth();
+  const navigate = useNavigate();
   const [navOpen, setNavOpen] = useState(false);
   const [rail, setRail] = useState(storedRail);
   const wide = useWide();
@@ -163,12 +171,16 @@ export function Layout() {
     });
   };
 
-  // The one action that is offered on every screen, because the frame is on
-  // every screen: a reader who found the palette can find everything else
-  // from inside it. Registered as the frame's, so it sits under whatever the
-  // screen in front of the reader offers rather than above it.
-  const commands = useMemo<PaletteCommand[]>(
-    () => [
+  // What is offered on every screen, because the frame is on every screen: a
+  // reader who found the palette can find everything else from inside it.
+  // Registered as the frame's, so it sits under whatever the screen in front
+  // of the reader offers rather than above it.
+  //
+  // The settings row is gated the same way its nav link is: an action a
+  // session may not run is never registered, so the palette offers no door
+  // that will not open.
+  const commands = useMemo<PaletteCommand[]>(() => {
+    const frame: PaletteCommand[] = [
       {
         id: "help",
         title: "Keyboard shortcuts",
@@ -176,9 +188,18 @@ export function Layout() {
           setHelpOpen(true);
         },
       },
-    ],
-    [],
-  );
+    ];
+    if (capabilities.canAdminister) {
+      frame.push({
+        id: "github-settings",
+        title: "GitHub settings",
+        run: () => {
+          void navigate(githubSettingsRoute());
+        },
+      });
+    }
+    return frame;
+  }, [capabilities.canAdminister, navigate]);
   useRegisterCommands(commands, "frame");
 
   useEffect(() => {
@@ -324,18 +345,38 @@ function TopBar({
           door that will not open.
         */}
         {capabilities.canAdminister && (
-          <NavLink
-            to={usersRoute()}
-            aria-label="Users"
-            title="Users"
-            className={({ isActive }) =>
-              `inline-flex h-8 w-8 shrink-0 items-center justify-center rounded text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800 ${FOCUS_RING} ${
-                isActive ? "bg-slate-100 dark:bg-slate-800" : ""
-              }`
-            }
-          >
-            <UsersIcon aria-hidden="true" size={16} strokeWidth={1.75} />
-          </NavLink>
+          <>
+            <NavLink
+              to={usersRoute()}
+              aria-label="Users"
+              title="Users"
+              className={({ isActive }) =>
+                `inline-flex h-8 w-8 shrink-0 items-center justify-center rounded text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800 ${FOCUS_RING} ${
+                  isActive ? "bg-slate-100 dark:bg-slate-800" : ""
+                }`
+              }
+            >
+              <UsersIcon aria-hidden="true" size={16} strokeWidth={1.75} />
+            </NavLink>
+            {/*
+              The connection team domains are tracked with, which is why the
+              glyph is a branch rather than a cog: the settings screen behind
+              it is about one repository connection, not about the instance's
+              preferences at large.
+            */}
+            <NavLink
+              to={githubSettingsRoute()}
+              aria-label="GitHub"
+              title="GitHub"
+              className={({ isActive }) =>
+                `inline-flex h-8 w-8 shrink-0 items-center justify-center rounded text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800 ${FOCUS_RING} ${
+                  isActive ? "bg-slate-100 dark:bg-slate-800" : ""
+                }`
+              }
+            >
+              <GitBranch aria-hidden="true" size={16} strokeWidth={1.75} />
+            </NavLink>
+          </>
         )}
 
         <ThemeMenu />

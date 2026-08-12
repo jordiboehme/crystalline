@@ -321,6 +321,10 @@ describe("the layout", () => {
       "href",
       "/users",
     );
+    expect(screen.getByRole("link", { name: "GitHub" })).toHaveAttribute(
+      "href",
+      "/settings/github",
+    );
     expect(screen.getByRole("button", { name: /^Theme:/ })).toBeVisible();
     expect(screen.getByRole("link", { name: "Fluid" })).toHaveAttribute(
       "href",

@@ -40,10 +40,21 @@ import UsersAdmin from "./screens/UsersAdmin";
 const EngramEditor = lazy(() => import("./screens/EngramEditor"));
 const ManifestEditor = lazy(() => import("./screens/ManifestEditor"));
 
+/**
+ * And the settings screen, which is lazy for a different reason: it weighs
+ * almost nothing, but it is a screen only an admin ever opens, and the app
+ * shell is paid for by everybody who opens the app at all.
+ */
+const GithubSettings = lazy(() => import("./screens/GithubSettings"));
+
 const EDITOR_FALLBACK = (
   <p className="text-sm text-slate-500 dark:text-slate-400">
     Loading the editor
   </p>
+);
+
+const SETTINGS_FALLBACK = (
+  <p className="text-sm text-slate-500 dark:text-slate-400">Loading settings</p>
 );
 
 export function AppRoutes() {
@@ -98,6 +109,19 @@ export function AppRoutes() {
             address says exactly as much as a mistyped one does.
           */}
           <Route path="/users" element={<UsersAdmin />} />
+          {/*
+            The same arrangement, one screen along: routed for everybody,
+            rendered for admins only, and lazy because nobody else will ever
+            load it.
+          */}
+          <Route
+            path="/settings/github"
+            element={
+              <Suspense fallback={SETTINGS_FALLBACK}>
+                <GithubSettings />
+              </Suspense>
+            }
+          />
           <Route path="*" element={<NotFound />} />
         </Route>
       </Route>
