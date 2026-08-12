@@ -18,11 +18,14 @@ import * as Y from "yjs";
 import { frontmatterFold, unfoldEffect } from "./frontmatterFold";
 import { baseExtensions, docText, lineSeparatorFor } from "./setup";
 import {
+  CODE_SKELETON,
   MERMAID_SKELETON,
+  ORDERED_ITEM,
   TABLE_SKELETON,
   cycleHeading,
   formattingKeymap,
   insertBlock,
+  insertMarkdownLink,
   insertWikilink,
   toggleInline,
   toggleLinePrefix,
@@ -85,6 +88,32 @@ describe("toggleInline", () => {
     toggleInline(v, "`");
     expect(docText(v.state)).toBe("```a``` b");
   });
+
+  test("strikethrough wraps and unwraps the same words", () => {
+    const v = solo("hello world", 0, 5);
+    toggleInline(v, "~~");
+    expect(docText(v.state)).toBe("~~hello~~ world");
+    // The wrap keeps the words selected, so the second press is the same
+    // gesture on the same text - the round trip a person actually makes.
+    toggleInline(v, "~~");
+    expect(docText(v.state)).toBe("hello world");
+  });
+
+  test("a bare cursor gets an empty strikethrough pair to type into", () => {
+    const v = solo("hello world", 5);
+    toggleInline(v, "~~");
+    expect(docText(v.state)).toBe("hello~~~~ world");
+    expect(v.state.selection.main.head).toBe(7);
+  });
+
+  test("strikethrough inside a longer tilde run nests rather than half-stripping", () => {
+    // Three tildes on each side are not this command's pair. Taking two of
+    // them would leave a stray `~` behind and break the markup that was
+    // there; the exact-run rule nests instead, at the price of one undo.
+    const v = solo("~~~hello~~~ world", 3, 8);
+    toggleInline(v, "~~");
+    expect(docText(v.state)).toBe("~~~~~hello~~~~~ world");
+  });
 });
 
 describe("cycleHeading", () => {
@@ -107,6 +136,29 @@ describe("toggleLinePrefix", () => {
     toggleLinePrefix(v, "- ");
     expect(docText(v.state)).toBe("one\ntwo\n");
   });
+
+  test("quotes every selected line, then unquotes", () => {
+    const v = solo("one\ntwo\n", 0, 7);
+    toggleLinePrefix(v, "> ");
+    expect(docText(v.state)).toBe("> one\n> two\n");
+    toggleLinePrefix(v, "> ");
+    expect(docText(v.state)).toBe("one\ntwo\n");
+  });
+
+  test("numbers every selected line with a literal 1., which markdown renumbers", () => {
+    const v = solo("one\ntwo\n", 0, 7);
+    toggleLinePrefix(v, "1. ", ORDERED_ITEM);
+    expect(docText(v.state)).toBe("1. one\n1. two\n");
+  });
+
+  test("a renumbered list is still a list to the numbered toggle", () => {
+    // What the author is looking at after markdown - or another editor - has
+    // numbered the items in sequence. A toggle that only knew the literal
+    // "1. " would strip the first line, prefix the rest and call it done.
+    const v = solo("1. one\n2. two\n10. ten\n", 0, 21);
+    expect(toggleLinePrefix(v, "1. ", ORDERED_ITEM)).toBe(true);
+    expect(docText(v.state)).toBe("one\ntwo\nten\n");
+  });
 });
 
 describe("insertWikilink", () => {
@@ -117,6 +169,28 @@ describe("insertWikilink", () => {
   });
 });
 
+describe("insertMarkdownLink", () => {
+  test("a bare cursor gets a whole link with its text selected", () => {
+    const v = solo("see here", 4);
+    insertMarkdownLink(v);
+    expect(docText(v.state)).toBe("see [text](url)here");
+    expect(
+      v.state.sliceDoc(v.state.selection.main.from, v.state.selection.main.to),
+    ).toBe("text");
+  });
+
+  test("a selection becomes the link text and the url is what is selected", () => {
+    // The words are already written; the address is the thing still missing,
+    // so that is where the next keystroke belongs.
+    const v = solo("see Target here", 4, 10);
+    insertMarkdownLink(v);
+    expect(docText(v.state)).toBe("see [Target](url) here");
+    expect(
+      v.state.sliceDoc(v.state.selection.main.from, v.state.selection.main.to),
+    ).toBe("url");
+  });
+});
+
 describe("insertBlock", () => {
   test("a table lands on its own lines below the cursor line", () => {
     const v = solo("prose line", 5);
@@ -124,6 +198,16 @@ describe("insertBlock", () => {
     expect(docText(v.state)).toBe(
       "prose line\n\n| Column | Column |\n| --- | --- |\n|  |  |\n",
     );
+  });
+
+  test("a code block lands with the caret in its language slot", () => {
+    const v = solo("prose line", 5);
+    insertBlock(v, CODE_SKELETON);
+    expect(docText(v.state)).toBe("prose line\n\n```\n\n```\n");
+    // Right after the opening fence: the block's own first line is where
+    // `insertBlock` leaves the caret, and on a bare fence that spot is the
+    // language name - the one token a fresh code block is missing.
+    expect(v.state.selection.main.head).toBe("prose line\n\n```".length);
   });
 
   test("a CRLF document keeps its endings through an insertion", () => {
@@ -195,6 +279,12 @@ describe("the folded frontmatter", () => {
     expect(docText(v.state)).toBe(
       `${YAML}| Column | Column |\n| --- | --- |\n|  |  |\n\nBody line\n`,
     );
+  });
+
+  test("a link from the mount-time caret lands in the body", () => {
+    const v = folded(FOLDED_DOC, 0);
+    insertMarkdownLink(v);
+    expect(docText(v.state)).toBe(`${YAML}[text](url)\nBody line\n`);
   });
 
   test("a selection spanning the block is refused rather than moved", () => {

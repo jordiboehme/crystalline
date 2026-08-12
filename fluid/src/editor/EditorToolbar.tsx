@@ -4,7 +4,7 @@
  * preview and Raw mode - it edits source text, which both modes are.
  *
  * Every button is an ordinary tab stop rather than a roving-tabindex group:
- * there are nine of them, they are all named, and native buttons already
+ * there are fourteen of them, they are all named, and native buttons already
  * answer Enter and Space. What they must not do is take the selection away
  * from the buffer they are about to edit, so the bar cancels its own mousedown
  * - the event that would move focus - and every command puts the caret back in
@@ -18,9 +18,14 @@ import {
   Code,
   Heading,
   Italic,
+  Link,
   List,
+  ListOrdered,
   ListTodo,
+  SquareCode,
+  Strikethrough,
   Table,
+  TextQuote,
   Workflow,
 } from "lucide-react";
 import { DropdownMenu } from "radix-ui";
@@ -29,10 +34,13 @@ import type { MouseEvent, ReactElement } from "react";
 import { ITEM_CLASSES, MENU_CLASSES } from "../components/menu";
 import { IconButton } from "../components/primitives";
 import {
+  CODE_SKELETON,
   MERMAID_SKELETON,
+  ORDERED_ITEM,
   TABLE_SKELETON,
   cycleHeading,
   insertBlock,
+  insertMarkdownLink,
   insertWikilink,
   toggleInline,
   toggleLinePrefix,
@@ -73,6 +81,12 @@ export function EditorToolbar({
         icon={Italic}
         disabled={off}
         onClick={act((v) => toggleInline(v, "*"))}
+      />
+      <IconButton
+        label="Strikethrough"
+        icon={Strikethrough}
+        disabled={off}
+        onClick={act((v) => toggleInline(v, "~~"))}
       />
       <IconButton
         label="Inline code"
@@ -118,10 +132,22 @@ export function EditorToolbar({
         onClick={act((v) => toggleLinePrefix(v, "- "))}
       />
       <IconButton
+        label="Numbered list"
+        icon={ListOrdered}
+        disabled={off}
+        onClick={act((v) => toggleLinePrefix(v, "1. ", ORDERED_ITEM))}
+      />
+      <IconButton
         label="Task list"
         icon={ListTodo}
         disabled={off}
         onClick={act((v) => toggleLinePrefix(v, "- [ ] "))}
+      />
+      <IconButton
+        label="Blockquote"
+        icon={TextQuote}
+        disabled={off}
+        onClick={act((v) => toggleLinePrefix(v, "> "))}
       />
       <IconButton
         label="Wiki link"
@@ -129,9 +155,15 @@ export function EditorToolbar({
         disabled={off}
         onClick={act(insertWikilink)}
       />
+      <IconButton
+        label="Link"
+        icon={Link}
+        disabled={off}
+        onClick={act(insertMarkdownLink)}
+      />
       {/*
-        Decoration, not information: the two insert verbs are named buttons
-        of their own, and this hairline only says they are a different kind of
+        Decoration, not information: the insert verbs are named buttons of
+        their own, and this hairline only says they are a different kind of
         thing. It is the same separator every menu in the app draws.
       */}
       <span
@@ -149,6 +181,12 @@ export function EditorToolbar({
         icon={Workflow}
         disabled={off}
         onClick={act((v) => insertBlock(v, MERMAID_SKELETON))}
+      />
+      <IconButton
+        label="Insert code block"
+        icon={SquareCode}
+        disabled={off}
+        onClick={act((v) => insertBlock(v, CODE_SKELETON))}
       />
     </div>
   );

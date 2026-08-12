@@ -194,14 +194,46 @@ export function cycleHeading(view: EditorView, level: number): boolean {
 }
 
 /**
+ * What a numbered list looks like once it exists.
+ *
+ * The button inserts a literal `1. ` on every line, which is correct markdown
+ * - the renderer numbers the items in sequence and an author who reorders
+ * them gets the new order for free - but it is not what the second line then
+ * READS as, here or after another editor has renumbered the source. Toggling
+ * off has to recognise whatever number is actually there, or the button
+ * unnumbers the first line and numbers the rest.
+ */
+export const ORDERED_ITEM = /^\d+\. /;
+
+/**
+ * How much of `text` is already this command's prefix: its length when the
+ * line carries it, zero when it does not.
+ *
+ * `pattern` is for the prefixes that are a shape rather than a string. The
+ * literal comparison is the rule for every other one, because `- ` and `> `
+ * mean themselves and a line that starts `-- ` is not a list item.
+ */
+function wornPrefix(text: string, prefix: string, pattern?: RegExp): number {
+  if (pattern) {
+    return pattern.exec(text)?.[0].length ?? 0;
+  }
+  return text.startsWith(prefix) ? prefix.length : 0;
+}
+
+/**
  * Put `prefix` on the front of every touched line, or take it off all of them
- * when every one already carries it - the list and task-list buttons.
+ * when every one already carries it - the list, numbered-list, task-list and
+ * quote buttons.
  *
  * Lines are collected by NUMBER rather than by walking positions: a CRLF
  * buffer's line break is two characters wide, so stepping `line.to + 1` would
  * be reasoning about the middle of a break.
  */
-export function toggleLinePrefix(view: EditorView, prefix: string): boolean {
+export function toggleLinePrefix(
+  view: EditorView,
+  prefix: string,
+  pattern?: RegExp,
+): boolean {
   if (!clearOfFoldedFrontmatter(view)) {
     return false;
   }
@@ -219,11 +251,17 @@ export function toggleLinePrefix(view: EditorView, prefix: string): boolean {
       }
     }
   }
-  const removing = lines.every((line) => line.text.startsWith(prefix));
-  const changes = lines.flatMap((line) =>
+  // The width is read once per line and carried, because removal strips what
+  // the line actually wears - `10. ` is a character wider than `1. `.
+  const worn = lines.map((line) => ({
+    line,
+    width: wornPrefix(line.text, prefix, pattern),
+  }));
+  const removing = worn.every((entry) => entry.width > 0);
+  const changes = worn.flatMap(({ line, width }) =>
     removing
-      ? [{ from: line.from, to: line.from + prefix.length, insert: "" }]
-      : line.text.startsWith(prefix)
+      ? [{ from: line.from, to: line.from + width, insert: "" }]
+      : width > 0
         ? []
         : [{ from: line.from, insert: prefix }],
   );
@@ -252,12 +290,68 @@ export function insertWikilink(view: EditorView): boolean {
   return true;
 }
 
+/** The placeholders a link arrives with, one of them always selected. */
+const LINK_TEXT = "text";
+const LINK_URL = "url";
+
+/**
+ * `[text](url)` - the link to somewhere that is not an engram.
+ *
+ * Which half is selected follows from what the author already gave. From a
+ * bare cursor nothing is written yet, so the whole link is placeholder and
+ * the words come first: `text` is selected and the first keystroke replaces
+ * it. From a selection the words exist and are kept - selecting them again
+ * would mean the next keystroke DELETES what was just linked - so the caret
+ * lands on `url`, the only part still missing.
+ */
+export function insertMarkdownLink(view: EditorView): boolean {
+  if (!clearOfFoldedFrontmatter(view)) {
+    return false;
+  }
+  const tail = `](${LINK_URL})`;
+  const changes = view.state.changeByRange((range) => {
+    if (range.empty) {
+      return {
+        changes: [{ from: range.from, insert: `[${LINK_TEXT}${tail}` }],
+        range: EditorSelection.range(
+          range.from + 1,
+          range.from + 1 + LINK_TEXT.length,
+        ),
+      };
+    }
+    // Where the address lands: past the bracket that went in front of the
+    // words, then past the `](` this tail opens with.
+    const url = range.to + "[".length + "](".length;
+    return {
+      changes: [
+        { from: range.from, insert: "[" },
+        { from: range.to, insert: tail },
+      ],
+      range: EditorSelection.range(url, url + LINK_URL.length),
+    };
+  });
+  view.dispatch(changes, { userEvent: "input" });
+  view.focus();
+  return true;
+}
+
 /** The starter table: a header, its rule and one empty row to fill in. */
 export const TABLE_SKELETON = [
   "| Column | Column |",
   "| --- | --- |",
   "|  |  |",
 ] as const;
+
+/**
+ * The starter code block: a bare fence, a line to write on and the close.
+ *
+ * The fence names no language on purpose. `insertBlock` leaves the caret at
+ * the end of the block's first line, which on a bare fence is exactly the
+ * language slot, so the first keystroke after the button names the language
+ * and one Down arrow reaches the body. A fence that guessed a language would
+ * have to be deleted before it could be corrected.
+ */
+export const CODE_SKELETON = ["```", "", "```"] as const;
 
 /** The starter diagram, in the flavor the read view already renders. */
 export const MERMAID_SKELETON = [
