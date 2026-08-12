@@ -267,6 +267,29 @@ describe("the frontmatter form", () => {
     expect(view.state.sliceDoc()).not.toContain("- eng\n");
   });
 
+  it("adds a tag to a list written flush against the margin, leaving one list", async () => {
+    // The shape real files carry, and the corruption it used to cause: the
+    // block items sit at zero indentation, so a write that took the key line
+    // for the whole entry left the original items stranded under the new
+    // list and the block stopped parsing as yaml at all.
+    const flush =
+      "---\ntitle: Alpha\ntags:\n- protocol\n- smoke\nstatus: current\n---\n\nBody.\n";
+    render(<Live content={flush} />);
+    await screen.findByLabelText("Engram source");
+    const view = liveView();
+    // The chips are the buffer's own answer, and it has two to give.
+    expect(
+      await screen.findByRole("button", { name: "Remove tag protocol" }),
+    ).toBeInTheDocument();
+
+    await userEvent.type(screen.getByLabelText("Add tag"), "editor{Enter}");
+
+    expect(view.state.sliceDoc()).toBe(
+      "---\ntitle: Alpha\ntags:\n  - protocol\n  - smoke\n  - editor\nstatus: current\n---\n\nBody.\n",
+    );
+    expect(view.state.sliceDoc().match(/^tags:/gm)).toHaveLength(1);
+  });
+
   it("offers the domain's own tags as suggestions", () => {
     mounted({
       tags: [

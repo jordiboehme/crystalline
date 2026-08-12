@@ -58,6 +58,17 @@ describe("frontmatterFold", () => {
     view.destroy();
   });
 
+  test("the chip counts a tag list written flush against the margin", () => {
+    // The shape this fixture already has, now asserted: block items at zero
+    // indentation are a tag list, and a summary that counted none of them
+    // told the reader the block held fewer tags than it does.
+    const view = mount(DOC.replace("- protocol\n", "- protocol\n- smoke\n"));
+    expect(
+      view.dom.querySelector(".cm-frontmatter-chip")?.textContent,
+    ).toContain("2 tags");
+    view.destroy();
+  });
+
   test("cursor motion steps over the fold rather than into it", () => {
     const view = mount(DOC);
     // Put the caret just after the fold, then walk left. The first two steps

@@ -144,3 +144,67 @@ describe("tag lists", () => {
     expect(next).not.toContain("tags:");
   });
 });
+
+/**
+ * The shape real engram files carry: a block sequence at ZERO indentation
+ * under its key, which yaml reads exactly like the indented form and which
+ * the core's emitter is what writes. Read as "no tags" the form showed no
+ * chips; written as if the key line were the whole entry, the indented list
+ * landed above the untouched original items and the file stopped being yaml.
+ */
+const FLUSH = `---
+title: Alpha
+tags:
+- protocol
+- smoke
+status: current
+---
+
+# Alpha
+`;
+
+describe("a block list at zero indentation", () => {
+  it("reads its items", () => {
+    expect(readTagList(FLUSH)).toEqual(["protocol", "smoke"]);
+  });
+
+  it("is replaced whole, leaving exactly one entry and the keys under it", () => {
+    const next = applied(
+      FLUSH,
+      writeTagList(FLUSH, [...readTagList(FLUSH), "editor"]),
+    );
+    expect(next).toBe(
+      "---\ntitle: Alpha\ntags:\n  - protocol\n  - smoke\n  - editor\nstatus: current\n---\n\n# Alpha\n",
+    );
+    // One entry, not two: the old items are gone rather than stranded below
+    // the new list, which is the state that was invalid yaml on disk.
+    expect(next.match(/^tags:/gm)).toHaveLength(1);
+    expect(readTagList(next)).toEqual(["protocol", "smoke", "editor"]);
+  });
+
+  it("an empty list takes the key line and every item with it", () => {
+    const next = applied(FLUSH, writeTagList(FLUSH, []));
+    expect(next).toBe("---\ntitle: Alpha\nstatus: current\n---\n\n# Alpha\n");
+    expect(readTagList(next)).toEqual([]);
+  });
+
+  it("stops at the closing fence when the list is the last entry", () => {
+    const last = "---\ntitle: Alpha\ntags:\n- protocol\n---\n\n- a body item\n";
+    expect(readTagList(last)).toEqual(["protocol"]);
+    expect(applied(last, writeTagList(last, []))).toBe(
+      "---\ntitle: Alpha\n---\n\n- a body item\n",
+    );
+    // The fence is not an item, and neither is the list-shaped body line.
+    expect(applied(last, writeTagList(last, ["protocol", "editor"]))).toBe(
+      "---\ntitle: Alpha\ntags:\n  - protocol\n  - editor\n---\n\n- a body item\n",
+    );
+  });
+
+  it("carries the buffer's own line endings", () => {
+    const crlf = FLUSH.replace(/\n/g, "\r\n");
+    expect(readTagList(crlf)).toEqual(["protocol", "smoke"]);
+    expect(applied(crlf, writeTagList(crlf, ["protocol", "editor"]))).toBe(
+      "---\r\ntitle: Alpha\r\ntags:\r\n  - protocol\r\n  - editor\r\nstatus: current\r\n---\r\n\r\n# Alpha\r\n",
+    );
+  });
+});

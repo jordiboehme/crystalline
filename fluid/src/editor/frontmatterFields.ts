@@ -172,9 +172,16 @@ function tagsSpan(
   const after = keyText.slice(keyText.indexOf(":") + 1).trim();
   let to = key.lineEnd;
   if (after === "") {
+    // Any indentation, none included: a block sequence under a mapping key is
+    // yaml whether or not its items are indented, and the flush form is what
+    // the core's emitter writes. Requiring the indent read those files as
+    // having no tags, and - worse - wrote a fresh list over the key line
+    // alone, stranding the original items below it as a second list.
+    // The closing fence never reaches here (`blockLines` stops at it) and
+    // would not match anyway: `---` has no space after its first dash.
     for (let i = index + 1; i < lines.length; i += 1) {
       const item = lines[i];
-      if (!item || !/^\s+-\s/.test(lineText(doc, item))) {
+      if (!item || !/^\s*-\s/.test(lineText(doc, item))) {
         break;
       }
       to = item.lineEnd;
