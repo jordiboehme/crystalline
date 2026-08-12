@@ -303,8 +303,9 @@ function indentWidth(text: string): number {
  * That means the change is applied twice - once to a scratch `Text` to find
  * the line, once by the transaction - and the duplication is the price, not an
  * oversight. The arithmetic that would avoid it reads the separator's length,
- * which is the one thing this module never does: on a CRLF buffer it would put
- * the caret one character into the second line's `|` on every added row.
+ * which is the one thing this module never does: on a CRLF buffer it would
+ * land the caret AT the second line's `|` - the last position still inside
+ * the first cell, so typing there gives `|  X|` - on every added row.
  */
 export function tableAddRowBelow(view: EditorView): boolean {
   const found = target(view);
