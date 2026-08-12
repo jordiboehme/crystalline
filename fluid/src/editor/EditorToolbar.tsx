@@ -34,7 +34,6 @@ import {
   Rows3,
   SquareCode,
   Strikethrough,
-  Table,
   TextQuote,
   Trash2,
   WandSparkles,
@@ -45,12 +44,12 @@ import type { MouseEvent, ReactElement } from "react";
 
 import { ITEM_CLASSES, MENU_CLASSES } from "../components/menu";
 import { IconButton } from "../components/primitives";
+import { TableSizePicker } from "./TableSizePicker";
 import type { Align } from "./tableModel";
 import {
   CODE_SKELETON,
   MERMAID_SKELETON,
   ORDERED_ITEM,
-  TABLE_SKELETON,
   cycleHeading,
   insertBlock,
   insertMarkdownLink,
@@ -207,12 +206,12 @@ export function EditorToolbar({
         only says they are a different kind of thing.
       */}
       <Divider />
-      <IconButton
-        label="Insert table"
-        icon={Table}
-        disabled={off}
-        onClick={act((v) => insertBlock(v, TABLE_SKELETON))}
-      />
+      {/*
+        The one insert verb that asks a question first: how big. Its trigger
+        is this bar's own icon button, so the row reads as one kind of thing
+        whatever happens after the press.
+      */}
+      <TableSizePicker view={view} />
       <IconButton
         label="Insert diagram"
         icon={Workflow}

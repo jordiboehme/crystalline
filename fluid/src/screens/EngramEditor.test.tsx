@@ -210,6 +210,22 @@ function mountedView(content: HTMLElement): EditorView {
 }
 
 /**
+ * Insert a table the way the bar now offers one: the button opens a size
+ * picker, and the default cell under the keyboard reproduces exactly what the
+ * button used to insert on its own. The grid is portalled out of the toolbar,
+ * so only the trigger can be looked up inside it.
+ */
+async function insertTable(bar?: HTMLElement): Promise<void> {
+  const trigger = bar
+    ? within(bar).getByRole("button", { name: "Insert table" })
+    : screen.getByRole("button", { name: "Insert table" });
+  await userEvent.click(trigger);
+  await userEvent.click(
+    await screen.findByRole("button", { name: "2 columns by 2 rows" }),
+  );
+}
+
+/**
  * A PUT that stays in flight until the test lets it land, which is what makes
  * "the buffer moved while the save was out" a thing a test can arrange rather
  * than a race it has to hope for.
@@ -346,9 +362,7 @@ describe("the engram editor", () => {
     act(() => {
       view.dispatch({ selection: { anchor: view.state.doc.length } });
     });
-    await userEvent.click(
-      within(bar).getByRole("button", { name: "Insert table" }),
-    );
+    await insertTable(bar);
 
     // The skeleton landed once - a second copy would be the command
     // dispatching twice - and the caret went back to the buffer, which is
@@ -390,9 +404,7 @@ describe("the engram editor", () => {
     });
     // Inserting a table leaves the caret in the header row of what it wrote,
     // which is the shortest honest way into a table from this screen.
-    await userEvent.click(
-      within(bar).getByRole("button", { name: "Insert table" }),
-    );
+    await insertTable(bar);
     await within(bar).findByRole("button", { name: "Add column after" });
 
     // And leaving it takes them away again.
@@ -420,7 +432,7 @@ describe("the engram editor", () => {
     });
     const view = mountedView(editor);
 
-    await userEvent.click(screen.getByRole("button", { name: "Insert table" }));
+    await insertTable();
 
     expect(docText(view.state)).toBe(
       CONTENT.replace(
@@ -1686,7 +1698,7 @@ describe("the engram editor in a session", () => {
     act(() => {
       view.dispatch({ selection: { anchor: view.state.doc.length } });
     });
-    await userEvent.click(screen.getByRole("button", { name: "Insert table" }));
+    await insertTable();
     // The command is a plain transaction on the bound buffer, so the binding
     // writes it into Y.Text once. A skeleton that had been pushed into the
     // shared text by hand as well would be in here twice.

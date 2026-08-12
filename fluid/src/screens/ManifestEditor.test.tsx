@@ -118,8 +118,13 @@ describe("the MANIFEST editor", () => {
       screen.queryByRole("button", { name: "Add column after" }),
     ).toBeNull();
 
-    // Inserting a table leaves the caret in the header row it just wrote.
+    // Inserting a table leaves the caret in the header row it just wrote. The
+    // button opens a size picker now; its default cell is the skeleton this
+    // screen used to get from the button itself.
     await userEvent.click(screen.getByRole("button", { name: "Insert table" }));
+    await userEvent.click(
+      await screen.findByRole("button", { name: "2 columns by 2 rows" }),
+    );
     expect(
       await screen.findByRole("button", { name: "Add column after" }),
     ).toBeInTheDocument();

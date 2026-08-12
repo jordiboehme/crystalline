@@ -16,25 +16,15 @@
  * and reports the token's place within the fenced block, which is the array
  * the toolbar hands to `insertBlock`.
  *
- * This module is data plus one pure function: no CodeMirror import, no
- * mermaid import. It costs nothing until the menu that consumes it is opened.
+ * This module is data plus one wrapper: no mermaid import, so the sixteen
+ * starters cost nothing until the menu that consumes them is opened. Its one
+ * import is the toolbar's `selectToken` and the `BlockSelection` it returns,
+ * which is where insertion lives anyway - a second copy of that search here
+ * would be a second thing to keep in step with the caret it produces.
  */
 
-/**
- * Where the caret lands inside a freshly inserted block: an index into the
- * inserted line array plus a character range within that line.
- *
- * Defined here rather than imported because the toolbar's own copy (with its
- * `selectToken` helper and the `insertBlock` parameter that takes it) lands in
- * Task 3 of this program, which had not landed when this module was written;
- * the shape is the plan's, so the two are the same type and one import from
- * ./toolbar replaces this declaration once the toolbar side exists.
- */
-export interface BlockSelection {
-  line: number;
-  from: number;
-  to: number;
-}
+import type { BlockSelection } from "./toolbar";
+import { selectToken } from "./toolbar";
 
 /** One insertable diagram: its menu label, its body and its first token. */
 export interface MermaidStarter {
@@ -254,42 +244,24 @@ export const MERMAID_STARTER_GROUPS: readonly StarterGroup[] = [
 ];
 
 /**
- * Find the FIRST occurrence of a token across a block's lines.
- *
- * First occurrence rather than exactly-once by design: a state diagram
- * necessarily repeats a state name, and every starter is written so its
- * first mention is the one a person edits.
- *
- * The consequence is real and accepted: where a token recurs (State's "First"
- * on its transition line, Class's "Order" on its edge), typing over the
- * selection leaves the later mention behind - a phantom state, a dangling
- * edge - and it is the person's to follow up. Tokens that occur exactly once
- * would avoid it at the cost of not selecting the word one edits first.
- */
-function firstOccurrence(
-  lines: readonly string[],
-  token: string,
-): BlockSelection | null {
-  for (const [line, text] of lines.entries()) {
-    const from = text.indexOf(token);
-    if (from !== -1) {
-      return { line, from, to: from + token.length };
-    }
-  }
-  return null;
-}
-
-/**
  * Wrap a starter in its mermaid fence and say where its token sits in the
  * result: the lines go to `insertBlock`, the selection with them, so the
  * caret arrives on the first word worth replacing rather than at the end of
  * the fence line. Null when a starter carries no token in its body, which
  * leaves the insertion at its default caret.
+ *
+ * `selectToken` takes the FIRST occurrence, which is what every starter is
+ * written for. The consequence is real and accepted: where a token recurs
+ * (State's "First" on its transition line, Class's "Order" on its edge),
+ * typing over the selection leaves the later mention behind - a phantom
+ * state, a dangling edge - and it is the person's to follow up. Tokens that
+ * occur exactly once would avoid it at the cost of not selecting the word one
+ * edits first.
  */
 export function mermaidFence(starter: MermaidStarter): {
   lines: string[];
   select: BlockSelection | null;
 } {
   const lines = ["```mermaid", ...starter.lines, "```"];
-  return { lines, select: firstOccurrence(lines, starter.token) };
+  return { lines, select: selectToken(lines, starter.token) };
 }

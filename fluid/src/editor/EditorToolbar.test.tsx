@@ -105,6 +105,20 @@ describe("the format buttons", () => {
     expect(v.state.sliceDoc(from, to)).toBe("text");
   });
 
+  test("Insert table opens the size picker and inserts from it", async () => {
+    // The pin for the one event-path question this bar raises: it cancels its
+    // own mousedown to keep the selection in the buffer, and a Popover trigger
+    // opens on CLICK, which a cancelled mousedown never suppresses. If that
+    // were wrong the button would look dead.
+    const v = mount("prose\n", 5);
+    await press("Insert table");
+    expect(screen.getByRole("group", { name: "Table size" })).not.toBeNull();
+    await press("2 columns by 2 rows");
+    expect(docText(v.state)).toBe(
+      "prose\n\n| Column | Column |\n| --- | --- |\n|  |  |\n\n",
+    );
+  });
+
   test("Insert code block inserts a bare fence", async () => {
     const v = mount("prose\n", 5);
     await press("Insert code block");

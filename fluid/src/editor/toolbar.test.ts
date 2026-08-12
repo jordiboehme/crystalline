@@ -27,6 +27,8 @@ import {
   insertBlock,
   insertMarkdownLink,
   insertWikilink,
+  selectToken,
+  tableSkeleton,
   toggleInline,
   toggleLinePrefix,
 } from "./toolbar";
@@ -216,6 +218,85 @@ describe("insertBlock", () => {
     const text = docText(v.state);
     expect(text).toContain("```mermaid\r\n");
     expect(text).not.toMatch(/[^\r]\n```/);
+  });
+
+  test("a CRLF document leaves the caret at the end of the first line", () => {
+    // A line break is ONE document position however many characters it is
+    // written with, so a caret computed from the separator's length would sit
+    // two positions past the header row in a CRLF buffer - inside the rule
+    // line - while every LF test stayed green.
+    const v = solo("top\r\nbottom\r\n", 3);
+    insertBlock(v, TABLE_SKELETON);
+    const { head } = v.state.selection.main;
+    const line = v.state.doc.lineAt(head);
+    expect(line.text).toBe("| Column | Column |");
+    expect(head).toBe(line.to);
+  });
+});
+
+describe("tableSkeleton and selection", () => {
+  test("2x2 is byte-identical to the historical skeleton", () => {
+    expect(tableSkeleton(2, 2)).toEqual([...TABLE_SKELETON]);
+  });
+
+  test("4x3 is four columns, header plus two data rows", () => {
+    const lines = tableSkeleton(4, 3);
+    expect(lines).toHaveLength(4); // header, rule, 2 data rows
+    expect(lines[0]?.split("|").filter((c) => c.trim() !== "")).toHaveLength(4);
+    expect(lines[1]).toBe("| --- | --- | --- | --- |");
+    expect(lines[3]).toBe("|  |  |  |  |");
+  });
+
+  test("one column by one row is a header and its rule, nothing else", () => {
+    // The grid's smallest cell: a table with no data row yet is still a
+    // table, and refusing to draw one would make the corner cell a lie.
+    expect(tableSkeleton(1, 1)).toEqual(["| Column |", "| --- |"]);
+  });
+
+  test("selectToken takes the first occurrence and nothing when absent", () => {
+    const lines = tableSkeleton(2, 2);
+    expect(selectToken(lines, "Column")).toEqual({ line: 0, from: 2, to: 8 });
+    expect(selectToken(lines, "nowhere")).toBeNull();
+  });
+
+  test("insertBlock with a selection lands it on the token", () => {
+    const v = solo("Text", 4);
+    const lines = tableSkeleton(2, 2);
+    insertBlock(v, lines, selectToken(lines, "Column"));
+    const { main } = v.state.selection;
+    expect(v.state.sliceDoc(main.from, main.to)).toBe("Column");
+  });
+
+  test("a selection on a later line lands there too", () => {
+    // The line term of the mapping, which a first-line-only token cannot
+    // exercise: every line before the selected one counts its own length and
+    // its own break.
+    const v = solo("Text", 4);
+    const lines = ["```mermaid", "flowchart TD", "    A[First step]", "```"];
+    insertBlock(v, lines, selectToken(lines, "First step"));
+    const { main } = v.state.selection;
+    expect(v.state.sliceDoc(main.from, main.to)).toBe("First step");
+  });
+
+  test("a CRLF document still selects the token", () => {
+    const v = solo("Text\r\nMore", 4);
+    const lines = tableSkeleton(3, 2);
+    insertBlock(v, lines, selectToken(lines, "Column"));
+    expect(
+      v.state.sliceDoc(v.state.selection.main.from, v.state.selection.main.to),
+    ).toBe("Column");
+    expect(docText(v.state)).toContain("\r\n| Column | Column | Column |");
+  });
+
+  test("a token below the first line survives CRLF too", () => {
+    const v = solo("Text\r\nMore", 4);
+    const lines = tableSkeleton(2, 3);
+    // Nothing in the skeleton repeats below the header, so this walks the
+    // mapping over two breaks written with two characters each.
+    insertBlock(v, lines, { line: 1, from: 2, to: 5 });
+    expect(
+      v.state.sliceDoc(v.state.selection.main.from, v.state.selection.main.to),
+    ).toBe("---");
   });
 });
 

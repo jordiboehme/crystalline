@@ -340,12 +340,74 @@ export function insertMarkdownLink(view: EditorView): boolean {
   return true;
 }
 
-/** The starter table: a header, its rule and one empty row to fill in. */
-export const TABLE_SKELETON = [
-  "| Column | Column |",
-  "| --- | --- |",
-  "|  |  |",
-] as const;
+/**
+ * A GFM table of the asked-for size: a header of `Column` placeholders, its
+ * rule, and the empty rows below it.
+ *
+ * `rows` counts the header, because that is what the size picker's grid shows
+ * - its top row IS the header row - so a 2x2 pick means a header and one row
+ * to type in, and the emitted array is one line longer than `rows` for the
+ * rule. One column by one row is a header and a rule with no data row, which
+ * is still a table; the grid's corner cell would be a lie otherwise.
+ */
+export function tableSkeleton(columns: number, rows: number): string[] {
+  const wide = Math.max(1, Math.trunc(columns));
+  const tall = Math.max(1, Math.trunc(rows));
+  const row = (cell: string) =>
+    `| ${Array.from({ length: wide }, () => cell).join(" | ")} |`;
+  return [
+    row("Column"),
+    row("---"),
+    ...Array.from({ length: tall - 1 }, () => row("")),
+  ];
+}
+
+/**
+ * The starter table: a header, its rule and one empty row to fill in.
+ *
+ * The size picker generates its own sizes now, so nothing in the app reads
+ * this - it stays as the historical shape the picker's default has to keep
+ * reproducing, and the byte-identity test next door is what says so.
+ */
+export const TABLE_SKELETON: readonly string[] = tableSkeleton(2, 2);
+
+/**
+ * Where the caret lands inside a freshly inserted block: an index into the
+ * inserted line array plus a character range within that line.
+ *
+ * Line-local and character-counted, deliberately: a caller building a block
+ * knows its own text and nothing about the buffer it will land in, and
+ * `insertBlock` turns this into document positions at insertion time, where
+ * the separator is finally known.
+ */
+export interface BlockSelection {
+  line: number;
+  from: number;
+  to: number;
+}
+
+/**
+ * Find the FIRST occurrence of `token` across a block's lines, or null when
+ * the block does not contain it.
+ *
+ * First occurrence rather than exactly-once by design: a state diagram
+ * necessarily repeats a state name, and every block that carries a token is
+ * written so its first mention is the one a person edits. Where a token does
+ * recur, typing over the selection leaves the later mention behind and it is
+ * the person's to follow up.
+ */
+export function selectToken(
+  lines: readonly string[],
+  token: string,
+): BlockSelection | null {
+  for (const [line, text] of lines.entries()) {
+    const from = text.indexOf(token);
+    if (from !== -1) {
+      return { line, from, to: from + token.length };
+    }
+  }
+  return null;
+}
 
 /**
  * The starter code block: a bare fence, a line to write on and the close.
@@ -371,13 +433,24 @@ export const MERMAID_SKELETON = [
  * a table or a fence has to start its own line to parse at all.
  *
  * A blank line goes in front of it unless the cursor line is already empty,
- * so the block is separated from the prose above it, and the cursor lands at
- * the end of the block's first line - the header row, the fence's own line -
- * which is where editing what was just inserted starts.
+ * so the block is separated from the prose above it. Where the caret lands is
+ * the caller's to say: a `select` descriptor puts it on the first word worth
+ * replacing, so the next keystroke is already content, and without one it
+ * lands at the end of the block's first line - the header row, the fence's
+ * own line - which is where editing an unlabelled block starts.
+ *
+ * The mapping counts POSITIONS, never characters of the separator. A line
+ * break is one document position however many characters it is written with:
+ * the change set splits the inserted text on the state's own separator and
+ * rebuilds it as lines, so a CRLF buffer stores `\r\n` as one break costing
+ * one position. A caret computed from `separator.length` reads two positions
+ * too far per line in a CRLF document - far enough to leave the caret in the
+ * rule row of a freshly inserted table - while every LF test stays green.
  */
 export function insertBlock(
   view: EditorView,
   lines: readonly string[],
+  select?: BlockSelection | null,
 ): boolean {
   if (!clearOfFoldedFrontmatter(view)) {
     return false;
@@ -388,9 +461,24 @@ export function insertBlock(
   const line = state.doc.lineAt(state.selection.main.head);
   const lead = line.length === 0 ? "" : separator + separator;
   const block = `${lead}${lines.join(separator)}${separator}`;
+  // Where the block's first line begins: past the cursor's line and past the
+  // lead's breaks, which are two positions when the lead is there at all.
+  const start = line.to + (lead === "" ? 0 : 2);
+  const startOf = (index: number) =>
+    start +
+    lines
+      .slice(0, index)
+      .reduce((positions, text) => positions + text.length + 1, 0);
+  const selection =
+    select == null
+      ? { anchor: start + (lines[0]?.length ?? 0) }
+      : {
+          anchor: startOf(select.line) + select.from,
+          head: startOf(select.line) + select.to,
+        };
   view.dispatch({
     changes: { from: line.to, insert: block },
-    selection: { anchor: line.to + lead.length + (lines[0]?.length ?? 0) },
+    selection,
     userEvent: "input",
   });
   view.focus();
