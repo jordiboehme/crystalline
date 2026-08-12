@@ -22,9 +22,11 @@
 [![Latest release](https://img.shields.io/github/v/release/jordiboehme/crystalline)](https://github.com/jordiboehme/crystalline/releases/latest)
 [![OKF BundleDex](https://bundledex.net/static-badge.svg)](https://bundledex.net)
 
-**Durable memory for AI agents. Plain markdown underneath.**
+**Crystalline intelligence for AI agents. Plain markdown underneath.**
 
-An AI agent starts every session as a stranger: yesterday's decisions forgotten, the team's conventions unknown, everything re-derived or re-explained. Crystalline gives it durable memory instead - onboarded at session start, taught curated knowledge organized into domains, capturing what it learns as engrams while it works. Session by session it stops being a stranger and becomes a peer.
+Psychology splits intelligence in two. Fluid intelligence reasons about novel problems in the moment; crystallized intelligence is everything learning has deposited - the vocabulary, the judgment, the lessons experience already paid for. A large language model is fluid intelligence in its purest form: brilliant in the moment, and the moment is all it has. Every session it starts as a stranger - yesterday's decisions forgotten, the team's conventions unknown, everything re-derived or re-explained.
+
+Crystalline is the other half: the crystalline intelligence an agent accumulates and keeps. Onboarded at session start, taught curated knowledge organized into domains, capturing what it learns as engrams while it works - session by session it stops being a stranger and becomes a peer.
 
 The difference it makes, in one exchange:
 
@@ -379,14 +381,14 @@ github:
 `crystalline verify` statically checks one or more domains against the full rule catalog - malformed frontmatter, broken links, missing MANIFEST sections, schema drift - with no database, service or network connection involved. Its usual home is CI/CD on the GitHub repositories that hold a team's knowledge: every proposal is verified before the team merges it, so nothing malformed ever lands on the branch everyone pulls from. The bundled GitHub Action wires that up:
 
 ```yaml
-- uses: jordiboehme/crystalline/action@v0.12.0
+- uses: jordiboehme/crystalline/action@v0.13.0
   with:
     paths: knowledge/       # space-separated domain roots, default '.'
     strict: 'false'         # promote Warning rules to Error
-    version: v0.12.0        # crystalline binary tag to download, or 'latest'
+    version: v0.13.0        # crystalline binary tag to download, or 'latest'
 ```
 
-The action ref (`@v0.12.0`) pins the action's own code; `version` pins the crystalline binary it downloads, so pinning both gives a fully reproducible check. The binary is checksum-verified, then the action runs `crystalline verify`, annotates the run and, on a pull request, posts a single summary comment kept up to date in place.
+The action ref (`@v0.13.0`) pins the action's own code; `version` pins the crystalline binary it downloads, so pinning both gives a fully reproducible check. The binary is checksum-verified, then the action runs `crystalline verify`, annotates the run and, on a pull request, posts a single summary comment kept up to date in place.
 
 Verify is one of three checks, and each asks a different question. `crystalline verify` asks whether the format holds. `crystalline doctor` asks whether the machinery around it - the index, the registered domains, the service - is healthy. `crystalline evolve` asks the question neither of the other two can: is the knowledge itself still true, and is it still well organized? A fourth command, the importer, brings an existing knowledge base under Crystalline in the first place:
 
