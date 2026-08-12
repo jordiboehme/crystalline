@@ -9,7 +9,8 @@
  * bundler serves one copy. It is initialized from the shared configuration in
  * `theme/mermaid`, the one MermaidDiagram uses, so the same fence draws the
  * same diagram in the same palette here and on the page; a diagram that will
- * not parse simply shows nothing - its source is right above it.
+ * not parse draws no diagram and one quiet caption saying why instead - its
+ * source is right above it, which is where the fix goes.
  *
  * A `StateField` rather than a `ViewPlugin`: CodeMirror refuses block
  * decorations from a plugin's dynamic source outright ("Block decorations
@@ -29,6 +30,59 @@ import { Decoration, EditorView, WidgetType } from "@codemirror/view";
 import { mermaidConfig } from "../theme/mermaid";
 
 let mermaidSequence = 0;
+
+/** What a failure says when the message names nothing a person can act on. */
+const UNRENDERABLE = "This diagram does not render yet.";
+
+/** One line under a fence, not a transcript: mermaid quotes source back. */
+const CAPTION_CAP = 160;
+
+/** The line number mermaid names, in either of its two error spellings. */
+const ERROR_LINE = /line (\d+)/i;
+
+/**
+ * Mermaid's own lead-in, dropped from the caption: "Parse error on line 2:"
+ * and "Lexical error on line 3:" both say in words what `Line 2: ` already
+ * says, and the message's own second line is the informative half. Anchored
+ * and newline-free, so it only ever eats the message's first line.
+ */
+const ERROR_PREFIX = /^.*?error on line \d+:?/i;
+
+/**
+ * A rejected render, in one muted line: `Line 2: Expecting 'ARROW', got
+ * 'NODE_STRING'`.
+ *
+ * Pure, and exported for its own tests: everything about the wording is
+ * decided here, and the widget only appends what comes back.
+ *
+ * A cause that is not an `Error` is the normal path, not a defensive one -
+ * the same `.catch` also catches a failed dynamic import or a thrown string -
+ * so anything without a readable message answers with the plain sentence
+ * rather than `[object Object]`. A message that names no line answers with it
+ * too: a half-typed diagram fails that way constantly (no type word yet), and
+ * quoting mermaid's internals at somebody mid-keystroke is noise, not help.
+ */
+export function describeMermaidError(cause: unknown): string {
+  const message =
+    cause instanceof Error
+      ? cause.message
+      : typeof cause === "string"
+        ? cause
+        : "";
+  const line = ERROR_LINE.exec(message)?.[1];
+  if (!line) {
+    return UNRENDERABLE;
+  }
+  const detail = message
+    .replace(ERROR_PREFIX, "")
+    .split(/\r?\n/)
+    .map((part) => part.trim())
+    .find((part) => part.length > 0);
+  const caption = `Line ${line}: ${detail ?? UNRENDERABLE}`;
+  return caption.length > CAPTION_CAP
+    ? `${caption.slice(0, CAPTION_CAP - 3)}...`
+    : caption;
+}
 
 class MermaidPreviewWidget extends WidgetType {
   // Assigned in the body rather than declared as constructor parameters: the
@@ -63,15 +117,31 @@ class MermaidPreviewWidget extends WidgetType {
         // that flag each failure appends mermaid's error graphic to
         // `document.body` - outside the editor, outside CodeMirror's own
         // teardown - where they accumulate for the whole session. A broken
-        // diagram previews as nothing; the source is right above it.
+        // diagram draws no diagram; what it draws instead is the caption
+        // below, and the source is right above it.
         mermaid.initialize(mermaidConfig(dark));
         const rendered = await mermaid.render(id, source);
         if (box.isConnected || box.childElementCount === 0) {
           box.innerHTML = rendered.svg;
         }
       })
-      .catch(() => {
-        // A broken diagram previews as nothing: the source is right above.
+      .catch((cause: unknown) => {
+        // Only in place of a blank, never over a diagram. The guard is
+        // structural rather than careful: every keystroke builds a NEW
+        // widget whose box starts empty, and the only thing that ever puts
+        // a child in it is the resolved branch above, so an empty box here
+        // means this render drew nothing at all. A widget that did draw and
+        // is later replaced takes its own SVG down with it.
+        if (box.childElementCount > 0) {
+          return;
+        }
+        const caption = document.createElement("div");
+        caption.className = "cm-mermaid-error";
+        // Text, never markup, and no live region: this fires on most
+        // keystrokes while a diagram is being typed, so a screen reader
+        // announcing each one would talk over the typing.
+        caption.textContent = describeMermaidError(cause);
+        box.appendChild(caption);
       });
     return box;
   }
@@ -161,8 +231,30 @@ function buildPreviews(state: EditorState, dark: boolean): DecorationSet {
   return Decoration.set(widgets.sort((a, b) => a.from - b.from));
 }
 
+/**
+ * The previews' own chrome.
+ *
+ * `.cm-mermaid-error` is a fresh class with no competing rule anywhere - not
+ * a `.cm-line`, not the scroller, written by this module alone - so cascade
+ * trap 1 (base style modules mount REVERSED, and equal-specificity rules are
+ * decided by that order) has nothing to bite on and a plain entry is safe. If
+ * a competitor ever appears, the fallback is `fenceMono`'s move: write the
+ * rule one class deeper (`.cm-mermaid-preview .cm-mermaid-error`) so it wins
+ * on specificity whatever the mount order turns out to be.
+ *
+ * Muted slate at the caption step, never red: mid-typing a diagram is
+ * "broken" almost continuously, so this is a hint about a blank space, not an
+ * alarm. The `&dark` variant is rewritten to the view's dark scope class and
+ * emitted second, so it wins over the plain rule inside this one module.
+ */
 const previewTheme = EditorView.baseTheme({
   ".cm-mermaid-preview": { padding: "0.5rem 0.75rem" },
+  ".cm-mermaid-error": {
+    color: "var(--color-slate-500)",
+    fontSize: "var(--text-caption, 0.75rem)",
+    lineHeight: "var(--text-caption--line-height, 1rem)",
+  },
+  "&dark .cm-mermaid-error": { color: "var(--color-slate-400)" },
   ".cm-table-preview": { padding: "0.25rem 0.75rem" },
   ".cm-table-preview table": { borderCollapse: "collapse" },
   ".cm-table-preview th, .cm-table-preview td": {

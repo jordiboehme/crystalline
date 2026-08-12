@@ -18,7 +18,9 @@
  * React's tree and outside CodeMirror's, where nothing either surface does
  * can take it down again; the editor renders a half-typed diagram on every
  * keystroke, so those failures are the normal path. Both surfaces answer a
- * diagram that will not parse by showing the source instead.
+ * diagram that will not parse by showing the source instead, and the editor's
+ * preview adds one muted line saying why it is blank (`describeMermaidError`
+ * in `editor/fencePreviews`) - never mermaid's own graphic.
  */
 
 import type { MermaidConfig } from "mermaid";

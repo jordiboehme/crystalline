@@ -10,7 +10,7 @@ import { EditorView } from "@codemirror/view";
 import mermaid from "mermaid";
 import { describe, expect, it, vi } from "vitest";
 
-import { fencePreviews } from "./fencePreviews";
+import { describeMermaidError, fencePreviews } from "./fencePreviews";
 import { baseExtensions } from "./setup";
 
 vi.mock("mermaid", () => ({
@@ -91,6 +91,32 @@ describe("fence previews", () => {
     view.destroy();
   });
 
+  it("a diagram that will not parse says why, quietly", async () => {
+    vi.mocked(mermaid.render).mockRejectedValueOnce(
+      new Error("Parse error on line 2:\nExpecting 'ARROW', got 'NODE_STRING'"),
+    );
+    const view = editor("```mermaid\nflowchart TD\n  A[Step\n```\n");
+    await vi.waitFor(() => {
+      expect(view.dom.querySelector(".cm-mermaid-error")).not.toBeNull();
+    });
+    const caption = view.dom.querySelector(".cm-mermaid-error");
+    expect(caption?.textContent).toContain("Line 2");
+    expect(caption?.textContent).toContain("Expecting 'ARROW'");
+    // The buffer is untouched and the caption is not a live region.
+    expect(view.state.doc.toString()).toContain("A[Step");
+    expect(caption?.getAttribute("role")).toBeNull();
+    view.destroy();
+  });
+
+  it("a good render never shows the caption", async () => {
+    const view = editor("```mermaid\ngraph TD; A-->B;\n```\n");
+    await vi.waitFor(() => {
+      expect(view.dom.querySelector(".cm-mermaid-preview svg")).not.toBeNull();
+    });
+    expect(view.dom.querySelector(".cm-mermaid-error")).toBeNull();
+    view.destroy();
+  });
+
   it("does not preview a table-shaped line that is fence content", () => {
     // The syntax tree, not a line-shaped regex, decides what a table is: a
     // pipe row inside a fence is code the author wrote about a table, not
@@ -98,5 +124,67 @@ describe("fence previews", () => {
     const view = editor("```text\n| a | b |\n|---|---|\n| 1 | 2 |\n```\n");
     expect(view.dom.querySelector(".cm-table-preview")).toBeNull();
     view.destroy();
+  });
+});
+
+describe("describeMermaidError", () => {
+  it("names the line and the first informative thing mermaid said", () => {
+    expect(
+      describeMermaidError(
+        new Error(
+          "Parse error on line 2:\nExpecting 'ARROW', got 'NODE_STRING'",
+        ),
+      ),
+    ).toBe("Line 2: Expecting 'ARROW', got 'NODE_STRING'");
+  });
+
+  it("reads the line out of a lexical error the same way", () => {
+    // Mermaid's other prefix for the same kind of failure; the caption must
+    // not carry either prefix through, since the line number already says it.
+    expect(
+      describeMermaidError(
+        new Error("Lexical error on line 3:\nUnrecognized text."),
+      ),
+    ).toBe("Line 3: Unrecognized text.");
+  });
+
+  it("falls back to one plain sentence when no line is named", () => {
+    // Half-typed diagrams fail this way constantly (no type word yet), and a
+    // caption that quoted mermaid's internals here would be noise.
+    expect(
+      describeMermaidError(
+        new Error("No diagram type detected matching given configuration"),
+      ),
+    ).toBe("This diagram does not render yet.");
+  });
+
+  it("uses the same sentence when the line is all mermaid said", () => {
+    expect(describeMermaidError(new Error("Parse error on line 7:"))).toBe(
+      "Line 7: This diagram does not render yet.",
+    );
+  });
+
+  it("caps a long complaint at 160 characters, tail included", () => {
+    // Mermaid quotes the offending source back, carets and all; the caption
+    // is one line under a fence, not a transcript.
+    const caption = describeMermaidError(
+      new Error(`Parse error on line 4:\n${"x".repeat(400)}`),
+    );
+    expect(caption).toHaveLength(160);
+    expect(caption.endsWith("...")).toBe(true);
+    expect(caption.startsWith("Line 4: xxx")).toBe(true);
+  });
+
+  it("survives a cause that is not an Error", () => {
+    // A rejected import or a thrown string reaches the same `.catch`.
+    expect(describeMermaidError(undefined)).toBe(
+      "This diagram does not render yet.",
+    );
+    expect(describeMermaidError({ trouble: true })).toBe(
+      "This diagram does not render yet.",
+    );
+    expect(describeMermaidError("Parse error on line 5:\nBad shape")).toBe(
+      "Line 5: Bad shape",
+    );
   });
 });
