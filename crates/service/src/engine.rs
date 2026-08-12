@@ -4966,9 +4966,26 @@ impl Engine {
         }
     }
 
-    /// Export every engram of a domain (file or virtual) from the database to
-    /// `dest` as a normal filesystem engram folder. Refuses to write into a
-    /// non-empty directory unless `force`; `dry_run` reports without writing.
+    /// Export every file of a domain (file or virtual) to `dest` as a normal
+    /// filesystem engram folder. Refuses to write into a non-empty directory
+    /// unless `force`; `dry_run` reports without writing.
+    ///
+    /// The read half is [`Engine::domain_files`], the same one the archive
+    /// download uses, so an export is a copy of the domain rather than a
+    /// re-serialization of the index: a file domain hands over its exact disk
+    /// bytes (frontmatter included, MANIFEST included), a virtual domain the
+    /// full text of every row, and the OKF reserved names are excluded from
+    /// both. Reading the store directly instead - the shape this verb had -
+    /// wrote frontmatter-less markdown for file domains, since their index
+    /// rows keep only the body, and silently dropped MANIFEST.md.
+    ///
+    /// Report shape follows from that source: `domain_files` carries
+    /// `(path, content)` and no permalink column, so each row reports its
+    /// path and byte count instead of the former path/permalink pair. Parsing
+    /// every body back just to re-derive a permalink would re-introduce the
+    /// re-serialization this verb exists to avoid, and no caller reads the
+    /// field: the two callers (`ctl` and the daemonless CLI) print the report
+    /// as-is.
     pub async fn export_domain(
         &self,
         domain: &str,
@@ -4976,22 +4993,7 @@ impl Engine {
         force: bool,
         dry_run: bool,
     ) -> Result<Value> {
-        let entry = self.domain_entry(domain)?;
-        let store = self.store.lock().await;
-        let domain_id = match self.source_of(&entry) {
-            ContentSource::File { root } => {
-                store
-                    .upsert_domain(domain, Some(&root.to_string_lossy()), DomainKind::File)
-                    .await?
-            }
-            ContentSource::Virtual => {
-                store
-                    .upsert_domain(domain, None, DomainKind::Virtual)
-                    .await?
-            }
-        };
-        let all = store.all_engram_contents(domain_id).await?;
-        drop(store);
+        let all = self.domain_files(domain).await?;
 
         if !dry_run && dir_is_nonempty(dest) && !force {
             return Err(EngineError::Conflict(format!(
@@ -5002,13 +5004,13 @@ impl Engine {
 
         let mut written = 0usize;
         let mut files: Vec<Value> = Vec::new();
-        for e in &all {
-            files.push(json!({ "path": e.path, "permalink": e.permalink }));
+        for (path, content) in &all {
+            files.push(json!({ "path": path, "bytes": content.len() }));
             if dry_run {
                 continue;
             }
-            let abs = join_rel(dest, &e.path);
-            write_file(&abs, &e.content)?;
+            let abs = join_rel(dest, path);
+            write_file(&abs, content)?;
             written += 1;
         }
 
@@ -5946,7 +5948,9 @@ impl Engine {
     /// the same per-name lock this verb would need to hold across its own
     /// tail, which is a cross-verb change out of scope here; a caller that
     /// cannot tolerate the window should serialize admin mutations for a
-    /// given name at its own layer (tracked for the REST unregister route).
+    /// given name at its own layer - which the REST surface does, in
+    /// `RestState::domain_admin`: one mutex held across the whole of a create
+    /// and the whole of an unregister.
     pub async fn domain_remove(&self, name: &str) -> Result<Value> {
         if self.read_only {
             return Err(EngineError::ReadOnly);

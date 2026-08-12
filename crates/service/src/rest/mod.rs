@@ -220,6 +220,14 @@ impl RestState {
     /// editor on the instance over a registration that closes no rooms. A
     /// create never sweeps anything, so it has no join window to close.
     ///
+    /// Serializing "for this surface" is the whole claim: the mutex lives in
+    /// `RestState`, so it does NOT serialize the other callers of the same
+    /// engine verbs - MCP's `add_domain` (and the CLI) reach
+    /// `domain_add_local`/`domain_add_virtual` with no REST state in hand and
+    /// can still race a REST unregister into the engine window above. That is
+    /// accepted: closing it needs the per-name lock inside the engine, and
+    /// the REST surface is the one with more than one concurrent caller.
+    ///
     /// Lock order where both are taken (unregister): this one, then
     /// [`RestState::fence_joins`]. Nothing else takes both.
     pub(super) async fn domain_admin(&self) -> tokio::sync::MutexGuard<'_, ()> {

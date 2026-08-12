@@ -496,11 +496,16 @@ both_backends!(
 async fn import_export_round_trip(store: Arc<Mutex<dyn Store>>) {
     let engine = virtual_engine(store);
 
-    // A source tree of well-formed engram files.
+    // A source tree of well-formed engram files, plus the domain's MANIFEST:
+    // for a virtual domain the manifest is an ordinary row, and an export that
+    // dropped it would hand back a folder that cannot be registered as the
+    // same domain.
     let src = tempfile::tempdir().unwrap();
     let one = "---\ntype: engram\ntitle: One\npermalink: one\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# One\n\nbody one\n";
     let two = "---\ntype: engram\ntitle: Two\npermalink: two\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Two\n\nbody two\n";
+    let manifest = "---\ntype: manifest\ntitle: notes\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# notes\n\n## Scope\n\n- Everything about notes\n\n## When to Use\n\n- Route here for notes questions\n";
     std::fs::write(src.path().join("one.md"), one).unwrap();
+    std::fs::write(src.path().join("MANIFEST.md"), manifest).unwrap();
     std::fs::create_dir_all(src.path().join("sub")).unwrap();
     std::fs::write(src.path().join("sub/two.md"), two).unwrap();
 
@@ -509,32 +514,46 @@ async fn import_export_round_trip(store: Arc<Mutex<dyn Store>>) {
         .import_domain("notes", src.path(), false, false)
         .await
         .unwrap();
-    assert_eq!(report["files_written"], 2);
+    assert_eq!(report["files_written"], 3);
     assert_eq!(report["collisions"].as_array().unwrap().len(), 0);
 
-    // A re-import without overwrite is a no-op: both collide.
+    // A re-import without overwrite is a no-op: all three collide.
     let again = engine
         .import_domain("notes", src.path(), false, false)
         .await
         .unwrap();
     assert_eq!(again["files_written"], 0);
-    assert_eq!(again["collisions"].as_array().unwrap().len(), 2);
+    assert_eq!(again["collisions"].as_array().unwrap().len(), 3);
 
-    // Export writes the engrams back to a folder, byte-identical to the source.
+    // Export writes the files back to a folder, byte-identical to the source,
+    // through the same read half the archive download uses.
     let dest = tempfile::tempdir().unwrap();
     let export = engine
         .export_domain("notes", dest.path(), true, false)
         .await
         .unwrap();
-    assert_eq!(export["files_written"], 2);
+    assert_eq!(export["files_written"], 3);
 
     let exported_one = std::fs::read_to_string(dest.path().join("one.md")).unwrap();
     let exported_two = std::fs::read_to_string(dest.path().join("sub/two.md")).unwrap();
+    let exported_manifest = std::fs::read_to_string(dest.path().join("MANIFEST.md")).unwrap();
     assert_eq!(exported_one, one, "export round-trips byte-identically");
     assert_eq!(
         exported_two, two,
         "nested export round-trips byte-identically"
     );
+    assert_eq!(
+        exported_manifest, manifest,
+        "the MANIFEST is part of the export, not just the engrams"
+    );
+    // The report names every file it wrote, with the path the domain holds.
+    let listed: Vec<&str> = export["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["path"].as_str().unwrap())
+        .collect();
+    assert!(listed.contains(&"MANIFEST.md"), "{listed:?}");
 }
 both_backends!(virtual_import_export_round_trips, import_export_round_trip);
 

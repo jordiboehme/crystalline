@@ -55,6 +55,14 @@
 //! stricter here costs nothing in agreement: `preview` and `import` share one
 //! `read_archive`, so both apply the identical rule and a preview can never
 //! promise something the import then contradicts.
+//!
+//! Locks: preview and import deliberately take neither the domain-admin mutex
+//! nor the join fence, the same ruling the sync POST carries - the domain is
+//! resolved per call, and an unregister racing an import lands in the same
+//! benign engine-level window that the MCP surface and the daemon's poller
+//! already share (worst case, stale index rows on the virtual arm), so a
+//! REST-local mutex could not close it and would only queue uploads behind
+//! minutes-long admin work. Fixing it for real means fixing it in the engine.
 
 use axum::extract::State;
 use axum::http::{StatusCode, header};

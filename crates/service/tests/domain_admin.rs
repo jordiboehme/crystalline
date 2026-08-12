@@ -131,6 +131,57 @@ async fn domain_files_reads_a_virtual_domain_from_the_database() {
     assert_eq!(alpha.1, ALPHA, "exact bytes for the database-backed kind");
 }
 
+/// `domain export` of a FILE domain copies the domain, it does not
+/// re-serialize the index: the emitted files carry their frontmatter, the
+/// MANIFEST comes along and the reserved names stay behind. The index rows of
+/// a file domain hold the body only, so an export read through the store used
+/// to write headerless markdown that could not be registered back as the same
+/// knowledge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn export_of_a_file_domain_round_trips_frontmatter_and_manifest() {
+    let (_tmp, engine) = engine().await;
+    let dest = tempfile::tempdir().unwrap();
+    let report = engine
+        .export_domain("eng", dest.path(), true, false)
+        .await
+        .unwrap();
+    assert_eq!(report["files_written"], 2, "{report}");
+
+    // Byte-identical to what the domain holds on disk, frontmatter included.
+    let alpha = std::fs::read_to_string(dest.path().join("alpha.md")).unwrap();
+    assert_eq!(
+        alpha, ALPHA,
+        "exact disk bytes, not the body-only index row"
+    );
+    assert!(
+        alpha.starts_with("---\ntype: engram\n"),
+        "the frontmatter survives the export: {alpha}"
+    );
+    let manifest = std::fs::read_to_string(dest.path().join("MANIFEST.md")).unwrap();
+    assert_eq!(manifest, MANIFEST, "the MANIFEST is exported too");
+    // The OKF reserved names are excluded, exactly as the archive excludes them.
+    assert!(!dest.path().join("log.md").exists(), "{report}");
+
+    // The report names what it wrote, path by path.
+    let listed: Vec<&str> = report["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["path"].as_str().unwrap())
+        .collect();
+    assert!(listed.contains(&"MANIFEST.md"), "{listed:?}");
+    assert!(listed.contains(&"alpha.md"), "{listed:?}");
+
+    // A dry run reports the same file list and writes nothing.
+    let empty = tempfile::tempdir().unwrap();
+    let preview = engine
+        .export_domain("eng", empty.path(), false, true)
+        .await
+        .unwrap();
+    assert_eq!(preview["files_written"], 2, "{preview}");
+    assert!(!empty.path().join("alpha.md").exists());
+}
+
 // --- archive import: one verb for preview and commit ------------------------
 
 /// The import classification and both policies, on a file domain: create,
