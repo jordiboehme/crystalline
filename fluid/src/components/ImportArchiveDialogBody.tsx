@@ -25,7 +25,7 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Dialog } from "radix-ui";
 import type { ReactElement } from "react";
-import { useId, useState } from "react";
+import { useId, useRef, useState } from "react";
 
 import { importArchive, previewArchive } from "../api/admin";
 import type { ArchiveEntry, ArchiveReport } from "../api/admin";
@@ -91,6 +91,18 @@ export default function ImportArchiveDialogBody({
   const [preview, setPreview] = useState<ArchiveReport | null>(null);
   const [result, setResult] = useState<ArchiveReport | null>(null);
   const [problem, setProblem] = useState<string | null>(null);
+  /**
+   * Which archive the reports on screen are allowed to be about.
+   *
+   * A real archive is megabytes over the wire, so a dry run is seconds long,
+   * and "wrong file, let me pick the other one" is the most ordinary gesture
+   * there is. Without this, the superseded run for the first file lands over
+   * the cleared state, draws ITS entries, arms `Import` - and the import then
+   * ships the second file's bytes, which nothing ever dry-ran. A ref rather
+   * than the state above because a callback closes over the state it was
+   * created with, and this has to be read as of the moment the answer arrives.
+   */
+  const picked = useRef<File | null>(null);
 
   // Derived rather than stored, so the three states cannot disagree with the
   // two reports they are made of: nothing picked yet, a dry run in hand, or an
@@ -101,10 +113,19 @@ export default function ImportArchiveDialogBody({
   const dryRun = useMutation({
     mutationFn: async (chosen: File) =>
       previewArchive(domain, await chosen.arrayBuffer()),
-    onSuccess: (report) => {
-      setPreview(report);
+    // Both callbacks take the file the call was made with and drop the answer
+    // when it is no longer the file on the form: a report is about the bytes
+    // it was made from, and a report about bytes nobody is offering any more
+    // is not news, it is a lie about what would happen next.
+    onSuccess: (report, chosen) => {
+      if (chosen === picked.current) {
+        setPreview(report);
+      }
     },
-    onError: (error: Error) => {
+    onError: (error: Error, chosen) => {
+      if (chosen !== picked.current) {
+        return;
+      }
       // A refusal of the archive itself - a path escaping the domain root, a
       // file that is not a zip - is about the whole upload, so no half-report
       // stands beside it.
@@ -175,8 +196,12 @@ export default function ImportArchiveDialogBody({
                   onChange={(event) => {
                     // A report is about the bytes it was made from. Picking
                     // another archive takes it away rather than leaving an
-                    // Import button armed over the wrong file.
-                    setFile(event.target.files?.[0] ?? null);
+                    // Import button armed over the wrong file - including the
+                    // report of a dry run that is still out, which the two
+                    // callbacks above drop by comparing against this.
+                    const chosen = event.target.files?.[0] ?? null;
+                    picked.current = chosen;
+                    setFile(chosen);
                     setPreview(null);
                     setProblem(null);
                   }}

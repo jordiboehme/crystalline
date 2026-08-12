@@ -43,6 +43,13 @@ function archiveFile(): File {
   });
 }
 
+/** The other archive, told apart from the first by its first byte. */
+function otherArchiveFile(): File {
+  return new File([new Uint8Array([0x42, 0x4b])], "second-thoughts.zip", {
+    type: "application/zip",
+  });
+}
+
 /** A dry run over an archive holding one of each kind of entry. */
 function previewReport() {
   return {
@@ -303,6 +310,11 @@ describe("importing an archive", () => {
     expect(
       requested().includes("/domains/eng/archive/import?policy=overwrite"),
     ).toBe(true);
+    // The write announces its bytes for what they are, exactly as the dry run
+    // did: the server refuses either route anything else.
+    expect(callTo("/domains/eng/archive/import").headers).toMatchObject({
+      "Content-Type": "application/zip",
+    });
     // An import moves the shape of the domain and its engram count, so both
     // the tree every folder view walks and the listing every sidebar draws are
     // asked again.
@@ -342,5 +354,47 @@ describe("importing an archive", () => {
     expect(
       within(dialog).getByRole("button", { name: "Import" }),
     ).toBeDisabled();
+  });
+
+  it("drops the report of an archive that is no longer the one picked", async () => {
+    // The dry run is held open, because that is the whole window this is
+    // about: a real archive is megabytes over the wire, so it is seconds long.
+    const gate: { release: () => void } = { release: () => undefined };
+    serve({
+      "/domains/eng/archive/preview": () =>
+        new Promise((resolve) => {
+          gate.release = () => {
+            resolve(previewReport());
+          };
+        }),
+    });
+
+    const dialog = await openWithFile();
+    const preview = within(dialog).getByRole("button", { name: "Preview" });
+    await userEvent.click(preview);
+    // Second thoughts, mid-flight: another archive, before the first report is
+    // back. What comes back is about the file that is no longer on the form.
+    await userEvent.upload(
+      within(dialog).getByLabelText("Archive file"),
+      otherArchiveFile(),
+    );
+    gate.release();
+    // The superseded dry run has landed and settled by the time the button it
+    // was disabling comes back.
+    await waitFor(() => {
+      expect(preview).toBeEnabled();
+    });
+
+    // Nothing of the first archive reaches the screen, and nothing arms the
+    // write: an Import enabled here would post the SECOND archive's bytes
+    // under the first one's report, which is the one thing the two-call design
+    // exists to prevent.
+    expect(within(dialog).queryByRole("table")).toBeNull();
+    expect(
+      within(dialog).getByRole("button", { name: "Import" }),
+    ).toBeDisabled();
+    expect(requested().some((path) => path.includes("/archive/import"))).toBe(
+      false,
+    );
   });
 });
