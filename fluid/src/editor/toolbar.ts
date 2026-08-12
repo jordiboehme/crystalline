@@ -349,10 +349,17 @@ export function insertMarkdownLink(view: EditorView): boolean {
  * to type in, and the emitted array is one line longer than `rows` for the
  * rule. One column by one row is a header and a rule with no data row, which
  * is still a table; the grid's corner cell would be a lie otherwise.
+ *
+ * Both counts are clamped to a whole number of at least one, and a size that
+ * is not a number at all is one too: `Math.max(1, NaN)` is `NaN`, which would
+ * emit a zero-column table with an empty rule row - markdown that does not
+ * parse, from a function whose contract says it always returns a table.
  */
 export function tableSkeleton(columns: number, rows: number): string[] {
-  const wide = Math.max(1, Math.trunc(columns));
-  const tall = Math.max(1, Math.trunc(rows));
+  const atLeastOne = (value: number) =>
+    Number.isFinite(value) ? Math.max(1, Math.trunc(value)) : 1;
+  const wide = atLeastOne(columns);
+  const tall = atLeastOne(rows);
   const row = (cell: string) =>
     `| ${Array.from({ length: wide }, () => cell).join(" | ")} |`;
   return [
@@ -446,6 +453,13 @@ export const MERMAID_SKELETON = [
  * one position. A caret computed from `separator.length` reads two positions
  * too far per line in a CRLF document - far enough to leave the caret in the
  * rule row of a freshly inserted table - while every LF test stays green.
+ *
+ * A `select` must describe the very `lines` being inserted: its `line` indexes
+ * that array and its `from`/`to` are offsets within that line. Nothing here
+ * validates it, because there is nothing honest to fall back to - a descriptor
+ * off the end maps past the document and `dispatch` raises rather than editing
+ * (atomically, so no half-insert lands). Build the two together, as
+ * `selectToken` and `mermaidFence` do, and the pair cannot disagree.
  */
 export function insertBlock(
   view: EditorView,

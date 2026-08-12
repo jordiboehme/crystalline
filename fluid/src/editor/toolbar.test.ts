@@ -253,6 +253,16 @@ describe("tableSkeleton and selection", () => {
     expect(tableSkeleton(1, 1)).toEqual(["| Column |", "| --- |"]);
   });
 
+  test("a size that is not a number is still a table", () => {
+    // `Math.max(1, NaN)` is NaN, which would emit "|  |" twice - a
+    // zero-column table with an empty rule row, markdown that does not parse.
+    expect(tableSkeleton(Number.NaN, Number.NaN)).toEqual([
+      "| Column |",
+      "| --- |",
+    ]);
+    expect(tableSkeleton(0, -4)).toEqual(["| Column |", "| --- |"]);
+  });
+
   test("selectToken takes the first occurrence and nothing when absent", () => {
     const lines = tableSkeleton(2, 2);
     expect(selectToken(lines, "Column")).toEqual({ line: 0, from: 2, to: 8 });

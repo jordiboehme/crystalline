@@ -214,6 +214,14 @@ function mountedView(content: HTMLElement): EditorView {
  * picker, and the default cell under the keyboard reproduces exactly what the
  * button used to insert on its own. The grid is portalled out of the toolbar,
  * so only the trigger can be looked up inside it.
+ *
+ * Every table these tests need arrives through that route rather than by
+ * dispatching one into the buffer, which would be the shorter way in: what
+ * each of them is worth is the real route. One undo takes the picker's
+ * insertion back out, the fold guard survives it, and a room sees exactly one
+ * write from it - three properties a hand-dispatched table would quietly stop
+ * proving while the tests kept passing. The route lives here once, so the
+ * next change to it is one edit.
  */
 async function insertTable(bar?: HTMLElement): Promise<void> {
   const trigger = bar

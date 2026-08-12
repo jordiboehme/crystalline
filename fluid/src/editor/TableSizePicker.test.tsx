@@ -94,6 +94,45 @@ describe("TableSizePicker", () => {
     expect(docText(v.state)).toBe("prose line\n\n| Column |\n| --- |\n");
   });
 
+  test("Tab carries the size with it, so Enter inserts what the caption says", async () => {
+    // The third mover, and the one this component never hears about: the
+    // popover traps no focus, so all 48 cells are ordinary tab stops. A Tab
+    // that moved the focus alone would light four cells, caption "2 x 2" and
+    // insert four columns from the cell it actually left the keyboard on.
+    const v = mount();
+    await open();
+    await userEvent.tab();
+    await userEvent.tab();
+    expect(
+      screen.getByRole("button", { name: "4 columns by 2 rows" }),
+    ).toHaveFocus();
+    expect(screen.getByText("4 x 2")).not.toBeNull();
+    await userEvent.keyboard("{Enter}");
+    expect(docText(v.state)).toContain("| Column | Column | Column | Column |");
+    expect(docText(v.state).split("|  |  |  |  |")).toHaveLength(2);
+  });
+
+  test("the highlight is every cell up and to the left of the size", async () => {
+    mount();
+    await open();
+    await userEvent.keyboard("{ArrowRight}");
+    const cells = screen.getAllByRole("button", { name: /columns by/ });
+    expect(cells).toHaveLength(48);
+    // The ON face is a whole class string, so the accent border is what tells
+    // the two apart - and counting them pins decision 4's rule rather than
+    // merely that something somewhere lit up.
+    const lit = cells.filter((cell) =>
+      cell.className.includes("border-accent-600"),
+    );
+    expect(lit).toHaveLength(6); // 3 columns by 2 rows
+    expect(lit.map((cell) => cell.getAttribute("aria-label"))).toContain(
+      "3 columns by 2 rows",
+    );
+    expect(
+      screen.getByRole("button", { name: "4 columns by 2 rows" }).className,
+    ).toContain("border-transparent");
+  });
+
   test("a hover carries the focus, so Enter inserts what is highlighted", async () => {
     const v = mount();
     await open();

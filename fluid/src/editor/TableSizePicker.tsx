@@ -13,10 +13,14 @@
  * dismissal and focus discipline without the navigation, so this component
  * owns its keyboard outright - the reasoning `SuggestInput` already follows.
  *
- * Focus moves with the size rather than being tracked beside it, whichever
- * changed it: Enter is a native activation of the FOCUSED cell, so a
- * highlight that could drift away from the focus - hovered one size, focused
- * another - would insert a size nobody was looking at.
+ * The size follows the FOCUS, and every mover works by moving it: Enter is a
+ * native activation of the focused cell, so a highlight that could drift away
+ * from the focus would insert a size nobody was looking at. Saying it that
+ * way round rather than updating the size at each mover is what makes it hold
+ * for movers this component never hears about - the grid is 48 ordinary tab
+ * stops in a popover that does not trap focus, so Tab walks it too, and a Tab
+ * that changed the focus without changing the size would light four cells,
+ * caption "2 x 2" and insert five columns.
  */
 
 import type { EditorView } from "@codemirror/view";
@@ -97,6 +101,12 @@ export function TableSizePicker({
     cells.current.get(key(columns, rows))?.focus();
   };
 
+  /*
+   * Move the focus, which is what moves the size: the cells set it when they
+   * receive focus. The `setSize` here is belt and braces for the one case
+   * focus cannot cover - a cell that is somehow not in the map, so `focus()`
+   * reaches nothing - and is a no-op the rest of the time.
+   */
   const resize = (columns: number, rows: number) => {
     const next = { columns: clamp(columns, COLUMNS), rows: clamp(rows, ROWS) };
     setSize(next);
@@ -152,7 +162,13 @@ export function TableSizePicker({
         <Popover.Content
           align="start"
           sideOffset={6}
-          className={`${MENU_CLASSES} min-w-0`}
+          // The shared menu surface exactly as it is, minimum width included:
+          // a `min-w-0` written after it would be the same cascade trap the
+          // cell faces avoid - Tailwind emits `.min-w-48` after `.min-w-0`, so
+          // the menu's 12rem wins and the override does nothing but read as if
+          // it worked. The grid is a little narrower than that, so it centers
+          // itself under the caption instead of hugging the left edge.
+          className={MENU_CLASSES}
           onKeyDown={onKeyDown}
           // Radix focuses the content itself on open, which would leave the
           // arrows with nothing to move and Enter with nothing to press. The
@@ -173,7 +189,7 @@ export function TableSizePicker({
           <div
             role="group"
             aria-label="Table size"
-            className="flex flex-col gap-1 p-1"
+            className="mx-auto flex w-fit flex-col gap-1 p-1"
           >
             {Array.from({ length: ROWS }, (_, index) => index + 1).map(
               (rows) => (
@@ -194,12 +210,19 @@ export function TableSizePicker({
                             ? CELL.on
                             : CELL.off
                         }`}
+                        onFocus={() => {
+                          // The whole invariant, in one place: whatever put
+                          // the focus here - an arrow, a hover, a Tab, a
+                          // pointer - the grid now draws this size and Enter
+                          // inserts it.
+                          setSize({ columns, rows });
+                        }}
                         onMouseEnter={() => {
-                          // The pointer moves the focus with the highlight
-                          // like the arrows do. Highlighting alone would let
-                          // the two drift apart - hover 5x4, press Enter, and
-                          // the cell that is still focused inserts the size
-                          // nobody is looking at.
+                          // The pointer moves the focus rather than the size,
+                          // like the arrows do. Setting the size directly
+                          // would let the two drift apart - hover 5x4, press
+                          // Enter, and the cell that is still focused inserts
+                          // the size nobody is looking at.
                           resize(columns, rows);
                         }}
                         onClick={() => {
