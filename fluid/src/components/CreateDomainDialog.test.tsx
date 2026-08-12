@@ -54,6 +54,11 @@ function serveAs(
         meResponse({ user: userFixture({ name: "root", role }) }),
       "/domains": domainsResponse,
       "/activity": () => ({ timeframe: "7d", items: [] }),
+      // The screen the flows below are opened from, which is any screen
+      // outside a domain that is not the home screen. It draws nothing this
+      // suite asserts on; it is here to be somewhere the frame's own launcher
+      // is offered.
+      "/users": () => ({ users: [] }),
       ...routes,
     }),
   );
@@ -81,6 +86,13 @@ function listingReads(): number {
   ).length;
 }
 
+/** Every call the app made to the GitHub connection. */
+function settingsCalls(): unknown[] {
+  return apiMock.mock.calls.filter(([path]) =>
+    String(path).startsWith("/settings/github"),
+  );
+}
+
 /** Whether anything was registered at all. */
 function registrations(): number {
   return apiMock.mock.calls.filter(
@@ -91,9 +103,10 @@ function registrations(): number {
 /**
  * Open the dialog from the frame's own launcher.
  *
- * Scoped to the sidebar deliberately: the home screen carries a launcher of its
- * own beside its Domains heading, and an unscoped query would not say which of
- * the two this test pressed.
+ * Scoped to the sidebar deliberately, and opened from a screen that is not the
+ * home screen: home is the one place the frame's launcher yields to the
+ * screen's own (see the pair of tests at the bottom), so the flows below drive
+ * the frame from `/users`, where the sidebar is the only way in.
  */
 async function openFromSidebar(): Promise<HTMLElement> {
   const sidebar = within(
@@ -141,7 +154,7 @@ describe("registering a domain", () => {
         relation_types: [],
       }),
     });
-    renderApp("/");
+    renderApp("/users");
 
     const dialog = await openFromSidebar();
     const before = listingReads();
@@ -176,7 +189,7 @@ describe("registering a domain", () => {
       "/domains": (_path, init) =>
         init?.method === "POST" ? created() : domainsResponse(),
     });
-    renderApp("/");
+    renderApp("/users");
 
     const dialog = await openFromSidebar();
     await userEvent.click(
@@ -200,7 +213,7 @@ describe("registering a domain", () => {
     serveAs("admin", {
       "/settings/github": () => githubStatus(false),
     });
-    renderApp("/");
+    renderApp("/users");
 
     const dialog = await openFromSidebar();
     await userEvent.click(
@@ -235,7 +248,7 @@ describe("registering a domain", () => {
       "/domains": (_path, init) =>
         init?.method === "POST" ? created() : domainsResponse(),
     });
-    renderApp("/");
+    renderApp("/users");
 
     const dialog = await openFromSidebar();
     await userEvent.click(
@@ -286,7 +299,7 @@ describe("registering a domain", () => {
         return domainsResponse();
       },
     });
-    renderApp("/");
+    renderApp("/users");
 
     const dialog = await openFromSidebar();
     await userEvent.type(within(dialog).getByLabelText("Name"), "notes");
@@ -325,5 +338,53 @@ describe("registering a domain", () => {
     expect(
       await screen.findByRole("dialog", { name: /new domain/i }),
     ).toBeInTheDocument();
+  });
+
+  it("hands the launcher to the home screen there, and keeps it everywhere else", async () => {
+    serveAs("admin");
+    const home = renderApp("/");
+    await screen.findByRole("heading", { name: "Home" });
+
+    // One act, one control: the home screen carries the launcher beside the
+    // heading it acts on, so the sidebar's yields - the rule `DomainNav`
+    // already follows one level down for "New engram".
+    expect(
+      within(screen.getByRole("navigation", { name: "Domains" })).queryByRole(
+        "button",
+        { name: "New domain" },
+      ),
+    ).toBeNull();
+    expect(
+      within(screen.getByRole("main")).getByRole("button", {
+        name: "New domain",
+      }),
+    ).toBeVisible();
+
+    // Nowhere else does it yield: every other screen outside a domain draws
+    // this listing with no launcher of its own, and the sidebar is the only
+    // way in there.
+    home.unmount();
+    renderApp("/users");
+    expect(
+      await within(
+        await screen.findByRole("navigation", { name: "Domains" }),
+      ).findByRole("button", { name: "New domain" }),
+    ).toBeVisible();
+  });
+
+  it("asks GitHub nothing while the form is in a local mode", async () => {
+    serveAs("admin", { "/settings/github": () => githubStatus(true) });
+    renderApp("/users");
+
+    const dialog = await openFromSidebar();
+    // Local, and then the other mode that has no repository either: the probe
+    // belongs to team mode alone, and an instance's GitHub connection is not
+    // something to go asking about because a dialog opened.
+    await userEvent.type(within(dialog).getByLabelText("Name"), "scratch");
+    await userEvent.click(
+      within(dialog).getByRole("radio", { name: "Virtual" }),
+    );
+
+    expect(settingsCalls()).toHaveLength(0);
   });
 });

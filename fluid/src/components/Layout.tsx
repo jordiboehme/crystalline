@@ -772,6 +772,9 @@ function DomainList({
   /** Register a domain, or null for a session that may not. */
   onCreateDomain: (() => void) | null;
 }) {
+  // Which screen this listing is drawn beside, for the launcher below: the
+  // home screen is the one that carries its own.
+  const home = useLocation().pathname === "/";
   return (
     <>
       <h2 className="text-caption px-2 pb-2 font-semibold text-slate-500 dark:text-slate-400">
@@ -801,8 +804,15 @@ function DomainList({
         thing one level up. It is also what the empty state above is an
         invitation to - an instance with nothing on it says so and then offers
         the one act that changes that, rather than saying so and stopping.
+
+        Left out on the home screen only, which is `DomainNav`'s own rule one
+        level down: that screen carries the same launcher beside its Domains
+        heading, so the sidebar would otherwise offer a second one right next
+        to the first. Every other screen outside a domain - users, settings,
+        search, the graph - draws this listing with no launcher of its own, and
+        keeps this one.
       */}
-      {onCreateDomain !== null && (
+      {onCreateDomain !== null && home === false && (
         <button
           type="button"
           onClick={onCreateDomain}

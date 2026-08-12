@@ -221,8 +221,8 @@ export default function CreateDomainDialogBody({
                   <p className="text-sm text-slate-500 dark:text-slate-400">
                     {/*
                       The way out of it, not just the fact. The link is the
-                      app's own: accent-700 on this panel is 5.49:1, and
-                      accent-400 on the dark panel (slate-900) is 10.69:1.
+                      app's own: accent-700 on this panel is 5.47:1, and
+                      accent-400 on the dark panel (slate-900) is 9.59:1.
                     */}
                     <Link
                       to={githubSettingsRoute()}
