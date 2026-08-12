@@ -12,7 +12,7 @@
  */
 
 import { useQuery } from "@tanstack/react-query";
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import { Link } from "react-router";
 
 import { problemDetail } from "../api/client";
@@ -20,12 +20,19 @@ import { ACTIVITY_QUERY_KEY, fetchActivity } from "../api/activity";
 import type { Activity } from "../api/activity";
 import { DOMAINS_QUERY_KEY, fetchDomains } from "../api/domains";
 import type { DomainSummary } from "../api/domains";
-import { Chip, FOCUS_RING } from "../components/primitives";
+import { useAuth } from "../auth/AuthContext";
+import { CreateDomainDialog } from "../components/CreateDomainDialog";
+import { BUTTON, Chip, FOCUS_RING } from "../components/primitives";
 import { formatDay, plural } from "../format";
 import { RETIRED_CLASS, isRetired } from "../lifecycle";
 import { domainRoute, engramRoute } from "../paths";
 
 export default function Home() {
+  const { capabilities } = useAuth();
+  // Its own, rather than the frame's: the dialog carries everything it needs,
+  // so a second mount is one boolean, while threading the frame's state down
+  // into a screen would be a prop on every screen for the sake of this one.
+  const [creating, setCreating] = useState(false);
   const listing = useQuery({
     queryKey: DOMAINS_QUERY_KEY,
     queryFn: fetchDomains,
@@ -50,9 +57,34 @@ export default function Home() {
       </header>
 
       <section aria-labelledby="home-domains">
-        <h2 id="home-domains" className="mb-3 text-section">
-          Domains
-        </h2>
+        <div className="mb-3 flex flex-wrap items-baseline justify-between gap-3">
+          <h2 id="home-domains" className="text-section">
+            Domains
+          </h2>
+          {/*
+            The primary here for the reason "New engram" is the primary on a
+            domain screen: it is the one act this section is about, and it is
+            offered only to the session the server would let do it.
+          */}
+          {capabilities.canAdminister && (
+            <button
+              type="button"
+              onClick={() => {
+                setCreating(true);
+              }}
+              className={BUTTON.primary}
+            >
+              New domain
+            </button>
+          )}
+        </div>
+        {creating && (
+          <CreateDomainDialog
+            onClose={() => {
+              setCreating(false);
+            }}
+          />
+        )}
         {listing.isPending && (
           <p className="text-sm text-slate-500 dark:text-slate-400">
             Loading domains

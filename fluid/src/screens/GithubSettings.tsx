@@ -26,7 +26,12 @@ import {
 import type { GithubPending } from "../api/admin";
 import { problemDetail } from "../api/client";
 import { useAuth } from "../auth/AuthContext";
-import { BUTTON, FOCUS_RING } from "../components/primitives";
+import {
+  BUTTON,
+  CONTROL_HEIGHT,
+  FIELD,
+  FOCUS_RING,
+} from "../components/primitives";
 import NotFound from "./NotFound";
 
 /** How often the status is asked again while a device flow is running. */
@@ -37,11 +42,6 @@ interface Notice {
   kind: "problem" | "done";
   text: string;
 }
-
-/** One height for every control here, as the rest of the app's controls stand. */
-const CONTROL_HEIGHT = "h-8";
-
-const FIELD_CLASSES = `${CONTROL_HEIGHT} rounded border border-slate-300 bg-white px-2 text-sm outline-none focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 dark:border-slate-700 dark:bg-slate-900`;
 
 /** The screen's one primary: the way in most people will take. */
 const CONNECT_BUTTON = `${CONTROL_HEIGHT} ${BUTTON.primary}`;
@@ -257,7 +257,7 @@ function GithubPanel() {
               onChange={(event) => {
                 setToken(event.target.value);
               }}
-              className={`w-72 ${FIELD_CLASSES}`}
+              className={`w-72 ${FIELD}`}
             />
           </div>
           <button

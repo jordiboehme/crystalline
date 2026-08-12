@@ -26,7 +26,7 @@ import {
   resetPassword,
 } from "../api/users";
 import { useAuth } from "../auth/AuthContext";
-import { BUTTON } from "../components/primitives";
+import { BUTTON, CONTROL_HEIGHT, FIELD } from "../components/primitives";
 import { formatDay } from "../format";
 import NotFound from "./NotFound";
 
@@ -38,20 +38,6 @@ interface Notice {
   kind: "problem" | "done";
   text: string;
 }
-
-/**
- * One height for every control on a row, and for the cells that are not
- * controls at all.
- *
- * A row here is a login name, an input, a select, a word and a handful of
- * buttons, and left to themselves the browser gives each of those a different
- * height. `h-8` is what the rest of the app's controls stand at (`IconButton`,
- * the filter bars), so a row reads as one line rather than as six things that
- * happen to be next to each other.
- */
-const CONTROL_HEIGHT = "h-8";
-
-const FIELD_CLASSES = `${CONTROL_HEIGHT} rounded border border-slate-300 bg-white px-2 text-sm outline-none focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 dark:border-slate-700 dark:bg-slate-900`;
 
 /**
  * The row's own buttons, from the shared tiers rather than hand-rolled here.
@@ -150,7 +136,7 @@ function UsersPanel() {
   return (
     <div className="flex flex-col gap-6">
       <header>
-        <h1 className="text-xl font-semibold">Users</h1>
+        <h1 className="text-display">Users</h1>
         <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">
           Who may sign in to this instance, and what each of them may do. The
           server decides every one of these changes; whatever it refuses is said
@@ -323,7 +309,7 @@ function AccountRow({
             onChange={(event) => {
               setDisplay(event.target.value);
             }}
-            className={`w-32 ${FIELD_CLASSES}`}
+            className={`w-32 ${FIELD}`}
           />
           <button
             type="submit"
@@ -346,7 +332,7 @@ function AccountRow({
           onChange={(event) => {
             onPatch({ role: event.target.value as Role });
           }}
-          className={FIELD_CLASSES}
+          className={FIELD}
         >
           {ROLES.map((role) => (
             <option key={role} value={role}>
@@ -414,7 +400,7 @@ function AccountRow({
                 onChange={(event) => {
                   setPassword(event.target.value);
                 }}
-                className={`w-36 ${FIELD_CLASSES}`}
+                className={`w-36 ${FIELD}`}
               />
               <button
                 type="submit"
@@ -598,7 +584,7 @@ function CreateForm({
             onChange={(event) => {
               setName(event.target.value);
             }}
-            className={FIELD_CLASSES}
+            className={FIELD}
           />
         </div>
 
@@ -616,7 +602,7 @@ function CreateForm({
             onChange={(event) => {
               setDisplay(event.target.value);
             }}
-            className={FIELD_CLASSES}
+            className={FIELD}
           />
         </div>
 
@@ -633,7 +619,7 @@ function CreateForm({
             onChange={(event) => {
               setRole(event.target.value as Role);
             }}
-            className={FIELD_CLASSES}
+            className={FIELD}
           >
             {ROLES.map((option) => (
               <option key={option} value={option}>
@@ -659,7 +645,7 @@ function CreateForm({
             onChange={(event) => {
               setPassword(event.target.value);
             }}
-            className={FIELD_CLASSES}
+            className={FIELD}
           />
         </div>
 

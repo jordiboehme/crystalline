@@ -13,7 +13,7 @@
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Dialog } from "radix-ui";
-import type { ReactElement, ReactNode } from "react";
+import type { ReactElement } from "react";
 import { useId, useState } from "react";
 import { useNavigate } from "react-router";
 
@@ -25,49 +25,11 @@ import { createEngram } from "../api/writes";
 import { editRoute } from "../paths";
 import { STATUS_SUGGESTIONS, TYPE_SUGGESTIONS } from "../suggestions";
 import type { CreateEngramDialogProps } from "./CreateEngramDialog";
-import { BUTTON } from "./primitives";
+import { BUTTON, Field } from "./primitives";
 import { SuggestInput, suggestionsAreOpen } from "./SuggestInput";
 
 const FIELD_CLASSES =
   "w-full rounded border border-slate-300 bg-transparent px-2 py-1 text-sm focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:border-slate-700";
-
-/**
- * One labelled field, with what the field is called kept apart from what is
- * worth knowing about it.
- *
- * The parenthetical the labels used to carry - "Tags (optional, comma
- * separated)" - was help wearing a label's clothes: it made the name a reader
- * hears longer than the thing it names, and it made every label a different
- * length for no reason a reader could see. The helper is a description
- * instead, tied on with `aria-describedby`, so the name stays the word and the
- * advice still reaches a screen reader - after the name rather than inside it.
- */
-function Field({
-  id,
-  label,
-  helper,
-  children,
-}: {
-  id: string;
-  label: string;
-  helper?: string;
-  children: ReactNode;
-}): ReactElement {
-  return (
-    <div className="flex flex-col gap-1 text-sm">
-      <label htmlFor={id}>{label}</label>
-      {helper !== undefined && (
-        <p
-          id={`${id}-help`}
-          className="text-caption text-slate-500 dark:text-slate-400"
-        >
-          {helper}
-        </p>
-      )}
-      {children}
-    </div>
-  );
-}
 
 export default function CreateEngramDialogBody({
   domain,

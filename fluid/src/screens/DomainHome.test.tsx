@@ -17,6 +17,7 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ApiProblem, api } from "../api/client";
+import type { Answer } from "../test/harness";
 import {
   answersFor,
   domainsResponse,
@@ -160,10 +161,13 @@ function vocabularyResponse() {
   };
 }
 
-function serve(routes: Record<string, (path: string) => unknown> = {}) {
+function serve(
+  routes: Record<string, Answer> = {},
+  role: "admin" | "editor" = "editor",
+) {
   apiMock.mockImplementation(
     answersFor({
-      "/auth/me": () => meResponse({ user: userFixture() }),
+      "/auth/me": () => meResponse({ user: userFixture({ role }) }),
       "/domains": domainsResponse,
       "/domains/eng/manifest": () => ({ domain: "eng", markdown: MANIFEST }),
       "/domains/eng/tree": treeResponse,
@@ -172,6 +176,12 @@ function serve(routes: Record<string, (path: string) => unknown> = {}) {
       ...routes,
     }),
   );
+}
+
+/** The listing as it reads for a domain of the given kind. */
+function listingOf(kind: string) {
+  const listing = domainsResponse();
+  return { ...listing, domains: [{ ...listing.domains[0], kind }] };
 }
 
 /** Every path the app asked for, in order. */
@@ -442,5 +452,80 @@ describe("the domain screen", () => {
     // And the screen says which view is on screen, so the switch is not a
     // silent one.
     expect(screen.getByText(/whole domain/i)).toBeVisible();
+  });
+
+  it("unregisters behind a second press, and says the files stay", async () => {
+    const removed = vi.fn(() => ({ files_kept: true, rooms_closed: 0 }));
+    serve(
+      {
+        "/domains/eng": (_path, init) =>
+          init?.method === "DELETE" ? removed() : domainsResponse(),
+        "/activity": () => ({ timeframe: "7d", items: [] }),
+      },
+      "admin",
+    );
+
+    renderApp("/d/eng");
+    const body = await screenBody();
+
+    await userEvent.click(
+      await within(body).findByRole("button", { name: "Unregister domain" }),
+    );
+    // The first press only asks. Nothing has been unregistered yet.
+    expect(removed).not.toHaveBeenCalled();
+    expect(within(body).getByText(/files stay on disk/i)).toBeVisible();
+
+    await userEvent.click(
+      within(body).getByRole("button", { name: "Confirm unregister" }),
+    );
+
+    await waitFor(() => {
+      expect(removed).toHaveBeenCalled();
+    });
+    // The domain the reader was on is gone, so the screen is: home, with the
+    // listing every screen reads asked again rather than left one domain long.
+    expect(
+      await screen.findByRole("heading", { level: 1, name: "Home" }),
+    ).toBeVisible();
+    await waitFor(() => {
+      expect(
+        requested().filter((path) => path === "/domains").length,
+      ).toBeGreaterThan(1);
+    });
+  });
+
+  it("does not offer unregistering below admin", async () => {
+    serve();
+
+    renderApp("/d/eng");
+    const body = await screenBody();
+    await within(body).findByRole("link", { name: /Alpha/ });
+
+    expect(
+      within(body).queryByRole("button", { name: "Unregister domain" }),
+    ).toBeNull();
+  });
+
+  it("warns that a virtual domain's engrams go with it", async () => {
+    serve(
+      {
+        "/domains": () => listingOf("virtual"),
+        "/activity": () => ({ timeframe: "7d", items: [] }),
+      },
+      "admin",
+    );
+
+    renderApp("/d/eng");
+    const body = await screenBody();
+
+    await userEvent.click(
+      await within(body).findByRole("button", { name: "Unregister domain" }),
+    );
+
+    // Nothing stays on disk here, so nothing here says it does: the engrams
+    // are the database's, and the way to keep a copy is named.
+    expect(within(body).getByText(/live in the database/i)).toBeVisible();
+    expect(within(body).getByText(/download the archive first/i)).toBeVisible();
+    expect(within(body).queryByText(/files stay on disk/i)).toBeNull();
   });
 });

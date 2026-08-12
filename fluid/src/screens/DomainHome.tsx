@@ -18,10 +18,11 @@
  * send, and the back button moves between them.
  */
 
-import { useQuery } from "@tanstack/react-query";
-import { useMemo, useState } from "react";
-import { Link, useParams, useSearchParams } from "react-router";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMemo, useRef, useState } from "react";
+import { Link, useNavigate, useParams, useSearchParams } from "react-router";
 
+import { unregisterDomain } from "../api/admin";
 import { ApiProblem, problemDetail } from "../api/client";
 import { fetchManifest, manifestKey, treeQuery } from "../api/domain";
 import { DOMAINS_QUERY_KEY, fetchDomains } from "../api/domains";
@@ -51,7 +52,11 @@ export default function DomainHome() {
   const { domain = "" } = useParams();
   const [params, setParams] = useSearchParams();
   const { capabilities } = useAuth();
+  const navigate = useNavigate();
+  const queryClient = useQueryClient();
   const [creating, setCreating] = useState(false);
+  const [confirmingUnregister, setConfirmingUnregister] = useState(false);
+  const [problem, setProblem] = useState<string | null>(null);
 
   const path = params.get("path") ?? "";
   // The frontmatter view, which is the whole domain: the shared reader leaves
@@ -104,22 +109,51 @@ export default function DomainHome() {
   //
   // The dialog it opens picks its own folder from the URL, so the keyboard
   // route lands exactly where the pointer route does.
-  const commands = useMemo<readonly PaletteCommand[]>(
-    () =>
-      capabilities.canWrite && !unknownDomain
-        ? [
-            {
-              id: "create",
-              title: "New engram",
-              run: () => {
-                setCreating(true);
-              },
-            },
-          ]
-        : NO_COMMANDS,
-    [capabilities.canWrite, unknownDomain],
-  );
+  //
+  // Unregistering rides on the same two gates, one role higher: the palette
+  // row does what the button does, which is to ASK - the second press is the
+  // point of the control and the keyboard route does not get to skip it.
+  const commands = useMemo<readonly PaletteCommand[]>(() => {
+    const rows: PaletteCommand[] = [];
+    if (unknownDomain) {
+      return NO_COMMANDS;
+    }
+    if (capabilities.canWrite) {
+      rows.push({
+        id: "create",
+        title: "New engram",
+        run: () => {
+          setCreating(true);
+        },
+      });
+    }
+    if (capabilities.canAdminister) {
+      rows.push({
+        id: "unregister-domain",
+        title: "Unregister domain",
+        run: () => {
+          setConfirmingUnregister(true);
+        },
+      });
+    }
+    return rows.length === 0 ? NO_COMMANDS : rows;
+  }, [capabilities.canAdminister, capabilities.canWrite, unknownDomain]);
   useRegisterCommands(commands);
+
+  const unregister = useMutation({
+    mutationFn: () => unregisterDomain(domain),
+    onSuccess: () => {
+      // The listing is what every sidebar, card and switcher draws from, and
+      // the domain this screen is about is no longer in it.
+      void queryClient.invalidateQueries({ queryKey: DOMAINS_QUERY_KEY });
+      // Nowhere to stay: this address is now a wrong address.
+      void navigate("/");
+    },
+    onError: (error: Error) => {
+      setConfirmingUnregister(false);
+      setProblem(problemDetail(error));
+    },
+  });
 
   /** Change the URL, which is the whole of this screen's state. */
   function apply(next: {
@@ -178,21 +212,43 @@ export default function DomainHome() {
           <h2 id="domain-engrams" className="text-section">
             Engrams
           </h2>
-          {capabilities.canWrite && (
-            <button
-              type="button"
-              onClick={() => {
-                setCreating(true);
-              }}
-              // Primary: writing an engram is what a writer opens a domain to
-              // do. The sidebar's launcher hides on this screen, so the two
-              // never sit on one page competing for the same attention.
-              className={BUTTON.primary}
-            >
-              New engram
-            </button>
-          )}
+          <div className="flex flex-wrap items-center gap-2">
+            {capabilities.canWrite && (
+              <button
+                type="button"
+                onClick={() => {
+                  setCreating(true);
+                }}
+                // Primary: writing an engram is what a writer opens a domain to
+                // do. The sidebar's launcher hides on this screen, so the two
+                // never sit on one page competing for the same attention.
+                className={BUTTON.primary}
+              >
+                New engram
+              </button>
+            )}
+            {capabilities.canAdminister && (
+              <UnregisterDomain
+                kind={summary?.kind ?? null}
+                confirming={confirmingUnregister}
+                pending={unregister.isPending}
+                onConfirmingChange={setConfirmingUnregister}
+                onUnregister={() => {
+                  setProblem(null);
+                  unregister.mutate();
+                }}
+              />
+            )}
+          </div>
         </div>
+        {problem !== null && (
+          <p
+            role="alert"
+            className="mb-3 rounded bg-red-50 px-3 py-2 text-sm text-red-800 dark:bg-red-950 dark:text-red-200"
+          >
+            {problem}
+          </p>
+        )}
         {creating && (
           <CreateEngramDialog
             domain={domain}
@@ -274,6 +330,107 @@ export default function DomainHome() {
           />
         )}
       </section>
+    </div>
+  );
+}
+
+/**
+ * Unregistering a domain, behind a second press that says what is lost.
+ *
+ * Two steps rather than a browser confirm, for the reason the account screen
+ * gives: a dialog the browser owns cannot be reached by a test, cannot be
+ * styled and cannot be dismissed by the keyboard the way the rest of this can.
+ *
+ * What the second step says is not one sentence but two, and which one it is
+ * is a fact about the domain rather than a softening: a file domain keeps its
+ * markdown on disk and can be registered again from it, while a virtual
+ * domain's engrams are the database's and go with it. Saying "the files stay"
+ * over a virtual domain would be the app telling somebody their engrams are
+ * safe on the way to deleting them.
+ *
+ * A `kind` of null - a listing that has not landed, which is also a listing
+ * that left the chips under the domain's name unwritten - falls back to the
+ * file sentence, because virtual is the kind that has to be declared and every
+ * domain this app has ever registered from a folder answers `file`.
+ */
+function UnregisterDomain({
+  kind,
+  confirming,
+  pending,
+  onConfirmingChange,
+  onUnregister,
+}: {
+  /** `file`, `virtual`, or null when the listing did not say. */
+  kind: string | null;
+  confirming: boolean;
+  pending: boolean;
+  onConfirmingChange: (confirming: boolean) => void;
+  onUnregister: () => void;
+}) {
+  const trigger = useRef<HTMLButtonElement>(null);
+
+  /** Give up on the pending unregister, and hand the focus back to what asked. */
+  function abandon() {
+    onConfirmingChange(false);
+    trigger.current?.focus();
+  }
+
+  return (
+    <div
+      className="flex flex-wrap items-center gap-2"
+      onKeyDown={(event) => {
+        if (event.key === "Escape" && confirming) {
+          event.stopPropagation();
+          abandon();
+        }
+      }}
+      onBlur={(event) => {
+        // Only when the focus actually landed somewhere else: a `focusout`
+        // with no destination is what a click looks like mid-flight, and
+        // taking the confirmation away there would eat the second press this
+        // exists to require.
+        const next = event.relatedTarget;
+        if (
+          confirming &&
+          next instanceof Node &&
+          !event.currentTarget.contains(next)
+        ) {
+          onConfirmingChange(false);
+        }
+      }}
+    >
+      <button
+        ref={trigger}
+        type="button"
+        aria-expanded={confirming}
+        disabled={pending}
+        onClick={() => {
+          onConfirmingChange(true);
+        }}
+        className={BUTTON.destructive}
+      >
+        Unregister domain
+      </button>
+      {confirming && (
+        <>
+          <button
+            type="button"
+            autoFocus
+            onClick={onUnregister}
+            className={BUTTON.destructive}
+          >
+            Confirm unregister
+          </button>
+          <button type="button" onClick={abandon} className={BUTTON.secondary}>
+            Keep
+          </button>
+          <span className="text-sm text-slate-500 dark:text-slate-400">
+            {kind === "virtual"
+              ? "This domain's engrams live in the database and will be removed from search; download the archive first if you need a copy."
+              : "The files stay on disk. This instance forgets the domain and drops it from search; registering the folder again brings it back."}
+          </span>
+        </>
+      )}
     </div>
   );
 }

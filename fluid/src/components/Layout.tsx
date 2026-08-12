@@ -64,6 +64,7 @@ import {
 import { useTheme } from "../theme/context";
 import type { ThemePreference } from "../theme/context";
 import { CommandPalette } from "./CommandPalette";
+import { CreateDomainDialog } from "./CreateDomainDialog";
 import { CreateEngramDialog } from "./CreateEngramDialog";
 import { DomainNav } from "./DomainNav";
 import { HelpOverlay } from "./HelpOverlay";
@@ -154,6 +155,9 @@ export function Layout() {
   const [rail, setRail] = useState(storedRail);
   const wide = useWide();
   const [helpOpen, setHelpOpen] = useState(false);
+  // Registering a domain is the frame's own act rather than any screen's: it
+  // is what the sidebar lists, and the sidebar is on every screen.
+  const [creatingDomain, setCreatingDomain] = useState(false);
   const mainRef = useRef<HTMLElement | null>(null);
 
   // A choice about the shape of the frame outlives the screen it was made on,
@@ -190,6 +194,13 @@ export function Layout() {
       },
     ];
     if (capabilities.canAdminister) {
+      frame.push({
+        id: "create-domain",
+        title: "Create domain",
+        run: () => {
+          setCreatingDomain(true);
+        },
+      });
       frame.push({
         id: "github-settings",
         title: "GitHub settings",
@@ -242,6 +253,9 @@ export function Layout() {
           open={navOpen}
           rail={rail && wide}
           onToggleRail={toggleRail}
+          onCreateDomain={() => {
+            setCreatingDomain(true);
+          }}
         />
         <main
           ref={mainRef}
@@ -266,6 +280,17 @@ export function Layout() {
           setHelpOpen(false);
         }}
       />
+      {/*
+        Mounted by the frame rather than by the sidebar, because both ways in -
+        the launcher under the listing and the palette row - are the frame's.
+      */}
+      {creatingDomain && (
+        <CreateDomainDialog
+          onClose={() => {
+            setCreatingDomain(false);
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -567,10 +592,13 @@ function DomainSidebar({
   open,
   rail,
   onToggleRail,
+  onCreateDomain,
 }: {
   open: boolean;
   rail: boolean;
   onToggleRail: () => void;
+  /** Open the frame's own register-a-domain dialog. */
+  onCreateDomain: () => void;
 }) {
   const navigate = useNavigate();
   const { capabilities } = useAuth();
@@ -691,6 +719,13 @@ function DomainSidebar({
               domains={listing.data?.domains}
               pending={listing.isPending}
               error={listing.error}
+              // Only for the session that may register one. The server refuses
+              // everyone else anyway, so this is the difference between a
+              // sidebar that offers what you can do and one that offers a door
+              // that will not open.
+              onCreateDomain={
+                capabilities.canAdminister ? onCreateDomain : null
+              }
             />
           ) : (
             <>
@@ -729,10 +764,13 @@ function DomainList({
   domains,
   pending,
   error,
+  onCreateDomain,
 }: {
   domains: DomainSummary[] | undefined;
   pending: boolean;
   error: Error | null;
+  /** Register a domain, or null for a session that may not. */
+  onCreateDomain: (() => void) | null;
 }) {
   return (
     <>
@@ -756,6 +794,22 @@ function DomainList({
         <p className="px-2 text-sm text-slate-500 dark:text-slate-400">
           No domains are registered on this instance yet.
         </p>
+      )}
+      {/*
+        Under the listing, in the launcher shape `DomainNav` gives "New
+        engram": the same place in the same column, doing the same kind of
+        thing one level up. It is also what the empty state above is an
+        invitation to - an instance with nothing on it says so and then offers
+        the one act that changes that, rather than saying so and stopping.
+      */}
+      {onCreateDomain !== null && (
+        <button
+          type="button"
+          onClick={onCreateDomain}
+          className="mt-2 w-full rounded border border-slate-300 px-2 py-1 text-sm hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800"
+        >
+          New domain
+        </button>
       )}
     </>
   );

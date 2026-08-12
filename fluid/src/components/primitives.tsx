@@ -54,6 +54,66 @@ export const TOGGLE = {
 } as const;
 
 /**
+ * One height for every control that stands on a row beside another one, and
+ * for the cells that are not controls at all.
+ *
+ * A row of an input, a select, a word and a handful of buttons gets a different
+ * height for each from the browser. `h-8` is what the rest of the app's
+ * controls stand at (`IconButton`, the filter bars), so a row reads as one line
+ * rather than as six things that happen to be next to each other.
+ */
+export const CONTROL_HEIGHT = "h-8";
+
+/**
+ * The one text-input face: the admin forms' fields, the settings screen's, and
+ * the domain dialog's.
+ *
+ * Width is the caller's, because that is the one thing that differs between
+ * them - a login name is not as wide as a personal access token - and the rest
+ * is shared to the character. Opaque rather than transparent, so a field inside
+ * a dialog reads as a field rather than as a rectangle drawn on the panel.
+ */
+export const FIELD = `${CONTROL_HEIGHT} rounded border border-slate-300 bg-white px-2 text-sm outline-none focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 dark:border-slate-700 dark:bg-slate-900`;
+
+/**
+ * One labelled field, with what the field is called kept apart from what is
+ * worth knowing about it.
+ *
+ * The parenthetical labels used to carry - "Tags (optional, comma separated)" -
+ * was help wearing a label's clothes: it made the name a reader hears longer
+ * than the thing it names, and it made every label a different length for no
+ * reason a reader could see. The helper is a description instead, tied on with
+ * `aria-describedby` by the caller, so the name stays the word and the advice
+ * still reaches a screen reader - after the name rather than inside it.
+ */
+export function Field({
+  id,
+  label,
+  helper,
+  children,
+}: {
+  id: string;
+  label: string;
+  helper?: string;
+  children: ReactNode;
+}): ReactElement {
+  return (
+    <div className="flex flex-col gap-1 text-sm">
+      <label htmlFor={id}>{label}</label>
+      {helper !== undefined && (
+        <p
+          id={`${id}-help`}
+          className="text-caption text-slate-500 dark:text-slate-400"
+        >
+          {helper}
+        </p>
+      )}
+      {children}
+    </div>
+  );
+}
+
+/**
  * Every button attribute, `ref` included: a caller that has to move the
  * keyboard onto one of these - a control that replaces the control that was
  * pressed - needs the element itself, and React hands a function component's
