@@ -7,10 +7,11 @@
 # playwright.config.ts) and drives a browser against it.
 #
 # Everything the daemon writes lives in a scratch directory this script makes
-# and removes: the config, the index, the accounts, the model cache and the
-# copy of the fixture domain the daemon indexes and writes its generated index
-# files into. Nothing here touches the machine's own Crystalline installation,
-# and the checked-in fixture under e2e/fixtures/domain is never written to.
+# and removes: the config, the index, the accounts, the model cache, the copy
+# of the fixture domain the daemon indexes and writes its generated index files
+# into, and the domains root a domain registered from the app lands under.
+# Nothing here touches the machine's own Crystalline installation, and the
+# checked-in fixture under e2e/fixtures/domain is never written to.
 #
 # The daemon's port is 7411 and not configurable, because vite.config.ts
 # forwards /api there and the browser only ever talks to the preview server.
@@ -95,14 +96,23 @@ trap finish EXIT
 # it: Playwright reads ~/Library/Caches there and ignores XDG entirely. Scoping
 # the isolation to the process it belongs to is what makes that impossible
 # rather than merely fixed, for pnpm's store and anything else reading XDG too.
+#
+# The domains root is the one path here that is NOT an XDG one: it defaults to
+# ~/Documents/Crystalline, in the daemon's own home, and it is where a local
+# domain registered from the app lands. The domain-administration journey
+# registers one, so without this line a smoke run would leave a real folder in
+# the developer's Documents rather than in the scratch directory the trap above
+# removes.
 isolated=(
     env
     "XDG_CONFIG_HOME=$run_dir/config"
     "XDG_STATE_HOME=$run_dir/state"
     "XDG_CACHE_HOME=$run_dir/cache"
     "XDG_DATA_HOME=$run_dir/data"
+    "CRYSTALLINE_DOMAINS_ROOT=$run_dir/domains-root"
 )
-mkdir -p "$run_dir/config" "$run_dir/state" "$run_dir/cache" "$run_dir/data"
+mkdir -p "$run_dir/config" "$run_dir/state" "$run_dir/cache" "$run_dir/data" \
+    "$run_dir/domains-root"
 
 domain_root="$run_dir/domain"
 cp -R "$here/fixtures/domain" "$domain_root"

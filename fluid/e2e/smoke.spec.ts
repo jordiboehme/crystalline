@@ -7,9 +7,11 @@
  * which is the static server's SPA fallback and the app's per-segment permalink
  * encoding meeting for the first time; a search answered by the index rather
  * than by a fixture; a graph canvas that only a browser with layout can draw;
- * and a keyboard shortcut delivered by the browser itself; and two browsers
+ * and a keyboard shortcut delivered by the browser itself; two browsers
  * co-editing one engram over a real websocket, which needs two of everything
- * jsdom has one of.
+ * jsdom has one of; and a domain's archive saved by the browser and handed
+ * straight back through a file input, which is a download and an upload of the
+ * same bytes with no test double anywhere between them.
  *
  * The domain behind it is `e2e/fixtures/domain`, copied to a scratch directory
  * and registered by `e2e/run-smoke.sh`, which is also what seeds the accounts
@@ -31,6 +33,14 @@ const PEER_PASSWORD = process.env.FLUID_E2E_PEER_PASSWORD ?? "peer-password";
 
 /** The engram three folders down, whose permalink is a path rather than a word. */
 const DEEP_PERMALINK = "notes/deep/gamma";
+
+/**
+ * The domain the last journey registers, fills and unregisters.
+ *
+ * Its folder lands under the domains root `run-smoke.sh` pins into the scratch
+ * directory, so the whole of it goes when that directory does.
+ */
+const RESTORE_DOMAIN = "smoke-restore";
 
 /**
  * Sign in, and land on the home screen.
@@ -326,4 +336,107 @@ test("two browsers co-edit one engram and the save lands once", async ({
 
   await contextA.close();
   await contextB.close();
+});
+
+/**
+ * Last in the file on purpose: this is the one journey that changes what the
+ * instance holds. It registers a domain of its own, fills it from a copy of
+ * the fixture domain and unregisters it again, and it never writes to the
+ * fixture domain the journeys above read - the archive it takes from there is
+ * a download, which is a read. Anything appended after this one would run
+ * against a world it has moved.
+ */
+test("a domain is registered, filled from an archive and unregistered", async ({
+  page,
+}) => {
+  // The home screen's own launcher. The sidebar's one yields here - Layout
+  // leaves it out on "/" so the two never sit on one page - which is what
+  // makes the button on this screen the only "New domain" to press.
+  await page.getByRole("button", { name: "New domain" }).click();
+  await page.getByLabel("Name", { exact: true }).fill(RESTORE_DOMAIN);
+  await page.getByRole("button", { name: "Create domain" }).click();
+  // Registering lands on the new domain's own screen, empty and addressable.
+  await expect(
+    page.getByRole("heading", { name: RESTORE_DOMAIN, level: 1 }),
+  ).toBeVisible();
+
+  // The fixture domain's archive, saved by the browser itself: the control is
+  // an anchor carrying `download`, so this is a real save of a real zip rather
+  // than a fetch the app holds in memory.
+  //
+  // Reached the way every other journey reaches a domain: from the home screen
+  // and its card. Inside a domain the sidebar is that domain's own tree rather
+  // than the listing, and `All domains` is the way back out of it that the
+  // sidebar itself offers.
+  await page.getByRole("link", { name: "All domains" }).click();
+  await page
+    .locator("main")
+    .getByRole("link", { name: DOMAIN, exact: true })
+    .click();
+  await expect(
+    page.getByRole("heading", { name: DOMAIN, level: 1 }),
+  ).toBeVisible();
+  const [download] = await Promise.all([
+    page.waitForEvent("download"),
+    page.getByRole("link", { name: "Download archive" }).click(),
+  ]);
+  expect(download.suggestedFilename()).toBe(`${DOMAIN}-archive.zip`);
+  const archivePath = await download.path();
+
+  // And straight back up into the new domain: a dry run first, which is the
+  // whole point of the two-step dialog, then the write it described.
+  await page.getByRole("link", { name: "All domains" }).click();
+  await page
+    .locator("main")
+    .getByRole("link", { name: RESTORE_DOMAIN, exact: true })
+    .click();
+  await expect(
+    page.getByRole("heading", { name: RESTORE_DOMAIN, level: 1 }),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Import archive" }).click();
+  await page.getByLabel("Archive file").setInputFiles(archivePath);
+  await page.getByRole("button", { name: "Preview" }).click();
+
+  // The MANIFEST is the entry that proves the report is the server's own
+  // reading of the archive rather than a list of file names: a domain keeps
+  // the manifest it has, so an archive's is ignored at any depth.
+  await expect(
+    page
+      .getByRole("table", { name: "What an import would do" })
+      .getByRole("row", { name: /MANIFEST\.md/ }),
+  ).toContainText("ignored");
+
+  // `Import` exactly, which is the only control here that writes: `Import
+  // archive` is the launcher on the screen behind the dialog.
+  await page.getByRole("button", { name: "Import", exact: true }).click();
+  await expect(
+    page.getByRole("table", { name: "What the import did" }),
+  ).toBeVisible();
+  await expect(page.getByText(/\d+ written, \d+ skipped/)).toBeVisible();
+  await page.getByRole("button", { name: "Close" }).click();
+
+  // The engrams really landed, asked of the API rather than of the screen that
+  // just claimed it (journey 8's pattern). Polled, because a written file is
+  // indexed a moment after it is written and the listing is the index talking.
+  await expect
+    .poll(
+      async () =>
+        (
+          await page.request.get(`/api/v1/domains/${RESTORE_DOMAIN}/engrams`)
+        ).text(),
+      { timeout: 30_000 },
+    )
+    .toContain("lantern-protocol");
+
+  // Unregistering, behind the second press that says what is lost - and what
+  // is not: the files stay, which is the sentence the spec pins.
+  await page.getByRole("button", { name: "Unregister domain" }).click();
+  await expect(page.getByText(/files stay on disk/i)).toBeVisible();
+  await page.getByRole("button", { name: "Confirm unregister" }).click();
+
+  // Nowhere to stay: the address is a wrong address now, so the app leaves.
+  await expect(page).toHaveURL(/\/$/);
+  const domains = await page.request.get("/api/v1/domains");
+  expect(domains.ok()).toBeTruthy();
+  expect(await domains.text()).not.toContain(RESTORE_DOMAIN);
 });
