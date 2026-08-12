@@ -529,6 +529,43 @@ describe("the domain screen", () => {
     ).toBeNull();
   });
 
+  it("offers the archive round trip to an admin", async () => {
+    serve({}, "admin");
+
+    renderApp("/d/eng");
+    const body = await screenBody();
+
+    // A link the browser saves rather than a fetch the app holds in memory:
+    // the download is a cookie-authenticated GET, so the anchor is the whole
+    // mechanism, and `download` is what makes it a save rather than a
+    // navigation into a zip.
+    const download = await within(body).findByRole("link", {
+      name: "Download archive",
+    });
+    expect(download).toHaveAttribute("href", "/api/v1/domains/eng/archive");
+    expect(download).toHaveAttribute("download");
+    expect(
+      within(body).getByRole("button", { name: "Import archive" }),
+    ).toBeVisible();
+  });
+
+  it("offers neither half of the archive round trip below admin", async () => {
+    serve();
+
+    renderApp("/d/eng");
+    const body = await screenBody();
+    await within(body).findByRole("link", { name: /Alpha/ });
+
+    // Both endpoints are admin-only, so neither control is drawn for anybody
+    // who would be refused at it.
+    expect(
+      within(body).queryByRole("link", { name: "Download archive" }),
+    ).toBeNull();
+    expect(
+      within(body).queryByRole("button", { name: "Import archive" }),
+    ).toBeNull();
+  });
+
   it("warns that a virtual domain's engrams go with it", async () => {
     serve(
       {
@@ -726,6 +763,95 @@ describe("the team sync card", () => {
     expect(
       within(card).getByRole("button", { name: "Sync now" }),
     ).toBeVisible();
+  });
+
+  it("keeps the numbers it already showed when a later check is refused", async () => {
+    let reads = 0;
+    serve(
+      {
+        "/domains/eng/sync": (_path, init) => {
+          if (init?.method === "POST") {
+            return { domain: "eng", up_to_date: true, applied: [] };
+          }
+          reads += 1;
+          if (reads > 1) {
+            throw new ApiProblem(
+              409,
+              "conflict",
+              "GitHub is disabled on this instance",
+            );
+          }
+          return syncResponse();
+        },
+      },
+      "admin",
+    );
+
+    renderApp("/d/eng");
+    const card = await within(await screenBody()).findByRole("region", {
+      name: "Team sync",
+    });
+    expect(within(card).getByText("acme/kb")).toBeVisible();
+
+    await userEvent.click(
+      within(card).getByRole("button", { name: "Sync now" }),
+    );
+
+    // The refusal is announced, and what was already on screen stays there: a
+    // refetch that failed is a card that could not be updated, not a card
+    // whose facts were withdrawn.
+    await waitFor(() => {
+      expect(within(card).getByRole("alert")).toHaveTextContent(
+        "GitHub is disabled on this instance",
+      );
+    });
+    expect(within(card).getByText("acme/kb")).toBeVisible();
+    expect(within(card).getByText("2 pending local changes")).toBeVisible();
+  });
+
+  it("says a domain that was never checked was never checked", async () => {
+    serve(
+      { "/domains/eng/sync": () => syncResponse({ last_checked: null }) },
+      "admin",
+    );
+
+    renderApp("/d/eng");
+    const card = await within(await screenBody()).findByRole("region", {
+      name: "Team sync",
+    });
+
+    // A day that does not exist gets no staleness marker and no invented
+    // date: a registered team domain the poller has not reached yet.
+    expect(within(card).getByText("not yet")).toBeVisible();
+    expect(within(card).queryByText(/stale/)).toBeNull();
+  });
+
+  it("does not say the same refusal twice", async () => {
+    const refusal = "GitHub is disabled on this instance";
+    serve(
+      {
+        "/domains/eng/sync": () => {
+          throw new ApiProblem(409, "conflict", refusal);
+        },
+      },
+      "admin",
+    );
+
+    renderApp("/d/eng");
+    const card = await within(await screenBody()).findByRole("region", {
+      name: "Team sync",
+    });
+
+    await userEvent.click(
+      within(card).getByRole("button", { name: "Sync now" }),
+    );
+
+    // The pull is refused for the reason the status already gives, so the
+    // card says it once: two byte-identical alerts read as two problems.
+    await waitFor(() => {
+      expect(within(card).getAllByRole("alert")).toHaveLength(1);
+    });
+    expect(within(card).getByRole("alert")).toHaveTextContent(refusal);
   });
 
   it("asks for no sync status below admin", async () => {

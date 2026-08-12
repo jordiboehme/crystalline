@@ -22,7 +22,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router";
 
-import { unregisterDomain } from "../api/admin";
+import { archiveDownloadUrl, unregisterDomain } from "../api/admin";
 import { ApiProblem, problemDetail } from "../api/client";
 import { fetchManifest, manifestKey, treeQuery } from "../api/domain";
 import { DOMAINS_QUERY_KEY, fetchDomains } from "../api/domains";
@@ -41,6 +41,7 @@ import type { PaletteCommand } from "../commands";
 import { CreateEngramDialog } from "../components/CreateEngramDialog";
 import { EngramList } from "../components/EngramList";
 import { FilterFields, TagChips } from "../components/FilterControls";
+import { ImportArchiveDialog } from "../components/ImportArchiveDialog";
 import { Skeleton } from "../components/Skeleton";
 import { SyncCard } from "../components/SyncCard";
 import { BUTTON, Chip, FOCUS_RING } from "../components/primitives";
@@ -56,6 +57,7 @@ export default function DomainHome() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const [creating, setCreating] = useState(false);
+  const [importing, setImporting] = useState(false);
   const [confirmingUnregister, setConfirmingUnregister] = useState(false);
   const [problem, setProblem] = useState<string | null>(null);
 
@@ -130,6 +132,24 @@ export default function DomainHome() {
     }
     if (capabilities.canAdminister) {
       rows.push({
+        id: "download-archive",
+        title: "Download archive",
+        // The address, navigated: the download is a cookie-authenticated GET
+        // that the browser saves on its own, so the keyboard route goes to the
+        // same URL the anchor carries rather than reaching into the DOM to
+        // press a link that may not even be rendered.
+        run: () => {
+          window.location.assign(archiveDownloadUrl(domain));
+        },
+      });
+      rows.push({
+        id: "import-archive",
+        title: "Import archive",
+        run: () => {
+          setImporting(true);
+        },
+      });
+      rows.push({
         id: "unregister-domain",
         title: "Unregister domain",
         run: () => {
@@ -138,7 +158,12 @@ export default function DomainHome() {
       });
     }
     return rows.length === 0 ? NO_COMMANDS : rows;
-  }, [capabilities.canAdminister, capabilities.canWrite, unknownDomain]);
+  }, [
+    capabilities.canAdminister,
+    capabilities.canWrite,
+    domain,
+    unknownDomain,
+  ]);
   useRegisterCommands(commands);
 
   const unregister = useMutation({
@@ -238,6 +263,33 @@ export default function DomainHome() {
               </button>
             )}
             {capabilities.canAdminister && (
+              <>
+                {/*
+                  An anchor rather than a button that fetches: the archive
+                  route is a cookie-authenticated GET, so the browser saves the
+                  file itself and this app never holds a whole domain in
+                  memory to hand it back. `download` is what makes it a save
+                  rather than a navigation into a zip.
+                */}
+                <a
+                  href={archiveDownloadUrl(domain)}
+                  download
+                  className={`inline-flex items-center ${BUTTON.secondary}`}
+                >
+                  Download archive
+                </a>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setImporting(true);
+                  }}
+                  className={BUTTON.secondary}
+                >
+                  Import archive
+                </button>
+              </>
+            )}
+            {capabilities.canAdminister && (
               <UnregisterDomain
                 kind={summary?.kind ?? null}
                 confirming={confirmingUnregister}
@@ -265,6 +317,14 @@ export default function DomainHome() {
             initialFolder={path}
             onClose={() => {
               setCreating(false);
+            }}
+          />
+        )}
+        {importing && (
+          <ImportArchiveDialog
+            domain={domain}
+            onClose={() => {
+              setImporting(false);
             }}
           />
         )}
@@ -426,6 +486,10 @@ function UnregisterDomain({
           <button
             type="button"
             autoFocus
+            // Disabled while the unregister is in flight, like the trigger it
+            // replaced: a second press would send a second DELETE for a domain
+            // that is already on its way out.
+            disabled={pending}
             onClick={onUnregister}
             className={BUTTON.destructive}
           >

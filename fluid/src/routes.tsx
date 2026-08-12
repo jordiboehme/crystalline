@@ -25,7 +25,6 @@ import Home from "./screens/Home";
 import ManifestPage from "./screens/ManifestPage";
 import NotFound from "./screens/NotFound";
 import Search from "./screens/Search";
-import UsersAdmin from "./screens/UsersAdmin";
 
 /**
  * The two lazy screens: everything CodeMirror rides in these chunks, so the
@@ -41,11 +40,13 @@ const EngramEditor = lazy(() => import("./screens/EngramEditor"));
 const ManifestEditor = lazy(() => import("./screens/ManifestEditor"));
 
 /**
- * And the settings screen, which is lazy for a different reason: it weighs
- * almost nothing, but it is a screen only an admin ever opens, and the app
- * shell is paid for by everybody who opens the app at all.
+ * And the two admin screens, which are lazy for a different reason: they weigh
+ * almost nothing each, but they are screens only an admin ever opens, and the
+ * app shell is paid for by everybody who opens the app at all. The accounts
+ * table is the larger of the two and takes the most off the eager path.
  */
 const GithubSettings = lazy(() => import("./screens/GithubSettings"));
+const UsersAdmin = lazy(() => import("./screens/UsersAdmin"));
 
 const EDITOR_FALLBACK = (
   <p className="text-sm text-slate-500 dark:text-slate-400">
@@ -55,6 +56,10 @@ const EDITOR_FALLBACK = (
 
 const SETTINGS_FALLBACK = (
   <p className="text-sm text-slate-500 dark:text-slate-400">Loading settings</p>
+);
+
+const USERS_FALLBACK = (
+  <p className="text-sm text-slate-500 dark:text-slate-400">Loading accounts</p>
 );
 
 export function AppRoutes() {
@@ -106,9 +111,19 @@ export function AppRoutes() {
           {/*
             Routed for everybody and rendered for admins only: the screen
             itself answers with the not-found screen for anyone else, so the
-            address says exactly as much as a mistyped one does.
+            address says exactly as much as a mistyped one does. Lazy for the
+            same reason the settings screen is - nobody but an admin ever
+            loads it - and the chunk carries the refusal too, which is what
+            keeps the address from saying more than a mistyped one.
           */}
-          <Route path="/users" element={<UsersAdmin />} />
+          <Route
+            path="/users"
+            element={
+              <Suspense fallback={USERS_FALLBACK}>
+                <UsersAdmin />
+              </Suspense>
+            }
+          />
           {/*
             The same arrangement, one screen along: routed for everybody,
             rendered for admins only, and lazy because nobody else will ever

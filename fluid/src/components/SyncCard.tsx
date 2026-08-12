@@ -88,6 +88,7 @@ export function SyncCard({ domain }: { domain: string }): ReactElement | null {
   // quotes, or a report the card reads.
   const failure = status.error;
   const sync = status.data ?? null;
+  const refusal = failure === null ? null : problemDetail(failure);
   return (
     // The home card's chrome, on the tag the screen's other blocks use: a
     // labelled `section` is a region somebody navigating by landmark can reach
@@ -116,56 +117,69 @@ export function SyncCard({ domain }: { domain: string }): ReactElement | null {
         </button>
       </div>
 
-      {failure !== null ? (
+      {/*
+        The refusal and the report are not alternatives. A first read that is
+        refused leaves nothing to show and this is the whole card; but a read
+        that is refused AFTER one succeeded - a "Sync now" against an instance
+        whose GitHub was switched off in the meantime - is a card that could
+        not be updated, not a card whose facts were withdrawn, so the rows it
+        already showed stay under the refusal rather than vanishing from under
+        the reader.
+      */}
+      {refusal !== null && (
         <p role="alert" className={ALERT_CLASSES}>
-          {problemDetail(failure)}
+          {refusal}
         </p>
-      ) : (
-        sync !== null && (
-          <>
-            {sync.probeError !== null && (
-              <p role="alert" className={STALE_CLASSES}>
-                {`The last origin check failed, so these numbers are this copy's own: ${sync.probeError}`}
-              </p>
-            )}
-            <dl className="grid grid-cols-[max-content_1fr] gap-x-4 gap-y-1 text-sm">
-              <dt className="text-slate-500 dark:text-slate-400">Repository</dt>
-              <dd className="font-mono">{sync.repo}</dd>
-              {sync.branch !== null && (
-                <>
-                  <dt className="text-slate-500 dark:text-slate-400">Branch</dt>
-                  <dd className="font-mono">{sync.branch}</dd>
-                </>
-              )}
-              <dt className="text-slate-500 dark:text-slate-400">
-                Last checked
-              </dt>
-              <dd className="tabular-nums">{lastChecked(sync)}</dd>
-            </dl>
-            <p className="flex flex-wrap gap-x-4 gap-y-1 text-sm">
-              <span>
-                {plural(
-                  sync.localChanges,
-                  "pending local change",
-                  "pending local changes",
-                )}
-              </span>
-              <span>
-                {plural(sync.openProposals, "open proposal", "open proposals")}
-              </span>
+      )}
+      {sync !== null && (
+        <>
+          {sync.probeError !== null && (
+            <p role="alert" className={STALE_CLASSES}>
+              {`The last origin check failed, so these numbers are this copy's own: ${sync.probeError}`}
             </p>
-            {/* Only when the origin is actually ahead: `behind` is null when
-                nothing probed it, and "not behind" is not a fact then. */}
-            {sync.behind === true && (
-              <p className="text-sm">
-                Behind upstream: the origin has work this copy does not.
-              </p>
+          )}
+          <dl className="grid grid-cols-[max-content_1fr] gap-x-4 gap-y-1 text-sm">
+            <dt className="text-slate-500 dark:text-slate-400">Repository</dt>
+            <dd className="font-mono">{sync.repo}</dd>
+            {sync.branch !== null && (
+              <>
+                <dt className="text-slate-500 dark:text-slate-400">Branch</dt>
+                <dd className="font-mono">{sync.branch}</dd>
+              </>
             )}
-          </>
-        )
+            <dt className="text-slate-500 dark:text-slate-400">Last checked</dt>
+            <dd className="tabular-nums">{lastChecked(sync)}</dd>
+          </dl>
+          <p className="flex flex-wrap gap-x-4 gap-y-1 text-sm">
+            <span>
+              {plural(
+                sync.localChanges,
+                "pending local change",
+                "pending local changes",
+              )}
+            </span>
+            <span>
+              {plural(sync.openProposals, "open proposal", "open proposals")}
+            </span>
+          </p>
+          {/* Only when the origin is actually ahead: `behind` is null when
+                nothing probed it, and "not behind" is not a fact then. */}
+          {sync.behind === true && (
+            <p className="text-sm">
+              Behind upstream: the origin has work this copy does not.
+            </p>
+          )}
+        </>
       )}
 
-      {problem !== null && (
+      {/*
+        The pull's own refusal, unless the status is already saying the same
+        sentence: an instance with GitHub switched off refuses both calls with
+        one message, and two byte-identical alerts read as two problems. A
+        pull that failed for its OWN reason still gets its own line - what is
+        suppressed is the repetition, not the second cause.
+      */}
+      {problem !== null && problem !== refusal && (
         <p role="alert" className={ALERT_CLASSES}>
           {problem}
         </p>

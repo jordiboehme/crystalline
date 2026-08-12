@@ -145,13 +145,20 @@ export function IconButton({
 }
 
 export type ChipVariant =
-  "neutral" | "positive" | "caution" | "retired" | "accent";
+  "neutral" | "positive" | "caution" | "danger" | "retired" | "accent";
 
 const CHIP_VARIANTS: Record<ChipVariant, string> = {
   neutral: "bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300",
   positive:
     "bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300",
   caution: "bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300",
+  // The face for what was refused rather than merely held back, kept apart
+  // from `caution` so a reader can tell "not written because something is
+  // already there" from "cannot be written at all". The alert red one shade
+  // deeper, because a chip is a filled block rather than a panel: red-800 on
+  // red-100 is 6.85:1 and red-200 on red-950 is 11.12:1, both clear of the
+  // 4.5:1 floor for text this size.
+  danger: "bg-red-100 text-red-800 dark:bg-red-950 dark:text-red-200",
   retired: "bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-400",
   accent:
     "bg-accent-100 text-accent-800 dark:bg-accent-950 dark:text-accent-300",
