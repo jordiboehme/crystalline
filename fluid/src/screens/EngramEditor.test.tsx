@@ -470,9 +470,20 @@ describe("the engram editor", () => {
     await userEvent.keyboard(" ");
     expect(docText(view.state)).toContain("- ");
 
+    // The diagram button opens a menu of starters now, so its keyboard route
+    // is Enter to open and Enter again to take the item the menu highlights
+    // first - the flowchart the button used to insert on its own. Like the
+    // table above it, this goes through the real route rather than dispatching
+    // a fence in: that the shortest keyboard path still reaches a diagram, and
+    // still ends with the caret back in the buffer, is what the screen is
+    // worth pinning for, and it is exactly what a menu in front of the button
+    // could break.
     within(bar).getByRole("button", { name: "Insert diagram" }).focus();
     await userEvent.keyboard("{Enter}");
+    await screen.findByRole("menuitem", { name: "Flowchart" });
+    await userEvent.keyboard("{Enter}");
     expect(docText(view.state)).toContain("```mermaid");
+    expect(docText(view.state)).toContain("flowchart TD");
     expect(view.hasFocus).toBe(true);
   });
 

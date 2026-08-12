@@ -45,10 +45,10 @@ import type { MouseEvent, ReactElement } from "react";
 import { ITEM_CLASSES, MENU_CLASSES } from "../components/menu";
 import { IconButton } from "../components/primitives";
 import { TableSizePicker } from "./TableSizePicker";
+import { MERMAID_STARTER_GROUPS, mermaidFence } from "./mermaidStarters";
 import type { Align } from "./tableModel";
 import {
   CODE_SKELETON,
-  MERMAID_SKELETON,
   ORDERED_ITEM,
   cycleHeading,
   insertBlock,
@@ -75,6 +75,29 @@ const ALIGNMENTS: { align: Align; label: string }[] = [
   { align: "center", label: "Align center" },
   { align: "right", label: "Align right" },
 ];
+
+/**
+ * The diagram menu's surface: the shared one, with a ceiling on it.
+ *
+ * Nineteen rows - sixteen starters and the three labels over them - stand 594
+ * pixels tall (a 32px item, a 24px label, 10px of padding and border), and a
+ * menu grows to its content by default, so on a short window the last group
+ * would open past the bottom edge. 70vh starts scrolling instead, which bites
+ * below a viewport of about 850px - an ordinary laptop - and never on a tall
+ * screen.
+ */
+const DIAGRAM_MENU_CLASSES = `${MENU_CLASSES} max-h-[70vh] overflow-y-auto`;
+
+/**
+ * A group's heading inside that menu: muted, small, sentence case. It is a
+ * signpost rather than a choice, so it is drawn quieter than the rows under it
+ * - slate-500 reads 4.76:1 on the light menu surface and slate-400 6.96:1 on
+ * the dark one, both clear of the floor for text this size. (slate-500 would
+ * be 3.75:1 on the dark surface, which is why the pair steps a shade lighter
+ * there rather than staying one color, the size picker's caption reasoning.)
+ */
+const GROUP_LABEL_CLASSES =
+  "px-2 py-1 text-caption text-slate-500 dark:text-slate-400";
 
 /** Decoration, not information: the same hairline every menu in the app draws. */
 function Divider(): ReactElement {
@@ -207,17 +230,59 @@ export function EditorToolbar({
       */}
       <Divider />
       {/*
-        The one insert verb that asks a question first: how big. Its trigger
-        is this bar's own icon button, so the row reads as one kind of thing
+        An insert verb that asks a question first: how big. Its trigger is
+        this bar's own icon button, so the row reads as one kind of thing
         whatever happens after the press.
       */}
       <TableSizePicker view={view} />
-      <IconButton
-        label="Insert diagram"
-        icon={Workflow}
-        disabled={off}
-        onClick={act((v) => insertBlock(v, MERMAID_SKELETON))}
-      />
+      {/*
+        The other insert verb that asks first: which diagram. The button that
+        used to drop a flowchart now offers all sixteen types, and the first
+        item is that same flowchart - so the keyboard route through this menu
+        costs one keypress more than the button did and lands the same text.
+      */}
+      <DropdownMenu.Root>
+        <DropdownMenu.Trigger asChild>
+          <IconButton label="Insert diagram" icon={Workflow} disabled={off} />
+        </DropdownMenu.Trigger>
+        <DropdownMenu.Portal>
+          <DropdownMenu.Content
+            align="start"
+            sideOffset={6}
+            className={DIAGRAM_MENU_CLASSES}
+            // The heading menu's discipline, for the same reason: Radix hands
+            // focus back to the trigger on close, and this bar always returns
+            // an author to the buffer instead - having picked a diagram, or
+            // having pressed Escape.
+            onCloseAutoFocus={(event) => {
+              event.preventDefault();
+              view?.focus();
+            }}
+          >
+            {MERMAID_STARTER_GROUPS.map((group) => (
+              <DropdownMenu.Group key={group.label}>
+                <DropdownMenu.Label className={GROUP_LABEL_CLASSES}>
+                  {group.label}
+                </DropdownMenu.Label>
+                {group.starters.map((starter) => (
+                  <DropdownMenu.Item
+                    key={starter.label}
+                    className={ITEM_CLASSES}
+                    onSelect={act((v) => {
+                      // The body and the caret come from one call, so the
+                      // range can never describe lines other than these.
+                      const { lines, select } = mermaidFence(starter);
+                      return insertBlock(v, lines, select);
+                    })}
+                  >
+                    {starter.label}
+                  </DropdownMenu.Item>
+                ))}
+              </DropdownMenu.Group>
+            ))}
+          </DropdownMenu.Content>
+        </DropdownMenu.Portal>
+      </DropdownMenu.Root>
       <IconButton
         label="Insert code block"
         icon={SquareCode}

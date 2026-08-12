@@ -10,6 +10,7 @@
  * breaks without any command test noticing.
  */
 
+import type { Extension } from "@codemirror/state";
 import { EditorSelection, EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import type { RenderResult } from "@testing-library/react";
@@ -19,6 +20,7 @@ import { afterEach, describe, expect, test } from "vitest";
 
 import { EditorToolbar } from "./EditorToolbar";
 import { baseExtensions, docText, lineSeparatorFor } from "./setup";
+import { MERMAID_SKELETON } from "./toolbar";
 
 const TABLE_DOC = "Before\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n\nAfter\n";
 const IN_TABLE = TABLE_DOC.indexOf("| 1") + 2;
@@ -48,13 +50,19 @@ function mount(
   anchor: number,
   head = anchor,
   tableActive = false,
+  /** Extras the buffer is built with - the update listener a count rides on. */
+  extensions: Extension[] = [],
 ): EditorView {
   view = new EditorView({
     state: EditorState.create({
       doc,
       selection: EditorSelection.single(anchor, head),
       // The markdown language, because table detection reads the syntax tree.
-      extensions: [...lineSeparatorFor(doc), ...baseExtensions(false)],
+      extensions: [
+        ...lineSeparatorFor(doc),
+        ...baseExtensions(false),
+        ...extensions,
+      ],
     }),
     parent: document.body,
   });
@@ -75,6 +83,13 @@ function press(name: string): Promise<void> {
 async function align(label: string): Promise<void> {
   const user = userEvent.setup();
   await user.click(screen.getByRole("button", { name: "Align column" }));
+  await user.click(await screen.findByRole("menuitem", { name: label }));
+}
+
+/** Open the diagram menu and pick one of its starters. */
+async function pickDiagram(label: string): Promise<void> {
+  const user = userEvent.setup();
+  await user.click(screen.getByRole("button", { name: "Insert diagram" }));
   await user.click(await screen.findByRole("menuitem", { name: label }));
 }
 
@@ -125,6 +140,72 @@ describe("the format buttons", () => {
     // A blank line, the bare fence, its body line and the close - dropped
     // below the cursor's line, which keeps its own trailing break.
     expect(docText(v.state)).toBe("prose\n\n```\n\n```\n\n");
+  });
+});
+
+describe("the diagram menu", () => {
+  test("offers sixteen starters under three group labels", async () => {
+    mount("prose\n", 5);
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Insert diagram" }));
+    // Sixteen by count rather than by reading the starters module back at
+    // itself: a menu that quietly lost an entry would agree with the module
+    // and disagree with the decision that named all sixteen.
+    expect(await screen.findAllByRole("menuitem")).toHaveLength(16);
+    for (const label of ["Everyday", "Planning and product", "Technical"]) {
+      expect(screen.getByText(label)).not.toBeNull();
+    }
+    // The labels are headings, not choices: only the sixteen are selectable.
+    expect(
+      screen.getByRole("menuitem", { name: "User journey" }),
+    ).not.toBeNull();
+    expect(screen.getByRole("menuitem", { name: "Radar" })).not.toBeNull();
+  });
+
+  test("User journey inserts its starter with the title selected", async () => {
+    const v = mount("prose\n", 5);
+    await pickDiagram("User journey");
+    const lines = docText(v.state).split("\n");
+    const fence = lines.indexOf("```mermaid");
+    expect(fence).toBeGreaterThan(-1);
+    expect(lines[fence + 1]).toBe("journey");
+    // The caret arrives on the first word worth replacing, which is the whole
+    // point of the picker over the old one-shape button.
+    const { from, to } = v.state.selection.main;
+    expect(v.state.sliceDoc(from, to)).toBe("First visit");
+  });
+
+  test("Enter Enter reproduces the old diagram button exactly", async () => {
+    // Decision 16, end to end: opening the menu from the keyboard highlights
+    // the first item, so the shortest route costs one extra keypress and
+    // lands the same bytes the button used to insert on its own.
+    const v = mount("prose\n", 5);
+    const user = userEvent.setup();
+    screen.getByRole("button", { name: "Insert diagram" }).focus();
+    await user.keyboard("{Enter}");
+    await screen.findByRole("menuitem", { name: "Flowchart" });
+    await user.keyboard("{Enter}");
+    expect(docText(v.state)).toBe(
+      `prose\n\n${MERMAID_SKELETON.join("\n")}\n\n`,
+    );
+    // Only the caret differs from the old insert, and deliberately so.
+    const { from, to } = v.state.selection.main;
+    expect(v.state.sliceDoc(from, to)).toBe("First step");
+  });
+
+  test("a starter lands in one transaction and gives the buffer back", async () => {
+    let edits = 0;
+    const v = mount("prose\n", 5, 5, false, [
+      EditorView.updateListener.of((update) => {
+        if (update.docChanged) edits += 1;
+      }),
+    ]);
+    await pickDiagram("Sequence");
+    expect(docText(v.state)).toContain("sequenceDiagram");
+    expect(edits).toBe(1);
+    // The menu hands focus back to its trigger on close unless it is told
+    // otherwise; an author who just picked a diagram wants the buffer.
+    expect(v.hasFocus).toBe(true);
   });
 });
 
