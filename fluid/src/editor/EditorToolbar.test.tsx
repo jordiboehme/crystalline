@@ -12,6 +12,7 @@
 
 import { EditorSelection, EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
+import type { RenderResult } from "@testing-library/react";
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, test } from "vitest";
@@ -33,9 +34,12 @@ const SEGMENT = [
 ];
 
 let view: EditorView | null = null;
+/** The bar `mount` put up, so a test can redraw that ONE rather than add another. */
+let bar: RenderResult | null = null;
 afterEach(() => {
   view?.destroy();
   view = null;
+  bar = null;
 });
 
 /** A live buffer with the bar above it, exactly as a screen mounts them. */
@@ -54,12 +58,24 @@ function mount(
     }),
     parent: document.body,
   });
-  render(<EditorToolbar view={view} tableActive={tableActive} />);
+  bar = render(<EditorToolbar view={view} tableActive={tableActive} />);
   return view;
+}
+
+/** The same bar again with the segment flipped - what a screen's state does. */
+function flip(tableActive: boolean): void {
+  bar?.rerender(<EditorToolbar view={view} tableActive={tableActive} />);
 }
 
 function press(name: string): Promise<void> {
   return userEvent.click(screen.getByRole("button", { name }));
+}
+
+/** Open the align menu and pick one of its items. */
+async function align(label: string): Promise<void> {
+  const user = userEvent.setup();
+  await user.click(screen.getByRole("button", { name: "Align column" }));
+  await user.click(await screen.findByRole("menuitem", { name: label }));
 }
 
 describe("the format buttons", () => {
@@ -112,10 +128,39 @@ describe("the table segment", () => {
     expect(screen.getByRole("button", { name: "Bold" })).not.toBeNull();
   });
 
+  /*
+   * Every one of the six is pinned to the verb its label promises, and each
+   * assertion names a result no OTHER control in the segment produces: a
+   * rewiring that swapped two of them - "Delete column" running the row
+   * delete, say - would otherwise ship with every gate green.
+   */
+
+  test("Add row below edits the buffer", async () => {
+    const v = mount(TABLE_DOC, IN_TABLE, IN_TABLE, true);
+    await press("Add row below");
+    expect(docText(v.state)).toBe(
+      "Before\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n|  |  |\n\nAfter\n",
+    );
+  });
+
   test("Add column after edits the buffer", async () => {
     const v = mount(TABLE_DOC, IN_TABLE, IN_TABLE, true);
     await press("Add column after");
     expect(docText(v.state)).toContain("| a | Column | b |");
+  });
+
+  test("Delete row takes the caret's row and only that", async () => {
+    const v = mount(TABLE_DOC, IN_TABLE, IN_TABLE, true);
+    await press("Delete row");
+    expect(docText(v.state)).toBe(
+      "Before\n\n| a | b |\n| --- | --- |\n\nAfter\n",
+    );
+  });
+
+  test("Delete column takes the caret's column and only that", async () => {
+    const v = mount(TABLE_DOC, IN_TABLE, IN_TABLE, true);
+    await press("Delete column");
+    expect(docText(v.state)).toBe("Before\n\n| b |\n| --- |\n| 2 |\n\nAfter\n");
   });
 
   test("Prettify table pads the whole table", async () => {
@@ -127,11 +172,38 @@ describe("the table segment", () => {
     expect(docText(v.state)).toContain("| name   | n   |");
   });
 
+  /*
+   * The align menu is the one place a user-visible label is bound to a typed
+   * enum value, so all three mappings are pinned separately: an array that was
+   * reordered rather than relabelled would still put the right colons in the
+   * wrong place, and only a per-alignment assertion catches that.
+   */
+  const RULES: [string, string][] = [
+    ["Align left", "| :--- | --- |"],
+    ["Align center", "| :---: | --- |"],
+    ["Align right", "| ---: | --- |"],
+  ];
+  for (const [label, rule] of RULES) {
+    test(`${label} rewrites the caret's rule cell`, async () => {
+      const v = mount(TABLE_DOC, IN_TABLE, IN_TABLE, true);
+      await align(label);
+      // The caret's column is the FIRST, so the second rule cell must stay
+      // exactly as it was - alignment touches one delimiter cell, no more.
+      expect(docText(v.state)).toContain(rule);
+    });
+  }
+
   test("appearing moves no focus", () => {
     const v = mount(TABLE_DOC, IN_TABLE);
     v.focus();
     const focused = document.activeElement;
-    render(<EditorToolbar view={v} tableActive />);
+    // The SAME bar redrawn with the segment on, which is what a screen's
+    // state does - rendering a second bar would prove nothing about the
+    // appearance path.
+    flip(true);
+    expect(
+      screen.getByRole("button", { name: "Add column after" }),
+    ).not.toBeNull();
     expect(document.activeElement).toBe(focused);
   });
 });

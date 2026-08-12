@@ -21,9 +21,11 @@ import { baseExtensions, docText, lineSeparatorFor } from "./setup";
 import {
   tableAddColumnAfter,
   tableAddRowBelow,
+  tableAlignColumn,
   tableContextAt,
   tableContextListener,
   tableDeleteColumn,
+  tableDeleteRow,
   tablePrettify,
 } from "./tableVerbs";
 
@@ -91,6 +93,70 @@ describe("tableContextAt", () => {
     const v = editor(DOC, DOC.indexOf("| 1 | 2 |") + "| 1 | 2 |".length);
     expect(tableContextAt(v.state)).not.toBeNull();
   });
+
+  test("the delimiter row is row 1, and it is not a row to delete", () => {
+    const v = editor(DOC, DOC.indexOf("| --- ") + 2);
+    expect(tableContextAt(v.state)?.row).toBe(1);
+    // The rule is structure, not content: deleting it would stop the table
+    // being a table, so the verb refuses rather than obliging.
+    expect(tableDeleteRow(v)).toBe(false);
+    expect(docText(v.state)).toBe(DOC);
+  });
+
+  test("two tables a blank line apart do not leak into each other", () => {
+    // What a naive line loop breaks silently: the second table's caret must
+    // resolve to the SECOND span, and a verb must edit only that one.
+    const doc = "| a | b |\n| --- | --- |\n\n| c | d |\n| --- | --- |\n";
+    const first = tableContextAt(editor(doc, 2).state);
+    const second = tableContextAt(editor(doc, doc.indexOf("| c") + 2).state);
+    expect(first?.from).toBe(0);
+    expect(second?.from).toBe(doc.indexOf("| c"));
+    expect(
+      tableContextAt(editor(doc, doc.indexOf("\n\n") + 1).state),
+    ).toBeNull();
+
+    const v = editor(doc, doc.indexOf("| c") + 2);
+    expect(tableAddColumnAfter(v)).toBe(true);
+    expect(docText(v.state)).toBe(
+      "| a | b |\n| --- | --- |\n\n| c | Column | d |\n| --- | --- | --- |\n",
+    );
+  });
+
+  test("a table carrying a quote mark inside its span is refused", () => {
+    // CommonMark's lazy continuation: the middle line may drop the `> ` and
+    // still belong to the quote, so the parser opens the table after the
+    // FIRST line's mark and the third line's mark sits inside the span. The
+    // model would read that mark as cell content - the caret in `1` would
+    // report column 1 - so the whole table is refused instead.
+    const doc = "> | a | b |\n| --- | --- |\n> | 1 | 2 |\n";
+    const v = editor(doc, doc.indexOf("| 1") + 3);
+    expect(tableContextAt(v.state)).toBeNull();
+    expect(tableAddColumnAfter(v)).toBe(false);
+    expect(tablePrettify(v)).toBe(false);
+    expect(docText(v.state)).toBe(doc);
+  });
+
+  test("the quote guard costs neither the lazy table nor a pipe-less one", () => {
+    // The boundary the guard is drawn at. A quote whose mark is written once
+    // leaves the span clean, so it keeps working; and the question is asked of
+    // the TREE rather than of the text, so a GFM table that drops its leading
+    // pipes - where every line has content before its first pipe - is still an
+    // ordinary table here.
+    const lazy = "> | a | b |\n| --- | --- |\n| 1 | 2 |\n";
+    const quoted = editor(lazy, lazy.indexOf("| 1") + 2);
+    expect(tableAddColumnAfter(quoted)).toBe(true);
+    expect(docText(quoted.state)).toBe(
+      "> | a | Column | b |\n| --- | --- | --- |\n| 1 |  | 2 |\n",
+    );
+
+    const bare = "abc | def\n--- | ---\nbar | baz\n";
+    const v = editor(bare, bare.indexOf("bar") + 1);
+    expect(tableContextAt(v.state)?.column).toBe(0);
+    expect(tableAddColumnAfter(v)).toBe(true);
+    expect(docText(v.state)).toBe(
+      "abc | Column | def\n--- | --- | ---\nbar |  | baz\n",
+    );
+  });
 });
 
 describe("the verbs", () => {
@@ -113,8 +179,24 @@ describe("the verbs", () => {
   test("outside a table every verb refuses without touching the doc", () => {
     const v = editor(DOC, 2);
     expect(tableAddRowBelow(v)).toBe(false);
+    expect(tableAddColumnAfter(v)).toBe(false);
+    expect(tableDeleteRow(v)).toBe(false);
     expect(tableDeleteColumn(v)).toBe(false);
+    expect(tableAlignColumn(v, "center")).toBe(false);
+    expect(tablePrettify(v)).toBe(false);
     expect(docText(v.state)).toBe(DOC);
+  });
+
+  test("delete row takes the caret's row, align takes its column", () => {
+    const v = editor(DOC, IN_TABLE);
+    expect(tableAlignColumn(v, "center")).toBe(true);
+    // The caret is in the first column, so it is the first rule cell that
+    // gains the colons and the second that does not.
+    expect(docText(v.state)).toContain("| :---: | --- |");
+    expect(tableDeleteRow(v)).toBe(true);
+    expect(docText(v.state)).toBe(
+      "Before\n\n| a | b |\n| :---: | --- |\n\nAfter\n",
+    );
   });
 
   test("add row below lands the caret in the new row's first cell", () => {
@@ -132,11 +214,12 @@ describe("the verbs", () => {
     const doc = "| name | n |\n| --- | --- |\n| longer | 2 |\n";
     const v = editor(doc, doc.indexOf("longer"));
     expect(tablePrettify(v)).toBe(true);
-    // The second column pads to THREE, not to one: a column is never
-    // narrower than the rule cell GFM requires, which is the model's own
-    // pinned behavior (`| name | n    |` in its `:---:` fixture). The whole
-    // table is asserted rather than a fragment, so the width rule is stated
-    // where a future reader can check it.
+    // The second column pads to THREE, not to one: a column is never narrower
+    // than the rule cell GFM requires, which for an unaligned column is the
+    // model's `minRuleWidth("none")`, three dashes. (Its own `| :--- | ---: |`
+    // fixture shows the same floor one wider, where a colon joins the dashes.)
+    // The whole table is asserted rather than a fragment, so the width rule is
+    // stated where a future reader can check it.
     expect(docText(v.state)).toBe(
       "| name   | n   |\n| ------ | --- |\n| longer | 2   |\n",
     );

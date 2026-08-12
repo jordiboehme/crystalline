@@ -26,6 +26,14 @@
  * span, row and column from `view.state` at dispatch time rather than closing
  * over what the toolbar last rendered, so a click on a stale control degrades
  * to a `false` and never to an edit in the wrong place.
+ *
+ * WHERE THAT TRUST STOPS. A `Table` node's span is not always table syntax
+ * from end to end: under a blockquote whose marks are written on some lines
+ * and left off others, the span carries the `> ` of the lines that kept it,
+ * and the model - which knows pipes and nothing else - reads that mark as the
+ * first cell's content. So the span is checked for the marks of the construct
+ * around it before anything is derived from it, and a contaminated span is
+ * refused. `quoteMarked` is that check and states the case.
  */
 
 import { syntaxTree } from "@codemirror/language";
@@ -84,13 +92,56 @@ function tableNodeAt(state: EditorState, pos: number): SyntaxNode | null {
   return null;
 }
 
+/**
+ * Whether a quote mark lands INSIDE the table's own span, which makes the span
+ * something other than table text.
+ *
+ * CommonMark's lazy continuation is what produces it: a blockquote's paragraph
+ * content continues on a following line that carries no `> ` at all, so
+ *
+ *     > | a | b |
+ *     | --- | --- |
+ *     > | 1 | 2 |
+ *
+ * is one quoted table, and the parser opens the `Table` node after the FIRST
+ * line's mark - leaving the third line's `> ` sitting inside the span. The
+ * model would read it as the first cell's content: the caret in `1` would
+ * report column 1, an added column would land in the wrong place, and prettify
+ * would promote the mark into a cell and lift that row out of the quote
+ * entirely. None of that is recoverable from pipes alone, so the whole table
+ * is refused instead - the same answer the fully quoted form already gets from
+ * the model, which sees an undelimited second line.
+ *
+ * The question is asked of the TREE rather than of the text, which is what
+ * keeps every legal pipe-less form working: a GFM table may drop its leading
+ * pipes (`abc | def`), and a rule that refused any line with text before its
+ * first pipe would refuse those honest tables along with this dishonest span.
+ * A quote mark is the only mark of an enclosing construct that can repeat
+ * inside a span this way - a list's marker is written once, on the line the
+ * item opens with, which is never inside the table that follows it.
+ */
+function quoteMarked(state: EditorState, node: SyntaxNode): boolean {
+  let found = false;
+  syntaxTree(state).iterate({
+    from: node.from,
+    to: node.to,
+    enter: (child) => {
+      if (child.name === "QuoteMark") {
+        found = true;
+      }
+      return !found;
+    },
+  });
+  return found;
+}
+
 /** The context and the model behind it, parsed once for both readers. */
 function analyze(
   state: EditorState,
 ): { context: TableContext; model: TableModel } | null {
   const head = state.selection.main.head;
   const node = tableNodeAt(state, head);
-  if (node === null) {
+  if (node === null || quoteMarked(state, node)) {
     return null;
   }
   // The sanctioned read: see the convention at the head of this file.
@@ -121,8 +172,14 @@ function analyze(
 
 /**
  * The table the caret is in, or null. Null is the whole refusal channel, so a
- * caller has exactly one thing to check: prose, a pipe line inside a fence and
- * a span the model refuses all answer the same way.
+ * caller has exactly one thing to check: prose, a pipe line inside a fence, a
+ * quote-marked span and a span the model refuses all answer the same way.
+ *
+ * Deliberately NOT guarded by `clearOfFoldedFrontmatter`, where every verb is:
+ * this answers where the caret IS, and moving the caret is not a question's
+ * job. The asymmetry is safe in both directions - a folded frontmatter block
+ * yields no `Table` node, so the segment does not appear over one, and a verb
+ * run from anywhere unfoldable refuses on its own guard a moment later.
  */
 export function tableContextAt(state: EditorState): TableContext | null {
   return analyze(state)?.context ?? null;
@@ -133,14 +190,17 @@ export function tableContextAt(state: EditorState): TableContext | null {
  *
  * Only transitions are reported, so a toolbar's `useState` is written once per
  * crossing rather than once per keystroke. The remembered value starts at
- * false because that is what the React side starts at: a listener that started
- * at "unknown" would push a redundant `false` on the first cursor move in the
- * ordinary case, for a state that is already false.
+ * "unknown" rather than at false, because a listener is built fresh every time
+ * a buffer is rebuilt while the React state it feeds survives that rebuild: a
+ * listener that assumed false would stay silent on the first look after a
+ * rebuild that left the caret outside a table, and the segment would go on
+ * being drawn until the next genuine crossing. The first look therefore always
+ * reports, and a `false` that React already holds costs a bailed-out setState.
  */
 export function tableContextListener(
   onChange: (inTable: boolean) => void,
 ): Extension {
-  let last = false;
+  let last: boolean | null = null;
   return EditorView.updateListener.of((update) => {
     // A parse pass is the third reason to re-derive, beside a moved caret and
     // an edited document: on a document big enough for the language plugin to
@@ -239,6 +299,12 @@ function indentWidth(text: string): number {
  * `line.from + indent + 2`, the `|` and the space that follows it. The doc the
  * position is measured in is the one the changes make, computed here so the
  * whole verb is still a single dispatch.
+ *
+ * That means the change is applied twice - once to a scratch `Text` to find
+ * the line, once by the transaction - and the duplication is the price, not an
+ * oversight. The arithmetic that would avoid it reads the separator's length,
+ * which is the one thing this module never does: on a CRLF buffer it would put
+ * the caret one character into the second line's `|` on every added row.
  */
 export function tableAddRowBelow(view: EditorView): boolean {
   const found = target(view);
