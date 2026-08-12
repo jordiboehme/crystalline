@@ -8,10 +8,18 @@
  * is because the minimum is the point: one insertion per line for a column,
  * exactly one insertion for a row, exactly one replacement for an alignment,
  * and nothing at all for an already-canonical prettify.
+ *
+ * One suite goes further and drives a real `EditorState`: the module is pure,
+ * but the convention for CALLING it is not free of CodeMirror, and a CRLF
+ * document is where a wrong convention shows. That suite is the executable
+ * statement of it - span read with `doc.sliceString`, separator passed as
+ * `state.lineBreak`, offsets mapped straight onto document positions.
  */
 
+import { EditorState } from "@codemirror/state";
 import { describe, expect, test } from "vitest";
 
+import type { SpanChange } from "./tableModel";
 import {
   addColumnAfter,
   addRowBelow,
@@ -215,16 +223,112 @@ describe("prettify", () => {
   });
 });
 
-describe("tolerances the verbs inherit from the parse", () => {
-  test("a CRLF span parses and a new row carries the CRLF separator", () => {
-    const span = "| a | b |\r\n| --- | --- |\r\n| 1 | 2 |";
-    const model = parseTable(span);
-    if (!model) throw new Error("no model");
-    expect(model.columns).toBe(2);
-    expect(model.lines[1]?.trailingPipe).toBe(true);
-    expect(apply(span, addRowBelow(model, 2, "\r\n") ?? [])).toBe(
-      `${span}\r\n|  |  |`,
+describe("the calling convention on a CRLF document", () => {
+  /** A table with content on both sides of it, in a real CRLF buffer. */
+  const DOC =
+    "Before\r\n\r\n| a | b |\r\n| --- | --- |\r\n| 1 | 2 |\r\n\r\nAfter\r\n";
+  const TABLE = { from: 8, to: 41 };
+
+  function crlfState(): EditorState {
+    return EditorState.create({
+      doc: DOC,
+      extensions: [EditorState.lineSeparator.of("\r\n")],
+    });
+  }
+
+  /** The sanctioned read: `doc.sliceString`, never `state.sliceDoc`. */
+  function tableSpan(state: EditorState): string {
+    return state.doc.sliceString(TABLE.from, TABLE.to);
+  }
+
+  /** The mapping Task 2 performs: span offsets are document offsets. */
+  function dispatch(
+    state: EditorState,
+    changes: SpanChange[] | null,
+  ): EditorState {
+    if (!changes) throw new Error("refused");
+    return state.update({
+      changes: changes.map((change) => {
+        const from = TABLE.from + change.from;
+        const to = TABLE.from + (change.to ?? change.from);
+        return change.insert === undefined
+          ? { from, to }
+          : { from, to, insert: change.insert };
+      }),
+    }).state;
+  }
+
+  test("doc.sliceString gives document offsets where sliceDoc inflates them", () => {
+    const state = crlfState();
+    expect(tableSpan(state)).toBe(SPAN);
+    // The read that must NOT be used: it re-joins with the two-character
+    // break, so its string is longer than the range it came from and every
+    // offset past the first line is wrong by one per break.
+    expect(state.sliceDoc(TABLE.from, TABLE.to)).toHaveLength(
+      TABLE.to - TABLE.from + 2,
     );
+    const model = parseTable(tableSpan(state));
+    expect(model?.lines[2]?.start).toBe(state.doc.lineAt(32).from - TABLE.from);
+  });
+
+  test("every verb edits the right characters and keeps the breaks", () => {
+    const state = crlfState();
+    const model = parseTable(tableSpan(state));
+    if (!model) throw new Error("no model");
+    const separator = state.lineBreak;
+
+    expect(dispatch(state, addRowBelow(model, 2, separator)).sliceDoc()).toBe(
+      "Before\r\n\r\n| a | b |\r\n| --- | --- |\r\n| 1 | 2 |\r\n|  |  |\r\n\r\nAfter\r\n",
+    );
+    // The last row's break comes from the model's own line spans: taking it
+    // from the separator's LENGTH ate the delimiter's closing pipe here.
+    expect(dispatch(state, deleteRow(model, 2, separator)).sliceDoc()).toBe(
+      "Before\r\n\r\n| a | b |\r\n| --- | --- |\r\n\r\nAfter\r\n",
+    );
+    expect(dispatch(state, addColumnAfter(model, 0)).sliceDoc()).toBe(
+      "Before\r\n\r\n| a | Column | b |\r\n| --- | --- | --- |\r\n| 1 |  | 2 |\r\n\r\nAfter\r\n",
+    );
+    expect(dispatch(state, deleteColumn(model, 0)).sliceDoc()).toBe(
+      "Before\r\n\r\n| b |\r\n| --- |\r\n| 2 |\r\n\r\nAfter\r\n",
+    );
+    expect(dispatch(state, setAlignment(model, 1, "center")).sliceDoc()).toBe(
+      "Before\r\n\r\n| a | b |\r\n| --- | :---: |\r\n| 1 | 2 |\r\n\r\nAfter\r\n",
+    );
+    expect(dispatch(state, prettify(model, separator)).sliceDoc()).toBe(
+      "Before\r\n\r\n| a   | b   |\r\n| --- | --- |\r\n| 1   | 2   |\r\n\r\nAfter\r\n",
+    );
+  });
+
+  test("the new row's caret is two characters into the line below the change", () => {
+    const state = crlfState();
+    const model = parseTable(tableSpan(state));
+    if (!model) throw new Error("no model");
+    const changes = addRowBelow(model, 2, state.lineBreak);
+    const change = changes?.[0];
+    if (!change) throw new Error("refused");
+
+    const next = dispatch(state, changes);
+    const inserted = next.doc.lineAt(TABLE.from + change.from + 1);
+    const caret = inserted.from + (model.lines[2]?.indent.length ?? 0) + 2;
+    expect(inserted.text).toBe("|  |  |");
+    expect(caret - inserted.from).toBe(2);
+    expect(next.sliceDoc(caret - 2, caret + 2)).toBe("|  |");
+    // Why the formula is stated against the new LINE rather than against the
+    // separator: a break costs one position whatever it spells, so the
+    // separator-length spelling lands one character too far here.
+    expect(
+      TABLE.from + change.from + state.lineBreak.length + 2 - inserted.from,
+    ).toBe(3);
+  });
+});
+
+describe("tolerances the verbs inherit from the parse", () => {
+  test("a raw CR-bearing slice still parses, as a safety net", () => {
+    // Not a sanctioned read - the verbs' offsets are only document offsets
+    // under the LF-joined convention above - but a stray CR must not explode.
+    const model = parseTable("| a | b |\r\n| --- | --- |\r\n| 1 | 2 |");
+    expect(model?.columns).toBe(2);
+    expect(model?.lines[1]?.trailingPipe).toBe(true);
   });
 
   test("an indented table keeps its indent in the row it gains", () => {

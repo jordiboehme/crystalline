@@ -9,6 +9,24 @@
  * dispatch layer hands it `state.lineBreak`, which keeps the "never a literal
  * newline" rule true without dragging the editor into this file.
  *
+ * THE CALLING CONVENTION, because a CRLF document makes it load-bearing.
+ * CodeMirror counts a line break as ONE document position however many
+ * characters the separator has, so a span's offsets equal document offsets
+ * only when the span is read with a single-character join:
+ *
+ *   const span = state.doc.sliceString(from, to);   // NEVER state.sliceDoc
+ *   const changes = addRowBelow(model, row, state.lineBreak);
+ *   // then map: { from: from + change.from, to: from + (change.to ?? ...) }
+ *
+ * `state.sliceDoc` re-joins with `state.lineBreak`, so on a CRLF document its
+ * string is LONGER than the range it came from and every offset past the first
+ * break is inflated - every verb then edits the wrong place. The `separator`
+ * parameter is insertion TEXT only, never a length: nothing here derives a
+ * position from it, so `"\r\n"` costing two characters and one position is
+ * never a contradiction. The parse still tolerates a stray CR (it reads as
+ * trailing whitespace) so a raw file slice does not explode, but the spans it
+ * hands back are only document offsets under the convention above.
+ *
  * WHY MINIMAL CHANGES. Every structural verb here could be written as "render
  * the whole table again and replace the span". It is not, because the buffer
  * is shared: under Yjs a replacement of the whole span deletes every character
@@ -77,7 +95,12 @@ const MIN_DASHES = 3;
 /** The placeholder a new header cell carries, matching the insert skeleton. */
 const NEW_HEADER_CELL = "Column";
 
-/** Positions of every pipe not escaped by a preceding backslash. */
+/**
+ * Positions of every pipe not escaped by a preceding backslash. One scan, no
+ * backtracking. Knowingly simpler than GFM in one spelling: a literal escaped
+ * backslash before a real boundary (`\\|`) reads as content here, where GFM
+ * would split. The one-character look-back is what keeps the scan linear.
+ */
 function unescapedPipes(text: string): number[] {
   const found: number[] = [];
   for (let i = 0; i < text.length; i += 1) {
@@ -134,9 +157,16 @@ function alignOf(cell: TableCell | undefined): Align {
 }
 
 /**
- * Parse a table span. Lines are split on the line feed and a carriage return
- * is treated as trailing whitespace, so a CRLF document parses and every
- * offset still points into the original text.
+ * Parse a table span, whose offsets are document offsets under the calling
+ * convention at the top of this file. Lines are split on the line feed and a
+ * carriage return is treated as trailing whitespace, so a raw CRLF slice
+ * parses rather than exploding - but only an LF-joined span (`doc.sliceString`)
+ * gives back spans a transaction can use.
+ *
+ * The two empty-cell guards below are defensive rather than reachable:
+ * `parseLine` always pushes a final cell, so a line has at least one. They
+ * stay because the refusal they express (a table needs a header and a rule)
+ * should be readable at the place it is decided.
  */
 export function parseTable(span: string): TableModel | null {
   const lines: TableLine[] = [];
@@ -217,9 +247,13 @@ function minRuleWidth(align: Align): number {
  * delimiter: a data row between the header and the rule is not a GFM table.
  *
  * The emission is exactly one insertion at the end of the target line, of
- * `separator + indent + "|" + "  |".repeat(columns)`. The new row's first cell
- * therefore begins at `change.from + separator.length + indent.length + 2`,
- * which is where the caller puts the caret.
+ * `separator + indent + "|" + "  |".repeat(columns)`. The caret goes into the
+ * new row's first cell, and that position is stated relative to the NEW LINE
+ * rather than to the separator's length: the inserted break costs exactly one
+ * document position whatever the separator spells, so after the dispatch the
+ * new row is the line at `change.from + 1` and its first cell's interior sits
+ * `indent.length + 2` past that line's start - `lineAt(pos).from + indent + 2`,
+ * which is a spelling a CRLF document cannot break.
  */
 export function addRowBelow(
   model: TableModel,
@@ -277,13 +311,19 @@ export function addColumnAfter(
 }
 
 /**
- * Delete a data row: the line plus exactly one separator. The header and the
+ * Delete a data row: the line plus exactly one break. The header and the
  * delimiter are refused - a GFM table needs both.
+ *
+ * Both ends of the deleted range come from the MODEL's own line spans - the
+ * start of the following line, or the end of the preceding one for the last
+ * row. Deriving the preceding break from `_separator.length` instead would be
+ * a length where the rest of the module has text, and it would eat a character
+ * of the previous line on a CRLF document, so `_separator` is unused here.
  */
 export function deleteRow(
   model: TableModel,
   row: number,
-  separator: string,
+  _separator: string,
 ): SpanChange[] | null {
   if (row < 2 || row >= model.lines.length) return null;
   const line = model.lines[row];
@@ -291,9 +331,14 @@ export function deleteRow(
 
   const next = model.lines[row + 1];
   if (next) return [{ from: line.start, to: next.start }];
-  const from = line.start - separator.length;
-  if (from < 0) return null;
-  return [{ from, to: line.start + line.text.length }];
+  const previous = model.lines[row - 1];
+  if (!previous) return null;
+  return [
+    {
+      from: previous.start + previous.text.length,
+      to: line.start + line.text.length,
+    },
+  ];
 }
 
 /**
@@ -335,6 +380,11 @@ export function deleteColumn(
  * colon form. The dash run keeps its width, so an already-prettified table
  * stays aligned; re-padding the data column is `prettify`'s job and the two
  * verbs compose.
+ *
+ * It always emits its one change, even when the cell already carries that
+ * alignment: the contract the caller checks stays two-state (null refuses,
+ * anything else is dispatched) rather than growing an "empty but not refused"
+ * third case.
  */
 export function setAlignment(
   model: TableModel,
@@ -370,9 +420,13 @@ function pad(text: string, width: number, align: Align): string {
  * Re-pad the table so its pipes line up in a monospaced reader: every cell
  * padded to its column's widest trimmed content, single-space margins,
  * canonical leading and trailing pipes, and the rule row's colons stretched
- * with its dashes. Cell TEXT is verbatim - prettify moves padding, never
- * content. The header row pads left whatever the column's alignment is, and
- * data cells follow the alignment.
+ * with its dashes. Cell TEXT is verbatim - prettify moves padding, never a
+ * character of content. It can still change what a row MEANS in one case: a
+ * row carrying more cells than the header has columns widens the whole table
+ * to fit them, so a cell the renderer was ignoring becomes a real column. The
+ * alternative - clamping to the header's count - would drop that cell's text,
+ * which is the worse of the two. The header row pads left whatever the
+ * column's alignment is, and data cells follow the alignment.
  *
  * This is the one verb that rewrites lines, and it emits a change only for a
  * line whose text actually changes, so an already-canonical table emits
