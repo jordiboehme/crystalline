@@ -219,6 +219,17 @@ export interface SyncStatus {
   openProposals: number;
   /** Whether the origin is ahead, or null when the probe could not say. */
   behind: boolean | null;
+  /**
+   * Why the live origin check failed, in the server's own words, or null when
+   * it succeeded or was never attempted.
+   *
+   * The engine answers this call rather than failing it when the probe cannot
+   * reach GitHub - offline, rate limited, an expired connection - by retrying
+   * with no probe at all, so every other field above is then local state
+   * alone: true about this copy, and possibly days behind the origin. A card
+   * that shows those numbers without showing this shows stale facts as fresh.
+   */
+  probeError: string | null;
 }
 
 /** The cache key of one domain's sync status. */
@@ -247,6 +258,7 @@ function readSyncStatus(payload: unknown): SyncStatus {
     localChanges: asCount(record?.local_changes),
     openProposals: asCount(record?.open_proposals),
     behind: typeof record?.behind === "boolean" ? record.behind : null,
+    probeError: asString(record?.probe_error),
   };
 }
 

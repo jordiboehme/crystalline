@@ -152,6 +152,29 @@ function engramsResponse(path: string) {
   };
 }
 
+/**
+ * The sync status, in the count spelling: `open_proposals` as a number.
+ *
+ * The engine's per-domain report embeds the proposals themselves and its poll
+ * overview counts them, so both spellings reach this screen. This is the short
+ * one; the test below overrides `open_proposals` with the list the real
+ * endpoint sends, so the card is pinned against both.
+ */
+function syncResponse(overrides: Record<string, unknown> = {}) {
+  return {
+    domain: "eng",
+    mode: "github",
+    repo: "acme/kb",
+    branch: "main",
+    last_checked: "2026-08-10T08:00:00Z",
+    local_changes: 2,
+    open_proposals: 1,
+    behind: false,
+    probe_error: null,
+    ...overrides,
+  };
+}
+
 function vocabularyResponse() {
   return {
     domain: "eng",
@@ -527,5 +550,198 @@ describe("the domain screen", () => {
     expect(within(body).getByText(/live in the database/i)).toBeVisible();
     expect(within(body).getByText(/download the archive first/i)).toBeVisible();
     expect(within(body).queryByText(/files stay on disk/i)).toBeNull();
+  });
+});
+
+describe("the team sync card", () => {
+  it("shows the sync card for an admin on a team domain", async () => {
+    serve({ "/domains/eng/sync": () => syncResponse() }, "admin");
+
+    renderApp("/d/eng");
+    const body = await screenBody();
+
+    const card = await within(body).findByRole("region", {
+      name: "Team sync",
+    });
+    expect(within(card).getByText("acme/kb")).toBeVisible();
+    expect(within(card).getByText("main")).toBeVisible();
+    // The day the instant names, cut out of the string: this app never turns
+    // a written date into a browser's local one.
+    expect(within(card).getByText("2026-08-10")).toBeVisible();
+    expect(within(card).getByText("2 pending local changes")).toBeVisible();
+    expect(within(card).getByText("1 open proposal")).toBeVisible();
+    // Nothing failed, so nothing is announced as failed.
+    expect(within(card).queryByRole("alert")).toBeNull();
+  });
+
+  it("counts the proposals the real endpoint actually sends", async () => {
+    // The wire spelling: `origin_status`'s report embeds the open proposals
+    // themselves rather than a count, so the card has to read a list here and
+    // a number in the fixture above without knowing which it will get.
+    serve(
+      {
+        "/domains/eng/sync": () =>
+          syncResponse({
+            local_changes: 1,
+            open_proposals: [
+              { number: 7, status: "open", url: null, title: "Add a runbook" },
+              { number: 9, status: "open", url: null, title: "Fix the lede" },
+            ],
+            declined_proposals: [],
+            conflicts: [],
+            behind: true,
+          }),
+      },
+      "admin",
+    );
+
+    renderApp("/d/eng");
+    const card = await within(await screenBody()).findByRole("region", {
+      name: "Team sync",
+    });
+
+    expect(within(card).getByText("2 open proposals")).toBeVisible();
+    expect(within(card).getByText("1 pending local change")).toBeVisible();
+    // The line that only exists when the origin is actually ahead.
+    expect(within(card).getByText(/behind upstream/i)).toBeVisible();
+  });
+
+  it("says the numbers are stale when the origin check itself failed", async () => {
+    serve(
+      {
+        "/domains/eng/sync": () =>
+          syncResponse({
+            last_checked: "2026-08-09T08:00:00Z",
+            probe_error: "offline: could not reach api.github.com",
+          }),
+      },
+      "admin",
+    );
+
+    renderApp("/d/eng");
+    const card = await within(await screenBody()).findByRole("region", {
+      name: "Team sync",
+    });
+
+    // The numbers still show - they are the local half of the report and they
+    // are true about this copy - but nothing here lets them read as fresh.
+    expect(within(card).getByText("2 pending local changes")).toBeVisible();
+    const warning = within(card).getByRole("alert");
+    expect(warning).toHaveTextContent(
+      "offline: could not reach api.github.com",
+    );
+    expect(within(card).getByText(/2026-08-09 \(stale\)/)).toBeVisible();
+  });
+
+  it("pulls the origin and refreshes what the pull changed", async () => {
+    const pulled = vi.fn(() => ({
+      domain: "eng",
+      up_to_date: false,
+      applied: ["notes/a.md"],
+    }));
+    serve(
+      {
+        "/domains/eng/sync": (_path, init) =>
+          init?.method === "POST" ? pulled() : syncResponse(),
+      },
+      "admin",
+    );
+
+    renderApp("/d/eng");
+    const card = await within(await screenBody()).findByRole("region", {
+      name: "Team sync",
+    });
+    const before = requested().filter((path) => path === "/domains").length;
+
+    await userEvent.click(
+      within(card).getByRole("button", { name: "Sync now" }),
+    );
+
+    await waitFor(() => {
+      expect(pulled).toHaveBeenCalled();
+    });
+    // Both of the things a pull can have changed are asked again: this card's
+    // own status, and the listing every sidebar and card draws from.
+    await waitFor(() => {
+      expect(
+        requested().filter((path) => path === "/domains/eng/sync").length,
+      ).toBeGreaterThan(1);
+      expect(
+        requested().filter((path) => path === "/domains").length,
+      ).toBeGreaterThan(before);
+    });
+  });
+
+  it("shows no card on a domain with no origin", async () => {
+    serve(
+      {
+        "/domains/eng/sync": () => {
+          throw new ApiProblem(
+            404,
+            "not found",
+            "domain 'eng' has no team origin",
+          );
+        },
+      },
+      "admin",
+    );
+
+    renderApp("/d/eng");
+    const body = await screenBody();
+    await within(body).findByRole("link", { name: /Alpha/ });
+
+    // A local domain has no sync status, which is not a failure to report.
+    expect(
+      within(body).queryByRole("region", { name: "Team sync" }),
+    ).toBeNull();
+    expect(within(body).queryByText(/no team origin/)).toBeNull();
+  });
+
+  it("keeps a non-404 refusal inside the card", async () => {
+    serve(
+      {
+        "/domains/eng/sync": () => {
+          throw new ApiProblem(
+            409,
+            "conflict",
+            "GitHub is disabled on this instance: connect it under Settings > GitHub",
+          );
+        },
+      },
+      "admin",
+    );
+
+    renderApp("/d/eng");
+    const card = await within(await screenBody()).findByRole("region", {
+      name: "Team sync",
+    });
+
+    expect(within(card).getByRole("alert")).toHaveTextContent(
+      "GitHub is disabled on this instance",
+    );
+    // No numbers stand in for the ones the server refused to give.
+    expect(within(card).queryByText("acme/kb")).toBeNull();
+    expect(within(card).queryByText(/pending local change/)).toBeNull();
+    // The button stays: pressing it re-surfaces the same refusal in place.
+    expect(
+      within(card).getByRole("button", { name: "Sync now" }),
+    ).toBeVisible();
+  });
+
+  it("asks for no sync status below admin", async () => {
+    serve({ "/domains/eng/sync": () => syncResponse() });
+
+    renderApp("/d/eng");
+    const body = await screenBody();
+    await within(body).findByRole("link", { name: /Alpha/ });
+
+    // The endpoints are admin-only, so an editor's screen must not knock on
+    // them at all: a 403 in the console is noise nobody can act on.
+    expect(
+      requested().some((path) => path.startsWith("/domains/eng/sync")),
+    ).toBe(false);
+    expect(
+      within(body).queryByRole("region", { name: "Team sync" }),
+    ).toBeNull();
   });
 });

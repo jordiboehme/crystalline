@@ -42,6 +42,7 @@ import { CreateEngramDialog } from "../components/CreateEngramDialog";
 import { EngramList } from "../components/EngramList";
 import { FilterFields, TagChips } from "../components/FilterControls";
 import { Skeleton } from "../components/Skeleton";
+import { SyncCard } from "../components/SyncCard";
 import { BUTTON, Chip, FOCUS_RING } from "../components/primitives";
 import { frontmatterFilters } from "../filters";
 import { plural } from "../format";
@@ -194,6 +195,15 @@ export default function DomainHome() {
           </p>
         )}
       </header>
+
+      {/*
+        Admin only, because the endpoints behind it are: a viewer's screen must
+        knock on nothing it would be refused. The card draws nothing at all on
+        a domain with no origin, which is most of them, so this is the whole of
+        the gate the screen owns - and an unregistered domain never reaches
+        here, the not-found branch above returns first.
+      */}
+      {capabilities.canAdminister && <SyncCard domain={domain} />}
 
       <section aria-labelledby="domain-manifest">
         <h2 id="domain-manifest" className="mb-2 text-section">

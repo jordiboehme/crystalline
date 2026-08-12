@@ -228,8 +228,28 @@ describe("the admin client layer", () => {
       localChanges: 2,
       openProposals: 2,
       behind: false,
+      probeError: null,
     });
     expect(syncStatusKey("eng")).toEqual(["domains", "eng", "sync"]);
+  });
+
+  it("carries a failed probe's own words through", async () => {
+    apiMock.mockResolvedValueOnce({
+      domain: "eng",
+      repo: "acme/kb",
+      branch: "main",
+      last_checked: "2026-08-09T08:00:00Z",
+      local_changes: 2,
+      open_proposals: [],
+      // The report came back without the probe, so `behind` is unknown and
+      // everything beside it is local state alone.
+      behind: null,
+      probe_error: "offline: could not reach api.github.com",
+    });
+    const status = await fetchSyncStatus("eng");
+
+    expect(status.probeError).toBe("offline: could not reach api.github.com");
+    expect(status.behind).toBeNull();
   });
 
   it("pulls a team domain on the same path with a POST", async () => {
