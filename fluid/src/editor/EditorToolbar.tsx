@@ -41,6 +41,7 @@ import {
 } from "lucide-react";
 import { DropdownMenu } from "radix-ui";
 import type { MouseEvent, ReactElement } from "react";
+import { useId } from "react";
 
 import { ITEM_CLASSES, MENU_CLASSES } from "../components/menu";
 import { IconButton } from "../components/primitives";
@@ -91,10 +92,13 @@ const DIAGRAM_MENU_CLASSES = `${MENU_CLASSES} max-h-[70vh] overflow-y-auto`;
 /**
  * A group's heading inside that menu: muted, small, sentence case. It is a
  * signpost rather than a choice, so it is drawn quieter than the rows under it
- * - slate-500 reads 4.76:1 on the light menu surface and slate-400 6.96:1 on
+ * - slate-500 reads 4.76:1 on the light menu surface and slate-400 6.78:1 on
  * the dark one, both clear of the floor for text this size. (slate-500 would
- * be 3.75:1 on the dark surface, which is why the pair steps a shade lighter
+ * be 3.74:1 on the dark surface, which is why the pair steps a shade lighter
  * there rather than staying one color, the size picker's caption reasoning.)
+ * The dark figures are computed from the palette this tree actually ships:
+ * Tailwind v4 declares the slate ramp in oklch, so slate-400 resolves to
+ * #90a1b9 and slate-900 to #0f172b, a hair off the v3 hexes the plan quoted.
  */
 const GROUP_LABEL_CLASSES =
   "px-2 py-1 text-caption text-slate-500 dark:text-slate-400";
@@ -118,6 +122,8 @@ export function EditorToolbar({
   tableActive?: boolean;
 }): ReactElement {
   const off = view === null;
+  /** The stem the diagram menu's group headings hang their ids off. */
+  const groupId = useId();
   const act = (run: (view: EditorView) => boolean) => () => {
     if (view) {
       run(view);
@@ -259,9 +265,20 @@ export function EditorToolbar({
               view?.focus();
             }}
           >
-            {MERMAID_STARTER_GROUPS.map((group) => (
-              <DropdownMenu.Group key={group.label}>
-                <DropdownMenu.Label className={GROUP_LABEL_CLASSES}>
+            {MERMAID_STARTER_GROUPS.map((group, index) => (
+              // Radix draws the group and the label as siblings and wires
+              // neither to the other, so the `role="group"` it emits would
+              // announce nothing: the heading has to be named as the group's
+              // label by hand. One id per menu with the group's index on it,
+              // rather than a hook per group, because a list cannot call one.
+              <DropdownMenu.Group
+                key={group.label}
+                aria-labelledby={`${groupId}-${String(index)}`}
+              >
+                <DropdownMenu.Label
+                  id={`${groupId}-${String(index)}`}
+                  className={GROUP_LABEL_CLASSES}
+                >
                   {group.label}
                 </DropdownMenu.Label>
                 {group.starters.map((starter) => (

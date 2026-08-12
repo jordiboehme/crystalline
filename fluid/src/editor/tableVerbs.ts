@@ -300,6 +300,11 @@ function indentWidth(text: string): number {
  * position is measured in is the one the changes make, computed here so the
  * whole verb is still a single dispatch.
  *
+ * `change.from + 1` is the model's own span-relative spelling; the code below
+ * looks the line up at `at + 1`, where `at` is that offset already carried
+ * into document terms by the same `node.from + change.from` that `absolute`
+ * applies to the change. Nothing here reads a span offset as a document one.
+ *
  * That means the change is applied twice - once to a scratch `Text` to find
  * the line, once by the transaction - and the duplication is the price, not an
  * oversight. The arithmetic that would avoid it reads the separator's length,

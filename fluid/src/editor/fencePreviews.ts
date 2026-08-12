@@ -60,10 +60,14 @@ const ERROR_LEAD =
   /^.*?(?:parse|lexer|lexical) error on line (\d+|\?)(?:,\s*column\s*(?:\d+|\?))?\s*[.:]?\s*/i;
 
 /**
- * `Expecting <tokens>, got <token>`: jison's shape, and the one message worth
- * shortening in the middle rather than at the end (see `fit`).
+ * The expectation messages, and the ones worth shortening in the middle rather
+ * than at the end (see `fit`). Both grammars write one, in shapes that agree on
+ * nothing but the word: jison says `Expecting <tokens>, got <token>` and
+ * langium says `Expecting: one of these possible Token sequences: 1. [...] ...
+ * but found: '<token>'`. The tail alternation is what makes the langium wall
+ * lose its middle instead of its found token, which is the informative end.
  */
-const EXPECTING = /^(Expecting )(.*)(, got .+)$/i;
+const EXPECTING = /^(Expecting[: ]\s*)(.*)((?:, got | but found: ).+)$/i;
 
 /** The family that quotes the fence body back; never worth showing. */
 const UNDETECTED = /^No diagram type detected/i;
@@ -105,9 +109,11 @@ function fit(detail: string, budget: number): string {
   if (shape) {
     // `Expecting 'A', 'B', ... 'Z', got 'X'` - both ends carry the meaning and
     // the tail carries most of it, so the token list gives way in the middle
-    // rather than the sentence losing the token it actually choked on.
+    // rather than the sentence losing the token it actually choked on. The
+    // separator the tail was found by is dropped with the whitespace around it,
+    // so a comma and a `but` read the same after the ellipsis.
     const head = shape[1] ?? "";
-    const tail = ` ... ${(shape[3] ?? "").replace(/^,\s*/, "")}`;
+    const tail = ` ... ${(shape[3] ?? "").replace(/^[,\s]+/, "")}`;
     const room = budget - Array.from(head).length - Array.from(tail).length;
     const tokens: string[] = [];
     let used = 0;
@@ -163,15 +169,21 @@ export function describeMermaidError(cause: unknown, fence: FenceBody): string {
         ? cause
         : "";
   const message = condense(raw);
+  // Recognized on the WHOLE message, before the lead-in is stripped: the
+  // family quotes the fence body back, the lead-in pattern is lazy because
+  // langium writes words in front of its own, and an author whose undetectable
+  // body reads `notadiagram Parse error on line 5: retry` would otherwise have
+  // their own sentence read as the parser's - line number and all.
+  if (UNDETECTED.test(message)) {
+    return UNRENDERABLE;
+  }
   const lead = ERROR_LEAD.exec(message);
   const detail = (lead ? message.slice(lead[0].length) : message)
     .replace(/^[,.:;]+\s*/, "")
     .trim();
   const reported = lead?.[1];
   if (reported === undefined || !/^\d+$/.test(reported)) {
-    return detail.length === 0 || UNDETECTED.test(detail)
-      ? UNRENDERABLE
-      : fit(detail, CAPTION_CAP);
+    return detail.length === 0 ? UNRENDERABLE : fit(detail, CAPTION_CAP);
   }
   const within = Math.min(Math.max(Number(reported), 1), fence.lineCount);
   const prefix = `Line ${String(fence.firstLine + within - 1)}: `;

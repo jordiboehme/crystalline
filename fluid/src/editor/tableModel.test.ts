@@ -125,6 +125,27 @@ describe("deleteColumn and deleteRow", () => {
     expect(deleteRow(one, 1, "\n")).toBeNull();
   });
 
+  test("a deletion that would empty a line is refused whole", () => {
+    // Edge-pipeless AND ragged to a single cell: that cell IS column 0, so
+    // deleting the column consumes the line down to nothing. A blank line ENDS
+    // a GFM table, so the emission would split this one in two and the rows
+    // below it would stop being a table - a structurally broken document from
+    // one segment click. The verb refuses instead, through the channel it
+    // already has.
+    const span = ["a | b | c", "--- | --- | ---", "1", "x | y | z"].join("\n");
+    const model = parseTable(span);
+    if (!model) throw new Error("no model");
+    expect(deleteColumn(model, 0)).toBeNull();
+    // Only that column: the refusal is about the line the deletion would
+    // empty, not about the table's shape, so the ragged row's absent columns
+    // are still deletable and it is left alone as ever. The space each line
+    // keeps is the one that preceded the pipe the deletion took with the last
+    // cell - trailing whitespace, which changes no cell's content.
+    expect(apply(span, deleteColumn(model, 2) ?? [])).toBe(
+      ["a | b ", "--- | --- ", "1", "x | y "].join("\n"),
+    );
+  });
+
   test("delete row removes the line and one separator", () => {
     const model = parseTable(SPAN);
     if (!model) throw new Error("no model");

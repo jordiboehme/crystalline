@@ -10,20 +10,27 @@
  * breaks without any command test noticing.
  */
 
+import { undo } from "@codemirror/commands";
 import type { Extension } from "@codemirror/state";
 import { EditorSelection, EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import type { RenderResult } from "@testing-library/react";
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, test } from "vitest";
 
 import { EditorToolbar } from "./EditorToolbar";
+import { frontmatterFold } from "./frontmatterFold";
 import { baseExtensions, docText, lineSeparatorFor } from "./setup";
 import { MERMAID_SKELETON } from "./toolbar";
 
 const TABLE_DOC = "Before\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n\nAfter\n";
 const IN_TABLE = TABLE_DOC.indexOf("| 1") + 2;
+
+/** The frontmatter a preview-mode buffer hides behind its chip. */
+const YAML = "---\ntitle: T\nstatus: draft\n---\n";
+/** That block, folded, with a caret at 0 - where a freshly opened engram puts it. */
+const FOLDED_DOC = `${YAML}\nBody line\n`;
 
 /** The segment's six controls, by the names that are the contract. */
 const SEGMENT = [
@@ -191,6 +198,66 @@ describe("the diagram menu", () => {
     // Only the caret differs from the old insert, and deliberately so.
     const { from, to } = v.state.selection.main;
     expect(v.state.sliceDoc(from, to)).toBe("First step");
+  });
+
+  test("each group carries its heading as its accessible name", async () => {
+    // The three groups exist for a screen reader as much as for an eye: a
+    // `role="group"` that names nothing announces sixteen flat items, which is
+    // the list the grouping was introduced to break up.
+    mount("prose\n", 5);
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Insert diagram" }));
+    for (const label of ["Everyday", "Planning and product", "Technical"]) {
+      expect(await screen.findByRole("group", { name: label })).not.toBeNull();
+    }
+  });
+
+  test("Escape closes the menu and gives the buffer back", async () => {
+    // The other half of what the close handler promises. The select path is
+    // pinned below; a refactor that moved `view.focus()` into the item handler
+    // would keep that one green and strand the caret on the trigger here.
+    const v = mount("prose\n", 5);
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Insert diagram" }));
+    await screen.findByRole("menuitem", { name: "Flowchart" });
+    await user.keyboard("{Escape}");
+    await waitFor(() => {
+      expect(screen.queryByRole("menuitem")).toBeNull();
+    });
+    expect(v.hasFocus).toBe(true);
+    expect(docText(v.state)).toBe("prose\n");
+  });
+
+  test("one undo takes a whole starter back out", async () => {
+    // One transaction is one undo step: the verb tags itself as input, so the
+    // fence never joins the typing around it and never comes out in pieces.
+    const v = mount("prose\n", 5);
+    await pickDiagram("Sequence");
+    expect(docText(v.state)).toContain("sequenceDiagram");
+    undo(v);
+    expect(docText(v.state)).toBe("prose\n");
+  });
+
+  test("the fold guard fires through the menu's own select path", async () => {
+    // This menu is the only insert verb whose guard is reached from an
+    // `onSelect` rather than an `onClick`, and both of the guard's answers
+    // matter here: a caret the buffer parked inside the hidden block is moved
+    // to the body, and a selection somebody made on purpose is refused.
+    const v = mount(FOLDED_DOC, 0, 0, false, [frontmatterFold()]);
+    await pickDiagram("Flowchart");
+    expect(docText(v.state)).toBe(
+      `${YAML}${MERMAID_SKELETON.join("\n")}\n\nBody line\n`,
+    );
+    const { from, to } = v.state.selection.main;
+    expect(v.state.sliceDoc(from, to)).toBe("First step");
+  });
+
+  test("a selection over the folded block refuses the starter", async () => {
+    const v = mount(FOLDED_DOC, 0, FOLDED_DOC.length, false, [
+      frontmatterFold(),
+    ]);
+    await pickDiagram("Flowchart");
+    expect(docText(v.state)).toBe(FOLDED_DOC);
   });
 
   test("a starter lands in one transaction and gives the buffer back", async () => {

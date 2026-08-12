@@ -427,7 +427,14 @@ export function selectToken(
  */
 export const CODE_SKELETON = ["```", "", "```"] as const;
 
-/** The starter diagram, in the flavor the read view already renders. */
+/**
+ * The starter diagram, in the flavor the read view already renders.
+ *
+ * The type picker builds its own fence for each of the sixteen starters now,
+ * so nothing in the app reads this - it stays as the historical shape the
+ * menu's first item has to keep reproducing, and the byte-identity test in
+ * `mermaidStarters.test.ts` is what says so.
+ */
 export const MERMAID_SKELETON = [
   "```mermaid",
   "flowchart TD",

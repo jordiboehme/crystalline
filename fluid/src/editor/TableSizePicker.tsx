@@ -54,7 +54,7 @@ const PLACEHOLDER = "Column";
  * appear. Every color is declared exactly once, by exactly one face.
  *
  * The state is carried by the BORDER - accent-600 is 3.74:1 on the light menu
- * surface and 3.32:1 on the wash it encloses, accent-400 is 9.59:1 on the
+ * surface and 3.32:1 on the wash it encloses, accent-400 is 9.58:1 on the
  * dark surface and 5.09:1 on its own wash, all clear of the 3:1 floor for
  * non-text UI - with the wash as the redundant affordance. The washes
  * themselves are ruling rather than state (accent-100 is 1.13:1 on white,
@@ -240,8 +240,10 @@ export function TableSizePicker({
             screen reader, and hearing it twice would be noise. The app's own
             muted pair rather than a step lighter, which is what the measurement
             settles: slate-600 is 7.58:1 on the light menu surface and slate-400
-            is 6.96:1 on the dark one, where slate-500 would read 4.76:1 light
-            but only 3.75:1 dark - under the floor for text this size.
+            is 6.78:1 on the dark one, where slate-500 would read 4.76:1 light
+            but only 3.74:1 dark - under the floor for text this size. The dark
+            figures come from the oklch ramp Tailwind v4 ships (slate-400
+            #90a1b9 on slate-900 #0f172b), not from the v3 hexes.
           */}
           <p
             aria-hidden="true"

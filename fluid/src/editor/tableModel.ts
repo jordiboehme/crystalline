@@ -254,6 +254,11 @@ function minRuleWidth(align: Align): number {
  * new row is the line at `change.from + 1` and its first cell's interior sits
  * `indent.length + 2` past that line's start - `lineAt(pos).from + indent + 2`,
  * which is a spelling a CRLF document cannot break.
+ *
+ * `change.from + 1` is SPAN-relative, like everything this module emits, so it
+ * is a document position only inside a span that starts at 0. A dispatch layer
+ * maps it first, exactly as it maps the change itself: the document spelling
+ * is `lineAt(node.from + change.from + 1).from + indent + 2`.
  */
 export function addRowBelow(
   model: TableModel,
@@ -346,6 +351,14 @@ export function deleteRow(
  * that follows it, or the one that precedes it when the cell is the last on
  * its line. A row too short to have the column is left untouched. The last
  * column of a table is refused; a table needs one.
+ *
+ * The whole verb is also refused when any one line would be left blank by it,
+ * which a line without edge pipes that is ragged down to the target column is:
+ * its only cell IS the column, so the deletion takes the line down to nothing.
+ * A blank line ENDS a table in GFM, so that emission would not narrow this
+ * table, it would split it in two and leave the rows below as prose. Refusing
+ * is the only outcome that keeps the document parseable, and it costs a rare
+ * shape one click that does nothing rather than a repair nobody asked for.
  */
 export function deleteColumn(
   model: TableModel,
@@ -358,19 +371,16 @@ export function deleteColumn(
   for (const line of model.lines) {
     const cell = line.cells[column];
     if (!cell) continue;
+    let from = cell.from;
+    let to = cell.to;
     if (column < line.cells.length - 1) {
-      changes.push({
-        from: line.start + cell.from,
-        to: line.start + cell.to + 1,
-      });
+      to = cell.to + 1;
     } else if (cell.from > line.indent.length) {
-      changes.push({
-        from: line.start + cell.from - 1,
-        to: line.start + cell.to,
-      });
-    } else {
-      changes.push({ from: line.start + cell.from, to: line.start + cell.to });
+      from = cell.from - 1;
     }
+    if (`${line.text.slice(0, from)}${line.text.slice(to)}`.trim() === "")
+      return null;
+    changes.push({ from: line.start + from, to: line.start + to });
   }
   return changes;
 }

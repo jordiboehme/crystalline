@@ -84,9 +84,18 @@ const MESSAGES = {
   /** radar, via langium, when it cannot even say which line it choked on. */
   radarNoLine:
     "Parsing failed:  Parse error on line ?, column ?: Expecting token of type 'NUMBER' but found ``.",
+  /**
+   * radar with an unclosed `curve c{`: langium's OTHER expectation shape, a
+   * numbered wall of alternatives with the token it found on the last line.
+   */
+  radarAlternatives:
+    "Parsing failed:  Parse error on line 3, column 11: Expecting: one of these possible Token sequences:\n  1. [NUMBER]\n  2. [NEWLINE, NUMBER]\n  3. [NEWLINE, NEWLINE, NEWLINE]\n  4. [NEWLINE, NEWLINE, NUMBER]\n  5. [ID]\n  6. [NEWLINE, ID]\n  7. [NEWLINE, NEWLINE, NEWLINE]\n  8. [NEWLINE, NEWLINE, ID]\nbut found: '\n'",
   /** Any text mermaid cannot type-detect - the whole fence body rides along. */
   unknownWithLineInside:
     "No diagram type detected matching given configuration for text: notadiagram see line 42 here",
+  /** The same family, where the body the author typed IS a parser message. */
+  unknownWithLeadInside:
+    "No diagram type detected matching given configuration for text: notadiagram Parse error on line 5: retry",
   /** The same error for an empty fence, which is what a fresh ```mermaid is. */
   unknownEmpty:
     "No diagram type detected matching given configuration for text: ",
@@ -393,6 +402,38 @@ describe("describeMermaidError", () => {
         lineCount: 3,
       }),
     ).toBe("This diagram does not render yet.");
+  });
+
+  it("never lets an author-typed lead donate one either", () => {
+    // The same family, one step meaner: the fence body IS a parser message, so
+    // the lazy lead-in pattern - which has to be lazy, to eat langium's
+    // `Parsing failed:` - matches the author's own words inside the quoted
+    // body. The undetectable-diagram family is therefore recognized on the
+    // whole message, before anything is stripped off the front of it.
+    expect(
+      describeMermaidError(new Error(MESSAGES.unknownWithLeadInside), {
+        firstLine: 8,
+        lineCount: 1,
+      }),
+    ).toBe("This diagram does not render yet.");
+  });
+
+  it("keeps the token langium found at the end of its alternatives wall", () => {
+    // langium's second expectation shape: `Expecting:` with a colon and a
+    // numbered list of token sequences, closing with `but found:` instead of
+    // jison's `, got`. The wall is long enough to need the cap, and the token
+    // it choked on is the half a person reads - so the middle gives way here
+    // too, rather than the tail being cut off.
+    const caption = describeMermaidError(
+      new Error(MESSAGES.radarAlternatives),
+      {
+        firstLine: 2,
+        lineCount: 3,
+      },
+    );
+    expect(caption.startsWith("Line 4: Expecting: one of these")).toBe(true);
+    expect(caption.endsWith(" ... but found: ' '")).toBe(true);
+    expect(Array.from(caption).length).toBeLessThanOrEqual(160);
   });
 
   it("answers an empty fence with the same calm sentence", () => {
