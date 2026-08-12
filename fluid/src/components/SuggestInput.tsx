@@ -33,7 +33,7 @@
  */
 
 import type { ReactElement } from "react";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 
 import { MENU_CLASSES } from "./menu";
 
@@ -118,6 +118,37 @@ export function suggestionsAreOpen(): boolean {
   );
 }
 
+/**
+ * Whether an open list belongs above the field rather than below it.
+ *
+ * Below is the default and stays the default: a list that reads downward from
+ * where the caret is, is what a combobox is expected to do. It moves for one
+ * reason only - there is not enough room under the field for the list, and
+ * there is more room over it - which is the short-screen case where the
+ * popover would otherwise cover the buttons of the dialog the field lives in.
+ *
+ * A rule this small is deliberate. The alternative is a positioning library,
+ * and this control is one hand-rolled panel anchored to one field: below unless
+ * it does not fit is the whole of what it needs, and the entry bundle would pay
+ * for the rest. Equal room is not a reason to move, so the comparison is
+ * strict.
+ *
+ * Exported for its own test: jsdom has no layout, so every rectangle it can
+ * produce is zero and the decision can only be pinned by being asked directly.
+ */
+// eslint-disable-next-line react-refresh/only-export-components
+export function flipsAbove(
+  field: { top: number; bottom: number },
+  listHeight: number,
+  viewportHeight: number,
+): boolean {
+  const below = viewportHeight - field.bottom;
+  if (below >= listHeight) {
+    return false;
+  }
+  return field.top > below;
+}
+
 export function SuggestInput({
   id,
   label,
@@ -147,6 +178,13 @@ export function SuggestInput({
   // the list, and these two fields are the opposite of that by design.
   const [active, setActive] = useState(NO_ROW);
   const focused = useRef(false);
+  const field = useRef<HTMLInputElement>(null);
+  const panel = useRef<HTMLUListElement>(null);
+  // Which side the open list is on. Measured when it opens, which is the case
+  // that matters: a list that has already been read past is one somebody is
+  // steering with the arrow keys, and moving it out from under them mid-filter
+  // would be worse than a list that runs a little short of the fold.
+  const [above, setAbove] = useState(false);
   // What the owner last heard, so a pick followed by a blur is one commit and
   // a blur that changed nothing is none. In the frontmatter rail a commit is a
   // document transaction, and a redundant one would be an undo step that
@@ -179,6 +217,25 @@ export function SuggestInput({
   const index =
     active === NO_ROW ? NO_ROW : Math.min(active, matches.length - 1);
   const hasActive = expanded && index >= 0;
+  // Which side to open on, decided before the browser paints so the list is
+  // never seen on the wrong one. The panel is measured rather than assumed:
+  // `max-h-64` is a ceiling, and a two-row list has no business being pushed
+  // upward for room it never wanted. Keyed on the list being on screen at all,
+  // so filtering it down never moves it under the person reading it.
+  useLayoutEffect(() => {
+    const box = field.current;
+    const list = panel.current;
+    if (!box || !list) {
+      return;
+    }
+    setAbove(
+      flipsAbove(
+        box.getBoundingClientRect(),
+        list.offsetHeight,
+        window.innerHeight,
+      ),
+    );
+  }, [expanded]);
   const listId = `${id}-suggestions`;
   const optionId = (position: number) => `${id}-suggestion-${String(position)}`;
 
@@ -211,6 +268,7 @@ export function SuggestInput({
   return (
     <div className="relative">
       <input
+        ref={field}
         id={id}
         role="combobox"
         aria-expanded={expanded}
@@ -308,6 +366,7 @@ export function SuggestInput({
       />
       {expanded && (
         <ul
+          ref={panel}
           id={listId}
           role="listbox"
           // Named for what it is, in the field's own words: a listbox must
@@ -316,7 +375,12 @@ export function SuggestInput({
           // the page answer to "Status", which is exactly how a screen reader
           // user and every test in this suite find the field itself.
           aria-label={`${label} suggestions`}
-          className={`absolute top-full left-0 mt-1 max-h-64 w-full overflow-y-auto ${MENU_CLASSES}`}
+          // The side is geometry and nothing else: the same listbox, the same
+          // `aria-controls` and `aria-activedescendant` relationships, drawn
+          // above the field instead of below it.
+          className={`absolute left-0 max-h-64 w-full overflow-y-auto ${
+            above ? "bottom-full mb-1" : "top-full mt-1"
+          } ${MENU_CLASSES}`}
         >
           {matches.map((suggestion, position) => (
             <li

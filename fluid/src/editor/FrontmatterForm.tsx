@@ -331,8 +331,19 @@ function DateRow({
           type="button"
           aria-label={`${label}: ${unbounded}`}
           // The field's own box, quietly: pressing it puts a picker in exactly
-          // this space, so nothing moves when it does.
-          className={`${BUTTON.ghost} inline-flex h-8 w-full items-center justify-start`}
+          // this space, so nothing moves when it does. The dashed border is
+          // what makes the box visible while it is empty - dashed rather than
+          // the picker's solid rule, because an absent bound is an answer and
+          // a box drawn like a filled field would read as a gap in one. It
+          // shifts nothing: the border is inside the same `h-8`, and the 1px
+          // it takes is the 1px the picker's own border takes, so the word
+          // sits exactly where the date will.
+          //
+          // RULING (Checkpoint D): this border is a redundant affordance - the
+          // state is already carried by the word inside it - so its 1.48:1
+          // light / 1.72:1 dark against the rail is accepted under the same
+          // reasoning as the divider precedent rather than the 3:1 floor.
+          className={`${BUTTON.ghost} inline-flex h-8 w-full items-center justify-start border border-dashed border-slate-300 dark:border-slate-700`}
           onClick={() => {
             setPicking(true);
           }}

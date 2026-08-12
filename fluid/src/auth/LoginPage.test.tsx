@@ -54,7 +54,23 @@ describe("the login screen", () => {
     // The way in is where the app gets to say what it is for; every screen
     // after it belongs to the reader's own work. `Home.test` holds the other
     // half of this: the same line must not reappear there.
-    expect(await screen.findByText(/think as one/)).toBeVisible();
+    expect(
+      await screen.findByText(
+        "mind-meld your fluid thoughts with your AI's crystalline intelligence",
+      ),
+    ).toBeVisible();
+  });
+
+  it("names the product and the interface, in that order", async () => {
+    serve({ "/auth/me": () => meResponse() });
+
+    renderApp("/login");
+
+    // Which product, then which of its faces. The wordmark is real text
+    // rather than the terminal banner's block letters, so it survives being
+    // listened to; the heading stays the name of this interface.
+    expect(await screen.findByText("CRYSTALLINE")).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Fluid" })).toBeVisible();
   });
 
   it("shows the server's own words when the credentials are refused", async () => {

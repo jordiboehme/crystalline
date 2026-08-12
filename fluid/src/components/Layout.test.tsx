@@ -467,7 +467,7 @@ describe("the sidebar inside a domain", () => {
     ).toBeVisible();
   });
 
-  it("splits a folder row: the name browses it, the chevron opens it here", async () => {
+  it("splits a folder row: the name browses it, the icon opens it here", async () => {
     serveInDomain();
 
     renderApp("/d/eng");
@@ -478,19 +478,50 @@ describe("the sidebar inside a domain", () => {
     // which of the two a click meant.
     const name = await within(nav).findByRole("link", { name: "notes" });
     expect(name).toHaveAttribute("href", "/d/eng?path=notes");
-    const chevron = within(nav).getByRole("button", { name: "Expand notes" });
-    expect(chevron.contains(name)).toBe(false);
-    expect(name.contains(chevron)).toBe(false);
+    const toggle = within(nav).getByRole("button", { name: "Expand notes" });
+    expect(toggle.contains(name)).toBe(false);
+    expect(name.contains(toggle)).toBe(false);
 
-    // The chevron looks inside without moving the screen beside it, and says
+    // The icon looks inside without moving the screen beside it, and says
     // which of the two things it does next.
-    await userEvent.click(chevron);
+    await userEvent.click(toggle);
     expect(
       await within(nav).findByRole("button", { name: "Collapse notes" }),
     ).toHaveAttribute("aria-expanded", "true");
     expect(
       await within(nav).findByRole("link", { name: "Beta" }),
     ).toBeVisible();
+  });
+
+  it("draws one folder glyph per row, on the control that opens it", async () => {
+    serveInDomain();
+
+    renderApp("/d/eng");
+    const nav = await sidebar();
+
+    // The chevron beside the folder icon read as a dot rather than a control,
+    // so the two became one: the icon IS the toggle now, and its open face is
+    // what the chevron used to say.
+    const toggle = await within(nav).findByRole("button", {
+      name: "Expand notes",
+    });
+    const name = within(nav).getByRole("link", { name: "notes" });
+    expect(toggle.querySelectorAll("svg")).toHaveLength(1);
+    expect(toggle.querySelector("svg")?.getAttribute("class")).toContain(
+      "lucide-folder",
+    );
+    expect(name.querySelectorAll("svg")).toHaveLength(0);
+    expect(toggle).not.toHaveTextContent(/\S/);
+
+    // Open, and the same one glyph says so.
+    await userEvent.click(toggle);
+    const opened = await within(nav).findByRole("button", {
+      name: "Collapse notes",
+    });
+    expect(opened.querySelectorAll("svg")).toHaveLength(1);
+    expect(opened.querySelector("svg")?.getAttribute("class")).toContain(
+      "lucide-folder-open",
+    );
   });
 
   it("offers the whole of a folder too big to draw, without quoting a count", async () => {

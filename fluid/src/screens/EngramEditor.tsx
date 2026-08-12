@@ -41,6 +41,7 @@ import { Breadcrumbs, crumbsOf } from "../components/Breadcrumbs";
 import { BUTTON, TOGGLE } from "../components/primitives";
 import { Skeleton } from "../components/Skeleton";
 import CmEditor from "../editor/CmEditor";
+import { ConfirmLeaveDialog } from "../editor/ConfirmLeaveDialog";
 import { ConflictDialog } from "../editor/ConflictDialog";
 import {
   crystallineCompletions,
@@ -666,26 +667,35 @@ function Surface({
    * so a refused write keeps the author here rather than walking them away
    * from text that never landed.
    *
-   * Both shortcuts leave immediately rather than doing nothing. A buffer with
-   * hard errors cannot be saved by this button any more than by Save, so the
-   * way out stays open exactly as it did when Done was a link. A clean buffer
-   * has nothing to write, so a PUT would only be a round trip for a file that
-   * already matches.
+   * The way out stays open when the save cannot happen, but only one of the
+   * two ways it cannot happen is silent. A clean buffer has nothing to write,
+   * so a PUT would only be a round trip for a file that already matches and
+   * leaving costs nothing: Done goes, and asking would be friction in front of
+   * a free exit. A buffer the findings refuse is the other case - there is
+   * text here that this button cannot keep, and walking somebody out of it
+   * without a word is the one thing Done must not do quietly. So that exit is
+   * a question: `ConfirmLeaveDialog` says what blocks the save and where the
+   * text goes, and the leaving happens only if it is chosen.
    *
-   * Leaving a buffer that could not be saved snapshots it first. Nothing in
-   * this app asks before an in-app navigation - `beforeunload` is for closing
-   * the tab, and there is no route blocker - so the draft store is the whole
-   * safety net here, and its own writer is a debounce a second wide. A
-   * correction typed and then abandoned inside that second would otherwise be
-   * in neither the file nor the draft. This is the same deliberate snapshot
-   * the closed-room walkout takes, for the same reason.
+   * The chosen walkout snapshots the buffer first. Nothing else in this app
+   * asks before an in-app navigation - `beforeunload` is for closing the tab,
+   * and there is no route blocker - so the draft store is the whole safety net
+   * here, and its own writer is a debounce a second wide. A correction typed
+   * and then abandoned inside that second would otherwise be in neither the
+   * file nor the draft. This is the same deliberate snapshot the closed-room
+   * walkout takes, for the same reason.
    */
+  const [confirmingLeave, setConfirmingLeave] = useState(false);
+  const leave = () => {
+    void navigate(engramRoute(engram.domain, engram.permalink));
+  };
   const finish = () => {
+    if (session.hardErrors > 0 && session.dirty) {
+      setConfirmingLeave(true);
+      return;
+    }
     if (session.hardErrors > 0 || !session.dirty) {
-      if (session.dirty) {
-        session.snapshotDraft();
-      }
-      void navigate(engramRoute(engram.domain, engram.permalink));
+      leave();
       return;
     }
     finishing.current = true;
@@ -1134,6 +1144,19 @@ function Surface({
           }}
           onClose={() => {
             setResolving(null);
+          }}
+        />
+      )}
+      {confirmingLeave && (
+        <ConfirmLeaveDialog
+          hardErrors={session.hardErrors}
+          onKeepEditing={() => {
+            setConfirmingLeave(false);
+          }}
+          onLeave={() => {
+            setConfirmingLeave(false);
+            session.snapshotDraft();
+            leave();
           }}
         />
       )}

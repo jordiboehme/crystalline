@@ -11,7 +11,7 @@ import { useState } from "react";
 import { describe, expect, it, vi } from "vitest";
 
 import type { Suggestion } from "./SuggestInput";
-import { SuggestInput } from "./SuggestInput";
+import { SuggestInput, flipsAbove } from "./SuggestInput";
 
 const SUGGESTIONS: Suggestion[] = [
   { name: "stable", gloss: "holds now, and the default" },
@@ -258,5 +258,48 @@ describe("the suggesting input", () => {
     expect(screen.getByRole("option", { name: /stable/ })).toHaveTextContent(
       "12",
     );
+  });
+});
+
+/**
+ * The one piece of geometry this control owns, asked directly.
+ *
+ * jsdom lays nothing out - every rectangle it can produce is zero - so the
+ * component test above can only ever see the default side. The decision is a
+ * pure function for exactly that reason, and this is where it is held to it.
+ * Numbers are a 900px viewport and a field 24px tall, which is the create
+ * dialog's own shape on a short screen.
+ */
+describe("which side the list opens on", () => {
+  const listHeight = 200;
+
+  it("stays below when the list fits under the field", () => {
+    // 900 - 300 = 600 below, room to spare.
+    expect(flipsAbove({ top: 276, bottom: 300 }, listHeight, 900)).toBe(false);
+  });
+
+  it("goes above when the list does not fit below and does above", () => {
+    // 900 - 800 = 100 below, 776 above: the short-screen case where the list
+    // would otherwise cover the dialog's own buttons.
+    expect(flipsAbove({ top: 776, bottom: 800 }, listHeight, 900)).toBe(true);
+  });
+
+  it("stays below when neither side has the room", () => {
+    // 100 below, 76 above: nothing is gained by moving, and below is where a
+    // combobox is expected to open.
+    expect(flipsAbove({ top: 76, bottom: 100 }, listHeight, 200)).toBe(false);
+  });
+
+  it("stays below on an exact fit, and on the tie above it", () => {
+    // Exactly the room it needs is enough room.
+    expect(flipsAbove({ top: 676, bottom: 700 }, listHeight, 900)).toBe(false);
+    // Equal room on both sides is not a reason to move.
+    expect(flipsAbove({ top: 100, bottom: 124 }, listHeight, 224)).toBe(false);
+  });
+
+  it("stays below when nothing has been laid out yet", () => {
+    // What jsdom answers, and what a field measured before its first paint
+    // would answer: all zeros, and no reason to move.
+    expect(flipsAbove({ top: 0, bottom: 0 }, 0, 0)).toBe(false);
   });
 });

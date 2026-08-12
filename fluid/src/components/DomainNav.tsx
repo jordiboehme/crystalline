@@ -29,16 +29,16 @@
  *
  * A folder row is two controls rather than one. Its name is a link to that
  * folder on the domain screen, which is where a folder of any size can be
- * paged; its chevron is a button that looks inside the sidebar without moving
- * the screen. They are siblings, never nested: a link inside a button is an
- * accessibility violation, and a reader would have no way to say which of the
- * two they meant. A level the server had to cut ends in one more row - the
+ * paged; its folder icon is a button that looks inside the sidebar without
+ * moving the screen. They are siblings, never nested: a link inside a button
+ * is an accessibility violation, and a reader would have no way to say which
+ * of the two they meant. A level the server had to cut ends in one more row - the
  * whole folder, on the screen - because the sidebar is a way around a domain
  * rather than a place to render ten thousand rows.
  */
 
 import { useQuery } from "@tanstack/react-query";
-import { Folder as FolderIcon } from "lucide-react";
+import { FolderOpen, Folder as FolderShut } from "lucide-react";
 import { DropdownMenu } from "radix-ui";
 import { useState } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router";
@@ -384,15 +384,21 @@ function isPinnedManifest(row: EngramRow): boolean {
 }
 
 /**
- * A folder: a name that goes there, and a chevron that looks inside.
+ * A folder: a name that goes there, and a folder icon that looks inside.
  *
  * The two are separate controls because they do two different things. The name
  * is a link to this folder on the domain screen, which is the surface that can
- * page a folder of any size; the chevron is a disclosure that opens the branch
+ * page a folder of any size; the icon is a disclosure that opens the branch
  * here and leaves the screen beside it where the reader left it. What is
  * inside is mounted only while it is open, which is what makes the fetch lazy.
  *
- * The chevron is named after what it will do - "Expand notes", "Collapse
+ * One glyph does both jobs - it says this row is a folder, and its open or
+ * shut face says whether the branch is - because the two pictures this row
+ * used to carry read as one smudge at sixteen pixels. The engram rows stay
+ * icon-free on purpose: the icon IS the distinction, and one on every row
+ * would say nothing.
+ *
+ * The button is named after what it will do - "Expand notes", "Collapse
  * notes" - rather than after the folder, for two reasons: two controls in one
  * row both called `notes` would be indistinguishable to anybody listening
  * rather than looking, and the name then says the thing `aria-expanded` only
@@ -458,6 +464,20 @@ function Folder({
           here ? "bg-slate-100 font-medium dark:bg-slate-800" : ""
         }`}
       >
+        {/*
+          One glyph, doing both jobs. The row used to carry two - a chevron on
+          the button and a folder icon on the link beside it - and at this size
+          the chevron read as a dot stuck to the folder rather than as a
+          control. A folder that is open looks different from a folder that is
+          shut, so the icon can carry the state the chevron was carrying and
+          the row gets its width back.
+
+          What did NOT change is which control is which: this is still the
+          button, it still says what it will do next and still carries
+          `aria-expanded`, and the name beside it is still the link that
+          browses the folder on the screen. Only the picture inside the button
+          is different.
+        */}
         <button
           type="button"
           aria-expanded={open}
@@ -467,27 +487,30 @@ function Folder({
           }}
           className={`rounded py-1 pr-1 pl-2 text-slate-500 dark:text-slate-400 ${FOCUS_RING}`}
         >
-          <span aria-hidden="true" className="block w-3 text-xs">
-            {open ? "▾" : "▸"}
-          </span>
+          {open ? (
+            <FolderOpen
+              aria-hidden="true"
+              size={16}
+              strokeWidth={1.75}
+              className="block shrink-0"
+            />
+          ) : (
+            <FolderShut
+              aria-hidden="true"
+              size={16}
+              strokeWidth={1.75}
+              className="block shrink-0"
+            />
+          )}
         </button>
         <Link
           to={folderRoute(domain, path)}
           aria-current={here ? "page" : undefined}
-          className={`flex min-w-0 grow items-center gap-1.5 rounded py-1 pr-2 ${FOCUS_RING}`}
+          // The gap the icon used to sit in, kept as padding: the name still
+          // stands off the glyph rather than against it, and the engram rows
+          // under it still start where they always did.
+          className={`flex min-w-0 grow items-center rounded py-1 pr-2 pl-1.5 ${FOCUS_RING}`}
         >
-          {/*
-            Decorative: the row says `notes`, and the icon is what makes a
-            folder legible as a folder at a glance rather than a second name
-            for it. The engram rows stay icon-free on purpose - the icon IS
-            the distinction, and one on every row would say nothing.
-          */}
-          <FolderIcon
-            aria-hidden="true"
-            size={16}
-            strokeWidth={1.75}
-            className="shrink-0"
-          />
           <span className="truncate">{name}</span>
         </Link>
       </div>

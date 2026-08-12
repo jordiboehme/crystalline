@@ -89,6 +89,17 @@ describe("the frontmatter form", () => {
     ).toBeInTheDocument();
   });
 
+  it("draws the unbounded state as a box of its own, dashed rather than filled", () => {
+    mounted();
+    // The state was legible only as a word floating in the rail. It has the
+    // field's box now, dashed: an absent bound is an answer, and a solid rule
+    // would draw it as the empty field it is not. Same `h-8` as the picker
+    // that replaces it, so pressing it moves nothing.
+    const ghost = screen.getByRole("button", { name: "Valid to: Forever" });
+    expect(ghost.className).toContain("border-dashed");
+    expect(ghost.className).toContain("h-8");
+  });
+
   it("an edit dispatches a single-line change into the buffer", async () => {
     const view = mounted();
     const status = screen.getByLabelText("Status");

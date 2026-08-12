@@ -92,7 +92,7 @@ describe("the home screen", () => {
     // Said once, on the way in. A subtitle repeating it under every visit is
     // the kind of line a reader stops seeing.
     await (await main()).findByRole("heading", { name: "Home", level: 1 });
-    expect(screen.queryByText(/think as one/)).toBeNull();
+    expect(screen.queryByText(/mind-meld/)).toBeNull();
   });
 
   it("dates a card by what was recorded, not by what was guessed", async () => {

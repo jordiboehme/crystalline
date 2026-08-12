@@ -2,10 +2,20 @@
  * The login screen.
  *
  * The one screen outside the app frame, so the one screen that has to say what
- * this is: the mark, the name and a line about the pairing the app is for.
+ * this is, and it has to say two things rather than one: which product this is,
+ * and which of its faces you are standing at. So the card reads top to bottom
+ * as the gem, CRYSTALLINE, Fluid, and the line about what the pairing is for.
  * Crystalline is what was learned and kept; fluid is what a person and a model
  * bring to the moment; this is where the two think in the same place. The line
  * says that once, quietly, and no other screen repeats it.
+ *
+ * The gem is the CLI banner's own gem, cut down to a size that fits a login
+ * card. The full block-letter wordmark beside it in the README and the serve
+ * banner is 87 columns wide, which is more than twice this card at any legible
+ * monospace size, so the word is set as ordinary letter-spaced text instead:
+ * readable beats faithful, and a wordmark that is real text is a wordmark a
+ * screen reader can read. Only the gem is art, and art is what `aria-hidden`
+ * is for.
  *
  * The one rule worth stating: when the server refuses, its own `detail` is
  * what is shown, word for word. That text is product copy written where the
@@ -24,6 +34,22 @@ import { BUTTON, FOCUS_RING } from "../components/primitives";
 import { useAuth } from "./AuthContext";
 import type { FromLocation } from "./RequireAuth";
 import { LOGIN_MUTATION_KEY } from "./keys";
+
+/**
+ * The gem from the CLI's startup banner, at a sixth of its width.
+ *
+ * Same silhouette and the same shading vocabulary the terminal draws it with -
+ * a flat table, a faceted crown, then the pavilion tapering to a point - so
+ * somebody who has seen the banner recognizes this, and somebody who has not
+ * still sees a cut stone. Held as one string rather than assembled at render:
+ * this route is eager, and a constant costs a few hundred bytes once.
+ */
+const GEM = ` ▄▄▄▄▄▄▄▄▄▄▄
+▐░░▒▒▓█▓▒▒░░▌
+  ▀█░▒█▒░█▀
+   ▀█▒█▒█▀
+    ▀███▀
+      ▀`;
 
 export default function LoginPage() {
   const { user, capabilities, login } = useAuth();
@@ -67,26 +93,35 @@ export default function LoginPage() {
     <main className="flex min-h-screen items-center justify-center bg-slate-50 p-6 dark:bg-slate-950">
       <div className="w-full max-w-sm">
         {/*
-          A cut gem in the CLI's own ASCII spirit, and decorative on purpose:
-          it is the app's mark, and the name it stands over is right beneath
-          it, so a screen reader is spared six lines of slashes.
+          The banner gem, decorative on purpose: the word it stands over is
+          right beneath it as text, so a screen reader is spared six lines of
+          block characters that say nothing it can pronounce.
+
+          Centered as one block (`mx-auto w-fit`) rather than line by line: the
+          taper is drawn with leading spaces, so centering each line on its own
+          width would walk the point three columns to the right of the crown it
+          hangs under.
         */}
         <pre
           aria-hidden="true"
-          className="text-caption mb-4 text-center leading-tight font-mono text-accent-600 select-none dark:text-accent-400"
+          className="text-caption mx-auto mb-3 w-fit leading-none font-mono text-accent-600 select-none dark:text-accent-400"
         >
-          {`   /\\
-  /  \\
- /____\\
- \\    /
-  \\  /
-   \\/`}
+          {GEM}
         </pre>
-        <h1 className="text-display text-center text-slate-900 dark:text-slate-50">
+        {/*
+          Text, not art: the product's name has to survive being listened to.
+          The letter spacing is what makes it read as the wordmark from the
+          terminal banner rather than as a heading, which is what the name
+          below it is.
+        */}
+        <p className="text-caption text-center font-mono tracking-[0.35em] text-slate-600 select-none dark:text-slate-400">
+          CRYSTALLINE
+        </p>
+        <h1 className="text-display mt-1 text-center text-slate-900 dark:text-slate-50">
           Fluid
         </h1>
         <p className="mt-1 text-center text-sm text-slate-600 dark:text-slate-400">
-          where fluid thought and crystalline memory think as one
+          mind-meld your fluid thoughts with your AI's crystalline intelligence
         </p>
 
         <form

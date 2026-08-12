@@ -134,6 +134,38 @@ function putIfMatch(index: number): string | undefined {
   return headers?.["If-Match"];
 }
 
+/** A validate route that refuses the buffer with one hard error. */
+function refusedByFindings() {
+  return {
+    "/validate": () => ({
+      errors: 1,
+      findings: [
+        {
+          rule: "E001",
+          severity: "error",
+          message: "frontmatter will not parse",
+          line: 1,
+          fix: null,
+        },
+      ],
+    }),
+  };
+}
+
+/**
+ * An edit the save gate will not accept: the buffer is dirty, so there is text
+ * to lose, and the findings hold the write back.
+ */
+async function typeUnsavableStatus() {
+  const status = await screen.findByLabelText("Status");
+  await userEvent.clear(status);
+  await userEvent.type(status, "brewing");
+  await userEvent.tab();
+  await waitFor(() => {
+    expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
+  });
+}
+
 /**
  * A joined room over a real Y.Text, so the binding under test is the real
  * `yCollab` one: a remote edit here is an actual Yjs update, not a prop.
@@ -647,9 +679,14 @@ describe("the engram editor", () => {
       await screen.findByRole("heading", { name: "Alpha", level: 1 }),
     ).toBeInTheDocument();
     expect(screen.queryByLabelText("Engram source")).not.toBeInTheDocument();
+    // The save landed, so nothing was at risk and nothing was asked: the
+    // confirm belongs to the one path where Done cannot keep its promise.
+    expect(
+      screen.queryByText("This engram cannot be saved"),
+    ).not.toBeInTheDocument();
   });
 
-  it("Done leaves without saving what hard errors refuse, rather than doing nothing", async () => {
+  it("Done leaves a clean buffer with hard errors without asking", async () => {
     const put = vi.fn(() => detailResponse({ checksum: "next111" }));
     serveEditor({
       "/validate": () => ({
@@ -675,44 +712,75 @@ describe("the engram editor", () => {
 
     await userEvent.click(screen.getByRole("button", { name: "Done" }));
 
-    // The save gate holds here exactly as it holds on Save; what Done falls
-    // back to is what it has always been, a way out - with the buffer kept as
-    // a draft the way every other way out keeps it.
+    // The save gate holds here exactly as it holds on Save. Nothing was typed,
+    // so the buffer is the file and leaving costs nothing: there is nothing to
+    // ask about, and a dialog in front of a free exit would be pure friction.
     expect(
       await screen.findByRole("heading", { name: "Alpha", level: 1 }),
     ).toBeInTheDocument();
     expect(put).not.toHaveBeenCalled();
+    expect(
+      screen.queryByText("This engram cannot be saved"),
+    ).not.toBeInTheDocument();
   });
 
-  it("Done writes the draft before walking out of a buffer it cannot save", async () => {
-    serveEditor({
-      "/validate": () => ({
-        errors: 1,
-        findings: [
-          {
-            rule: "E001",
-            severity: "error",
-            message: "frontmatter will not parse",
-            line: 1,
-            fix: null,
-          },
-        ],
-      }),
-    });
+  it("Done asks before leaving text that hard errors will not let it save", async () => {
+    serveEditor(refusedByFindings());
     renderApp("/d/eng/edit/alpha");
     await screen.findByLabelText("Engram source");
-    const status = await screen.findByLabelText("Status");
-    await userEvent.clear(status);
-    await userEvent.type(status, "brewing");
-    await userEvent.tab();
-    await waitFor(() => {
-      expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
-    });
+    await typeUnsavableStatus();
 
-    // Immediately: the draft debounce is a whole second, and nothing in this
-    // app asks before an in-app navigation, so a Done pressed inside that
-    // second is the moment the text has to be put somewhere.
     await userEvent.click(screen.getByRole("button", { name: "Done" }));
+
+    // Done promises the work is kept, and here it cannot keep it: the way out
+    // stays open, but it is now a thing somebody chooses with the count of
+    // what blocks the save and the fate of their text on screen.
+    expect(
+      await screen.findByText("This engram cannot be saved"),
+    ).toBeVisible();
+    expect(
+      screen.getByText(
+        "1 hard error blocks saving. Your text is kept as a local draft.",
+      ),
+    ).toBeVisible();
+    expect(screen.getByLabelText("Engram source")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("heading", { name: "Alpha", level: 1 }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("Keep editing puts the confirm away and leaves the buffer standing", async () => {
+    serveEditor(refusedByFindings());
+    renderApp("/d/eng/edit/alpha");
+    await screen.findByLabelText("Engram source");
+    await typeUnsavableStatus();
+    await userEvent.click(screen.getByRole("button", { name: "Done" }));
+    await screen.findByText("This engram cannot be saved");
+
+    await userEvent.click(screen.getByRole("button", { name: "Keep editing" }));
+
+    // The default answer, and the one that changes nothing: the text is where
+    // it was, on the screen it was on.
+    await waitFor(() => {
+      expect(
+        screen.queryByText("This engram cannot be saved"),
+      ).not.toBeInTheDocument();
+    });
+    expect(screen.getByLabelText("Status")).toHaveValue("brewing");
+    expect(screen.getByLabelText("Engram source")).toBeInTheDocument();
+  });
+
+  it("Leave anyway writes the draft before walking out of a buffer it cannot save", async () => {
+    serveEditor(refusedByFindings());
+    renderApp("/d/eng/edit/alpha");
+    await screen.findByLabelText("Engram source");
+    await typeUnsavableStatus();
+
+    // Immediately: the draft debounce is a whole second, so the walkout the
+    // confirm authorizes is the moment the text has to be put somewhere.
+    await userEvent.click(screen.getByRole("button", { name: "Done" }));
+    await screen.findByText("This engram cannot be saved");
+    await userEvent.click(screen.getByRole("button", { name: "Leave anyway" }));
 
     await screen.findByRole("heading", { name: "Alpha", level: 1 });
     expect(readDraft("ada", "eng", "alpha")?.content).toContain(
