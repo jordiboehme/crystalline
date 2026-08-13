@@ -72,16 +72,12 @@ import { RetireDialog } from "../components/RetireDialog";
 import { Skeleton } from "../components/Skeleton";
 import { useRememberedDisclosure } from "../disclosure";
 import { domainRoute, editRoute, engramRoute, graphRoute } from "../paths";
+import { prefetchEngramEditor } from "../prefetch";
 import type { WikilinkResolver } from "../wikilinks";
 import { buildWikilinkResolver, innerOf, referenceState } from "../wikilinks";
 
 /** Where the neighborhood section writes down whether it was left open. */
 const GRAPH_SECTION_KEY = "fluid.section.graph";
-
-/** Warm the editor chunk while the pointer is still on its way to the click. */
-function prefetchEditor(): void {
-  void import("./EngramEditor");
-}
 
 export default function EngramPage() {
   const params = useParams();
@@ -268,8 +264,8 @@ export default function EngramPage() {
               <>
                 <Link
                   to={editRoute(engram.domain, engram.permalink)}
-                  onPointerEnter={prefetchEditor}
-                  onFocus={prefetchEditor}
+                  onPointerEnter={prefetchEngramEditor}
+                  onFocus={prefetchEngramEditor}
                   className={BUTTON.primary}
                 >
                   Edit

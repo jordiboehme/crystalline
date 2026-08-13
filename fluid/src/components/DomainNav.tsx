@@ -52,6 +52,7 @@ import { useAuth } from "../auth/AuthContext";
 import { frontmatterFilters } from "../filters";
 import { RETIRED_CLASS, isRetired } from "../lifecycle";
 import { domainRoute, engramRoute, folderRoute, manifestRoute } from "../paths";
+import { ENGRAM_PREFETCH } from "../prefetch";
 import { CreateEngramDialog } from "./CreateEngramDialog";
 import { ITEM_CLASSES, MENU_CLASSES } from "./menu";
 import { FOCUS_RING } from "./primitives";
@@ -541,6 +542,7 @@ function EngramLink({ row, current }: { row: EngramRow; current: boolean }) {
   return (
     <Link
       to={engramRoute(row.domain, row.permalink)}
+      {...ENGRAM_PREFETCH}
       aria-current={current ? "page" : undefined}
       className={`block truncate rounded px-2 py-1 text-sm hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:hover:bg-slate-800 ${
         current ? "bg-slate-100 font-medium dark:bg-slate-800" : ""

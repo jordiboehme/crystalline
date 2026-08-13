@@ -22,11 +22,7 @@ import type { PaletteCommand } from "../commands";
 import { Breadcrumbs, crumbsOf } from "../components/Breadcrumbs";
 import { Markdown } from "../components/Markdown";
 import { manifestEditRoute } from "../paths";
-
-/** Warm the editor chunk while the pointer is still on its way to the click. */
-function prefetchEditor(): void {
-  void import("./ManifestEditor");
-}
+import { prefetchManifestEditor } from "../prefetch";
 
 export default function ManifestPage() {
   const { domain = "" } = useParams();
@@ -110,8 +106,8 @@ export default function ManifestPage() {
         {capabilities.canAdminister && (
           <Link
             to={manifestEditRoute(domain)}
-            onPointerEnter={prefetchEditor}
-            onFocus={prefetchEditor}
+            onPointerEnter={prefetchManifestEditor}
+            onFocus={prefetchManifestEditor}
             className="rounded border border-slate-300 px-2 py-0.5 text-xs hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800"
           >
             Edit MANIFEST

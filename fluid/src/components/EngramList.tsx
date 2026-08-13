@@ -26,6 +26,7 @@ import type { EngramPage, EngramRow } from "../api/engrams";
 import { hasNextPage as envelopeHasNext } from "../api/engrams";
 import { RETIRED_CLASS, isRetired } from "../lifecycle";
 import { engramRoute } from "../paths";
+import { ENGRAM_PREFETCH } from "../prefetch";
 import { snippetParts, stripSnippetMarkup } from "../snippet";
 import { Chip, statusVariant } from "./primitives";
 
@@ -226,6 +227,7 @@ function Row({
     >
       <Link
         to={engramRoute(row.domain, row.permalink)}
+        {...ENGRAM_PREFETCH}
         // Named by what it points at. Without this the name is every badge on
         // the row run together, which is what a screen reader would read out
         // for each of a hundred rows.

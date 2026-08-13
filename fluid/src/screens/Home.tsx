@@ -26,6 +26,7 @@ import { BUTTON, Chip, FOCUS_RING } from "../components/primitives";
 import { formatDay, plural } from "../format";
 import { RETIRED_CLASS, isRetired } from "../lifecycle";
 import { domainRoute, engramRoute } from "../paths";
+import { ENGRAM_PREFETCH } from "../prefetch";
 
 export default function Home() {
   const { capabilities } = useAuth();
@@ -273,6 +274,7 @@ function ActivityFeed({
           >
             <Link
               to={engramRoute(item.domain, item.permalink)}
+              {...ENGRAM_PREFETCH}
               className="flex flex-wrap items-baseline gap-x-3 rounded hover:underline focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none"
             >
               <span className="font-medium">{item.title}</span>

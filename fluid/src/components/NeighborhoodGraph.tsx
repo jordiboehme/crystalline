@@ -36,6 +36,7 @@ import type { GraphAnchor } from "../graphElements";
 import { graphConnections, graphElements } from "../graphElements";
 import { RETIRED_CLASS, isRetired } from "../lifecycle";
 import { engramRoute } from "../paths";
+import { ENGRAM_PREFETCH } from "../prefetch";
 import { BUTTON } from "./primitives";
 
 const GraphCanvas = lazy(() => import("./GraphCanvas"));
@@ -246,6 +247,7 @@ function EngramName({ node }: { node: GraphNode }) {
   return (
     <Link
       to={engramRoute(node.domain, node.permalink)}
+      {...ENGRAM_PREFETCH}
       aria-label={`${node.title}, ${node.permalink}`}
       className={`text-sky-700 underline underline-offset-2 hover:no-underline dark:text-sky-400 ${
         isRetired(node.status) ? RETIRED_CLASS : ""
