@@ -601,6 +601,8 @@ mod tests {
             ("CRYSTALLINE_GITHUB_OAUTH_CLIENT_ID", "client-xyz"),
             ("CRYSTALLINE_SERVICE_READ_ONLY", "true"),
             ("CRYSTALLINE_SERVICE_HTTP", "0.0.0.0:7411"),
+            ("CRYSTALLINE_SERVICE_UI", "false"),
+            ("CRYSTALLINE_SERVICE_API", "false"),
             (
                 "CRYSTALLINE_SERVICE_ALLOWED_HOSTS",
                 "muthur.lan,mcp.example.com",
@@ -618,6 +620,8 @@ mod tests {
             "github.oauth_client_id",
             "service.read_only",
             "service.http",
+            "service.ui",
+            "service.api",
             "service.allowed_hosts",
             "database.backend",
             "database.url",
@@ -632,6 +636,8 @@ mod tests {
         );
         assert!(effective.github_enabled());
         assert!(effective.read_only());
+        assert!(!effective.ui_enabled());
+        assert!(!effective.api_enabled());
         assert_eq!(
             effective
                 .service
