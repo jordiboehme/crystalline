@@ -263,9 +263,11 @@ enum Command {
         secs: u64,
     },
     /// Run the single-instance daemon: watch domains, embed and serve MCP and ctl
-    /// over the socket, optionally over HTTP.
+    /// over the socket, plus MCP, the JSON API and the web UI over HTTP at
+    /// 127.0.0.1:7411 unless that is turned off.
     Serve {
-        /// Serve the tool router over streamable HTTP at this localhost address.
+        /// Serve MCP, the JSON API and the web UI over HTTP at this address
+        /// (on at 127.0.0.1:7411 by default; pass 'off' to disable).
         #[arg(long)]
         http: Option<String>,
         /// Accept this `Host` header value on the HTTP transport (repeatable).

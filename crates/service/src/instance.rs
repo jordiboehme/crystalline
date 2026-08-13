@@ -871,6 +871,16 @@ fn daemon_log_sink() -> Option<std::process::Stdio> {
 
 /// Spawn `current_exe serve --daemon` fully detached, forwarding `--read-only`
 /// when this instance was asked to serve read-only.
+///
+/// No `--http off` is passed and none ever should be: a daemon started this way
+/// (an agent's `crystalline mcp` connection, the Desktop extension) serves the
+/// HTTP endpoint on 127.0.0.1:7411 by exactly the same default a hand-started
+/// `crystalline serve` does. The daemon is a singleton, so an autostarted one
+/// that skipped HTTP would leave the web UI dead for the most common population
+/// of all, with no way to get it back short of shutting the daemon down. The one
+/// coherent opt-out is `service.http=false`, which turns the endpoint off for
+/// every daemon however it started; the spawned process inherits this one's
+/// environment, so `CRYSTALLINE_SERVICE_HTTP` reaches it too.
 fn spawn_daemon(
     db: Option<&Path>,
     config_path: Option<&Path>,

@@ -39,11 +39,22 @@ impl Env {
         Env { dir }
     }
 
+    /// Isolate a child (and, through inheritance, any daemon it spawns) into
+    /// this test's directories, with the HTTP endpoint turned off.
+    ///
+    /// The endpoint is on at `127.0.0.1:7411` by default, and a port is the one
+    /// thing a temp directory cannot isolate: several of these tests run daemons
+    /// concurrently under nextest, and they would race each other and the
+    /// developer's own daemon for that single real port. `CRYSTALLINE_SERVICE_HTTP=false`
+    /// makes the hermeticity explicit rather than lucky. The one test that wants
+    /// an endpoint passes `--http <free port>`, and the flag wins over this
+    /// variable.
     fn apply(&self, cmd: &mut Command) {
         cmd.env("HOME", &self.dir)
             .env("XDG_CONFIG_HOME", self.dir.join("config"))
             .env("XDG_STATE_HOME", self.dir.join("state"))
-            .env("XDG_CACHE_HOME", self.dir.join("cache"));
+            .env("XDG_CACHE_HOME", self.dir.join("cache"))
+            .env("CRYSTALLINE_SERVICE_HTTP", "false");
     }
 
     fn state_dir(&self) -> PathBuf {
@@ -962,6 +973,83 @@ fn http_smoke_initialize_list_and_search() {
         "search over HTTP returns content: {search}"
     );
 
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// An unrelated process holding the HTTP address is not fatal: the daemon says
+/// which address failed, why, and what still works, then keeps serving MCP and
+/// ctl over its socket. With the endpoint on by default this is the way most
+/// people will ever meet a port conflict, so the line has to be actionable.
+///
+/// The squatted address is an ephemeral port this test binds itself, never the
+/// real `127.0.0.1:7411` default: a test must not fight the developer's own
+/// daemon for the one real port. The `--http` flag also proves it wins over the
+/// `CRYSTALLINE_SERVICE_HTTP=false` this env applies.
+#[test]
+fn an_occupied_http_address_is_not_fatal_and_says_so() {
+    let env = Env::new("busy");
+    env.setup_domain("eng");
+
+    let squatter = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = squatter.local_addr().unwrap().to_string();
+
+    let mut serve = Command::new(bin());
+    env.apply(&mut serve);
+    let mut child = serve
+        .args(["serve", "--http", &addr, "--config"])
+        .arg(env.config_path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // The warning rides the daemon's stderr. Reading it on a thread keeps a line
+    // that never arrives from blocking this test forever: the deadline below
+    // fails it instead.
+    let stderr = BufReader::new(child.stderr.take().unwrap());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in stderr.lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                return;
+            }
+        }
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut warning = None;
+    while Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(line) if line.contains("HTTP endpoint failed on") => {
+                warning = Some(line);
+                break;
+            }
+            Ok(_) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    let warning = warning.expect("the daemon reports the HTTP bind it could not take");
+    assert!(
+        warning.contains(&addr),
+        "the line names the address that failed: {warning}"
+    );
+    assert!(
+        warning.contains("MCP over the socket is unaffected"),
+        "the line says what still works: {warning}"
+    );
+    assert!(
+        warning.contains("service.http=false"),
+        "the line names the opt-out: {warning}"
+    );
+
+    // The daemon itself is healthy: its socket answers as if nothing happened.
+    env.wait_ready();
+    let (ok, out) = env.run(&["ctl", "status", "--json"]);
+    assert!(ok, "ctl status still answers over the socket: {out}");
+
+    let _ = env.run(&["ctl", "shutdown"]);
     let _ = child.kill();
     let _ = child.wait();
 }

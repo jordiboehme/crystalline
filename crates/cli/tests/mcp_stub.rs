@@ -58,11 +58,18 @@ impl Env {
         Env { dir, _lock: lock }
     }
 
+    /// Isolate a child into this test's directories, with the HTTP endpoint
+    /// turned off. The daemon-first case here spawns a real `serve --daemon`
+    /// (which inherits this environment) and that daemon dies on the lock this
+    /// test holds, long before it would reach the bind - but the endpoint is on
+    /// at `127.0.0.1:7411` by default now, so relying on a startup ordering to
+    /// keep a test off a real port is not a bet worth taking.
     fn apply(&self, cmd: &mut Command) {
         cmd.env("HOME", &self.dir)
             .env("XDG_CONFIG_HOME", self.dir.join("config"))
             .env("XDG_STATE_HOME", self.dir.join("state"))
-            .env("XDG_CACHE_HOME", self.dir.join("cache"));
+            .env("XDG_CACHE_HOME", self.dir.join("cache"))
+            .env("CRYSTALLINE_SERVICE_HTTP", "false");
     }
 
     fn info_path(&self) -> PathBuf {

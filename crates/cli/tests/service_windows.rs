@@ -52,10 +52,17 @@ impl Env {
         Env { dir }
     }
 
+    /// Isolate a child (and any daemon it spawns, which inherits this
+    /// environment) into this test's directories, with the HTTP endpoint turned
+    /// off: it is on at `127.0.0.1:7411` by default and a port is the one thing
+    /// a scratch directory cannot isolate, so concurrent daemons here would race
+    /// each other and the runner for one real port. No test in this file wants
+    /// an endpoint.
     fn apply(&self, cmd: &mut Command) {
         cmd.env("USERPROFILE", &self.dir)
             .env("APPDATA", self.dir.join("roaming"))
-            .env("LOCALAPPDATA", self.dir.join("local"));
+            .env("LOCALAPPDATA", self.dir.join("local"))
+            .env("CRYSTALLINE_SERVICE_HTTP", "false");
     }
 
     fn state_dir(&self) -> PathBuf {

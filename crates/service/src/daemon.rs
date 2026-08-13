@@ -24,8 +24,11 @@ use crate::instance::{acquire_ownership, read_mode_line};
 use crate::mcp::McpServer;
 use crate::overlay;
 
-/// The default HTTP bind address when HTTP is enabled without an explicit one.
-const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:7411";
+/// The default HTTP bind address: where the endpoint comes up when nothing asks
+/// for another one, which since the default flip is the plain `crystalline serve`
+/// case too. `crate::settings` reports it as the effective `service.http` value
+/// so `config show` and the daemon cannot drift apart.
+pub(crate) const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:7411";
 
 /// Startup banner, shown on a foreground start when stderr is a terminal.
 const BANNER: &str = r"
@@ -395,8 +398,15 @@ pub async fn run_serve(
         let rx = shared.watch();
         let token = setup_token.clone();
         tokio::spawn(async move {
+            // Named for the operator, because with the endpoint on by default
+            // the common way to see this line is an unrelated process already
+            // holding 7411 - and the daemon is otherwise perfectly healthy, so
+            // the line has to say both what broke and what still works.
+            let bind = addr.clone();
             if let Err(err) = run_http(addr, allowed_hosts, e, sessions, token, rx).await {
-                tracing::warn!("HTTP endpoint stopped: {err}");
+                tracing::warn!(
+                    "HTTP endpoint failed on {bind} ({err}); MCP over the socket is unaffected - free the port, bind another with service.http, or set service.http=false"
+                );
             }
         });
     }
@@ -1457,6 +1467,12 @@ fn is_hidden(name: &str) -> bool {
 // --- config + path resolution -----------------------------------------------
 
 /// Resolve the HTTP bind address from the flag then the config.
+///
+/// The endpoint is ON by default, at [`DEFAULT_HTTP_ADDR`]: a daemon nobody
+/// configured still serves the web UI, the JSON API and MCP over loopback, which
+/// is what makes the UI zero-config. `serve --http off` wins over everything, and
+/// `service.http: false` (or `CRYSTALLINE_SERVICE_HTTP=false`) is the config-file
+/// opt-out; every other spelling names an address or asks for the default one.
 fn resolve_http(flag: Option<&str>, config: &GlobalConfig) -> Option<String> {
     if let Some(f) = flag {
         let f = f.trim();
@@ -1467,9 +1483,10 @@ fn resolve_http(flag: Option<&str>, config: &GlobalConfig) -> Option<String> {
         };
     }
     match config.service.as_ref().and_then(|s| s.http.as_ref()) {
-        Some(HttpSetting::Enabled(true)) => Some(DEFAULT_HTTP_ADDR.to_string()),
+        Some(HttpSetting::Enabled(false)) => None,
         Some(HttpSetting::Address(a)) => Some(a.clone()),
-        _ => None,
+        // Explicitly on, and unset, are the same answer: the loopback default.
+        Some(HttpSetting::Enabled(true)) | None => Some(DEFAULT_HTTP_ADDR.to_string()),
     }
 }
 
@@ -1599,10 +1616,39 @@ mod tests {
         );
     }
 
+    /// The zero-config shape: no flag, no setting, and the endpoint still comes
+    /// up on loopback. This is the whole point of the default - the web UI is
+    /// there without anybody asking for it - and the address is the loopback one
+    /// so nothing is reachable from the network without a deliberate bind.
     #[test]
-    fn resolve_http_none_without_flag_or_config() {
+    fn resolve_http_defaults_to_loopback_without_flag_or_config() {
         let config = GlobalConfig::default();
+        assert_eq!(
+            resolve_http(None, &config),
+            Some(DEFAULT_HTTP_ADDR.to_string())
+        );
+    }
+
+    /// `service.http: false` is the opt-out. Before the default flipped it was
+    /// indistinguishable from an unset setting; now it is the only way to say
+    /// "no HTTP" in the config file, so it gets its own pin.
+    #[test]
+    fn resolve_http_config_false_disables() {
+        let mut config = GlobalConfig::default();
+        config.service = Some(crystalline_core::config::ServiceConfig {
+            http: Some(HttpSetting::Enabled(false)),
+            ..Default::default()
+        });
         assert_eq!(resolve_http(None, &config), None);
+    }
+
+    /// The flag still wins, including against the default nobody configured:
+    /// `serve --http off` on an untouched config serves no HTTP.
+    #[test]
+    fn resolve_http_flag_off_still_wins_over_default() {
+        let config = GlobalConfig::default();
+        assert_eq!(resolve_http(Some("off"), &config), None);
+        assert_eq!(resolve_http(Some("false"), &config), None);
     }
 
     /// A config carrying the two HTTP-surface toggles.
@@ -2040,6 +2086,14 @@ mod tests {
     /// startup output and nowhere else. The startup emission goes through
     /// [`setup_token_lines`], whose text the test above pins, so a log call that
     /// spells the variable itself is by definition a second appearance.
+    ///
+    /// The scan rejects the bare name `token` as well as `setup_token`, because
+    /// the HTTP spawn arm rebinds the secret as `token` before moving it into
+    /// [`run_http`] and the endpoint's own failure warning sits right beside
+    /// that binding: a log line there spelling `{token}` would leak the secret
+    /// into the daemon log with every test in the tree still green. No
+    /// production line in this file pairs `tracing::` with either spelling, so
+    /// the wider net costs nothing today and closes that gap.
     #[test]
     fn the_setup_token_is_never_spelled_into_a_log_call() {
         // Everything above `#[cfg(test)]`, which is the code that runs in a
@@ -2050,7 +2104,7 @@ mod tests {
             .unwrap();
         for (n, line) in served.lines().enumerate() {
             assert!(
-                !(line.contains("tracing::") && line.contains("setup_token")),
+                !(line.contains("tracing::") && line.contains("token")),
                 "daemon.rs:{} logs the setup token: {}",
                 n + 1,
                 line.trim()

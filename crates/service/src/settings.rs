@@ -164,7 +164,7 @@ pub fn registry() -> &'static [SettingSpec] {
         },
         SettingSpec {
             key: "service.http",
-            doc: "Enable the HTTP transport (true or false) or bind it to a host:port address; the serve --http flag wins when given (applies at the next daemon start)",
+            doc: "The HTTP endpoint: on at 127.0.0.1:7411 by default; false turns it off, true spells the default, or bind a host:port address; the serve --http flag wins when given (applies at the next daemon start)",
             kind: SettingKind::String,
             startup_effective: true,
             apply: set_http,
@@ -675,11 +675,15 @@ fn clear_http(config: &mut GlobalConfig) {
     drop_service_if_empty(config);
 }
 
+/// The effective value is what the daemon will actually do, so an unset setting
+/// reports the loopback address the endpoint now opens by default rather than
+/// the old `false`. It is still the default (nobody set it), which is what the
+/// second element says.
 fn http_effective(config: &GlobalConfig) -> (String, bool) {
     match config.service.as_ref().and_then(|s| s.http.as_ref()) {
         Some(HttpSetting::Enabled(v)) => (v.to_string(), false),
         Some(HttpSetting::Address(a)) => (a.clone(), false),
-        None => ("false".to_string(), true),
+        None => (crate::daemon::DEFAULT_HTTP_ADDR.to_string(), true),
     }
 }
 
@@ -1647,12 +1651,14 @@ mod tests {
         assert_eq!(read_only.value, "false");
         assert_eq!(read_only.source, SettingSource::Default);
 
+        // The endpoint is on by default, so the effective value nobody set is the
+        // loopback address the daemon will actually bind.
         let http = &views[6];
-        assert_eq!(http.value, "false");
+        assert_eq!(http.value, "127.0.0.1:7411");
         assert_eq!(http.source, SettingSource::Default);
 
         // Both HTTP-surface toggles default to on, so an unconfigured install
-        // that turns the transport on gets the web UI and the JSON API with it.
+        // gets the web UI and the JSON API on that endpoint.
         let ui = &views[7];
         assert_eq!(ui.value, "true");
         assert_eq!(ui.source, SettingSource::Default);
@@ -1864,6 +1870,28 @@ mod tests {
             cfg.service.as_ref().unwrap().http,
             Some(HttpSetting::Address("127.0.0.1:7411".to_string()))
         );
+    }
+
+    /// `config show` reports what the daemon will actually do, so an untouched
+    /// config reads as the loopback address the endpoint now opens by default -
+    /// still flagged as the default, because nobody set it. `false` is the
+    /// opt-out and reads as itself.
+    #[test]
+    fn service_http_effective_reports_the_loopback_default_when_unset() {
+        let cfg = GlobalConfig::default();
+        assert_eq!(
+            http_effective(&cfg),
+            ("127.0.0.1:7411".to_string(), true),
+            "an unset service.http serves the loopback default"
+        );
+
+        let mut off = GlobalConfig::default();
+        apply(&mut off, "service.http", "false").unwrap();
+        assert_eq!(http_effective(&off), ("false".to_string(), false));
+
+        let mut addr = GlobalConfig::default();
+        apply(&mut addr, "service.http", "0.0.0.0:7411").unwrap();
+        assert_eq!(http_effective(&addr), ("0.0.0.0:7411".to_string(), false));
     }
 
     #[test]
