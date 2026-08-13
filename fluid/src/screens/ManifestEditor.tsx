@@ -271,14 +271,16 @@ function EditorSurface({
             buffer is a question, and a link would have gone regardless of the
             answer.
           */}
-          <button
-            type="button"
-            onClick={session.requestSave}
-            disabled={session.saving || session.hardErrors > 0}
-            className={BUTTON.secondary}
-          >
-            Save
-          </button>
+          <Tooltip label="Save and keep editing">
+            <button
+              type="button"
+              onClick={session.requestSave}
+              disabled={session.saving || session.hardErrors > 0}
+              className={BUTTON.secondary}
+            >
+              Save
+            </button>
+          </Tooltip>
           {/*
             The hint rides the app's own tooltip surface, which is what the
             engram editor's row wears: the two editors are one screen with two
