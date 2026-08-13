@@ -312,6 +312,22 @@ describe("the engram editor", () => {
     });
   });
 
+  it("wears the Raw switch as a glyph, named rather than lettered", async () => {
+    serveEditor();
+    renderApp("/d/eng/edit/alpha");
+    await screen.findByLabelText("Engram source");
+
+    // A mode switch is not a verb, and the two verbs on this row - Save and
+    // Close - are the only things on it that should be read as words. Raw
+    // keeps its name where a name is what a control is known by, in the
+    // accessible name and the tooltip, and shows a source-view glyph instead.
+    const raw = screen.getByRole("button", { name: "Raw" });
+    expect(raw).toHaveTextContent("");
+    expect(raw.querySelector("svg")).not.toBeNull();
+    expect(raw).toHaveAttribute("aria-label", "Raw");
+    expect(raw).toHaveAttribute("title", "Raw");
+  });
+
   it("renders live preview and hands the raw text back on demand", async () => {
     serveEditor();
     renderApp("/d/eng/edit/alpha");
@@ -716,7 +732,55 @@ describe("the engram editor", () => {
     });
   });
 
-  it("Done saves the buffer and leaves for the reading page", async () => {
+  it("carries its actions in the trail's own row, where reading mode has them", async () => {
+    serveEditor();
+    renderApp("/d/eng/edit/alpha");
+    await screen.findByLabelText("Engram source");
+
+    // The reading page puts the trail on the left of a row and the controls at
+    // its right end (`EngramPage.test.tsx` pins that). Editing the same engram
+    // must not move that row: entering the editor used to draw its buttons one
+    // row lower, beside the title, so every toggle between the two modes shunted
+    // the controls up and down the screen.
+    const trail = await screen.findByRole("navigation", { name: "Breadcrumb" });
+    const row = trail.parentElement;
+    expect(row).not.toBeNull();
+    expect(
+      within(row as HTMLElement).getByRole("button", { name: "Save" }),
+    ).toBeInTheDocument();
+    expect(row).toHaveClass("justify-between");
+
+    // And the title keeps its own line under it, with the permalink beside it.
+    const title = screen.getByRole("heading", { level: 1 });
+    expect(title).toHaveTextContent("Editing Alpha");
+    expect(row).not.toContainElement(title);
+  });
+
+  it("Close leaves a clean buffer at once, with nothing to ask about", async () => {
+    const put = vi.fn(() => detailResponse({ checksum: "next111" }));
+    serveEditor({
+      "/domains/eng/engrams/alpha": (_path, init) =>
+        init?.method === "PUT" ? put() : detailResponse(),
+    });
+    renderApp("/d/eng/edit/alpha");
+    await screen.findByLabelText("Engram source");
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Save" })).toBeEnabled();
+    });
+
+    await userEvent.click(screen.getByRole("button", { name: "Close" }));
+
+    // Nothing was typed, so there is nothing to keep and nothing to lose:
+    // asking would be a question with one answer, and writing the file again
+    // would be a round trip for bytes the server already has.
+    expect(
+      await screen.findByRole("heading", { name: "Alpha", level: 1 }),
+    ).toBeInTheDocument();
+    expect(put).not.toHaveBeenCalled();
+    expect(screen.queryByText("Close the editor?")).not.toBeInTheDocument();
+  });
+
+  it("Save and close writes the buffer and then leaves for the reading page", async () => {
     const put = vi.fn(() => detailResponse({ checksum: "next111" }));
     serveEditor({
       "/domains/eng/engrams/alpha": (_path, init) =>
@@ -734,10 +798,17 @@ describe("the engram editor", () => {
       expect(screen.getByRole("button", { name: "Save" })).toBeEnabled();
     });
 
-    await userEvent.click(screen.getByRole("button", { name: "Done" }));
+    // Close no longer saves on its own: it asks what should happen to the text
+    // it is about to walk away from, and this is the answer that keeps it.
+    await userEvent.click(screen.getByRole("button", { name: "Close" }));
+    expect(await screen.findByText("Close the editor?")).toBeVisible();
+    await userEvent.click(
+      screen.getByRole("button", { name: "Save and close" }),
+    );
 
-    // Finished means both halves: the write landed, and the reading page is
-    // where being finished ends up.
+    // Both halves: the write landed, and the reading page is where the answer
+    // ends up. The navigation hangs off the server's receipt, so a refused
+    // write could never take somebody away from text it did not keep.
     await waitFor(() => {
       expect(put).toHaveBeenCalled();
     });
@@ -748,14 +819,9 @@ describe("the engram editor", () => {
       await screen.findByRole("heading", { name: "Alpha", level: 1 }),
     ).toBeInTheDocument();
     expect(screen.queryByLabelText("Engram source")).not.toBeInTheDocument();
-    // The save landed, so nothing was at risk and nothing was asked: the
-    // confirm belongs to the one path where Done cannot keep its promise.
-    expect(
-      screen.queryByText("This engram cannot be saved"),
-    ).not.toBeInTheDocument();
   });
 
-  it("Done leaves a clean buffer with hard errors without asking", async () => {
+  it("Close leaves a clean buffer with hard errors without asking", async () => {
     const put = vi.fn(() => detailResponse({ checksum: "next111" }));
     serveEditor({
       "/validate": () => ({
@@ -779,67 +845,70 @@ describe("the engram editor", () => {
       expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
     });
 
-    await userEvent.click(screen.getByRole("button", { name: "Done" }));
+    await userEvent.click(screen.getByRole("button", { name: "Close" }));
 
-    // The save gate holds here exactly as it holds on Save. Nothing was typed,
-    // so the buffer is the file and leaving costs nothing: there is nothing to
-    // ask about, and a dialog in front of a free exit would be pure friction.
+    // The findings are about the file, not about this session: nothing was
+    // typed, so there is still nothing at risk and the exit is still free.
     expect(
       await screen.findByRole("heading", { name: "Alpha", level: 1 }),
     ).toBeInTheDocument();
     expect(put).not.toHaveBeenCalled();
-    expect(
-      screen.queryByText("This engram cannot be saved"),
-    ).not.toBeInTheDocument();
+    expect(screen.queryByText("Close the editor?")).not.toBeInTheDocument();
   });
 
-  it("Done asks before leaving text that hard errors will not let it save", async () => {
+  it("Save and close keeps the author here when the findings refuse the save", async () => {
     serveEditor(refusedByFindings());
     renderApp("/d/eng/edit/alpha");
     await screen.findByLabelText("Engram source");
     await typeUnsavableStatus();
 
-    await userEvent.click(screen.getByRole("button", { name: "Done" }));
-
-    // Done promises the work is kept, and here it cannot keep it: the way out
-    // stays open, but it is now a thing somebody chooses with the count of
-    // what blocks the save and the fate of their text on screen.
-    expect(
-      await screen.findByText("This engram cannot be saved"),
-    ).toBeVisible();
+    await userEvent.click(screen.getByRole("button", { name: "Close" }));
+    expect(await screen.findByText("Close the editor?")).toBeVisible();
+    // The question says why the save may not land, in the same count the
+    // screen behind it carries.
     expect(
       screen.getByText(
-        "1 hard error blocks saving. Your text is kept as a local draft.",
+        /1 hard error blocks saving, so Save and close will keep you here/,
       ),
     ).toBeVisible();
+
+    await userEvent.click(
+      screen.getByRole("button", { name: "Save and close" }),
+    );
+
+    // The gate refuses, so the answer cannot be honoured: the question goes
+    // away rather than standing there unanswerable, and the author is left on
+    // their own text with the findings that hold it back in plain sight.
+    await waitFor(() => {
+      expect(screen.queryByText("Close the editor?")).not.toBeInTheDocument();
+    });
     expect(screen.getByLabelText("Engram source")).toBeInTheDocument();
+    expect(screen.getByText(/block saving/)).toBeVisible();
     expect(
       screen.queryByRole("heading", { name: "Alpha", level: 1 }),
-    ).not.toBeInTheDocument();
+    ).toBeNull();
   });
 
-  it("Keep editing puts the confirm away and leaves the buffer standing", async () => {
+  it("Keep editing puts the question away and leaves the buffer standing", async () => {
     serveEditor(refusedByFindings());
     renderApp("/d/eng/edit/alpha");
     await screen.findByLabelText("Engram source");
     await typeUnsavableStatus();
-    await userEvent.click(screen.getByRole("button", { name: "Done" }));
-    await screen.findByText("This engram cannot be saved");
+    await userEvent.click(screen.getByRole("button", { name: "Close" }));
+    await screen.findByText("Close the editor?");
 
     await userEvent.click(screen.getByRole("button", { name: "Keep editing" }));
 
-    // The default answer, and the one that changes nothing: the text is where
-    // it was, on the screen it was on.
+    // The answer that changes nothing: the text is where it was, on the screen
+    // it was on.
     await waitFor(() => {
-      expect(
-        screen.queryByText("This engram cannot be saved"),
-      ).not.toBeInTheDocument();
+      expect(screen.queryByText("Close the editor?")).not.toBeInTheDocument();
     });
     expect(screen.getByLabelText("Status")).toHaveValue("brewing");
     expect(screen.getByLabelText("Engram source")).toBeInTheDocument();
   });
 
-  it("Keep editing disarms a Done that is already riding a save", async () => {
+  it("Keep editing disarms a Close that is already riding a save", async () => {
     const { put, land } = gatedPut();
     let landVerdict = () => {};
     const verdict = new Promise<void>((resolve) => {
@@ -881,9 +950,12 @@ describe("the engram editor", () => {
     await userEvent.type(status, "brewing");
     await userEvent.tab();
 
-    // Done #1 lands inside that window: the gate is still open, so this is an
-    // ordinary save-and-finish and the PUT goes out armed.
-    await userEvent.click(screen.getByRole("button", { name: "Done" }));
+    // Close #1 lands inside that window: the gate is still open, so Save and
+    // close starts an ordinary PUT and arms the exit that rides it.
+    await userEvent.click(screen.getByRole("button", { name: "Close" }));
+    await userEvent.click(
+      screen.getByRole("button", { name: "Save and close" }),
+    );
     await waitFor(() => {
       expect(put).toHaveBeenCalled();
     });
@@ -892,14 +964,14 @@ describe("the engram editor", () => {
     landVerdict();
     expect(await screen.findByText(/block saving/)).toBeVisible();
 
-    // Done #2 can only offer the way out now, and the author turns it down.
-    await userEvent.click(screen.getByRole("button", { name: "Done" }));
-    await screen.findByText("This engram cannot be saved");
+    // Close #2 asks again, and this time the author turns the exit down.
+    await userEvent.click(screen.getByRole("button", { name: "Close" }));
+    await screen.findByText("Close the editor?");
     await userEvent.click(screen.getByRole("button", { name: "Keep editing" }));
 
     // The save that was already on its way lands on a buffer that still
-    // matches what it carried. Nothing may act on the finish request the
-    // author has since withdrawn: choosing to stay means staying.
+    // matches what it carried. Nothing may act on the exit the author has
+    // since withdrawn: choosing to stay means staying.
     land();
     await settled();
     expect(screen.getByLabelText("Engram source")).toBeInTheDocument();
@@ -908,25 +980,34 @@ describe("the engram editor", () => {
     ).toBeNull();
   });
 
-  it("Leave anyway writes the draft before walking out of a buffer it cannot save", async () => {
+  it("Discard changes walks out and takes the recovery draft with it", async () => {
     serveEditor(refusedByFindings());
     renderApp("/d/eng/edit/alpha");
     await screen.findByLabelText("Engram source");
     await typeUnsavableStatus();
+    // The safety net has caught this text by now, which is exactly what makes
+    // the discard a real question: without clearing it, the next visit would
+    // offer back the very text that was thrown away.
+    await waitFor(
+      () => {
+        expect(readDraft("ada", "eng", "alpha")?.content).toContain(
+          "status: brewing",
+        );
+      },
+      { timeout: 4000 },
+    );
 
-    // Immediately: the draft debounce is a whole second, so the walkout the
-    // confirm authorizes is the moment the text has to be put somewhere.
-    await userEvent.click(screen.getByRole("button", { name: "Done" }));
-    await screen.findByText("This engram cannot be saved");
-    await userEvent.click(screen.getByRole("button", { name: "Leave anyway" }));
+    await userEvent.click(screen.getByRole("button", { name: "Close" }));
+    await screen.findByText("Close the editor?");
+    await userEvent.click(
+      screen.getByRole("button", { name: "Discard changes" }),
+    );
 
     await screen.findByRole("heading", { name: "Alpha", level: 1 });
-    expect(readDraft("ada", "eng", "alpha")?.content).toContain(
-      "status: brewing",
-    );
+    expect(readDraft("ada", "eng", "alpha")).toBeNull();
   });
 
-  it("Done rides a save that is already in flight and finishes on it", async () => {
+  it("Close rides a save that is already in flight and finishes on it", async () => {
     const { put, land } = gatedPut();
     serveEditor({
       "/domains/eng/engrams/alpha": (_path, init) =>
@@ -946,9 +1027,12 @@ describe("the engram editor", () => {
     await waitFor(() => {
       expect(put).toHaveBeenCalledTimes(1);
     });
-    // Pressed while the round trip is still out: a second save cannot start,
-    // so the press rides the one that is already carrying this text.
-    await userEvent.click(screen.getByRole("button", { name: "Done" }));
+    // Answered while the round trip is still out: a second save cannot start,
+    // so the answer rides the one that is already carrying this text.
+    await userEvent.click(screen.getByRole("button", { name: "Close" }));
+    await userEvent.click(
+      screen.getByRole("button", { name: "Save and close" }),
+    );
     land();
 
     expect(
@@ -957,7 +1041,7 @@ describe("the engram editor", () => {
     expect(put).toHaveBeenCalledTimes(1);
   });
 
-  it("Done never finishes on a save that no longer carries what is on screen", async () => {
+  it("Close never finishes on a save that no longer carries what is on screen", async () => {
     const { put, land } = gatedPut();
     serveEditor({
       "/domains/eng/engrams/alpha": (_path, init) =>
@@ -978,7 +1062,7 @@ describe("the engram editor", () => {
       expect(put).toHaveBeenCalledTimes(1);
     });
     // The author keeps working while the round trip is out, and only then asks
-    // to be finished. What is in flight is a version of this engram that has
+    // to be closed out. What is in flight is a version of this engram that has
     // already been left behind.
     await userEvent.clear(await screen.findByLabelText("Status"));
     await userEvent.type(screen.getByLabelText("Status"), "legacy");
@@ -988,11 +1072,15 @@ describe("the engram editor", () => {
         "legacy",
       );
     });
-    await userEvent.click(screen.getByRole("button", { name: "Done" }));
+    await userEvent.click(screen.getByRole("button", { name: "Close" }));
+    await userEvent.click(
+      screen.getByRole("button", { name: "Save and close" }),
+    );
     land();
 
-    // Finished would be a lie about text the server has never seen, so the
-    // save lands, says so, and leaves the author on their own newer buffer.
+    // Closing on it would be a lie about text the server has never seen, so
+    // the save lands, says so, and leaves the author on their own newer
+    // buffer.
     expect(await screen.findByText("Saved")).toBeInTheDocument();
     await settled();
     expect(screen.getByLabelText("Engram source")).toBeInTheDocument();
@@ -1006,7 +1094,7 @@ describe("the engram editor", () => {
     );
   });
 
-  it("a refused save disarms Done rather than finishing on the next one", async () => {
+  it("a refused save disarms the exit rather than taking the next one", async () => {
     const put = vi.fn(() => {
       throw new ApiProblem(500, "server error", "the index is on fire");
     });
@@ -1024,7 +1112,10 @@ describe("the engram editor", () => {
       expect(screen.getByRole("button", { name: "Save" })).toBeEnabled();
     });
 
-    await userEvent.click(screen.getByRole("button", { name: "Done" }));
+    await userEvent.click(screen.getByRole("button", { name: "Close" }));
+    await userEvent.click(
+      screen.getByRole("button", { name: "Save and close" }),
+    );
 
     expect(await screen.findByText(/the index is on fire/)).toBeInTheDocument();
     await settled();
@@ -1034,7 +1125,7 @@ describe("the engram editor", () => {
     ).toBeNull();
   });
 
-  it("Done never saves twice for one press", async () => {
+  it("Close never saves twice for one press", async () => {
     const put = vi.fn(() => detailResponse({ checksum: "next111" }));
     serveEditor({
       "/domains/eng/engrams/alpha": (_path, init) =>
@@ -1045,11 +1136,12 @@ describe("the engram editor", () => {
     await waitFor(() => {
       expect(screen.getByRole("button", { name: "Save" })).toBeEnabled();
     });
-    // Save, then Done - the order the smoke journey presses them in. The
-    // second press has nothing left to write, so it only leaves.
+    // Save, then Close - the order the smoke journey presses them in. The
+    // save left the buffer clean, so the second press has nothing to ask
+    // about and nothing left to write: it only leaves.
     await userEvent.click(screen.getByRole("button", { name: "Save" }));
     await screen.findByText("Saved");
-    await userEvent.click(screen.getByRole("button", { name: "Done" }));
+    await userEvent.click(screen.getByRole("button", { name: "Close" }));
     expect(
       await screen.findByRole("heading", { name: "Alpha", level: 1 }),
     ).toBeInTheDocument();
@@ -1647,11 +1739,11 @@ describe("the engram editor in a session", () => {
     expect(puts()).toHaveLength(0);
   });
 
-  it("Done is the plain way out of a room, saving nothing itself", async () => {
+  it("Close is the plain way out of a room, saving nothing itself", async () => {
     const { flush } = await openRoom();
     // The server owns the write in a session, so the promise this control can
     // keep is leaving - and it keeps it as a link, the way it always has.
-    const done = screen.getByRole("link", { name: "Done" });
+    const done = screen.getByRole("link", { name: "Close" });
     expect(done).toHaveAttribute("href", "/d/eng/e/alpha");
     await userEvent.click(done);
     expect(

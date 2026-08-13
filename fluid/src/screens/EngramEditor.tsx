@@ -16,7 +16,7 @@ import type { EditorView } from "@codemirror/view";
 import { keymap } from "@codemirror/view";
 import type { QueryClient } from "@tanstack/react-query";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Check } from "lucide-react";
+import { Check, FileCode } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router";
 import type { YSyncConfig } from "y-codemirror.next";
@@ -38,7 +38,7 @@ import { PresenceChips } from "../collab/PresenceChips";
 import type { CollabConflict, CollabSession } from "../collab/useCollabSession";
 import { fileSpace, useCollabSession } from "../collab/useCollabSession";
 import { Breadcrumbs, crumbsOf } from "../components/Breadcrumbs";
-import { BUTTON, TOGGLE } from "../components/primitives";
+import { BUTTON, ICON_TOGGLE } from "../components/primitives";
 import { Skeleton } from "../components/Skeleton";
 import CmEditor from "../editor/CmEditor";
 import { ConfirmLeaveDialog } from "../editor/ConfirmLeaveDialog";
@@ -62,6 +62,7 @@ import {
 } from "../editor/setup";
 import { tableContextListener } from "../editor/tableVerbs";
 import { formattingKeymap } from "../editor/toolbar";
+import { useCloseFlow, useExitRequest } from "../editor/useCloseFlow";
 import { saveKeymap, useEditorSession } from "../editor/useEditorSession";
 import {
   wikilinkChips,
@@ -566,20 +567,18 @@ function Surface({
    * keystroke, which an inline closure would let starve the draft to nothing.
    */
   const inRoom = room !== null;
-  /**
-   * Whether the save now being asked for is a Done rather than a checkpoint.
-   *
-   * A ref rather than state because nothing renders differently for it: it is
-   * read once, inside the save that answers the request, where the server's
-   * response is what says the write landed. It is set by `finish` below and
-   * cleared by whichever end the save reaches - the navigation, or the throw.
-   */
-  const finishing = useRef(false);
   const separator = collab.separator;
   const draftContent = useCallback(
     (buffer: string) => (inRoom ? fileSpace(buffer, separator) : buffer),
     [inRoom, separator],
   );
+
+  /**
+   * The standing "leave when this save lands" flag, made before the session
+   * because the save below is what answers it. The flow that arms and clears
+   * it is built after the session, where the dirty state it asks about is.
+   */
+  const exit = useExitRequest();
 
   // Everything both editors agree on - the buffer's checksum and dirty state,
   // the dry-run gate, drafts, the Mod-S save and the 412 flow - lives in the
@@ -611,11 +610,11 @@ function Surface({
           token,
         );
       } catch (error) {
-        // A refused save is not a finish. The author stays on the buffer that
+        // A refused save is not an exit. The author stays on the buffer that
         // caused it, with the notice or the conflict view the session raises,
         // and the standing request to leave is dropped rather than left armed
         // for whatever save happens to land next.
-        finishing.current = false;
+        exit.disarm();
         throw error;
       }
       queryClient.setQueryData(
@@ -633,31 +632,21 @@ function Surface({
         queryKey: domainTreeKey(saved.domain),
       });
       /*
-       * Whether this save is the one Done meant.
+       * Whether this save is the one Save and close asked for.
        *
-       * The flag rides whichever save consumes it, which is what makes a Done
-       * pressed during a round trip finish on it - but the buffer can have
-       * moved on in the meantime, and then this response is a receipt for text
-       * the author has already left behind. Walking them out on it would take
-       * the newer text off the screen under a button that promises the work is
-       * kept. So the finish is conditional on the buffer still being what went
-       * on the wire, read back through `docText` at the moment the answer
-       * lands. What is compared is the SENT content rather than the returned
-       * content: a server that normalizes what it stores would otherwise make
-       * every save look stale and no Done would ever finish.
-       *
-       * A stale one leaves the author on their newer buffer with the "Saved"
-       * notice standing, and one more press finishes that.
+       * What is compared is the SENT content rather than the returned content,
+       * read back through `docText` at the moment the answer lands: a server
+       * that normalizes what it stores would otherwise make every save look
+       * stale and no exit would ever be taken. The rest of the rule - why it is
+       * conditional at all, and who else clears the flag - lives on
+       * `useCloseFlow`, which holds it for both editors.
        */
-      const finished =
-        finishing.current && (view === null || docText(view.state) === content);
-      finishing.current = false;
-      if (finished) {
-        // Done: the server has confirmed the write, so being finished with
-        // this engram ends where reading it does - at the address the save
-        // answered from, which a rename through the frontmatter has already
-        // moved. Nothing navigates before this point: a save the server
-        // refused throws above and leaves the author where they are.
+      if (exit.consume(view === null || docText(view.state) === content)) {
+        // The server has confirmed the write, so closing ends where reading
+        // begins - at the address the save answered from, which a rename
+        // through the frontmatter has already moved. Nothing navigates before
+        // this point: a save the server refused throws above and leaves the
+        // author where they are.
         void navigate(engramRoute(saved.domain, saved.permalink));
       } else if (saved.permalink !== engram.permalink) {
         // The rename receipt: the engram answers at its new address now, and
@@ -679,59 +668,22 @@ function Surface({
   });
 
   /**
-   * Done on the solo surface: save what there is to save, then leave.
-   *
-   * Two mental models, one for each control - Save is a checkpoint, Done is
-   * being finished - and finished has to mean the work is kept, or the word is
-   * a lie. The navigation happens in the save itself, on the server's receipt,
-   * so a refused write keeps the author here rather than walking them away
-   * from text that never landed.
-   *
-   * The way out stays open when the save cannot happen, but only one of the
-   * two ways it cannot happen is silent. A clean buffer has nothing to write,
-   * so a PUT would only be a round trip for a file that already matches and
-   * leaving costs nothing: Done goes, and asking would be friction in front of
-   * a free exit. A buffer the findings refuse is the other case - there is
-   * text here that this button cannot keep, and walking somebody out of it
-   * without a word is the one thing Done must not do quietly. So that exit is
-   * a question: `ConfirmLeaveDialog` says what blocks the save and where the
-   * text goes, and the leaving happens only if it is chosen.
-   *
-   * The chosen walkout snapshots the buffer first. Nothing else in this app
-   * asks before an in-app navigation - `beforeunload` is for closing the tab,
-   * and there is no route blocker - so the draft store is the whole safety net
-   * here, and its own writer is a debounce a second wide. A correction typed
-   * and then abandoned inside that second would otherwise be in neither the
-   * file nor the draft. This is the same deliberate snapshot the closed-room
-   * walkout takes, for the same reason.
-   *
-   * Every press decides afresh, which is why the standing request is dropped
-   * on the way in rather than left for the next branch to inherit. A save can
-   * be in the air when this runs - the findings lag the buffer by the dry-run
-   * debounce, so a Done inside that window starts a PUT and the refusal lands
-   * behind it - and the second press then reaches the confirm with the first
-   * one's flag still armed. Without this line "Keep editing" would put the
-   * dialog away and the landing save would walk the author out anyway, on a
-   * request they had just withdrawn. The save path re-arms two lines below, so
-   * a Done that really is a save still finishes on its own receipt.
+   * The way out, and the question it asks of a buffer with unsaved text in it.
+   * Every rule it holds - what each answer means, and what may still act on a
+   * save already in the air - lives in `useCloseFlow`, which both editors use.
    */
-  const [confirmingLeave, setConfirmingLeave] = useState(false);
-  const leave = () => {
-    void navigate(engramRoute(engram.domain, engram.permalink));
-  };
-  const finish = () => {
-    finishing.current = false;
-    if (session.hardErrors > 0 && session.dirty) {
-      setConfirmingLeave(true);
-      return;
-    }
-    if (session.hardErrors > 0 || !session.dirty) {
-      leave();
-      return;
-    }
-    finishing.current = true;
-    session.requestSave();
-  };
+  const closing = useCloseFlow(
+    exit,
+    {
+      dirty: session.dirty,
+      hardErrors: session.hardErrors,
+      requestSave: session.requestSave,
+      discardDraft: session.discardDraft,
+    },
+    () => {
+      void navigate(engramRoute(engram.domain, engram.permalink));
+    },
+  );
 
   /**
    * The session's own save receipt, folded back into the buffer's state: the
@@ -886,32 +838,18 @@ function Surface({
           Where this engram lives, above its name - the same trail the read
           page carries, so moving between reading and editing does not move
           the address to a different place on the screen.
+
+          The controls sit at the right end of that same trail row, which is
+          where the reading page carries its own. They used to stand one row
+          lower, beside the title, so every toggle between reading and editing
+          shunted the row of controls up or down the screen under the pointer
+          that had just pressed one of them.
         */}
-        <Breadcrumbs
-          crumbs={crumbsOf(engram.domain, engram.permalink, engram.title)}
-        />
-        <div className="flex flex-wrap items-baseline justify-between gap-3">
-          <div className="flex flex-wrap items-baseline gap-3">
-            <h1 className="text-title">Editing {engram.title}</h1>
-            {/*
-              The permalink stays beside the title rather than folding into
-              the trail above, which carries folders and the title but never
-              the slug. This screen has no details panel to hold the address,
-              and a save that renamed the engram through its frontmatter
-              answers at a new one: this line is where an author sees that
-              happen.
-            */}
-            <span className="font-mono text-caption text-slate-500 dark:text-slate-400">
-              {engram.permalink}
-            </span>
-            {inRoom && (
-              <PresenceChips
-                participants={collab.participants}
-                offline={collab.status !== "connected"}
-              />
-            )}
-          </div>
-          <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <Breadcrumbs
+            crumbs={crumbsOf(engram.domain, engram.permalink, engram.title)}
+          />
+          <div className="flex flex-wrap items-center gap-2">
             {/*
               Who reports on saving depends on who does it. In a room the
               server saves and its control channel is the only truth about
@@ -957,10 +895,19 @@ function Surface({
               `aria-pressed` carries the state. A button whose text flipped to
               "Preview" while announcing itself as pressed would be telling a
               screen reader the opposite of what it shows.
+
+              A glyph rather than the word, because this row's two verbs - Save
+              and Close - are what should read as words on it, and a mode switch
+              standing between them in the same letters competes with both. The
+              name survives where a name is what a control is known by: the
+              accessible name and the tooltip both still say Raw, and the
+              document glyph says which of the two faces the buffer is wearing.
             */}
             <button
               type="button"
               aria-pressed={raw}
+              aria-label="Raw"
+              title="Raw"
               onClick={() => {
                 const next = !raw;
                 setRaw(next);
@@ -974,9 +921,9 @@ function Surface({
               // whole strings rather than a base plus overrides: see `TOGGLE`
               // for why layering accent utilities onto the ghost tier renders
               // nothing at all.
-              className={raw ? TOGGLE.on : TOGGLE.off}
+              className={raw ? ICON_TOGGLE.on : ICON_TOGGLE.off}
             >
-              Raw
+              <FileCode aria-hidden="true" size={16} strokeWidth={1.75} />
             </button>
             <button
               type="button"
@@ -998,36 +945,52 @@ function Surface({
               Save
             </button>
             {/*
-              The primary verb of this screen: Save keeps the work, Done is
-              the act of being finished with it and the one that leaves.
-
-              What "finished" can promise depends on who saves. On the solo
-              surface this tab owns the write, so Done performs it and then
-              leaves - a button, because a link that refused to navigate when
-              the save was refused would be lying about what it is. In a room
-              the server owns the write and is already making it; there is
-              nothing for this control to do but leave, so it stays the link
-              it has always been.
+              The primary verb of this screen: Save keeps the work, Close is
+              the way out. It does not save on the way - one press with two
+              meanings hid the one that could fail - so on the solo surface it
+              is a button that asks what should become of unsaved text before
+              it goes anywhere. In a room the server owns the write and is
+              already making it; there is nothing for this control to do but
+              leave, so it stays the link it has always been.
             */}
             {inRoom ? (
               <Link
                 to={engramRoute(engram.domain, engram.permalink)}
-                title="Finish; the server keeps the room's work"
+                title="Close; the server keeps the room's work"
                 className={BUTTON.primary}
               >
-                Done
+                Close
               </Link>
             ) : (
               <button
                 type="button"
-                onClick={finish}
-                title="Save and finish"
+                onClick={closing.close}
+                title="Close the editor"
                 className={BUTTON.primary}
               >
-                Done
+                Close
               </button>
             )}
           </div>
+        </div>
+        <div className="flex flex-wrap items-baseline gap-3">
+          <h1 className="text-title">Editing {engram.title}</h1>
+          {/*
+            The permalink stays beside the title rather than folding into the
+            trail above, which carries folders and the title but never the
+            slug. This screen has no details panel to hold the address, and a
+            save that renamed the engram through its frontmatter answers at a
+            new one: this line is where an author sees that happen.
+          */}
+          <span className="font-mono text-caption text-slate-500 dark:text-slate-400">
+            {engram.permalink}
+          </span>
+          {inRoom && (
+            <PresenceChips
+              participants={collab.participants}
+              offline={collab.status !== "connected"}
+            />
+          )}
         </div>
       </header>
       {session.hardErrors > 0 && (
@@ -1179,17 +1142,12 @@ function Surface({
           }}
         />
       )}
-      {confirmingLeave && (
+      {closing.confirming && (
         <ConfirmLeaveDialog
           hardErrors={session.hardErrors}
-          onKeepEditing={() => {
-            setConfirmingLeave(false);
-          }}
-          onLeave={() => {
-            setConfirmingLeave(false);
-            session.snapshotDraft();
-            leave();
-          }}
+          onSaveAndClose={closing.saveAndClose}
+          onDiscard={closing.discard}
+          onKeepEditing={closing.keepEditing}
         />
       )}
       {session.conflict && (

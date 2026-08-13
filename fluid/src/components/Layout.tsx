@@ -29,7 +29,6 @@ import {
   PanelLeftOpen,
   Plus,
   Sun,
-  Users as UsersIcon,
 } from "lucide-react";
 import {
   useEffect,
@@ -368,40 +367,28 @@ function TopBar({
           else on its own, so this is not the guard - it is the difference
           between a frame that offers what you can do and one that offers a
           door that will not open.
+
+          The accounts screen used to have an icon of its own beside this one.
+          It does not any more: who you are and what only you may reach are one
+          subject, and they are gathered in the identity menu at the end of this
+          row. What is left here is the connection team domains are tracked
+          with, which is why the glyph is a branch rather than a cog - the
+          screen behind it is about one repository, not about the instance's
+          preferences at large.
         */}
         {capabilities.canAdminister && (
-          <>
-            <NavLink
-              to={usersRoute()}
-              aria-label="Users"
-              title="Users"
-              className={({ isActive }) =>
-                `inline-flex h-8 w-8 shrink-0 items-center justify-center rounded text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800 ${FOCUS_RING} ${
-                  isActive ? "bg-slate-100 dark:bg-slate-800" : ""
-                }`
-              }
-            >
-              <UsersIcon aria-hidden="true" size={16} strokeWidth={1.75} />
-            </NavLink>
-            {/*
-              The connection team domains are tracked with, which is why the
-              glyph is a branch rather than a cog: the settings screen behind
-              it is about one repository connection, not about the instance's
-              preferences at large.
-            */}
-            <NavLink
-              to={githubSettingsRoute()}
-              aria-label="GitHub"
-              title="GitHub"
-              className={({ isActive }) =>
-                `inline-flex h-8 w-8 shrink-0 items-center justify-center rounded text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800 ${FOCUS_RING} ${
-                  isActive ? "bg-slate-100 dark:bg-slate-800" : ""
-                }`
-              }
-            >
-              <GitBranch aria-hidden="true" size={16} strokeWidth={1.75} />
-            </NavLink>
-          </>
+          <NavLink
+            to={githubSettingsRoute()}
+            aria-label="GitHub"
+            title="GitHub"
+            className={({ isActive }) =>
+              `inline-flex h-8 w-8 shrink-0 items-center justify-center rounded text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800 ${FOCUS_RING} ${
+                isActive ? "bg-slate-100 dark:bg-slate-800" : ""
+              }`
+            }
+          >
+            <GitBranch aria-hidden="true" size={16} strokeWidth={1.75} />
+          </NavLink>
         )}
 
         <ThemeMenu />
@@ -515,7 +502,15 @@ function ThemeMenu() {
 }
 
 /**
- * Who you are, and how to stop being them.
+ * Who you are, what only you can reach, and how to stop being them.
+ *
+ * The one identity item in the frame. The accounts screen used to sit beside
+ * this as an icon of its own, which made two controls out of one subject: an
+ * administrator is a person, and the screens only an administrator opens are
+ * things about that person's session rather than things about the page. So they
+ * are rows in here, under the line that says who is signed in - and the two of
+ * them are gated exactly as the screens behind them are, because a frame that
+ * offers a door which will not open is worse than one that offers nothing.
  *
  * The anonymous viewer is named on the trigger itself rather than only inside
  * the menu: browsing without an account changes what the app will let you do,
@@ -544,6 +539,23 @@ function UserMenu() {
                 {user.name} ({capabilities.role})
               </DropdownMenu.Label>
               <DropdownMenu.Separator className="my-1 h-px bg-slate-200 dark:bg-slate-700" />
+              {capabilities.canAdminister && (
+                <>
+                  <DropdownMenu.Item className={ITEM_CLASSES} asChild>
+                    <Link to={usersRoute()}>Users</Link>
+                  </DropdownMenu.Item>
+                  {/*
+                    Named for what the screen is rather than for the service it
+                    talks to: from in here it is where this instance's settings
+                    are kept, and the one page of them today is the repository
+                    connection the branch icon above also opens.
+                  */}
+                  <DropdownMenu.Item className={ITEM_CLASSES} asChild>
+                    <Link to={githubSettingsRoute()}>Settings</Link>
+                  </DropdownMenu.Item>
+                  <DropdownMenu.Separator className="my-1 h-px bg-slate-200 dark:bg-slate-700" />
+                </>
+              )}
               <DropdownMenu.Item
                 className={ITEM_CLASSES}
                 onSelect={() => {

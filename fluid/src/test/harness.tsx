@@ -51,6 +51,9 @@ export function meResponse(overrides: Partial<MeResponse> = {}): MeResponse {
     user: null,
     anonymous: false,
     read_only: false,
+    // An instance that has been set up already, which is what every screen
+    // under test assumes; the first-run flow overrides it where it matters.
+    needs_setup: false,
     csrf: null,
     version: import.meta.env.VITE_APP_VERSION,
     ...overrides,

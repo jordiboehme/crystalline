@@ -30,7 +30,13 @@
  */
 
 import { useQuery } from "@tanstack/react-query";
-import { ChevronRight, MoreHorizontal } from "lucide-react";
+import {
+  ChevronRight,
+  Download,
+  Link2,
+  MoreHorizontal,
+  Printer,
+} from "lucide-react";
 import { DropdownMenu } from "radix-ui";
 import { useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router";
@@ -216,76 +222,76 @@ export default function EngramPage() {
             crumbs={crumbsOf(engram.domain, engram.permalink, engram.title)}
           />
           {/*
-            One thing to do and one place to look for the rest. Editing is what
-            somebody came to this page's header for, so it keeps its name and
-            its button; everything else is a row in the overflow menu, where
-            the destructive one sits alone below a rule. `EngramActions` builds
-            the three utilities and hands them over through the ref the menu
-            rows and the palette both run; it draws nothing here but the region
-            that announces them.
+            A quiet strip, then the one labelled thing. The three utilities are
+            what a reader reaches for often and thinks about rarely, so they are
+            icons: no words to read past on the way to Edit, which is what
+            somebody came to this header for and which keeps its name and its
+            tier. Move and Retire stay behind the fold - one is rare, the other
+            is destructive and destructive belongs where it cannot be brushed.
+
+            Each icon carries EXACTLY the name its menu row carried. A control
+            with no text in it has nothing else to be known by, and the palette
+            still runs the same three through the same ref, so a name that
+            drifted here would be a name that disagreed with itself.
+
+            `EngramActions` builds the three and hands them over through that
+            ref; it draws nothing here but the region that announces a copy.
           */}
           <div className="flex flex-wrap items-center gap-2 print:hidden">
+            <IconButton
+              label="Share link"
+              icon={Link2}
+              onClick={() => {
+                utilities.current?.share();
+              }}
+            />
+            <IconButton
+              label="Download as Markdown"
+              icon={Download}
+              onClick={() => {
+                utilities.current?.download();
+              }}
+            />
+            <IconButton
+              label="Print view"
+              icon={Printer}
+              onClick={() => {
+                utilities.current?.print();
+              }}
+            />
+            {/*
+              Both halves of the write surface hang off one gate: a reader who
+              may not write has nothing left for the menu to hold, and an
+              ellipsis that opens onto an empty panel is worse than no ellipsis.
+            */}
             {capabilities.canWrite && (
-              <Link
-                to={editRoute(engram.domain, engram.permalink)}
-                onPointerEnter={prefetchEditor}
-                onFocus={prefetchEditor}
-                className={BUTTON.primary}
-              >
-                Edit
-              </Link>
-            )}
-            <DropdownMenu.Root>
-              <DropdownMenu.Trigger asChild>
-                <IconButton label="More actions" icon={MoreHorizontal} />
-              </DropdownMenu.Trigger>
-              <DropdownMenu.Portal>
-                <DropdownMenu.Content
-                  align="end"
-                  sideOffset={6}
-                  className={MENU_CLASSES}
+              <>
+                <Link
+                  to={editRoute(engram.domain, engram.permalink)}
+                  onPointerEnter={prefetchEditor}
+                  onFocus={prefetchEditor}
+                  className={BUTTON.primary}
                 >
-                  {capabilities.canWrite && (
-                    <DropdownMenu.Item
-                      className={ITEM_CLASSES}
-                      onSelect={() => {
-                        setMoving(true);
-                      }}
+                  Edit
+                </Link>
+                <DropdownMenu.Root>
+                  <DropdownMenu.Trigger asChild>
+                    <IconButton label="More actions" icon={MoreHorizontal} />
+                  </DropdownMenu.Trigger>
+                  <DropdownMenu.Portal>
+                    <DropdownMenu.Content
+                      align="end"
+                      sideOffset={6}
+                      className={MENU_CLASSES}
                     >
-                      Move
-                    </DropdownMenu.Item>
-                  )}
-                  <DropdownMenu.Item
-                    className={ITEM_CLASSES}
-                    onSelect={() => {
-                      utilities.current?.download();
-                    }}
-                  >
-                    Download as Markdown
-                  </DropdownMenu.Item>
-                  <DropdownMenu.Item
-                    className={ITEM_CLASSES}
-                    onSelect={() => {
-                      utilities.current?.share();
-                    }}
-                  >
-                    Share link
-                  </DropdownMenu.Item>
-                  <DropdownMenu.Item
-                    className={ITEM_CLASSES}
-                    onSelect={() => {
-                      utilities.current?.print();
-                    }}
-                  >
-                    Print view
-                  </DropdownMenu.Item>
-                  {/*
-                    The rule and the retirement are one piece: a reader who
-                    may not write sees neither, rather than a menu ending in a
-                    divider with nothing under it.
-                  */}
-                  {capabilities.canWrite && (
-                    <>
+                      <DropdownMenu.Item
+                        className={ITEM_CLASSES}
+                        onSelect={() => {
+                          setMoving(true);
+                        }}
+                      >
+                        Move
+                      </DropdownMenu.Item>
                       <DropdownMenu.Separator className="my-1 h-px bg-slate-200 dark:bg-slate-700" />
                       <DropdownMenu.Item
                         className={`${ITEM_CLASSES} text-red-700 dark:text-red-300`}
@@ -295,11 +301,11 @@ export default function EngramPage() {
                       >
                         Retire
                       </DropdownMenu.Item>
-                    </>
-                  )}
-                </DropdownMenu.Content>
-              </DropdownMenu.Portal>
-            </DropdownMenu.Root>
+                    </DropdownMenu.Content>
+                  </DropdownMenu.Portal>
+                </DropdownMenu.Root>
+              </>
+            )}
             <EngramActions engram={engram} handlers={utilities} />
           </div>
         </div>

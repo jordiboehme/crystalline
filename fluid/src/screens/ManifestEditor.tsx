@@ -22,7 +22,7 @@ import type { Extension } from "@codemirror/state";
 import type { EditorView } from "@codemirror/view";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
-import { Link, useParams } from "react-router";
+import { useNavigate, useParams } from "react-router";
 
 import { problemDetail } from "../api/client";
 import type { ManifestDetail } from "../api/domain";
@@ -33,15 +33,23 @@ import {
   saveManifest,
 } from "../api/domain";
 import { useAuth } from "../auth/AuthContext";
+import { Breadcrumbs, crumbsOf } from "../components/Breadcrumbs";
 import { BUTTON } from "../components/primitives";
 import { Skeleton } from "../components/Skeleton";
 import CmEditor from "../editor/CmEditor";
+import { ConfirmLeaveDialog } from "../editor/ConfirmLeaveDialog";
 import { ConflictDialog } from "../editor/ConflictDialog";
 import { EditorToolbar } from "../editor/EditorToolbar";
 import { FindingsPanel, jumpToLine } from "../editor/FindingsPanel";
-import { RAW_MONO, baseExtensions, lineSeparatorFor } from "../editor/setup";
+import {
+  RAW_MONO,
+  baseExtensions,
+  docText,
+  lineSeparatorFor,
+} from "../editor/setup";
 import { tableContextListener } from "../editor/tableVerbs";
 import { formattingKeymap } from "../editor/toolbar";
+import { useCloseFlow, useExitRequest } from "../editor/useCloseFlow";
 import { saveKeymap, useEditorSession } from "../editor/useEditorSession";
 import { manifestRoute } from "../paths";
 import { useTheme } from "../theme/context";
@@ -129,6 +137,7 @@ function EditorSurface({
   domain: string;
   manifest: ManifestDetail;
 }) {
+  const navigate = useNavigate();
   const queryClient = useQueryClient();
   const { resolved } = useTheme();
   const { user } = useAuth();
@@ -148,6 +157,17 @@ function EditorSurface({
    */
   const [tableActive, setTableActive] = useState(false);
 
+  /**
+   * The standing "leave when this save lands" flag, made before the session
+   * because the save below is what answers it, and the leaving itself. The flow
+   * that arms and clears the flag is built after the session, where the dirty
+   * state it asks about is.
+   */
+  const exit = useExitRequest();
+  const leave = () => {
+    void navigate(manifestRoute(domain));
+  };
+
   // The shared shell: buffer, checksum, dirty state, the dry-run gate,
   // drafts, the Mod-S save and the 412 flow. What this screen adds is the
   // transport below and the layout under it.
@@ -160,21 +180,60 @@ function EditorSurface({
     validateDomain: domain,
     validatePath: MANIFEST_PATH,
     save: async (content, token) => {
-      const saved = await saveManifest(domain, content, token);
+      let saved;
+      try {
+        saved = await saveManifest(domain, content, token);
+      } catch (error) {
+        // A refused save is not an exit: the author stays on the buffer that
+        // caused it, and the standing request dies with the save rather than
+        // being left armed for whatever lands next.
+        exit.disarm();
+        throw error;
+      }
       // The plain read and the detail read are two cache entries over one
       // file: both are stale the moment this lands.
       void queryClient.invalidateQueries({ queryKey: manifestKey(domain) });
       void queryClient.invalidateQueries({
         queryKey: manifestDetailKey(domain),
       });
+      // Whether this is the save Save and close asked for, and whether it still
+      // carries what is on screen - the same rule the engram editor applies,
+      // spelled once in `useCloseFlow`.
+      if (exit.consume(view === null || docText(view.state) === content)) {
+        leave();
+      }
       return { content: saved.markdown, checksum: saved.checksum ?? "" };
     },
     extensionsFor: (content) => extensionsFor(content, dark, setTableActive),
     ariaLabel: ARIA_LABEL,
   });
 
+  /**
+   * The way out, and the question it asks of a buffer with unsaved text in it -
+   * the engram editor's flow exactly, from the module both screens share, so
+   * the two editors cannot drift apart on what closing means.
+   */
+  const closing = useCloseFlow(
+    exit,
+    {
+      dirty: session.dirty,
+      hardErrors: session.hardErrors,
+      requestSave: session.requestSave,
+      discardDraft: session.discardDraft,
+    },
+    leave,
+  );
+
   return (
     <div className="flex flex-col gap-4">
+      {/*
+        The same trail the MANIFEST's reading page carries, in the same place:
+        this screen used to draw none, so opening the editor took the address
+        off the screen and moved the row of controls up into the line the trail
+        had been on. The reading page's own row is heading-plus-controls with
+        the trail above it, and this is that row.
+      */}
+      <Breadcrumbs crumbs={crumbsOf(domain, "MANIFEST", "MANIFEST")} />
       <header className="flex flex-wrap items-baseline justify-between gap-3">
         <div className="flex flex-wrap items-baseline gap-3">
           {/* The engram editor's own heading scale: the two editors are one
@@ -203,9 +262,14 @@ function EditorSurface({
           {/*
             The same two tiers the engram editor's header wears, drawn from
             the shared primitives rather than hand-rolled here: Save keeps the
-            work, Done is the act of being finished with it and the one that
-            leaves. The classes were a copy of `BUTTON.secondary` for both,
-            which made the two editors' headers drift apart.
+            work, Close is the way out. The classes were a copy of
+            `BUTTON.secondary` for both, which made the two editors' headers
+            drift apart.
+
+            A button rather than the link this used to be, for the reason the
+            engram editor's is one: leaving a MANIFEST with unsaved text in the
+            buffer is a question, and a link would have gone regardless of the
+            answer.
           */}
           <button
             type="button"
@@ -215,9 +279,14 @@ function EditorSurface({
           >
             Save
           </button>
-          <Link to={manifestRoute(domain)} className={BUTTON.primary}>
-            Done
-          </Link>
+          <button
+            type="button"
+            onClick={closing.close}
+            title="Close the editor"
+            className={BUTTON.primary}
+          >
+            Close
+          </button>
         </div>
       </header>
       {session.hardErrors > 0 && (
@@ -283,6 +352,14 @@ function EditorSurface({
           />
         </aside>
       </div>
+      {closing.confirming && (
+        <ConfirmLeaveDialog
+          hardErrors={session.hardErrors}
+          onSaveAndClose={closing.saveAndClose}
+          onDiscard={closing.discard}
+          onKeepEditing={closing.keepEditing}
+        />
+      )}
       {session.conflict && (
         <ConflictDialog
           conflict={session.conflict}

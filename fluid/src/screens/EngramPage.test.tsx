@@ -538,14 +538,19 @@ describe("the engram page", () => {
     });
   });
 
-  it("puts editing in reach and everything else behind one menu", async () => {
+  it("puts the utilities on the row as icons and the writes behind one menu", async () => {
     serve();
 
     renderApp("/d/eng/e/alpha");
 
-    // One thing to do in the header, so the row is a button rather than a
-    // shelf of seven equals.
-    expect(await screen.findByRole("link", { name: "Edit" })).toHaveAttribute(
+    // A quiet strip of icons, then the one labelled thing somebody came to
+    // this header for. Each icon carries EXACTLY the name its menu row carried,
+    // because the name is the whole contract a keyboard or a screen reader
+    // holds over a control with no text in it.
+    for (const name of ["Share link", "Download as Markdown", "Print view"]) {
+      expect(await screen.findByRole("button", { name })).toBeVisible();
+    }
+    expect(screen.getByRole("link", { name: "Edit" })).toHaveAttribute(
       "href",
       "/d/eng/edit/alpha",
     );
@@ -555,14 +560,14 @@ describe("the engram page", () => {
     const user = userEvent.setup();
     await user.click(screen.getByRole("button", { name: "More actions" }));
 
-    for (const name of [
-      "Move",
-      "Download as Markdown",
-      "Share link",
-      "Print view",
-      "Retire",
-    ]) {
+    // What is left behind the fold is what belongs there: the move, and the
+    // destructive one alone under a rule.
+    for (const name of ["Move", "Retire"]) {
       expect(await screen.findByRole("menuitem", { name })).toBeVisible();
+    }
+    // And nothing is offered twice.
+    for (const name of ["Share link", "Download as Markdown", "Print view"]) {
+      expect(screen.queryByRole("menuitem", { name })).toBeNull();
     }
   });
 
@@ -594,19 +599,14 @@ describe("the engram page", () => {
     expect(title.parentElement?.lastElementChild).toBe(title);
   });
 
-  it("runs a utility from the menu rather than from a second copy of it", async () => {
+  it("runs a utility from its icon rather than from a second copy of it", async () => {
     const print = vi.spyOn(window, "print").mockImplementation(() => undefined);
     serve();
 
     renderApp("/d/eng/e/alpha");
 
     const user = userEvent.setup();
-    await user.click(
-      await screen.findByRole("button", { name: "More actions" }),
-    );
-    await user.click(
-      await screen.findByRole("menuitem", { name: "Print view" }),
-    );
+    await user.click(await screen.findByRole("button", { name: "Print view" }));
 
     expect(print).toHaveBeenCalled();
     print.mockRestore();
@@ -636,17 +636,13 @@ describe("the engram page", () => {
     await screen.findByRole("heading", { name: "Alpha" });
     expect(screen.queryByRole("link", { name: "Edit" })).toBeNull();
 
-    const user = userEvent.setup();
-    await user.click(screen.getByRole("button", { name: "More actions" }));
-
-    // The three utilities are everybody's; the writes are absent, and so is
-    // the rule that would otherwise end the menu with nothing under it.
-    expect(
-      await screen.findByRole("menuitem", { name: "Download as Markdown" }),
-    ).toBeVisible();
-    expect(screen.queryByRole("menuitem", { name: "Retire" })).toBeNull();
-    expect(screen.queryByRole("menuitem", { name: "Move" })).toBeNull();
-    expect(screen.queryByRole("separator")).toBeNull();
+    // The three utilities are everybody's, and they are the whole row now.
+    for (const name of ["Share link", "Download as Markdown", "Print view"]) {
+      expect(screen.getByRole("button", { name })).toBeVisible();
+    }
+    // The writes are absent, which leaves the menu with nothing to hold: an
+    // ellipsis that opens onto an empty panel is worse than no ellipsis.
+    expect(screen.queryByRole("button", { name: "More actions" })).toBeNull();
   });
 
   it("keeps the graph folded away until somebody asks for it", async () => {

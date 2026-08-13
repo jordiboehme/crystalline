@@ -11,7 +11,8 @@
  * own.
  */
 
-import { screen, waitFor } from "@testing-library/react";
+import { EditorView } from "@codemirror/view";
+import { act, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -79,6 +80,27 @@ function firstIfMatch(): string | undefined {
   return headers?.["If-Match"];
 }
 
+/**
+ * Put text into the buffer the way an author would leave it - a transaction on
+ * the live view. This screen has no form beside the buffer to type through, so
+ * the dispatch IS the edit; what the tests below care about is the session
+ * state it leaves behind, not the keystrokes that produced it.
+ */
+async function typeIntoBuffer(
+  content: HTMLElement,
+  text: string,
+): Promise<void> {
+  const host = content.closest(".cm-editor");
+  const view = host ? EditorView.findFromDOM(host as HTMLElement) : null;
+  if (!view) {
+    throw new Error("no EditorView is mounted on the buffer");
+  }
+  act(() => {
+    view.dispatch({ changes: { from: view.state.doc.length, insert: text } });
+  });
+  await screen.findByText("Unsaved changes");
+}
+
 beforeEach(() => {
   apiMock.mockReset();
   localStorage.clear();
@@ -130,6 +152,25 @@ describe("the MANIFEST editor", () => {
     ).toBeInTheDocument();
   });
 
+  it("carries the trail above its actions, where the reading page has them", async () => {
+    serveEditor();
+    renderApp("/d/eng/manifest/edit");
+    await screen.findByLabelText("MANIFEST source");
+
+    // The reading page draws the trail on its own line and puts the one
+    // control it has in the row beside the heading. This screen drew no trail
+    // at all and stood its buttons a row higher, so opening the editor moved
+    // them up the screen and losing the trail moved the address off it.
+    const trail = await screen.findByRole("navigation", { name: "Breadcrumb" });
+    const title = screen.getByRole("heading", { level: 1 });
+    const row = title.closest("header");
+    expect(row).not.toBeNull();
+    expect(
+      within(row as HTMLElement).getByRole("button", { name: "Save" }),
+    ).toBeInTheDocument();
+    expect((row as HTMLElement).previousElementSibling).toBe(trail);
+  });
+
   it("saves from inside the buffer, on the keyboard", async () => {
     const put = vi.fn(() => manifestResponse({ checksum: "m2" }));
     serveEditor(savingManifest(put));
@@ -144,6 +185,80 @@ describe("the MANIFEST editor", () => {
       expect(put).toHaveBeenCalled();
     });
     expect(firstIfMatch()).toBe('"m1"');
+  });
+
+  it("Close leaves a clean buffer at once, with nothing to ask about", async () => {
+    const put = vi.fn(() => manifestResponse({ checksum: "m2" }));
+    serveEditor(savingManifest(put));
+    renderApp("/d/eng/manifest/edit");
+    await screen.findByLabelText("MANIFEST source");
+
+    await userEvent.click(screen.getByRole("button", { name: "Close" }));
+
+    // Nothing was typed, so there is nothing to keep and nothing to lose.
+    expect(
+      await screen.findByRole("heading", { name: "MANIFEST", level: 1 }),
+    ).toBeInTheDocument();
+    expect(put).not.toHaveBeenCalled();
+    expect(screen.queryByText("Close the editor?")).not.toBeInTheDocument();
+  });
+
+  it("Close asks before leaving unsaved text, and Save and close keeps it", async () => {
+    const put = vi.fn(() => manifestResponse({ checksum: "m2" }));
+    serveEditor(savingManifest(put));
+    renderApp("/d/eng/manifest/edit");
+    const editor = await screen.findByLabelText("MANIFEST source");
+    await waitFor(() => {
+      expect(editor.textContent).toContain("Route here for eng.");
+    });
+    await typeIntoBuffer(editor, "\nAnd a second line.\n");
+
+    await userEvent.click(screen.getByRole("button", { name: "Close" }));
+    expect(await screen.findByText("Close the editor?")).toBeVisible();
+    await userEvent.click(
+      screen.getByRole("button", { name: "Save and close" }),
+    );
+
+    // The write lands first and the leaving hangs off its receipt, exactly as
+    // it does on the engram editor: the two screens are one editor.
+    await waitFor(() => {
+      expect(put).toHaveBeenCalled();
+    });
+    expect(
+      await screen.findByRole("heading", { name: "MANIFEST", level: 1 }),
+    ).toBeInTheDocument();
+  });
+
+  it("Discard changes walks out and takes the recovery draft with it", async () => {
+    const put = vi.fn(() => manifestResponse({ checksum: "m2" }));
+    serveEditor(savingManifest(put));
+    renderApp("/d/eng/manifest/edit");
+    const editor = await screen.findByLabelText("MANIFEST source");
+    await waitFor(() => {
+      expect(editor.textContent).toContain("Route here for eng.");
+    });
+    await typeIntoBuffer(editor, "\nA line nobody wants.\n");
+    // The safety net has caught it by now, which is what makes discarding a
+    // real question: left behind, the snapshot would offer this text back on
+    // the next visit.
+    await waitFor(
+      () => {
+        expect(localStorage.getItem("fluid.draft.ada.eng/MANIFEST")).toContain(
+          "A line nobody wants.",
+        );
+      },
+      { timeout: 4000 },
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: "Close" }));
+    await screen.findByText("Close the editor?");
+    await userEvent.click(
+      screen.getByRole("button", { name: "Discard changes" }),
+    );
+
+    await screen.findByRole("heading", { name: "MANIFEST", level: 1 });
+    expect(put).not.toHaveBeenCalled();
+    expect(localStorage.getItem("fluid.draft.ada.eng/MANIFEST")).toBeNull();
   });
 
   it("offers a stored draft and restores it into the buffer", async () => {

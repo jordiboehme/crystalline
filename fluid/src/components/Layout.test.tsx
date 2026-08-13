@@ -300,8 +300,8 @@ describe("the layout", () => {
   });
 
   it("names every control in the top bar, icon-shaped ones included", async () => {
-    // An administrator, because the accounts link is the one control the
-    // frame only offers to a session that may use it.
+    // An administrator, because the graph icon is the one control the frame
+    // only offers to a session that may use it.
     serve({
       "/auth/me": () => meResponse({ user: userFixture({ role: "admin" }) }),
       "/domains": domainsResponse,
@@ -317,10 +317,6 @@ describe("the layout", () => {
       "aria-controls",
       "domain-sidebar",
     );
-    expect(screen.getByRole("link", { name: "Users" })).toHaveAttribute(
-      "href",
-      "/users",
-    );
     expect(screen.getByRole("link", { name: "GitHub" })).toHaveAttribute(
       "href",
       "/settings/github",
@@ -330,6 +326,55 @@ describe("the layout", () => {
       "href",
       "/",
     );
+    // Who you are is one item, not a strip: the accounts screen is reached
+    // from inside it rather than from an icon of its own beside it.
+    expect(screen.queryByRole("link", { name: "Users" })).toBeNull();
+  });
+
+  it("gathers who you are and what only you can reach into one menu", async () => {
+    serve({
+      "/auth/me": () => meResponse({ user: userFixture({ role: "admin" }) }),
+      "/domains": domainsResponse,
+      "/activity": () => ({ timeframe: "7d", count: 0, engrams: [] }),
+    });
+
+    renderApp("/");
+    await screen.findByRole("heading", { name: "Home" });
+
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Ada Lovelace" }));
+
+    // The header line says who, in the account's own name and its role, and is
+    // not something to press - it is what the rest of the menu is about.
+    expect(await screen.findByText("ada (admin)")).toBeVisible();
+    expect(screen.queryByRole("menuitem", { name: "ada (admin)" })).toBeNull();
+    // Then the two screens this session may reach, then the way out.
+    expect(
+      await screen.findByRole("menuitem", { name: "Users" }),
+    ).toHaveAttribute("href", "/users");
+    expect(screen.getByRole("menuitem", { name: "Settings" })).toHaveAttribute(
+      "href",
+      "/settings/github",
+    );
+    expect(screen.getByRole("menuitem", { name: "Log out" })).toBeVisible();
+  });
+
+  it("offers no accounts row to a session that may not administer", async () => {
+    serveSignedIn();
+
+    renderApp("/");
+    await screen.findByRole("heading", { name: "Home" });
+
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Ada Lovelace" }));
+
+    // The editor's own identity, and the way out. The screens behind Users and
+    // Settings both refuse anyone but an admin, and the frame offers no door
+    // that will not open.
+    expect(await screen.findByText("ada (editor)")).toBeVisible();
+    expect(screen.getByRole("menuitem", { name: "Log out" })).toBeVisible();
+    expect(screen.queryByRole("menuitem", { name: "Users" })).toBeNull();
+    expect(screen.queryByRole("menuitem", { name: "Settings" })).toBeNull();
   });
 
   it("writes the chosen theme onto the document", async () => {

@@ -54,6 +54,23 @@ export const TOGGLE = {
 } as const;
 
 /**
+ * `TOGGLE`'s two faces at `IconButton`'s size, for a two-state switch whose
+ * name is its tooltip rather than its text.
+ *
+ * Self-contained for exactly the reason spelled out above `TOGGLE`, and doubly
+ * so here: `IconButton` bakes its own `text-slate-600 hover:bg-slate-100` into
+ * the element, so a pressed face passed to it through `className` would lose to
+ * it in the emitted stylesheet and press silently. These are whole strings for
+ * a plain button instead, and every color in them is one of the pairs `TOGGLE`
+ * already carries - no new pair enters the app through this constant.
+ */
+// eslint-disable-next-line react-refresh/only-export-components
+export const ICON_TOGGLE = {
+  off: `inline-flex h-8 w-8 shrink-0 items-center justify-center rounded border border-transparent text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800 ${FOCUS_RING}`,
+  on: `inline-flex h-8 w-8 shrink-0 items-center justify-center rounded border border-accent-600 bg-accent-100 text-accent-900 hover:bg-accent-200 dark:border-accent-400 dark:bg-accent-900 dark:text-accent-50 dark:hover:bg-accent-800 ${FOCUS_RING}`,
+} as const;
+
+/**
  * One height for every control that stands on a row beside another one, and
  * for the cells that are not controls at all.
  *

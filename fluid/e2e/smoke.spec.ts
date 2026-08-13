@@ -236,15 +236,16 @@ test("an engram is created, edited, saved and retired", async ({ page }) => {
   await saveButton.click();
   await expect(page.getByText("Saved")).toBeVisible();
 
-  // The read view shows what was written. Done wears whichever shape the
+  // The read view shows what was written. Close wears whichever shape the
   // surface earns: a link in a room, where the server owns the write and
   // leaving is all this control can promise, and a button on the solo
-  // surface, where it saves first and then leaves. The name is the same
-  // promise either way, and this journey reaches whichever one the daemon
+  // surface, where it asks about unsaved text before it goes. The save above
+  // left this buffer clean either way, so it has nothing to ask about and
+  // leaves at once - and this journey reaches whichever shape the daemon
   // gives it a room for.
   await page
-    .getByRole("link", { name: "Done" })
-    .or(page.getByRole("button", { name: "Done" }))
+    .getByRole("link", { name: "Close" })
+    .or(page.getByRole("button", { name: "Close" }))
     .click();
   await expect(engramTitle(page)).toHaveText("Smoke Journey");
   await expect(page.locator("article")).toContainText("A smoke-written line.");

@@ -9,9 +9,9 @@
  * content, the title and the trail above it.
  *
  * This component draws no controls of its own. The three are handed out
- * through the optional `handlers` ref and run from the page's overflow menu
- * and from the command palette, which is what keeps one copy of each: the
- * clipboard call has an outcome to announce, and the live region that
+ * through the optional `handlers` ref and run from the icon strip in the
+ * page's header and from the command palette, which is what keeps one copy of
+ * each: the clipboard call has an outcome to announce, and the live region that
  * announces it is here, so a share run from either place says the same thing.
  */
 

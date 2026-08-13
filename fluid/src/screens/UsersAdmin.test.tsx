@@ -139,9 +139,15 @@ describe("the user admin screen", () => {
     serveAs("admin");
     renderApp("/users");
 
+    // Inside the identity menu rather than on an icon of its own: who you are
+    // and the accounts only you may administer are one subject, and the frame
+    // gathers them in one place.
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Ada Lovelace" }),
+    );
     expect(
-      await screen.findByRole("link", { name: /users/i }),
-    ).toBeInTheDocument();
+      await screen.findByRole("menuitem", { name: "Users" }),
+    ).toHaveAttribute("href", "/users");
   });
 
   it("teaches what to do when no account is listed", async () => {
