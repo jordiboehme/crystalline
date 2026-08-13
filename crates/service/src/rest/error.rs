@@ -27,6 +27,10 @@ pub struct ApiError {
     pub title: &'static str,
     /// The specific occurrence, safe to show to the caller.
     pub detail: String,
+    /// The one RFC 9457 extension member this surface sends. See
+    /// [`ApiError::token_required`]; `None` on every other failure, and the
+    /// member is then absent from the body entirely.
+    pub token_required: Option<bool>,
 }
 
 impl ApiError {
@@ -36,6 +40,7 @@ impl ApiError {
             status: StatusCode::NOT_FOUND,
             title: "not found",
             detail: detail.into(),
+            token_required: None,
         }
     }
 
@@ -46,6 +51,7 @@ impl ApiError {
             status: StatusCode::UNAUTHORIZED,
             title: "unauthorized",
             detail: detail.into(),
+            token_required: None,
         }
     }
 
@@ -58,6 +64,7 @@ impl ApiError {
             status: StatusCode::FORBIDDEN,
             title: "forbidden",
             detail: detail.into(),
+            token_required: None,
         }
     }
 
@@ -72,6 +79,7 @@ impl ApiError {
             status: StatusCode::CONFLICT,
             title: "conflict",
             detail: detail.into(),
+            token_required: None,
         }
     }
 
@@ -93,6 +101,7 @@ impl ApiError {
             status: StatusCode::PRECONDITION_REQUIRED,
             title: "precondition required",
             detail: detail.into(),
+            token_required: None,
         }
     }
 
@@ -105,6 +114,7 @@ impl ApiError {
             status: StatusCode::BAD_REQUEST,
             title: "invalid request",
             detail: detail.into(),
+            token_required: None,
         }
     }
 
@@ -117,7 +127,31 @@ impl ApiError {
             status: StatusCode::METHOD_NOT_ALLOWED,
             title: "method not allowed",
             detail: "this path does not serve that method".to_string(),
+            token_required: None,
         }
+    }
+
+    /// Mark this problem document with the `token_required` extension member,
+    /// for the one refusal that has a machine-readable answer to "what would
+    /// make this work": `POST /auth/setup` refused for a non-local caller by an
+    /// instance that actually holds a setup token.
+    ///
+    /// RFC 9457 extension members are the standard way to say something a
+    /// client can act on without parsing prose, and this one exists because the
+    /// first-run wizard must decide whether to render a token field at all. It
+    /// is set ONLY when a token exists to be entered: an instance that has none
+    /// (the loopback bind, which generates no token) refuses without the
+    /// member, so the wizard never draws an input that cannot lead anywhere.
+    /// The detail stays display-only copy either way.
+    ///
+    /// A member on [`ProblemDetail`] rather than a second problem type in
+    /// [`ConflictDetail`]'s style: this one adds a flag to an ordinary
+    /// refusal rather than a payload the caller has to be handed, and a handler
+    /// returning `Result<_, ApiError>` can carry it through `?` without giving
+    /// up the shared error type.
+    pub fn token_required(mut self) -> ApiError {
+        self.token_required = Some(true);
+        self
     }
 
     /// Re-render an axum extractor rejection as a problem detail.
@@ -143,6 +177,7 @@ impl ApiError {
             status,
             title,
             detail,
+            token_required: None,
         }
     }
 }
@@ -238,6 +273,15 @@ pub struct ProblemDetail {
     /// The specific occurrence, safe to show to the caller.
     #[schema(example = "no engram 'ghost' in domain 'eng'")]
     pub detail: String,
+    /// An RFC 9457 extension member, present only on the `403` of
+    /// `POST /auth/setup` and only when this instance holds a setup token: the
+    /// first-run wizard renders its token field on this member rather than on
+    /// the detail prose, so an instance that has no token to enter (the
+    /// loopback bind generates none) never causes a dead-end input to be
+    /// drawn. Absent from every other problem document on this surface.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = true)]
+    pub token_required: Option<bool>,
 }
 
 impl IntoResponse for ApiError {
@@ -247,6 +291,7 @@ impl IntoResponse for ApiError {
             status: self.status.as_u16(),
             title: self.title,
             detail: self.detail,
+            token_required: self.token_required,
         };
         let mut resp = (self.status, axum::Json(body)).into_response();
         // `axum::Json` writes `application/json`; RFC 9457 requires the
@@ -410,6 +455,7 @@ fn unprocessable_error(detail: String) -> ApiError {
         status: StatusCode::UNPROCESSABLE_ENTITY,
         title: "invalid request",
         detail,
+        token_required: None,
     }
 }
 
@@ -419,6 +465,7 @@ fn internal_error(detail: String) -> ApiError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
         title: "internal error",
         detail,
+        token_required: None,
     }
 }
 
@@ -534,6 +581,30 @@ mod tests {
                 .unwrap()
                 .contains("title: Now")
         );
+    }
+
+    /// The one extension member: present when a refusal was asked to carry it,
+    /// and absent from the body entirely otherwise - not `null`, which a client
+    /// checking for the key would have to special-case.
+    #[tokio::test]
+    async fn the_token_required_member_appears_only_when_it_is_set() {
+        let body = |error: ApiError| async {
+            let resp = error.into_response();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        };
+
+        let plain = body(ApiError::forbidden("no")).await;
+        assert!(
+            plain.get("token_required").is_none(),
+            "an ordinary refusal carries no extension member: {plain}"
+        );
+        let marked = body(ApiError::forbidden("no").token_required()).await;
+        assert_eq!(marked["token_required"], true);
+        assert_eq!(marked["status"], 403, "and the rest of the shape is intact");
+        assert_eq!(marked["title"], "forbidden");
     }
 
     /// An axum rejection keeps the status axum chose and gains a title from

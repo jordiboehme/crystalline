@@ -53,7 +53,9 @@ use serde::Deserialize;
 
 use super::auth::{Caller, Identity};
 use super::auth_store::{Role, User};
-use super::{ApiError, ApiJson, ApiPath, ProblemDetail, RestState, refuse_read_only};
+use super::{
+    ApiError, ApiJson, ApiPath, ProblemDetail, RestState, check_password, refuse_read_only,
+};
 
 /// What `GET /users` answers with. A wrapper rather than a bare array, matching
 /// the `{"users": [...]}` envelope `crystalline users list --json` prints.
@@ -570,24 +572,13 @@ fn refuse_self(caller: &Caller, target: &str, verb: &str) -> Result<(), ApiError
     )))
 }
 
-/// Refuse an empty password before it is hashed into an account nobody can log
-/// in as. The store would accept it; `crystalline users` refuses it, and this
-/// surface matches.
-fn check_password(password: &str) -> Result<(), ApiError> {
-    if password.is_empty() {
-        return Err(ApiError::unprocessable(
-            "the password is empty; pick one with at least one character",
-        ));
-    }
-    Ok(())
-}
-
 /// The account as it now stands, read back out of the store after a write.
 ///
 /// The listing rather than a single-row read because the store exposes no
 /// by-name getter, and the cost is one small query over a table with a handful
-/// of rows in it.
-async fn read_back(state: &RestState, name: &str) -> Result<User, ApiError> {
+/// of rows in it. Shared with `super::auth::setup`, which reads its brand new
+/// first admin back the same way rather than echoing the request.
+pub(super) async fn read_back(state: &RestState, name: &str) -> Result<User, ApiError> {
     let name = folded(name);
     state
         .auth

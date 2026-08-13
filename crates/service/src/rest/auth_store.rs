@@ -477,6 +477,62 @@ impl AuthStore {
         Ok(())
     }
 
+    /// How many accounts exist. Zero is what opens the first-run setup path,
+    /// and it is what `GET /auth/me` reports as `needs_setup`.
+    pub async fn user_count(&self) -> Result<usize> {
+        let _guard = self.guard.lock().await;
+        Ok(
+            match self
+                .query_first("SELECT COUNT(*) FROM users", vec![])
+                .await?
+                .map(|row| row.get_value(0))
+            {
+                Some(Ok(Value::Integer(n))) => n as usize,
+                _ => 0,
+            },
+        )
+    }
+
+    /// Create the first admin, and only into an empty table. Returns whether
+    /// this call is the one that created it.
+    ///
+    /// The zero-check and the insert are ONE statement, which is the whole
+    /// point: this is the only claim on the first-account slot that holds
+    /// across processes. `crystalline users add` opens this same file from
+    /// another process while the daemon serves, so no mutex in the daemon can
+    /// serialize against it - and a read-then-write here would let a setup
+    /// request and a CLI add both see an empty table and both go through, the
+    /// second of them silently creating an admin nobody asked for. As part of
+    /// the statement, the `WHERE NOT EXISTS` is decided by whichever writer
+    /// holds the write lock, exactly like [`NOT_LAST_ADMIN`].
+    ///
+    /// The name is folded by [`normalize_name`] like every other path, and a
+    /// name that will not fold is refused before anything is written, so a typo
+    /// does not consume the one slot there is. The password is hashed outside
+    /// the lock, as in [`AuthStore::add_user`]: argon2 is CPU, not database.
+    pub async fn add_first_admin(&self, name: &str, display: &str, password: &str) -> Result<bool> {
+        let name = normalize_name(name)?;
+        // Hash before taking the lock: argon2 is CPU, not database.
+        let hash = hash_password(password).await?;
+        let _guard = self.guard.lock().await;
+        let written = self
+            .conn
+            .execute(
+                "INSERT INTO users (name, display, email, role, pass_hash, disabled, created_at)
+                 SELECT ?1, ?2, NULL, 'admin', ?3, 0, ?4
+                 WHERE NOT EXISTS (SELECT 1 FROM users)",
+                vec![
+                    Value::Text(name.clone()),
+                    Value::Text(display.to_string()),
+                    Value::Text(hash),
+                    Value::Text(chrono::Utc::now().to_rfc3339()),
+                ],
+            )
+            .await
+            .with_context(|| format!("creating the first admin '{name}'"))?;
+        Ok(written > 0)
+    }
+
     /// Check a password. `None` covers every way this can fail to produce a
     /// login: unknown name, wrong password, a disabled account, an account
     /// with no password at all (one provisioned by [`AuthStore::ensure_user`]),
@@ -2310,6 +2366,175 @@ mod tests {
                 .add_user("ada", "Ada Again", None, Role::Viewer, "pw2")
                 .await
                 .is_err()
+        );
+    }
+
+    /// The count the first-run probe reads: zero on a fresh file, and one more
+    /// for every account however it was created.
+    #[tokio::test]
+    async fn user_count_is_zero_until_an_account_exists() {
+        let (_dir, store) = store().await;
+        assert_eq!(store.user_count().await.unwrap(), 0);
+        store
+            .add_user("ada", "Ada", None, Role::Admin, "pw")
+            .await
+            .unwrap();
+        assert_eq!(store.user_count().await.unwrap(), 1);
+        // The trusted-header path mints accounts too, and they count the same.
+        store
+            .ensure_user("bob", Role::Viewer, usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(store.user_count().await.unwrap(), 2);
+        store.remove_user("bob").await.unwrap();
+        assert_eq!(store.user_count().await.unwrap(), 1);
+    }
+
+    /// The first admin is created only into an empty table, and the account it
+    /// creates is a real one: admin, enabled, folded name, display as typed,
+    /// and a password that verifies.
+    #[tokio::test]
+    async fn add_first_admin_creates_one_admin_and_only_on_an_empty_table() {
+        let (_dir, store) = store().await;
+        assert!(
+            store.add_first_admin("Ada", "Ada", "s3cret").await.unwrap(),
+            "an empty table is what the first-run path is for"
+        );
+        let users = store.list_users().await.unwrap();
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].name, "ada", "the name is folded like every other");
+        assert_eq!(users[0].display, "Ada");
+        assert_eq!(users[0].role, Role::Admin);
+        assert!(!users[0].disabled);
+        assert!(matches!(
+            store.check_password("ada", "s3cret").await.unwrap(),
+            PasswordCheck::Verified(_)
+        ));
+
+        assert!(
+            !store.add_first_admin("bob", "Bob", "pw").await.unwrap(),
+            "the slot is gone once any account exists"
+        );
+        assert_eq!(
+            store.user_count().await.unwrap(),
+            1,
+            "and nothing was written"
+        );
+    }
+
+    /// The account that closes the slot need not be an admin, and need not have
+    /// been created here: `crystalline users add` in another process is the
+    /// case that matters, and it lands an ordinary row.
+    #[tokio::test]
+    async fn add_first_admin_refuses_once_any_account_exists() {
+        let (_dir, added) = store().await;
+        added
+            .add_user("vera", "Vera", None, Role::Viewer, "pw")
+            .await
+            .unwrap();
+        assert!(
+            !added
+                .add_first_admin("root", "Root", "rootpw")
+                .await
+                .unwrap()
+        );
+        assert_eq!(added.list_users().await.unwrap().len(), 1);
+
+        let (_dir2, provisioned) = store().await;
+        provisioned
+            .ensure_user("proxied", Role::Viewer, usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            !provisioned
+                .add_first_admin("root", "Root", "rootpw")
+                .await
+                .unwrap()
+        );
+    }
+
+    /// An unusable name is refused before anything is written, so a typo does
+    /// not consume the one slot there is.
+    #[tokio::test]
+    async fn add_first_admin_refuses_a_name_the_store_cannot_key_on() {
+        let (_dir, store) = store().await;
+        assert!(store.add_first_admin("  ", "Blank", "pw").await.is_err());
+        assert!(
+            store
+                .add_first_admin("ada lovelace", "Ada", "pw")
+                .await
+                .is_err()
+        );
+        assert_eq!(store.user_count().await.unwrap(), 0);
+        assert!(store.add_first_admin("ada", "Ada", "pw").await.unwrap());
+    }
+
+    /// Invariant 1's real pin: the claim holds across PROCESSES, which is what
+    /// the REST layer's own guard mutex can never show.
+    ///
+    /// Two [`AuthStore`]s are opened on one `web-auth.db` - the exact shape
+    /// `crystalline users add` takes while the daemon serves - and the first
+    /// admin is raced against a second first-admin call and against a plain
+    /// `add_user`. Two assertions carry the invariant, and neither is "exactly
+    /// one row lands": in the `add_user` leg two rows legitimately can, since
+    /// an ordinary add of a different name is not competing for the slot at
+    /// all. What must hold is that `add_first_admin` reports success at most
+    /// once, and never once any row already exists.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_second_store_open_cannot_also_win_first_admin() {
+        // Leg one: first admin against first admin, on two opens of one file.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("web-auth.db");
+        let daemon = AuthStore::open(&path).await.unwrap();
+        let cli = AuthStore::open(&path).await.unwrap();
+        let (a, b) = tokio::join!(
+            daemon.add_first_admin("root", "Root", "rootpw"),
+            cli.add_first_admin("boss", "Boss", "bosspw"),
+        );
+        let won = [a.unwrap(), b.unwrap()];
+        assert_eq!(
+            won.iter().filter(|w| **w).count(),
+            1,
+            "exactly one of two racing first-admin calls may win"
+        );
+        assert_eq!(
+            daemon.user_count().await.unwrap(),
+            1,
+            "and exactly one row is what they left behind"
+        );
+
+        // Leg two: first admin against an ordinary add from the other open.
+        // Both may land - the names differ and `users add` is not competing for
+        // the slot - but a first admin created after a row exists would be a
+        // check-then-insert that read stale.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("web-auth.db");
+        let daemon = AuthStore::open(&path).await.unwrap();
+        let cli = AuthStore::open(&path).await.unwrap();
+        let (first, added) = tokio::join!(
+            daemon.add_first_admin("root", "Root", "rootpw"),
+            cli.add_user("ada", "Ada", None, Role::Viewer, "pw"),
+        );
+        added.unwrap();
+        let names: Vec<String> = daemon
+            .list_users()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|u| u.name)
+            .collect();
+        if first.unwrap() {
+            assert!(names.contains(&"root".to_string()));
+        } else {
+            assert_eq!(
+                names,
+                vec!["ada".to_string()],
+                "a first admin that reported failure must not have written a row"
+            );
+        }
+        assert!(
+            !daemon.add_first_admin("late", "Late", "pw").await.unwrap(),
+            "and the slot stays shut for every later caller"
         );
     }
 

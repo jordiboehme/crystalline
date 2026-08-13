@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Crystalline Fluid API",
-    "description": "The JSON API `crystalline serve --http` mounts at `/api/v1`, the surface the Fluid UI talks to. Reading is open to any signed-in viewer; writing content needs an editor account and the `If-Match` token of the version being replaced, and account management needs an admin.\n\nEvery path but `/auth/login`, `/auth/logout` and `/auth/me` is closed by default: a request that carries no identity is answered 401 ahead of routing, so an unauthenticated caller never learns which paths exist. Every failure is an RFC 9457 problem detail sent as `application/problem+json`.\n\nThe payloads marked as generic objects are the engine's own JSON, passed through unchanged so this API and the MCP tools stay one source of truth; each carries an example of the shape it answers with.",
+    "description": "The JSON API `crystalline serve --http` mounts at `/api/v1`, the surface the Fluid UI talks to. Reading is open to any signed-in viewer; writing content needs an editor account and the `If-Match` token of the version being replaced, and account management needs an admin.\n\nEvery path but `/auth/login`, `/auth/logout`, `/auth/me` and `/auth/setup` is closed by default: a request that carries no identity is answered 401 ahead of routing, so an unauthenticated caller never learns which paths exist. Every failure is an RFC 9457 problem detail sent as `application/problem+json`.\n\nThe payloads marked as generic objects are the engine's own JSON, passed through unchanged so this API and the MCP tools stay one source of truth; each carries an example of the shape it answers with.",
     "license": {
       "name": "AGPL-3.0-or-later"
     },
@@ -256,8 +256,8 @@
         "tags": [
           "auth"
         ],
-        "summary": "The capability probe a client calls before anything else: who it is, whether\nit is being served anonymously, whether this instance refuses content\nmutations, and which server version it is talking to, so a mismatched UI can\nsay so instead of failing later.",
-        "description": "Who the caller is, whether it is being served anonymously, whether this instance refuses content mutations, and which server version it is talking to. Also issues the CSRF token every later mutating request must echo in `x-csrf-token`: a cookie session has its token reissued here, and a trusted-header identity is minted a session on the first call, which is the only way that mode obtains a token.",
+        "summary": "The capability probe a client calls before anything else: who it is, whether\nit is being served anonymously, whether this instance refuses content\nmutations, whether it has any accounts at all, and which server version it\nis talking to, so a mismatched UI can say so instead of failing later.",
+        "description": "Who the caller is, whether it is being served anonymously, whether this instance refuses content mutations, whether it has no accounts yet and so still needs its first admin (`needs_setup`, which is what opens `POST /auth/setup`), and which server version it is talking to. Also issues the CSRF token every later mutating request must echo in `x-csrf-token`: a cookie session has its token reissued here, and a trusted-header identity is minted a session on the first call, which is the only way that mode obtains a token.",
         "operationId": "get_me",
         "responses": {
           "200": {
@@ -286,6 +286,102 @@
           },
           "403": {
             "description": "The trusted-header identity names a disabled account. The guard resolves identity ahead of routing, so this answer reaches even the paths that are served without one.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/auth/setup": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Create the first admin account and sign in.",
+        "description": "Valid only while this instance has no accounts at all, and only for a caller on the machine that serves it or one carrying the one-time setup token `serve` prints for a non-loopback bind. Succeeds exactly once: the account is created by a single conditional insert, so a concurrent caller - another browser, or `crystalline users add` in another process - cannot also win. Success sets the `fluid_session` cookie and answers in the login shape.",
+        "operationId": "setup",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetupBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The first admin was created and signed in. The session cookie is set and the CSRF token is in the body, exactly as `POST /auth/login` answers.",
+            "headers": {
+              "cache-control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "`no-store`: this answer carries a session cookie and a CSRF token, so no cache between the server and the browser may keep it."
+              },
+              "set-cookie": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "The `fluid_session` session cookie, HttpOnly and SameSite=Lax."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LoginResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The body is not JSON.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The request did not come from the machine that serves this instance and carried no setup token, or the wrong one; one message covers both, so nothing says whether a token was close. When this instance holds a token, the problem document carries the extension member `token_required: true`, which is what a client keys a token field on - an instance that has no token to enter refuses without the member, so no dead-end input is ever offered.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "An account already exists, so the first-run slot is permanently gone. Checked before locality and before the token, and answered for a lost race too. 410 rather than 403 because a credential cannot change the answer, and rather than 409 because the conflict never resolves.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body is not `application/json`. Load bearing rather than pedantic: with no CORS layer on this surface, it is what stops another origin from driving this pre-session POST with a form.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The body is JSON but not a setup, the password is empty, or the name is not one this store can key on.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -4191,6 +4287,7 @@
         "required": [
           "anonymous",
           "read_only",
+          "needs_setup",
           "version"
         ],
         "properties": {
@@ -4205,6 +4302,10 @@
             ],
             "description": "The CSRF token of the session this request arrived on, or null when it\narrived on no session.\n\nReissued here, not only by login, because the session cookie is\n`HttpOnly` and the token is not stored anywhere a reload survives: a\nbrowser that refreshes holds a live session whose token it can no longer\nproduce, and would be unable to log out or to write until it logged in\nagain. This probe is what a client opens on, so it is where the token\nbelongs.\n\nNull only for the anonymous viewer, which has no account and can never\nwrite; a trusted-header identity is given a session here on the first\ncall and handed that same session's token on every later one, so every\nidentity that can mutate anything carries a token. See the `check_csrf`\nrule.\n\nHanding the token back on a `GET` is safe for the same reason handing it\nback from login is: no CORS layer exists on this surface, so another\norigin can send the request but cannot read the answer. **That is load\nbearing - a CORS layer must not be added without revisiting this.**",
             "example": "9f2c1d7e4b6a8035"
+          },
+          "needs_setup": {
+            "type": "boolean",
+            "description": "Whether no account exists yet, so the first-run setup path is open.\n\nRead fresh on every probe rather than cached: it is one indexed count\nover a table with a handful of rows, and a stale `true` would draw a\nwizard whose POST then answers 410 - correct, but baffling. That it\ntells an unauthenticated caller \"this instance has no accounts yet\" is\ndeliberate: the login page needs to know before any identity exists, and\nthe state itself is what makes `POST /auth/setup` answer at all."
           },
           "read_only": {
             "type": "boolean",
@@ -4327,6 +4428,14 @@
             "description": "A short, stable, human-readable summary of the problem type.",
             "example": "not found"
           },
+          "token_required": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "An RFC 9457 extension member, present only on the `403` of\n`POST /auth/setup` and only when this instance holds a setup token: the\nfirst-run wizard renders its token field on this member rather than on\nthe detail prose, so an instance that has no token to enter (the\nloopback bind generates none) never causes a dead-end input to be\ndrawn. Absent from every other problem document on this surface.",
+            "example": true
+          },
           "type": {
             "type": "string",
             "description": "The problem type URI. Always `about:blank`: `status` and `title` carry\nthe classification, and this surface publishes no per-problem pages to\npoint at.",
@@ -4402,6 +4511,34 @@
             "type": "string",
             "description": "The full MANIFEST markdown as the editor holds it.",
             "example": "---\ntitle: eng\n---\n\n## When to Use\n\n- Route here for eng questions.\n"
+          }
+        }
+      },
+      "SetupBody": {
+        "type": "object",
+        "description": "The first admin. `display` is the name as typed; no email is asked for, since that is a users-screen concern. `token` is the one-time setup token `serve` prints for a non-loopback bind, and is not needed when the request comes from the machine that serves this instance.",
+        "required": [
+          "name",
+          "password"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The login name of the first admin, in any casing: the store folds it,\nand the name as typed becomes the display name.",
+            "example": "ada"
+          },
+          "password": {
+            "type": "string",
+            "description": "The password for the new account. Never stored in the clear; the store\nhashes it with argon2id.",
+            "example": "correct horse battery staple"
+          },
+          "token": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The one-time setup token, when this instance printed one. In the body\nrather than a header on purpose: it is a one-shot secret rather than a\nsession credential, and a body keeps it out of the header dumps an\naccess log or a proxy trace collects.",
+            "example": "a1b2c3d4e5f60718293a4b5c6d7e8f90"
           }
         }
       },

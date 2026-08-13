@@ -52,8 +52,9 @@ use crate::engine::Engine;
                        open to any signed-in viewer; writing content needs an \
                        editor account and the `If-Match` token of the version \
                        being replaced, and account management needs an \
-                       admin.\n\nEvery path but `/auth/login`, `/auth/logout` \
-                       and `/auth/me` is closed by default: a request that \
+                       admin.\n\nEvery path but `/auth/login`, `/auth/logout`, \
+                       `/auth/me` and `/auth/setup` is closed by default: a \
+                       request that \
                        carries no identity is answered 401 ahead of routing, so \
                        an unauthenticated caller never learns which paths \
                        exist. Every failure is an RFC 9457 problem detail sent \
@@ -79,6 +80,7 @@ use crate::engine::Engine;
         auth::login,
         auth::logout,
         auth::me,
+        auth::setup,
         domains::list,
         domains_admin::create,
         domains_admin::remove,
@@ -135,6 +137,7 @@ use crate::engine::Engine;
         auth::LoginResponse,
         auth::LogoutResponse,
         auth::MeResponse,
+        auth::SetupBody,
         users_api::CreateBody,
         users_api::PatchBody,
         users_api::PasswordBody,
@@ -174,6 +177,13 @@ pub struct RestState {
     /// collab upgrade route joins rooms in it, and every save it makes goes
     /// back through the engine above.
     pub collab: Arc<crate::collab::session::CollabSessions>,
+    /// The one-time token that lets a non-local caller reach
+    /// `POST /auth/setup`, generated once per `serve` process and only for a
+    /// non-loopback bind. `None` means the token path is closed: there is no
+    /// token, so no non-local caller can create the first admin and the
+    /// refusal says so rather than pointing at a secret that does not exist.
+    /// Set through [`RestState::with_setup_token`].
+    setup_token: Option<String>,
     /// Caps how many password verifications run at once. See
     /// [`LOGIN_SLOTS`].
     login_slots: Arc<Semaphore>,
@@ -197,10 +207,32 @@ impl RestState {
             engine,
             auth,
             auth_cfg,
+            setup_token: None,
             login_slots: auth::login_slots(),
             domain_admin: Arc::new(tokio::sync::Mutex::new(())),
             join_fence: Arc::new(tokio::sync::RwLock::new(())),
         })
+    }
+
+    /// Hand this state the process's one-time setup token, or `None` to leave
+    /// the token path closed.
+    ///
+    /// A builder rather than a parameter on [`RestState::new`] so the call
+    /// sites that have no token to offer - every test state, and any future
+    /// caller - stay as they are, and so the token is visibly opt-in at the one
+    /// place that has it: `run_serve`, which generates it for a non-loopback
+    /// bind and prints it once.
+    pub fn with_setup_token(mut self, token: Option<String>) -> RestState {
+        self.setup_token = token;
+        self
+    }
+
+    /// The process's one-time setup token, if it has one. Read by
+    /// [`auth::setup`] alone, and never rendered into a response: see the
+    /// handler for what it is compared with and why the comparison is
+    /// constant-time.
+    pub(super) fn setup_token(&self) -> Option<&str> {
+        self.setup_token.as_deref()
     }
 
     /// Hold the domain-admin lock for the whole of a create or an unregister.
@@ -306,6 +338,9 @@ pub fn router(state: RestState) -> Router {
         .route("/auth/login", post(auth::login))
         .route("/auth/logout", post(auth::logout))
         .route("/auth/me", get(auth::me))
+        // The first-run path: public, CSRF-exempt by path like login, and 410
+        // for good once any account exists. See [`auth::setup`].
+        .route("/auth/setup", post(auth::setup))
         .route("/domains", get(domains::list).post(domains_admin::create))
         // Admin only, enforced in the handler like every other admin route
         // here. Registered before the domain sub-paths for readability only;
@@ -476,6 +511,24 @@ pub(super) fn refuse_read_only(state: &RestState) -> Result<(), ApiError> {
         return Err(ApiError::forbidden(
             "this instance is read-only; changes are disabled here - use the \
              `crystalline` CLI on the server that holds the data",
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse an empty password before it is hashed into an account nobody can log
+/// in as. The store would accept it; `crystalline users` refuses it, and this
+/// surface matches.
+///
+/// Here rather than in [`users_api`], which is where it started, because the
+/// first-run [`auth::setup`] creates an account too and a second spelling of
+/// the same rule is how the two surfaces would drift: an installation whose
+/// very first admin was allowed a password no later account could have is
+/// exactly the wrong place to discover that.
+pub(super) fn check_password(password: &str) -> Result<(), ApiError> {
+    if password.is_empty() {
+        return Err(ApiError::unprocessable(
+            "the password is empty; pick one with at least one character",
         ));
     }
     Ok(())

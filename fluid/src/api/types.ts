@@ -78,13 +78,33 @@ export interface paths {
         /**
          * The capability probe a client calls before anything else: who it is, whether
          *     it is being served anonymously, whether this instance refuses content
-         *     mutations, and which server version it is talking to, so a mismatched UI can
-         *     say so instead of failing later.
-         * @description Who the caller is, whether it is being served anonymously, whether this instance refuses content mutations, and which server version it is talking to. Also issues the CSRF token every later mutating request must echo in `x-csrf-token`: a cookie session has its token reissued here, and a trusted-header identity is minted a session on the first call, which is the only way that mode obtains a token.
+         *     mutations, whether it has any accounts at all, and which server version it
+         *     is talking to, so a mismatched UI can say so instead of failing later.
+         * @description Who the caller is, whether it is being served anonymously, whether this instance refuses content mutations, whether it has no accounts yet and so still needs its first admin (`needs_setup`, which is what opens `POST /auth/setup`), and which server version it is talking to. Also issues the CSRF token every later mutating request must echo in `x-csrf-token`: a cookie session has its token reissued here, and a trusted-header identity is minted a session on the first call, which is the only way that mode obtains a token.
          */
         get: operations["get_me"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/auth/setup": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Create the first admin account and sign in.
+         * @description Valid only while this instance has no accounts at all, and only for a caller on the machine that serves it or one carrying the one-time setup token `serve` prints for a non-loopback bind. Succeeds exactly once: the account is created by a single conditional insert, so a concurrent caller - another browser, or `crystalline users add` in another process - cannot also win. Success sets the `fluid_session` cookie and answers in the login shape.
+         */
+        post: operations["setup"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1036,6 +1056,17 @@ export interface components {
              * @example 9f2c1d7e4b6a8035
              */
             csrf?: string | null;
+            /**
+             * @description Whether no account exists yet, so the first-run setup path is open.
+             *
+             *     Read fresh on every probe rather than cached: it is one indexed count
+             *     over a table with a handful of rows, and a stale `true` would draw a
+             *     wizard whose POST then answers 410 - correct, but baffling. That it
+             *     tells an unauthenticated caller "this instance has no accounts yet" is
+             *     deliberate: the login page needs to know before any identity exists, and
+             *     the state itself is what makes `POST /auth/setup` answer at all.
+             */
+            needs_setup: boolean;
             /** @description Whether this instance refuses content mutations. */
             read_only: boolean;
             user?: null | components["schemas"]["User"];
@@ -1108,6 +1139,16 @@ export interface components {
              */
             title: string;
             /**
+             * @description An RFC 9457 extension member, present only on the `403` of
+             *     `POST /auth/setup` and only when this instance holds a setup token: the
+             *     first-run wizard renders its token field on this member rather than on
+             *     the detail prose, so an instance that has no token to enter (the
+             *     loopback bind generates none) never causes a dead-end input to be
+             *     drawn. Absent from every other problem document on this surface.
+             * @example true
+             */
+            token_required?: boolean | null;
+            /**
              * @description The problem type URI. Always `about:blank`: `status` and `title` carry
              *     the classification, and this surface publishes no per-problem pages to
              *     point at.
@@ -1167,6 +1208,29 @@ export interface components {
              *     - Route here for eng questions.
              */
             markdown: string;
+        };
+        /** @description The first admin. `display` is the name as typed; no email is asked for, since that is a users-screen concern. `token` is the one-time setup token `serve` prints for a non-loopback bind, and is not needed when the request comes from the machine that serves this instance. */
+        SetupBody: {
+            /**
+             * @description The login name of the first admin, in any casing: the store folds it,
+             *     and the name as typed becomes the display name.
+             * @example ada
+             */
+            name: string;
+            /**
+             * @description The password for the new account. Never stored in the clear; the store
+             *     hashes it with argon2id.
+             * @example correct horse battery staple
+             */
+            password: string;
+            /**
+             * @description The one-time setup token, when this instance printed one. In the body
+             *     rather than a header on purpose: it is a one-shot secret rather than a
+             *     session credential, and a body keeps it out of the header dumps an
+             *     access log or a proxy trace collects.
+             * @example a1b2c3d4e5f60718293a4b5c6d7e8f90
+             */
+            token?: string | null;
         };
         /** @description A GitHub personal access token to connect with. Write-only: no response on this surface ever echoes it, and the status shape carries only where the credential lives and whose it is. */
         TokenBody: {
@@ -1507,6 +1571,79 @@ export interface operations {
             };
             /** @description The trusted-header identity names a disabled account. The guard resolves identity ahead of routing, so this answer reaches even the paths that are served without one. */
             403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    setup: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetupBody"];
+            };
+        };
+        responses: {
+            /** @description The first admin was created and signed in. The session cookie is set and the CSRF token is in the body, exactly as `POST /auth/login` answers. */
+            200: {
+                headers: {
+                    /** @description `no-store`: this answer carries a session cookie and a CSRF token, so no cache between the server and the browser may keep it. */
+                    "cache-control"?: string;
+                    /** @description The `fluid_session` session cookie, HttpOnly and SameSite=Lax. */
+                    "set-cookie"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LoginResponse"];
+                };
+            };
+            /** @description The body is not JSON. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The request did not come from the machine that serves this instance and carried no setup token, or the wrong one; one message covers both, so nothing says whether a token was close. When this instance holds a token, the problem document carries the extension member `token_required: true`, which is what a client keys a token field on - an instance that has no token to enter refuses without the member, so no dead-end input is ever offered. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description An account already exists, so the first-run slot is permanently gone. Checked before locality and before the token, and answered for a lost race too. 410 rather than 403 because a credential cannot change the answer, and rather than 409 because the conflict never resolves. */
+            410: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The body is not `application/json`. Load bearing rather than pedantic: with no CORS layer on this surface, it is what stops another origin from driving this pre-session POST with a form. */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The body is JSON but not a setup, the password is empty, or the name is not one this store can key on. */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };

@@ -1737,8 +1737,8 @@ fn canonicalize(path: &str) -> String {
 /// instead of relying on a reviewer noticing a pointer comment (this is
 /// exactly how Task 13 shipped three routes uncovered by the matrix).
 ///
-/// Two mounted mutating routes are named exemptions rather than matrix rows,
-/// both resting on `check_csrf` in `rest/auth.rs`:
+/// Three mounted mutating routes are named exemptions rather than matrix rows,
+/// all three resting on `check_csrf` in `rest/auth.rs`:
 /// - `POST /auth/login` is CSRF-exempt by design: `check_csrf` waves through
 ///   any request whose path is `LOGIN_PATH` unconditionally, because login is
 ///   what mints the token a later request would echo - there is no session
@@ -1751,11 +1751,24 @@ fn canonicalize(path: &str) -> String {
 ///   match as every other unsafe request - only the account-less case is
 ///   exempt, which is why this is a logout-specific carve-out and not a
 ///   second CSRF-exempt path in `check_csrf` itself.
+/// - `POST /auth/setup` is pre-session for the same reason login is - it
+///   creates the first account, before which no session and so no CSRF token
+///   can exist - and `check_csrf` exempts it by path exactly as it exempts
+///   login. It cannot be driven from this matrix either: every fixture here
+///   has five accounts, so every leg of every row would see the same 410 and
+///   assert nothing about roles or CSRF. Its auth story - the 410 once any
+///   account exists, the loopback-or-token gate, the CSRF exemption and the
+///   read-only carve-out - is pinned by `tests/rest_setup_api.rs` instead,
+///   which serves a deliberately account-less instance.
 #[test]
 fn write_ops_covers_every_mutating_route_mounted() {
     use std::collections::BTreeSet;
 
-    const EXEMPT: &[&str] = &["POST /api/v1/auth/login", "POST /api/v1/auth/logout"];
+    const EXEMPT: &[&str] = &[
+        "POST /api/v1/auth/login",
+        "POST /api/v1/auth/logout",
+        "POST /api/v1/auth/setup",
+    ];
 
     let mutating: BTreeSet<String> = support::MOUNTED_OPERATIONS
         .iter()

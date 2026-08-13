@@ -24,6 +24,7 @@
 //! added later is guarded the moment it is registered rather than when someone
 //! remembers to add an extractor to it.
 
+use std::convert::Infallible;
 use std::future::Future;
 use std::sync::Arc;
 
@@ -64,11 +65,18 @@ pub const LOGIN_SLOTS: usize = 4;
 /// there is no token to echo.
 const LOGIN_PATH: &str = "/auth/login";
 
+/// The first-run path, which is pre-session for the same reason login is: it
+/// creates the account every later session belongs to. See [`setup`].
+pub const SETUP_PATH: &str = "/auth/setup";
+
 /// Paths served without an identity. The rest of the API is closed by default.
 /// `/auth/me` is the capability probe a client calls before it knows whether it
-/// is logged in, and `/auth/logout` must work with a cookie the server has
-/// already forgotten, which is exactly the case a browser retries.
-const PUBLIC_PATHS: [&str; 3] = [LOGIN_PATH, "/auth/logout", "/auth/me"];
+/// is logged in, `/auth/logout` must work with a cookie the server has
+/// already forgotten, which is exactly the case a browser retries, and
+/// `/auth/setup` runs when no account exists at all, so there is no identity
+/// for the guard to find and it would otherwise 401 the one route the wizard
+/// has.
+const PUBLIC_PATHS: [&str; 4] = [LOGIN_PATH, "/auth/logout", "/auth/me", SETUP_PATH];
 
 /// The three auth settings, resolved once when the HTTP surface is built.
 ///
@@ -357,8 +365,19 @@ async fn resolve(state: &RestState, headers: &HeaderMap) -> Result<Identity, Api
 /// revisiting this check**: allowing a cross-origin preflight would remove the
 /// only thing standing between another origin and a trusted-header admin's
 /// account.
+///
+/// [`SETUP_PATH`] is exempt beside login and for the same reason: it runs
+/// before the first account exists, so no session and therefore no token can
+/// have been issued to echo. An account-less identity would pass the branch
+/// below anyway; the exemption is spelled out because it documents why the
+/// route is safe pre-session, and because it keeps the one identity that
+/// arrives with an account and no token - a trusted-header caller - from being
+/// told to fetch a token for an endpoint that is [`gone`] for it either way
+/// (with a trusted header configured, that proxy's first request mints an
+/// account, which closes setup).
 fn check_csrf(identity: &Identity, req: &Request) -> Result<(), ApiError> {
-    if req.method().is_safe() || req.uri().path() == LOGIN_PATH {
+    let path = req.uri().path();
+    if req.method().is_safe() || path == LOGIN_PATH || path == SETUP_PATH {
         return Ok(());
     }
     let Some(expected) = identity.csrf.as_deref() else {
@@ -484,6 +503,15 @@ pub struct MeResponse {
     anonymous: bool,
     /// Whether this instance refuses content mutations.
     read_only: bool,
+    /// Whether no account exists yet, so the first-run setup path is open.
+    ///
+    /// Read fresh on every probe rather than cached: it is one indexed count
+    /// over a table with a handful of rows, and a stale `true` would draw a
+    /// wizard whose POST then answers 410 - correct, but baffling. That it
+    /// tells an unauthenticated caller "this instance has no accounts yet" is
+    /// deliberate: the login page needs to know before any identity exists, and
+    /// the state itself is what makes `POST /auth/setup` answer at all.
+    needs_setup: bool,
     /// The server version, so a mismatched UI can say so.
     #[schema(example = "0.12.0")]
     version: &'static str,
@@ -571,6 +599,22 @@ pub async fn login(
         // that the pair was wrong, never which half.
         return Err(ApiError::unauthorized("the name or password is wrong"));
     };
+    sign_in(&state, jar, &headers, user).await
+}
+
+/// Issue a session for `user` and answer in the login shape: the cookie, the
+/// `no-store` header and the account plus its CSRF token.
+///
+/// Shared by [`login`] and [`setup`] rather than written twice, which is what
+/// makes "setup signs the caller in exactly as login does" a fact about the
+/// code instead of a claim about it: the fixation rule, the cookie attributes,
+/// the TTL and the response type are one definition with two callers.
+async fn sign_in(
+    state: &RestState,
+    jar: CookieJar,
+    headers: &HeaderMap,
+    user: User,
+) -> Result<(CookieJar, NoStore, axum::Json<LoginResponse>), ApiError> {
     // Whatever session the caller arrived holding is retired rather than left
     // live beside the new one. A session fixation attack works by planting a
     // token the victim then logs in under, so the token that was presented is
@@ -586,7 +630,7 @@ pub async fn login(
         .path("/")
         .http_only(true)
         .same_site(SameSite::Lax)
-        .secure(cookie_needs_secure(&headers))
+        .secure(cookie_needs_secure(headers))
         .max_age(time::Duration::seconds(SESSION_TTL_SECS))
         .build();
     Ok((
@@ -659,6 +703,338 @@ pub(super) async fn with_login_slot<F: Future>(
     Ok(work.await)
 }
 
+/// What `POST /auth/setup` takes.
+///
+/// [`Debug`] is written by hand rather than derived, as on `users_api`'s
+/// `CreateBody`: the derived one would print the plaintext password and the
+/// one-time token, and this type is one `tracing::debug!` or one `unwrap` on a
+/// rejection away from a log file.
+#[derive(serde::Deserialize, utoipa::ToSchema)]
+#[schema(description = "The first admin. `display` is the name as typed; no \
+                        email is asked for, since that is a users-screen \
+                        concern. `token` is the one-time setup token `serve` \
+                        prints for a non-loopback bind, and is not needed when \
+                        the request comes from the machine that serves this \
+                        instance.")]
+pub struct SetupBody {
+    /// The login name of the first admin, in any casing: the store folds it,
+    /// and the name as typed becomes the display name.
+    #[schema(example = "ada")]
+    name: String,
+    /// The password for the new account. Never stored in the clear; the store
+    /// hashes it with argon2id.
+    #[schema(example = "correct horse battery staple")]
+    password: String,
+    /// The one-time setup token, when this instance printed one. In the body
+    /// rather than a header on purpose: it is a one-shot secret rather than a
+    /// session credential, and a body keeps it out of the header dumps an
+    /// access log or a proxy trace collects.
+    #[serde(default)]
+    #[schema(example = "a1b2c3d4e5f60718293a4b5c6d7e8f90")]
+    token: Option<String>,
+}
+
+impl std::fmt::Debug for SetupBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SetupBody")
+            .field("name", &self.name)
+            .field("password", &"<redacted>")
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// The peer address the connection was accepted from, or `None` when the
+/// router was served without connection info.
+///
+/// Read out of the request extensions rather than through axum's
+/// [`axum::extract::ConnectInfo`] extractor, which rejects when the extension
+/// is absent: a missing peer address is exactly the case that must resolve to
+/// "not local" rather than to an error, so it is read as an `Option` and
+/// [`is_local_setup_peer`] fails closed on it.
+pub struct PeerAddr(Option<std::net::SocketAddr>);
+
+impl<S: Send + Sync> FromRequestParts<S> for PeerAddr {
+    type Rejection = Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<PeerAddr, Infallible> {
+        Ok(PeerAddr(
+            parts
+                .extensions
+                .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+                .map(|info| info.0),
+        ))
+    }
+}
+
+/// Create the first admin and sign them in - the browser half of first-run
+/// setup, valid only while this instance has no accounts at all.
+///
+/// Three rules carry it, each pinned by a named test in
+/// `tests/rest_setup_api.rs`:
+///
+/// 1. **Once any account exists this endpoint is [`gone`], permanently.** The
+///    count is checked first, before locality and before the token, so a remote
+///    prober learns nothing it could not read off the public `needs_setup`
+///    probe. The check is not what makes the slot safe, though: the store's
+///    `add_first_admin` is one conditional statement, so a setup racing another
+///    setup or racing `crystalline users add` in another process cannot both
+///    win, and a lost race is mapped onto the same 410 as an outright refusal.
+///    410 rather than 403 because the slot really did exist and is really gone,
+///    and rather than 409 because the conflict never resolves and a 409 invites
+///    a retry.
+/// 2. **Locality is the socket peer address, never a header.** The peer comes
+///    from the connection ([`PeerAddr`]); no `Host`, `X-Forwarded-For` or
+///    `Forwarded` value can GRANT it, a missing peer is not local, and a
+///    forwarded-shaped header may only take locality away: a loopback peer that
+///    carries one is a reverse proxy on this host relaying a browser that is
+///    somewhere else entirely (see [`is_local_setup_peer`]).
+/// 3. **A non-local caller needs the one-time token**, generated once per
+///    `serve` process, only for a non-loopback bind, printed once at startup
+///    and compared with [`constant_time_eq`]. It is never echoed into a
+///    response, a detail or a later log line. An instance that holds no token
+///    says so instead of pointing at one that does not exist, and only the
+///    refusals that a token could fix carry the `token_required` extension
+///    member the wizard keys its token field on.
+///
+/// CSRF: exempt by path, exactly like [`login`] and for the same reason - the
+/// first account is what every session descends from, so there is nothing to
+/// echo yet. The trusted-header mode needs no special case: a configured proxy
+/// mints an account on its first request, which closes this endpoint anyway.
+///
+/// **The [`ApiJson`] extractor's `application/json` requirement is the
+/// cross-origin defense for this pre-session POST, not a formality.** No CORS
+/// layer exists on this surface, so no preflight can ever approve a cross-site
+/// JSON body, and a cross-site form can only send
+/// `application/x-www-form-urlencoded`, `text/plain` or `multipart/form-data` -
+/// all three refused here with a 415. That is the same argument
+/// `MeResponse::csrf` records for handing a token back at all, and it breaks
+/// the moment a CORS layer is added.
+///
+/// Read-only instances are the one deliberate carve-out (`refuse_read_only` is
+/// not called here): accounts are not content, and a read-only mirror that
+/// could never be given a first admin would have its UI locked shut forever.
+/// Every content and account mutation stays refused there.
+#[utoipa::path(
+    post,
+    path = "/api/v1/auth/setup",
+    tag = "auth",
+    operation_id = "setup",
+    summary = "Create the first admin account and sign in.",
+    description = "Valid only while this instance has no accounts at all, and \
+                   only for a caller on the machine that serves it or one \
+                   carrying the one-time setup token `serve` prints for a \
+                   non-loopback bind. Succeeds exactly once: the account is \
+                   created by a single conditional insert, so a concurrent \
+                   caller - another browser, or `crystalline users add` in \
+                   another process - cannot also win. Success sets the \
+                   `fluid_session` cookie and answers in the login shape.",
+    request_body = SetupBody,
+    responses(
+        (
+            status = 200,
+            description = "The first admin was created and signed in. The \
+                           session cookie is set and the CSRF token is in the \
+                           body, exactly as `POST /auth/login` answers.",
+            body = LoginResponse,
+            headers(
+                ("set-cookie" = String, description = "The `fluid_session` \
+                 session cookie, HttpOnly and SameSite=Lax."),
+                ("cache-control" = String, description = "`no-store`: this \
+                 answer carries a session cookie and a CSRF token, so no cache \
+                 between the server and the browser may keep it."),
+            ),
+        ),
+        (
+            status = 400,
+            description = "The body is not JSON.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "The request did not come from the machine that \
+                           serves this instance and carried no setup token, or \
+                           the wrong one; one message covers both, so nothing \
+                           says whether a token was close. When this instance \
+                           holds a token, the problem document carries the \
+                           extension member `token_required: true`, which is \
+                           what a client keys a token field on - an instance \
+                           that has no token to enter refuses without the \
+                           member, so no dead-end input is ever offered.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 410,
+            description = "An account already exists, so the first-run slot is \
+                           permanently gone. Checked before locality and before \
+                           the token, and answered for a lost race too. 410 \
+                           rather than 403 because a credential cannot change \
+                           the answer, and rather than 409 because the conflict \
+                           never resolves.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 415,
+            description = "The body is not `application/json`. Load bearing \
+                           rather than pedantic: with no CORS layer on this \
+                           surface, it is what stops another origin from \
+                           driving this pre-session POST with a form.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 422,
+            description = "The body is JSON but not a setup, the password is \
+                           empty, or the name is not one this store can key on.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+pub async fn setup(
+    State(state): State<RestState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+    peer: PeerAddr,
+    ApiJson(body): ApiJson<SetupBody>,
+) -> Result<(CookieJar, NoStore, axum::Json<LoginResponse>), ApiError> {
+    // First, and before anything that costs a hash or reveals whether a token
+    // would have helped.
+    if state.auth.user_count().await? > 0 {
+        return Err(gone());
+    }
+    super::check_password(&body.password)?;
+    authorize_setup(&state, peer, &headers, body.token.as_deref())?;
+    // The login name as typed makes the better display name, matching
+    // `users_api::create`: the store folds the login name and keeps this one.
+    let display = body.name.trim().to_string();
+    // Under the login limiter like every other path that hashes.
+    let created = state
+        .with_login_slot(
+            state
+                .auth
+                .add_first_admin(&body.name, &display, &body.password),
+        )
+        .await?
+        .map_err(setup_store_error)?;
+    if !created {
+        // Somebody else - another browser, or `crystalline users add` - claimed
+        // the slot between the count above and the insert. The store decided
+        // it, and the answer is the one every later caller gets.
+        return Err(gone());
+    }
+    let user = super::users_api::read_back(&state, &body.name).await?;
+    sign_in(&state, jar, &headers, user).await
+}
+
+/// The forever-after refusal: the setup slot existed and is permanently gone.
+fn gone() -> ApiError {
+    ApiError {
+        status: axum::http::StatusCode::GONE,
+        title: "gone",
+        detail: "this instance already has an account, so first-run setup is \
+                 closed: log in instead"
+            .to_string(),
+        token_required: None,
+    }
+}
+
+/// Whether this request may create the first admin: it is local, or it carries
+/// the token this process printed.
+///
+/// The two refusals are deliberately different documents. A caller of an
+/// instance that HAS a token can act on the answer, so that one names the token
+/// and carries the `token_required` member; a caller of an instance that never
+/// generated one (every loopback bind) is told the truth instead, which is that
+/// there is no token to find and setup has to run from the machine itself.
+/// Neither ever contains the token, and a wrong token is answered exactly like
+/// a missing one so the difference is not an oracle.
+fn authorize_setup(
+    state: &RestState,
+    peer: PeerAddr,
+    headers: &HeaderMap,
+    presented: Option<&str>,
+) -> Result<(), ApiError> {
+    if is_local_setup_peer(peer.0, headers) {
+        return Ok(());
+    }
+    let Some(expected) = state.setup_token() else {
+        return Err(ApiError::forbidden(
+            "first-run setup is open to this instance's own machine only: run \
+             it from there, or restart `crystalline serve` on a network \
+             address and use the one-time setup token it prints",
+        ));
+    };
+    if constant_time_eq(
+        presented.unwrap_or_default().as_bytes(),
+        expected.as_bytes(),
+    ) {
+        return Ok(());
+    }
+    Err(ApiError::forbidden(
+        "this request did not come from the machine that serves this instance, \
+         so first-run setup needs the one-time setup token `crystalline serve` \
+         printed at startup",
+    )
+    .token_required())
+}
+
+/// Whether the connection this request arrived on is a browser on the machine
+/// that serves this instance.
+///
+/// The peer address is the authority and the only thing that can say yes: a
+/// loopback peer is a process on this host, and nothing a client sends can
+/// forge one. A request with no peer address at all - a router served without
+/// connection info - is not local, because failing closed is the only safe
+/// reading of "we do not know who this is".
+///
+/// Headers are then allowed to say no, and only no. A loopback peer carrying
+/// `X-Forwarded-For`, `X-Forwarded-Proto`, `X-Forwarded-Host` or `Forwarded` is
+/// a reverse proxy on this host relaying a browser that may be anywhere, which
+/// is the standard container and same-host proxy shape; treating it as local
+/// would hand first-run setup to the internet. Using headers this way is not a
+/// hole: an attacker gains nothing by adding one, since every one of them can
+/// only narrow what the peer address already allowed.
+///
+/// An IPv4-mapped IPv6 peer (`::ffff:127.0.0.1`, what a dual-stack listener
+/// reports for an IPv4 connection) is canonicalized first, so the same machine
+/// reads as the same machine whichever stack it arrived on.
+fn is_local_setup_peer(peer: Option<std::net::SocketAddr>, headers: &HeaderMap) -> bool {
+    let Some(peer) = peer else {
+        return false;
+    };
+    if !peer.ip().to_canonical().is_loopback() {
+        return false;
+    }
+    !FORWARDING_HEADERS
+        .iter()
+        .any(|name| headers.contains_key(*name))
+}
+
+/// The headers that say a proxy relayed this request. Any one of them makes a
+/// request non-local however loopback its peer address is.
+const FORWARDING_HEADERS: [&str; 4] = [
+    "x-forwarded-for",
+    "x-forwarded-proto",
+    "x-forwarded-host",
+    "forwarded",
+];
+
+/// Classify a store failure from the first-admin insert. Only the name rules
+/// are the caller's to fix; everything else is this server's problem.
+fn setup_store_error(e: anyhow::Error) -> ApiError {
+    let detail = format!("{e:#}");
+    if detail.contains("a user name cannot be empty")
+        || detail.contains("cannot contain whitespace")
+    {
+        return ApiError::unprocessable(detail);
+    }
+    ApiError::internal(detail)
+}
+
 /// Revoke the session and clear its cookie. Not an error without one: a browser
 /// logging out twice, or with a cookie this server has already forgotten, is
 /// ordinary. Guarded by the CSRF check like any other mutating request, so
@@ -711,12 +1087,13 @@ pub async fn logout(
 
 /// The capability probe a client calls before anything else: who it is, whether
 /// it is being served anonymously, whether this instance refuses content
-/// mutations, and which server version it is talking to, so a mismatched UI can
-/// say so instead of failing later.
+/// mutations, whether it has any accounts at all, and which server version it
+/// is talking to, so a mismatched UI can say so instead of failing later.
 ///
 /// Answers without an identity on purpose. `user: null, anonymous: false` is
 /// what tells a browser to show a login form; `anonymous: true` tells it to
-/// browse instead.
+/// browse instead; `needs_setup: true` tells it to draw the first-run wizard
+/// over the login form instead (see [`setup`]).
 ///
 /// It also issues and reissues the session's CSRF token, which is the only way
 /// a reloaded browser gets it back and the only way a trusted-header identity
@@ -727,8 +1104,10 @@ pub async fn logout(
     tag = "auth",
     operation_id = "get_me",
     description = "Who the caller is, whether it is being served anonymously, \
-                   whether this instance refuses content mutations, and which \
-                   server version it is talking to. Also issues the CSRF token \
+                   whether this instance refuses content mutations, whether it \
+                   has no accounts yet and so still needs its first admin \
+                   (`needs_setup`, which is what opens `POST /auth/setup`), and \
+                   which server version it is talking to. Also issues the CSRF token \
                    every later mutating request must echo in `x-csrf-token`: a \
                    cookie session has its token reissued here, and a \
                    trusted-header identity is minted a session on the first \
@@ -825,6 +1204,7 @@ pub async fn me(
             csrf,
             anonymous: identity.anonymous,
             read_only: state.engine.read_only(),
+            needs_setup: state.auth.user_count().await? == 0,
             version: crystalline_core::VERSION,
         }),
     ))
@@ -1211,6 +1591,54 @@ mod tests {
         );
     }
 
+    /// Invariant 2, at the unit the integration suite cannot reach: a loopback
+    /// test socket can never present a genuinely remote peer, so the remote and
+    /// the missing-peer legs live here.
+    #[test]
+    fn locality_is_the_peer_and_forwarding_headers_only_take_it_away() {
+        let peer = |raw: &str| Some(raw.parse::<std::net::SocketAddr>().unwrap());
+        let local = |p, pairs: &[(&str, &str)]| is_local_setup_peer(p, &header_map(pairs));
+
+        // The peer address is the only thing that can say yes.
+        assert!(local(peer("127.0.0.1:51234"), &[]));
+        assert!(local(peer("[::1]:51234"), &[]));
+        assert!(
+            local(peer("[::ffff:127.0.0.1]:51234"), &[]),
+            "a dual-stack listener reports an IPv4 connection this way"
+        );
+        assert!(!local(peer("192.168.1.5:51234"), &[]));
+        assert!(!local(peer("[2001:db8::1]:51234"), &[]));
+        assert!(
+            !local(None, &[]),
+            "no peer address at all is not local: this fails closed"
+        );
+
+        // No header can grant it.
+        assert!(!local(
+            peer("203.0.113.9:443"),
+            &[("host", "localhost"), ("x-forwarded-for", "127.0.0.1")]
+        ));
+
+        // And every forwarding header takes it away from a loopback peer: that
+        // is a proxy on this host relaying a browser that is somewhere else.
+        for (name, value) in [
+            ("x-forwarded-for", "203.0.113.9"),
+            ("x-forwarded-proto", "https"),
+            ("x-forwarded-host", "crystalline.example"),
+            ("forwarded", "for=203.0.113.9"),
+        ] {
+            assert!(
+                !local(peer("127.0.0.1:51234"), &[(name, value)]),
+                "{name} means this request was relayed"
+            );
+        }
+        // An unrelated header changes nothing.
+        assert!(local(
+            peer("127.0.0.1:51234"),
+            &[("host", "localhost:7411")]
+        ));
+    }
+
     #[test]
     fn constant_time_eq_matches_ordinary_equality() {
         assert!(constant_time_eq(b"abc", b"abc"));
@@ -1292,6 +1720,21 @@ mod tests {
         // A safe method is still safe, and login is still exempt.
         assert!(check_csrf(&empty, &request("GET", "/domains", None)).is_ok());
         assert!(check_csrf(&empty, &request("POST", LOGIN_PATH, None)).is_ok());
+
+        // Setup joins login's exemption by path, for every identity: it runs
+        // before the first account exists, so no token can have been issued.
+        // The trusted-header identity that arrives with an account and no token
+        // is the case the exemption is spelled out for - it is told nothing
+        // about CSRF here, and the handler answers it 410 anyway.
+        for identity in [&session, &tokenless_account, &nobody, &anonymous, &empty] {
+            assert!(
+                check_csrf(identity, &request("POST", SETUP_PATH, None)).is_ok(),
+                "setup is pre-session, like login"
+            );
+        }
+        // And nothing else moved: the same identity still owes a token
+        // everywhere else.
+        assert!(check_csrf(&session, &request("POST", "/users", None)).is_err());
     }
 
     #[test]

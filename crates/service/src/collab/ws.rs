@@ -157,6 +157,7 @@ fn busy(detail: &str) -> ApiError {
         status: axum::http::StatusCode::SERVICE_UNAVAILABLE,
         title: "busy",
         detail: detail.to_string(),
+        token_required: None,
     }
 }
 
