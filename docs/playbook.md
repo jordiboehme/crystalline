@@ -39,7 +39,7 @@ That single step registers the MCP server, the `SessionStart` routing hook, the
 program: next session it wakes already knowing how to route, capture and share.
 The same command takes `codex` or `copilot`. This is the last time you need a
 terminal. Claude Desktop skips even this: install the `.mcpb` extension from the
-latest release, upload the `crystalline-memory` skill zip and never open a
+latest release, upload the `crystalline-intelligence` skill zip and never open a
 terminal.
 
 Start a session and give the agent its first domain in plain language:

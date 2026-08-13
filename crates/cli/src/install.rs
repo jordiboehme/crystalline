@@ -94,7 +94,7 @@ const HOOK_TIMEOUT_SECS: u64 = 10;
 /// in [`crystalline_core::SKILL_ASSETS`] by their `install_managed` flag. The
 /// assets are embedded with `include_str!` so the binary is self-contained and
 /// an install from a downloaded release carries the same skills a clone would.
-/// `crystalline-memory` is deliberately not managed: it is the single
+/// `crystalline-intelligence` is deliberately not managed: it is the single
 /// consolidated skill for Claude Desktop, which has no hooks and installs one
 /// skill at a time. The MCP server serves all five regardless (see
 /// [`crystalline_core::skills`]); only installation is filtered here.
@@ -110,7 +110,10 @@ pub(crate) fn managed_skills() -> Vec<(&'static str, &'static str)> {
 /// release drops or renames a managed skill, its old folder name is appended
 /// here in the same change and never leaves the list, so install and the
 /// session-start auto-reconcile can retire a leftover even when no receipt
-/// records it (a zip-unpacked install, a lost state directory).
+/// records it (a zip-unpacked install, a lost state directory). The 0.13.0
+/// rename of the consolidated Desktop skill to `crystalline-intelligence`
+/// deliberately adds nothing here: that skill was never install-managed, so no
+/// harness folder ever held its old name and there is nothing to retire.
 pub(crate) const RETIRED_SKILLS: &[&str] = &[];
 
 /// How a reconcile treats a managed skill whose file is missing: an explicit

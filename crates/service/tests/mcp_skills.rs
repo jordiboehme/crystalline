@@ -27,7 +27,7 @@ const SKILL_NAMES: [&str; 5] = [
     "crystalline-capture",
     "crystalline-schema",
     "crystalline-collaboration",
-    "crystalline-memory",
+    "crystalline-intelligence",
 ];
 
 struct Harness {

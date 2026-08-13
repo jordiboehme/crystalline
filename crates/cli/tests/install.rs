@@ -136,8 +136,8 @@ fn install_into_an_empty_home_writes_the_exact_managed_shape() {
         assert!(claude_skill(&home, name).exists(), "skill {name} installed");
     }
     assert!(
-        !claude_skill(&home, "crystalline-memory").exists(),
-        "crystalline-memory is Desktop-only and never installed"
+        !claude_skill(&home, "crystalline-intelligence").exists(),
+        "crystalline-intelligence is Desktop-only and never installed"
     );
 }
 

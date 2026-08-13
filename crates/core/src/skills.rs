@@ -16,10 +16,10 @@
 //! (no async, no database, no ML) the way the rest of the crate is.
 //!
 //! [`SkillAsset::install_managed`] is the one axis the two consumers differ on.
-//! `crystalline-memory` is the single consolidated skill for Claude Desktop,
-//! which has no hooks and installs one skill at a time, so it ships only as
-//! its own zip and is never copied into a harness skills folder beside the
-//! four topical skills - installing both would teach the same lessons twice.
+//! `crystalline-intelligence` is the single consolidated skill for Claude
+//! Desktop, which has no hooks and installs one skill at a time, so it ships
+//! only as its own zip and is never copied into a harness skills folder beside
+//! the four topical skills - installing both would teach the same lessons twice.
 //! It is still served over MCP like any other: a remote client reading the
 //! skills should see everything this binary knows how to teach.
 
@@ -78,8 +78,8 @@ pub const SKILL_ASSETS: &[SkillAsset] = &[
         install_managed: true,
     },
     SkillAsset {
-        name: "crystalline-memory",
-        content: include_str!("../../../skills/crystalline-memory/SKILL.md"),
+        name: "crystalline-intelligence",
+        content: include_str!("../../../skills/crystalline-intelligence/SKILL.md"),
         install_managed: false,
     },
 ];
@@ -112,7 +112,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            skill("crystalline-memory").map(|s| s.install_managed),
+            skill("crystalline-intelligence").map(|s| s.install_managed),
             Some(false),
             "the consolidated Desktop skill is served but never installed"
         );
