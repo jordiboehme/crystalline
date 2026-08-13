@@ -31,6 +31,11 @@ function serve(routes: Record<string, () => unknown>) {
   apiMock.mockImplementation(answersFor(routes));
 }
 
+/** How many times the capability probe was read. */
+function probeCount(): number {
+  return apiMock.mock.calls.filter(([path]) => path === "/auth/me").length;
+}
+
 /** Fill both fields and submit. */
 async function signIn(name = "ada", password = "hunter2") {
   const user = userEvent.setup();
@@ -91,6 +96,27 @@ describe("the login screen", () => {
     expect(
       await screen.findByText("the name or password is wrong"),
     ).toBeVisible();
+  });
+
+  it("does not re-probe the identity when login itself is refused", async () => {
+    serve({
+      "/auth/me": () => meResponse(),
+      "/auth/login": () => {
+        throw new ApiProblem(
+          401,
+          "unauthorized",
+          "the name or password is wrong",
+        );
+      },
+    });
+
+    renderApp("/login");
+    await signIn();
+
+    await screen.findByText("the name or password is wrong");
+    // Nobody had a session to expire: a refused login is not that, and the
+    // recovery re-probe would be asking a question already answered.
+    expect(probeCount()).toBe(1);
   });
 
   it("disables the submit button while the attempt is in flight", async () => {

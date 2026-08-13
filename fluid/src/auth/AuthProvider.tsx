@@ -32,7 +32,7 @@ import { AccountDisabled } from "../components/AccountDisabled";
 import { ServerDown } from "../components/ServerDown";
 import { AuthContext } from "./AuthContext";
 import type { AuthValue, Capabilities } from "./AuthContext";
-import { ME_QUERY_KEY, SETUP_MUTATION_KEY } from "./keys";
+import { LOGIN_MUTATION_KEY, ME_QUERY_KEY, SETUP_MUTATION_KEY } from "./keys";
 
 /**
  * Run the probe, and hand the token it carries to the client on the way past.
@@ -71,6 +71,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const me = useQuery({ queryKey: ME_QUERY_KEY, queryFn: probe });
 
   const loginMutation = useMutation({
+    // The key rides the mutation that issues the request, which is the one the
+    // expired-session recovery inspects: a refusal here is not an expired
+    // session, since nobody has a session yet.
+    mutationKey: LOGIN_MUTATION_KEY,
     mutationFn: async ({ name, password }: Credentials) => {
       const session = await api<LoginResponse>("/auth/login", {
         method: "POST",
