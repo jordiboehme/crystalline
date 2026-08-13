@@ -60,6 +60,18 @@ export function FirstRunSetup({
   const mismatch = password !== confirm;
 
   /**
+   * A confirmation that is filled in and wrong, as opposed to one that is
+   * simply not filled in yet.
+   *
+   * The distinction drives everything this field says, in both channels at
+   * once: the color of the message, and whether the field announces itself as
+   * an invalid entry. Derived in one place so the two cannot disagree - a
+   * neutral hint on screen beside "invalid entry" in a screen reader is the
+   * field telling two different people two different things.
+   */
+  const wrongConfirmation = mismatch && confirm !== "";
+
+  /**
    * Why the submit button is not usable yet, or null when it is.
    *
    * A disabled button suppresses the browser's own "please fill out this
@@ -71,9 +83,9 @@ export function FirstRunSetup({
    */
   const blocked = !mismatch
     ? null
-    : confirm === ""
-      ? "type the password again to confirm it"
-      : "the passwords do not match";
+    : wrongConfirmation
+      ? "the passwords do not match"
+      : "type the password again to confirm it";
 
   const attempt = useMutation({
     // Under the auth family's key, so the expired-session recovery leaves this
@@ -185,7 +197,7 @@ export function FirstRunSetup({
             // field as well, so tabbing back to it hears the reason rather
             // than an unexplained text box.
             aria-describedby={confirmHelp}
-            aria-invalid={mismatch}
+            aria-invalid={wrongConfirmation}
             value={confirm}
             onChange={(event) => {
               setConfirm(event.target.value);
@@ -201,9 +213,9 @@ export function FirstRunSetup({
             id={confirmHelp}
             role="alert"
             className={
-              confirm === ""
-                ? "text-sm text-slate-600 dark:text-slate-400"
-                : "text-sm text-red-700 dark:text-red-300"
+              wrongConfirmation
+                ? "text-sm text-red-700 dark:text-red-300"
+                : "text-sm text-slate-600 dark:text-slate-400"
             }
           >
             {blocked}

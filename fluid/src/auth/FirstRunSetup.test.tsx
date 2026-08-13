@@ -125,6 +125,13 @@ describe("an instance with no accounts yet", () => {
     expect(
       screen.getByRole("button", { name: "Create admin account" }),
     ).toBeDisabled();
+    // The hint is neutral on screen, so it has to be neutral in the other
+    // channel too: a field nobody has typed into yet is incomplete, and
+    // announcing it as an invalid entry would call that a mistake.
+    expect(screen.getByLabelText("Confirm password")).toHaveAttribute(
+      "aria-invalid",
+      "false",
+    );
   });
 
   it("catches a mistyped confirmation before the server ever hears about it", async () => {
