@@ -107,6 +107,54 @@ describe("MermaidDiagram", () => {
     // pinned to the left edge of a wide figure reads as a mistake.
     const wrapper = container.querySelector("svg")?.parentElement;
     expect(wrapper?.className).toContain("justify-center");
+    // The ordinary diagram is exactly what it was: clamped to the column, not
+    // a scroller, and not a tab stop.
+    expect(wrapper?.className).toContain("[&_svg]:max-w-full");
+    expect(wrapper?.className).not.toContain("overflow-x-auto");
+    expect(wrapper?.getAttribute("tabindex")).toBeNull();
+    expect(wrapper?.getAttribute("role")).toBeNull();
+  });
+
+  it("lets a wide diagram scroll at its own size instead of shrinking", async () => {
+    renderDiagram.mockResolvedValue({
+      svg: '<svg viewBox="0 0 1600 400" width="100%" style="max-width: 1600px;"><g/></svg>',
+      diagramType: "flowchart-v2",
+    });
+    const { container } = draw("graph LR; A-->B;");
+    await waitFor(() => {
+      expect(container.querySelector("svg")).not.toBeNull();
+    });
+    const wrapper = container.querySelector("svg")?.parentElement;
+    expect(wrapper?.className).toContain("overflow-x-auto");
+    // The clamp class is the whole point: stripping mermaid's inline
+    // max-width while `[&_svg]:max-w-full` is still on the wrapper changes
+    // nothing on screen.
+    expect(wrapper?.className).not.toContain("max-w-full");
+    expect(wrapper?.className).toContain("justify-start");
+    // A flex item shrinks to its line by default, which scales the diagram
+    // back down to the column and leaves nothing to scroll. Measured in a real
+    // browser: without this the 3112px diagram rendered at 774px and the
+    // container's scrollWidth equalled its clientWidth.
+    expect(wrapper?.className).toContain("[&_svg]:shrink-0");
+    // A scrollable region is a tab stop with a name, so the arrow keys can
+    // reach it and a screen reader can say what it is.
+    expect(wrapper?.getAttribute("tabindex")).toBe("0");
+    const region = screen.getByRole("region");
+    expect(region).toBe(wrapper);
+    expect(region.getAttribute("aria-label")).toBeTruthy();
+    // A horizontal scroller nested in a scrolling page must not walk the page
+    // or fire the browser's back gesture, and it must still let both axes pan.
+    expect(wrapper?.className).toContain("overscroll-x-contain");
+    expect(wrapper?.className).toContain("touch-pan-x");
+    expect(wrapper?.className).toContain("touch-pan-y");
+    // And it has to LOOK scrollable, otherwise the fix trades "too small to
+    // read" for "looks cut off".
+    expect(wrapper?.className).toContain("mask-image");
+    // Mermaid's scale-to-fit is off for this one: the diagram keeps its own
+    // width.
+    expect(container.querySelector("svg")?.getAttribute("width")).toBe(
+      "1600px",
+    );
   });
 
   it("shows the source when the diagram will not parse", async () => {
