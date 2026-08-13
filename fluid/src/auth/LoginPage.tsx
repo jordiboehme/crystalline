@@ -17,6 +17,11 @@
  * screen reader can read. Only the gem is art, and art is what `aria-hidden`
  * is for.
  *
+ * On an instance with no accounts at all there is nothing to log in to, so the
+ * card carries the first-run wizard instead of the credentials form. Same
+ * route, same gem, same wordmark: the door does not move because the instance
+ * is new, and once the first admin exists the wizard is gone for good.
+ *
  * The one rule worth stating: when the server refuses, its own `detail` is
  * what is shown, word for word. That text is product copy written where the
  * decision was made ("the name or password is wrong" is deliberately one
@@ -32,7 +37,9 @@ import { Link, Navigate, useLocation, useNavigate } from "react-router";
 import { ApiProblem } from "../api/client";
 import { BUTTON, FOCUS_RING } from "../components/primitives";
 import { useAuth } from "./AuthContext";
+import { FirstRunSetup } from "./FirstRunSetup";
 import type { FromLocation } from "./RequireAuth";
+import { CARD_FIELD, CARD_LABEL } from "./card";
 import { LOGIN_MUTATION_KEY } from "./keys";
 
 /**
@@ -59,6 +66,10 @@ export default function LoginPage() {
   const passwordField = useId();
   const [name, setName] = useState("");
   const [password, setPassword] = useState("");
+  // What the setup endpoint said when it refused for good, kept here rather
+  // than in the wizard: the wizard is what disappears when the probe is
+  // re-read, and its last words are the reason this form is on screen instead.
+  const [setupClosed, setSetupClosed] = useState<string | null>(null);
 
   // Where to go once this works: back to whatever `RequireAuth` interrupted,
   // or the home screen for someone who came here directly.
@@ -80,6 +91,10 @@ export default function LoginPage() {
   if (user && !attempt.isPending) {
     return <Navigate to={destination} replace />;
   }
+
+  // Nobody has an account here yet, so there is nothing to log in to: the card
+  // asks for the first admin instead.
+  const firstRun = capabilities.needsSetup && !user;
 
   const problem = attempt.error;
   const message =
@@ -124,77 +139,89 @@ export default function LoginPage() {
           mind-meld your fluid thoughts with your AI's crystalline intelligence
         </p>
 
-        <form
-          className="mt-8 flex flex-col gap-4"
-          onSubmit={(event) => {
-            event.preventDefault();
-            attempt.mutate();
-          }}
-        >
-          <div className="flex flex-col gap-1">
-            <label
-              htmlFor={nameField}
-              className="text-sm font-medium text-slate-700 dark:text-slate-300"
-            >
-              Name
-            </label>
-            <input
-              id={nameField}
-              name="name"
-              autoComplete="username"
-              autoFocus
-              required
-              value={name}
-              onChange={(event) => {
-                setName(event.target.value);
-              }}
-              className={`rounded border border-slate-300 bg-white px-3 py-2 text-slate-900 outline-none dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100 ${FOCUS_RING}`}
-            />
-          </div>
-
-          <div className="flex flex-col gap-1">
-            <label
-              htmlFor={passwordField}
-              className="text-sm font-medium text-slate-700 dark:text-slate-300"
-            >
-              Password
-            </label>
-            <input
-              id={passwordField}
-              name="password"
-              type="password"
-              autoComplete="current-password"
-              required
-              value={password}
-              onChange={(event) => {
-                setPassword(event.target.value);
-              }}
-              className={`rounded border border-slate-300 bg-white px-3 py-2 text-slate-900 outline-none dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100 ${FOCUS_RING}`}
-            />
-          </div>
-
-          {message && (
-            <p
-              role="alert"
-              className="rounded border border-red-300 bg-red-50 px-3 py-2 text-sm text-red-800 dark:border-red-900 dark:bg-red-950 dark:text-red-200"
-            >
-              {message}
-            </p>
-          )}
-
-          {/*
-            The app's own primary tier, in the app's own accent: this screen is
-            the first thing anybody sees of it, and it was the last one still
-            wearing the blue the tiers replaced.
-          */}
-          <button
-            type="submit"
-            disabled={attempt.isPending}
-            className={`py-2 ${BUTTON.primary}`}
+        {/*
+          Why this card changed under somebody who was mid-wizard: another
+          browser, or a terminal, created the first admin first. The server's
+          own sentence says it, and it stays until this tab is done with it.
+        */}
+        {setupClosed && (
+          <p
+            role="status"
+            className="mt-6 rounded border border-slate-300 bg-slate-100 px-3 py-2 text-sm text-slate-700 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300"
           >
-            Log in
-          </button>
-        </form>
+            {setupClosed}
+          </p>
+        )}
+
+        {firstRun ? (
+          <FirstRunSetup onGone={setSetupClosed} />
+        ) : (
+          <form
+            className="mt-8 flex flex-col gap-4"
+            onSubmit={(event) => {
+              event.preventDefault();
+              attempt.mutate();
+            }}
+          >
+            <div className="flex flex-col gap-1">
+              <label htmlFor={nameField} className={CARD_LABEL}>
+                Name
+              </label>
+              <input
+                id={nameField}
+                name="name"
+                autoComplete="username"
+                autoFocus
+                required
+                value={name}
+                onChange={(event) => {
+                  setName(event.target.value);
+                }}
+                className={CARD_FIELD}
+              />
+            </div>
+
+            <div className="flex flex-col gap-1">
+              <label htmlFor={passwordField} className={CARD_LABEL}>
+                Password
+              </label>
+              <input
+                id={passwordField}
+                name="password"
+                type="password"
+                autoComplete="current-password"
+                required
+                value={password}
+                onChange={(event) => {
+                  setPassword(event.target.value);
+                }}
+                className={CARD_FIELD}
+              />
+            </div>
+
+            {message && (
+              <p
+                role="alert"
+                className="rounded border border-red-300 bg-red-50 px-3 py-2 text-sm text-red-800 dark:border-red-900 dark:bg-red-950 dark:text-red-200"
+              >
+                {message}
+              </p>
+            )}
+
+            {/*
+              The app's own primary tier, in the app's own accent: this screen
+              is the first thing anybody sees of it, and it was the last one
+              still wearing the blue the tiers replaced.
+            */}
+            <button
+              type="submit"
+              disabled={attempt.isPending}
+              className={`py-2 ${BUTTON.primary}`}
+            >
+              Log in
+            </button>
+          </form>
+        )}
 
         {capabilities.anonymous && (
           <p className="mt-6 text-sm text-slate-600 dark:text-slate-400">

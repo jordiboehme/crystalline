@@ -27,7 +27,7 @@ import { useCallback, useMemo } from "react";
 import type { ReactNode } from "react";
 
 import { ApiProblem, api, setCsrfToken } from "../api/client";
-import type { LoginResponse, MeResponse } from "../api/model";
+import type { LoginResponse, MeResponse, SetupBody } from "../api/model";
 import { AccountDisabled } from "../components/AccountDisabled";
 import { ServerDown } from "../components/ServerDown";
 import { AuthContext } from "./AuthContext";
@@ -57,6 +57,7 @@ function capabilitiesOf(me: MeResponse | undefined): Capabilities {
     role,
     canWrite: !readOnly && (role === "editor" || role === "admin"),
     canAdminister: role === "admin",
+    needsSetup: me?.needs_setup ?? false,
     serverVersion: me?.version ?? "",
   };
 }
@@ -94,6 +95,43 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     [runLogin],
   );
 
+  const setupMutation = useMutation({
+    mutationFn: async ({ name, password, token }: FirstAdmin) => {
+      // The token is omitted rather than sent empty: an instance that never
+      // printed one treats "no token configured" as a closed path, and a
+      // caller that has none has nothing to say about it.
+      const body: SetupBody = { name, password, ...(token ? { token } : {}) };
+      const session = await api<LoginResponse>("/auth/setup", {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
+      setCsrfToken(session.csrf);
+      return session;
+    },
+    onSuccess: async () => {
+      // Same reasoning as login: the identity is re-read from the probe, which
+      // is also what flips `needs_setup` false and takes the wizard away.
+      await queryClient.invalidateQueries({ queryKey: ME_QUERY_KEY });
+    },
+    onError: async (error: Error) => {
+      // A 410 says the setup slot closed while this form was open, which makes
+      // the probe's `needs_setup` a stale answer. Re-reading it is what turns
+      // the wizard back into the login form the person now needs; every other
+      // refusal leaves the instance exactly as the probe described it.
+      if (error instanceof ApiProblem && error.status === 410) {
+        await queryClient.invalidateQueries({ queryKey: ME_QUERY_KEY });
+      }
+    },
+  });
+  const { mutateAsync: runSetup } = setupMutation;
+
+  const setup = useCallback(
+    async (name: string, password: string, token?: string) => {
+      await runSetup({ name, password, token });
+    },
+    [runSetup],
+  );
+
   const logout = useCallback(async () => {
     try {
       await api("/auth/logout", { method: "POST" });
@@ -125,9 +163,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       user: identity?.user ?? null,
       capabilities: capabilitiesOf(identity),
       login,
+      setup,
       logout,
     }),
-    [identity, login, logout],
+    [identity, login, setup, logout],
   );
 
   if (me.isPending) {
@@ -161,6 +200,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 interface Credentials {
   name: string;
   password: string;
+}
+
+/** What first-run setup takes: credentials, plus a token when one was asked for. */
+interface FirstAdmin extends Credentials {
+  token?: string | undefined;
 }
 
 /**

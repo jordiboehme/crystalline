@@ -29,6 +29,11 @@ export interface Capabilities {
   canWrite: boolean;
   /** Whether this session may administer accounts. */
   canAdminister: boolean;
+  /**
+   * The instance holds no accounts at all, so first-run setup is still open
+   * and the login screen asks for a first admin instead of credentials.
+   */
+  needsSetup: boolean;
   /** The version of the server that answered the probe. */
   serverVersion: string;
 }
@@ -41,6 +46,14 @@ export interface AuthValue {
   capabilities: Capabilities;
   /** Exchange credentials for a session. Rejects with the `ApiProblem` the server sent. */
   login: (name: string, password: string) => Promise<void>;
+  /**
+   * Create the first admin of an instance that has none, and sign in as them.
+   * `token` is the one-time setup token `serve` prints for a network bind, and
+   * is left out entirely when the server never asked for one. Rejects with the
+   * `ApiProblem` the server sent, which is what tells the screen whether a
+   * token would help.
+   */
+  setup: (name: string, password: string, token?: string) => Promise<void>;
   /** End the session and drop everything it was allowed to see. */
   logout: () => Promise<void>;
 }

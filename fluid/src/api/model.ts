@@ -23,6 +23,9 @@ export type MeResponse = components["schemas"]["MeResponse"];
 /** What a successful `POST /auth/login` answers with. */
 export type LoginResponse = components["schemas"]["LoginResponse"];
 
+/** What `POST /auth/setup` takes: the first admin, and a setup token if one is needed. */
+export type SetupBody = components["schemas"]["SetupBody"];
+
 /** The RFC 9457 body every failure on this API carries. */
 export type ProblemDetail = components["schemas"]["ProblemDetail"];
 
