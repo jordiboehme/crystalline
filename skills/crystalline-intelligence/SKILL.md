@@ -5,7 +5,7 @@ description: Use when the crystalline MCP tools are available and the task invol
 
 # Crystalline Intelligence
 
-Crystalline is your crystalline intelligence across sessions: what you have been taught and what you have learned lives in Domains as Engrams you search, read and, where allowed, capture into.
+Crystalline is your crystallized intelligence across sessions: what you have been taught and what you have learned lives in Domains as Engrams you search, read and, where allowed, capture into.
 
 ## Start from the routing block
 

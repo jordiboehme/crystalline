@@ -6,7 +6,7 @@ Local-first knowledge management for humans and AI agents. Every Domain has exac
 
 Crystalline gives an AI agent the capability to learn and evolve instead of starting from zero in every session. An agent is onboarded via a generated routing prompt, taught information through curated domains and stores its learnings and experiences as engrams while it works - becoming a useful and productive peer over time. All user-facing language (README, skills, MCP tool descriptions, routing prompt) is framed around onboarding, teaching, learning and experience rather than notes or documents.
 
-Positioning follows the psychology concept of fluid vs crystallized intelligence: a language model is fluid intelligence (reasons in the moment, keeps nothing), Crystalline is the crystalline intelligence an agent accumulates and keeps, and the web UI (Fluid) is where the two meet. Describe Crystalline as "crystalline intelligence", never as "crystalline memory" or a memory tool.
+Positioning follows the psychology concept of fluid vs crystallized intelligence: a language model is fluid intelligence (reasons in the moment, keeps nothing), Crystalline is the crystalline intelligence an agent accumulates and keeps, and the web UI (Fluid) is where the two meet. Describe the product as "crystalline intelligence"; the agent-facing phrase avoids the Crystalline/crystalline doubling and reads "Crystalline is your crystallized intelligence across sessions". Never describe it as "crystalline memory" or a memory tool.
 
 ## Vocabulary
 
