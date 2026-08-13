@@ -56,7 +56,10 @@ fn config(github_enabled: bool) -> GlobalConfig {
 /// A bare engine (no origin provider, no connect auth) for gating and
 /// refusal tests that never reach `resolve_origin_provider` or a real
 /// connect action. `config_path` points `configure`'s `set`/`unset` at a
-/// tempdir file instead of the real machine global config.
+/// tempdir file instead of the real machine global config, and the token
+/// store is pointed at the same tempdir: a test that turns github.enabled on
+/// mid-call gets an ungated snapshot afterwards, and without the override
+/// that snapshot would read the developer's real OS keychain.
 async fn engine(config_path: &std::path::Path, github_enabled: bool, read_only: bool) -> Engine {
     let store = TursoStore::open_in_memory().await.unwrap();
     Engine::new(
@@ -65,6 +68,7 @@ async fn engine(config_path: &std::path::Path, github_enabled: bool, read_only: 
         None,
         Some(config_path.to_path_buf()),
     )
+    .with_token_store_dir(config_path.parent().unwrap().to_path_buf())
     .with_read_only(read_only)
 }
 
@@ -362,8 +366,65 @@ async fn configure_with_no_args_reports_the_settings_snapshot_and_github_block()
     assert_eq!(settings.len(), 21, "{settings:?}");
     assert!(settings.iter().any(|s| s["key"] == "github.enabled"));
     assert!(settings.iter().any(|s| s["key"] == "domains_root"));
-    assert_eq!(out["github"]["connected"], json!(false));
-    assert!(out["github"]["pending_connect"].is_null());
+    // github.enabled is off here, so the github block states enablement and
+    // says nothing about a credential the call deliberately never read.
+    assert_eq!(out["github"]["github_enabled"], json!(false));
+    assert!(
+        out["github"]["note"]
+            .as_str()
+            .unwrap()
+            .contains("configure")
+    );
+    let github = out["github"].as_object().unwrap();
+    for absent in ["connected", "user", "token_store", "pending_connect"] {
+        assert!(
+            !github.contains_key(absent),
+            "a disabled instance reports no connection facts, not false ones: {github:?}"
+        );
+    }
+}
+
+/// The gate is about the credential store, not only about the JSON: a token
+/// sitting in the engine's token directory would make an ungated snapshot
+/// report `connected: true`, so the disabled shape here is proof the block
+/// never reached the store. On a real machine that store is the OS keychain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configure_snapshot_never_reads_the_credential_while_github_is_off() {
+    let tmp = tempfile::tempdir().unwrap();
+    seed_token_file(tmp.path(), "octocat");
+    let eng = engine(&tmp.path().join("config.yaml"), false, false).await;
+
+    let snap = eng.configure_snapshot().await.unwrap();
+    assert_eq!(snap["github"]["github_enabled"], json!(false));
+    assert_eq!(
+        snap["github"]["note"],
+        json!(
+            "GitHub is switched off on this instance; set github.enabled true with configure to connect or read the connection."
+        )
+    );
+    let github = snap["github"].as_object().unwrap();
+    for absent in ["connected", "user", "token_store", "pending_connect"] {
+        assert!(
+            !github.contains_key(absent),
+            "the seeded token must not surface in any shape: {github:?}"
+        );
+    }
+}
+
+/// The counterweight: with github.enabled on, the same seeded token is read
+/// and reported exactly as before, so the gate cannot be over-applied into a
+/// snapshot that never reports a connection at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configure_snapshot_still_reports_the_connection_while_github_is_on() {
+    let tmp = tempfile::tempdir().unwrap();
+    seed_token_file(tmp.path(), "octocat");
+    let eng = engine(&tmp.path().join("config.yaml"), true, false).await;
+
+    let snap = eng.configure_snapshot().await.unwrap();
+    assert_eq!(snap["github"]["connected"], json!(true));
+    assert_eq!(snap["github"]["user"], json!("octocat"));
+    assert_eq!(snap["github"]["token_store"], json!("file"));
+    assert!(snap["github"]["pending_connect"].is_null());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -492,6 +553,13 @@ async fn engine_for_connect(auth: Arc<StubConnectAuth>, dir: &std::path::Path) -
 /// engine's config instead of always off - so a test can prove a connect
 /// response's `github_enabled`/`note` reflect the live config in both
 /// states, not just the disabled default the other connect fixtures use.
+///
+/// Every test below about the credential cache or the device-flow lifecycle
+/// builds its engine with `true` here. Those tests are about the token cache
+/// and the pending slot, not about enablement, and they read their result
+/// out of `configure_snapshot`, which reports connection facts only while
+/// github.enabled is on. The tests that ARE about enablement (the connect
+/// responses' `github_enabled`/`note`) keep the disabled fixture.
 async fn engine_for_connect_with(
     github_enabled: bool,
     auth: Arc<StubConnectAuth>,
@@ -508,11 +576,15 @@ async fn engine_for_connect_with(
     .with_token_store_dir(dir.to_path_buf())
 }
 
-/// The same wiring as [`engine_for_connect`], plus `CRYSTALLINE_GITHUB_TOKEN`
-/// in the environment overlay: the token store directory stays wired up too,
-/// so a test built this way can prove the environment wins over it rather
-/// than merely being the only option available.
+/// The same wiring as [`engine_for_connect_with`], plus
+/// `CRYSTALLINE_GITHUB_TOKEN` in the environment overlay: the token store
+/// directory stays wired up too, so a test built this way can prove the
+/// environment wins over it rather than merely being the only option
+/// available. `github_enabled` is a parameter for the same reason it is one
+/// on `engine_for_connect_with`: the snapshot test needs it on, the two
+/// refusal tests are about a refusal that happens with it off.
 async fn engine_for_connect_with_env_token(
+    github_enabled: bool,
     auth: Arc<StubConnectAuth>,
     dir: &std::path::Path,
     token: &str,
@@ -522,7 +594,7 @@ async fn engine_for_connect_with_env_token(
         token.to_string(),
     )])
     .unwrap();
-    engine_for_connect(auth, dir)
+    engine_for_connect_with(github_enabled, auth, dir)
         .await
         .with_env_overlay(overlay)
 }
@@ -535,7 +607,7 @@ async fn token_connect_validates_saves_and_reports_connected() {
         Err(RemoteError::NotConnected),
         Ok("octocat".to_string()),
     );
-    let eng = engine_for_connect(auth, tmp.path()).await;
+    let eng = engine_for_connect_with(true, auth, tmp.path()).await;
 
     let result = eng.connect_with_token("pat-123", None).await.unwrap();
     assert_eq!(result["github"]["connected"], json!(true));
@@ -620,7 +692,7 @@ async fn token_connect_refuses_when_the_environment_owns_the_token() {
         Err(RemoteError::NotConnected),
         Ok("octocat".to_string()),
     );
-    let eng = engine_for_connect_with_env_token(auth, tmp.path(), "gho_SECRETSECRET").await;
+    let eng = engine_for_connect_with_env_token(false, auth, tmp.path(), "gho_SECRETSECRET").await;
 
     let err = eng.connect_with_token("pat-123", None).await.unwrap_err();
     assert!(matches!(err, EngineError::EnvTokenConnect));
@@ -638,7 +710,7 @@ async fn device_flow_refuses_when_the_environment_owns_the_token() {
         Ok("device-token".to_string()),
         Ok("octocat".to_string()),
     );
-    let eng = engine_for_connect_with_env_token(auth, tmp.path(), "gho_SECRETSECRET").await;
+    let eng = engine_for_connect_with_env_token(false, auth, tmp.path(), "gho_SECRETSECRET").await;
 
     let err = eng.start_device_connect(None).await.unwrap_err();
     assert!(matches!(err, EngineError::EnvTokenConnect));
@@ -661,7 +733,7 @@ async fn env_token_wins_over_the_test_token_dir_override() {
         Err(RemoteError::NotConnected),
         Err(RemoteError::NotConnected),
     );
-    let eng = engine_for_connect_with_env_token(auth, tmp.path(), "gho_SECRETSECRET").await;
+    let eng = engine_for_connect_with_env_token(true, auth, tmp.path(), "gho_SECRETSECRET").await;
 
     let snap = eng.configure_snapshot().await.unwrap();
     assert_eq!(snap["github"]["connected"], json!(true));
@@ -681,7 +753,7 @@ async fn device_flow_second_connect_reports_the_same_pending_code_then_lands_con
         Ok("device-token".to_string()),
         Ok("octocat".to_string()),
     );
-    let eng = engine_for_connect(auth.clone(), tmp.path()).await;
+    let eng = engine_for_connect_with(true, auth.clone(), tmp.path()).await;
 
     let first = eng.start_device_connect(None).await.unwrap();
     assert_eq!(first["github"]["connected"], json!(false));
@@ -768,7 +840,7 @@ async fn device_flow_failure_is_reported_once_as_an_error_then_the_slot_clears()
         Err(RemoteError::AuthExpired),
         Err(RemoteError::AuthExpired),
     );
-    let eng = engine_for_connect(auth.clone(), tmp.path()).await;
+    let eng = engine_for_connect_with(true, auth.clone(), tmp.path()).await;
 
     eng.start_device_connect(None).await.unwrap();
     auth.run_gate.notify_one();
@@ -784,6 +856,52 @@ async fn device_flow_failure_is_reported_once_as_an_error_then_the_slot_clears()
     let after = eng.configure_snapshot().await.unwrap();
     assert_eq!(after["github"]["connected"], json!(false));
     assert!(after["github"]["pending_connect"].is_null());
+}
+
+/// The gate sits ABOVE the pending drain, so on a disabled instance a bare
+/// `configure` neither reports a landed device-flow outcome nor destroys it:
+/// the outcome stays in the slot for the settings surface, which still
+/// reports it exactly once.
+#[tokio::test]
+async fn a_disabled_snapshot_leaves_a_landed_outcome_for_the_settings_surface() {
+    let tmp = tempfile::tempdir().unwrap();
+    let auth = fake_auth(
+        Ok(device_flow_start()),
+        Err(RemoteError::AuthExpired),
+        Err(RemoteError::AuthExpired),
+    );
+    let eng = engine_for_connect(auth.clone(), tmp.path()).await;
+
+    eng.start_device_connect(None).await.unwrap();
+    auth.run_gate.notify_one();
+
+    // The snapshot call sits INSIDE the poll loop deliberately. Nothing can
+    // observe the background task landing its outcome without draining it
+    // (the pending view is private and github_connection drains), so a
+    // single snapshot before the poll would prove nothing: it would usually
+    // run before the outcome landed and pass with or without the gate. Here
+    // it runs on every iteration, including the one where the outcome is
+    // sitting in the slot. An ungated snapshot would drain the failure and
+    // return it as an error, github_connection would never see it, and this
+    // loop would run out and panic.
+    let reported = wait_until(|| async {
+        let snap = eng.configure_snapshot().await.unwrap();
+        let github = snap["github"].as_object().unwrap();
+        assert_eq!(github["github_enabled"], json!(false));
+        assert!(
+            !github.contains_key("connected") && !github.contains_key("pending_connect"),
+            "a disabled snapshot reports no connection facts, landed outcome or not: {github:?}"
+        );
+        eng.github_connection().await.unwrap().error
+    })
+    .await;
+    assert_eq!(
+        reported,
+        "The GitHub connection has expired or was revoked. Use configure to sign in again."
+    );
+
+    // Still exactly once: the drain that reported it also cleared the slot.
+    assert!(eng.github_connection().await.unwrap().error.is_none());
 }
 
 // --- process-lifetime token cache -------------------------------------------
@@ -812,7 +930,7 @@ async fn configure_snapshot_serves_the_cached_token_after_the_backing_file_is_de
         Err(RemoteError::NotConnected),
         Ok("octocat".to_string()),
     );
-    let eng = engine_for_connect(auth, tmp.path()).await;
+    let eng = engine_for_connect_with(true, auth, tmp.path()).await;
 
     // Connect writes the token once and refreshes the cache.
     let result = eng.connect_with_token("pat-123", None).await.unwrap();
@@ -841,7 +959,7 @@ async fn connect_with_token_refreshes_the_cached_credential() {
         Err(RemoteError::NotConnected),
         Ok("octocat".to_string()),
     );
-    let eng = engine_for_connect(auth, tmp.path()).await;
+    let eng = engine_for_connect_with(true, auth, tmp.path()).await;
 
     // Populate the cache with the stale identity.
     let before = eng.configure_snapshot().await.unwrap();
@@ -874,7 +992,7 @@ async fn a_landed_device_flow_refreshes_the_cached_credential() {
         Ok("device-token".to_string()),
         Ok("octocat".to_string()),
     );
-    let eng = engine_for_connect(auth.clone(), tmp.path()).await;
+    let eng = engine_for_connect_with(true, auth.clone(), tmp.path()).await;
 
     // Populate the cache with the stale identity, then start the flow.
     let before = eng.configure_snapshot().await.unwrap();

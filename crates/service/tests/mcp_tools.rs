@@ -71,9 +71,16 @@ impl Harness {
         }
         let config_path = root.join("config.yaml");
         crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
+        // The `configure` tool's snapshot reads the GitHub credential once
+        // github.enabled is on, and a test here can turn it on mid-call, so
+        // point the token store at the tempdir: nothing in this file may
+        // reach the developer's real OS keychain.
+        let token_store = root.join("token-store");
+        std::fs::create_dir_all(&token_store).unwrap();
         let store = TursoStore::open_in_memory().await.unwrap();
         let engine = Arc::new(
             Engine::new(Arc::new(Mutex::new(store)), cfg, None, Some(config_path))
+                .with_token_store_dir(token_store)
                 .with_read_only(read_only),
         );
         engine.sync(None).await.unwrap();

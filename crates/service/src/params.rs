@@ -391,10 +391,12 @@ pub struct EvolveParams {
     pub today: Option<String>,
 }
 
-/// Parameters for `configure`. Omit everything to see the current settings
-/// and GitHub connection. `token` or `connect` handle a GitHub connect
-/// action on their own and ignore `set`/`unset` in the same call; give them
-/// on a separate call from a settings change.
+/// Parameters for `configure`. Omit everything to see the current settings,
+/// and with `github.enabled` on the GitHub connection too; with it off the
+/// snapshot reports that the feature is off and how to turn it on, leaving
+/// the stored credential unread. `token` or `connect` handle a GitHub
+/// connect action on their own and ignore `set`/`unset` in the same call;
+/// give them on a separate call from a settings change.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 pub struct ConfigureParams {
     /// Settings to change, key to value, for example { "github.enabled":

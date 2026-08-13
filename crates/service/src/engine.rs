@@ -7436,7 +7436,42 @@ impl Engine {
     /// The `configure` tool's plain snapshot: every registry setting plus
     /// the GitHub connection block. Used for a bare call and after applying
     /// `set`/`unset`.
+    ///
+    /// With `github.enabled` off the connection block is `{ github_enabled:
+    /// false, note }` and nothing else: no `connected`, no `user`, no
+    /// `token_store`, no `pending_connect`. Absent rather than false on
+    /// purpose - a `connected: false` would be a claim about a credential
+    /// this call deliberately did not read, and reading it is the thing the
+    /// gate exists to prevent (on a real machine that read is an OS keychain
+    /// touch, for a feature that is switched off). What a disabled instance
+    /// reports is the feature's state and how to turn it on, which is the
+    /// only actionable thing at that moment: `configure` stays visible with
+    /// GitHub off precisely so it can be enabled.
+    ///
+    /// The gate sits ABOVE [`Engine::configure_connection_block`], whose
+    /// first act is draining a landed device-flow outcome. That placement is
+    /// deliberate: gating below the drain would leave only two options, both
+    /// wrong - report the landed outcome (connection facts on a disabled
+    /// instance) or drain and swallow it (destroying the one thing a
+    /// report-once contract cannot survive). Above the drain the outcome
+    /// stays in the slot and is still reported exactly once, by the next
+    /// connect call or by the settings surface through
+    /// [`Engine::github_connection`], which drains for itself. The only
+    /// change is that a bare `configure` stops being one of the surfaces
+    /// that report it while the feature is off.
+    ///
+    /// The connect paths are NOT gated: [`Engine::connect_with_token`] and
+    /// [`Engine::start_device_connect`] build their own block and go through
+    /// [`Engine::configure_snapshot_with`], so connecting with
+    /// `github.enabled` off still reports the connection and says so in its
+    /// note. Connecting and enabling are independent and either order works.
     pub async fn configure_snapshot(&self) -> Result<Value> {
+        if !self.github_enabled() {
+            return self.configure_snapshot_with(json!({
+                "github_enabled": false,
+                "note": "GitHub is switched off on this instance; set github.enabled true with configure to connect or read the connection.",
+            }));
+        }
         let github = self.configure_connection_block().await?;
         self.configure_snapshot_with(github)
     }
