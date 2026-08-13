@@ -73,6 +73,34 @@ function savingManifest(put: () => unknown): Record<string, Answer> {
   };
 }
 
+/**
+ * A PUT that is held open until the test says otherwise, so a save can be in
+ * flight while the author goes on working - which is where every rule about
+ * what a landing save may still do to the buffer behind it lives.
+ */
+function gatedPut() {
+  let land = () => undefined as void;
+  const landed = new Promise<void>((resolve) => {
+    land = () => {
+      resolve();
+    };
+  });
+  const put = vi.fn(async () => {
+    await landed;
+    return manifestResponse({ checksum: "m2" });
+  });
+  return { put, land: () => land() };
+}
+
+/** Let everything a landed save scheduled flush, a navigation included. */
+async function settled(): Promise<void> {
+  await act(async () => {
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0);
+    });
+  });
+}
+
 /** The `If-Match` header of the first PUT the mock has seen. */
 function firstIfMatch(): string | undefined {
   const call = apiMock.mock.calls.find(([, init]) => init?.method === "PUT");
@@ -187,6 +215,22 @@ describe("the MANIFEST editor", () => {
     expect(firstIfMatch()).toBe('"m1"');
   });
 
+  it("hints at Close in the app's tooltip rather than the browser's", async () => {
+    serveEditor();
+    renderApp("/d/eng/manifest/edit");
+    await screen.findByLabelText("MANIFEST source");
+
+    // The engram editor's row carries the app's own tooltip surface; this one
+    // is the same editor with a different subject, and a native `title` here
+    // would make the pair disagree about what a hint looks like.
+    const close = screen.getByRole("button", { name: "Close" });
+    expect(close).not.toHaveAttribute("title");
+    await userEvent.hover(close);
+    expect(
+      await screen.findByRole("tooltip", {}, { timeout: 2000 }),
+    ).toHaveTextContent("Close the editor");
+  });
+
   it("Close leaves a clean buffer at once, with nothing to ask about", async () => {
     const put = vi.fn(() => manifestResponse({ checksum: "m2" }));
     serveEditor(savingManifest(put));
@@ -259,6 +303,81 @@ describe("the MANIFEST editor", () => {
     await screen.findByRole("heading", { name: "MANIFEST", level: 1 });
     expect(put).not.toHaveBeenCalled();
     expect(localStorage.getItem("fluid.draft.ada.eng/MANIFEST")).toBeNull();
+  });
+
+  it("Discard changes outlives a save that lands after the walkout", async () => {
+    const { put, land } = gatedPut();
+    serveEditor(savingManifest(put));
+    renderApp("/d/eng/manifest/edit");
+    const editor = await screen.findByLabelText("MANIFEST source");
+    await waitFor(() => {
+      expect(editor.textContent).toContain("Route here for eng.");
+    });
+    await typeIntoBuffer(editor, "\nThe first line.\n");
+    await userEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => {
+      expect(put).toHaveBeenCalledTimes(1);
+    });
+
+    // Still typing while that round trip is out, so the save is carrying a
+    // version the buffer has already moved past.
+    await typeIntoBuffer(editor, "A line nobody wants.\n");
+    await waitFor(
+      () => {
+        expect(localStorage.getItem("fluid.draft.ada.eng/MANIFEST")).toContain(
+          "A line nobody wants.",
+        );
+      },
+      { timeout: 4000 },
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: "Close" }));
+    await screen.findByText("Close the editor?");
+    await userEvent.click(
+      screen.getByRole("button", { name: "Discard changes" }),
+    );
+    await screen.findByRole("heading", { name: "MANIFEST", level: 1 });
+    expect(localStorage.getItem("fluid.draft.ada.eng/MANIFEST")).toBeNull();
+
+    // The save the author walked out on lands behind them, and must not put
+    // the discarded text back for the next visit to offer.
+    land();
+    await settled();
+    expect(localStorage.getItem("fluid.draft.ada.eng/MANIFEST")).toBeNull();
+  });
+
+  it("Save and close never finishes on a save that no longer carries the buffer", async () => {
+    const { put, land } = gatedPut();
+    serveEditor(savingManifest(put));
+    renderApp("/d/eng/manifest/edit");
+    const editor = await screen.findByLabelText("MANIFEST source");
+    await waitFor(() => {
+      expect(editor.textContent).toContain("Route here for eng.");
+    });
+    await typeIntoBuffer(editor, "\nThe first line.\n");
+    await userEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => {
+      expect(put).toHaveBeenCalledTimes(1);
+    });
+    await typeIntoBuffer(editor, "A later line.\n");
+
+    // The answer rides the save that is already out, and that save is a
+    // receipt for text this author has already left behind. Leaving on it
+    // would take the newer lines off the screen under an answer that promised
+    // to keep the work - the same rule the engram editor holds, pinned here
+    // too because this screen has its own copy of the line that applies it.
+    await userEvent.click(screen.getByRole("button", { name: "Close" }));
+    await userEvent.click(
+      screen.getByRole("button", { name: "Save and close" }),
+    );
+    land();
+
+    expect(await screen.findByText("Saved")).toBeInTheDocument();
+    await settled();
+    expect(screen.getByLabelText("MANIFEST source")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("heading", { name: "MANIFEST", level: 1 }),
+    ).toBeNull();
   });
 
   it("offers a stored draft and restores it into the buffer", async () => {

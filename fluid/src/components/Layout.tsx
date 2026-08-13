@@ -522,8 +522,10 @@ function UserMenu() {
                   {/*
                     Named for what the screen is rather than for the service it
                     talks to: from in here it is where this instance's settings
-                    are kept, and the one page of them today is the repository
-                    connection the branch icon above also opens.
+                    are kept, and the one page of them today happens to be the
+                    repository connection team domains are tracked with. This is
+                    the only door to it - the branch icon that used to stand in
+                    the top bar came in here with the accounts one.
                   */}
                   <DropdownMenu.Item className={ITEM_CLASSES} asChild>
                     <Link to={githubSettingsRoute()}>Settings</Link>

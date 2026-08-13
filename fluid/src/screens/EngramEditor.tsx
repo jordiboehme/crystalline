@@ -70,6 +70,7 @@ import {
   wikilinkResolverFacet,
 } from "../editor/wikilinkChips";
 import { domainRoute, editRoute, engramRoute } from "../paths";
+import { ENGRAM_PREFETCH } from "../prefetch";
 import { useTheme } from "../theme/context";
 import type { WikilinkResolver } from "../wikilinks";
 import { buildWikilinkResolver } from "../wikilinks";
@@ -678,7 +679,7 @@ function Surface({
       dirty: session.dirty,
       hardErrors: session.hardErrors,
       requestSave: session.requestSave,
-      discardDraft: session.discardDraft,
+      abandon: session.abandon,
     },
     () => {
       void navigate(engramRoute(engram.domain, engram.permalink));
@@ -926,25 +927,30 @@ function Surface({
                 <FileCode aria-hidden="true" size={16} strokeWidth={1.75} />
               </button>
             </Tooltip>
-            <button
-              type="button"
-              onClick={session.requestSave}
-              // What each of the two verbs promises, in one line, where the
-              // pointer already is. The buttons say what they do; these say
-              // what happens next.
-              title="Save and keep editing"
-              // In a room the client's verdict never gates a save: the server
-              // owns the write, it debounce-saves whatever the shared text
-              // holds regardless of this tab, and its own parse refusal is
-              // the authoritative gate - it comes back as a save-failed
-              // control in the server's words. A button disabled here while
-              // Mod-S flushed and the server saved anyway would be a control
-              // lying about what is happening.
-              disabled={session.saving || (!inRoom && session.hardErrors > 0)}
-              className={BUTTON.secondary}
-            >
-              Save
-            </button>
+            {/*
+              What each of the two verbs promises, in one line, where the
+              pointer already is. The buttons say what they do; these say what
+              happens next - through the app's own tooltip, because Raw next to
+              them wears that surface and a native `title` here was a second
+              one, drawn a beat later in a font the page does not choose.
+            */}
+            <Tooltip label="Save and keep editing">
+              <button
+                type="button"
+                onClick={session.requestSave}
+                // In a room the client's verdict never gates a save: the
+                // server owns the write, it debounce-saves whatever the shared
+                // text holds regardless of this tab, and its own parse refusal
+                // is the authoritative gate - it comes back as a save-failed
+                // control in the server's words. A button disabled here while
+                // Mod-S flushed and the server saved anyway would be a control
+                // lying about what is happening.
+                disabled={session.saving || (!inRoom && session.hardErrors > 0)}
+                className={BUTTON.secondary}
+              >
+                Save
+              </button>
+            </Tooltip>
             {/*
               The primary verb of this screen: Save keeps the work, Close is
               the way out. It does not save on the way - one press with two
@@ -955,22 +961,31 @@ function Surface({
               leave, so it stays the link it has always been.
             */}
             {inRoom ? (
-              <Link
-                to={engramRoute(engram.domain, engram.permalink)}
-                title="Close; the server keeps the room's work"
-                className={BUTTON.primary}
-              >
-                Close
-              </Link>
+              <Tooltip label="Close; the server keeps the room's work">
+                {/*
+                  Warmed like every other link to the reading screen: that
+                  screen is lazy now, and an author who deep-linked into the
+                  editor has never loaded its chunk, which makes this the one
+                  link to it most likely to be cold when it is pressed.
+                */}
+                <Link
+                  to={engramRoute(engram.domain, engram.permalink)}
+                  {...ENGRAM_PREFETCH}
+                  className={BUTTON.primary}
+                >
+                  Close
+                </Link>
+              </Tooltip>
             ) : (
-              <button
-                type="button"
-                onClick={closing.close}
-                title="Close the editor"
-                className={BUTTON.primary}
-              >
-                Close
-              </button>
+              <Tooltip label="Close the editor">
+                <button
+                  type="button"
+                  onClick={closing.close}
+                  className={BUTTON.primary}
+                >
+                  Close
+                </button>
+              </Tooltip>
             )}
           </div>
         </div>

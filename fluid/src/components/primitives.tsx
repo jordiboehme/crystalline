@@ -187,6 +187,16 @@ const TOOLTIP_CLASSES =
  * The label is NOT the accessible name. `aria-label` on the control itself is
  * that, and it stays; this is the same words drawn for a pointer, tied on with
  * `aria-describedby` by Radix, so a screen reader hears the name once.
+ *
+ * One known edge, kept rather than fought: a control that also opens a menu -
+ * the theme trigger, More actions, the toolbar's pickers - shows its tooltip
+ * again the instant that menu closes. Radix returns the keyboard to the trigger
+ * on dismissal, and a tooltip opens on focus with no delay, by design, because
+ * a control somebody deliberately moved to has already been asked about. The
+ * cure is worse than the noise: suppressing it means making every such trigger
+ * carry the menu's open state into a controlled tooltip, which is state in a
+ * dozen call sites to stop one label appearing a moment early. It goes as soon
+ * as the pointer moves or the focus does.
  */
 export function Tooltip({
   label,
@@ -218,8 +228,17 @@ export function Tooltip({
  * keyboard onto one of these - a control that replaces the control that was
  * pressed - needs the element itself, and React hands a function component's
  * `ref` through with the rest of its props.
+ *
+ * Every attribute except `title`, which is removed rather than merely unused.
+ * It would ride `...rest` straight onto the button and draw the browser's own
+ * label beside the tooltip below: one control, two surfaces, two delays, the
+ * exact thing this component exists to stop. Made impossible here rather than
+ * left to the discipline of every future call site.
  */
-export interface IconButtonProps extends ComponentPropsWithRef<"button"> {
+export interface IconButtonProps extends Omit<
+  ComponentPropsWithRef<"button">,
+  "title"
+> {
   /** The accessible name; also the tooltip. Mandatory by construction. */
   label: string;
   icon: LucideIcon;

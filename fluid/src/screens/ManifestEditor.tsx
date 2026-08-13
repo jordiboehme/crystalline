@@ -34,7 +34,7 @@ import {
 } from "../api/domain";
 import { useAuth } from "../auth/AuthContext";
 import { Breadcrumbs, crumbsOf } from "../components/Breadcrumbs";
-import { BUTTON } from "../components/primitives";
+import { BUTTON, Tooltip } from "../components/primitives";
 import { Skeleton } from "../components/Skeleton";
 import CmEditor from "../editor/CmEditor";
 import { ConfirmLeaveDialog } from "../editor/ConfirmLeaveDialog";
@@ -219,7 +219,7 @@ function EditorSurface({
       dirty: session.dirty,
       hardErrors: session.hardErrors,
       requestSave: session.requestSave,
-      discardDraft: session.discardDraft,
+      abandon: session.abandon,
     },
     leave,
   );
@@ -279,14 +279,21 @@ function EditorSurface({
           >
             Save
           </button>
-          <button
-            type="button"
-            onClick={closing.close}
-            title="Close the editor"
-            className={BUTTON.primary}
-          >
-            Close
-          </button>
+          {/*
+            The hint rides the app's own tooltip surface, which is what the
+            engram editor's row wears: the two editors are one screen with two
+            subjects, and a browser-drawn title here would make them disagree
+            about what a hint looks like.
+          */}
+          <Tooltip label="Close the editor">
+            <button
+              type="button"
+              onClick={closing.close}
+              className={BUTTON.primary}
+            >
+              Close
+            </button>
+          </Tooltip>
         </div>
       </header>
       {session.hardErrors > 0 && (

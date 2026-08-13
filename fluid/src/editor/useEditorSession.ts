@@ -129,6 +129,14 @@ export interface EditorSession {
   restoreDraft: () => void;
   discardDraft: () => void;
   /**
+   * Throw this buffer away for good: clear the draft, and refuse every later
+   * snapshot of it. For the one act that means the text is not wanted anywhere
+   * - the walkout from `useCloseFlow`'s Discard changes - as opposed to
+   * `discardDraft`, which only turns down the recovery offer and leaves the
+   * safety net armed for whatever is typed next.
+   */
+  abandon: () => void;
+  /**
    * Store the buffer as a draft right now, in draft space. For the deliberate
    * snapshots that precede giving the text up: the collab conflict's "take
    * the file version" and the walk-out from an accepted deletion.
@@ -196,14 +204,38 @@ export function useEditorSession(options: EditorSessionOptions): EditorSession {
     useValidationGate(validateDomain, validatePath, buffer);
 
   /**
+   * Whether this buffer was thrown away on the way out.
+   *
+   * The one latch that outranks every writer below. `abandon` sets it, nothing
+   * clears it - the screen is leaving, and a session that came back would be a
+   * new mount with a new ref - and `snapshotDraft` refuses on it, which is what
+   * makes a discard hold against work that is still in the air. Without it the
+   * stale-success rule inside the save writes the abandoned buffer straight
+   * back into the draft store a moment after the author is gone, and the next
+   * visit offers back exactly the text they threw away.
+   *
+   * A ref rather than state because nothing renders differently for it and the
+   * writers that read it are callbacks, not renders: the answer has to be the
+   * latest one at the moment a save lands, not the one a render captured.
+   */
+  const abandoned = useRef(false);
+
+  /**
    * Store the buffer as it stands, in draft space. The debounce below is the
    * only writer that runs on its own; the deliberate snapshots - taking the
    * server's version, handing a room's conflict to the file, walking out of a
    * deleted engram, keeping what a landed save did not carry - go through the
    * same spelling rather than a second one.
+   *
+   * Which is exactly why the walkout latch is checked HERE rather than at any
+   * one of those call sites: one refusal covers every way this buffer could be
+   * written back, including the ones a later change adds.
    */
   const snapshotDraft = useCallback(
     (text: string) => {
+      if (abandoned.current) {
+        return;
+      }
       writeDraft(draftUser, draftDomain, draftSlot, {
         // In collab mode the buffer is LF session space; `draftContent` maps
         // it to file space so the stored draft matches the solo flow's.
@@ -399,6 +431,15 @@ export function useEditorSession(options: EditorSessionOptions): EditorSession {
       }
     },
     discardDraft: () => {
+      clearDraft(draftUser, draftDomain, draftSlot);
+      setOfferedDraft(null);
+    },
+    abandon: () => {
+      // Deliberately not `discardDraft`, though it does the same two things
+      // first. That one is the recovery banner's answer, after which the
+      // author goes on editing and every later snapshot must still be written;
+      // this one is the walkout, after which none of them may be.
+      abandoned.current = true;
       clearDraft(draftUser, draftDomain, draftSlot);
       setOfferedDraft(null);
     },
