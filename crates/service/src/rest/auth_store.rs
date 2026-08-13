@@ -2480,62 +2480,114 @@ mod tests {
     /// an ordinary add of a different name is not competing for the slot at
     /// all. What must hold is that `add_first_admin` reports success at most
     /// once, and never once any row already exists.
+    ///
+    /// **The two racing calls are `tokio::spawn`ed behind a barrier, and the
+    /// race is repeated ten times.** All three details are load bearing and
+    /// none is style. A `tokio::join!` polls both futures on ONE task, so they
+    /// can only interleave where one of them returns `Pending` - and the
+    /// check-then-insert window this test exists to catch is store work that
+    /// never yields, so a `join!` version of this test passes against exactly
+    /// the naive implementation the plan rejects (measured against a
+    /// deliberately naive store: 12 runs, 12 misses). Spawned onto different
+    /// worker threads and released together, the same race caught that store in
+    /// roughly four rounds out of five, and ten rounds is what turns "roughly
+    /// four out of five" into a pin. Anyone tempted to tidy this back into a
+    /// `join!` is removing the only test that can see the bug.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_second_store_open_cannot_also_win_first_admin() {
+        use std::sync::Arc;
+
         // Leg one: first admin against first admin, on two opens of one file.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("web-auth.db");
-        let daemon = AuthStore::open(&path).await.unwrap();
-        let cli = AuthStore::open(&path).await.unwrap();
-        let (a, b) = tokio::join!(
-            daemon.add_first_admin("root", "Root", "rootpw"),
-            cli.add_first_admin("boss", "Boss", "bosspw"),
-        );
-        let won = [a.unwrap(), b.unwrap()];
-        assert_eq!(
-            won.iter().filter(|w| **w).count(),
-            1,
-            "exactly one of two racing first-admin calls may win"
-        );
-        assert_eq!(
-            daemon.user_count().await.unwrap(),
-            1,
-            "and exactly one row is what they left behind"
-        );
+        for round in 0..10 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("web-auth.db");
+            let daemon = Arc::new(AuthStore::open(&path).await.unwrap());
+            let cli = Arc::new(AuthStore::open(&path).await.unwrap());
+            // Released together, so what separates the two calls is the work
+            // itself rather than however long each task waited to be scheduled.
+            let gate = Arc::new(tokio::sync::Barrier::new(2));
+            let one = tokio::spawn({
+                let store = daemon.clone();
+                let gate = gate.clone();
+                async move {
+                    gate.wait().await;
+                    store.add_first_admin("root", "Root", "rootpw").await
+                }
+            });
+            let two = tokio::spawn({
+                let store = cli.clone();
+                let gate = gate.clone();
+                async move {
+                    gate.wait().await;
+                    store.add_first_admin("boss", "Boss", "bosspw").await
+                }
+            });
+            let won = [one.await.unwrap().unwrap(), two.await.unwrap().unwrap()];
+            assert_eq!(
+                won.iter().filter(|w| **w).count(),
+                1,
+                "round {round}: exactly one of two racing first-admin calls may win"
+            );
+            assert_eq!(
+                daemon.user_count().await.unwrap(),
+                1,
+                "round {round}: and exactly one row is what they left behind"
+            );
+        }
 
         // Leg two: first admin against an ordinary add from the other open.
         // Both may land - the names differ and `users add` is not competing for
         // the slot - but a first admin created after a row exists would be a
-        // check-then-insert that read stale.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("web-auth.db");
-        let daemon = AuthStore::open(&path).await.unwrap();
-        let cli = AuthStore::open(&path).await.unwrap();
-        let (first, added) = tokio::join!(
-            daemon.add_first_admin("root", "Root", "rootpw"),
-            cli.add_user("ada", "Ada", None, Role::Viewer, "pw"),
-        );
-        added.unwrap();
-        let names: Vec<String> = daemon
-            .list_users()
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|u| u.name)
-            .collect();
-        if first.unwrap() {
-            assert!(names.contains(&"root".to_string()));
-        } else {
-            assert_eq!(
-                names,
-                vec!["ada".to_string()],
-                "a first admin that reported failure must not have written a row"
+        // check-then-insert that read stale, and a first admin that reported
+        // failure while writing a row would be worse still.
+        for round in 0..10 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("web-auth.db");
+            let daemon = Arc::new(AuthStore::open(&path).await.unwrap());
+            let cli = Arc::new(AuthStore::open(&path).await.unwrap());
+            let gate = Arc::new(tokio::sync::Barrier::new(2));
+            let first = tokio::spawn({
+                let store = daemon.clone();
+                let gate = gate.clone();
+                async move {
+                    gate.wait().await;
+                    store.add_first_admin("root", "Root", "rootpw").await
+                }
+            });
+            let added = tokio::spawn({
+                let store = cli.clone();
+                let gate = gate.clone();
+                async move {
+                    gate.wait().await;
+                    store.add_user("ada", "Ada", None, Role::Viewer, "pw").await
+                }
+            });
+            added.await.unwrap().unwrap();
+            // Both racers have finished before the table is read, or the read
+            // could miss a row that was still on its way in.
+            let first = first.await.unwrap().unwrap();
+            let names: Vec<String> = daemon
+                .list_users()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|u| u.name)
+                .collect();
+            if first {
+                assert!(names.contains(&"root".to_string()), "round {round}");
+            } else {
+                assert_eq!(
+                    names,
+                    vec!["ada".to_string()],
+                    "round {round}: a first admin that reported failure must not \
+                     have written a row"
+                );
+            }
+            assert!(
+                !daemon.add_first_admin("late", "Late", "pw").await.unwrap(),
+                "round {round}: and the slot stays shut for every later caller"
             );
         }
-        assert!(
-            !daemon.add_first_admin("late", "Late", "pw").await.unwrap(),
-            "and the slot stays shut for every later caller"
-        );
     }
 
     #[tokio::test]

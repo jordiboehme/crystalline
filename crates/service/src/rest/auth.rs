@@ -952,6 +952,17 @@ fn gone() -> ApiError {
 /// there is no token to find and setup has to run from the machine itself.
 /// Neither ever contains the token, and a wrong token is answered exactly like
 /// a missing one so the difference is not an oracle.
+///
+/// A blank configured token is treated as no token at all, the same rule
+/// [`check_csrf`] applies to an empty expected CSRF token and for the same
+/// reason: it would match the empty string a caller that sends nothing is
+/// compared as, and hand first-run setup to the whole network. It is
+/// unreachable as things stand - [`RestState::with_setup_token`] drops a blank
+/// token on the way in, and the generator produces 32 hex characters - but a
+/// check that fails open when its own input is missing is the wrong shape to
+/// leave lying around, and the plan's own named follow-up (a `--setup-token`
+/// flag for provisioning scripts) is one step away from making an operator's
+/// empty string reachable.
 fn authorize_setup(
     state: &RestState,
     peer: PeerAddr,
@@ -961,7 +972,7 @@ fn authorize_setup(
     if is_local_setup_peer(peer.0, headers) {
         return Ok(());
     }
-    let Some(expected) = state.setup_token() else {
+    let Some(expected) = state.setup_token().filter(|token| !token.trim().is_empty()) else {
         return Err(ApiError::forbidden(
             "first-run setup is open to this instance's own machine only: run \
              it from there, or restart `crystalline serve` on a network \

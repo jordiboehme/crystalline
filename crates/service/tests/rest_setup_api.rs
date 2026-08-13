@@ -275,6 +275,33 @@ async fn setup_is_gone_once_any_account_exists() {
     let resp = setup(seeded.addr, json!({"name": "root", "password": "rootpw"})).await;
     assert_eq!(resp.status(), 410);
     assert_eq!(seeded.auth.user_count().await.unwrap(), 1);
+
+    // The order the handler checks in is a security property, so it is asserted
+    // rather than read off the code: an instance that HOLDS a token, probed
+    // from a non-local caller carrying none, hears only "gone". Were locality
+    // checked first, that prober would instead be handed a 403 whose
+    // `token_required` member tells it a setup token exists to be guessed at.
+    let configured = serve(Options {
+        setup_token: Some(TOKEN.to_string()),
+        ..Options::default()
+    })
+    .await;
+    configured
+        .auth
+        .add_user("ada", "Ada", None, Role::Viewer, "s3cret")
+        .await
+        .unwrap();
+    let resp = setup_forwarded(
+        configured.addr,
+        json!({"name": "root", "password": "rootpw"}),
+    )
+    .await;
+    assert_eq!(resp.status(), 410, "the account gate is checked first");
+    let doc = problem(resp).await;
+    assert!(
+        doc.get("token_required").is_none(),
+        "and a remote prober learns nothing about this instance's token: {doc}"
+    );
 }
 
 /// The handler half of invariant 1: whatever arrives at once, exactly one
@@ -445,6 +472,53 @@ async fn the_setup_token_is_required_and_compared_for_a_non_local_caller() {
     assert_eq!(tokenless.auth.user_count().await.unwrap(), 0);
 }
 
+/// A blank configured token is no token: it must never match the empty string a
+/// caller who sends nothing is compared as, which would hand first-run setup to
+/// every remote caller on the network.
+///
+/// Nothing generates a blank token today, which is exactly why this is pinned:
+/// the failure is silent, it is the worst one this endpoint has, and the
+/// plan's own named follow-up (a `--setup-token` flag for provisioning scripts)
+/// would put an operator's empty string one flag away from reaching it.
+#[tokio::test]
+async fn a_blank_setup_token_is_no_token_rather_than_a_skeleton_key() {
+    for blank in ["", "   "] {
+        let fixture = serve(Options {
+            setup_token: Some(blank.to_string()),
+            ..Options::default()
+        })
+        .await;
+        // A remote caller sending nothing: refused, and told the truth - this
+        // instance holds no token, so no token field may be offered.
+        let resp =
+            setup_forwarded(fixture.addr, json!({"name": "root", "password": "rootpw"})).await;
+        assert_eq!(resp.status(), 403, "a blank token admits nobody");
+        let doc = problem(resp).await;
+        assert!(
+            doc.get("token_required").is_none(),
+            "a blank token is no token, so no token field is offered: {doc}"
+        );
+        // And sending the blank value back does not match it either.
+        for presented in ["", "   "] {
+            let resp = setup_forwarded(
+                fixture.addr,
+                json!({"name": "root", "password": "rootpw", "token": presented}),
+            )
+            .await;
+            assert_eq!(resp.status(), 403, "{presented:?} is not a token either");
+        }
+        assert_eq!(fixture.auth.user_count().await.unwrap(), 0);
+        // The local path is untouched: a blank token closes the token path, not
+        // the endpoint.
+        assert_eq!(
+            setup(fixture.addr, json!({"name": "root", "password": "rootpw"}))
+                .await
+                .status(),
+            200
+        );
+    }
+}
+
 /// Decision 6: setup is CSRF-exempt by path, exactly as login is, and nothing
 /// else moved.
 #[tokio::test]
@@ -542,6 +616,23 @@ async fn setup_serves_problem_json_like_the_rest() {
     // JSON, but not a setup.
     let resp = setup(fixture.addr, json!({"name": "root"})).await;
     assert_eq!(resp.status(), 422);
+    assert_eq!(fixture.auth.user_count().await.unwrap(), 0);
+
+    // A name the store cannot key on, which is the one store refusal this
+    // endpoint reclassifies as the caller's mistake. Asserted at the HTTP level
+    // because the mapping reads the store's own wording: without this, a
+    // reworded store message would turn a typo on the first screen a new user
+    // ever sees into a 500.
+    for name in ["ada lovelace", "   "] {
+        let resp = setup(fixture.addr, json!({"name": name, "password": "rootpw"})).await;
+        assert_eq!(resp.status(), 422, "{name:?} is not a login name");
+        let doc = problem(resp).await;
+        assert!(
+            doc["detail"].as_str().unwrap().contains("name"),
+            "the store's own wording, which says what is wrong with it: {}",
+            doc["detail"]
+        );
+    }
     assert_eq!(fixture.auth.user_count().await.unwrap(), 0);
 
     // The anonymous viewer changes nothing: setup is public either way, and an

@@ -222,8 +222,15 @@ impl RestState {
     /// caller - stay as they are, and so the token is visibly opt-in at the one
     /// place that has it: `run_serve`, which generates it for a non-loopback
     /// bind and prints it once.
+    ///
+    /// A blank token is stored as no token. Nothing generates one today, but a
+    /// token nobody could type is not a token, and the handler that compares it
+    /// would otherwise be handed a value that matches a caller who sends
+    /// nothing at all - see `auth::authorize_setup`, which fails closed on it a
+    /// second time rather than trusting this to be the only way the field is
+    /// ever set.
     pub fn with_setup_token(mut self, token: Option<String>) -> RestState {
-        self.setup_token = token;
+        self.setup_token = token.filter(|token| !token.trim().is_empty());
         self
     }
 
