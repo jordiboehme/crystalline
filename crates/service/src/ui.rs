@@ -9,16 +9,30 @@
 //! ## Cache semantics, mirrored from the nginx variant
 //!
 //! The compose deployment (`fluid/nginx.conf.template`) stays supported as the
-//! scale-out variant, so a browser must not be able to tell which of the two
-//! served it. That means these rules, one for one:
+//! scale-out variant, so a browser must not be able to tell from the cache
+//! semantics which of the two served it. That means these rules, one for one:
 //!
 //! | Request | Answer | Why |
 //! |---|---|---|
 //! | `/assets/<hashed>` | 200, `public, max-age=31536000, immutable`, `ETag` | the names are content-hashed, so a name never survives a change to what is behind it |
 //! | `/assets/<hashed>` with a matching `If-None-Match` | 304, no body | the validator is the embed's own sha256 |
 //! | `/assets/<gone>` | 404 | nginx says `try_files $uri =404`: a chunk that no longer exists must be told so, never answered with the shell |
-//! | `index.html`, however it is reached | 200, `no-store` | the one unhashed name, and it is what names the current chunks: a stale copy is exactly how a browser asks a new deployment for chunks that are gone |
-//! | another root-level file | 200, `no-cache` | unhashed too, so it revalidates rather than sticks |
+//! | `index.html`, however it is reached | 200, `no-store`, `ETag` | the one unhashed name, and it is what names the current chunks: a stale copy is exactly how a browser asks a new deployment for chunks that are gone |
+//! | another root-level file | 200, `no-cache`, `ETag` | unhashed too, so it revalidates rather than sticks |
+//!
+//! Two deviations from that parity are deliberate and live outside the table:
+//! there is no gzip here (nginx compresses, this does not), and only a request
+//! that says it accepts `text/html` reaches the app shell, where nginx answers
+//! `try_files $uri $uri/ /index.html` whatever the client asked for. Both are
+//! settled decisions rather than gaps; see [`wants_spa`].
+//!
+//! The `ETag` on the two revalidating rows is deliberate and currently inert:
+//! `no-store` forbids keeping the response at all, and the no-cache row takes
+//! no `If-None-Match`, so a root-level file is always re-sent in full. Both
+//! match nginx, which emits an `ETag` on `index.html` beside its `no-store`,
+//! and a later decision to allow revalidation finds the validator already
+//! there. This is module policy, pinned by this module's tests: the router
+//! that calls these functions has no cache rule of its own to add.
 //!
 //! Compression is deliberately absent: nginx gzips, this does not. The bundle
 //! is loaded lazily and then held immutable, so the cost is first load only,
@@ -37,11 +51,13 @@
 //! carries no knowledge; every byte of data still comes through `/api/v1`,
 //! which stays closed behind its own guard.
 
+use std::borrow::Cow;
 use std::fmt::Write as _;
 
 use axum::body::Body;
 use axum::http::{HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use bytes::Bytes;
 use rust_embed::{EmbeddedFile, RustEmbed};
 
 /// The Fluid bundle staged by `build.rs`. Empty when `fluid/dist` was absent
@@ -105,14 +121,20 @@ pub fn asset_response<E: RustEmbed>(path: &str, if_none_match: Option<&str>) -> 
         .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response())
 }
 
-/// The exact-match half of the fallback: the embedded file at `path` (no
-/// leading slash), or `None` when nothing stands behind that name.
+/// The exact-match half of the fallback: a ROOT-LEVEL embedded file at `path`
+/// (no leading slash), or `None` when nothing stands behind that name.
 ///
-/// `index.html` deliberately answers `None` here: it is served through
+/// Root-level is enforced rather than assumed, and that is a cache rule, not
+/// tidiness: everything under `assets/` is content-hashed and belongs to
+/// [`asset_response`]'s immutable policy, so answering one here would quietly
+/// downgrade a chunk to `no-cache`. Refusing any key with a slash keeps that
+/// impossible however the router is later rearranged.
+///
+/// `index.html` deliberately answers `None` too: it is served through
 /// [`index_response`] alone, so its no-store rule cannot be bypassed by asking
 /// for it by name.
 pub fn exact_response<E: RustEmbed>(path: &str) -> Option<Response> {
-    if path == INDEX {
+    if path == INDEX || path.contains('/') {
         return None;
     }
     embedded::<E>(path, REVALIDATE, None)
@@ -149,11 +171,16 @@ fn embedded<E: RustEmbed>(
     cache: &'static str,
     if_none_match: Option<&str>,
 ) -> Option<Response> {
-    // Embed lookups are keyed rather than filesystem walks, so a dot segment
-    // has nothing to traverse in a release binary; a debug build resolves the
-    // path on disk, though, and one line here makes the rule the same in both
-    // and the review of it trivial.
-    if path.is_empty() || path.contains("..") {
+    // Embed lookups are keyed rather than filesystem walks, so neither shape
+    // below can traverse anything in a release binary. A DEBUG build is a
+    // different matter: rust-embed resolves the path on disk there, so
+    // `assets/../index.html` would resolve and be served with the immutable
+    // policy, and a leading slash makes `Path::join` discard the staging
+    // folder entirely, leaving only upstream's own containment check (which
+    // documents a symlink carve-out) between the request and the filesystem.
+    // Every caller hands this an embed key, never a URI path, and these two
+    // lines are what turn that from a comment into an invariant.
+    if path.is_empty() || path.starts_with('/') || path.contains("..") {
         return None;
     }
     let file = E::get(path)?;
@@ -170,6 +197,13 @@ fn embedded<E: RustEmbed>(
     }
 
     let mime = file.metadata.mimetype().to_owned();
+    // A release binary holds the bytes in the executable itself, so the
+    // borrowed arm hands them out without copying; only a debug build, which
+    // reads the staging folder per request, owns anything.
+    let body = match file.data {
+        Cow::Borrowed(embedded) => Body::from(Bytes::from_static(embedded)),
+        Cow::Owned(read) => Body::from(read),
+    };
     Some(
         (
             StatusCode::OK,
@@ -178,7 +212,7 @@ fn embedded<E: RustEmbed>(
                 cache_control(cache),
                 etag_header(&etag),
             ],
-            Body::from(file.data.into_owned()),
+            body,
         )
             .into_response(),
     )

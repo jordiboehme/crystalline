@@ -17,8 +17,9 @@ use crystalline_service::ui::{
 };
 use rust_embed::RustEmbed;
 
-/// A bundle-shaped fixture: the unhashed entry point, two hashed chunks and a
-/// root-level file that is not the entry point.
+/// A bundle-shaped fixture: the unhashed entry point, two hashed chunks, a
+/// root-level file that is not the entry point, and two sourcemaps that the
+/// exclude below must keep out of the embed.
 #[derive(RustEmbed)]
 #[folder = "tests/fixtures/ui-dist"]
 #[exclude = "*.map"]
@@ -90,6 +91,12 @@ async fn the_index_is_served_and_never_stored() {
          asks a new deployment for chunks that no longer exist"
     );
     assert!(
+        !header_of(&response, header::ETAG).is_empty(),
+        "the validator rides along even though no-store means nothing can \
+         revalidate against it today: it is what nginx sends here too, and a \
+         later decision to allow revalidation finds it already in place"
+    );
+    assert!(
         body_of(response).await.contains("fixture-index-marker"),
         "the body is the embedded document, not a placeholder"
     );
@@ -134,6 +141,60 @@ async fn a_known_validator_answers_304_with_no_body() {
     assert_eq!(body_len(second).await, 0, "a 304 carries no body");
 }
 
+#[tokio::test]
+async fn an_unknown_validator_answers_the_file_again() {
+    let response = asset_response::<Fixture>("assets/app-fixture01.css", Some("\"not-this-one\""));
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "a validator that does not match this file must send the file. A 304 \
+         here is the worst failure this module can produce: the chunk is held \
+         for a year under `immutable`, so the browser never asks again and \
+         the stale copy outlives every deployment"
+    );
+    assert!(
+        body_len(response).await > 0,
+        "and it sends the bytes, not an empty 200"
+    );
+}
+
+#[test]
+fn the_validator_is_matched_in_every_form_a_client_sends_it() {
+    let etag = header_of(
+        &asset_response::<Fixture>("assets/app-fixture01.css", None),
+        header::ETAG,
+    );
+
+    for (candidate, why) in [
+        (
+            format!("W/{etag}"),
+            "the weak form: comparison for If-None-Match is weak by \
+             definition, and a proxy may have added the prefix",
+        ),
+        (
+            format!("\"an-older-build\", {etag}"),
+            "the list form: a client may offer every copy it holds",
+        ),
+        ("*".to_owned(), "the wildcard: any representation at all"),
+    ] {
+        let response = asset_response::<Fixture>("assets/app-fixture01.css", Some(&candidate));
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_MODIFIED,
+            "`{candidate}` names this file's validator, so it is a 304: {why}"
+        );
+    }
+
+    for candidate in ["", "   ", "\"unterminated", "\"another-file-entirely\""] {
+        let response = asset_response::<Fixture>("assets/app-fixture01.css", Some(candidate));
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "`{candidate}` does not name this file's validator, so it is a 200"
+        );
+    }
+}
+
 #[test]
 fn an_unknown_asset_is_a_plain_404() {
     let response = asset_response::<Fixture>("assets/nope.js", None);
@@ -161,6 +222,16 @@ async fn root_level_files_answer_the_exact_match_but_the_index_never_does() {
         exact_response::<Fixture>("fixture.svg").expect("a root-level embedded file is served");
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(header_of(&response, header::CONTENT_TYPE), "image/svg+xml");
+    assert_eq!(
+        header_of(&response, header::CACHE_CONTROL),
+        "no-cache",
+        "a root-level name is not content-hashed, so it revalidates rather \
+         than sticking in a cache for as long as the browser feels like"
+    );
+    assert!(
+        !header_of(&response, header::ETAG).is_empty(),
+        "and it carries the validator that revalidation needs"
+    );
 
     assert!(
         exact_response::<Fixture>("index.html").is_none(),
@@ -170,6 +241,70 @@ async fn root_level_files_answer_the_exact_match_but_the_index_never_does() {
     assert!(
         exact_response::<Fixture>("missing.png").is_none(),
         "a name nothing stands behind falls through to the next rule"
+    );
+}
+
+#[test]
+fn the_exact_match_never_reaches_below_the_root() {
+    assert!(
+        exact_response::<Fixture>("assets/app-fixture01.js").is_none(),
+        "a hashed chunk belongs to asset_response's immutable policy. Serving \
+         one here would answer it correctly and cache it wrongly, and it \
+         would make the router's rung order load bearing for cache \
+         correctness rather than only for the shape of a 404"
+    );
+    assert!(
+        exact_response::<Fixture>("/fixture.svg").is_none(),
+        "these functions take embed keys, never URI paths: a leading slash is \
+         refused rather than trimmed, so a caller that forgets gets nothing \
+         instead of something surprising"
+    );
+    assert!(
+        exact_response::<Fixture>("../Cargo.toml").is_none(),
+        "and a dot segment is refused outright"
+    );
+}
+
+#[test]
+fn an_absolute_path_never_leaves_the_embed() {
+    assert_eq!(
+        asset_response::<Fixture>("/etc/hosts", None).status(),
+        StatusCode::NOT_FOUND,
+        "an absolute path is refused before the lookup. In a release binary \
+         the embed is keyed and this is a plain miss, but a debug build \
+         resolves keys on disk, and joining an absolute path throws the \
+         staging folder away"
+    );
+    assert_eq!(
+        asset_response::<Fixture>("/assets/app-fixture01.js", None).status(),
+        StatusCode::NOT_FOUND,
+        "the leading slash is refused even when the rest of the key is real"
+    );
+}
+
+#[test]
+fn sourcemaps_never_enter_the_embed() {
+    assert!(
+        Fixture::get("root-fixture.map").is_none(),
+        "the exclude keeps a root-level sourcemap out"
+    );
+    assert!(
+        Fixture::get("assets/app-fixture01.js.map").is_none(),
+        "and a nested one too, which is the half that is not obvious: the \
+         pattern is `*.map` and it only covers this because the glob treats a \
+         slash as an ordinary character. A build that starts emitting \
+         sourcemaps would otherwise roughly double the binary in silence"
+    );
+    let embedded: Vec<String> = Fixture::iter().map(|name| name.to_string()).collect();
+    assert!(
+        !embedded.iter().any(|name| name.ends_with(".map")),
+        "nothing named like a sourcemap is in the embed at all, got {embedded:?}"
+    );
+    assert!(
+        embedded
+            .iter()
+            .any(|name| name == "assets/app-fixture01.js"),
+        "and the exclude did not take the chunk with it, got {embedded:?}"
     );
 }
 
@@ -183,6 +318,11 @@ async fn an_embed_with_no_bundle_says_so_out_loud() {
          not 404, because the path is right and the build is what is missing"
     );
     assert!(header_of(&response, header::CONTENT_TYPE).contains("text/html"));
+    assert_eq!(
+        header_of(&response, header::CACHE_CONTROL),
+        "no-store",
+        "a cached not-built page would outlive the build that fixes it"
+    );
     assert!(
         body_of(response).await.contains("pnpm --dir fluid build"),
         "the page names the command that fixes it"
@@ -218,5 +358,13 @@ fn only_a_browser_navigation_reaches_the_app_shell() {
     assert!(
         !wants_spa(&Method::POST, accept("text/html")),
         "an MCP call is a POST, whatever it says it accepts"
+    );
+    assert!(
+        !wants_spa(&Method::GET, accept("text/htmlx")),
+        "the media type is matched whole, not by prefix"
+    );
+    assert!(
+        wants_spa(&Method::GET, accept("application/json, TEXT/HTML;q=0.9")),
+        "a list, a parameter and an unusual case are all still a navigation"
     );
 }

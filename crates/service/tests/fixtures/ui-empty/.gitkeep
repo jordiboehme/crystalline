@@ -3,5 +3,11 @@ compiled without `pnpm --dir fluid build`. It has to exist in the tree because
 the RustEmbed derive fails to compile on a folder that is not there, and git
 does not track empty folders, so this file is the folder.
 
+One clause of fidelity, so nobody reads more into it than it says: rust-embed
+embeds dotfiles, so this file is itself an entry in that embed, while the
+folder build.rs stages for a no-node build genuinely holds zero entries. What
+the fixture stands in for is an embed with no entry point, which is the only
+thing the tests using it ask about.
+
 Nothing here may be named index.html, or the empty-embed tests stop testing an
 empty embed.

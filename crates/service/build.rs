@@ -54,8 +54,9 @@ fn main() {
     fs::create_dir_all(&staged).unwrap_or_else(|e| panic!("creating {}: {e}", staged.display()));
 
     // With the feature off nothing reads the staged folder, so skip the copy;
-    // the folder itself still gets created above, which keeps this script free
-    // of a branch the embed macro would have to agree with.
+    // the folder itself still gets created above though nothing needs it,
+    // which keeps this script free of a branch the embed macro would have to
+    // agree with.
     if env::var_os("CARGO_FEATURE_FLUID_UI").is_none() {
         return;
     }
