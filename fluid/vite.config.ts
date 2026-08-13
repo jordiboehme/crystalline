@@ -17,11 +17,17 @@ const { version } = JSON.parse(
 ) as { version: string };
 
 /**
- * The local `crystalline serve --http` a `pnpm dev` session talks to. It is the
- * daemon's own default bind (`DEFAULT_HTTP_ADDR` in
- * crates/service/src/daemon.rs).
+ * The local daemon a `pnpm dev` session, or a `vite preview` the browser smoke
+ * drives, talks to. It defaults to the daemon's own default bind
+ * (`DEFAULT_HTTP_ADDR` in crates/service/src/daemon.rs).
+ *
+ * `e2e/run-smoke.sh` overrides it through `CRYSTALLINE_API_TARGET`: the HTTP
+ * endpoint is on by default, so the machine's own daemon usually holds 7411 and
+ * the smoke has to stand its scratch daemon up on another port. Without this
+ * the browser journeys would keep talking to whichever daemon holds 7411.
  */
-const DEV_API_TARGET = "http://127.0.0.1:7411";
+const DEV_API_TARGET =
+  process.env.CRYSTALLINE_API_TARGET ?? "http://127.0.0.1:7411";
 
 // https://vite.dev/config/
 export default defineConfig({

@@ -2,10 +2,11 @@
 # Run the Fluid browser smoke against a real Crystalline daemon.
 #
 # One command, the same one locally and in CI: it stands up a daemon holding a
-# copy of the fixture domain and two seeded accounts, checks the web UI that
-# daemon serves out of its own binary, then builds the bundle and hands both to
-# Playwright, which serves the bundle with `vite preview` (see
-# playwright.config.ts) and drives a browser against it.
+# copy of the fixture domain, creates the admin account through the first-run
+# setup endpoint the browser wizard drives and seeds a peer editor with the CLI,
+# checks the web UI that daemon serves out of its own binary, then builds the
+# bundle and hands both to Playwright, which serves the bundle with `vite
+# preview` (see playwright.config.ts) and drives a browser against it.
 #
 # The two deployments are both real and both covered: the embedded one the
 # curl block asserts (the bundle compiled into the binary, served by
@@ -20,8 +21,10 @@
 # Nothing here touches the machine's own Crystalline installation, and the
 # checked-in fixture under e2e/fixtures/domain is never written to.
 #
-# The daemon's port is 7411 and not configurable, because vite.config.ts
-# forwards /api there and the browser only ever talks to the preview server.
+# The daemon takes port 7411 when it is free and the next free port otherwise,
+# and hands the address to vite through CRYSTALLINE_API_TARGET so the /api proxy
+# in front of the browser journeys follows it. FLUID_E2E_PORT pins a port
+# instead.
 #
 #   bash fluid/e2e/run-smoke.sh                 # the whole suite
 #   bash fluid/e2e/run-smoke.sh --headed        # arguments reach playwright
@@ -34,7 +37,43 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 fluid_dir="$(dirname "$here")"
 repo_root="$(dirname "$fluid_dir")"
 
-DAEMON_ADDR="127.0.0.1:7411"
+# Where the daemon listens. 7411 is Crystalline's own default and stays the
+# first choice, but it is no longer a port this script may assume is free: the
+# HTTP endpoint is on by default now, so any daemon on the machine - a
+# hand-started `crystalline serve`, or one an agent session spawned - already
+# holds it. A run that quietly probed THAT daemon would be checking the
+# developer's own instance instead of the scratch one it just built, and the
+# bind failure a busy port produces is deliberately non-fatal for the daemon, so
+# nothing would say so. Stepping aside to a free port is the whole fix; the
+# address travels to `vite preview` through CRYSTALLINE_API_TARGET (see
+# ../vite.config.ts), which is what keeps the browser journeys pointed at it.
+port_is_free() {
+    # A refused connect is a free port. The probe runs in a subshell so the
+    # descriptor it may open dies with it, and it reserves nothing: a port that
+    # is taken between here and the daemon's own bind surfaces as the
+    # bind-failure check in the readiness loop below.
+    if (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; then
+        return 1
+    fi
+    return 0
+}
+
+DAEMON_PORT="${FLUID_E2E_PORT:-}"
+if [ -z "$DAEMON_PORT" ]; then
+    for candidate in $(seq 7411 7431); do
+        if port_is_free "$candidate"; then
+            DAEMON_PORT="$candidate"
+            break
+        fi
+    done
+fi
+if [ -z "$DAEMON_PORT" ]; then
+    echo "smoke: every port from 7411 to 7431 is taken; free one or set FLUID_E2E_PORT" >&2
+    exit 1
+fi
+DAEMON_ADDR="127.0.0.1:$DAEMON_PORT"
+export CRYSTALLINE_API_TARGET="http://$DAEMON_ADDR"
+
 FLUID_E2E_USER="${FLUID_E2E_USER:-smoke}"
 FLUID_E2E_PASSWORD="${FLUID_E2E_PASSWORD:-smoke-password}"
 FLUID_E2E_DOMAIN="${FLUID_E2E_DOMAIN:-fluid-smoke}"
@@ -127,17 +166,10 @@ cp -R "$here/fixtures/domain" "$domain_root"
 echo "smoke: registering the fixture domain"
 "${isolated[@]}" "$bin" domain add "$FLUID_E2E_DOMAIN" "$domain_root"
 
-echo "smoke: seeding the account"
-printf '%s' "$FLUID_E2E_PASSWORD" \
-    | "${isolated[@]}" "$bin" users add "$FLUID_E2E_USER" --role admin --password-stdin
-
-# An editor rather than a second admin: the co-editing journey only needs to
-# reach the editor, and a peer with no more rights than that is the account a
-# real second author would have.
-echo "smoke: seeding the peer account"
-printf '%s' "$FLUID_E2E_PEER_PASSWORD" \
-    | "${isolated[@]}" "$bin" users add "$FLUID_E2E_PEER" --role editor --password-stdin
-
+# The daemon comes up before any account exists, which is the state a real
+# first run is in: the admin below is created through the daemon's own setup
+# endpoint rather than seeded past it.
+#
 # `env` execs, so the pid recorded here is the daemon's own and the trap above
 # signals the daemon rather than a wrapper around it.
 echo "smoke: starting the daemon on $DAEMON_ADDR"
@@ -152,6 +184,15 @@ for _ in $(seq 1 60); do
         echo "smoke: the daemon exited before it was ready" >&2
         exit 1
     fi
+    # A busy port does not stop the daemon: it keeps serving MCP over its socket
+    # and warns about the endpoint. Without this check the healthcheck below
+    # would then be answered by whatever else holds the port, and the whole run
+    # would assert against a daemon this script never started.
+    if grep -q 'HTTP endpoint failed on' "$run_dir/daemon.log" 2>/dev/null; then
+        echo "smoke: the daemon could not open the HTTP endpoint on $DAEMON_ADDR" >&2
+        grep 'HTTP endpoint failed on' "$run_dir/daemon.log" >&2
+        exit 1
+    fi
     if "${isolated[@]}" "$bin" healthcheck "$DAEMON_ADDR" > /dev/null 2>&1; then
         ready=1
         break
@@ -162,6 +203,81 @@ if [ "$ready" -ne 1 ]; then
     echo "smoke: the daemon never became healthy on $DAEMON_ADDR" >&2
     exit 1
 fi
+
+# The first admin, created the way a person creates one: through the endpoint
+# behind the browser's first-run wizard, over loopback, where no setup token is
+# asked for (a non-loopback bind is the case that prints one, and this daemon
+# binds 127.0.0.1). The component tests cover the form itself; what only a real
+# daemon can answer is the endpoint's own story, so this block walks it: the
+# probe advertises the open slot, the POST creates the admin and signs it in,
+# the probe closes, and the slot is gone for everyone after.
+setup_headers="$run_dir/setup-headers"
+setup_body="$run_dir/setup-body"
+
+# The response body and headers land in the two files above; the status code is
+# printed, as in the UI block further down.
+api_get() {
+    curl --silent --show-error --output "$setup_body" --dump-header "$setup_headers" \
+        --write-out '%{http_code}' --max-time 30 \
+        --header 'Accept: application/json' "http://$DAEMON_ADDR$1"
+}
+
+api_post_json() {
+    curl --silent --show-error --output "$setup_body" --dump-header "$setup_headers" \
+        --write-out '%{http_code}' --max-time 30 \
+        --header 'Content-Type: application/json' --data "$2" \
+        "http://$DAEMON_ADDR$1"
+}
+
+api_fail() {
+    echo "smoke: $1" >&2
+    echo "smoke: the response body follows" >&2
+    cat "$setup_body" >&2
+    echo >&2
+    exit 1
+}
+
+echo "smoke: creating the first admin through the setup endpoint"
+
+status=$(api_get /api/v1/auth/me)
+if [ "$status" != "200" ]; then
+    api_fail "GET /api/v1/auth/me answered $status rather than 200; the capability probe is public by design"
+fi
+grep -q '"needs_setup":[[:space:]]*true' "$setup_body" \
+    || api_fail "a daemon with no accounts does not report needs_setup, so the browser would render a login form nobody can use"
+
+# The credentials are the ones every journey logs in with. Spelled into JSON by
+# hand because they are plain by construction; a value carrying a quote would
+# need a real encoder here.
+status=$(api_post_json /api/v1/auth/setup \
+    "$(printf '{"name":"%s","password":"%s"}' "$FLUID_E2E_USER" "$FLUID_E2E_PASSWORD")")
+if [ "$status" != "200" ]; then
+    api_fail "POST /api/v1/auth/setup answered $status rather than 200 for a loopback caller on an instance with no accounts"
+fi
+tr -d '\r' < "$setup_headers" | grep -qi '^set-cookie:.*fluid_session' \
+    || api_fail "the setup answer carries no fluid_session cookie, so the wizard would create an admin and leave them logged out"
+
+status=$(api_get /api/v1/auth/me)
+grep -q '"needs_setup":[[:space:]]*false' "$setup_body" \
+    || api_fail "the probe still reports needs_setup after the admin was created ($status), so the wizard would never make way for the login form"
+
+# Once is the whole contract: the slot is permanently gone rather than merely
+# guarded, so a second caller is refused whoever they are.
+status=$(api_post_json /api/v1/auth/setup \
+    "$(printf '{"name":"%s","password":"%s"}' "second-admin" "second-password")")
+if [ "$status" != "410" ]; then
+    api_fail "a second POST /api/v1/auth/setup answered $status rather than 410; the first-run slot has to close for good"
+fi
+
+# An editor rather than a second admin: the co-editing journey only needs to
+# reach the editor, and a peer with no more rights than that is the account a
+# real second author would have. The CLI is the right tool for it and the path
+# an operator scripts, so the run covers that half too: `users add` writes the
+# accounts database directly, and the running daemon picks the account up on
+# its next lookup.
+echo "smoke: seeding the peer account"
+printf '%s' "$FLUID_E2E_PEER_PASSWORD" \
+    | "${isolated[@]}" "$bin" users add "$FLUID_E2E_PEER" --role editor --password-stdin
 
 # The embedded web UI, checked against the daemon's own port before the browser
 # journeys start. Playwright drives `vite preview` (the compose scenario, where

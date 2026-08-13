@@ -8,10 +8,13 @@ See [Get started](../README.md#get-started) in the README to install the binary 
 
 The default shape: install the binary, point one or more agents at `crystalline mcp` over stdio, and the first connection spawns a background daemon that loads the embedding model once and watches every registered domain. Knowledge lives in ordinary local folders, read-write, so capturing what an agent learns as it works is the entire point. See [Get started](../README.md#get-started) in the README for the stdio setup.
 
+That daemon serves the web UI too, however it started: a hand-typed `crystalline serve` and the one an agent's stdio connection spawns behave the same, and both open the HTTP endpoint at `http://localhost:7411` unless it is turned off. So there is nothing to deploy to browse what your agents have learned - open that address, and the first visit to an instance with no accounts yet asks you to create your admin account right there in the browser (see [Web UI from the daemon](#web-ui-from-the-daemon)). `crystalline config set service.http false`, or `CRYSTALLINE_SERVICE_HTTP=false`, closes the endpoint for every daemon on the machine.
+
 ```mermaid
 flowchart LR
     A1[Agent] -->|stdio| D[Daemon]
     A2[Agent] -->|stdio| D
+    B[Browser] -->|HTTP :7411| D
     D --> K[Knowledge files]
     D --> I[Index]
 ```
@@ -26,12 +29,13 @@ Upgrades need no manual restart: attaching is version aware, so the first client
 
 ## Claude Desktop extension
 
-For someone who never opens a terminal, the `.mcpb` bundle wraps the same binary in a one-click Claude Desktop extension. The universal bundle (`crystalline-v<version>.mcpb`) covers Apple Silicon Macs and Windows (windows-arm64 runs it via x64 emulation) in one download, and is what the Connectors Directory listing carries; four per-arch bundles remain for intel Macs, native windows-arm64 and anyone who would rather have the smaller download for their exact platform. Whichever one is installed, it takes no configuration and starts with no domains: under the hood Claude Desktop spawns `crystalline mcp` over stdio, landing on the same daemon as the personal workstation shape. The agent creates a domain whenever it needs somewhere to capture knowledge, with the `add_domain` tool - a folder of markdown files under `Documents/Crystalline` (the default domains root, overridable with `domains_root` or `CRYSTALLINE_DOMAINS_ROOT`), a database-backed virtual domain or a GitHub team domain. Onboarding is automatic - the server's instructions deliver the routing block on every connection, empty at first - and the release's crystalline-claude-desktop-skill zip adds capture and collaboration best practices as an uploadable skill (see [Skills](../README.md#skills) in the README).
+For someone who never opens a terminal, the `.mcpb` bundle wraps the same binary in a one-click Claude Desktop extension. The universal bundle (`crystalline-v<version>.mcpb`) covers Apple Silicon Macs and Windows (windows-arm64 runs it via x64 emulation) in one download, and is what the Connectors Directory listing carries; four per-arch bundles remain for intel Macs, native windows-arm64 and anyone who would rather have the smaller download for their exact platform. Whichever one is installed, it takes no configuration and starts with no domains: under the hood Claude Desktop spawns `crystalline mcp` over stdio, landing on the same daemon as the personal workstation shape. That daemon opens the web UI at `http://localhost:7411` by default, so installing the extension is also how a Desktop user gets the browser half: the first visit creates the admin account in the browser and everything the agent captured is a page to read (`service.http: false`, or `CRYSTALLINE_SERVICE_HTTP=false`, turns the endpoint off). The agent creates a domain whenever it needs somewhere to capture knowledge, with the `add_domain` tool - a folder of markdown files under `Documents/Crystalline` (the default domains root, overridable with `domains_root` or `CRYSTALLINE_DOMAINS_ROOT`), a database-backed virtual domain or a GitHub team domain. Onboarding is automatic - the server's instructions deliver the routing block on every connection, empty at first - and the release's crystalline-claude-desktop-skill zip adds capture and collaboration best practices as an uploadable skill (see [Skills](../README.md#skills) in the README).
 
 ```mermaid
 flowchart LR
     CD[Claude Desktop] -->|stdio, one-click install| D[Daemon]
     A[Agent] -->|add_domain| D
+    B[Browser] -->|HTTP :7411| D
     D --> K[Domains under Documents/Crystalline]
     D --> I[Index]
 ```
@@ -52,7 +56,7 @@ flowchart LR
 
 ## Web UI from the daemon
 
-`serve --http` serves Fluid itself. The browser UI is built into the binary, so one process on one port answers both the agents that speak MCP and the people who want to read what those agents learned: point a browser at `http://localhost:7411` and the app is there, with no second container, no static bundle to deploy and no version to keep in step. It is the same UI the compose variant below runs - domains down the side, an engram with its frontmatter, observations, relations, backlinks and neighborhood graph, faceted search and Cmd+K to jump anywhere - served straight from the daemon that holds the index.
+The daemon serves Fluid itself, and it does so by default. The browser UI is built into the binary and the HTTP endpoint opens at `127.0.0.1:7411` unless something turns it off, so one process on one port answers both the agents that speak MCP and the people who want to read what those agents learned: point a browser at `http://localhost:7411` and the app is there, with no second container, no static bundle to deploy and no version to keep in step. `serve --http <host:port>` moves the endpoint somewhere else and `serve --http off` (or `service.http: false`, or `CRYSTALLINE_SERVICE_HTTP=false`) closes it. It is the same UI the compose variant below runs - domains down the side, an engram with its frontmatter, observations, relations, backlinks and neighborhood graph, faceted search and Cmd+K to jump anywhere - served straight from the daemon that holds the index.
 
 ```mermaid
 flowchart LR
@@ -64,7 +68,11 @@ flowchart LR
 
 The web UI and the JSON API are both on by default wherever the HTTP endpoint is on, so there is nothing to enable. Two settings turn them off: `service.ui: false` (or `CRYSTALLINE_SERVICE_UI=false`) serves the API and MCP without the UI, which is the shape a separate Fluid deployment fronts, and `service.api: false` leaves MCP and `GET /health` alone on the port and takes the UI down with it, since a UI without its API is a shell that can only render a login error. Both are read once when the HTTP surface starts, like `service.read_only`, so changing one needs a daemon restart, and the line the daemon prints on start names which of the two is off.
 
-Accounts work exactly as in [Team server with Fluid](#team-server-with-fluid), because it is the same API behind the same UI: nothing is readable until an account exists, and `crystalline users add ada --role admin` prompts for a password on a terminal (`--password-stdin` reads it from a pipe instead) and writes the accounts database directly, so a running daemon picks the new account up on its next lookup with nothing to restart. The static shell is served to anyone who connects, exactly as nginx serves it in the compose variant; every byte of knowledge still comes through the JSON API, which answers `401` to a request that carries no identity.
+Accounts work exactly as in [Team server with Fluid](#team-server-with-fluid), because it is the same API behind the same UI: nothing is readable until an account exists. The browser is where that first account is normally made. A daemon that has no accounts yet greets the first visit with a create-first-admin form instead of a login form: fill in a name and a password, and you are that instance's admin and signed in already. There is no second chance for a passer-by, because once any account exists the endpoint behind that form is gone for good and answers `410 Gone` to everyone, forever. `crystalline users add ada --role admin` does the same job from a terminal (it prompts for a password, or `--password-stdin` reads it from a pipe) and stays the scripted and recovery path; it writes the accounts database directly, so a running daemon picks the new account up on its next lookup with nothing to restart. The static shell is served to anyone who connects, exactly as nginx serves it in the compose variant; every byte of knowledge still comes through the JSON API, which answers `401` to a request that carries no identity.
+
+Who may fill that form in is decided by the connection itself, never by anything a request can claim. A caller on the machine that serves the instance is trusted on the strength of its loopback peer address and is asked for nothing more. A bind anyone else can reach cannot be, so a `serve` that binds anything but loopback (`0.0.0.0`, a LAN address, the container default) mints a one-time setup token for that process and prints it as it starts: on the startup banner in the foreground, and in the daemon log when it runs in the background (`docker logs` for a container, `journalctl -u crystalline` under systemd). The form asks for the token only when the server says it is required, so a loopback user never sees the field, and a remote one pastes in the printed value. The token belongs to that one serve process: restart the daemon and the next one prints a fresh token.
+
+The same rule has a caveat worth knowing before a proxy goes in front. A request carrying `X-Forwarded-For`, `Forwarded` or the other forwarding headers is never counted as local, even when the proxy that sent it runs on this very machine, since a loopback peer with proxy headers is a reverse proxy relaying somebody remote. So the wizard behind a proxy asks for a token, and a daemon bound to loopback has none to give. Create the first admin before you put a proxy in front of the daemon, or bind a network address so that `serve` prints a token to paste.
 
 The `Host` allow-list guards the MCP endpoint only, so a browser needs no entry in it: open `http://server.lan:7411` and the UI loads and calls the API with nothing configured. An agent that reaches MCP by that same name still needs `server.lan` in `CRYSTALLINE_SERVICE_ALLOWED_HOSTS`, as it always did (see [Configure through environment variables](#configure-through-environment-variables)).
 
@@ -90,7 +98,7 @@ flowchart LR
 
 The bundled nginx config carries its own dedicated location for the collab WebSocket, `/api/v1/collab/`, with the Upgrade and Connection headers the plain `/api/` block does not send. Anyone who replaces the Fluid image's nginx config with their own has to carry that block over, or the upgrade never reaches the daemon and the editor runs solo-only with nothing on screen to explain why.
 
-Nothing is readable until an account exists: the JSON API answers `401` to a request that carries no identity. Creating the first admin is the one manual step, and `users add` writes the accounts database directly (never through the daemon), so a running instance picks the new account up on its next lookup with nothing to restart:
+Nothing is readable until an account exists: the JSON API answers `401` to a request that carries no identity. Creating the first admin is the one bootstrap step, and there are two ways to take it. From the host, `users add` writes the accounts database directly (never through the daemon), so a running instance picks the new account up on its next lookup with nothing to restart:
 
 ```sh
 docker compose -f deploy/fluid/docker-compose.yml up -d
@@ -98,6 +106,8 @@ docker compose -f deploy/fluid/docker-compose.yml up -d
 printf '%s' 'the-password' | docker compose -f deploy/fluid/docker-compose.yml \
   exec -T crystalline crystalline users add ada --role admin --password-stdin
 ```
+
+Or take it in the browser instead: open Fluid and an instance with no accounts renders the create-first-admin form ([Web UI from the daemon](#web-ui-from-the-daemon)). The daemon binds `0.0.0.0` inside its container, so that form asks for the one-time setup token the daemon printed when it started, and `docker compose -f deploy/fluid/docker-compose.yml logs crystalline` is where to read it (a restarted daemon prints a new one). Either route mints the same admin, and either one closes the form for good.
 
 Restart the daemon after upgrading the binary, before editing accounts, so both sides open the accounts database the same way. A container upgrade recreates the container and has this covered already; a native install upgraded underneath a daemon that keeps running does not.
 
@@ -126,10 +136,16 @@ sudo systemctl enable --now crystalline
 The unit runs `crystalline serve` in the foreground under a dynamic service
 user: the index and socket live in `/var/lib/crystalline`, the model cache in
 `/var/cache/crystalline` and the config in `/etc/crystalline/config.yaml`.
-HTTP binds `127.0.0.1:7411` by default; set
-`CRYSTALLINE_SERVICE_HTTP=0.0.0.0:7411` in `/etc/default/crystalline` to let
-agents on the network learn from it, and probe `GET /health` from a load
-balancer or uptime monitor without an MCP handshake. The sandbox makes the
+HTTP is on at `127.0.0.1:7411` by default, so the unit serves MCP, the JSON
+API and the web UI there as installed, and `CRYSTALLINE_SERVICE_HTTP=false`
+in `/etc/default/crystalline` closes the endpoint (the file is read after the
+unit's own defaults, so a line there wins). Set
+`CRYSTALLINE_SERVICE_HTTP=0.0.0.0:7411` there instead to let agents on the
+network learn from it, and probe `GET /health` from a load balancer or uptime
+monitor without an MCP handshake. That network bind is also the one that makes `serve` print a
+one-time setup token for the browser's create-first-admin form ([Web UI from
+the daemon](#web-ui-from-the-daemon)); the service user has no terminal, so
+read it back with `journalctl -u crystalline`. The sandbox makes the
 filesystem read-only outside those directories, so grant each knowledge
 folder a write allowance with a drop-in: `sudo systemctl edit crystalline`,
 then `ReadWritePaths=/srv/knowledge` under `[Service]`. Check on the daemon
@@ -226,7 +242,7 @@ docker run -d \
   ghcr.io/jordiboehme/crystalline:latest
 ```
 
-That one published port carries the browser too: the image serves the web UI built in, so `open http://localhost:7411` lands on Fluid while agents keep speaking MCP to the same address (see [Web UI from the daemon](#web-ui-from-the-daemon) for accounts, TLS and the two toggles).
+That one published port carries the browser too: the image serves the web UI built in, so `open http://localhost:7411` lands on Fluid while agents keep speaking MCP to the same address (see [Web UI from the daemon](#web-ui-from-the-daemon) for accounts, TLS and the two toggles). A fresh container has no accounts, so that first visit renders the create-first-admin form. The container binds `0.0.0.0`, which is not loopback, so the form asks for the one-time setup token the daemon prints as it starts: `docker logs crystalline` is where to read it, and a restarted container prints a new one.
 
 What persists where:
 
@@ -262,7 +278,7 @@ An immutable image with no `config.yaml` to mount or edit configures purely thro
 | Variable | Maps to | Notes |
 |---|---|---|
 | `CRYSTALLINE_SERVICE_READ_ONLY` | `service.read_only` | `serve --read-only` still forces it on |
-| `CRYSTALLINE_SERVICE_HTTP` | `service.http` | `serve --http` wins over it |
+| `CRYSTALLINE_SERVICE_HTTP` | `service.http` | the HTTP endpoint carrying MCP, the JSON API and the web UI: on at `127.0.0.1:7411` by default, `false` turns it off, `true` spells the default out, or give it a `host:port` to bind instead. `serve --http` wins over it, `serve --http off` closes it |
 | `CRYSTALLINE_SERVICE_UI` | `service.ui` | `true` (default) serves the embedded Fluid web UI on the HTTP endpoint; `false` serves the JSON API and MCP only, the shape a separate Fluid deployment fronts. Read once when the HTTP surface starts, like `service.read_only` |
 | `CRYSTALLINE_SERVICE_API` | `service.api` | `true` (default) serves the JSON API under `/api/v1`; `false` leaves MCP and `GET /health` alone on the port and disables the web UI with it, since a UI without its API is a shell that can only render a login error. Read once when the HTTP surface starts, like `service.read_only` |
 | `CRYSTALLINE_SERVICE_ALLOWED_HOSTS` | `service.allowed_hosts` | comma-separated `Host` allow-list; loopback is always allowed and a single `*` allows any Host; `serve --allowed-host` wins over it |

@@ -8,16 +8,17 @@
  * deployment actually ships is the one under test.
  *
  * The API is not stubbed. `vite preview` inherits `server.proxy` from
- * `vite.config.ts`, so `/api` is forwarded to the daemon on 127.0.0.1:7411
- * exactly as nginx forwards it in the image, and `e2e/run-smoke.sh` is what
- * puts a daemon with a fixture domain and an account behind that port. Run the
- * suite through that script; `pnpm exec playwright test` on its own has
- * nothing to talk to.
+ * `vite.config.ts`, so `/api` is forwarded to the daemon exactly as nginx
+ * forwards it in the image, and `e2e/run-smoke.sh` is what puts a daemon with
+ * a fixture domain and an account behind it - on 127.0.0.1:7411 when that port
+ * is free, on the next free one otherwise, handed to the proxy through
+ * `CRYSTALLINE_API_TARGET`. Run the suite through that script; `pnpm exec
+ * playwright test` on its own has nothing to talk to.
  */
 
 import { defineConfig, devices } from "@playwright/test";
 
-/** Where the preview server answers. The daemon's own port is fixed at 7411. */
+/** Where the preview server answers; the daemon's own port is the script's. */
 const PORT = Number(process.env.FLUID_PREVIEW_PORT ?? "4173");
 const BASE_URL = `http://127.0.0.1:${String(PORT)}`;
 
