@@ -31,7 +31,7 @@ use crystalline_service::Engine;
 use crystalline_service::daemon::http_router_with_assets;
 use crystalline_service::rest::{AuthStore, Role};
 use crystalline_service::ui::{
-    asset_response, exact_response, index_response, ui_available, wants_spa,
+    asset_response, exact_response, index_response, ui_available, wants_event_stream, wants_spa,
 };
 use rust_embed::RustEmbed;
 use tokio::sync::Mutex;
@@ -385,6 +385,47 @@ fn only_a_browser_navigation_reaches_the_app_shell() {
     assert!(
         wants_spa(&Method::GET, accept("application/json, TEXT/HTML;q=0.9")),
         "a list, a parameter and an unusual case are all still a navigation"
+    );
+}
+
+#[test]
+fn the_transports_standby_stream_is_told_apart_from_a_navigation() {
+    assert!(
+        wants_event_stream(accept("text/event-stream, application/json")),
+        "the exact header rmcp's own client opens the standby stream with"
+    );
+    assert!(
+        wants_event_stream(accept("text/event-stream")),
+        "and the bare form the TypeScript SDK sends"
+    );
+    assert!(
+        wants_event_stream(accept("TEXT/EVENT-STREAM;q=0.9, application/json")),
+        "a parameter and an unusual case do not hide it"
+    );
+    assert!(
+        !wants_event_stream(accept(
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+        )),
+        "a browser navigation never asks for the stream"
+    );
+    assert!(
+        !wants_event_stream(accept("*/*")),
+        "and neither does curl's default: `*/*` reaches the transport through \
+         the fallback, not through this rule, and at the root it is served the \
+         shell on purpose"
+    );
+    assert!(!wants_event_stream(None), "nor a request that asks nothing");
+    assert!(
+        !wants_event_stream(accept("text/event-streamx")),
+        "the media type is matched whole here too, not by prefix"
+    );
+    assert!(
+        !wants_event_stream(accept("text/html, text/event-stream")),
+        "a client asking for both is served the document: these rungs belong \
+         to the UI and the transport is what they fall back to. No real client \
+         sends this - rmcp sends event-stream with application/json, a browser \
+         sends html with */* - so the tie-break only has to be defined, not \
+         clever"
     );
 }
 
@@ -890,6 +931,107 @@ async fn mcp_shaped_requests_reach_the_transport_untouched() {
             "and it is answered by the transport, not out of the embed"
         );
     }
+}
+
+#[tokio::test]
+async fn the_standby_stream_reaches_the_transport_at_every_ui_path() {
+    let server = serve_fixture().await;
+
+    // The root is what the deployment docs hand an agent, so this is the
+    // request an HTTP MCP client opens on the endpoint it was configured with.
+    for (path, accept) in [
+        ("/", "text/event-stream"),
+        // rmcp's own client sends this exact list.
+        ("/", "text/event-stream, application/json"),
+        // A client whose endpoint URL happens to sit under the asset prefix.
+        ("/assets/anything.js", "text/event-stream"),
+        ("/elsewhere", "text/event-stream"),
+    ] {
+        let response = get_accepting(server.addr, path, accept).await;
+        assert_eq!(
+            response.status(),
+            400,
+            "GET {path} with `Accept: {accept}` is streamable HTTP's second \
+             half - the client-opened stream every server-initiated message \
+             rides, tools/list_changed among them - and it must reach the \
+             transport, which asks it for a session id. Answering it with the \
+             app shell is a 200 the client reads as UnexpectedContentType, so \
+             the stream never opens and the agent silently stops learning that \
+             the tool surface changed"
+        );
+        assert!(
+            !head(&response, header::CONTENT_TYPE).contains("text/html"),
+            "and it is certainly not HTML"
+        );
+        assert!(
+            response
+                .text()
+                .await
+                .unwrap()
+                .contains("Session ID is required"),
+            "the answer is rmcp's own, the same one GET /x gets"
+        );
+    }
+
+    // The narrowness of that exception, at the one path that serves the shell
+    // to anything: only a request that actually asks for the stream is handed
+    // on.
+    for accept in ["*/*", "application/json", "text/html"] {
+        let response = get_accepting(server.addr, "/", accept).await;
+        assert_eq!(
+            response.status(),
+            200,
+            "GET / with `Accept: {accept}` is still the app shell: the root is \
+             the UI's front door whatever the caller accepts, which is what \
+             makes a bare `curl http://host:7411/` show the UI"
+        );
+        assert!(head(&response, header::CONTENT_TYPE).contains("text/html"));
+    }
+    let bare = client()
+        .get(format!("http://{}/", server.addr))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        bare.status(),
+        200,
+        "and so is a request that names nothing at all"
+    );
+}
+
+#[tokio::test]
+async fn the_bare_asset_prefix_is_a_404_rather_than_the_shell() {
+    let server = serve_fixture().await;
+
+    for path in ["/assets", "/assets/"] {
+        let response = get_accepting(server.addr, path, BROWSER_ACCEPT).await;
+        assert_eq!(
+            response.status(),
+            404,
+            "the wildcard route does not match the bare prefix, so {path} \
+             lands in the fallback - where it must not become the app shell: \
+             nginx answers the whole /assets/ prefix with try_files $uri =404, \
+             and a directory listing turning into a 200 document is exactly \
+             the parity the compose variant is judged on"
+        );
+        assert!(
+            !response
+                .text()
+                .await
+                .unwrap()
+                .contains("fixture-index-marker"),
+            "{path} serves no shell"
+        );
+    }
+
+    assert_eq!(
+        get_accepting(server.addr, "/assetsomething", BROWSER_ACCEPT)
+            .await
+            .status(),
+        200,
+        "and the rule is the prefix itself, not anything that starts like it: \
+         an app route whose name begins with `assets` is still a navigation"
+    );
 }
 
 #[tokio::test]

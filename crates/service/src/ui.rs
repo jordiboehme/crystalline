@@ -116,6 +116,14 @@ pub fn index_response<E: RustEmbed>() -> Response {
 /// and a plain 404 on a miss.
 ///
 /// `path` is the full embed key, `assets/` prefix included.
+///
+/// A `Range` request is answered in full with a 200 rather than a 206, and no
+/// `Accept-Ranges` is advertised, where nginx would serve the range. The bundle
+/// is a few hundred small hashed chunks with nothing seekable in it, and the
+/// immutable policy means each is fetched once, so a range would save nothing
+/// today; the day something large or streamable is served out of the embed,
+/// this is the line to revisit (it sits beside decision 6's compression
+/// follow-up).
 pub fn asset_response<E: RustEmbed>(path: &str, if_none_match: Option<&str>) -> Response {
     embedded::<E>(path, IMMUTABLE, if_none_match)
         .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response())
@@ -152,15 +160,42 @@ pub fn wants_spa(method: &Method, accept: Option<&str>) -> bool {
     if method != Method::GET && method != Method::HEAD {
         return false;
     }
-    accept.is_some_and(|accept| {
-        accept.split(',').any(|entry| {
-            entry
-                .split(';')
-                .next()
-                .unwrap_or_default()
-                .trim()
-                .eq_ignore_ascii_case("text/html")
-        })
+    accept.is_some_and(|accept| names(accept, "text/html"))
+}
+
+/// The rule that keeps the transport's own stream out of the UI's hands: true
+/// when this `Accept` asks for server-sent events rather than for a document.
+///
+/// Streamable HTTP has a second half beside the request/response POST: a
+/// client-opened GET at the endpoint path, held open, carrying every
+/// server-initiated message - which for this server means the
+/// `tools/list_changed` an agent needs to see after `configure` or
+/// `add_domain`. It arrives at whatever path the client was pointed at,
+/// including `/`, which is the endpoint the deployment docs hand out, so the
+/// routes the UI declares there have to let it past or the stream is answered
+/// with HTML and never opens.
+///
+/// rmcp's client sends `text/event-stream, application/json` here and the
+/// TypeScript SDK sends `text/event-stream`; neither ever names `text/html`,
+/// and no browser navigation names `text/event-stream`, so the two populations
+/// are disjoint in practice. The `text/html` clause is only the tie-break for a
+/// client that somehow asks for both: the document wins, because these rungs
+/// belong to the UI and the transport is what they fall back to.
+pub fn wants_event_stream(accept: Option<&str>) -> bool {
+    accept.is_some_and(|accept| names(accept, "text/event-stream") && !names(accept, "text/html"))
+}
+
+/// Whether an `Accept` header names `media_type`: matched as a whole media
+/// type rather than as a prefix (`text/htmlx` is not `text/html`), ignoring the
+/// q-parameters a browser attaches and the case a client chose.
+fn names(accept: &str, media_type: &str) -> bool {
+    accept.split(',').any(|entry| {
+        entry
+            .split(';')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .eq_ignore_ascii_case(media_type)
     })
 }
 

@@ -741,12 +741,16 @@ type McpService = rmcp::transport::streamable_http_server::tower::StreamableHttp
 /// 2. The embedded bundle, from the fallback: a root-level file matched
 ///    exactly, then a GET or HEAD that accepts `text/html` answered with the
 ///    app shell (the SPA's own router owns the 404 experience).
-/// 3. The MCP streamable-HTTP transport, which sees every request the two above
-///    did not claim - which is every request it saw before this UI existed.
-///    MCP traffic is POST, DELETE, or a GET asking for `text/event-stream`, and
-///    none of those is a navigation, so rung 2 cannot capture one. That is also
-///    why the transport keeps the fallback rather than moving to a named route:
-///    a client pointed at any path on this endpoint keeps working.
+/// 3. The MCP streamable-HTTP transport, which sees everything the two above
+///    did not claim. What they claim is narrow and worth stating exactly: a GET
+///    or HEAD that either asks for a document or lands on `/` or an asset path,
+///    and nothing else. Every POST and DELETE reaches the transport, and so
+///    does its client-opened standby SSE stream - a GET asking for
+///    `text/event-stream`, which arrives at whatever path a client was pointed
+///    at, `/` included, and is let past every UI rung by
+///    [`crate::ui::wants_event_stream`]. That is also why the transport keeps
+///    the fallback rather than moving to a named route: a client pointed at any
+///    path on this endpoint keeps working, both halves of it.
 ///
 /// With the UI off (`service.ui=false`, `service.api=false`, or a binary built
 /// without the `fluid-ui` feature) the fallback is the transport alone, exactly
@@ -839,12 +843,30 @@ pub fn http_router_with_assets<E: rust_embed::RustEmbed + 'static>(
         ))
 }
 
-/// Whether this request is one a browser fetches a document or an asset with,
-/// which is the only kind the UI answers: decision 4 calls every other method
-/// MCP-shaped, and an MCP client is free to point at any path on this endpoint.
+/// Whether the UI may answer this request at all, which is the guard in front
+/// of every one of its rungs.
+///
+/// Two conditions, and both are about leaving the transport alone. The method
+/// has to be one a browser fetches a document or an asset with: decision 4
+/// calls every other method MCP-shaped, and an MCP client is free to point at
+/// any path on this endpoint. And the request must not be the transport's own
+/// client-opened SSE stream, which is a GET like any navigation and arrives at
+/// the same paths - see [`crate::ui::wants_event_stream`] for what that stream
+/// is and why answering it with a document breaks an agent quietly.
 #[cfg(feature = "fluid-ui")]
-fn is_fetch(request: &axum::extract::Request) -> bool {
-    request.method() == axum::http::Method::GET || request.method() == axum::http::Method::HEAD
+fn is_ui_fetch(request: &axum::extract::Request) -> bool {
+    let is_fetch =
+        request.method() == axum::http::Method::GET || request.method() == axum::http::Method::HEAD;
+    is_fetch && !crate::ui::wants_event_stream(accept_of(request))
+}
+
+/// The `Accept` a request carries, if it carries a readable one.
+#[cfg(feature = "fluid-ui")]
+fn accept_of(request: &axum::extract::Request) -> Option<&str> {
+    request
+        .headers()
+        .get(axum::http::header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
 }
 
 /// The request path as an embed key: no leading slash, and undecoded, because
@@ -914,18 +936,21 @@ fn http_base(
 }
 
 /// `/`: the app shell for a browser, the not-built page when nothing was
-/// embedded, and the transport for every other method - the root is where an
-/// MCP client points by default.
+/// embedded, and the transport for everything else - the root is where an MCP
+/// client points by default.
 ///
-/// The shell answers here whatever the request accepts, which is what makes
+/// The shell answers here whatever the request accepts, with exactly one
+/// exception: a GET asking for `text/event-stream` is the transport's standby
+/// stream and is handed on. Serving the shell to `*/*`, to `application/json`
+/// and to a request naming nothing is what makes a bare
 /// `curl http://host:7411/` show the UI rather than a transport error; the
-/// Accept rule below applies to the app's other routes alone.
+/// narrower Accept rule applies to the app's other routes alone.
 #[cfg(feature = "fluid-ui")]
 async fn serve_index<E: rust_embed::RustEmbed>(
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    if !is_fetch(&request) {
+    if !is_ui_fetch(&request) {
         return next.run(request).await;
     }
     crate::ui::index_response::<E>()
@@ -933,13 +958,14 @@ async fn serve_index<E: rust_embed::RustEmbed>(
 
 /// `/assets/{*path}`: one content-hashed chunk, held for a year, and a plain
 /// 404 for a name nothing stands behind - never the app shell, whatever the
-/// request accepts.
+/// request accepts. The standby-stream exception holds here too, for a client
+/// whose endpoint URL happens to sit under this prefix.
 #[cfg(feature = "fluid-ui")]
 async fn serve_asset<E: rust_embed::RustEmbed>(
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    if !is_fetch(&request) {
+    if !is_ui_fetch(&request) {
         return next.run(request).await;
     }
     crate::ui::asset_response::<E>(embed_key(&request), if_none_match(&request))
@@ -957,20 +983,28 @@ async fn dispatch_ui<E: rust_embed::RustEmbed>(
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    // The exact-match rung. `exact_response` answers `None` for any key
-    // carrying a slash, so a multi-segment app route (the common case) costs a
-    // string scan and no lookup, and a hashed chunk can never be served from
-    // here under the wrong cache policy.
-    if is_fetch(&request)
-        && let Some(response) = crate::ui::exact_response::<E>(embed_key(&request))
-    {
-        return response;
+    use axum::response::IntoResponse as _;
+
+    if is_ui_fetch(&request) {
+        // The exact-match rung. `exact_response` answers `None` for any key
+        // carrying a slash, so a multi-segment app route (the common case)
+        // costs a string scan and no lookup, and a hashed chunk can never be
+        // served from here under the wrong cache policy. A root-level name
+        // that misses falls through, so with a non-html Accept it ends up at
+        // the transport's 406 rather than at a 404 - the `*/*` deviation
+        // working as designed, recorded here because it reads like a bug.
+        if let Some(response) = crate::ui::exact_response::<E>(embed_key(&request)) {
+            return response;
+        }
+        // The bare asset prefix, which the `/assets/{*path}` route above does
+        // not match (a wildcard takes no empty segment). nginx answers the
+        // whole prefix with `try_files $uri =404`, so neither spelling of it
+        // may fall through to the shell below.
+        if matches!(request.uri().path(), "/assets" | "/assets/") {
+            return axum::http::StatusCode::NOT_FOUND.into_response();
+        }
     }
-    let accept = request
-        .headers()
-        .get(axum::http::header::ACCEPT)
-        .and_then(|value| value.to_str().ok());
-    if crate::ui::wants_spa(request.method(), accept) {
+    if crate::ui::wants_spa(request.method(), accept_of(&request)) {
         return crate::ui::index_response::<E>();
     }
     next.run(request).await
