@@ -484,11 +484,11 @@ pub fn render_instructions(output: &PromptOutput) -> String {
     head.push_str(ROUTING_HEADER);
     if output.read_only {
         head.push_str(
-            "Crystalline is your durable memory across sessions: the domains below hold curated knowledge as engrams you search and read (your harness may prefix tool names, for example mcp__crystalline__search_engrams). Search them before answering from memory; list_domains with include_routing=true returns this index and its behavior rules at any time.\n\n",
+            "Crystalline is your crystalline intelligence across sessions: the domains below hold curated knowledge as engrams you search and read (your harness may prefix tool names, for example mcp__crystalline__search_engrams). Search them before answering from memory; list_domains with include_routing=true returns this index and its behavior rules at any time.\n\n",
         );
     } else {
         head.push_str(
-            "Crystalline is your durable memory across sessions: the domains below hold knowledge as engrams you read, write and refine (your harness may prefix tool names, for example mcp__crystalline__search_engrams). Search them before answering from memory and before writing; list_domains with include_routing=true returns this index and its behavior rules at any time.\n\n",
+            "Crystalline is your crystalline intelligence across sessions: the domains below hold knowledge as engrams you read, write and refine (your harness may prefix tool names, for example mcp__crystalline__search_engrams). Search them before answering from memory and before writing; list_domains with include_routing=true returns this index and its behavior rules at any time.\n\n",
         );
     }
     render_behavior_block(output, &mut head);
@@ -544,7 +544,7 @@ pub fn render_minimal_instructions() -> String {
 const ROUTING_HEADER: &str = "CRYSTALLINE KNOWLEDGE ROUTING\n\n";
 
 /// The one sentence [`render_minimal_instructions`] carries under the header.
-const MINIMAL_INSTRUCTIONS_POINTER: &str = "Crystalline is your durable memory across sessions and your session hook has already delivered its full routing block; call list_domains with include_routing=true to fetch the domain index and its behavior rules again at any time.";
+const MINIMAL_INSTRUCTIONS_POINTER: &str = "Crystalline is your crystalline intelligence across sessions and your session hook has already delivered its full routing block; call list_domains with include_routing=true to fetch the domain index and its behavior rules again at any time.";
 
 /// The paste-able custom-instructions snippet for remote clients whose harness
 /// runs no session hooks and never shows the model a server's initialize
@@ -554,7 +554,7 @@ const MINIMAL_INSTRUCTIONS_POINTER: &str = "Crystalline is your durable memory a
 /// It is deliberately static and content-free - it names no domain, no count
 /// and no setting - so it can never go stale in a place Crystalline cannot
 /// update. All dynamic routing comes from the `list_domains` call it points at.
-pub const CONNECTOR_SNIPPET: &str = "This environment includes the Crystalline knowledge server over MCP. At the start of every session call its list_domains tool with include_routing set to true; the result is your onboarding: one routing line per domain plus the behavior rules for this server's tools. Follow it, search those domains before answering from memory and re-fetch it mid-session with the same call whenever you need it again.";
+pub const CONNECTOR_SNIPPET: &str = "This environment includes Crystalline, your crystalline intelligence across sessions, over MCP. At the start of every session call its list_domains tool with include_routing set to true; the result is your onboarding: one routing line per domain plus the behavior rules for this server's tools. Follow it, search those domains before answering from memory and re-fetch it mid-session with the same call whenever you need it again.";
 
 #[derive(Serialize)]
 struct JsonPromptDomain<'a> {
@@ -1025,7 +1025,7 @@ mod tests {
         let text = render_minimal_instructions();
         assert_eq!(
             text,
-            "CRYSTALLINE KNOWLEDGE ROUTING\n\nCrystalline is your durable memory across sessions and your session hook has already delivered its full routing block; call list_domains with include_routing=true to fetch the domain index and its behavior rules again at any time.\n"
+            "CRYSTALLINE KNOWLEDGE ROUTING\n\nCrystalline is your crystalline intelligence across sessions and your session hook has already delivered its full routing block; call list_domains with include_routing=true to fetch the domain index and its behavior rules again at any time.\n"
         );
 
         let (_tmp, global) = fixture();
