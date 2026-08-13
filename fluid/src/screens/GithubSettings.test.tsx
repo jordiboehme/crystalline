@@ -139,14 +139,16 @@ describe("the GitHub settings screen", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("offers the nav entry to an admin", async () => {
+  it("offers the settings door to an admin, inside the identity menu", async () => {
     serveAs("admin");
     renderApp("/settings/github");
 
-    expect(await screen.findByRole("link", { name: "GitHub" })).toHaveAttribute(
-      "href",
-      "/settings/github",
+    const user = userEvent.setup();
+    await user.click(
+      await screen.findByRole("button", { name: "Ada Lovelace" }),
     );
+    const settings = await screen.findByRole("menuitem", { name: "Settings" });
+    expect(settings).toHaveAttribute("href", "/settings/github");
   });
 
   it("shows the disconnected state with both connect paths", async () => {
