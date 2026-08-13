@@ -6,7 +6,16 @@
 #
 # Then open http://localhost. There are no accounts until you create one, and
 # the JSON API answers 401 to a request that carries no identity, so the first
-# admin is the one manual step. `users add` writes the accounts database
+# admin is the one bootstrap step. Take it in the browser: an instance with no
+# accounts renders a create-first-admin form instead of a login form. The
+# daemon binds 0.0.0.0 inside its container, so that form asks for the one-time
+# setup token the daemon printed as it started, and
+#
+#   docker compose -f deploy/fluid/docker-compose.yml logs crystalline
+#
+# is where to read it (a restarted daemon prints a new one).
+#
+# Or take it from the host instead. `users add` writes the accounts database
 # directly and a running daemon picks the change up on its next lookup, so
 # there is nothing to restart:
 #
