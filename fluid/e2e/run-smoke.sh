@@ -1,10 +1,17 @@
 #!/usr/bin/env bash
 # Run the Fluid browser smoke against a real Crystalline daemon.
 #
-# One command, the same one locally and in CI: it builds the bundle, stands up
-# a daemon holding a copy of the fixture domain and two seeded accounts, and
-# hands both to Playwright, which serves the bundle with `vite preview` (see
+# One command, the same one locally and in CI: it stands up a daemon holding a
+# copy of the fixture domain and two seeded accounts, checks the web UI that
+# daemon serves out of its own binary, then builds the bundle and hands both to
+# Playwright, which serves the bundle with `vite preview` (see
 # playwright.config.ts) and drives a browser against it.
+#
+# The two deployments are both real and both covered: the embedded one the
+# curl block asserts (the bundle compiled into the binary, served by
+# `serve --http`) and the compose one Playwright drives (a separate server in
+# front of the daemon). The embedded checks need a binary built AFTER
+# `pnpm --dir fluid build`, since the bundle is staged at compile time.
 #
 # Everything the daemon writes lives in a scratch directory this script makes
 # and removes: the config, the index, the accounts, the model cache, the copy
@@ -155,6 +162,93 @@ if [ "$ready" -ne 1 ]; then
     echo "smoke: the daemon never became healthy on $DAEMON_ADDR" >&2
     exit 1
 fi
+
+# The embedded web UI, checked against the daemon's own port before the browser
+# journeys start. Playwright drives `vite preview` (the compose scenario, where
+# nginx serves the bundle), so this block is the only place the run exercises
+# the other deployment: the bundle compiled into the binary and served by
+# `serve --http` itself. It runs early because it is cheap and because a UI-less
+# binary is worth hearing about before a browser download.
+#
+# The four checks below are the contract: the shell is served with no-store, a
+# hashed asset is immutable, a data route without a cookie is refused, and the
+# MCP standby stream at `/` is never answered with the shell.
+echo "smoke: checking the embedded web UI on http://$DAEMON_ADDR"
+
+ui_headers="$run_dir/ui-headers"
+ui_body="$run_dir/ui-body"
+
+# One GET, with the Accept header the caller cares about. Prints the status
+# code; the headers and the body stay in the two files above so the assertions
+# after it can look at either.
+ui_get() {
+    curl --silent --show-error --output "$ui_body" --dump-header "$ui_headers" \
+        --write-out '%{http_code}' --max-time 30 \
+        --header "Accept: $2" "http://$DAEMON_ADDR$1"
+}
+
+# Header names are case insensitive and every value here is ASCII, so both sides
+# are lowercased once and the match is a plain substring. The trailing CR the
+# protocol puts on each line would otherwise end up inside the value.
+ui_header_has() {
+    tr -d '\r' < "$ui_headers" | tr '[:upper:]' '[:lower:]' | grep -q "^$1:.*$2"
+}
+
+ui_fail() {
+    echo "smoke: $1" >&2
+    echo "smoke: the response headers follow" >&2
+    cat "$ui_headers" >&2
+    exit 1
+}
+
+status=$(ui_get / 'text/html,application/xhtml+xml')
+if [ "$status" != "200" ]; then
+    ui_fail "GET / answered $status rather than 200. A binary compiled with no bundle staged answers 503 here: run 'pnpm --dir fluid build' and rebuild the binary (the build script copies fluid/dist at compile time, so the bundle has to exist first)."
+fi
+ui_header_has content-type 'text/html' \
+    || ui_fail "GET / is not text/html, so the daemon did not serve the app shell"
+ui_header_has cache-control 'no-store' \
+    || ui_fail "GET / is not no-store; the one unhashed name must never be cached"
+
+# The asset is read out of the shell the daemon just served rather than off
+# disk, so it names a file THIS binary carries. dist/ is rebuilt further down
+# for `vite preview`, and a rebuild that lands different hashes than the ones
+# compiled in would otherwise fail this check for no fault of the server.
+asset=$(grep -o '/assets/[A-Za-z0-9._-]*' "$ui_body" | head -n 1 || true)
+if [ -z "$asset" ]; then
+    ui_fail "the served shell references no /assets/ file, so there is no hashed asset to check"
+fi
+status=$(ui_get "$asset" '*/*')
+if [ "$status" != "200" ]; then
+    ui_fail "GET $asset answered $status rather than 200, though the shell the same binary served asks for it"
+fi
+ui_header_has cache-control 'immutable' \
+    || ui_fail "GET $asset is not immutable; hashed assets carry a one year cache"
+
+# A data route, not /api/v1/auth/me: that one is public by design (it is how a
+# logged-out client learns it must log in). This daemon has accounts and no
+# anonymous access, so the API refuses an uncredentialed reader; with
+# auth.anonymous=true the same request would be 200 at viewer level.
+status=$(ui_get /api/v1/domains 'application/json')
+if [ "$status" != "401" ]; then
+    ui_fail "GET /api/v1/domains without a cookie answered $status rather than 401; serving the UI must not open the API"
+fi
+
+# The MCP transport's standby stream: a client opens it with GET / and
+# `Accept: text/event-stream`, and it is the channel server notifications ride.
+# Answering it with the app shell breaks every stateful MCP session, so the
+# shape asserted here is the transport's own refusal of a session-less stream
+# (400) rather than anything the UI could produce.
+status=$(ui_get / 'text/event-stream')
+if ui_header_has content-type 'text/html'; then
+    ui_fail "GET / with Accept: text/event-stream was answered with the app shell; the MCP standby stream has to reach the transport"
+fi
+case "$status" in
+    400 | 406) ;;
+    *) ui_fail "GET / with Accept: text/event-stream answered $status; the transport refuses a session-less stream with 400 or 406" ;;
+esac
+
+echo "smoke: the embedded UI serves the shell, a hashed asset and no data"
 
 cd "$fluid_dir"
 

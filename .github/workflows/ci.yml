@@ -173,11 +173,6 @@ jobs:
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
-      # Debug rather than release: the smoke drives the API, not the throughput
-      # of the index, and a release build would cost more than the run does.
-      - name: Build crystalline
-        run: cargo build -p crystalline
-
       - name: Enable corepack
         run: |
           npm install --global corepack@0.35.0
@@ -188,14 +183,32 @@ jobs:
         run: pnpm install --frozen-lockfile
         working-directory: fluid
 
+      # The bundle is built before the binary, and the order is the point: the
+      # service crate's build script copies fluid/dist into its OUT_DIR at
+      # compile time, so a binary compiled first carries nothing and answers
+      # 503 on every navigation. This is the one job in CI that exercises a
+      # real embedded bundle (the Rust matrix compiles against the empty
+      # placeholder and covers the serving rules with fixture assets), and
+      # run-smoke.sh asserts it against the daemon's own port. The script
+      # builds the bundle again further on for `vite preview`; the second build
+      # is the same inputs and costs a few hundred milliseconds.
+      - name: Build the bundle
+        run: pnpm build
+        working-directory: fluid
+
+      # Debug rather than release: the smoke drives the API, not the throughput
+      # of the index, and a release build would cost more than the run does.
+      - name: Build crystalline
+        run: cargo build -p crystalline
+
       - name: Install the browser
         run: pnpm exec playwright install --with-deps chromium
         working-directory: fluid
 
-      # Builds the bundle, stands up the daemon on a scratch state directory
-      # with the fixture domain and one account, then runs Playwright against
-      # `vite preview`. The script is the whole sequence, so a local run is the
-      # same run.
+      # Stands up the daemon on a scratch state directory with the fixture
+      # domain and one account, checks the UI the daemon serves out of the
+      # binary, rebuilds the bundle and runs Playwright against `vite preview`.
+      # The script is the whole sequence, so a local run is the same run.
       - name: Run the browser smoke
         run: bash fluid/e2e/run-smoke.sh
 
