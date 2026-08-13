@@ -414,7 +414,7 @@ pub async fn run_serve(
                 Ok(router) => router,
                 Err(err) => {
                     tracing::warn!(
-                        "HTTP endpoint could not start ({err}); MCP over the socket is unaffected"
+                        "HTTP endpoint for {addr} could not start ({err}); MCP over the socket is unaffected"
                     );
                     return;
                 }
@@ -2151,14 +2151,32 @@ mod tests {
     /// that binding: a log line there spelling `{token}` would leak the secret
     /// into the daemon log with every test in the tree still green.
     ///
-    /// It reads a whole `tracing::` INVOCATION, not a line: everything from the
-    /// macro's name to the next `;`. The warnings in that arm are multi-line
-    /// (rustfmt keeps them that way, since the sentences are long), so their
-    /// format string lives on a different line from the `tracing::` that opens
-    /// the call and a per-line scan would sail straight past the one edit this
-    /// guard exists to catch. Taking the slice to the next `;` overshoots for a
-    /// macro used as a match arm or the tail of a block, which is the harmless
-    /// direction: it can only read more text, never less.
+    /// Two predicates, unioned, because neither alone covers the ways this file
+    /// actually writes a log call:
+    ///
+    /// 1. Per INVOCATION: from `tracing::` to the balanced close of the macro's
+    ///    argument list. The warnings in that arm are multi-line (rustfmt keeps
+    ///    them that way, the sentences being long), so their format string sits
+    ///    on a different line from the `tracing::` that opens the call, and a
+    ///    per-line scan sails straight past the edit this guard exists to catch.
+    ///    Delimiting on the next `;` instead would be worse than useless here:
+    ///    all three warnings in that arm carry a semicolon INSIDE their format
+    ///    string, so the slice would end after ~78 characters and everything
+    ///    after the remedy's semicolon - exactly where a careless edit lands -
+    ///    would go unread.
+    /// 2. Per LINE, the predicate this guard shipped with: `tracing::` and
+    ///    `token` on one line. Kept so a call the paren walk delimits
+    ///    differently, or skips, can never regress out of coverage.
+    ///
+    /// Honest about the walk: it counts parentheses without parsing string
+    /// literals, so a literal holding an unmatched `(` or `)` would skew it. The
+    /// literals here balance (`({err})`, `(os error 48)`), and an unbalanced one
+    /// panics with the offending text rather than silently truncating the slice.
+    /// A `tracing::` that is not a macro call (`tracing::Level::INFO`) is skipped
+    /// by predicate 1 and left to predicate 2. A COMMENT that names `tracing::`
+    /// and `token` before the next close paren fails the guard; there are none
+    /// today, and a comment about the token beside a log call is not a shape
+    /// worth defending anyway.
     #[test]
     fn the_setup_token_is_never_spelled_into_a_log_call() {
         // Everything above `#[cfg(test)]`, which is the code that runs in a
@@ -2167,9 +2185,17 @@ mod tests {
             .split("#[cfg(test)]")
             .next()
             .unwrap();
+        assert_no_logged_token(served);
+    }
+
+    /// The guard's predicate over the served region's text, split out from the
+    /// test so the same code can be run over a scratch copy of this file when
+    /// the guard's own coverage is being proved.
+    fn assert_no_logged_token(served: &str) {
         for (at, _) in served.match_indices("tracing::") {
-            let rest = &served[at..];
-            let call = &rest[..rest.find(';').unwrap_or(rest.len())];
+            let Some(call) = tracing_call(&served[at..]) else {
+                continue;
+            };
             assert!(
                 !call.contains("token"),
                 "daemon.rs:{} logs the setup token: {}",
@@ -2177,5 +2203,41 @@ mod tests {
                 call.split_whitespace().collect::<Vec<_>>().join(" ")
             );
         }
+        for (n, line) in served.lines().enumerate() {
+            assert!(
+                !(line.contains("tracing::") && line.contains("token")),
+                "daemon.rs:{} logs the setup token: {}",
+                n + 1,
+                line.trim()
+            );
+        }
+    }
+
+    /// The text of the `tracing::` macro invocation that starts at `rest[0]`,
+    /// from the macro name through the balanced close of its argument list.
+    /// `None` when this `tracing::` opens no argument list at all, which is a
+    /// path (`tracing::Level::INFO`) rather than a call.
+    fn tracing_call(rest: &str) -> Option<&str> {
+        let open = rest.find('(')?;
+        if !rest[..open].trim_end().ends_with('!') {
+            return None;
+        }
+        let mut depth = 0usize;
+        for (i, ch) in rest[open..].char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(&rest[..open + i + 1]);
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!(
+            "a tracing call's parentheses never balance, so this guard cannot read it: {}",
+            &rest[..rest.len().min(200)]
+        );
     }
 }

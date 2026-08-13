@@ -1,4 +1,4 @@
-//! Drives `serve --http`'s real router (`crystalline_service::daemon::http_router`,
+//! Drives the HTTP endpoint's real router (`crystalline_service::daemon::http_router`,
 //! the same construction `run_http` mounts) over a live TCP listener and reads the
 //! raw SSE wire bytes, so a regression in the rmcp config can't hide behind a
 //! client library that silently tolerates the extra priming frame.

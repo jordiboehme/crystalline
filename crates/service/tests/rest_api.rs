@@ -1,4 +1,4 @@
-//! Drives the REST surface `serve --http` mounts at `/api/v1` over a live TCP
+//! Drives the REST surface the HTTP endpoint mounts at `/api/v1` over a live TCP
 //! listener, through the production router construction
 //! (`crystalline_service::daemon::http_router`) rather than a hand-built
 //! sub-router, so a regression in the mount point or in the nesting order
