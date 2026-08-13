@@ -221,9 +221,11 @@ describe("fence previews", () => {
     // what makes two widgets equal. Without it CodeMirror reuses the DOM of a
     // widget whose source has not changed - correct for the diagram, wrong for
     // the number, which would keep naming the line the fence used to sit on.
-    vi.mocked(mermaid.render)
-      .mockRejectedValueOnce(new Error(MESSAGES.flowchartAtEnd))
-      .mockRejectedValueOnce(new Error(MESSAGES.flowchartAtEnd));
+    // The correction is made IN the caption rather than by drawing again: one
+    // rejection is queued, and one is all mermaid is asked for.
+    vi.mocked(mermaid.render).mockRejectedValueOnce(
+      new Error(MESSAGES.flowchartAtEnd),
+    );
     const view = editor(
       "# Title\n\nintro\n\n```mermaid\nflowchart TD\n  A[Step\n```\n",
     );
@@ -232,12 +234,99 @@ describe("fence previews", () => {
         view.dom.querySelector(".cm-mermaid-error")?.textContent,
       ).toContain("Line 7:");
     });
+    const caption = view.dom.querySelector(".cm-mermaid-error");
     view.dispatch({ changes: { from: 0, insert: "one more line\n" } });
     await vi.waitFor(() => {
       expect(
         view.dom.querySelector(".cm-mermaid-error")?.textContent,
       ).toContain("Line 8:");
     });
+    // The same caption element, rewritten: nothing was torn down to say a
+    // different number.
+    expect(view.dom.querySelector(".cm-mermaid-error")).toBe(caption);
+    expect(vi.mocked(mermaid.render)).toHaveBeenCalledTimes(1);
+    view.destroy();
+  });
+
+  it("keeps the diagram mounted when the fence only changes line", async () => {
+    // Enter typed anywhere above a diagram moves its fence, which changes the
+    // line the caption would name and so makes the new widget unequal to the
+    // old one. Equality is only the FIRST question CodeMirror asks: the second
+    // is whether the new widget can take over the mounted DOM, and a widget
+    // whose source and theme are unchanged can - so the SVG stays on screen
+    // instead of blinking out for a tick on every Enter.
+    const view = editor("intro\n\n```mermaid\ngraph TD; A-->B;\n```\n");
+    await vi.waitFor(() => {
+      expect(view.dom.querySelector(".cm-mermaid-preview svg")).not.toBeNull();
+    });
+    const svg = view.dom.querySelector(".cm-mermaid-preview svg");
+    // A mark on the node itself: the assertion is about THIS element surviving,
+    // not about some svg being present again a tick later.
+    svg?.setAttribute("data-generation", "first");
+    view.dispatch({ changes: { from: 0, insert: "one more line\n" } });
+    // Synchronously after the edit, which is where the flash was.
+    expect(view.dom.querySelector(".cm-mermaid-preview svg")).toBe(svg);
+    expect(
+      view.dom.querySelector(
+        ".cm-mermaid-preview svg[data-generation='first']",
+      ),
+    ).not.toBeNull();
+    expect(vi.mocked(mermaid.render)).toHaveBeenCalledTimes(1);
+    view.destroy();
+  });
+
+  it("captions a late failure at the line the fence reached", async () => {
+    // A render is a promise, so a fence can move while its own render is in
+    // flight: the box changes hands, and the rejection then arrives holding a
+    // widget that was retired one edit ago. The caption has to say where the
+    // fence IS - which is why the box, not the closure, carries the line.
+    let fail: ((cause: unknown) => void) | undefined;
+    vi.mocked(mermaid.render).mockImplementationOnce(
+      () =>
+        new Promise<never>((_resolve, reject) => {
+          fail = reject;
+        }),
+    );
+    const view = editor(
+      "# Title\n\nintro\n\n```mermaid\nflowchart TD\n  A[Step\n```\n",
+    );
+    // The render has started - the module import and the call are both
+    // promises - and has not answered yet.
+    await vi.waitFor(() => {
+      expect(fail).not.toBeUndefined();
+    });
+    view.dispatch({ changes: { from: 0, insert: "one more line\n" } });
+    fail?.(new Error(MESSAGES.flowchartAtEnd));
+    await vi.waitFor(() => {
+      expect(
+        view.dom.querySelector(".cm-mermaid-error")?.textContent,
+      ).toContain("Line 8:");
+    });
+    view.destroy();
+  });
+
+  it("draws again when the fence's own text changes", async () => {
+    // The other half of the same rule: taking over a box is for a diagram that
+    // is the same diagram. Edit the body and the preview has to be rendered
+    // again, however cheap keeping the old one would be.
+    const view = editor("```mermaid\ngraph TD; A-->B;\n```\n");
+    await vi.waitFor(() => {
+      expect(view.dom.querySelector(".cm-mermaid-preview svg")).not.toBeNull();
+    });
+    const svg = view.dom.querySelector(".cm-mermaid-preview svg");
+    svg?.setAttribute("data-generation", "first");
+    // The end of the body line: "```mermaid\n" is 11 characters and
+    // "graph TD; A-->B;" is 16 more.
+    view.dispatch({ changes: { from: 27, insert: " C-->D;" } });
+    expect(view.state.doc.toString()).toContain("A-->B; C-->D;");
+    await vi.waitFor(() => {
+      expect(vi.mocked(mermaid.render)).toHaveBeenCalledTimes(2);
+    });
+    expect(
+      view.dom.querySelector(
+        ".cm-mermaid-preview svg[data-generation='first']",
+      ),
+    ).toBeNull();
     view.destroy();
   });
 

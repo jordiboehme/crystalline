@@ -6,7 +6,9 @@
  * one opens a grid, and the cell the keyboard already sits on IS that 2x2, so
  * the shortest route costs exactly one more keypress than before and every
  * other size costs the arrows it takes to reach it. The grid's top row is the
- * header row, which is why a 2x2 pick means a header and one row to fill.
+ * header row, which is why a 2x2 pick means a header and one row to fill - and
+ * why that row is drawn a shade heavier than the rest, so the grid says so on
+ * its own rather than leaving a person to be surprised by the table.
  *
  * A Popover rather than a DropdownMenu: a menu owns its arrow keys for moving
  * between items, and here the arrows mean "bigger table". A popover brings the
@@ -45,28 +47,45 @@ const DEFAULT_SIZE = { columns: 2, rows: 2 } as const;
 const PLACEHOLDER = "Column";
 
 /**
- * A cell's two faces, each a whole class string.
+ * A cell's four faces, each a whole class string: the top row and the rows
+ * under it, each highlighted and resting.
  *
- * Two faces rather than accent utilities layered onto one, for the reason
+ * Whole strings rather than accent utilities layered onto one, for the reason
  * `TOGGLE` in the primitives spells out: Tailwind resolves same-specificity
  * conflicts by emission order, not by the order of names in a class
  * attribute, so a highlight written as an override would silently never
- * appear. Every color is declared exactly once, by exactly one face.
+ * appear. Every color is declared exactly once, by exactly one face - which is
+ * also why the header row is a face of its own rather than an extra class.
  *
  * The state is carried by the BORDER - accent-600 is 3.74:1 on the light menu
- * surface and 3.32:1 on the wash it encloses, accent-400 is 9.58:1 on the
- * dark surface and 5.09:1 on its own wash, all clear of the 3:1 floor for
- * non-text UI - with the wash as the redundant affordance. The washes
- * themselves are ruling rather than state (accent-100 is 1.13:1 on white,
- * accent-900 1.88:1 on the dark surface, and the unhighlighted cells are
- * fainter still at 1.23:1 and 1.72:1), which is the same trade every divider
- * in this app makes: they draw the grid, the border says which part of it is
- * chosen. The off face reserves the border in `transparent`, so highlighting
- * changes color and nothing moves.
+ * surface and 3.32:1 on the `data` wash it encloses, accent-400 is 9.58:1 on
+ * the dark surface and 5.09:1 on its own - with the wash as the redundant
+ * affordance. The washes themselves are ruling rather than state (accent-100
+ * is 1.13:1 on white, accent-900 1.88:1 on the dark surface, and the resting
+ * cells are fainter still at 1.23:1 and 1.72:1), which is the same trade every
+ * divider in this app makes: they draw the grid, the border says which part of
+ * it is chosen. The off face reserves the border in `transparent`, so
+ * highlighting changes color and nothing moves.
+ *
+ * The header row is one wash HEAVIER in every face, which is decorative
+ * distinction rather than state or text - the ruling this app's dividers
+ * already stand on, so it is allowed under the 3:1 floor. Measured against the
+ * wash it has to be told apart from: slate-400 on slate-200 is 2.13:1 light
+ * and slate-500 on slate-700 is 2.17:1 dark, accent-400 on accent-100 is
+ * 1.65:1 light and accent-600 on accent-900 is 2.53:1 dark. The lit pair is
+ * the quieter one on purpose: a heavier light wash (accent-500 would read
+ * 2.21:1) starts to swallow the accent-600 border that says "chosen", which
+ * still reads 2.01:1 against accent-400 and is the cue that must survive.
  */
 const CELL = {
-  off: "border border-transparent bg-slate-200 dark:bg-slate-700",
-  on: "border border-accent-600 bg-accent-100 dark:border-accent-400 dark:bg-accent-900",
+  header: {
+    off: "border border-transparent bg-slate-400 dark:bg-slate-500",
+    on: "border border-accent-600 bg-accent-400 dark:border-accent-400 dark:bg-accent-600",
+  },
+  data: {
+    off: "border border-transparent bg-slate-200 dark:bg-slate-700",
+    on: "border border-accent-600 bg-accent-100 dark:border-accent-400 dark:bg-accent-900",
+  },
 } as const;
 
 /** The geometry both faces share: a small square, and the app's focus ring. */
@@ -75,6 +94,19 @@ const CELL_SHAPE = `h-4 w-4 rounded-xs ${FOCUS_RING}`;
 /** Keep a size on the grid however far an arrow key is held down. */
 function clamp(value: number, high: number): number {
   return Math.min(high, Math.max(1, value));
+}
+
+/**
+ * A cell's size in words: "1 column by 1 row", "3 columns by 2 rows".
+ *
+ * The plural follows each count on its own, because the two are independent -
+ * a single column of four rows is "1 column by 4 rows". Words rather than
+ * "3 x 4", because that read aloud is three letters and two numbers.
+ */
+function sizeName(columns: number, rows: number): string {
+  const count = (n: number, unit: string) =>
+    `${String(n)} ${unit}${n === 1 ? "" : "s"}`;
+  return `${count(columns, "column")} by ${count(rows, "row")}`;
 }
 
 export function TableSizePicker({
@@ -199,16 +231,19 @@ export function TableSizePicker({
                       <button
                         key={columns}
                         type="button"
-                        // The size in words, because "3 x 4" read aloud is not
-                        // a size - it is three letters and two numbers.
-                        aria-label={`${String(columns)} columns by ${String(rows)} rows`}
+                        aria-label={sizeName(columns, rows)}
                         ref={(element) => {
                           cells.current.set(key(columns, rows), element);
                         }}
+                        // The top row is the header row of the table this
+                        // inserts, so it is drawn as one: same two states,
+                        // heavier wash.
                         className={`${CELL_SHAPE} ${
-                          columns <= size.columns && rows <= size.rows
-                            ? CELL.on
-                            : CELL.off
+                          (rows === 1 ? CELL.header : CELL.data)[
+                            columns <= size.columns && rows <= size.rows
+                              ? "on"
+                              : "off"
+                          ]
                         }`}
                         onFocus={() => {
                           // The whole invariant, in one place: whatever put

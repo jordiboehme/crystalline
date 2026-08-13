@@ -73,6 +73,18 @@ describe("the starter library", () => {
   );
 
   test.each(ALL.map((s) => [s.label, s] as const))(
+    "%s mentions its token exactly once",
+    (_label, starter) => {
+      // The rule that keeps type-over honest: the caret lands on the token
+      // selected, and one keystroke replaces every mention there is. A body
+      // that names its token twice leaves the second one behind as a phantom
+      // state or a dangling edge, which is a diagram nobody asked for.
+      const body = starter.lines.join("\n");
+      expect(body.split(starter.token)).toHaveLength(2);
+    },
+  );
+
+  test.each(ALL.map((s) => [s.label, s] as const))(
     "%s selects its first editable token",
     (_label, starter) => {
       const { lines, select } = mermaidFence(starter);

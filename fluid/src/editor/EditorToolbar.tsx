@@ -24,7 +24,6 @@ import {
   Brackets,
   Code,
   Columns3,
-  Grid2X2X,
   Heading,
   Italic,
   Link,
@@ -317,6 +316,17 @@ export function EditorToolbar({
             The glyphs are a mnemonic; the labels are the contract. Every one
             of these is a tooltip as well as an accessible name, because a row
             of small squares is not self-explanatory whatever is drawn in it.
+
+            Two idioms, used consistently: the add verbs draw the axis they act
+            on (Rows3, Columns3) and both delete verbs draw the same trash can.
+            The axis is the thing these two glyphs are worst at saying - the
+            set has no row-flavored sibling of the grid-with-an-X this one used
+            to wear - while "this destroys something" is the thing they must
+            not be coy about, and it is the half a glyph can carry. Reaching
+            for the axis instead (Rows2 beside Rows3) would put the mistake in
+            the worse place: delete looking like add rather than delete row
+            looking like delete column, with the label and the order that
+            mirrors the two buttons above them to tell those apart.
           */}
           <IconButton
             label="Add row below"
@@ -338,7 +348,7 @@ export function EditorToolbar({
           />
           <IconButton
             label="Delete column"
-            icon={Grid2X2X}
+            icon={Trash2}
             disabled={off}
             onClick={act(tableDeleteColumn)}
           />

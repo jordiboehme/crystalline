@@ -290,6 +290,23 @@ describe("the table segment", () => {
     expect(screen.getByRole("button", { name: "Bold" })).not.toBeNull();
   });
 
+  test("the two delete verbs wear one glyph and the two add verbs two", () => {
+    // Taste, pinned because it is invisible to every other assertion here:
+    // the labels are the contract, so a glyph that drifts back to a second
+    // idiom - a trash can beside a grid-with-an-X for two verbs that differ
+    // only in axis - breaks nothing and reads as an accident.
+    render(<EditorToolbar view={null} tableActive />);
+    const glyph = (name: string) =>
+      screen
+        .getByRole("button", { name })
+        .querySelector("svg")
+        ?.getAttribute("class");
+    expect(glyph("Delete row")).toBe(glyph("Delete column"));
+    expect(glyph("Add row below")).not.toBe(glyph("Add column after"));
+    // And the two idioms stay apart: deleting must not look like adding.
+    expect(glyph("Delete row")).not.toBe(glyph("Add row below"));
+  });
+
   /*
    * Every one of the six is pinned to the verb its label promises, and each
    * assertion names a result no OTHER control in the segment produces: a

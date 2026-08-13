@@ -190,6 +190,35 @@ export function describeMermaidError(cause: unknown, fence: FenceBody): string {
   return `${prefix}${fit(detail.length > 0 ? detail : UNRENDERABLE, CAPTION_CAP - prefix.length)}`;
 }
 
+/**
+ * What a mounted preview box is drawing, by box.
+ *
+ * Two questions need it. `updateDOM` is offered a box and has to say whether
+ * it can take it over, which means knowing what drew it. And the render that
+ * fills a box is asynchronous, so a box can change hands while its own render
+ * is still in flight - the caption that lands afterwards has to name the line
+ * the fence is on NOW, not the one it was on when the render started. One
+ * record per box answers both, and holds the rejection so a caption can be
+ * rewritten without asking mermaid anything a second time.
+ */
+interface Preview {
+  /** The widget the box currently draws for; `updateDOM` moves it on. */
+  widget: MermaidPreviewWidget;
+  /** Wrapped, because a rejection is allowed to BE undefined. */
+  cause?: { of: unknown };
+}
+
+const previews = new WeakMap<HTMLElement, Preview>();
+
+/** The caption a box's failure reads as from where its fence sits now. */
+function captionFor(preview: Preview): string {
+  const { widget } = preview;
+  return describeMermaidError(preview.cause?.of, {
+    firstLine: widget.firstLine,
+    lineCount: widget.source.split("\n").length,
+  });
+}
+
 class MermaidPreviewWidget extends WidgetType {
   // Assigned in the body rather than declared as constructor parameters: the
   // build erases types, it does not run a TypeScript transform, and
@@ -208,10 +237,10 @@ class MermaidPreviewWidget extends WidgetType {
 
   // The fence's own position is part of what makes two widgets equal, because
   // the caption asserts a document line: a widget whose source is unchanged
-  // but which has been pushed down the document has to draw again, or it keeps
-  // naming the line it used to sit on. The cost is one re-render of a diagram
-  // when lines are added or removed ABOVE it, which is a line-count change
-  // rather than a keystroke, so typing near a diagram does not redraw it.
+  // but which has been pushed down the document is NOT the same widget, or it
+  // keeps naming the line it used to sit on. What that costs is settled by
+  // `updateDOM` below rather than here - unequal earns a second question, not
+  // a re-render.
   override eq(other: MermaidPreviewWidget): boolean {
     return (
       other.source === this.source &&
@@ -220,10 +249,50 @@ class MermaidPreviewWidget extends WidgetType {
     );
   }
 
+  /**
+   * The second question CodeMirror asks: this widget is not equal to the one
+   * holding that box - can it have the box anyway?
+   *
+   * Yes whenever the only difference is WHERE the fence sits. A diagram that
+   * has been pushed down the document is the same diagram, so it keeps its
+   * mounted SVG and the only thing that changes is the caption's number, if
+   * there is a caption. Without this, Enter typed anywhere above a diagram
+   * emptied its box and re-rendered it - a visible blank frame per diagram
+   * below the caret, once per Enter.
+   *
+   * A source or theme change answers no and falls through to a fresh `toDOM`,
+   * which is the only way the drawing itself can change. The box may belong to
+   * a DIFFERENT fence, too: CodeMirror offers any unclaimed box of this
+   * widget's own class, so the record is the box's own answer to what it is
+   * drawing rather than an assumption about which fence it came from.
+   */
+  override updateDOM(dom: HTMLElement): boolean {
+    const preview = previews.get(dom);
+    if (
+      !preview ||
+      preview.widget.source !== this.source ||
+      preview.widget.dark !== this.dark
+    ) {
+      return false;
+    }
+    preview.widget = this;
+    const caption = dom.querySelector(".cm-mermaid-error");
+    if (caption) {
+      caption.textContent = captionFor(preview);
+    }
+    return true;
+  }
+
   override toDOM(): HTMLElement {
     const box = document.createElement("div");
     box.className = "cm-mermaid-preview";
-    const { source, dark, firstLine } = this;
+    const { source, dark } = this;
+    // The box's record, from its first frame: `updateDOM` reads it to decide
+    // whether it may take this box over, and writes itself into it when it
+    // does - which is why the caption below asks the record for its line
+    // rather than closing over one.
+    const preview: Preview = { widget: this };
+    previews.set(box, preview);
     mermaidSequence += 1;
     const id = `cm-mermaid-${String(mermaidSequence)}`;
     void import("mermaid")
@@ -258,15 +327,16 @@ class MermaidPreviewWidget extends WidgetType {
         if (box.childElementCount > 0) {
           return;
         }
+        preview.cause = { of: cause };
         const caption = document.createElement("div");
         caption.className = "cm-mermaid-error";
         // Text, never markup, and no live region: this fires on most
         // keystrokes while a diagram is being typed, so a screen reader
-        // announcing each one would talk over the typing.
-        caption.textContent = describeMermaidError(cause, {
-          firstLine,
-          lineCount: source.split("\n").length,
-        });
+        // announcing each one would talk over the typing. The line comes from
+        // the record rather than from this closure: the fence may have been
+        // pushed down the document while this render was in flight, and the
+        // widget that took the box over is the one that knows where it is now.
+        caption.textContent = captionFor(preview);
         box.appendChild(caption);
       });
     return box;

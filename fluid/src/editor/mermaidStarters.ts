@@ -6,9 +6,10 @@
  * Two rules hold every starter together. It PARSES under the pinned mermaid -
  * the sibling test runs the real parser over all sixteen, so a starter that
  * drifts out of the grammar fails the suite rather than the reader's editor.
- * And it names its first editable token, the one word a person would replace
- * first (a title, a participant, the opening state), so the caret can land on
- * it selected and the first keystroke after the insert is already content.
+ * And it names its editable token, the one word a person would replace first
+ * (a title, a participant, the opening state), EXACTLY ONCE, so the caret can
+ * land on it selected and one keystroke replaces the whole of it. The
+ * once-only half of that rule is spelled out at `mermaidFence`.
  *
  * The bodies are line arrays, never joined strings: an insertion joins with
  * the buffer's own `state.lineBreak`, so a literal "\n" here would land as
@@ -52,35 +53,45 @@ const EVERYDAY: readonly MermaidStarter[] = [
     token: "First step",
   },
   {
+    // Named participants rather than bare ones: an id used by two arrows is
+    // written three times, and only the label is written once. See the
+    // once-only rule at `mermaidFence`.
     label: "Sequence",
     lines: [
       "sequenceDiagram",
-      "    participant Caller",
-      "    participant Service",
-      "    Caller->>Service: Request",
-      "    Service-->>Caller: Reply",
+      "    participant caller as Caller",
+      "    participant service as Service",
+      "    caller->>service: Request",
+      "    service-->>caller: Reply",
     ],
     token: "Caller",
   },
   {
+    // Described states rather than bare ones, for the once-only rule: a state
+    // that is entered and left names itself twice, its description once.
     label: "State",
     lines: [
       "stateDiagram-v2",
-      "    [*] --> First",
-      "    First --> Second : event",
-      "    Second --> [*]",
+      '    state "First" as s1',
+      '    state "Second" as s2',
+      "    [*] --> s1",
+      "    s1 --> s2 : event",
+      "    s2 --> [*]",
     ],
     token: "First",
   },
   {
+    // Labelled classes rather than bare ones, for the once-only rule: a class
+    // that is declared and then related names itself twice, its label once.
     label: "Class",
     lines: [
       "classDiagram",
-      "    class Order {",
+      '    class order["Order"] {',
       "        +String reference",
       "        +total() float",
       "    }",
-      "    Order --> Item",
+      '    class item["Item"]',
+      "    order --> item",
     ],
     token: "Order",
   },
@@ -250,13 +261,19 @@ export const MERMAID_STARTER_GROUPS: readonly StarterGroup[] = [
  * the fence line. Null when a starter carries no token in its body, which
  * leaves the insertion at its default caret.
  *
- * `selectToken` takes the FIRST occurrence, which is what every starter is
- * written for. The consequence is real and accepted: where a token recurs
- * (State's "First" on its transition line, Class's "Order" on its edge),
- * typing over the selection leaves the later mention behind - a phantom
- * state, a dangling edge - and it is the person's to follow up. Tokens that
- * occur exactly once would avoid it at the cost of not selecting the word one
- * edits first.
+ * `selectToken` takes the FIRST occurrence, and every starter is written so
+ * that it is also the ONLY one - the sibling test asserts exactly one mention
+ * for all sixteen. That is the rule that makes typing over the selection a
+ * finished edit rather than the first half of one: a token mentioned twice
+ * leaves the second mention behind as a phantom state or a dangling edge, for
+ * the person to find later in a diagram they thought they had renamed.
+ *
+ * Three diagram types need an identifier in more than one place, so their
+ * starters separate the two jobs: a short id carries the structure and a
+ * label carries the words. `participant caller as Caller`, `state "First" as
+ * s1` and `class order["Order"]` each say their editable word once, and the
+ * arrows underneath go on referring to the id. Any starter added later has
+ * the same two ways out: mention the token once, or give it a label.
  */
 export function mermaidFence(starter: MermaidStarter): {
   lines: string[];

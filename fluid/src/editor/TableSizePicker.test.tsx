@@ -116,7 +116,8 @@ describe("TableSizePicker", () => {
     mount();
     await open();
     await userEvent.keyboard("{ArrowRight}");
-    const cells = screen.getAllByRole("button", { name: /columns by/ });
+    // Tolerant of the plural, because the first column's cells say "1 column".
+    const cells = screen.getAllByRole("button", { name: /columns? by/ });
     expect(cells).toHaveLength(48);
     // The ON face is a whole class string, so the accent border is what tells
     // the two apart - and counting them pins decision 4's rule rather than
@@ -131,6 +132,41 @@ describe("TableSizePicker", () => {
     expect(
       screen.getByRole("button", { name: "4 columns by 2 rows" }).className,
     ).toContain("border-transparent");
+  });
+
+  test("the top row is drawn as the header row it inserts", async () => {
+    // Decision 3's rule - the top row IS the header row, so a 2x2 pick means a
+    // header and one row to fill - is otherwise a thing a person has to be
+    // told. Both faces carry the cue, because the header row is lit for every
+    // size the grid can express.
+    mount();
+    await open();
+    const face = (name: string) =>
+      screen.getByRole("button", { name }).className;
+    // Lit: the header row is the heavier wash of the two accent faces.
+    expect(face("2 columns by 1 row")).toContain("bg-accent-400");
+    expect(face("2 columns by 2 rows")).toContain("bg-accent-100");
+    // Unlit: the same step, in the resting pair.
+    expect(face("8 columns by 1 row")).toContain("bg-slate-400");
+    expect(face("8 columns by 2 rows")).toContain("bg-slate-200");
+  });
+
+  test("a size of one says column and row, not columns and rows", async () => {
+    // The corner cell is the one a screen reader reaches first and the one it
+    // read out as "1 columns by 1 rows".
+    mount();
+    await open();
+    await userEvent.keyboard("{ArrowLeft}{ArrowUp}");
+    expect(
+      screen.getByRole("button", { name: "1 column by 1 row" }),
+    ).toHaveFocus();
+    // One of each still pluralises the other: the two counts are independent.
+    expect(
+      screen.getByRole("button", { name: "1 column by 4 rows" }),
+    ).not.toBeNull();
+    expect(
+      screen.getByRole("button", { name: "5 columns by 1 row" }),
+    ).not.toBeNull();
   });
 
   test("a hover carries the focus, so Enter inserts what is highlighted", async () => {
