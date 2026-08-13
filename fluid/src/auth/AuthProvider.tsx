@@ -32,7 +32,7 @@ import { AccountDisabled } from "../components/AccountDisabled";
 import { ServerDown } from "../components/ServerDown";
 import { AuthContext } from "./AuthContext";
 import type { AuthValue, Capabilities } from "./AuthContext";
-import { ME_QUERY_KEY } from "./keys";
+import { ME_QUERY_KEY, SETUP_MUTATION_KEY } from "./keys";
 
 /**
  * Run the probe, and hand the token it carries to the client on the way past.
@@ -96,6 +96,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   );
 
   const setupMutation = useMutation({
+    // The key rides the mutation that issues the request, which is the one the
+    // expired-session recovery inspects: a refusal here is not an expired
+    // session, since nobody has a session yet.
+    mutationKey: SETUP_MUTATION_KEY,
+    // No automatic retry on the one request that creates an account. A 500 or
+    // a dropped connection is for the person to decide about, and the default
+    // would turn one submit into a pair of POSTs the server has to race
+    // against itself.
+    retry: 0,
     mutationFn: async ({ name, password, token }: FirstAdmin) => {
       // The token is omitted rather than sent empty: an instance that never
       // printed one treats "no token configured" as a closed path, and a

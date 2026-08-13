@@ -48,6 +48,7 @@ export function FirstRunSetup({
   const nameField = useId();
   const passwordField = useId();
   const confirmField = useId();
+  const confirmHelp = useId();
   const tokenField = useId();
   const tokenHelp = useId();
   const [name, setName] = useState("");
@@ -58,10 +59,32 @@ export function FirstRunSetup({
 
   const mismatch = password !== confirm;
 
+  /**
+   * Why the submit button is not usable yet, or null when it is.
+   *
+   * A disabled button suppresses the browser's own "please fill out this
+   * field" bubble, so the two states have to say themselves: a confirmation
+   * nobody has typed yet is not a mistake and is not called one, and a
+   * confirmation that differs is. Silence in either state is a dead button
+   * with no explanation, which is where a password manager that fills only the
+   * first field leaves people.
+   */
+  const blocked = !mismatch
+    ? null
+    : confirm === ""
+      ? "type the password again to confirm it"
+      : "the passwords do not match";
+
   const attempt = useMutation({
-    // Under the auth family's key, so the expired-session recovery leaves it
-    // alone: there is no session to have expired yet.
+    // Under the auth family's key, so the expired-session recovery leaves this
+    // alone: there is no session to have expired yet. The mutation that issues
+    // the request carries the same key, which is the one that has to.
     mutationKey: SETUP_MUTATION_KEY,
+    // Creating an account is not a request to repeat on its own. Both this
+    // wrapper and the provider's mutation would otherwise inherit `retry: 1`
+    // for a 500 or a dropped connection, and one submit would leave four
+    // POSTs in the server's log.
+    retry: 0,
     mutationFn: () =>
       setup(name, password, tokenAsked ? token.trim() || undefined : undefined),
     onError: (error: Error) => {
@@ -158,17 +181,33 @@ export function FirstRunSetup({
             type="password"
             autoComplete="new-password"
             required
+            // The message is announced once when it appears and is tied to the
+            // field as well, so tabbing back to it hears the reason rather
+            // than an unexplained text box.
+            aria-describedby={confirmHelp}
+            aria-invalid={mismatch}
             value={confirm}
             onChange={(event) => {
               setConfirm(event.target.value);
             }}
             className={CARD_FIELD}
           />
-          {confirm !== "" && mismatch && (
-            <p role="alert" className="text-sm text-red-700 dark:text-red-300">
-              the passwords do not match
-            </p>
-          )}
+          {/*
+            Mounted whether or not it has anything to say: a live region
+            created together with its text is announced unreliably, and this
+            one's text arrives while somebody is typing next to it.
+          */}
+          <p
+            id={confirmHelp}
+            role="alert"
+            className={
+              confirm === ""
+                ? "text-sm text-slate-600 dark:text-slate-400"
+                : "text-sm text-red-700 dark:text-red-300"
+            }
+          >
+            {blocked}
+          </p>
         </div>
 
         {tokenAsked && (
@@ -211,7 +250,7 @@ export function FirstRunSetup({
 
         <button
           type="submit"
-          disabled={attempt.isPending || mismatch}
+          disabled={attempt.isPending || blocked !== null}
           className={`py-2 ${BUTTON.primary}`}
         >
           Create admin account

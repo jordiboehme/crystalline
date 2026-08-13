@@ -143,11 +143,22 @@ export default function LoginPage() {
           Why this card changed under somebody who was mid-wizard: another
           browser, or a terminal, created the first admin first. The server's
           own sentence says it, and it stays until this tab is done with it.
+
+          The region is mounted for the whole of the first-run flow rather than
+          created with its text, because it is filled in the same commit that
+          swaps the wizard for the login form and moves focus into it: a live
+          region born with its content, next to a focus move, is announced
+          unreliably. An instance that is already set up never enters this flow
+          and gets the card exactly as it was.
         */}
-        {setupClosed && (
+        {(firstRun || setupClosed !== null) && (
           <p
             role="status"
-            className="mt-6 rounded border border-slate-300 bg-slate-100 px-3 py-2 text-sm text-slate-700 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300"
+            className={
+              setupClosed === null
+                ? undefined
+                : "mt-6 rounded border border-slate-300 bg-slate-100 px-3 py-2 text-sm text-slate-700 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300"
+            }
           >
             {setupClosed}
           </p>

@@ -48,6 +48,17 @@ function setupCalls(): unknown[] {
     .map(([, init]) => sentBody(init));
 }
 
+/** How many times the capability probe was read. */
+function probeCount(): number {
+  return apiMock.mock.calls.filter(([path]) => path === "/auth/me").length;
+}
+
+/** What an element points its `aria-describedby` at, if anything. */
+function describedBy(element: HTMLElement): HTMLElement | null {
+  const id = element.getAttribute("aria-describedby");
+  return id === null ? null : document.getElementById(id);
+}
+
 /** Fill the wizard and submit it. */
 async function createAdmin(
   name = "ada",
@@ -96,6 +107,26 @@ describe("an instance with no accounts yet", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("says why the button is dead before the confirmation is filled in", async () => {
+    serve({ "/auth/me": firstRun });
+
+    renderApp("/login");
+    const user = userEvent.setup();
+    await user.type(await screen.findByLabelText("Name"), "ada");
+    await user.type(screen.getByLabelText("Password"), "hunter2");
+
+    // A disabled button suppresses the browser's own "please fill this in"
+    // bubble, so a half-filled form that says nothing is a dead end: the
+    // password manager that filled one field and not the other leaves people
+    // exactly here.
+    expect(
+      screen.getByText("type the password again to confirm it"),
+    ).toBeVisible();
+    expect(
+      screen.getByRole("button", { name: "Create admin account" }),
+    ).toBeDisabled();
+  });
+
   it("catches a mistyped confirmation before the server ever hears about it", async () => {
     serve({ "/auth/me": firstRun });
 
@@ -107,6 +138,14 @@ describe("an instance with no accounts yet", () => {
       screen.getByRole("button", { name: "Create admin account" }),
     ).toBeDisabled();
     expect(setupCalls()).toHaveLength(0);
+
+    // The message announces itself once when it appears; the field has to
+    // carry it too, or somebody who tabs back to it hears nothing at all.
+    const confirm = screen.getByLabelText("Confirm password");
+    expect(confirm).toHaveAttribute("aria-invalid", "true");
+    expect(describedBy(confirm)).toHaveTextContent(
+      "the passwords do not match",
+    );
   });
 
   it("signs the new admin in and lands them in the app", async () => {
@@ -234,5 +273,72 @@ describe("an instance with no accounts yet", () => {
         screen.queryByLabelText("Confirm password"),
       ).not.toBeInTheDocument();
     });
+    // The sentence lands in the live region that was already on the page.
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "this instance already has an account, so first-run setup is closed: log in instead",
+    );
+  });
+
+  it("keeps the live region on the page before it has anything to say", async () => {
+    serve({ "/auth/me": firstRun });
+
+    renderApp("/login");
+
+    // A live region that is created together with its text is announced
+    // unreliably, and the flip that fills this one also moves focus into the
+    // login form. So it waits there, empty, from the first paint.
+    await screen.findByLabelText("Confirm password");
+    expect(screen.getByRole("status")).toHaveTextContent("");
+  });
+
+  it("adds nothing to the login screen of an instance that is set up", async () => {
+    serve({ "/auth/me": () => meResponse() });
+
+    renderApp("/login");
+
+    // The wizard's live region belongs to the wizard's own flow: an instance
+    // that has accounts renders the card it always rendered.
+    expect(await screen.findByRole("button", { name: "Log in" })).toBeVisible();
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+  });
+
+  it("does not re-probe the identity when setup itself is refused", async () => {
+    serve({
+      "/auth/me": firstRun,
+      "/auth/setup": () => {
+        throw new ApiProblem(401, "unauthorized", "this call was not allowed");
+      },
+    });
+
+    renderApp("/login");
+    await createAdmin();
+
+    await screen.findByText("this call was not allowed");
+    // Nobody is signed in yet, so a refusal here is not an expired session:
+    // the recovery re-probe would be asking a question already answered.
+    expect(probeCount()).toBe(1);
+  });
+
+  it("sends one request per submit, whatever the server does with it", async () => {
+    serve({
+      "/auth/me": firstRun,
+      "/auth/setup": () => {
+        throw new ApiProblem(
+          500,
+          "server error",
+          "the store could not be read",
+        );
+      },
+    });
+
+    renderApp("/login");
+    await createAdmin();
+
+    // Creating an account is not a request to repeat on its own: a retrying
+    // pair of mutations would show this message only after four POSTs.
+    expect(
+      await screen.findByText("the store could not be read"),
+    ).toBeVisible();
+    expect(setupCalls()).toHaveLength(1);
   });
 });
