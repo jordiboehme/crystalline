@@ -489,6 +489,15 @@ async fn run_archive(
     overwrite: bool,
     dry_run: bool,
 ) -> Result<ArchiveReport, ApiError> {
+    // Resolve the domain before paying for decompression: `read_archive`
+    // meters up to 32 MiB of decompressed content, and an upload aimed at a
+    // domain that does not exist can never succeed regardless of what is
+    // inside it. Both `preview` and `import` inherit this order from this one
+    // function. It still sits BELOW `identity.require_admin()` and
+    // `refuse_read_only` in both handlers - moving it above them would make a
+    // read-only instance answer 404 where it answers 403, and let an
+    // unauthorized caller learn which domains exist.
+    state.engine.require_domain(domain)?;
     let screened = read_archive(bytes)?;
     let mut slots: Vec<Slot> = Vec::new();
     let mut clean: Vec<(String, String)> = Vec::new();

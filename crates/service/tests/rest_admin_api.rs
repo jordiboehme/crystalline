@@ -1509,3 +1509,189 @@ async fn reserved_names_are_ignored_whatever_their_case() {
         "a nested reserved name creates no folder either"
     );
 }
+
+/// Task 6 (0.13.0 close-out): the domain must be resolved before the upload
+/// is decompressed, so a request that can never succeed does not pay for the
+/// decompression first.
+///
+/// The order-proving case is bytes that are NOT a zip at all, aimed at a
+/// domain that does not exist: today `read_archive` runs first and answers
+/// 422 for the bad bytes without ever looking at the domain, so this exact
+/// case is the red proof of the reorder, not merely a 404 that would also
+/// pass today. A plain leg follows it: a genuinely valid small archive
+/// against the same unregistered domain, which already answers 404 today
+/// (`import_domain_files` resolves the domain on its own path) and must go
+/// on doing so - it is the control that shows the fix changed WHERE the 404
+/// comes from, not whether one arrives at all.
+///
+/// Decision 19: the resolve has to land BELOW `identity.require_admin()` and
+/// `refuse_read_only`, never above them, or a read-only instance starts
+/// answering 404 where it answers 403 and a non-admin caller learns which
+/// domains exist. Both are pinned here by comparing a known domain (`eng`)
+/// against an unknown one (`ghost`): a read-only admin and a non-admin editor
+/// must see the identical 403 for both, never a 404 that would tell them
+/// `ghost` is the one that is missing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn preview_resolves_the_domain_before_it_decompresses() {
+    let fx = serve(Options::default()).await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    let ghost_path = "/api/v1/domains/ghost/archive/preview";
+
+    let resp = post_zip(fx.addr, ghost_path, &admin, b"not a zip".to_vec()).await;
+    assert_eq!(
+        resp.status(),
+        404,
+        "the domain must be resolved before the bytes are ever read as a zip"
+    );
+    let problem: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        problem["detail"].as_str().unwrap().contains("ghost"),
+        "the 404 must name the missing domain: {problem}"
+    );
+
+    let resp = post_zip(fx.addr, ghost_path, &admin, zip_of(&[("a.md", ALPHA)])).await;
+    assert_eq!(
+        resp.status(),
+        404,
+        "a genuinely valid archive against the same unknown domain is still 404"
+    );
+
+    // Decision 19, direction one: read-only refuses before the domain is
+    // looked up, so it answers the same 403 whether the domain exists or not.
+    let ro = serve(Options {
+        read_only: true,
+        ..Options::default()
+    })
+    .await;
+    let ro_admin = login(ro.addr, "root", "rootpw").await;
+    let known = post_zip(
+        ro.addr,
+        "/api/v1/domains/eng/archive/preview",
+        &ro_admin,
+        b"not a zip".to_vec(),
+    )
+    .await;
+    let unknown = post_zip(ro.addr, ghost_path, &ro_admin, b"not a zip".to_vec()).await;
+    assert_eq!(known.status(), 403, "read-only refuses a known domain too");
+    assert_eq!(
+        unknown.status(),
+        403,
+        "read-only must not answer 404 for an unknown domain"
+    );
+    assert_eq!(
+        known.status(),
+        unknown.status(),
+        "read-only must look identical whether the domain exists or not"
+    );
+
+    // Decision 19, direction two: a non-admin is refused before the domain is
+    // looked up, so an editor cannot tell an unknown domain from one they
+    // simply may not touch.
+    let editor = login(fx.addr, "eddy", "eddypw").await;
+    let known = post_zip(
+        fx.addr,
+        "/api/v1/domains/eng/archive/preview",
+        &editor,
+        b"not a zip".to_vec(),
+    )
+    .await;
+    let unknown = post_zip(fx.addr, ghost_path, &editor, b"not a zip".to_vec()).await;
+    assert_eq!(
+        known.status(),
+        403,
+        "a non-admin is refused a known domain too"
+    );
+    assert_eq!(
+        unknown.status(),
+        403,
+        "a non-admin must not learn that an unknown domain does not exist"
+    );
+    assert_eq!(
+        known.status(),
+        unknown.status(),
+        "a non-admin must see the same answer whether the domain exists or not"
+    );
+}
+
+/// The import twin of `preview_resolves_the_domain_before_it_decompresses`;
+/// see that test's doc for the full reasoning. Kept as its own test because
+/// `import` is a distinct handler with its own admin, read-only and policy
+/// checks ahead of the shared `run_archive`, and the order pinned here is
+/// what stops a future edit from hoisting the resolve above them on the
+/// import side while leaving preview alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn import_resolves_the_domain_before_it_decompresses() {
+    let fx = serve(Options::default()).await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    let ghost_path = "/api/v1/domains/ghost/archive/import";
+
+    let resp = post_zip(fx.addr, ghost_path, &admin, b"not a zip".to_vec()).await;
+    assert_eq!(
+        resp.status(),
+        404,
+        "the domain must be resolved before the bytes are ever read as a zip"
+    );
+    let problem: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        problem["detail"].as_str().unwrap().contains("ghost"),
+        "the 404 must name the missing domain: {problem}"
+    );
+
+    let resp = post_zip(fx.addr, ghost_path, &admin, zip_of(&[("a.md", ALPHA)])).await;
+    assert_eq!(
+        resp.status(),
+        404,
+        "a genuinely valid archive against the same unknown domain is still 404"
+    );
+
+    let ro = serve(Options {
+        read_only: true,
+        ..Options::default()
+    })
+    .await;
+    let ro_admin = login(ro.addr, "root", "rootpw").await;
+    let known = post_zip(
+        ro.addr,
+        "/api/v1/domains/eng/archive/import",
+        &ro_admin,
+        b"not a zip".to_vec(),
+    )
+    .await;
+    let unknown = post_zip(ro.addr, ghost_path, &ro_admin, b"not a zip".to_vec()).await;
+    assert_eq!(known.status(), 403, "read-only refuses a known domain too");
+    assert_eq!(
+        unknown.status(),
+        403,
+        "read-only must not answer 404 for an unknown domain"
+    );
+    assert_eq!(
+        known.status(),
+        unknown.status(),
+        "read-only must look identical whether the domain exists or not"
+    );
+
+    let editor = login(fx.addr, "eddy", "eddypw").await;
+    let known = post_zip(
+        fx.addr,
+        "/api/v1/domains/eng/archive/import",
+        &editor,
+        b"not a zip".to_vec(),
+    )
+    .await;
+    let unknown = post_zip(fx.addr, ghost_path, &editor, b"not a zip".to_vec()).await;
+    assert_eq!(
+        known.status(),
+        403,
+        "a non-admin is refused a known domain too"
+    );
+    assert_eq!(
+        unknown.status(),
+        403,
+        "a non-admin must not learn that an unknown domain does not exist"
+    );
+    assert_eq!(
+        known.status(),
+        unknown.status(),
+        "a non-admin must see the same answer whether the domain exists or not"
+    );
+}
