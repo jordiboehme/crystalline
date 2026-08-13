@@ -53,7 +53,8 @@ restart-after-upgrade = true
 default = ["local-embeddings", "postgres", "fluid-ui"]
 local-embeddings = ["crystalline-index/local-embeddings"]
 postgres = ["crystalline-index/postgres"]
-# The embedded Fluid web UI, served by `crystalline serve --http`. Forwarded to
+# The embedded Fluid web UI, which every daemon serves on its HTTP endpoint
+# (on at 127.0.0.1:7411 unless it is turned off). Forwarded to
 # crystalline-service the same way the two above are forwarded to the index, so
 # `--no-default-features` on the workspace drops the bundle from the binary.
 fluid-ui = ["crystalline-service/fluid-ui"]

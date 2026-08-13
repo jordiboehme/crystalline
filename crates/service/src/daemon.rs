@@ -850,7 +850,7 @@ fn bind_is_loopback(addr: &str) -> bool {
 fn setup_token_lines(addr: &str, token: &str) -> [String; 2] {
     [
         format!("first-run setup token (create the first admin at http://{addr}): {token}"),
-        "this line is printed once and never logged again".to_string(),
+        "this token is not shown again; a restart mints a new one".to_string(),
     ]
 }
 
@@ -2133,17 +2133,45 @@ mod tests {
             lines[0],
             "first-run setup token (create the first admin at http://0.0.0.0:7411): a1b2c3d4e5f60718293a4b5c6d7e8f90"
         );
-        assert_eq!(lines[1], "this line is printed once and never logged again");
+        assert_eq!(
+            lines[1],
+            "this token is not shown again; a restart mints a new one"
+        );
         assert!(
             !lines[1].contains("a1b2c3d4e5f60718293a4b5c6d7e8f90"),
             "the caveat line carries no secret of its own"
         );
     }
 
+    /// Every file the setup token lives in, with the name a failure message
+    /// says out loud. `include_str!` resolves against this file, so the two
+    /// `rest` entries are the token's other two homes: `rest/mod.rs` stores it
+    /// (`RestState::setup_token`, `with_setup_token`, `setup_token()`) and
+    /// `rest/auth.rs` is its only reader (`SetupBody::token`,
+    /// `authorize_setup`). Neither writes any output today, which is exactly
+    /// when a guard is worth installing: the gap is vacuous now and would not
+    /// be noticed the day somebody fills it.
+    const TOKEN_BEARING_SOURCES: [(&str, &str); 3] = [
+        ("daemon.rs", include_str!("daemon.rs")),
+        ("rest/mod.rs", include_str!("rest/mod.rs")),
+        ("rest/auth.rs", include_str!("rest/auth.rs")),
+    ];
+
+    /// The output macros none of those three files may spell the token into.
+    /// `eprintln!` is in the list even though the startup banner prints the
+    /// token with it: the banner prints the strings [`setup_token_lines`]
+    /// built, so no output macro anywhere needs the secret's own name, and
+    /// under `--daemon` stderr IS the daemon log file.
+    ///
+    /// `eprintln!` sits ahead of `println!` because it ends in one: a scan for
+    /// the shorter name matches inside the longer one, and this order is what
+    /// makes a failure name the macro that is actually written there.
+    const OUTPUT_CALLS: [&str; 5] = ["tracing::", "log::", "eprintln!", "println!", "dbg!"];
+
     /// Security invariant 3, guarded at the source: the token is named in the
     /// startup output and nowhere else. The startup emission goes through
-    /// [`setup_token_lines`], whose text the test above pins, so a log call that
-    /// spells the variable itself is by definition a second appearance.
+    /// [`setup_token_lines`], whose text the test above pins, so an output call
+    /// that spells the variable itself is by definition a second appearance.
     ///
     /// The scan rejects the bare name `token` as well as `setup_token`, because
     /// the HTTP spawn arm rebinds the secret as `token` before handing it to
@@ -2151,10 +2179,10 @@ mod tests {
     /// that binding: a log line there spelling `{token}` would leak the secret
     /// into the daemon log with every test in the tree still green.
     ///
-    /// Two predicates, unioned, because neither alone covers the ways this file
-    /// actually writes a log call:
+    /// Two predicates, unioned, because neither alone covers the ways these
+    /// files actually write an output call:
     ///
-    /// 1. Per INVOCATION: from `tracing::` to the balanced close of the macro's
+    /// 1. Per INVOCATION: from the macro path to the balanced close of its
     ///    argument list. The warnings in that arm are multi-line (rustfmt keeps
     ///    them that way, the sentences being long), so their format string sits
     ///    on a different line from the `tracing::` that opens the call, and a
@@ -2164,60 +2192,128 @@ mod tests {
     ///    string, so the slice would end after ~78 characters and everything
     ///    after the remedy's semicolon - exactly where a careless edit lands -
     ///    would go unread.
-    /// 2. Per LINE, the predicate this guard shipped with: `tracing::` and
+    /// 2. Per LINE, the predicate this guard shipped with: an output call and
     ///    `token` on one line. Kept so a call the paren walk delimits
     ///    differently, or skips, can never regress out of coverage.
     ///
-    /// Honest about the walk: it counts parentheses without parsing string
-    /// literals, so a literal holding an unmatched `(` or `)` would skew it. The
-    /// literals here balance (`({err})`, `(os error 48)`), and an unbalanced one
-    /// panics with the offending text rather than silently truncating the slice.
-    /// A `tracing::` that is not a macro call (`tracing::Level::INFO`) is skipped
-    /// by predicate 1 and left to predicate 2. A COMMENT that names `tracing::`
-    /// and `token` before the next close paren fails the guard; there are none
-    /// today, and a comment about the token beside a log call is not a shape
-    /// worth defending anyway.
+    /// What the scan deliberately does NOT read is comment-only lines, blanked
+    /// by [`served_source`] before either predicate runs. A comment emits
+    /// nothing at runtime, so flagging one is a false positive - and the
+    /// alternative is worse than a false positive: `rest/auth.rs` carries a doc
+    /// comment that names `tracing::debug!` and the token in one sentence
+    /// precisely to warn the next person off deriving [`Debug`] for
+    /// `SetupBody`, and rewording that warning to please a source scan would
+    /// trade the documentation of the hazard for the check on it. The next test
+    /// pins that trade shut. Blanking keeps the line numbering, so a failure
+    /// still names the right line.
+    ///
+    /// Honest about the rest of it, so nobody mistakes a limit for a hole:
+    ///
+    /// - The paren walk counts parentheses without parsing string literals, so
+    ///   a literal holding an unmatched `(` or `)` would skew it. The literals
+    ///   here balance (`({err})`, `(os error 48)`), and an unbalanced one panics
+    ///   with the offending text rather than silently truncating the slice.
+    /// - A path that is not a macro call (`tracing::Level::INFO`) is skipped by
+    ///   predicate 1 and left to predicate 2.
+    /// - Only comment-ONLY lines are blanked, never a `//` inside a line, which
+    ///   in these files is always a `http://` in a string literal. Block
+    ///   comments are not handled and none of the three files uses one; a
+    ///   stripper for them would be actively dangerous here, since the `*/*`
+    ///   inside daemon.rs's own doc comments would open one and swallow the
+    ///   rest of the file.
+    /// - A source scan cannot see the token under another name: rebind it, move
+    ///   it into a struct field read as `self.secret`, and no text search finds
+    ///   it. That residual is accepted. The guard catches the careless edit,
+    ///   which is the one that actually happens.
     #[test]
     fn the_setup_token_is_never_spelled_into_a_log_call() {
-        // Everything above `#[cfg(test)]`, which is the code that runs in a
-        // daemon; this module's own text is not a log call.
-        let served = include_str!("daemon.rs")
-            .split("#[cfg(test)]")
-            .next()
-            .unwrap();
-        assert_no_logged_token(served);
+        for (file, source) in TOKEN_BEARING_SOURCES {
+            assert_no_logged_token(file, &served_source(source));
+        }
     }
 
-    /// The guard's predicate over the served region's text, split out from the
-    /// test so the same code can be run over a scratch copy of this file when
-    /// the guard's own coverage is being proved.
-    fn assert_no_logged_token(served: &str) {
-        for (at, _) in served.match_indices("tracing::") {
-            let Some(call) = tracing_call(&served[at..]) else {
+    /// The comment above is a load-bearing part of the guard, so this pins both
+    /// halves of it: `rest/auth.rs` still carries a comment naming an output
+    /// call and the token in one breath, and the guard is green with it there.
+    /// Deleting that warning to quiet a scan is the swap this test exists to
+    /// make visible; if it moves or is reworded, point this test at the new
+    /// wording rather than dropping it, because without such a line nothing
+    /// proves the comment blanking works at all.
+    #[test]
+    fn a_comment_naming_a_log_call_and_the_token_is_prose_the_guard_reads_past() {
+        let auth = include_str!("rest/auth.rs");
+        let warning = auth.lines().find(|line| {
+            line.trim_start().starts_with("//")
+                && line.contains("token")
+                && OUTPUT_CALLS.iter().any(|call| line.contains(call))
+        });
+        assert!(
+            warning.is_some(),
+            "rest/auth.rs no longer warns, in a comment, that the token is one output call away \
+             from a log file - that warning is why nobody derives Debug for SetupBody"
+        );
+        assert_no_logged_token("rest/auth.rs", &served_source(auth));
+    }
+
+    /// The part of a source file that runs in a daemon: everything above its
+    /// `#[cfg(test)]` module, with comment-only lines blanked out so the guard
+    /// reads code rather than prose. A file with no test module is taken whole,
+    /// which `split` gives for free; all three have one today. Blanking rather
+    /// than dropping keeps every following line at its own number.
+    fn served_source(source: &str) -> String {
+        source
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap()
+            .lines()
+            .map(|line| {
+                if line.trim_start().starts_with("//") {
+                    ""
+                } else {
+                    line
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The guard's predicate over one file's served region, split out from the
+    /// test so the same code can be run over a scratch copy of any of the three
+    /// files when the guard's own coverage is being proved. `file` is carried
+    /// rather than hardcoded because "daemon.rs:403" says nothing useful when
+    /// the hit is in `rest/auth.rs`.
+    fn assert_no_logged_token(file: &str, served: &str) {
+        for macro_path in OUTPUT_CALLS {
+            for (at, _) in served.match_indices(macro_path) {
+                let Some(call) = output_call(&served[at..]) else {
+                    continue;
+                };
+                assert!(
+                    !call.contains("token"),
+                    "{file}:{} logs the setup token: {}",
+                    served[..at].lines().count(),
+                    call.split_whitespace().collect::<Vec<_>>().join(" ")
+                );
+            }
+        }
+        for (n, line) in served.lines().enumerate() {
+            let Some(macro_path) = OUTPUT_CALLS.iter().find(|call| line.contains(**call)) else {
                 continue;
             };
             assert!(
-                !call.contains("token"),
-                "daemon.rs:{} logs the setup token: {}",
-                served[..at].lines().count(),
-                call.split_whitespace().collect::<Vec<_>>().join(" ")
-            );
-        }
-        for (n, line) in served.lines().enumerate() {
-            assert!(
-                !(line.contains("tracing::") && line.contains("token")),
-                "daemon.rs:{} logs the setup token: {}",
+                !line.contains("token"),
+                "{file}:{} logs the setup token through {macro_path}: {}",
                 n + 1,
                 line.trim()
             );
         }
     }
 
-    /// The text of the `tracing::` macro invocation that starts at `rest[0]`,
-    /// from the macro name through the balanced close of its argument list.
-    /// `None` when this `tracing::` opens no argument list at all, which is a
-    /// path (`tracing::Level::INFO`) rather than a call.
-    fn tracing_call(rest: &str) -> Option<&str> {
+    /// The text of the output macro invocation that starts at `rest[0]`, from
+    /// the macro name through the balanced close of its argument list. `None`
+    /// when it opens no argument list at all, which is a path
+    /// (`tracing::Level::INFO`) rather than a call.
+    fn output_call(rest: &str) -> Option<&str> {
         let open = rest.find('(')?;
         if !rest[..open].trim_end().ends_with('!') {
             return None;
@@ -2236,7 +2332,7 @@ mod tests {
             }
         }
         panic!(
-            "a tracing call's parentheses never balance, so this guard cannot read it: {}",
+            "an output call's parentheses never balance, so this guard cannot read it: {}",
             &rest[..rest.len().min(200)]
         );
     }

@@ -18,7 +18,8 @@ path = "src/lib.rs"
 default = ["local-embeddings", "postgres", "fluid-ui"]
 local-embeddings = ["crystalline-index/local-embeddings"]
 postgres = ["crystalline-index/postgres"]
-# The Fluid web bundle, compiled into the binary and served by `serve --http`.
+# The Fluid web bundle, compiled into the binary and served by every daemon on
+# its HTTP endpoint (on at 127.0.0.1:7411 unless it is turned off).
 # On by default so a plain `cargo build` produces the same code paths a release
 # ships; a packager who wants a lean binary drops it with
 # `--no-default-features`. The build script stages `fluid/dist` into `$OUT_DIR`

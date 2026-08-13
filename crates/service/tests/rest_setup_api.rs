@@ -698,10 +698,19 @@ async fn setup_serves_problem_json_like_the_rest() {
 }
 
 // The two below drive the router `serve` actually builds, rather than a state
-// this file assembled: they are the wiring tests. Everything above them would
-// stay green if `run_http` served a router with no peer address in it and no
-// token threaded through, which is exactly the outage this endpoint would have
-// shipped with.
+// this file assembled: they are the wiring tests, and they close the TOKEN half
+// of the wiring. Everything above them would stay green if `http_router` took
+// the token and dropped it on the floor.
+//
+// The other half, `run_http` serving with `into_make_service_with_connect_info`
+// so a peer address is in the extensions at all, is pinned by NO Rust test in
+// this tree: `run_http` is private to the daemon, and every harness that serves
+// a router - this file's `spawn` included - spells the connect-info form for
+// itself, so deleting it from `run_http` breaks nothing here. What catches that
+// is `fluid/e2e/run-smoke.sh` (the setup block around :252), which starts a real
+// `serve --http` and asserts a tokenless loopback POST answers 200: with the
+// connect info gone the handler sees no peer, fails closed, and the smoke
+// reports a 403 where it demanded a 200.
 
 /// End to end through the production constructor: a browser on the machine that
 /// serves the daemon creates the first admin with no token at all, because the
