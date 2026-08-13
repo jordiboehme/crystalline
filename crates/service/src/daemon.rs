@@ -261,6 +261,7 @@ pub async fn run_serve(
         );
         if let Some(addr) = &http_addr {
             eprintln!("crystalline HTTP endpoint on http://{addr}");
+            eprintln!("{}", ui_startup_line(&loaded.effective, addr));
         }
         if read_only {
             eprintln!("crystalline serving read-only: content-mutating tools are disabled");
@@ -720,19 +721,161 @@ async fn run_http(
     Ok(())
 }
 
-/// Build the router `serve --http` mounts: the tool router behind rmcp's
-/// streamable-HTTP service, plus the `/health` probe and the JSON API nested
-/// at `/api/v1`. Both routes are declared ahead of the fallback service, so
-/// the MCP transport only ever sees paths the API does not claim. Public and
-/// doc-commented on purpose (not `pub(crate)`) so an integration test can
-/// drive the exact production construction over a real `TcpListener` instead
-/// of reimplementing it; `run_http` is the only other caller.
+/// The MCP streamable-HTTP service, which is what every request the rest of
+/// the router does not claim is answered by.
+type McpService = rmcp::transport::streamable_http_server::tower::StreamableHttpService<
+    McpServer,
+    rmcp::transport::streamable_http_server::session::local::LocalSessionManager,
+>;
+
+/// Build the router `serve --http` mounts. Three citizens share the one port,
+/// in this precedence:
+///
+/// 1. The declared routes: the `/health` probe, the JSON API nested at
+///    `/api/v1` (when `service.api` is on) and, when `service.ui` is on, the
+///    web UI's own `/` and `/assets/{*path}`. All of them are declared ahead of
+///    the fallback, so nothing below can shadow them: a monitor asking for
+///    `/health` with a browser's `Accept` gets JSON, and the API nest carries
+///    its own 404, so an unknown API path is an API error rather than the app
+///    shell.
+/// 2. The embedded bundle, from the fallback: a root-level file matched
+///    exactly, then a GET or HEAD that accepts `text/html` answered with the
+///    app shell (the SPA's own router owns the 404 experience).
+/// 3. The MCP streamable-HTTP transport, which sees every request the two above
+///    did not claim - which is every request it saw before this UI existed.
+///    MCP traffic is POST, DELETE, or a GET asking for `text/event-stream`, and
+///    none of those is a navigation, so rung 2 cannot capture one. That is also
+///    why the transport keeps the fallback rather than moving to a named route:
+///    a client pointed at any path on this endpoint keeps working.
+///
+/// With the UI off (`service.ui=false`, `service.api=false`, or a binary built
+/// without the `fluid-ui` feature) the fallback is the transport alone, exactly
+/// as it was before the UI existed.
+///
+/// There is no CORS layer here and there must never be one (`tests/no_cors.rs`
+/// fails the build over it): `GET /api/v1/auth/me` hands the caller their CSRF
+/// token, which is safe only because no other origin can read the answer. The
+/// UI adds no CORS surface at all - it is served from the same origin as the
+/// API it calls, by construction, which is precisely the deployment the auth
+/// settlement was designed around.
+///
+/// Public and doc-commented on purpose (not `pub(crate)`) so an integration
+/// test can drive the exact production construction over a real `TcpListener`
+/// instead of reimplementing it; `run_http` is the only other caller.
 pub fn http_router(
     engine: Arc<Engine>,
     http_sessions: Arc<AtomicUsize>,
     allowed_hosts: &[String],
     auth: Arc<crate::rest::AuthStore>,
 ) -> anyhow::Result<axum::Router> {
+    #[cfg(feature = "fluid-ui")]
+    {
+        http_router_with_assets::<crate::ui::FluidAssets>(
+            engine,
+            http_sessions,
+            allowed_hosts,
+            auth,
+        )
+    }
+    #[cfg(not(feature = "fluid-ui"))]
+    {
+        // No embed exists to serve, so the router is its pre-UI self: the
+        // declared routes and the transport behind them.
+        let api = engine.config().api_enabled();
+        let (router, service) = http_base(engine, http_sessions, allowed_hosts, auth, api)?;
+        Ok(router.fallback_service(service))
+    }
+}
+
+/// [`http_router`], told which embed to serve. The production call passes
+/// [`crate::ui::FluidAssets`]; the integration suite passes a committed fixture
+/// bundle, so the whole dispatch is driven on a machine that has never run a
+/// node toolchain.
+#[cfg(feature = "fluid-ui")]
+pub fn http_router_with_assets<E: rust_embed::RustEmbed + 'static>(
+    engine: Arc<Engine>,
+    http_sessions: Arc<AtomicUsize>,
+    allowed_hosts: &[String],
+    auth: Arc<crate::rest::AuthStore>,
+) -> anyhow::Result<axum::Router> {
+    // One snapshot for both keys: they are read once when the HTTP surface
+    // starts, like `service.read_only` and the `auth.*` keys, and `ui_enabled`
+    // already carries the coupling (`service.api=false` turns the UI off with
+    // it, since a shell whose data routes are gone can only render a login
+    // error).
+    let config = engine.config();
+    let (api, ui) = (config.api_enabled(), config.ui_enabled());
+    let (router, service) = http_base(engine, http_sessions, allowed_hosts, auth, api)?;
+    if !ui {
+        return Ok(router.fallback_service(service));
+    }
+    // The UI is mounted whether or not a bundle was embedded: with an empty
+    // embed every navigation gets the 503 not-built page rather than falling
+    // through to a transport error nobody can read (design decision 3).
+    //
+    // Every one of the three mounts is the transport with a rule layered in
+    // front of it, and that shape is load bearing twice over. First, each hands
+    // the methods it does not serve straight on: `/` is the path an MCP client
+    // points at by default and its calls are POSTs, so a plain `get(...)` at the
+    // root would answer every default-configured agent 405 the moment the UI
+    // mounted. Second, `any_service` is the one constructor that does not append
+    // an `Allow` header to what it falls back to, so an MCP response out of
+    // these paths is byte for byte the response the same request got before the
+    // UI existed - a `get(...).fallback_service(...)` pair would decorate every
+    // MCP answer at `/` with `Allow: GET,HEAD`.
+    Ok(router
+        .route(
+            "/",
+            axum::routing::any_service(service.clone())
+                .layer(axum::middleware::from_fn(serve_index::<E>)),
+        )
+        .route(
+            "/assets/{*path}",
+            axum::routing::any_service(service.clone())
+                .layer(axum::middleware::from_fn(serve_asset::<E>)),
+        )
+        .fallback_service(
+            axum::routing::any_service(service).layer(axum::middleware::from_fn(dispatch_ui::<E>)),
+        ))
+}
+
+/// Whether this request is one a browser fetches a document or an asset with,
+/// which is the only kind the UI answers: decision 4 calls every other method
+/// MCP-shaped, and an MCP client is free to point at any path on this endpoint.
+#[cfg(feature = "fluid-ui")]
+fn is_fetch(request: &axum::extract::Request) -> bool {
+    request.method() == axum::http::Method::GET || request.method() == axum::http::Method::HEAD
+}
+
+/// The request path as an embed key: no leading slash, and undecoded, because
+/// a bundle's names are the ASCII ones a bundler emits. The `ui` functions
+/// refuse a key that keeps its slash rather than trimming one, so this is the
+/// one place the conversion happens.
+#[cfg(feature = "fluid-ui")]
+fn embed_key(request: &axum::extract::Request) -> &str {
+    let path = request.uri().path();
+    path.strip_prefix('/').unwrap_or(path)
+}
+
+/// The `If-None-Match` a request carries, if any.
+#[cfg(feature = "fluid-ui")]
+fn if_none_match(request: &axum::extract::Request) -> Option<&str> {
+    request
+        .headers()
+        .get(axum::http::header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+}
+
+/// The part of the router that is the same whatever the UI does: the `/health`
+/// probe, the JSON API nested at `/api/v1` when `api` is on, and the MCP
+/// service the caller mounts as (or behind) the fallback.
+fn http_base(
+    engine: Arc<Engine>,
+    http_sessions: Arc<AtomicUsize>,
+    allowed_hosts: &[String],
+    auth: Arc<crate::rest::AuthStore>,
+    api: bool,
+) -> anyhow::Result<(axum::Router, McpService)> {
     use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
     use rmcp::transport::streamable_http_server::tower::StreamableHttpService;
 
@@ -743,7 +886,18 @@ pub fn http_router(
     let mut session_manager = LocalSessionManager::default();
     session_manager.session_config.sse_retry = None;
     let session_manager = Arc::new(session_manager);
-    let rest = crate::rest::router(crate::rest::RestState::new(engine.clone(), auth)?);
+    // The REST state is built only when the API is served. It is not free (it
+    // resolves paths and can fail), and building it to then leave it unmounted
+    // would mean `service.api=false` could still fail a start over a surface
+    // that daemon is deliberately not offering.
+    let rest = if api {
+        Some(crate::rest::router(crate::rest::RestState::new(
+            engine.clone(),
+            auth,
+        )?))
+    } else {
+        None
+    };
     let service = StreamableHttpService::new(
         move || {
             http_sessions.fetch_add(1, Ordering::Relaxed);
@@ -752,10 +906,104 @@ pub fn http_router(
         session_manager,
         http_config(allowed_hosts),
     );
-    Ok(axum::Router::new()
-        .route("/health", axum::routing::get(health))
-        .nest("/api/v1", rest)
-        .fallback_service(service))
+    let mut router = axum::Router::new().route("/health", axum::routing::get(health));
+    if let Some(rest) = rest {
+        router = router.nest("/api/v1", rest);
+    }
+    Ok((router, service))
+}
+
+/// `/`: the app shell for a browser, the not-built page when nothing was
+/// embedded, and the transport for every other method - the root is where an
+/// MCP client points by default.
+///
+/// The shell answers here whatever the request accepts, which is what makes
+/// `curl http://host:7411/` show the UI rather than a transport error; the
+/// Accept rule below applies to the app's other routes alone.
+#[cfg(feature = "fluid-ui")]
+async fn serve_index<E: rust_embed::RustEmbed>(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if !is_fetch(&request) {
+        return next.run(request).await;
+    }
+    crate::ui::index_response::<E>()
+}
+
+/// `/assets/{*path}`: one content-hashed chunk, held for a year, and a plain
+/// 404 for a name nothing stands behind - never the app shell, whatever the
+/// request accepts.
+#[cfg(feature = "fluid-ui")]
+async fn serve_asset<E: rust_embed::RustEmbed>(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if !is_fetch(&request) {
+        return next.run(request).await;
+    }
+    crate::ui::asset_response::<E>(embed_key(&request), if_none_match(&request))
+}
+
+/// The dispatching fallback: the two path-independent bundle rungs in front of
+/// the MCP transport, which `next` runs whenever neither claims the request.
+///
+/// A layer rather than a handler that holds the transport, because that is what
+/// keeps the transport's own call path byte for byte what it was: a request the
+/// UI does not answer is handed on unmodified, and this crate needs no service
+/// plumbing of its own to do it.
+#[cfg(feature = "fluid-ui")]
+async fn dispatch_ui<E: rust_embed::RustEmbed>(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    // The exact-match rung. `exact_response` answers `None` for any key
+    // carrying a slash, so a multi-segment app route (the common case) costs a
+    // string scan and no lookup, and a hashed chunk can never be served from
+    // here under the wrong cache policy.
+    if is_fetch(&request)
+        && let Some(response) = crate::ui::exact_response::<E>(embed_key(&request))
+    {
+        return response;
+    }
+    let accept = request
+        .headers()
+        .get(axum::http::header::ACCEPT)
+        .and_then(|value| value.to_str().ok());
+    if crate::ui::wants_spa(request.method(), accept) {
+        return crate::ui::index_response::<E>();
+    }
+    next.run(request).await
+}
+
+/// The one line a foreground start prints about the web UI, beside the HTTP
+/// endpoint's own line. Every state is named out loud: a UI that is off because
+/// of a config key, off because the API it needs is off, or missing because
+/// this binary was built without a bundle, is a state an operator otherwise
+/// discovers from a browser rather than from the daemon.
+fn ui_startup_line(config: &GlobalConfig, addr: &str) -> String {
+    if !config.api_enabled() {
+        return "web UI off (service.api=false)".to_string();
+    }
+    if !config.ui_enabled() {
+        return "web UI off (service.ui=false)".to_string();
+    }
+    #[cfg(feature = "fluid-ui")]
+    {
+        if crate::ui::ui_available::<crate::ui::FluidAssets>() {
+            return format!("crystalline web UI at http://{addr}");
+        }
+        // A dev build whose `fluid/dist` was never built, or was built after
+        // the last compile of this crate: see the note in `build.rs`.
+        "web UI not built into this binary".to_string()
+    }
+    #[cfg(not(feature = "fluid-ui"))]
+    {
+        // Built without the `fluid-ui` feature, so there is no bundle at all
+        // and nothing to point an address at.
+        let _ = addr;
+        "web UI not built into this binary".to_string()
+    }
 }
 
 /// Liveness probe for load balancers and uptime monitors: a static payload
@@ -1227,6 +1475,66 @@ mod tests {
     fn resolve_http_none_without_flag_or_config() {
         let config = GlobalConfig::default();
         assert_eq!(resolve_http(None, &config), None);
+    }
+
+    /// A config carrying the two HTTP-surface toggles.
+    fn config_with_ui(ui: Option<bool>, api: Option<bool>) -> GlobalConfig {
+        GlobalConfig {
+            service: Some(crystalline_core::config::ServiceConfig {
+                ui,
+                api,
+                ..Default::default()
+            }),
+            ..GlobalConfig::default()
+        }
+    }
+
+    // The startup line is how an operator learns which of the four states this
+    // daemon is in without opening a browser: serving, off by its own key, off
+    // because the API it needs is off, or built without a bundle. Each is
+    // reported for the reason that actually applies, so the line names the key
+    // to change.
+
+    #[test]
+    fn the_ui_startup_line_names_the_key_that_turned_it_off() {
+        assert_eq!(
+            ui_startup_line(&config_with_ui(Some(false), None), "127.0.0.1:7411"),
+            "web UI off (service.ui=false)"
+        );
+        assert_eq!(
+            ui_startup_line(&config_with_ui(None, Some(false)), "127.0.0.1:7411"),
+            "web UI off (service.api=false)",
+            "the API is the reason here, not the UI key: reporting service.ui \
+             would send the operator to flip a key that is already on"
+        );
+        assert_eq!(
+            ui_startup_line(&config_with_ui(Some(true), Some(false)), "127.0.0.1:7411"),
+            "web UI off (service.api=false)",
+            "even with the UI asked for explicitly, since a shell without its \
+             API can only render a login error"
+        );
+    }
+
+    #[test]
+    fn the_ui_startup_line_points_at_the_address_when_a_bundle_is_served() {
+        let line = ui_startup_line(&config_with_ui(None, None), "0.0.0.0:7411");
+        #[cfg(feature = "fluid-ui")]
+        {
+            let expected = if crate::ui::ui_available::<crate::ui::FluidAssets>() {
+                "crystalline web UI at http://0.0.0.0:7411"
+            } else {
+                // A tree whose `fluid/dist` was never built: the embed is
+                // empty and the line says so rather than pointing a browser at
+                // a 503.
+                "web UI not built into this binary"
+            };
+            assert_eq!(line, expected);
+        }
+        #[cfg(not(feature = "fluid-ui"))]
+        assert_eq!(
+            line, "web UI not built into this binary",
+            "a binary built without the feature carries no bundle at all"
+        );
     }
 
     fn config_with_allowed_hosts(hosts: Vec<String>) -> GlobalConfig {
