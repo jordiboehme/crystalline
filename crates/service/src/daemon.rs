@@ -4,11 +4,13 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use argon2::password_hash::rand_core::{OsRng, RngCore};
 use crystalline_core::config::{self, GlobalConfig, HttpSetting};
 use crystalline_index::{HostClaim, Store};
 use interprocess::local_socket::tokio::Stream as IpcStream;
@@ -158,6 +160,12 @@ pub async fn run_serve(
     let db_path = resolve_db(db.as_deref())?;
     let http_addr = resolve_http(http_flag.as_deref(), &loaded.effective);
     let allowed_hosts = resolve_allowed_hosts(&allowed_host_flag, &loaded.effective);
+    // The one-time first-run setup token, drawn once per serve process and only
+    // for a bind other machines can reach: on loopback the wizard is authorized
+    // by the peer address itself, so there is nothing to hand out and nothing to
+    // leak. See [`setup_token_for`] and the startup print below - the token is
+    // said once and never written anywhere again.
+    let setup_token = http_addr.as_deref().and_then(setup_token_for);
 
     // An env-defined domain that shadows a config file entry is worth one
     // startup warning (not one per `apply`, which runs constantly): the file
@@ -262,6 +270,11 @@ pub async fn run_serve(
         if let Some(addr) = &http_addr {
             eprintln!("crystalline HTTP endpoint on http://{addr}");
             eprintln!("{}", ui_startup_line(&loaded.effective, addr));
+            if let Some(token) = &setup_token {
+                for line in setup_token_lines(addr, token) {
+                    eprintln!("{line}");
+                }
+            }
         }
         if read_only {
             eprintln!("crystalline serving read-only: content-mutating tools are disabled");
@@ -270,6 +283,14 @@ pub async fn run_serve(
             eprintln!(
                 "no domains registered yet - agents can create one with add_domain, or run: crystalline domain add <name> <path>"
             );
+        }
+    } else if let (Some(addr), Some(token)) = (&http_addr, &setup_token) {
+        // Daemonized, so there is no terminal reading the banner: the same two
+        // lines go to the daemon log instead, once. Without them a backgrounded
+        // non-loopback serve would offer a first-run wizard nobody can get
+        // through and no way to find out why.
+        for line in setup_token_lines(addr, token) {
+            tracing::info!("{line}");
         }
     }
 
@@ -372,8 +393,9 @@ pub async fn run_serve(
         let e = engine.clone();
         let sessions = http_sessions.clone();
         let rx = shared.watch();
+        let token = setup_token.clone();
         tokio::spawn(async move {
-            if let Err(err) = run_http(addr, allowed_hosts, e, sessions, rx).await {
+            if let Err(err) = run_http(addr, allowed_hosts, e, sessions, token, rx).await {
                 tracing::warn!("HTTP endpoint stopped: {err}");
             }
         });
@@ -702,23 +724,88 @@ async fn run_watcher(
 
 /// Serve the tool router over streamable HTTP until shutdown. `allowed_hosts`
 /// carries the resolved `Host` header allow-list on top of loopback (a single
-/// `*` disables the guard); see [`http_config`].
+/// `*` disables the guard); see [`http_config`]. `setup_token` is this process's
+/// first-run token, if it drew one ([`setup_token_for`]).
+///
+/// The service is built with `into_make_service_with_connect_info`, which is the
+/// only thing that puts the client's socket address in each request's
+/// extensions. First-run setup reads it there to decide whether the caller is on
+/// this machine, and fails closed without it, so serving the plain router would
+/// silently make the wizard unreachable everywhere.
 async fn run_http(
     addr: String,
     allowed_hosts: Vec<String>,
     engine: Arc<Engine>,
     http_sessions: Arc<AtomicUsize>,
+    setup_token: Option<String>,
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let auth = Arc::new(
         crate::rest::AuthStore::open(&crystalline_core::config::web_auth_db_path()?).await?,
     );
-    let router = http_router(engine, http_sessions, &allowed_hosts, auth)?;
+    let router = http_router(engine, http_sessions, &allowed_hosts, auth, setup_token)?;
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, router)
-        .with_graceful_shutdown(async move { wait_true(&mut shutdown).await })
-        .await?;
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move { wait_true(&mut shutdown).await })
+    .await?;
     Ok(())
+}
+
+/// The first-run setup token for a resolved bind address: `None` when only this
+/// machine can reach it, `Some` 32 lower-case hex characters otherwise.
+///
+/// A loopback bind needs no token at all - the setup handler authorizes a
+/// loopback peer directly - so generating one there would be a secret with
+/// nothing to protect and one more thing to print. Any other bind is reachable
+/// by somebody else, and the token is what stands between them and the first
+/// admin account.
+///
+/// The host half is read out of `host:port` (brackets stripped for an IPv6
+/// literal). An address that is not an IP literal is loopback only when it is
+/// literally `localhost`: a name this daemon cannot resolve to a loopback
+/// interface is treated as reachable, because a token nobody needs is harmless
+/// (a local peer is never asked for one) while a missing token on a reachable
+/// bind locks the wizard shut.
+///
+/// 32 hex characters is 128 bits from the same `OsRng` the session tokens are
+/// drawn from - a one-shot secret a human retypes off a terminal, not a stored
+/// credential.
+fn setup_token_for(addr: &str) -> Option<String> {
+    if bind_is_loopback(addr) {
+        return None;
+    }
+    let mut bytes = [0u8; 16];
+    OsRng.fill_bytes(&mut bytes);
+    Some(crystalline_index::hex_lower(&bytes))
+}
+
+/// Whether a bind address can only be reached from this machine.
+fn bind_is_loopback(addr: &str) -> bool {
+    if let Ok(socket) = addr.parse::<SocketAddr>() {
+        return socket.ip().is_loopback();
+    }
+    let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr);
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    match host.parse::<IpAddr>() {
+        Ok(ip) => ip.is_loopback(),
+        Err(_) => host.eq_ignore_ascii_case("localhost"),
+    }
+}
+
+/// The two lines a serve process says about its setup token, in the order it
+/// says them. Built here rather than inlined so the exact wording is testable
+/// and so the foreground banner and the daemon log cannot drift apart.
+fn setup_token_lines(addr: &str, token: &str) -> [String; 2] {
+    [
+        format!("first-run setup token (create the first admin at http://{addr}): {token}"),
+        "this line is printed once and never logged again".to_string(),
+    ]
 }
 
 /// The MCP streamable-HTTP service, which is what every request the rest of
@@ -771,6 +858,7 @@ pub fn http_router(
     http_sessions: Arc<AtomicUsize>,
     allowed_hosts: &[String],
     auth: Arc<crate::rest::AuthStore>,
+    setup_token: Option<String>,
 ) -> anyhow::Result<axum::Router> {
     #[cfg(feature = "fluid-ui")]
     {
@@ -779,6 +867,7 @@ pub fn http_router(
             http_sessions,
             allowed_hosts,
             auth,
+            setup_token,
         )
     }
     #[cfg(not(feature = "fluid-ui"))]
@@ -786,7 +875,8 @@ pub fn http_router(
         // No embed exists to serve, so the router is its pre-UI self: the
         // declared routes and the transport behind them.
         let api = engine.config().api_enabled();
-        let (router, service) = http_base(engine, http_sessions, allowed_hosts, auth, api)?;
+        let (router, service) =
+            http_base(engine, http_sessions, allowed_hosts, auth, api, setup_token)?;
         Ok(router.fallback_service(service))
     }
 }
@@ -801,6 +891,7 @@ pub fn http_router_with_assets<E: rust_embed::RustEmbed + 'static>(
     http_sessions: Arc<AtomicUsize>,
     allowed_hosts: &[String],
     auth: Arc<crate::rest::AuthStore>,
+    setup_token: Option<String>,
 ) -> anyhow::Result<axum::Router> {
     // One snapshot for both keys: they are read once when the HTTP surface
     // starts, like `service.read_only` and the `auth.*` keys, and `ui_enabled`
@@ -809,7 +900,8 @@ pub fn http_router_with_assets<E: rust_embed::RustEmbed + 'static>(
     // error).
     let config = engine.config();
     let (api, ui) = (config.api_enabled(), config.ui_enabled());
-    let (router, service) = http_base(engine, http_sessions, allowed_hosts, auth, api)?;
+    let (router, service) =
+        http_base(engine, http_sessions, allowed_hosts, auth, api, setup_token)?;
     if !ui {
         return Ok(router.fallback_service(service));
     }
@@ -890,13 +982,16 @@ fn if_none_match(request: &axum::extract::Request) -> Option<&str> {
 
 /// The part of the router that is the same whatever the UI does: the `/health`
 /// probe, the JSON API nested at `/api/v1` when `api` is on, and the MCP
-/// service the caller mounts as (or behind) the fallback.
+/// service the caller mounts as (or behind) the fallback. `setup_token` is this
+/// process's first-run token, handed to the REST state that answers the setup
+/// route; `None` closes the token path, which is what a loopback bind wants.
 fn http_base(
     engine: Arc<Engine>,
     http_sessions: Arc<AtomicUsize>,
     allowed_hosts: &[String],
     auth: Arc<crate::rest::AuthStore>,
     api: bool,
+    setup_token: Option<String>,
 ) -> anyhow::Result<(axum::Router, McpService)> {
     use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
     use rmcp::transport::streamable_http_server::tower::StreamableHttpService;
@@ -913,10 +1008,9 @@ fn http_base(
     // would mean `service.api=false` could still fail a start over a surface
     // that daemon is deliberately not offering.
     let rest = if api {
-        Some(crate::rest::router(crate::rest::RestState::new(
-            engine.clone(),
-            auth,
-        )?))
+        Some(crate::rest::router(
+            crate::rest::RestState::new(engine.clone(), auth)?.with_setup_token(setup_token),
+        ))
     } else {
         None
     };
@@ -1881,5 +1975,86 @@ mod tests {
             classify_in_root(&root.join("runbooks/index.md"), root),
             DirtyKind::Ignore
         ));
+    }
+
+    // The one-time setup token exists for exactly one reason: on a bind other
+    // machines can reach there is no loopback peer to trust, so the wizard needs
+    // a secret the operator reads off the startup output. A bind only this
+    // machine can reach protects nothing by having one, so it gets none.
+
+    #[test]
+    fn setup_token_only_for_non_loopback_binds() {
+        for addr in [
+            "127.0.0.1:7411",
+            "127.0.0.1:0",
+            "127.7.7.7:7411",
+            "[::1]:7411",
+            "localhost:7411",
+        ] {
+            assert_eq!(
+                setup_token_for(addr),
+                None,
+                "{addr} can only be reached from this machine"
+            );
+        }
+        // A host name that is not the literal `localhost` is treated as
+        // reachable: the token is additive (a loopback peer never needs it), so
+        // the unknown case fails towards having one.
+        for addr in [
+            "0.0.0.0:7411",
+            "192.168.1.5:7411",
+            "[::]:7411",
+            "[2001:db8::1]:7411",
+            "fluid.example:7411",
+        ] {
+            let token = setup_token_for(addr)
+                .unwrap_or_else(|| panic!("{addr} is reachable from elsewhere and needs a token"));
+            assert_eq!(token.len(), 32, "32 hex characters: {token}");
+            assert!(
+                token.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')),
+                "lower-case hex, nothing a terminal font can confuse: {token}"
+            );
+        }
+        assert_ne!(
+            setup_token_for("0.0.0.0:7411"),
+            setup_token_for("0.0.0.0:7411"),
+            "drawn fresh every time, so one serve process's token is its own"
+        );
+    }
+
+    #[test]
+    fn the_setup_token_lines_name_the_address_and_say_it_is_said_once() {
+        let lines = setup_token_lines("0.0.0.0:7411", "a1b2c3d4e5f60718293a4b5c6d7e8f90");
+        assert_eq!(
+            lines[0],
+            "first-run setup token (create the first admin at http://0.0.0.0:7411): a1b2c3d4e5f60718293a4b5c6d7e8f90"
+        );
+        assert_eq!(lines[1], "this line is printed once and never logged again");
+        assert!(
+            !lines[1].contains("a1b2c3d4e5f60718293a4b5c6d7e8f90"),
+            "the caveat line carries no secret of its own"
+        );
+    }
+
+    /// Security invariant 3, guarded at the source: the token is named in the
+    /// startup output and nowhere else. The startup emission goes through
+    /// [`setup_token_lines`], whose text the test above pins, so a log call that
+    /// spells the variable itself is by definition a second appearance.
+    #[test]
+    fn the_setup_token_is_never_spelled_into_a_log_call() {
+        // Everything above `#[cfg(test)]`, which is the code that runs in a
+        // daemon; this module's own text is not a log call.
+        let served = include_str!("daemon.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        for (n, line) in served.lines().enumerate() {
+            assert!(
+                !(line.contains("tracing::") && line.contains("setup_token")),
+                "daemon.rs:{} logs the setup token: {}",
+                n + 1,
+                line.trim()
+            );
+        }
     }
 }

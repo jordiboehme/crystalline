@@ -185,13 +185,21 @@ const FIXTURE_ENGRAMS: [FixtureEngram; 3] = [
 /// Bind `http_router` on an ephemeral loopback port and serve it on a
 /// background task for the duration of the test.
 fn serve_test_router(engine: Arc<Engine>, auth: Arc<AuthStore>) -> std::net::SocketAddr {
-    let router = http_router(engine, Arc::new(AtomicUsize::new(0)), &[], auth).unwrap();
+    let router = http_router(engine, Arc::new(AtomicUsize::new(0)), &[], auth, None).unwrap();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         let listener = tokio::net::TcpListener::from_std(listener).unwrap();
-        axum::serve(listener, router).await.unwrap();
+        // Served the way `run_http` serves it, connect info included: the peer
+        // address the first-run setup route reads lives in the extensions this
+        // adds, and a plain router would leave it missing.
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
     addr
 }

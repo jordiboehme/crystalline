@@ -64,14 +64,22 @@ async fn spawn_router() -> std::net::SocketAddr {
             .await
             .unwrap(),
     );
-    let router = http_router(engine, Arc::new(AtomicUsize::new(0)), &[], auth).unwrap();
+    let router = http_router(engine, Arc::new(AtomicUsize::new(0)), &[], auth, None).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         // Leak the temp dir's engine/store for the server's lifetime; the test
         // process exits at the end of the test function anyway.
         let _tmp = _tmp;
-        axum::serve(listener, router).await.unwrap();
+        // Served the way `run_http` serves it, connect info included: the peer
+        // address the first-run setup route reads lives in the extensions this
+        // adds, and a plain router would leave it missing.
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
     addr
 }

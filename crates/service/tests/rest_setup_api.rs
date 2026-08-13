@@ -14,10 +14,12 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 
 use crystalline_core::config::{AuthConfig, GlobalConfig, ResponseFormat, ServiceConfig};
 use crystalline_index::TursoStore;
 use crystalline_service::Engine;
+use crystalline_service::daemon::http_router;
 use crystalline_service::rest::{AuthStore, RestState, Role, router};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
@@ -48,11 +50,12 @@ struct Fixture {
     _tmp: tempfile::TempDir,
 }
 
-/// Serve the REST router over an empty engine and an empty auth database.
+/// An account-less instance: the engine and the auth database both fixtures
+/// below are built on.
 ///
 /// No domain is registered: nothing here reads content, and the one ordinary
 /// write these tests re-assert against (`POST /users`) needs none.
-async fn serve(opts: Options) -> Fixture {
+async fn instance(opts: &Options) -> (Arc<Engine>, Arc<AuthStore>, tempfile::TempDir) {
     let tmp = tempfile::tempdir().unwrap();
     let cfg = GlobalConfig {
         auth: Some(AuthConfig {
@@ -78,10 +81,52 @@ async fn serve(opts: Options) -> Fixture {
             .await
             .unwrap(),
     );
+    (engine, auth, tmp)
+}
+
+/// Serve the REST router over an account-less instance.
+async fn serve(opts: Options) -> Fixture {
+    let (engine, auth, tmp) = instance(&opts).await;
     let state = RestState::new(engine, auth.clone())
         .unwrap()
         .with_setup_token(opts.setup_token);
     let app = axum::Router::new().nest("/api/v1", router(state));
+    Fixture {
+        addr: spawn(app),
+        auth,
+        _tmp: tmp,
+    }
+}
+
+/// The production router (`daemon::http_router`), served the way `run_http`
+/// serves it: with connect info, and with the token `serve` generated for a
+/// non-loopback bind threaded in through its parameter.
+///
+/// [`serve`] above builds `RestState` itself, which proves the handler. This one
+/// proves the WIRING: that the token reaches the handler through the production
+/// constructor at all, and that the peer address the locality decision rests on
+/// exists on a request the daemon's own `axum::serve` answered.
+async fn serve_production(setup_token: Option<String>) -> Fixture {
+    let (engine, auth, tmp) = instance(&Options::default()).await;
+    let router = http_router(
+        engine,
+        Arc::new(AtomicUsize::new(0)),
+        &[],
+        auth.clone(),
+        setup_token,
+    )
+    .unwrap();
+    Fixture {
+        addr: spawn(router),
+        auth,
+        _tmp: tmp,
+    }
+}
+
+/// Bind an ephemeral loopback port and serve the router on a background task
+/// with `into_make_service_with_connect_info`, which is what puts the peer
+/// address in the extensions the handler reads.
+fn spawn(app: axum::Router) -> SocketAddr {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let addr = listener.local_addr().unwrap();
@@ -94,11 +139,7 @@ async fn serve(opts: Options) -> Fixture {
         .await
         .unwrap();
     });
-    Fixture {
-        addr,
-        auth,
-        _tmp: tmp,
-    }
+    addr
 }
 
 /// A client with proxy discovery disabled: the target is loopback, where a
@@ -654,4 +695,69 @@ async fn setup_serves_problem_json_like_the_rest() {
         .status(),
         200
     );
+}
+
+// The two below drive the router `serve` actually builds, rather than a state
+// this file assembled: they are the wiring tests. Everything above them would
+// stay green if `run_http` served a router with no peer address in it and no
+// token threaded through, which is exactly the outage this endpoint would have
+// shipped with.
+
+/// End to end through the production constructor: a browser on the machine that
+/// serves the daemon creates the first admin with no token at all, because the
+/// peer address the server saw is loopback.
+#[tokio::test]
+async fn the_production_router_creates_the_first_admin_over_a_real_socket() {
+    let fixture = serve_production(None).await;
+    assert_eq!(me(fixture.addr, None).await["needs_setup"], true);
+
+    let resp = setup(fixture.addr, json!({"name": "Root", "password": "rootpw"})).await;
+    assert_eq!(
+        resp.status(),
+        200,
+        "connect info is served, so the loopback peer is visible to the handler"
+    );
+    assert!(session_cookie(&resp).is_some(), "and it signs them in");
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["user"]["name"], "root");
+    assert_eq!(body["user"]["role"], "admin");
+    assert_eq!(me(fixture.addr, None).await["needs_setup"], false);
+    assert_eq!(fixture.auth.user_count().await.unwrap(), 1);
+}
+
+/// The token a non-loopback `serve` generates reaches the handler through
+/// `http_router`'s parameter: presented by a caller this server treats as
+/// remote, it opens the slot, and the same request against a router built
+/// without one is refused.
+#[tokio::test]
+async fn the_production_router_threads_the_setup_token_to_the_handler() {
+    let configured = serve_production(Some(TOKEN.to_string())).await;
+    let resp = setup_forwarded(
+        configured.addr,
+        json!({"name": "root", "password": "rootpw", "token": TOKEN}),
+    )
+    .await;
+    assert_eq!(resp.status(), 200, "the threaded token is the way in");
+    assert_eq!(configured.auth.user_count().await.unwrap(), 1);
+
+    // The parameter is what carries it: the identical request against a router
+    // built with `None` (the loopback-bind case) is refused, and the refusal
+    // offers no token field, since this daemon has no token to present.
+    let tokenless = serve_production(None).await;
+    let resp = setup_forwarded(
+        tokenless.addr,
+        json!({"name": "root", "password": "rootpw", "token": TOKEN}),
+    )
+    .await;
+    assert_eq!(resp.status(), 403);
+    let doc = problem(resp).await;
+    assert!(
+        doc.get("token_required").is_none(),
+        "a daemon with no token offers no token field: {doc}"
+    );
+    assert!(
+        !doc.to_string().contains(TOKEN),
+        "and no refusal ever echoes a token: {doc}"
+    );
+    assert_eq!(tokenless.auth.user_count().await.unwrap(), 0);
 }
