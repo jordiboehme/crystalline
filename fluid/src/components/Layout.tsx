@@ -68,7 +68,7 @@ import { CreateEngramDialog } from "./CreateEngramDialog";
 import { DomainNav } from "./DomainNav";
 import { HelpOverlay } from "./HelpOverlay";
 import { ITEM_CLASSES, MENU_CLASSES } from "./menu";
-import { BUTTON, Chip, FOCUS_RING, IconButton } from "./primitives";
+import { BUTTON, Chip, FOCUS_RING, IconButton, Tooltip } from "./primitives";
 
 /**
  * What the command palette's shortcut is called on this keyboard.
@@ -377,18 +377,19 @@ function TopBar({
           preferences at large.
         */}
         {capabilities.canAdminister && (
-          <NavLink
-            to={githubSettingsRoute()}
-            aria-label="GitHub"
-            title="GitHub"
-            className={({ isActive }) =>
-              `inline-flex h-8 w-8 shrink-0 items-center justify-center rounded text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800 ${FOCUS_RING} ${
-                isActive ? "bg-slate-100 dark:bg-slate-800" : ""
-              }`
-            }
-          >
-            <GitBranch aria-hidden="true" size={16} strokeWidth={1.75} />
-          </NavLink>
+          <Tooltip label="GitHub">
+            <NavLink
+              to={githubSettingsRoute()}
+              aria-label="GitHub"
+              className={({ isActive }) =>
+                `inline-flex h-8 w-8 shrink-0 items-center justify-center rounded text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800 ${FOCUS_RING} ${
+                  isActive ? "bg-slate-100 dark:bg-slate-800" : ""
+                }`
+              }
+            >
+              <GitBranch aria-hidden="true" size={16} strokeWidth={1.75} />
+            </NavLink>
+          </Tooltip>
         )}
 
         <ThemeMenu />
@@ -459,17 +460,22 @@ function ThemeMenu() {
 
   return (
     <DropdownMenu.Root>
-      <DropdownMenu.Trigger
-        aria-label={`Theme: ${preference}`}
-        title={`Theme: ${preference}`}
-        className={`inline-flex h-8 w-8 shrink-0 items-center justify-center rounded text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800 ${FOCUS_RING}`}
-      >
-        {resolved === "dark" ? (
-          <Moon aria-hidden="true" size={16} strokeWidth={1.75} />
-        ) : (
-          <Sun aria-hidden="true" size={16} strokeWidth={1.75} />
-        )}
-      </DropdownMenu.Trigger>
+      {/*
+        The tooltip wraps the trigger rather than the menu: what a reader wants
+        named is the glyph, and the panel it opens names itself in three rows.
+      */}
+      <Tooltip label={`Theme: ${preference}`}>
+        <DropdownMenu.Trigger
+          aria-label={`Theme: ${preference}`}
+          className={`inline-flex h-8 w-8 shrink-0 items-center justify-center rounded text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800 ${FOCUS_RING}`}
+        >
+          {resolved === "dark" ? (
+            <Moon aria-hidden="true" size={16} strokeWidth={1.75} />
+          ) : (
+            <Sun aria-hidden="true" size={16} strokeWidth={1.75} />
+          )}
+        </DropdownMenu.Trigger>
+      </Tooltip>
       <DropdownMenu.Portal>
         <DropdownMenu.Content
           align="end"

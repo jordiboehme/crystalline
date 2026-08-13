@@ -38,7 +38,7 @@ import { PresenceChips } from "../collab/PresenceChips";
 import type { CollabConflict, CollabSession } from "../collab/useCollabSession";
 import { fileSpace, useCollabSession } from "../collab/useCollabSession";
 import { Breadcrumbs, crumbsOf } from "../components/Breadcrumbs";
-import { BUTTON, ICON_TOGGLE } from "../components/primitives";
+import { BUTTON, ICON_TOGGLE, Tooltip } from "../components/primitives";
 import { Skeleton } from "../components/Skeleton";
 import CmEditor from "../editor/CmEditor";
 import { ConfirmLeaveDialog } from "../editor/ConfirmLeaveDialog";
@@ -903,28 +903,29 @@ function Surface({
               accessible name and the tooltip both still say Raw, and the
               document glyph says which of the two faces the buffer is wearing.
             */}
-            <button
-              type="button"
-              aria-pressed={raw}
-              aria-label="Raw"
-              title="Raw"
-              onClick={() => {
-                const next = !raw;
-                setRaw(next);
-                session.viewRef.current?.dispatch({
-                  effects: preview.reconfigure(
-                    previewConfig(next, resolved === "dark"),
-                  ),
-                });
-              }}
-              // Quiet until it is on, then an accent wash. The two faces are
-              // whole strings rather than a base plus overrides: see `TOGGLE`
-              // for why layering accent utilities onto the ghost tier renders
-              // nothing at all.
-              className={raw ? ICON_TOGGLE.on : ICON_TOGGLE.off}
-            >
-              <FileCode aria-hidden="true" size={16} strokeWidth={1.75} />
-            </button>
+            <Tooltip label="Raw">
+              <button
+                type="button"
+                aria-pressed={raw}
+                aria-label="Raw"
+                onClick={() => {
+                  const next = !raw;
+                  setRaw(next);
+                  session.viewRef.current?.dispatch({
+                    effects: preview.reconfigure(
+                      previewConfig(next, resolved === "dark"),
+                    ),
+                  });
+                }}
+                // Quiet until it is on, then an accent wash. The two faces are
+                // whole strings rather than a base plus overrides: see `TOGGLE`
+                // for why layering accent utilities onto the ghost tier renders
+                // nothing at all.
+                className={raw ? ICON_TOGGLE.on : ICON_TOGGLE.off}
+              >
+                <FileCode aria-hidden="true" size={16} strokeWidth={1.75} />
+              </button>
+            </Tooltip>
             <button
               type="button"
               onClick={session.requestSave}

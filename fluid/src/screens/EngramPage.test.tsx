@@ -571,6 +571,28 @@ describe("the engram page", () => {
     }
   });
 
+  it("names each icon on hover without renaming it", async () => {
+    serve();
+
+    renderApp("/d/eng/e/alpha");
+
+    const share = await screen.findByRole("button", { name: "Share link" });
+    // Nothing hangs over the row until it is asked for, and when it is, the
+    // words are the ones the control is already called. The browser's own
+    // tooltip is gone: two labels for one button, drawn a beat apart, is
+    // worse than either alone.
+    expect(share).not.toHaveAttribute("title");
+    expect(screen.queryByRole("tooltip")).toBeNull();
+
+    const user = userEvent.setup();
+    await user.hover(share);
+    expect(
+      await screen.findByRole("tooltip", {}, { timeout: 2000 }),
+    ).toHaveTextContent("Share link");
+    // The accessible name is still the label alone: a tooltip describes.
+    expect(screen.getByRole("button", { name: "Share link" })).toBe(share);
+  });
+
   it("carries the actions in the trail's own row, leaving the title alone", async () => {
     serve();
 

@@ -18,8 +18,8 @@ import { Route, Routes } from "react-router";
 import LoginPage from "./auth/LoginPage";
 import { RequireAuth } from "./auth/RequireAuth";
 import { Layout } from "./components/Layout";
+import { Skeleton } from "./components/Skeleton";
 import DomainHome from "./screens/DomainHome";
-import EngramPage from "./screens/EngramPage";
 import GraphView from "./screens/GraphView";
 import Home from "./screens/Home";
 import ManifestPage from "./screens/ManifestPage";
@@ -27,7 +27,7 @@ import NotFound from "./screens/NotFound";
 import Search from "./screens/Search";
 
 /**
- * The two lazy screens: everything CodeMirror rides in these chunks, so the
+ * The two editors: everything CodeMirror rides in these chunks, so the
  * app shell never pays for either editor. Split from one another rather than
  * shared: a MANIFEST editor has no wikilinks, no frontmatter form and no
  * vocabulary to fetch, and bundling it with the engram editor's weight would
@@ -38,6 +38,22 @@ import Search from "./screens/Search";
  */
 const EngramEditor = lazy(() => import("./screens/EngramEditor"));
 const ManifestEditor = lazy(() => import("./screens/ManifestEditor"));
+
+/**
+ * The reading screen, lazy for a third reason again.
+ *
+ * It is the screen this app exists to draw, so making it wait looks wrong
+ * until the numbers are read: it pulls the markdown renderer's whole
+ * neighborhood, the details and backlinks panels, the two dialogs and the
+ * neighborhood section behind it, and every one of those bytes was being paid
+ * for by the home screen, the search screen and the login screen too. The
+ * primary deployment is the daemon serving this bundle off localhost, where a
+ * second request for an already-built chunk is a round trip measured in
+ * single-digit milliseconds - and the fallback is the exact skeleton the
+ * screen shows itself while its own two requests are in flight, so a reader
+ * sees one loading shape rather than a chunk fetch followed by a screen.
+ */
+const EngramPage = lazy(() => import("./screens/EngramPage"));
 
 /**
  * And the two admin screens, which are lazy for a different reason: they weigh
@@ -61,6 +77,13 @@ const SETTINGS_FALLBACK = (
 const USERS_FALLBACK = (
   <p className="text-sm text-slate-500 dark:text-slate-400">Loading accounts</p>
 );
+
+/**
+ * The engram screen's own skeleton, spelled the same way it spells it: the
+ * chunk arriving and the detail request landing are one wait to a reader, and
+ * two different loading shapes in a row would say otherwise.
+ */
+const ENGRAM_FALLBACK = <Skeleton label="Loading the engram" rows={6} />;
 
 export function AppRoutes() {
   return (
@@ -105,7 +128,14 @@ export function AppRoutes() {
               </Suspense>
             }
           />
-          <Route path="/d/:domain/e/*" element={<EngramPage />} />
+          <Route
+            path="/d/:domain/e/*"
+            element={
+              <Suspense fallback={ENGRAM_FALLBACK}>
+                <EngramPage />
+              </Suspense>
+            }
+          />
           <Route path="/search" element={<Search />} />
           <Route path="/graph" element={<GraphView />} />
           {/*

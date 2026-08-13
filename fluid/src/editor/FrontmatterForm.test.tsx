@@ -19,6 +19,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import type { Vocabulary } from "../api/vocabulary";
 import CmEditor from "./CmEditor";
+import { Tooltips } from "../components/primitives";
 import { FrontmatterForm } from "./FrontmatterForm";
 import { lineSeparatorFor } from "./setup";
 
@@ -43,7 +44,9 @@ function mounted(vocabulary: Vocabulary | null = null) {
     parent: document.body,
   });
   views.push(view);
-  render(<FrontmatterForm doc={DOC} view={view} vocabulary={vocabulary} />);
+  render(<FrontmatterForm doc={DOC} view={view} vocabulary={vocabulary} />, {
+    wrapper: Tooltips,
+  });
   return view;
 }
 
@@ -117,7 +120,9 @@ describe("the frontmatter form", () => {
     });
     views.push(view);
     // Deliberately stale: the prop is the text from before that line arrived.
-    render(<FrontmatterForm doc={DOC} view={view} vocabulary={null} />);
+    render(<FrontmatterForm doc={DOC} view={view} vocabulary={null} />, {
+      wrapper: Tooltips,
+    });
 
     const status = screen.getByLabelText("Status");
     await userEvent.clear(status);
@@ -152,7 +157,7 @@ describe("the frontmatter form", () => {
   });
 
   it("round-trips the upper bound between forever and a date, both ways, twice", async () => {
-    render(<Live content={DOC} />);
+    render(<Live content={DOC} />, { wrapper: Tooltips });
     await screen.findByLabelText("Engram source");
     const view = liveView();
 
@@ -188,7 +193,7 @@ describe("the frontmatter form", () => {
   });
 
   it("round-trips the lower bound between a date and always", async () => {
-    render(<Live content={DOC} />);
+    render(<Live content={DOC} />, { wrapper: Tooltips });
     await screen.findByLabelText("Engram source");
     const view = liveView();
 
@@ -208,7 +213,7 @@ describe("the frontmatter form", () => {
   });
 
   it("keyboard-editing a date leaves its line where it is, never removing it", async () => {
-    render(<Live content={DOC} />);
+    render(<Live content={DOC} />, { wrapper: Tooltips });
     await screen.findByLabelText("Engram source");
     const view = liveView();
     const lineOf = (text: string, key: string) =>
@@ -233,7 +238,7 @@ describe("the frontmatter form", () => {
   });
 
   it("setting an absent bound adds its line before the closing fence", async () => {
-    render(<Live content={DOC} />);
+    render(<Live content={DOC} />, { wrapper: Tooltips });
     await screen.findByLabelText("Engram source");
     const view = liveView();
     await userEvent.click(
@@ -253,7 +258,7 @@ describe("the frontmatter form", () => {
   });
 
   it("adds and removes tags as a block list", async () => {
-    render(<Live content={DOC} />);
+    render(<Live content={DOC} />, { wrapper: Tooltips });
     await screen.findByLabelText("Engram source");
     const view = liveView();
     await userEvent.type(screen.getByLabelText("Add tag"), "editor{Enter}");
@@ -274,7 +279,7 @@ describe("the frontmatter form", () => {
     // list and the block stopped parsing as yaml at all.
     const flush =
       "---\ntitle: Alpha\ntags:\n- protocol\n- smoke\nstatus: current\n---\n\nBody.\n";
-    render(<Live content={flush} />);
+    render(<Live content={flush} />, { wrapper: Tooltips });
     await screen.findByLabelText("Engram source");
     const view = liveView();
     // The chips are the buffer's own answer, and it has two to give.
@@ -346,7 +351,7 @@ describe("the frontmatter form", () => {
   });
 
   it("follows a hand edit in the text rather than holding its own copy", async () => {
-    render(<Live content={DOC} />);
+    render(<Live content={DOC} />, { wrapper: Tooltips });
     await screen.findByLabelText("Engram source");
     const view = liveView();
     expect(screen.getByLabelText("Status")).toHaveValue("stable");
@@ -362,7 +367,7 @@ describe("the frontmatter form", () => {
 
   it("writes into a CRLF buffer on the line the field names", async () => {
     const crlf = DOC.replace(/\n/g, "\r\n");
-    render(<Live content={crlf} />);
+    render(<Live content={crlf} />, { wrapper: Tooltips });
     await screen.findByLabelText("Engram source");
     await waitFor(() => {
       expect(screen.getByLabelText("Valid from")).toHaveValue("2026-01-01");

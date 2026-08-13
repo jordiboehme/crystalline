@@ -325,7 +325,11 @@ describe("the engram editor", () => {
     expect(raw).toHaveTextContent("");
     expect(raw.querySelector("svg")).not.toBeNull();
     expect(raw).toHaveAttribute("aria-label", "Raw");
-    expect(raw).toHaveAttribute("title", "Raw");
+    // The name the pointer gets is the app's own tooltip now rather than the
+    // browser's, so there is no `title` for a second label to be drawn from.
+    expect(raw).not.toHaveAttribute("title");
+    raw.focus();
+    expect(await screen.findByRole("tooltip")).toHaveTextContent("Raw");
   });
 
   it("renders live preview and hands the raw text back on demand", async () => {

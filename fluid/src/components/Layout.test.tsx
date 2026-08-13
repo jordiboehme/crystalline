@@ -329,6 +329,22 @@ describe("the layout", () => {
     // Who you are is one item, not a strip: the accounts screen is reached
     // from inside it rather than from an icon of its own beside it.
     expect(screen.queryByRole("link", { name: "Users" })).toBeNull();
+
+    // And the pointer is told the same names the screen reader is, by the
+    // app's own tooltip rather than the browser's - so none of these three
+    // carries a `title` for a second label to be drawn from.
+    for (const control of [
+      screen.getByRole("button", { name: "Domains" }),
+      screen.getByRole("link", { name: "GitHub" }),
+      screen.getByRole("button", { name: /^Theme:/ }),
+    ]) {
+      expect(control).not.toHaveAttribute("title");
+    }
+    const user = userEvent.setup();
+    await user.hover(screen.getByRole("link", { name: "GitHub" }));
+    expect(
+      await screen.findByRole("tooltip", {}, { timeout: 2000 }),
+    ).toHaveTextContent("GitHub");
   });
 
   it("gathers who you are and what only you can reach into one menu", async () => {

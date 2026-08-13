@@ -15,6 +15,7 @@ import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, test } from "vitest";
 
+import { Tooltips } from "../components/primitives";
 import { TableSizePicker } from "./TableSizePicker";
 import { docText, lineSeparatorFor } from "./setup";
 
@@ -34,7 +35,7 @@ function mount(doc = "prose line", anchor = doc.length): EditorView {
     }),
     parent: document.body,
   });
-  render(<TableSizePicker view={view} />);
+  render(<TableSizePicker view={view} />, { wrapper: Tooltips });
   return view;
 }
 
@@ -221,7 +222,7 @@ describe("TableSizePicker", () => {
   });
 
   test("without a buffer the trigger is disabled and opens nothing", async () => {
-    render(<TableSizePicker view={null} />);
+    render(<TableSizePicker view={null} />, { wrapper: Tooltips });
     const trigger = screen.getByRole("button", { name: "Insert table" });
     expect(trigger).toBeDisabled();
     await userEvent.click(trigger);

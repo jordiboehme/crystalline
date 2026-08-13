@@ -19,6 +19,7 @@ import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, test } from "vitest";
 
+import { Tooltips } from "../components/primitives";
 import { EditorToolbar } from "./EditorToolbar";
 import { frontmatterFold } from "./frontmatterFold";
 import { baseExtensions, docText, lineSeparatorFor } from "./setup";
@@ -44,7 +45,11 @@ const SEGMENT = [
 
 let view: EditorView | null = null;
 /** The bar `mount` put up, so a test can redraw that ONE rather than add another. */
-let bar: RenderResult | null = null;
+// Only the redraw is kept, rather than the whole render result: a `render`
+// call carrying a `wrapper` infers its query set as the bare `Queries`
+// interface, which is not the concrete `RenderResult` this held before, and
+// the one method this helper actually uses is the same either way.
+let bar: Pick<RenderResult, "rerender"> | null = null;
 afterEach(() => {
   view?.destroy();
   view = null;
@@ -73,7 +78,9 @@ function mount(
     }),
     parent: document.body,
   });
-  bar = render(<EditorToolbar view={view} tableActive={tableActive} />);
+  bar = render(<EditorToolbar view={view} tableActive={tableActive} />, {
+    wrapper: Tooltips,
+  });
   return view;
 }
 
@@ -278,7 +285,9 @@ describe("the diagram menu", () => {
 
 describe("the table segment", () => {
   test("its controls are there only while the caret is in a table", () => {
-    const { rerender } = render(<EditorToolbar view={null} />);
+    const { rerender } = render(<EditorToolbar view={null} />, {
+      wrapper: Tooltips,
+    });
     for (const name of SEGMENT) {
       expect(screen.queryByRole("button", { name })).toBeNull();
     }
@@ -295,7 +304,7 @@ describe("the table segment", () => {
     // the labels are the contract, so a glyph that drifts back to a second
     // idiom - a trash can beside a grid-with-an-X for two verbs that differ
     // only in axis - breaks nothing and reads as an accident.
-    render(<EditorToolbar view={null} tableActive />);
+    render(<EditorToolbar view={null} tableActive />, { wrapper: Tooltips });
     const glyph = (name: string) =>
       screen
         .getByRole("button", { name })

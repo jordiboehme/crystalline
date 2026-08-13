@@ -13,6 +13,7 @@ import { describe, expect, test } from "vitest";
 
 import type { EngramFrontmatter } from "../api/engram";
 import { DetailsPanel } from "./DetailsPanel";
+import { Tooltips } from "./primitives";
 
 const FRONTMATTER: EngramFrontmatter = {
   type: "guide",
@@ -33,6 +34,10 @@ function draw(overrides: Partial<EngramFrontmatter> = {}) {
         address="crystalline://playground/lantern-protocol"
       />
     </MemoryRouter>,
+    // The copy button is an `IconButton`, which names itself with a tooltip,
+    // and a tooltip belongs to a group. The app mounts that group once at its
+    // root; a suite that mounts one panel on its own mounts it here.
+    { wrapper: Tooltips },
   );
 }
 

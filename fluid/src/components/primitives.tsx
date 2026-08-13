@@ -8,6 +8,7 @@
  */
 
 import type { LucideIcon } from "lucide-react";
+import { Tooltip as TooltipPrimitive } from "radix-ui";
 import type { ComponentPropsWithRef, ReactElement, ReactNode } from "react";
 
 import { isRetired } from "../lifecycle";
@@ -131,6 +132,88 @@ export function Field({
 }
 
 /**
+ * How long the pointer has to rest on a control before it says its name.
+ *
+ * Long enough that crossing a row of icons on the way somewhere else says
+ * nothing at all, short enough that pausing on one is answered rather than
+ * waited out. The keyboard does not wait: focus opens a tooltip immediately,
+ * because a control that was deliberately moved to has already been asked
+ * about.
+ */
+const TOOLTIP_DELAY_MS = 600;
+
+/**
+ * The whole app's tooltip group, mounted once at the root.
+ *
+ * Once, rather than one per tooltip, for the thing only a shared group can
+ * do: after one tooltip has been open, a neighbor within the skip window
+ * opens instantly instead of making a reader who is scanning the row wait out
+ * the delay again. Every `IconButton` and every `Tooltip` in the tree needs
+ * this above it - Radix throws by name without it - so a test that mounts one
+ * of those in isolation mounts this around it.
+ */
+export function Tooltips({ children }: { children: ReactNode }): ReactElement {
+  return (
+    <TooltipPrimitive.Provider delayDuration={TOOLTIP_DELAY_MS}>
+      {children}
+    </TooltipPrimitive.Provider>
+  );
+}
+
+/**
+ * The tooltip surface: a menu's face, sized for a word.
+ *
+ * Deliberately not `MENU_CLASSES` itself plus overrides. That constant carries
+ * `min-w-48` and `p-1` because a menu is a column of rows, and a tooltip
+ * holding two words is neither; overriding them from a second class string
+ * would be the layering trap `TOGGLE` documents above - same specificity,
+ * decided by the order Tailwind happens to emit the two utilities in. So the
+ * border, the background, the radius, the shadow and the stacking are copied
+ * exactly, the sizing is the tooltip's own, and nothing here is fighting
+ * anything.
+ */
+const TOOLTIP_CLASSES =
+  "text-caption z-50 max-w-64 rounded border border-slate-200 bg-white px-2 py-1 shadow-lg dark:border-slate-700 dark:bg-slate-900";
+
+/**
+ * A name for a control that has no room for one, on hover and on focus.
+ *
+ * No arrow: an arrow is for a surface a reader has to connect to a target
+ * across distance, and this one opens under the control it names. Below by
+ * default for the same reason - the row above a control is usually where the
+ * page's own content is, and a label that covers what you were reading to
+ * tell you what a button is called has traded down.
+ *
+ * The label is NOT the accessible name. `aria-label` on the control itself is
+ * that, and it stays; this is the same words drawn for a pointer, tied on with
+ * `aria-describedby` by Radix, so a screen reader hears the name once.
+ */
+export function Tooltip({
+  label,
+  side = "bottom",
+  children,
+}: {
+  label: string;
+  side?: "top" | "right" | "bottom" | "left";
+  children: ReactNode;
+}): ReactElement {
+  return (
+    <TooltipPrimitive.Root>
+      <TooltipPrimitive.Trigger asChild>{children}</TooltipPrimitive.Trigger>
+      <TooltipPrimitive.Portal>
+        <TooltipPrimitive.Content
+          side={side}
+          sideOffset={6}
+          className={TOOLTIP_CLASSES}
+        >
+          {label}
+        </TooltipPrimitive.Content>
+      </TooltipPrimitive.Portal>
+    </TooltipPrimitive.Root>
+  );
+}
+
+/**
  * Every button attribute, `ref` included: a caller that has to move the
  * keyboard onto one of these - a control that replaces the control that was
  * pressed - needs the element itself, and React hands a function component's
@@ -142,6 +225,15 @@ export interface IconButtonProps extends ComponentPropsWithRef<"button"> {
   icon: LucideIcon;
 }
 
+/**
+ * One icon, one name, said two ways.
+ *
+ * The name is `aria-label` for anything that reads the page and a `Tooltip`
+ * for anything that looks at it, and there is no `title` beside them: the
+ * browser's own tooltip would be a second label for the same button, drawn a
+ * beat later, in a font the page does not choose. One label, one delay, one
+ * surface.
+ */
 export function IconButton({
   label,
   icon: Icon,
@@ -149,15 +241,16 @@ export function IconButton({
   ...rest
 }: IconButtonProps): ReactElement {
   return (
-    <button
-      type="button"
-      aria-label={label}
-      title={label}
-      className={`inline-flex h-8 w-8 shrink-0 items-center justify-center rounded text-slate-600 hover:bg-slate-100 disabled:opacity-50 dark:text-slate-300 dark:hover:bg-slate-800 ${FOCUS_RING} ${className ?? ""}`}
-      {...rest}
-    >
-      <Icon aria-hidden="true" size={16} strokeWidth={1.75} />
-    </button>
+    <Tooltip label={label}>
+      <button
+        type="button"
+        aria-label={label}
+        className={`inline-flex h-8 w-8 shrink-0 items-center justify-center rounded text-slate-600 hover:bg-slate-100 disabled:opacity-50 dark:text-slate-300 dark:hover:bg-slate-800 ${FOCUS_RING} ${className ?? ""}`}
+        {...rest}
+      >
+        <Icon aria-hidden="true" size={16} strokeWidth={1.75} />
+      </button>
+    </Tooltip>
   );
 }
 
