@@ -45,26 +45,101 @@ pub struct CreateDomainBody {
     pub path: Option<String>,
 }
 
-/// A domain name that is safe as a path segment under the domains root and
-/// in crystalline:// addresses: no separators, no traversal, no drive
-/// colon, not hidden, no whitespace.
+/// A domain name that is safe as a path segment under the domains root, in
+/// crystalline:// addresses, and on every operating system this server may
+/// run on - not merely the one whoever last touched this file was using.
+///
+/// Enforced, as an ALLOWLIST rather than a denylist: every character must be
+/// a Unicode alphanumeric (`char::is_alphanumeric`) or one of `-`, `_`, `.`.
+/// A denylist has to remember every hostile character; an allowlist refuses
+/// everything it does not name, which is why the Windows-illegal punctuation
+/// `* ? < > | " :`, every path separator and all whitespace (including the
+/// hostile invisibles - U+202E, U+200B, U+200D are category Cf, which
+/// `is_alphanumeric` excludes) fall out of this rule for free rather than
+/// needing their own line. On top of the allowlist: a 64-CHARACTER cap
+/// (counted, not bytes - the cap is about legibility, a readable folder
+/// segment and a readable piece of a `crystalline://` address, and claims no
+/// filesystem guarantee; the OS's own segment limit is separate, larger in
+/// every realistic case, and enforced by the OS with its own error); no
+/// leading dot (a hidden file) and, the same hazard class as this whole
+/// item, no trailing dot either (Windows strips one silently); and a refusal
+/// of the Windows RESERVED DEVICE NAMES (see [`is_windows_device_name`]),
+/// because an allowlist of alphanumerics cannot see that class at all - it
+/// is illegal regardless of which characters make it up.
+///
+/// Trailing spaces, the other Windows hazard, are already closed by the
+/// `trim()` below (pinned by the `" notes "` test case) - keep it, even
+/// though most of what it catches the allowlist would also refuse on its
+/// own.
+///
+/// Deliberately NOT defended, because closing it costs more than the gap is
+/// worth: a decomposed (NFD) name - what macOS input and pasted macOS
+/// filenames often produce - is refused outright, since a combining mark is
+/// category Mn and not alphanumeric; normalizing to NFC first would need a
+/// dependency this change does not take. Homoglyph confusables (Cyrillic
+/// `а` beside Latin `a`) stay open, as does two distinct registered names
+/// colliding on one directory on a case- or normalization-insensitive
+/// filesystem (APFS, NTFS). Neither is a new hole: nothing screens either
+/// today.
+///
+/// Nothing here re-validates an already-registered name: this function runs
+/// only when a domain is CREATED (the three arms of `create` below). A
+/// domain an earlier CLI call or a hand-edited config registered under a
+/// name this function would now refuse keeps serving, keeps listing and can
+/// still be unregistered from the browser; only a NEW registration through
+/// this REST surface is refused. No migration, no lazy rename - there is no
+/// backcompat obligation to keep.
 fn check_domain_name(name: &str) -> Result<&str, ApiError> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
         return Err(ApiError::unprocessable("the domain name is empty"));
     }
-    if trimmed.chars().any(char::is_whitespace)
-        || trimmed.contains('/')
-        || trimmed.contains('\\')
-        || trimmed.contains(':')
-        || trimmed.starts_with('.')
-    {
+    let stem = trimmed.split('.').next().unwrap_or(trimmed);
+    let allowed = trimmed.chars().count() <= 64
+        && !trimmed.starts_with('.')
+        && !trimmed.ends_with('.')
+        && trimmed
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        && !is_windows_device_name(stem);
+    if !allowed {
         return Err(ApiError::unprocessable(format!(
-            "'{trimmed}' cannot name a domain: use letters, digits, hyphens \
-             and underscores, with no separators, colons or leading dots"
+            "'{trimmed}' cannot name a domain: use letters, digits, hyphens, \
+             underscores and dots (no leading or trailing dot), 64 \
+             characters or fewer, and not a Windows device name (CON, PRN, \
+             AUX, NUL, COM1-COM9, LPT1-LPT9)"
         )));
     }
     Ok(trimmed)
+}
+
+/// Whether `stem` - the segment before the first dot, so `CON.txt` is
+/// checked as `CON` while `a.CON` is checked as `a` - names a Windows
+/// reserved device: `CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`, `LPT1`-`LPT9`,
+/// matched case-insensitively (ASCII case only - the reserved names are
+/// ASCII, so a non-ASCII lookalike is correctly left alone), plus the
+/// superscript-digit spellings `COM\u{b9}`/`COM\u{b2}`/`COM\u{b3}` and their
+/// LPT equivalents (U+00B9, U+00B2, U+00B3), which Windows resolves to the
+/// same device as the ASCII digit and which sail through a bare
+/// `is_alphanumeric` allowlist because Unicode category No (\"other
+/// number\") counts as numeric. `COM10` and up are NOT reserved (they need
+/// the `\\.\` device syntax), so `console`, `com10` and `a.CON` all stay
+/// legal - this only ever matches an EXACT stem, never a prefix.
+fn is_windows_device_name(stem: &str) -> bool {
+    let mut chars = stem.chars();
+    let head: String = chars
+        .by_ref()
+        .take(3)
+        .map(|c| c.to_ascii_uppercase())
+        .collect();
+    let rest: Vec<char> = chars.collect();
+    match (head.as_str(), rest.as_slice()) {
+        ("CON" | "PRN" | "AUX" | "NUL", []) => true,
+        ("COM" | "LPT", [c]) => {
+            c.is_ascii_digit() && *c != '0' || matches!(c, '\u{b9}' | '\u{b2}' | '\u{b3}')
+        }
+        _ => false,
+    }
 }
 
 /// `POST /domains` - register a domain: a local folder under the server's
@@ -631,6 +706,85 @@ mod tests {
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "{bad:?} names no domain"
             );
+        }
+    }
+
+    #[test]
+    fn the_allowlist_refuses_windows_hostile_punctuation_a_cap_and_bare_dots() {
+        for bad in ["a*b", "a?b", "a<b", "a>b", "a|b", "a\"b"] {
+            assert_eq!(
+                check_domain_name(bad).unwrap_err().status,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{bad:?} names no domain"
+            );
+        }
+        let too_long: String = "a".repeat(65);
+        assert_eq!(
+            check_domain_name(&too_long).unwrap_err().status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "65 characters is over the cap"
+        );
+        assert_eq!(
+            check_domain_name("notes.").unwrap_err().status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a trailing dot is a Windows hazard, same class as a leading one"
+        );
+
+        // Must stay legal: the cap itself, dotted names, non-ASCII letters
+        // (an operator's own language buys no safety by being refused), and
+        // a decomposed accent is refused for a documented reason, not left
+        // to chance.
+        let exactly_64: String = "a".repeat(64);
+        assert_eq!(check_domain_name(&exactly_64).unwrap(), exactly_64);
+        assert_eq!(check_domain_name("notes.v2").unwrap(), "notes.v2");
+        assert_eq!(check_domain_name("wissen").unwrap(), "wissen");
+        assert_eq!(check_domain_name("知识库").unwrap(), "知识库");
+    }
+
+    #[test]
+    fn the_allowlist_refuses_nfd_decomposed_names() {
+        // "café" spelled with a combining acute accent (U+0301) rather than
+        // the precomposed U+00E9: category Mn, not alphanumeric, so this is
+        // refused - a documented limitation (decision 9), not a surprise.
+        // Normalizing to NFC first would need a new dependency this change
+        // does not take.
+        let nfd_name = "cafe\u{0301}";
+        assert_eq!(
+            check_domain_name(nfd_name).unwrap_err().status,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+
+    #[test]
+    fn the_allowlist_refuses_windows_reserved_device_names() {
+        for bad in [
+            "con",
+            "CON",
+            "PRN",
+            "AUX",
+            "NUL",
+            "com1",
+            "LPT9",
+            "CON.txt",
+            "nul.md",
+            // The superscript-digit spellings resolve to the same device as
+            // the ASCII digit on Windows and sail through a bare
+            // alphanumeric allowlist unless matched explicitly (decision 7).
+            "COM\u{b9}",
+            "LPT\u{b9}",
+        ] {
+            assert_eq!(
+                check_domain_name(bad).unwrap_err().status,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{bad:?} is a Windows reserved device name"
+            );
+        }
+        // Must stay legal - none of these are reserved: COM10 and up need
+        // the `\\.\` device syntax, "console" merely starts with "con", and
+        // the reserved check only looks at the segment before the first
+        // dot, so an extension named "CON" is not the device stem.
+        for ok in ["console", "com10", "a.CON"] {
+            assert_eq!(check_domain_name(ok).unwrap(), ok, "{ok:?} is legal");
         }
     }
 
