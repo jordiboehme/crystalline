@@ -21,7 +21,6 @@
 import { useQuery } from "@tanstack/react-query";
 import {
   Gem,
-  GitBranch,
   House,
   Moon,
   PanelLeft,
@@ -360,36 +359,6 @@ function TopBar({
           <span className="hidden sm:inline">
             <Chip variant="caution">Read only</Chip>
           </span>
-        )}
-
-        {/*
-          Only for the session that may use it. The screen refuses everyone
-          else on its own, so this is not the guard - it is the difference
-          between a frame that offers what you can do and one that offers a
-          door that will not open.
-
-          The accounts screen used to have an icon of its own beside this one.
-          It does not any more: who you are and what only you may reach are one
-          subject, and they are gathered in the identity menu at the end of this
-          row. What is left here is the connection team domains are tracked
-          with, which is why the glyph is a branch rather than a cog - the
-          screen behind it is about one repository, not about the instance's
-          preferences at large.
-        */}
-        {capabilities.canAdminister && (
-          <Tooltip label="GitHub">
-            <NavLink
-              to={githubSettingsRoute()}
-              aria-label="GitHub"
-              className={({ isActive }) =>
-                `inline-flex h-8 w-8 shrink-0 items-center justify-center rounded text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800 ${FOCUS_RING} ${
-                  isActive ? "bg-slate-100 dark:bg-slate-800" : ""
-                }`
-              }
-            >
-              <GitBranch aria-hidden="true" size={16} strokeWidth={1.75} />
-            </NavLink>
-          </Tooltip>
         )}
 
         <ThemeMenu />

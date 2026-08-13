@@ -317,10 +317,9 @@ describe("the layout", () => {
       "aria-controls",
       "domain-sidebar",
     );
-    expect(screen.getByRole("link", { name: "GitHub" })).toHaveAttribute(
-      "href",
-      "/settings/github",
-    );
+    // GitHub settings are reached through the identity menu's Settings item;
+    // the top bar carries no separate door to the same screen.
+    expect(screen.queryByRole("link", { name: "GitHub" })).toBeNull();
     expect(screen.getByRole("button", { name: /^Theme:/ })).toBeVisible();
     expect(screen.getByRole("link", { name: "Fluid" })).toHaveAttribute(
       "href",
@@ -335,16 +334,15 @@ describe("the layout", () => {
     // carries a `title` for a second label to be drawn from.
     for (const control of [
       screen.getByRole("button", { name: "Domains" }),
-      screen.getByRole("link", { name: "GitHub" }),
       screen.getByRole("button", { name: /^Theme:/ }),
     ]) {
       expect(control).not.toHaveAttribute("title");
     }
     const user = userEvent.setup();
-    await user.hover(screen.getByRole("link", { name: "GitHub" }));
+    await user.hover(screen.getByRole("button", { name: "Domains" }));
     expect(
       await screen.findByRole("tooltip", {}, { timeout: 2000 }),
-    ).toHaveTextContent("GitHub");
+    ).toHaveTextContent("Domains");
   });
 
   it("gathers who you are and what only you can reach into one menu", async () => {
