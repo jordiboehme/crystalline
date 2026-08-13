@@ -1,5 +1,5 @@
-//! `crystalline users`: the accounts that may sign in to the web API served
-//! by `serve --http`.
+//! `crystalline users`: the accounts that may sign in to the web API and the
+//! web UI the daemon serves at 127.0.0.1:7411 by default.
 //!
 //! The accounts live in their own small database in the state directory
 //! (`web-auth.db`), never in the index: credentials are not knowledge and must

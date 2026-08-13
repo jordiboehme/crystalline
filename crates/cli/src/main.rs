@@ -294,7 +294,9 @@ enum Command {
         config: Option<PathBuf>,
     },
     /// Serve MCP over stdio for an agent: attach to (or start) the daemon, or run
-    /// the full stack in-process. HTTP is served by the daemon, not this command.
+    /// the full stack in-process. HTTP is served by the daemon, not this command,
+    /// and a daemon this command starts opens it at 127.0.0.1:7411 by default,
+    /// web UI included (service.http=false turns that off).
     Mcp {
         /// Run the full stack in-process instead of attaching to a daemon.
         #[arg(long)]
@@ -313,9 +315,11 @@ enum Command {
         #[command(subcommand)]
         command: CtlCommand,
     },
-    /// Manage the accounts that may sign in to the web API served by
-    /// `serve --http`. The accounts live in their own small database in the
-    /// state directory, beside the index but never inside it, so a
+    /// Manage the accounts that may sign in to the web API and the web UI the
+    /// daemon serves at 127.0.0.1:7411 by default. The first admin is normally
+    /// created in the browser on the first visit; these commands are the
+    /// scripted and recovery path to the same accounts, which live in their own
+    /// small database in the state directory, beside the index but never inside it, so a
     /// `reindex --full` cannot take them with it. Safe to run while a daemon
     /// is serving: it picks the change up without a restart.
     Users {

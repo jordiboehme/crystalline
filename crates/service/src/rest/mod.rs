@@ -1,4 +1,4 @@
-//! The JSON API `serve --http` nests at `/api/v1`, the surface the Fluid UI
+//! The JSON API the HTTP endpoint nests at `/api/v1`, the surface the Fluid UI
 //! talks to. Handlers pass the engine's own JSON values through unchanged, so
 //! the MCP tools and this API stay one source of truth, and every failure is
 //! an [`ApiError`] rendered as RFC 9457 problem detail.
@@ -47,8 +47,9 @@ use crate::engine::Engine;
     info(
         title = "Crystalline Fluid API",
         version = "v1",
-        description = "The JSON API `crystalline serve --http` mounts at \
-                       `/api/v1`, the surface the Fluid UI talks to. Reading is \
+        description = "The JSON API the Crystalline daemon mounts at `/api/v1` \
+                       on its HTTP endpoint (127.0.0.1:7411 by default), the \
+                       surface the Fluid UI talks to. Reading is \
                        open to any signed-in viewer; writing content needs an \
                        editor account and the `If-Match` token of the version \
                        being replaced, and account management needs an \

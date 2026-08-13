@@ -2,7 +2,7 @@
 //! machine: the advisory lock and socket that guarantee exactly one process
 //! holds the derived index, the daemon that watches Domains and runs the
 //! embedding queue, the ctl control protocol, the rmcp tool router and the
-//! JSON API `serve --http` mounts at `/api/v1`.
+//! JSON API the HTTP endpoint mounts at `/api/v1`.
 //!
 //! The CLI is a thin dispatcher over this crate. Data operations run through one
 //! shared [`engine::Engine`], reached either over the socket (when a daemon owns

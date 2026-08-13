@@ -137,7 +137,9 @@ impl Shared {
 }
 
 /// Run the daemon: `crystalline serve [--daemon] [--http <addr>] [--read-only]
-/// [--take-over]`. The effective read-only mode is the explicit flag or
+/// [--take-over]`. The HTTP endpoint is on at [`DEFAULT_HTTP_ADDR`] unless it was
+/// turned off, so `--http` moves it or closes it rather than opening it; see
+/// [`resolve_http`]. The effective read-only mode is the explicit flag or
 /// `service.read_only`; `take_over` forces host-lock claims for a deliberate host
 /// migration in a shared database.
 pub async fn run_serve(
@@ -391,21 +393,44 @@ pub async fn run_serve(
         });
     }
 
-    // The optional HTTP endpoint.
+    // The HTTP endpoint, which is on unless it was turned off.
     if let Some(addr) = http_addr.clone() {
         let e = engine.clone();
         let sessions = http_sessions.clone();
         let rx = shared.watch();
         let token = setup_token.clone();
         tokio::spawn(async move {
-            // Named for the operator, because with the endpoint on by default
-            // the common way to see this line is an unrelated process already
-            // holding 7411 - and the daemon is otherwise perfectly healthy, so
-            // the line has to say both what broke and what still works.
-            let bind = addr.clone();
-            if let Err(err) = run_http(addr, allowed_hosts, e, sessions, token, rx).await {
+            // Three failure classes, three sentences, because the remedy
+            // differs: the endpoint never came up at all, the address was
+            // already taken, or a live endpoint stopped later. With the
+            // endpoint on by default the middle one is the one most people
+            // will ever meet (an unrelated process holding 7411) and the
+            // daemon is otherwise perfectly healthy, so that line has to name
+            // the address, say what still works, and name the lever that
+            // actually applies: a `--http` address beats both `service.http`
+            // spellings, so telling a flag user to edit the config would be
+            // advice that does nothing.
+            let router = match http_service(allowed_hosts, e, sessions, token).await {
+                Ok(router) => router,
+                Err(err) => {
+                    tracing::warn!(
+                        "HTTP endpoint could not start ({err}); MCP over the socket is unaffected"
+                    );
+                    return;
+                }
+            };
+            let listener = match tokio::net::TcpListener::bind(&addr).await {
+                Ok(listener) => listener,
+                Err(err) => {
+                    tracing::warn!(
+                        "HTTP endpoint failed on {addr} ({err}); MCP over the socket is unaffected - free the port, bind another address, or turn the endpoint off (serve --http off, or service.http=false when no flag is given)"
+                    );
+                    return;
+                }
+            };
+            if let Err(err) = run_http(listener, router, rx).await {
                 tracing::warn!(
-                    "HTTP endpoint failed on {bind} ({err}); MCP over the socket is unaffected - free the port, bind another with service.http, or set service.http=false"
+                    "HTTP endpoint on {addr} stopped ({err}); MCP over the socket is unaffected and a daemon restart brings it back"
                 );
             }
         });
@@ -732,10 +757,29 @@ async fn run_watcher(
     Ok(())
 }
 
-/// Serve the tool router over streamable HTTP until shutdown. `allowed_hosts`
-/// carries the resolved `Host` header allow-list on top of loopback (a single
-/// `*` disables the guard); see [`http_config`]. `setup_token` is this process's
-/// first-run token, if it drew one ([`setup_token_for`]).
+/// Everything the HTTP endpoint needs before it can take a socket: the accounts
+/// store and the router that fronts it. `allowed_hosts` carries the resolved
+/// `Host` header allow-list on top of loopback (a single `*` disables the
+/// guard); see [`http_config`]. `setup_token` is this process's first-run token,
+/// if it drew one ([`setup_token_for`]).
+///
+/// Split from the bind and from [`run_http`] so the call site can tell three
+/// different failures apart: an endpoint that never came up, an address somebody
+/// else already holds, and a served endpoint that stopped. Only the middle one
+/// is about a port, and only it should ever tell an operator to free one.
+async fn http_service(
+    allowed_hosts: Vec<String>,
+    engine: Arc<Engine>,
+    http_sessions: Arc<AtomicUsize>,
+    setup_token: Option<String>,
+) -> anyhow::Result<axum::Router> {
+    let auth = Arc::new(
+        crate::rest::AuthStore::open(&crystalline_core::config::web_auth_db_path()?).await?,
+    );
+    http_router(engine, http_sessions, &allowed_hosts, auth, setup_token)
+}
+
+/// Serve the built router on a bound listener until shutdown.
 ///
 /// The service is built with `into_make_service_with_connect_info`, which is the
 /// only thing that puts the client's socket address in each request's
@@ -743,18 +787,10 @@ async fn run_watcher(
 /// this machine, and fails closed without it, so serving the plain router would
 /// silently make the wizard unreachable everywhere.
 async fn run_http(
-    addr: String,
-    allowed_hosts: Vec<String>,
-    engine: Arc<Engine>,
-    http_sessions: Arc<AtomicUsize>,
-    setup_token: Option<String>,
+    listener: tokio::net::TcpListener,
+    router: axum::Router,
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
-    let auth = Arc::new(
-        crate::rest::AuthStore::open(&crystalline_core::config::web_auth_db_path()?).await?,
-    );
-    let router = http_router(engine, http_sessions, &allowed_hosts, auth, setup_token)?;
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(
         listener,
         router.into_make_service_with_connect_info::<SocketAddr>(),
@@ -825,7 +861,7 @@ type McpService = rmcp::transport::streamable_http_server::tower::StreamableHttp
     rmcp::transport::streamable_http_server::session::local::LocalSessionManager,
 >;
 
-/// Build the router `serve --http` mounts. Three citizens share the one port,
+/// Build the router the HTTP endpoint mounts. Three citizens share the one port,
 /// in this precedence:
 ///
 /// 1. The declared routes: the `/health` probe, the JSON API nested at
@@ -1651,6 +1687,28 @@ mod tests {
         assert_eq!(resolve_http(Some("false"), &config), None);
     }
 
+    /// The other direction of the same precedence, and the one every serve
+    /// spawning test harness leans on: an address on the flag beats
+    /// `service.http: false` (which is what `CRYSTALLINE_SERVICE_HTTP=false`
+    /// resolves to), so a harness can turn the endpoint off for its daemons and
+    /// still ask one of them for an endpoint on a port it picked itself.
+    #[test]
+    fn resolve_http_flag_address_wins_over_a_config_that_turned_it_off() {
+        let mut config = GlobalConfig::default();
+        config.service = Some(crystalline_core::config::ServiceConfig {
+            http: Some(HttpSetting::Enabled(false)),
+            ..Default::default()
+        });
+        assert_eq!(
+            resolve_http(Some("127.0.0.1:9999"), &config),
+            Some("127.0.0.1:9999".to_string())
+        );
+        assert_eq!(
+            resolve_http(Some("true"), &config),
+            Some(DEFAULT_HTTP_ADDR.to_string())
+        );
+    }
+
     /// A config carrying the two HTTP-surface toggles.
     fn config_with_ui(ui: Option<bool>, api: Option<bool>) -> GlobalConfig {
         GlobalConfig {
@@ -2088,12 +2146,19 @@ mod tests {
     /// spells the variable itself is by definition a second appearance.
     ///
     /// The scan rejects the bare name `token` as well as `setup_token`, because
-    /// the HTTP spawn arm rebinds the secret as `token` before moving it into
-    /// [`run_http`] and the endpoint's own failure warning sits right beside
+    /// the HTTP spawn arm rebinds the secret as `token` before handing it to
+    /// [`http_service`] and the endpoint's own failure warnings sit right beside
     /// that binding: a log line there spelling `{token}` would leak the secret
-    /// into the daemon log with every test in the tree still green. No
-    /// production line in this file pairs `tracing::` with either spelling, so
-    /// the wider net costs nothing today and closes that gap.
+    /// into the daemon log with every test in the tree still green.
+    ///
+    /// It reads a whole `tracing::` INVOCATION, not a line: everything from the
+    /// macro's name to the next `;`. The warnings in that arm are multi-line
+    /// (rustfmt keeps them that way, since the sentences are long), so their
+    /// format string lives on a different line from the `tracing::` that opens
+    /// the call and a per-line scan would sail straight past the one edit this
+    /// guard exists to catch. Taking the slice to the next `;` overshoots for a
+    /// macro used as a match arm or the tail of a block, which is the harmless
+    /// direction: it can only read more text, never less.
     #[test]
     fn the_setup_token_is_never_spelled_into_a_log_call() {
         // Everything above `#[cfg(test)]`, which is the code that runs in a
@@ -2102,12 +2167,14 @@ mod tests {
             .split("#[cfg(test)]")
             .next()
             .unwrap();
-        for (n, line) in served.lines().enumerate() {
+        for (at, _) in served.match_indices("tracing::") {
+            let rest = &served[at..];
+            let call = &rest[..rest.find(';').unwrap_or(rest.len())];
             assert!(
-                !(line.contains("tracing::") && line.contains("token")),
+                !call.contains("token"),
                 "daemon.rs:{} logs the setup token: {}",
-                n + 1,
-                line.trim()
+                served[..at].lines().count(),
+                call.split_whitespace().collect::<Vec<_>>().join(" ")
             );
         }
     }

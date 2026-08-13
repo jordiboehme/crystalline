@@ -1039,9 +1039,17 @@ fn an_occupied_http_address_is_not_fatal_and_says_so() {
         warning.contains("MCP over the socket is unaffected"),
         "the line says what still works: {warning}"
     );
+    // Both opt-out spellings, and the flag one first: this daemon took its
+    // address from `--http`, which beats every `service.http` spelling, so a
+    // line that named only the config key would be advice that does nothing
+    // for the very case this test drives.
+    assert!(
+        warning.contains("serve --http off"),
+        "the line names the opt-out that applies to a flag-configured bind: {warning}"
+    );
     assert!(
         warning.contains("service.http=false"),
-        "the line names the opt-out: {warning}"
+        "the line names the config opt-out too: {warning}"
     );
 
     // The daemon itself is healthy: its socket answers as if nothing happened.

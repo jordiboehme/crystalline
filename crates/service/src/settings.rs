@@ -678,10 +678,13 @@ fn clear_http(config: &mut GlobalConfig) {
 /// The effective value is what the daemon will actually do, so an unset setting
 /// reports the loopback address the endpoint now opens by default rather than
 /// the old `false`. It is still the default (nobody set it), which is what the
-/// second element says.
+/// second element says. `true` reports that same address for the same reason:
+/// it is a spelling of the default bind, not a different one, and reporting the
+/// word back would leave a reader guessing which address it means.
 fn http_effective(config: &GlobalConfig) -> (String, bool) {
     match config.service.as_ref().and_then(|s| s.http.as_ref()) {
-        Some(HttpSetting::Enabled(v)) => (v.to_string(), false),
+        Some(HttpSetting::Enabled(true)) => (crate::daemon::DEFAULT_HTTP_ADDR.to_string(), false),
+        Some(HttpSetting::Enabled(false)) => ("false".to_string(), false),
         Some(HttpSetting::Address(a)) => (a.clone(), false),
         None => (crate::daemon::DEFAULT_HTTP_ADDR.to_string(), true),
     }
@@ -1892,6 +1895,12 @@ mod tests {
         let mut addr = GlobalConfig::default();
         apply(&mut addr, "service.http", "0.0.0.0:7411").unwrap();
         assert_eq!(http_effective(&addr), ("0.0.0.0:7411".to_string(), false));
+
+        // `true` binds the very address the unset case does, so it reports the
+        // address rather than the word: same endpoint, one spelling of it.
+        let mut on = GlobalConfig::default();
+        apply(&mut on, "service.http", "true").unwrap();
+        assert_eq!(http_effective(&on), ("127.0.0.1:7411".to_string(), false));
     }
 
     #[test]
