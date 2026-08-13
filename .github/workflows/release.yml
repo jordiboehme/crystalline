@@ -58,6 +58,10 @@ jobs:
           name: fluid-dist
           path: fluid/dist
           if-no-files-found: error
+          # The action skips dotfiles by default and the index.html guard in
+          # the build legs would never notice one missing; a future vite
+          # emitting .vite/manifest.json must ride along, not silently drop.
+          include-hidden-files: true
 
   build:
     name: build (${{ matrix.target }})

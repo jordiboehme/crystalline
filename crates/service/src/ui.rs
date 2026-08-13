@@ -21,12 +21,12 @@
 //! | another root-level file | 200, `no-cache`, `ETag` | unhashed too, so it revalidates rather than sticks |
 //!
 //! Two deviations from that parity are deliberate and live outside the table:
-//! there is no gzip here (nginx compresses, this does not), and only a request
-//! that says it accepts `text/html` reaches the app shell, where nginx answers
+//! compression, covered below, and that only a request saying it accepts
+//! `text/html` reaches the app shell, where nginx answers
 //! `try_files $uri $uri/ /index.html` whatever the client asked for. Both are
 //! settled decisions rather than gaps; see [`wants_spa`].
 //!
-//! The `ETag` on the two revalidating rows is deliberate and currently inert:
+//! The `ETag` on the two unhashed rows is deliberate and currently inert:
 //! `no-store` forbids keeping the response at all, and the no-cache row takes
 //! no `If-None-Match`, so a root-level file is always re-sent in full. Both
 //! match nginx, which emits an `ETag` on `index.html` beside its `no-store`,
@@ -155,7 +155,10 @@ pub fn exact_response<E: RustEmbed>(path: &str) -> Option<Response> {
 /// what a naive API script sends) is NOT a navigation and falls through to the
 /// MCP service, and neither is anything that is not a GET or a HEAD, whatever
 /// it claims to accept. Every MCP request is a POST, a DELETE or a GET asking
-/// for `text/event-stream`, so this rule cannot capture one.
+/// for `text/event-stream`; this rule alone would still take a GET naming
+/// both `text/event-stream` and `text/html`, which is why the router asks
+/// [`wants_event_stream`] first - the standby stream is told apart one layer
+/// up, in `is_ui_fetch`, not here.
 pub fn wants_spa(method: &Method, accept: Option<&str>) -> bool {
     if method != Method::GET && method != Method::HEAD {
         return false;
