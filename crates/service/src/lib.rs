@@ -28,6 +28,8 @@ pub mod stub;
 pub mod temp_store;
 mod tool_schema;
 mod toon;
+#[cfg(feature = "fluid-ui")]
+pub mod ui;
 
 /// The name the consolidation sweep is advertised and dispatched under.
 ///

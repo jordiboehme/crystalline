@@ -15,9 +15,16 @@ path = "src/lib.rs"
 # Forwarded to crystalline-index so a `--no-default-features` workspace build
 # drops candle and sqlx while the daemon still compiles and serves text search
 # over Turso.
-default = ["local-embeddings", "postgres"]
+default = ["local-embeddings", "postgres", "fluid-ui"]
 local-embeddings = ["crystalline-index/local-embeddings"]
 postgres = ["crystalline-index/postgres"]
+# The Fluid web bundle, compiled into the binary and served by `serve --http`.
+# On by default so a plain `cargo build` produces the same code paths a release
+# ships; a packager who wants a lean binary drops it with
+# `--no-default-features`. The build script stages `fluid/dist` into `$OUT_DIR`
+# and tolerates its absence, so a clone without node still builds and tests
+# green with this on - the embed is then simply empty.
+fluid-ui = ["dep:rust-embed"]
 
 [dependencies]
 crystalline-core = { workspace = true }
@@ -65,6 +72,8 @@ bytes = { workspace = true }
 # needs its own line.
 diffy = { workspace = true }
 zip = { workspace = true }
+# Optional: the embedded Fluid bundle, behind the `fluid-ui` feature.
+rust-embed = { workspace = true, optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

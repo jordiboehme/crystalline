@@ -50,9 +50,13 @@ restart-after-upgrade = true
 # Forwarded to crystalline-index so `--no-default-features` on the workspace
 # drops candle and sqlx from the binary while everything still compiles and text
 # search, the remote provider and chunking keep working over Turso.
-default = ["local-embeddings", "postgres"]
+default = ["local-embeddings", "postgres", "fluid-ui"]
 local-embeddings = ["crystalline-index/local-embeddings"]
 postgres = ["crystalline-index/postgres"]
+# The embedded Fluid web UI, served by `crystalline serve --http`. Forwarded to
+# crystalline-service the same way the two above are forwarded to the index, so
+# `--no-default-features` on the workspace drops the bundle from the binary.
+fluid-ui = ["crystalline-service/fluid-ui"]
 
 [dependencies]
 crystalline-service = { workspace = true }

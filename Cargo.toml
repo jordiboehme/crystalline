@@ -121,6 +121,21 @@ argon2 = { version = "0.5.3", features = ["std"] }
 # through crates/remote, so the lean deflate backend is the whole need.
 zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
+# The Fluid web bundle, compiled into the binary (crates/service, behind the
+# `fluid-ui` feature). This crate has no default features, and all three named
+# here are load bearing rather than nice to have:
+# `interpolate-folder-path` is what lets the derive read `$OUT_DIR/fluid-dist`
+# (without it the path is taken literally and the build fails), `mime-guess` is
+# what gives `Metadata::mimetype()`, the Content-Type of every served file, and
+# `include-exclude` is what makes the `#[exclude = "*.map"]` attribute compile
+# at all (the derive rejects it otherwise, by name). `sha256_hash()`, the ETag
+# source, needs no feature.
+rust-embed = { version = "8.12", features = [
+    "interpolate-folder-path",
+    "mime-guess",
+    "include-exclude",
+] }
+
 # The OpenAPI document for the REST surface (crates/service). Default features
 # are exactly the `macros` one the `#[utoipa::path]`, `ToSchema` and
 # `IntoParams` attributes need; `preserve_order` stays off, so nothing here can
