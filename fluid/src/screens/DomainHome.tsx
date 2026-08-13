@@ -19,7 +19,7 @@
  */
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router";
 
 import { archiveDownloadUrl, unregisterDomain } from "../api/admin";
@@ -438,12 +438,38 @@ function UnregisterDomain({
   onUnregister: () => void;
 }) {
   const trigger = useRef<HTMLButtonElement>(null);
+  const wasConfirming = useRef(confirming);
 
   /** Give up on the pending unregister, and hand the focus back to what asked. */
   function abandon() {
     onConfirmingChange(false);
     trigger.current?.focus();
   }
+
+  // The safety net for every path that collapses `confirming` without going
+  // through `abandon()` - today that is only the refusal: `unregister`'s
+  // mutation lives in the PARENT (`onError` at DomainHome.tsx), which sets
+  // `confirming` false directly and has no way to reach this ref. Escape and
+  // "Keep" both already call `abandon()` and focus the trigger synchronously,
+  // so by the time this effect runs afterward, focus is already there and
+  // the check below is a no-op for them.
+  //
+  // The body check is the discriminator that keeps the deliberate blur path
+  // honest: that path (the wrapper's own `onBlur`) also collapses
+  // `confirming`, but BECAUSE focus already moved somewhere else on purpose -
+  // stealing it back here would undo that intent. When the confirm buttons
+  // unmount out from under a refusal, the browser drops focus to the
+  // document body, which is exactly what distinguishes "focus was lost" from
+  // "focus moved on purpose".
+  useEffect(() => {
+    if (wasConfirming.current && !confirming) {
+      const active = document.activeElement;
+      if (active === document.body || active === null) {
+        trigger.current?.focus();
+      }
+    }
+    wasConfirming.current = confirming;
+  }, [confirming]);
 
   return (
     <div

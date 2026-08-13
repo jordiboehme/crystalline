@@ -93,10 +93,18 @@ export default function CreateDomainDialogBody({
     onSuccess: (created) => {
       // The listing is the sidebar, the home screen and the switcher, all
       // three, and a domain that was just registered is not in the copy any of
-      // them are holding.
+      // them are holding. Invalidated and closed either way, so an admin
+      // reading the sidebar update never mistakes this for a failed create.
       void queryClient.invalidateQueries({ queryKey: DOMAINS_QUERY_KEY });
       onClose();
-      void navigate(domainRoute(created.domain));
+      // An empty name means the server named nothing and neither did the
+      // request (the reader in api/admin.ts falls back to "" for exactly
+      // that case). The domain was still created - the sidebar now shows it -
+      // while `domainRoute("")` is a route with an empty segment, which is
+      // certainly wrong. Staying put beats navigating to it.
+      if (created.domain !== "") {
+        void navigate(domainRoute(created.domain));
+      }
     },
     onError: (error: Error) => {
       // A 409 (already registered) and a 422 (a name the engine will not take)

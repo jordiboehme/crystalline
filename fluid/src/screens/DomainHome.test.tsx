@@ -566,6 +566,85 @@ describe("the domain screen", () => {
     ).toBeNull();
   });
 
+  it("returns focus to the trigger when a refusal blocks the confirm", async () => {
+    serve(
+      {
+        "/domains/eng": (_path, init) => {
+          if (init?.method === "DELETE") {
+            throw new ApiProblem(
+              409,
+              "conflict",
+              "domain 'eng' is defined by the environment and cannot be unregistered here",
+            );
+          }
+          return domainsResponse();
+        },
+      },
+      "admin",
+    );
+
+    renderApp("/d/eng");
+    const body = await screenBody();
+    const trigger = await within(body).findByRole("button", {
+      name: "Unregister domain",
+    });
+
+    await userEvent.click(trigger);
+    await userEvent.click(
+      within(body).getByRole("button", { name: "Confirm unregister" }),
+    );
+
+    // The refusal lives in the parent's mutation `onError`, which cannot
+    // reach the child's trigger ref; the fix is a transition-aware effect in
+    // the child, not a copy of `abandon()`'s one-liner.
+    const alert = await within(body).findByRole("alert");
+    expect(alert).toHaveTextContent(/cannot be unregistered/);
+    // The confirm buttons unmounted with the refusal, which would otherwise
+    // drop focus to the document body - a keyboard or screen-reader user
+    // loses their place entirely. Identity, not merely "not the trigger":
+    // asserting `document.activeElement` really is `trigger`.
+    expect(document.activeElement).toBe(trigger);
+    // `role="alert"` is already an implicit ARIA live region (assertive), so
+    // the refusal text is announced without the trigger needing to point at
+    // it: the connection decision 26 asks for already exists here.
+    expect(alert).toHaveAttribute("role", "alert");
+  });
+
+  it("leaves focus where the blur path put it, not on the trigger", async () => {
+    serve({}, "admin");
+
+    renderApp("/d/eng");
+    const body = await screenBody();
+    const trigger = await within(body).findByRole("button", {
+      name: "Unregister domain",
+    });
+
+    await userEvent.click(trigger);
+    within(body).getByRole("button", { name: "Confirm unregister" });
+
+    // Shift-tab out of the confirm row entirely: the first hop stays inside
+    // it (trigger to confirm are siblings under the same wrapper), the
+    // second leaves it for "Import archive", the control immediately before
+    // it in the row. That crossing is what the wrapper's own `onBlur`
+    // collapses `confirming` for - deliberately, because focus moved
+    // somewhere else on purpose.
+    await userEvent.tab({ shift: true });
+    await userEvent.tab({ shift: true });
+    const importButton = within(body).getByRole("button", {
+      name: "Import archive",
+    });
+
+    // The counterweight: a fix that steals focus back to the trigger
+    // whenever `confirming` goes false would pass a check that only asserts
+    // "not the trigger" on a jsdom that parks focus on the body mid-blur.
+    // Asserting identity against the actual destination is what catches
+    // that over-reach.
+    expect(document.activeElement).toBe(importButton);
+    expect(
+      within(body).queryByRole("button", { name: "Confirm unregister" }),
+    ).toBeNull();
+  });
+
   it("warns that a virtual domain's engrams go with it", async () => {
     serve(
       {

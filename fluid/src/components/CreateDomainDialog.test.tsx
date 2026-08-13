@@ -286,6 +286,64 @@ describe("registering a domain", () => {
     });
   });
 
+  it("stays put when the report names nothing, rather than navigating to a broken route", async () => {
+    // The real server always defaults a team domain's name to the
+    // repository's own, so a report with no `domain` field should never
+    // actually arrive here - this stands in for a server bug or a future
+    // mode that could omit it, and pins that the dialog does not navigate
+    // into a route built from an empty segment if one ever does.
+    const created = vi.fn(() => ({}));
+    serveAs("admin", {
+      "/settings/github": () => githubStatus(true),
+      "/domains": (_path, init) =>
+        init?.method === "POST" ? created() : domainsResponse(),
+    });
+    renderApp("/users");
+
+    const dialog = await openFromSidebar();
+    await userEvent.click(
+      within(dialog).getByRole("radio", { name: "GitHub team" }),
+    );
+    await userEvent.type(
+      await within(dialog).findByLabelText("Repository"),
+      "acme/kb",
+    );
+    await waitFor(() => {
+      expect(
+        within(dialog).getByRole("button", { name: "Create domain" }),
+      ).toBeEnabled();
+    });
+    const before = listingReads();
+
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Create domain" }),
+    );
+
+    await waitFor(() => {
+      expect(created).toHaveBeenCalled();
+    });
+    // The request carried no name either: team mode leaves it out entirely
+    // when the field is empty.
+    expect(sentBody("/domains", "POST")).toEqual({
+      mode: "github",
+      repo: "acme/kb",
+    });
+    // The domain was still created, so the dialog closes and the listing
+    // every sidebar and switcher draws from is invalidated exactly as a
+    // named create does - nothing here reads as a failure.
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog", { name: /new domain/i })).toBeNull();
+    });
+    await waitFor(() => {
+      expect(listingReads()).toBeGreaterThan(before);
+    });
+    // But there is no navigation: an empty name has no route to navigate to,
+    // so the screen the admin was already on is exactly where they stay.
+    expect(
+      await screen.findByRole("heading", { level: 1, name: "Users" }),
+    ).toBeVisible();
+  });
+
   it("shows a server refusal in its words", async () => {
     serveAs("admin", {
       "/domains": (_path, init) => {
