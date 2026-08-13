@@ -33,6 +33,7 @@ import { NO_SEARCH, fetchSearch, titleMatchesKey } from "../api/search";
 import type { ReferenceState, WikilinkResolver } from "../wikilinks";
 import { WIKILINK, parseWikiTarget, referenceState } from "../wikilinks";
 import { frontmatterRegion } from "./frontmatterRegion";
+import { parseAdvanced } from "./parseProgress";
 import { CODE_CONTEXTS, inCompletableProse } from "./prose";
 
 /**
@@ -176,6 +177,7 @@ const chipsPlugin = ViewPlugin.fromClass(
         update.docChanged ||
         update.selectionSet ||
         update.viewportChanged ||
+        parseAdvanced(update) ||
         // The resolver lands after the buffer does; the chips it was drawn
         // without have to be redrawn when it arrives.
         update.startState.facet(wikilinkResolverFacet) !==

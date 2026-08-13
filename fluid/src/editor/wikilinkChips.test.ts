@@ -19,6 +19,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { EngramRow } from "../api/engrams";
 import { singlePage } from "../api/engrams";
 import { fetchSearch, titleMatchesKey } from "../api/search";
+import { parsedState } from "../test/parse";
 import type { WikilinkResolution } from "../wikilinks";
 import { baseExtensions, docText, lineSeparatorFor } from "./setup";
 import {
@@ -56,18 +57,22 @@ function editor(
   doc = DOC,
 ): EditorView {
   return new EditorView({
+    // `parsedState`, because a chip is drawn off the syntax tree and a new
+    // state's first parse is cut off after 20ms of wall clock.
     // A named separator on every state this file builds, tests included: a
     // buffer that names none rewrites a CRLF document to LF on read-back.
-    state: EditorState.create({
-      doc,
-      selection: EditorSelection.cursor(0),
-      extensions: [
-        ...lineSeparatorFor(doc),
-        ...baseExtensions(false),
-        wikilinkResolverFacet.of(resolve),
-        wikilinkChips(),
-      ],
-    }),
+    state: parsedState(
+      EditorState.create({
+        doc,
+        selection: EditorSelection.cursor(0),
+        extensions: [
+          ...lineSeparatorFor(doc),
+          ...baseExtensions(false),
+          wikilinkResolverFacet.of(resolve),
+          wikilinkChips(),
+        ],
+      }),
+    ),
     parent: document.body,
   });
 }

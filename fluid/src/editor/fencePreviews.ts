@@ -30,6 +30,7 @@ import type { DecorationSet } from "@codemirror/view";
 import { Decoration, EditorView, WidgetType } from "@codemirror/view";
 
 import { mermaidConfig } from "../theme/mermaid";
+import { parseAdvanced } from "./parseProgress";
 
 let mermaidSequence = 0;
 
@@ -475,7 +476,9 @@ export function fencePreviews(dark: boolean): Extension {
   const field = StateField.define<DecorationSet>({
     create: (state) => buildPreviews(state, dark),
     update: (value, tr) =>
-      tr.docChanged ? buildPreviews(tr.state, dark) : value,
+      tr.docChanged || parseAdvanced(tr)
+        ? buildPreviews(tr.state, dark)
+        : value,
     provide: (f) => EditorView.decorations.from(f),
   });
   return [field, previewTheme];

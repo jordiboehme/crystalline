@@ -30,6 +30,7 @@ import {
 import type { SyntaxNodeRef } from "@lezer/common";
 
 import { frontmatterRegion } from "./frontmatterRegion";
+import { parseAdvanced } from "./parseProgress";
 
 /** The formatting marks that fold away off the active lines. */
 const FOLDING_MARKS = new Set([
@@ -203,7 +204,12 @@ const previewPlugin = ViewPlugin.fromClass(
     }
 
     update(update: ViewUpdate) {
-      if (update.docChanged || update.selectionSet || update.viewportChanged) {
+      if (
+        update.docChanged ||
+        update.selectionSet ||
+        update.viewportChanged ||
+        parseAdvanced(update)
+      ) {
         this.decorations = buildDecorations(update.view);
       }
     }

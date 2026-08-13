@@ -12,6 +12,7 @@ import { EditorSelection, EditorState, Text } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { describe, expect, it } from "vitest";
 
+import { parsedState } from "../test/parse";
 import { frontmatterRegion } from "./frontmatterRegion";
 import { livePreview } from "./preview";
 import { baseExtensions, docText, lineSeparatorFor } from "./setup";
@@ -21,16 +22,20 @@ const DOC =
 
 function editor(doc: string, at?: number): EditorView {
   const view = new EditorView({
+    // `parsedState`, because these decorations are read off the syntax tree and
+    // a new state's first parse is cut off after 20ms of wall clock.
     // A named separator on every state this file builds, tests included: a
     // buffer that names none rewrites a CRLF document to LF on read-back.
-    state: EditorState.create({
-      doc,
-      extensions: [
-        ...lineSeparatorFor(doc),
-        ...baseExtensions(false),
-        livePreview(),
-      ],
-    }),
+    state: parsedState(
+      EditorState.create({
+        doc,
+        extensions: [
+          ...lineSeparatorFor(doc),
+          ...baseExtensions(false),
+          livePreview(),
+        ],
+      }),
+    ),
     parent: document.body,
   });
   // The end of the document is asked of the buffer, never of the file string:

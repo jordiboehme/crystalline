@@ -5,11 +5,12 @@
  * own DOM while confirming the buffer itself is untouched.
  */
 
-import { EditorSelection } from "@codemirror/state";
+import { EditorSelection, EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import mermaid from "mermaid";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { parsedState } from "../test/parse";
 import { describeMermaidError, fencePreviews } from "./fencePreviews";
 import { baseExtensions } from "./setup";
 
@@ -42,9 +43,16 @@ afterEach(() => {
 
 function editor(doc: string): EditorView {
   return new EditorView({
-    doc,
-    selection: EditorSelection.cursor(0),
-    extensions: [...baseExtensions(false), fencePreviews(false)],
+    // `parsedState`, because a preview is only drawn under a fence the syntax
+    // tree has closed, and a new state's first parse is cut off after 20ms of
+    // wall clock.
+    state: parsedState(
+      EditorState.create({
+        doc,
+        selection: EditorSelection.cursor(0),
+        extensions: [...baseExtensions(false), fencePreviews(false)],
+      }),
+    ),
     parent: document.body,
   });
 }

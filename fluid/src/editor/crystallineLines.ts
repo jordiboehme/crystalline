@@ -14,6 +14,7 @@ import { Decoration, EditorView, ViewPlugin } from "@codemirror/view";
 
 import type { Vocabulary } from "../api/vocabulary";
 import { frontmatterRegion } from "./frontmatterRegion";
+import { parseAdvanced } from "./parseProgress";
 import { CODE_CONTEXTS, inCompletableProse } from "./prose";
 
 // The literal "- " `top_level_bullet` strips (parse.rs) - not "-\s+": a tab
@@ -120,7 +121,11 @@ const linesPlugin = ViewPlugin.fromClass(
     }
 
     update(update: ViewUpdate) {
-      if (update.docChanged || update.viewportChanged) {
+      if (
+        update.docChanged ||
+        update.viewportChanged ||
+        parseAdvanced(update)
+      ) {
         this.decorations = buildMarks(update.view);
       }
     }

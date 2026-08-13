@@ -17,6 +17,7 @@ import { yCollab } from "y-codemirror.next";
 import { Awareness } from "y-protocols/awareness";
 import * as Y from "yjs";
 
+import { parsedState } from "../test/parse";
 import { baseExtensions, docText, lineSeparatorFor } from "./setup";
 import {
   tableAddColumnAfter,
@@ -43,17 +44,21 @@ function editor(
   extra: unknown[] = [],
 ): EditorView {
   view = new EditorView({
-    state: EditorState.create({
-      doc,
-      selection: EditorSelection.cursor(anchor),
-      // baseExtensions carries the markdown language: the syntax tree is
-      // what decides what a table is, exactly as fencePreviews trusts it.
-      extensions: [
-        ...lineSeparatorFor(doc),
-        ...baseExtensions(false),
-        ...(extra as never[]),
-      ],
-    }),
+    // `parsedState`, because a new state's first parse is cut off after 20ms of
+    // wall clock and a half-parsed table is no table at all here.
+    state: parsedState(
+      EditorState.create({
+        doc,
+        selection: EditorSelection.cursor(anchor),
+        // baseExtensions carries the markdown language: the syntax tree is
+        // what decides what a table is, exactly as fencePreviews trusts it.
+        extensions: [
+          ...lineSeparatorFor(doc),
+          ...baseExtensions(false),
+          ...(extra as never[]),
+        ],
+      }),
+    ),
     parent: document.body,
   });
   return view;
@@ -275,15 +280,17 @@ describe("in a room", () => {
     ytext.insert(0, DOC);
     const awareness = new Awareness(ydoc);
     view = new EditorView({
-      state: EditorState.create({
-        doc: ytext.toJSON(),
-        selection: EditorSelection.cursor(IN_TABLE),
-        extensions: [
-          EditorState.lineSeparator.of("\n"),
-          ...baseExtensions(false),
-          yCollab(ytext, awareness),
-        ],
-      }),
+      state: parsedState(
+        EditorState.create({
+          doc: ytext.toJSON(),
+          selection: EditorSelection.cursor(IN_TABLE),
+          extensions: [
+            EditorState.lineSeparator.of("\n"),
+            ...baseExtensions(false),
+            yCollab(ytext, awareness),
+          ],
+        }),
+      ),
       parent: document.body,
     });
     expect(tableAddColumnAfter(view)).toBe(true);

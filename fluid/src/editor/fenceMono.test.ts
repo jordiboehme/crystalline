@@ -13,6 +13,7 @@ import { EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { afterEach, describe, expect, it } from "vitest";
 
+import { parsedState } from "../test/parse";
 import { fenceMono } from "./fenceMono";
 import { baseExtensions } from "./setup";
 
@@ -43,10 +44,14 @@ afterEach(() => {
 
 function open(): EditorView {
   const view = new EditorView({
-    state: EditorState.create({
-      doc: DOC,
-      extensions: [...baseExtensions(false), fenceMono()],
-    }),
+    // `parsedState`, because the fence lines are read off the syntax tree and
+    // a new state's first parse is cut off after 20ms of wall clock.
+    state: parsedState(
+      EditorState.create({
+        doc: DOC,
+        extensions: [...baseExtensions(false), fenceMono()],
+      }),
+    ),
     parent: document.body,
   });
   views.push(view);

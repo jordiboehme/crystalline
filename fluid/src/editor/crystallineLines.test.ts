@@ -4,6 +4,7 @@ import { EditorView } from "@codemirror/view";
 import { describe, expect, it } from "vitest";
 
 import type { Vocabulary } from "../api/vocabulary";
+import { parsedState } from "../test/parse";
 import { crystallineCompletions, crystallineLines } from "./crystallineLines";
 import { baseExtensions } from "./setup";
 
@@ -25,14 +26,30 @@ const VOCAB: Vocabulary = {
   ],
 };
 
+/**
+ * A mounted editor over `doc`.
+ *
+ * The state goes through `parsedState` first: these marks are read off the
+ * syntax tree, and a new state's first parse is cut off after 20ms of wall
+ * clock, which on a loaded machine leaves a fence unclosed and the lines
+ * inside it decorated as if they were prose.
+ */
+function mount(doc: string): EditorView {
+  return new EditorView({
+    state: parsedState(
+      EditorState.create({
+        doc,
+        selection: EditorSelection.cursor(0),
+        extensions: [...baseExtensions(false), crystallineLines()],
+      }),
+    ),
+    parent: document.body,
+  });
+}
+
 describe("line affordances", () => {
   it("marks the category, the rel type and the tags", () => {
-    const view = new EditorView({
-      doc: DOC,
-      selection: EditorSelection.cursor(0),
-      extensions: [...baseExtensions(false), crystallineLines()],
-      parent: document.body,
-    });
+    const view = mount(DOC);
     expect(view.dom.querySelector(".cm-obs-category")?.textContent).toBe(
       "[decision]",
     );
@@ -51,12 +68,7 @@ describe("grammar fidelity", () => {
   it("draws nothing for an observation or relation line inside a fence", () => {
     const doc =
       "---\nt: x\n---\n\n- [decision] outside the fence #tag\n\n```\n- [decision] inside the fence #tag\n- relates_to [[Beta]]\n```\n";
-    const view = new EditorView({
-      doc,
-      selection: EditorSelection.cursor(0),
-      extensions: [...baseExtensions(false), crystallineLines()],
-      parent: document.body,
-    });
+    const view = mount(doc);
     const categories = [...view.dom.querySelectorAll(".cm-obs-category")].map(
       (el) => el.textContent,
     );
@@ -75,12 +87,7 @@ describe("grammar fidelity", () => {
   it("does not draw for a bullet the server's literal '- ' prefix would reject", () => {
     const doc =
       "---\nt: x\n---\n\n-  [decision] two spaces\n-\t[decision] a tab\n-  relates_to [[Beta]]\n";
-    const view = new EditorView({
-      doc,
-      selection: EditorSelection.cursor(0),
-      extensions: [...baseExtensions(false), crystallineLines()],
-      parent: document.body,
-    });
+    const view = mount(doc);
     expect(view.dom.querySelector(".cm-obs-category")).toBeNull();
     expect(view.dom.querySelector(".cm-rel-type")).toBeNull();
     view.destroy();
@@ -89,12 +96,7 @@ describe("grammar fidelity", () => {
   it("recognizes a quoted relation type and a mixed-case bare one", () => {
     const doc =
       '---\nt: x\n---\n\n- "relates to" [[Beta]]\n- SupersedesV2 [[Gamma]]\n';
-    const view = new EditorView({
-      doc,
-      selection: EditorSelection.cursor(0),
-      extensions: [...baseExtensions(false), crystallineLines()],
-      parent: document.body,
-    });
+    const view = mount(doc);
     const relTypes = [...view.dom.querySelectorAll(".cm-rel-type")].map(
       (el) => el.textContent,
     );
@@ -128,11 +130,13 @@ async function completionsInParsed(
   doc: string,
   at: number,
 ): Promise<string[] | null> {
-  const state = EditorState.create({
-    doc,
-    selection: EditorSelection.cursor(at),
-    extensions: baseExtensions(false),
-  });
+  const state = parsedState(
+    EditorState.create({
+      doc,
+      selection: EditorSelection.cursor(at),
+      extensions: baseExtensions(false),
+    }),
+  );
   const result = await crystallineCompletions(() => VOCAB)(
     new CompletionContext(state, at, false),
   );

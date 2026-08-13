@@ -33,6 +33,8 @@ import { StateField } from "@codemirror/state";
 import type { DecorationSet } from "@codemirror/view";
 import { Decoration, EditorView } from "@codemirror/view";
 
+import { parseAdvanced } from "./parseProgress";
+
 /** The class one line of code wears. */
 const FENCE_LINE = Decoration.line({ class: "cm-fence-mono" });
 
@@ -87,7 +89,8 @@ const fenceMonoTheme = EditorView.baseTheme({
 export function fenceMono(): Extension {
   const field = StateField.define<DecorationSet>({
     create: (state) => buildFenceLines(state),
-    update: (value, tr) => (tr.docChanged ? buildFenceLines(tr.state) : value),
+    update: (value, tr) =>
+      tr.docChanged || parseAdvanced(tr) ? buildFenceLines(tr.state) : value,
     provide: (f) => EditorView.decorations.from(f),
   });
   return [field, fenceMonoTheme];
