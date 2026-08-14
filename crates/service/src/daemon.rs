@@ -15,6 +15,7 @@ use crystalline_core::config::{self, GlobalConfig, HttpSetting};
 use crystalline_index::{HostClaim, Store};
 use interprocess::local_socket::tokio::Stream as IpcStream;
 use notify::{RecursiveMode, Watcher};
+use rmcp::transport::streamable_http_server::session::{ServerSseMessage, SessionId};
 use serde_json::Value;
 use tokio::sync::{Mutex as TokioMutex, watch};
 
@@ -869,8 +870,166 @@ fn setup_token_lines(addr: &str, token: &str) -> [String; 2] {
 /// the router does not claim is answered by.
 type McpService = rmcp::transport::streamable_http_server::tower::StreamableHttpService<
     McpServer,
-    rmcp::transport::streamable_http_server::session::local::LocalSessionManager,
+    CountingSessions<rmcp::transport::streamable_http_server::session::local::LocalSessionManager>,
 >;
+
+/// A session manager that counts the sessions it creates, wrapping the real
+/// one and delegating everything else untouched.
+///
+/// # Why the count cannot live in the service factory
+///
+/// It used to. `StreamableHttpService` calls that factory through
+/// `get_service()`, and rmcp 3.1.2 calls `get_service()` at five sites
+/// (`transport/streamable_http_server/tower.rs:1280`, `:1426`, `:1822`,
+/// `:1855`, `:1948`) of which exactly one - `:1855`, immediately before
+/// `session_manager.create_session()` - is a session:
+///
+/// | site | what it is |
+/// |---|---|
+/// | `:1280` | `tool_schema()`, the SEP-2243 header-validation cache, one construction per distinct tool name |
+/// | `:1426` | the external session-store restore replay, unreachable here (we configure no `session_store`) |
+/// | `:1822` | the stateless `server/discover` branch |
+/// | `:1855` | **legacy session creation** |
+/// | `:1948` | **every** stateless POST |
+///
+/// So a counter incremented in the factory was reporting session creations plus
+/// stateless requests plus schema-cache misses under the name `http_sessions`.
+/// Two of the four non-session sites are reachable on the tree as it stands,
+/// which is why this is a fix rather than a note for later: a modern-shaped
+/// sessionless POST at an advertised revision is served today, and
+/// `validate_standard_headers` arms on the **client's** `MCP-Protocol-Version`
+/// header rather than on our advertised set (`tower.rs:678-684`), so a
+/// `tools/call` naming 2026-07-28 reaches the schema cache before the request
+/// is refused. `tests/http_stream.rs::http_sessions_counts_sessions_rather_than_service_constructions`
+/// is the guard.
+///
+/// # What the number means, and what it will stop meaning
+///
+/// A session, in this transport, is the legacy `Mcp-Session-Id` lifecycle. From
+/// 2026-07-28 there are none: modern peers route statelessly by design, so once
+/// that revision is advertised this counter reports only the legacy clients
+/// still connecting. That is the honest reading of the name it already has; a
+/// figure covering modern traffic would be a different metric, not a repair of
+/// this one.
+pub(crate) struct CountingSessions<M> {
+    inner: M,
+    created: Arc<AtomicUsize>,
+}
+
+impl<M> CountingSessions<M> {
+    fn new(inner: M, created: Arc<AtomicUsize>) -> CountingSessions<M> {
+        CountingSessions { inner, created }
+    }
+}
+
+impl<M: rmcp::transport::streamable_http_server::session::SessionManager>
+    rmcp::transport::streamable_http_server::session::SessionManager for CountingSessions<M>
+{
+    type Error = M::Error;
+    type Transport = M::Transport;
+
+    async fn create_session(&self) -> Result<(SessionId, Self::Transport), Self::Error> {
+        let created = self.inner.create_session().await?;
+        self.created.fetch_add(1, Ordering::Relaxed);
+        Ok(created)
+    }
+
+    fn initialize_session(
+        &self,
+        id: &SessionId,
+        message: rmcp::model::ClientJsonRpcMessage,
+    ) -> impl Future<Output = Result<rmcp::model::ServerJsonRpcMessage, Self::Error>> + Send {
+        self.inner.initialize_session(id, message)
+    }
+
+    fn has_session(
+        &self,
+        id: &SessionId,
+    ) -> impl Future<Output = Result<bool, Self::Error>> + Send {
+        self.inner.has_session(id)
+    }
+
+    fn close_session(
+        &self,
+        id: &SessionId,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        self.inner.close_session(id)
+    }
+
+    fn create_stream(
+        &self,
+        id: &SessionId,
+        message: rmcp::model::ClientJsonRpcMessage,
+    ) -> impl Future<
+        Output = Result<
+            impl futures::Stream<Item = ServerSseMessage> + Send + Sync + 'static,
+            Self::Error,
+        >,
+    > + Send {
+        self.inner.create_stream(id, message)
+    }
+
+    fn accept_message(
+        &self,
+        id: &SessionId,
+        message: rmcp::model::ClientJsonRpcMessage,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        self.inner.accept_message(id, message)
+    }
+
+    fn create_standalone_stream(
+        &self,
+        id: &SessionId,
+    ) -> impl Future<
+        Output = Result<
+            impl futures::Stream<Item = ServerSseMessage> + Send + Sync + 'static,
+            Self::Error,
+        >,
+    > + Send {
+        self.inner.create_standalone_stream(id)
+    }
+
+    fn resume(
+        &self,
+        id: &SessionId,
+        last_event_id: String,
+    ) -> impl Future<
+        Output = Result<
+            impl futures::Stream<Item = ServerSseMessage> + Send + Sync + 'static,
+            Self::Error,
+        >,
+    > + Send {
+        self.inner.resume(id, last_event_id)
+    }
+
+    /// A restore allocates a fresh in-memory session worker, so a genuine
+    /// restore counts and the other two outcomes do not. Unreachable while no
+    /// `session_store` is configured (`tower.rs:1351-1355` returns before
+    /// calling this), and counted anyway so configuring one later cannot
+    /// silently make the number wrong again.
+    async fn restore_session(
+        &self,
+        id: SessionId,
+    ) -> Result<
+        rmcp::transport::streamable_http_server::session::RestoreOutcome<Self::Transport>,
+        Self::Error,
+    > {
+        let outcome = self.inner.restore_session(id).await?;
+        if matches!(
+            outcome,
+            rmcp::transport::streamable_http_server::session::RestoreOutcome::Restored(_)
+        ) {
+            self.created.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(outcome)
+    }
+
+    fn event_store(
+        &self,
+    ) -> Option<Arc<dyn rmcp::transport::streamable_http_server::session::EventStore>> {
+        self.inner.event_store()
+    }
+}
 
 /// Build the router the HTTP endpoint mounts. Three citizens share the one port,
 /// in this precedence:
@@ -1059,7 +1218,10 @@ fn http_base(
     // `#[non_exhaustive]` and only reachable through the `Default` instance.
     let mut session_manager = LocalSessionManager::default();
     session_manager.session_config.sse_retry = None;
-    let session_manager = Arc::new(session_manager);
+    // The counter lives here rather than in the factory below, so it counts
+    // sessions rather than every construction rmcp asks for; see
+    // [`CountingSessions`].
+    let session_manager = Arc::new(CountingSessions::new(session_manager, http_sessions));
     // The REST state is built only when the API is served. It is not free (it
     // resolves paths and can fail), and building it to then leave it unmounted
     // would mean `service.api=false` could still fail a start over a surface
@@ -1072,10 +1234,7 @@ fn http_base(
         None
     };
     let service = StreamableHttpService::new(
-        move || {
-            http_sessions.fetch_add(1, Ordering::Relaxed);
-            Ok(McpServer::new_http(engine.clone()))
-        },
+        move || Ok(McpServer::new_http(engine.clone())),
         session_manager,
         http_config(allowed_hosts),
     );

@@ -58,13 +58,20 @@ async fn build_engine() -> (tempfile::TempDir, Arc<Engine>) {
 /// Bind `http_router` on an ephemeral loopback port and serve it on a
 /// background task for the duration of the test.
 async fn spawn_router() -> std::net::SocketAddr {
+    spawn_router_counting().await.0
+}
+
+/// As [`spawn_router`], handing back the `http_sessions` counter the daemon
+/// reports through `ctl status` so a test can read it between requests.
+async fn spawn_router_counting() -> (std::net::SocketAddr, Arc<AtomicUsize>) {
     let (_tmp, engine) = build_engine().await;
     let auth = Arc::new(
         crystalline_service::rest::AuthStore::open(&_tmp.path().join("web-auth.db"))
             .await
             .unwrap(),
     );
-    let router = http_router(engine, Arc::new(AtomicUsize::new(0)), &[], auth, None).unwrap();
+    let sessions = Arc::new(AtomicUsize::new(0));
+    let router = http_router(engine, sessions.clone(), &[], auth, None).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -81,7 +88,7 @@ async fn spawn_router() -> std::net::SocketAddr {
         .await
         .unwrap();
     });
-    addr
+    (addr, sessions)
 }
 
 /// Send one raw HTTP/1.1 POST over a fresh connection and read back whatever
@@ -372,7 +379,23 @@ async fn post_with_standard_headers(
     version: &str,
     method: &str,
 ) -> String {
+    post_with_named_headers(addr, body, version, method, None).await
+}
+
+/// [`post_with_standard_headers`] plus the `Mcp-Name` header the methods that
+/// name a thing require.
+async fn post_with_named_headers(
+    addr: std::net::SocketAddr,
+    body: &str,
+    version: &str,
+    method: &str,
+    name: Option<&str>,
+) -> String {
     let mut stream = TcpStream::connect(addr).await.unwrap();
+    let named = match name {
+        Some(name) => format!("Mcp-Name: {name}\r\n"),
+        None => String::new(),
+    };
     let request = format!(
         "POST / HTTP/1.1\r\n\
          Host: 127.0.0.1\r\n\
@@ -380,6 +403,7 @@ async fn post_with_standard_headers(
          Accept: application/json, text/event-stream\r\n\
          MCP-Protocol-Version: {version}\r\n\
          Mcp-Method: {method}\r\n\
+         {named}\
          Connection: close\r\n\
          Content-Length: {}\r\n\r\n{body}",
         body.len()
@@ -517,8 +541,9 @@ async fn the_wire_format_baseline_the_conformance_tasks_measure_against() {
             .unwrap()
             .len(),
         0,
-        "rmcp's default list_resource_templates, which Task 7 has to override for \
-         its cache hints (handler/server.rs:383-393)"
+        "this server serves no resource templates; the endpoint is overridden \
+         rather than inherited only because rmcp's default answers one of the \
+         six cache-hint operations with no hints (handler/server.rs:387-395)"
     );
     let prompts = list(5, "prompts/list").await;
     assert_eq!(
@@ -527,13 +552,40 @@ async fn the_wire_format_baseline_the_conformance_tasks_measure_against() {
         "connector and onboarding"
     );
 
-    // No caching hints anywhere yet. The 2026-07-28 revision makes them a MUST
-    // on six operations; Task 7 adds them and every one of these four flips.
+    let read = payload(
+        &post(
+            addr,
+            r#"{"jsonrpc":"2.0","id":11,"method":"resources/read","params":{"uri":"skill://crystalline-routing/SKILL.md"}}"#,
+            Some(&session_id),
+        )
+        .await,
+    );
+    assert!(
+        read["result"]["contents"][0]["text"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()),
+        "a skill reads back: {read}"
+    );
+
+    // **No caching hints on this session, now or ever.** An earlier version of
+    // this comment predicted that Task 7 would flip all four; it does not, and
+    // the reason is the assertion rather than an omission. SEP-2549's hints
+    // (`ttlMs`, `cacheScope`) and SEP-2322's `resultType` are 2026-07-28 wire
+    // shape, and this is a 2025-06-18 session: rmcp strips `resultType` for a
+    // peer below the era (`handler/server.rs:246-260`) and our own
+    // `CacheHinted` gate withholds the other two on the same test
+    // (`RequestContext::protocol_version()`). Emitting them here would be
+    // inventing wire shape for a revision that has none, so these five stay
+    // absent for the whole program. What moves when the era is advertised is a
+    // **new** modern-peer leg, not these lines; `tests/mcp_cache_hints.rs`
+    // holds that half today, and explains why it cannot yet be driven over a
+    // wire.
     for (label, result) in [
         ("tools/list", &tools),
         ("resources/list", &resources),
         ("resources/templates/list", &templates),
         ("prompts/list", &prompts),
+        ("resources/read", &read),
     ] {
         let object = result["result"].as_object().unwrap();
         for hint in ["resultType", "ttlMs", "cacheScope"] {
@@ -652,4 +704,102 @@ async fn the_wire_format_baseline_the_conformance_tasks_measure_against() {
     )
     .await;
     assert!(over.starts_with("HTTP/1.1 413 Payload Too Large"));
+}
+
+/// **`http_sessions` counts sessions, not service constructions.**
+///
+/// `Shared::http_session_count` (`daemon.rs`) is reported as `http_sessions` by
+/// the daemon's `ctl status`, and its only writer used to be the service
+/// factory `StreamableHttpService::new` is handed. That factory is
+/// `get_service()`, which rmcp 3.1.2 calls at five sites
+/// (`tower.rs:1280`, `:1426`, `:1822`, `:1855`, `:1948`) and only one of them
+/// - `:1855` - creates a session. The other four are the SEP-2243 tool-schema
+/// cache, the external-store restore replay, the stateless `server/discover`
+/// branch and **every stateless POST**, so the counter was reading a number
+/// with no name.
+///
+/// Two of the four are reachable on the tree as it stands, which is why this is
+/// a genuine red rather than a note for the task that advertises the era:
+///
+/// - a sessionless modern-shaped POST at an advertised revision is served
+///   statelessly today (the baseline above pins that it works), and took the
+///   `:1948` construction with it;
+/// - `validate_standard_headers` arms on the **client's**
+///   `MCP-Protocol-Version` header rather than on our advertised set
+///   (`tower.rs:678-684`), so a `tools/call` whose header names 2026-07-28
+///   reaches the tool-schema cache at `:1280` before the request is refused
+///   `-32022` for a version we do not serve. That one POST used to move the
+///   counter twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_sessions_counts_sessions_rather_than_service_constructions() {
+    let (addr, sessions) = spawn_router_counting().await;
+    let count = || sessions.load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(count(), 0, "nothing has connected yet");
+
+    // A legacy handshake is a session, and is the one thing that should count.
+    let init = post(addr, &init_body("2025-06-18"), None).await;
+    let session_id = extract_session_id(&init);
+    assert_eq!(count(), 1, "the legacy handshake created one session");
+
+    // Further requests on that session reuse the session worker.
+    let _ = post(
+        addr,
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        Some(&session_id),
+    )
+    .await;
+    let _ = post(
+        addr,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
+        Some(&session_id),
+    )
+    .await;
+    assert_eq!(count(), 1, "requests on a live session create no session");
+
+    // A sessionless modern-shaped request at a revision we serve. It is
+    // answered (the baseline pins the 200 and the tool count), it is by
+    // definition not a session - no `Mcp-Session-Id` is presented and none is
+    // returned - and it must not move the counter.
+    let stateless = post_with_standard_headers(
+        addr,
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2025-11-25","io.modelcontextprotocol/clientCapabilities":{}}}}"#,
+        "2025-11-25",
+        "tools/list",
+    )
+    .await;
+    assert!(
+        stateless.starts_with("HTTP/1.1 200 OK"),
+        "the stateless request is served:\n{}",
+        head_of(&stateless)
+    );
+    assert_eq!(
+        count(),
+        1,
+        "a stateless POST is not a session:\n{}",
+        head_of(&stateless)
+    );
+
+    // A `tools/call` whose header declares the era reaches the SEP-2243
+    // tool-schema cache during header validation, then is refused because we
+    // do not serve that revision yet. Neither step is a session.
+    let schema_probe = post_with_named_headers(
+        addr,
+        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"search_engrams","arguments":{"query":"anything"},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}"#,
+        "2026-07-28",
+        "tools/call",
+        Some("search_engrams"),
+    )
+    .await;
+    assert_eq!(
+        payload(&schema_probe)["error"]["code"],
+        -32022,
+        "the era is not advertised yet, so the call is refused:\n{}",
+        head_of(&schema_probe)
+    );
+    assert_eq!(
+        count(),
+        1,
+        "neither the schema cache nor the refusal is a session:\n{}",
+        head_of(&schema_probe)
+    );
 }

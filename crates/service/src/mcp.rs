@@ -175,12 +175,12 @@ use std::sync::Arc;
 use rmcp::handler::server::prompt::PromptContext;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, ContentBlock, DiscoverResult, ErrorData, GetPromptRequestParams,
+    CacheScope, CallToolResult, ContentBlock, DiscoverResult, ErrorData, GetPromptRequestParams,
     GetPromptResponse, Implementation, InitializeRequestParams, InitializeResult,
-    ListPromptsResult, ListResourcesResult, ListToolsResult, PaginatedRequestParams,
-    ProgressNotificationParam, PromptMessage, ProtocolVersion, ReadResourceRequestParams,
-    ReadResourceResponse, ReadResourceResult, Resource, ResourceContents, Role, ServerCapabilities,
-    ServerInfo, SubscriptionFilter, Tool,
+    ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, ListToolsResult,
+    PaginatedRequestParams, ProgressNotificationParam, PromptMessage, ProtocolVersion,
+    ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
+    ResourceContents, Role, ServerCapabilities, ServerInfo, SubscriptionFilter, Tool,
 };
 use rmcp::service::{RequestContext, SubscriptionContext};
 use rmcp::{RoleServer, ServerHandler, prompt, prompt_router, tool, tool_handler, tool_router};
@@ -220,12 +220,14 @@ fn is_write_tool(name: &str) -> bool {
 /// learns a new revision fails the build and asks for the decision instead of
 /// taking it.
 ///
-/// **The top is a decision.** `V_2026_07_28` is deliberately absent: that
+/// **The top is a decision.** `V_2026_07_28` is deliberately absent. That
 /// revision makes list endpoints connection-invariant, moves `instructions` to
 /// `server/discover`, restricts `tools/list_changed` to subscribers and requires
-/// cache hints, none of which this server does yet. Advertising it would be a
-/// false claim. Tasks 4 to 7 of the rmcp 3.x migration implement those four, and
-/// Task 9 adds the constant here.
+/// caching hints on six operations. All four are implemented now - see
+/// [`McpServer::list_tools`], [`McpServer::discover`], [`McpServer::listen`] and
+/// [`CacheHinted`] - and what remains before the constant is added here is the
+/// `server/discover` probe on the stdio bridge (`crate::client`), which still
+/// answers a probing client that this server is legacy.
 ///
 /// **The bottom is deliberately NOT a decision.** `V_2024_11_05` is served today
 /// and stays served: rmcp branches nowhere between it and `V_2025_11_25`
@@ -249,6 +251,97 @@ fn newest_served_protocol_version() -> ProtocolVersion {
         .expect("SERVED_PROTOCOL_VERSIONS is never empty")
         .clone()
 }
+
+/// How long a cacheable result may be treated as fresh, in milliseconds.
+///
+/// Zero, which is what rmcp's own `#[tool_handler]` and `#[prompt_handler]`
+/// macros emit for the endpoints they generate
+/// (`rmcp-macros-3.1.2/src/tool_handler.rs:79-81`,
+/// `prompt_handler.rs:71-73`). Deliberately the same number: a hand-written
+/// endpoint and a generated one must be indistinguishable on the wire, and a
+/// server that names a longer window is promising something about a future it
+/// does not control - a daemon restart with different configuration serves a
+/// different list.
+const CACHE_TTL_MS: u64 = 0;
+
+/// Who may cache a result of ours.
+///
+/// [`CacheScope::Public`] is truthful rather than convenient, and it became
+/// truthful only once the list endpoints stopped varying per connection: every
+/// list this server answers is decided before the first request from
+/// deployment configuration and machine state, never from who is asking, and
+/// none of it varies by the authorization presented on the request - which is
+/// the one variation SEP-2567 explicitly permits and the one that would force
+/// `private`. The shipped skills a `resources/read` returns are static copy
+/// compiled into this binary.
+const CACHE_SCOPE: CacheScope = CacheScope::Public;
+
+/// Whether the peer this request belongs to gets SEP-2549 caching hints.
+///
+/// The gate is [`RequestContext::protocol_version`] (rmcp 3.1.2
+/// `service.rs:1223-1229`: the request's own `_meta` version first, then the
+/// version the peer negotiated), compared with `>=` exactly as rmcp's macros
+/// compare it. `>=` rather than `==` on purpose: `ProtocolVersion` derives
+/// `PartialOrd` over its string (`model.rs:153-155`) and ISO dates order
+/// lexicographically, so a revision newer than 2026-07-28 keeps the obligation
+/// instead of silently losing it.
+///
+/// The fields did not exist before 2026-07-28, so the negative half matters as
+/// much as the positive one: emitting them to a legacy peer would be inventing
+/// wire shape for a revision that has none.
+fn peer_gets_cache_hints(context: &RequestContext<RoleServer>) -> bool {
+    context
+        .protocol_version()
+        .is_some_and(|version| version >= ProtocolVersion::V_2026_07_28)
+}
+
+/// Attach the SEP-2549 caching hints a modern peer is owed, and nothing to a
+/// legacy one.
+///
+/// **The obligation, quoted, because six operations is not five call sites.**
+/// `/server/utilities/caching`: "Servers MUST include caching hints on results
+/// with `resultType: "complete"` returned by the following operations:
+/// `server/discover`, `tools/list`, `prompts/list`, `resources/list`,
+/// `resources/templates/list`, `resources/read`." `ttlMs` MUST be `>= 0` and
+/// `cacheScope` is required because there is no safe default.
+///
+/// `server/discover` is the one operation nobody has to call this for: rmcp's
+/// `DiscoverResult::from_server_info` sets `ttl_ms: 0` and
+/// `cache_scope: Private` on non-optional fields (rmcp 3.1.2
+/// `model.rs:1258-1263`), and [`McpServer::discover`] builds through it. The
+/// other five are ours, on both this server and [`crate::stub::DegradedServer`],
+/// including the ones neither of them writes by hand: rmcp's default
+/// `list_resource_templates`, `list_resources` and `list_prompts`
+/// (`handler/server.rs:373-395`) all return an empty **complete** result with
+/// no hints, and `Service::handle_request` (`:50-245`) dispatches every method
+/// regardless of the capabilities `get_info` advertises. An un-advertised
+/// capability is therefore not a defence against this MUST; an override is.
+pub(crate) trait CacheHinted: Sized {
+    /// Set both hints, or neither.
+    fn with_cache_hints(self, context: &RequestContext<RoleServer>) -> Self;
+}
+
+macro_rules! impl_cache_hinted {
+    ($($t:ty),+ $(,)?) => {
+        $(impl CacheHinted for $t {
+            fn with_cache_hints(self, context: &RequestContext<RoleServer>) -> Self {
+                if peer_gets_cache_hints(context) {
+                    self.with_ttl_ms(CACHE_TTL_MS).with_cache_scope(CACHE_SCOPE)
+                } else {
+                    self
+                }
+            }
+        })+
+    };
+}
+
+impl_cache_hinted!(
+    ListToolsResult,
+    ListPromptsResult,
+    ListResourcesResult,
+    ListResourceTemplatesResult,
+    ReadResourceResult,
+);
 
 /// The five GitHub collaboration tools, gated on the engine's live
 /// `github.enabled` setting (all but `configure`) and `read_only` flag (see
@@ -1620,7 +1713,7 @@ impl ServerHandler for McpServer {
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
         let read_only = self.engine.read_only();
         let skills_hidden =
@@ -1647,7 +1740,7 @@ impl ServerHandler for McpServer {
         for tool in &mut tools {
             crate::tool_schema::sanitize_tool(tool);
         }
-        Ok(ListToolsResult::with_all_items(tools))
+        Ok(ListToolsResult::with_all_items(tools).with_cache_hints(&context))
     }
 
     /// Resolve a tool definition by name, hiding exactly what `list_tools`
@@ -1685,10 +1778,10 @@ impl ServerHandler for McpServer {
     async fn list_resources(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, ErrorData> {
         if hidden_skills_surface(self.engine.skills_serve(), self.harness_onboarded) {
-            return Ok(ListResourcesResult::with_all_items(Vec::new()));
+            return Ok(ListResourcesResult::with_all_items(Vec::new()).with_cache_hints(&context));
         }
         let resources = SKILL_ASSETS
             .iter()
@@ -1698,7 +1791,22 @@ impl ServerHandler for McpServer {
                     .with_mime_type(SKILL_MIME_TYPE)
             })
             .collect();
-        Ok(ListResourcesResult::with_all_items(resources))
+        Ok(ListResourcesResult::with_all_items(resources).with_cache_hints(&context))
+    }
+
+    /// This server serves no resource templates, and answering the method is
+    /// still work: rmcp's default returns `ListResourceTemplatesResult::default()`
+    /// (rmcp 3.1.2 `handler/server.rs:387-395`), which is a **complete** result
+    /// with no caching hints on one of the six operations SEP-2549 names. So
+    /// the override exists for the hints alone, and the empty list is rmcp's
+    /// answer unchanged. See [`CacheHinted`] for why an un-advertised or empty
+    /// surface is not a defence against that MUST.
+    async fn list_resource_templates(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListResourceTemplatesResult, ErrorData> {
+        Ok(ListResourceTemplatesResult::with_all_items(Vec::new()).with_cache_hints(&context))
     }
 
     /// Read one shipped skill by its resource uri. Like every hidden tool,
@@ -1709,12 +1817,13 @@ impl ServerHandler for McpServer {
     async fn read_resource(
         &self,
         request: ReadResourceRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResponse, ErrorData> {
         match skill_for_uri(&request.uri) {
             Some(asset) => Ok(ReadResourceResult::new(vec![
                 ResourceContents::text(asset.content, &request.uri).with_mime_type(SKILL_MIME_TYPE),
             ])
+            .with_cache_hints(&context)
             .into()),
             None => Err(ErrorData::invalid_params(
                 format!(
@@ -1734,14 +1843,14 @@ impl ServerHandler for McpServer {
     async fn list_prompts(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ListPromptsResult, ErrorData> {
         let prompts = if hidden_skills_surface(self.engine.skills_serve(), self.harness_onboarded) {
             Vec::new()
         } else {
             Self::prompt_router().list_all()
         };
-        Ok(ListPromptsResult::with_all_items(prompts))
+        Ok(ListPromptsResult::with_all_items(prompts).with_cache_hints(&context))
     }
 
     /// Render one prompt through the macro-declared router. Answers while the
