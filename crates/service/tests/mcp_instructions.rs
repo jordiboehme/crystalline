@@ -12,10 +12,9 @@
 //! the virtual-domain bullets appear only because `scaffold_virtual_manifest`
 //! refreshes the cache itself, which is exactly the write-side hook under test.
 //!
-//! The last section covers the receipt-aware variant: `connect_as` drives the
-//! handshake with a chosen `clientInfo.name` over a chosen transport, against
-//! a server pointed at a stand-in install receipt, which is exactly the three
-//! inputs the `auto` value of `skills.serve` decides on.
+//! The last sections cover the two things the block's delivery depends on:
+//! the onboarding decision the spawned process resolved before the session
+//! started (`connect_as`), and the arrival path each protocol revision uses.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -57,6 +56,20 @@ impl Harness {
         virtual_domains: &[&str],
         read_only: bool,
     ) -> Harness {
+        Harness::build_with(file_domains, virtual_domains, read_only, None).await
+    }
+
+    /// As [`Harness::build`], with `skills.serve` written into the config
+    /// before the engine is built. That is the only way to change the value
+    /// the server reads: it is snapshotted at engine construction, so a
+    /// `configure` on a live engine saves the setting for the next start
+    /// rather than moving anything now.
+    async fn build_with(
+        file_domains: &[(&str, &[&str])],
+        virtual_domains: &[&str],
+        read_only: bool,
+        skills_serve: Option<&str>,
+    ) -> Harness {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();
         let config_path = root.join("config.yaml");
@@ -73,6 +86,9 @@ impl Harness {
             config
                 .domains
                 .insert(name.to_string(), DomainEntry::virtual_domain());
+        }
+        if let Some(value) = skills_serve {
+            crystalline_service::settings::apply(&mut config, "skills.serve", value).unwrap();
         }
         crystalline_core::config::save_yaml(&config_path, &config).unwrap();
 
@@ -115,13 +131,17 @@ impl Harness {
         (client, server)
     }
 
-    /// Open one connection whose client announces itself as `client_name` in
-    /// the `initialize` handshake, against a server built for `transport` and
-    /// pointed at this harness's own install receipt. That is everything the
-    /// receipt-aware `auto` behaviour reads.
+    /// Open one connection over `transport`, served with `onboarded` as the
+    /// answer the spawned process resolved before the session started.
+    ///
+    /// **The HTTP arm ignores `onboarded`, and that is the asymmetry rather
+    /// than a shortcut in the test.** One daemon serves every HTTP connection,
+    /// a remote client never ran `crystalline install` on this machine and
+    /// there is no per-client process to resolve anything, so the flag is
+    /// never set there and an HTTP client is never suppressed.
     async fn connect_as(
         &self,
-        client_name: &str,
+        onboarded: bool,
         transport: ServedTransport,
     ) -> (
         RunningService<RoleClient, ClientInfo>,
@@ -129,16 +149,15 @@ impl Harness {
     ) {
         let (client_io, server_io) = tokio::io::duplex(1 << 16);
         let engine = self.engine.clone();
-        let receipt = self.receipt_path();
         let server_task = tokio::spawn(async move {
             let server = match transport {
-                ServedTransport::Stdio => McpServer::new(engine),
+                ServedTransport::Stdio => McpServer::new(engine).with_onboarded_harness(onboarded),
                 ServedTransport::Http => McpServer::new_http(engine),
             };
-            rmcp::serve_server(server.with_install_receipt(receipt), server_io).await
+            rmcp::serve_server(server, server_io).await
         });
         let mut info = ClientInfo::default();
-        info.client_info = Implementation::new(client_name, "1.2.3");
+        info.client_info = Implementation::new("mcp-test-client", "1.2.3");
         let client = rmcp::serve_client(info, client_io).await.unwrap();
         let server = server_task.await.unwrap().unwrap();
         (client, server)
@@ -166,23 +185,6 @@ impl Harness {
         drop(client);
         drop(server);
         answered
-    }
-
-    /// Where this harness's stand-in install receipt lives.
-    fn receipt_path(&self) -> PathBuf {
-        self.root.join("installs.json")
-    }
-
-    /// Write an install receipt in exactly the shape `crystalline install`
-    /// writes, recording `harness` with `hooks` either wired or skipped.
-    fn write_receipt(&self, harness: &str, hooks: bool) {
-        std::fs::write(
-            self.receipt_path(),
-            format!(
-                r#"{{"format":1,"installs":[{{"harness":"{harness}","scope":"user","version":"0.11.0","parts":{{"mcp":true,"hooks":{hooks},"skills":true}},"skills":[]}}]}}"#
-            ),
-        )
-        .unwrap();
     }
 }
 
@@ -423,16 +425,20 @@ async fn routing_lines_cap_at_three_bullets() {
 // to roughly 475 tokens of routing prose a locally installed harness has
 // already received from its own SessionStart hook; the minimal block is the
 // header plus one pointer sentence.
+//
+// The decision's own inputs (the `--harness` argument and this machine's
+// receipt) are resolved in the spawned process, so their table lives beside
+// the resolver in `client.rs`. These tests take the resolved answer as given
+// and prove what the server does with it.
 
-/// The row the whole feature exists for: a stdio client whose `initialize`
-/// name is a harness this machine's receipt onboarded with hooks gets the
-/// minimal block instead of the full routing prose.
+/// The row the whole feature exists for: a session spawned by a harness this
+/// machine has already onboarded gets the minimal block instead of the full
+/// routing prose, because its own session hook delivered that block already.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_receipt_matched_stdio_client_gets_the_minimal_block() {
+async fn an_onboarded_harness_gets_the_minimal_block() {
     let h = Harness::build(&[("eng", &["Route here for eng questions"])], &[], false).await;
-    h.write_receipt("claude-code", true);
 
-    let (client, _server) = h.connect_as("claude-code", ServedTransport::Stdio).await;
+    let (client, _server) = h.connect_as(true, ServedTransport::Stdio).await;
     let text = instructions(&client);
 
     assert!(
@@ -453,14 +459,16 @@ async fn a_receipt_matched_stdio_client_gets_the_minimal_block() {
     );
 }
 
-/// The same client over HTTP is never suppressed: a remote session says
-/// nothing about what the machine running the client has on disk.
+/// An HTTP session is never suppressed, whatever this machine has installed:
+/// one daemon serves every HTTP client, a remote client never ran
+/// `crystalline install` here, and a remote client is exactly who the served
+/// surface exists for. The `onboarded` argument is passed and deliberately
+/// ignored on that transport.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_same_client_over_http_gets_the_full_block() {
+async fn an_http_session_always_gets_the_full_block() {
     let h = Harness::build(&[("eng", &["Route here for eng questions"])], &[], false).await;
-    h.write_receipt("claude-code", true);
 
-    let (client, _server) = h.connect_as("claude-code", ServedTransport::Http).await;
+    let (client, _server) = h.connect_as(true, ServedTransport::Http).await;
     let text = instructions(&client);
     assert!(
         text.contains("Behavior:") && text.contains("- eng: Route here for eng questions"),
@@ -468,64 +476,41 @@ async fn the_same_client_over_http_gets_the_full_block() {
     );
 }
 
-/// A harness installed with `--skip-hooks` never receives the routing block at
-/// session start, so the instructions must still carry it.
+/// Everything that is not a resolved, onboarded harness gets the full block:
+/// a registration predating the `--harness` argument, an id this binary does
+/// not know, a harness installed with `--skip-hooks`, a machine with no
+/// receipt. Every one of those resolves to `false` in the bridge (see the
+/// resolver's own table in `client.rs`), and `false` is this row.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_hooks_skipped_install_still_gets_the_full_block() {
+async fn an_unresolved_session_gets_the_full_block() {
     let h = Harness::build(&[("eng", &["Route here for eng questions"])], &[], false).await;
-    h.write_receipt("claude-code", false);
 
-    let (client, _server) = h.connect_as("claude-code", ServedTransport::Stdio).await;
+    let (client, _server) = h.connect_as(false, ServedTransport::Stdio).await;
     let text = instructions(&client);
     assert!(
         text.contains("Behavior:") && text.contains("- eng: Route here for eng questions"),
-        "no hooks means no other onboarding, so the block stays:\n{text}"
+        "nothing onboards this session, so the block stays:\n{text}"
     );
-}
-
-/// An unrecognized client name and a machine with no receipt at all are both
-/// misses, and a miss always means the full block.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_unknown_client_or_a_missing_receipt_gets_the_full_block() {
-    let h = Harness::build(&[("eng", &["Route here for eng questions"])], &[], false).await;
-
-    // No receipt on disk yet.
-    let (client, _server) = h.connect_as("claude-code", ServedTransport::Stdio).await;
-    assert!(
-        instructions(&client).contains("Behavior:"),
-        "no receipt is no match"
-    );
-    drop(client);
-
-    // A receipt that knows claude-code, but a different client connecting.
-    h.write_receipt("claude-code", true);
-    for name in ["mcp-inspector", "codex", "claude"] {
-        let (client, _server) = h.connect_as(name, ServedTransport::Stdio).await;
-        let text = instructions(&client);
-        assert!(
-            text.contains("Behavior:") && text.contains("- eng:"),
-            "'{name}' is not a name an onboarded harness sends:\n{text}"
-        );
-    }
 }
 
 /// `skills.serve` forces the decision in both directions: `true` restores the
-/// full block for a matched client, `false` leaves it alone entirely, since it
-/// gates skill serving rather than onboarding.
+/// full block for an onboarded harness, `false` leaves it alone entirely,
+/// since it gates skill serving rather than onboarding.
+///
+/// The three values are set in the config before the engine is built, where
+/// this test used to `configure` them on a live engine between connections:
+/// the effective value is snapshotted at engine construction now.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_setting_overrides_the_receipt_in_both_directions() {
-    let h = Harness::build(&[("eng", &["Route here for eng questions"])], &[], false).await;
-    h.write_receipt("claude-code", true);
-
     for (value, expect_full) in [("true", true), ("false", true), ("auto", false)] {
-        h.engine
-            .configure(&crystalline_service::engine::ConfigureAction::Set {
-                key: "skills.serve".to_string(),
-                value: value.to_string(),
-            })
-            .await
-            .unwrap();
-        let (client, _server) = h.connect_as("claude-code", ServedTransport::Stdio).await;
+        let h = Harness::build_with(
+            &[("eng", &["Route here for eng questions"])],
+            &[],
+            false,
+            Some(value),
+        )
+        .await;
+        let (client, _server) = h.connect_as(true, ServedTransport::Stdio).await;
         let text = instructions(&client);
         assert_eq!(
             text.contains("Behavior:"),
@@ -625,5 +610,183 @@ async fn the_advertised_protocol_set_is_exactly_this() {
         ],
         "rmcp's own list changed: decide which revisions we serve, then edit \
          SERVED_PROTOCOL_VERSIONS and this pin together"
+    );
+}
+
+// --- the arrival path, per protocol revision ---------------------------------
+//
+// **The failure this section exists for is silent.** From 2026-07-28 there is
+// no `initialize` and no `InitializeResult`: `instructions` moves to
+// `DiscoverResult`, so a server that still only fills the handshake hands a
+// modern agent nothing at all, with no error anywhere. An agent simply arrives
+// uninstructed, which is the one outcome this product exists to prevent.
+//
+// So the table below is over the advertised set rather than over a list of
+// eras somebody remembered to write down: adding a revision to
+// `SERVED_PROTOCOL_VERSIONS` without giving it an arrival path fails here
+// instead of shipping silence.
+//
+// **What this cannot prove**, stated so the test is not mistaken for coverage
+// it does not provide: it proves this server offers the routing block by the
+// path each era actually uses. It cannot prove a client chose to pull it - the
+// specification explicitly permits a client never to call `server/discover`,
+// and no server-side test can observe that decision. Only a by-hand run of a
+// real agent over each era can, once.
+
+/// How one protocol revision delivers the routing block.
+#[derive(Debug, PartialEq, Eq)]
+enum Arrival {
+    /// `InitializeResult.instructions`, the four revisions below 2026-07-28.
+    Initialize,
+    /// `DiscoverResult.instructions`, from 2026-07-28 on, where the handshake
+    /// is deleted from the schema outright.
+    Discover,
+}
+
+/// The arrival path a revision uses. **Exhaustive on purpose**: a revision
+/// this table does not know is a revision nobody has decided an onboarding
+/// path for, and shipping it would be shipping the silent failure.
+fn arrival_path(version: &ProtocolVersion) -> Arrival {
+    match version.as_str() {
+        "2024-11-05" | "2025-03-26" | "2025-06-18" | "2025-11-25" => Arrival::Initialize,
+        "2026-07-28" => Arrival::Discover,
+        other => panic!(
+            "protocol revision {other} is served with no onboarding path decided. \
+             Give it one here and in McpServer before adding it to \
+             SERVED_PROTOCOL_VERSIONS."
+        ),
+    }
+}
+
+/// The instructions a legacy peer reads out of its `initialize` answer.
+async fn instructions_via_initialize(h: &Harness, version: ProtocolVersion) -> String {
+    let (client_io, server_io) = tokio::io::duplex(1 << 16);
+    let engine = h.engine.clone();
+    let server_task =
+        tokio::spawn(async move { rmcp::serve_server(McpServer::new(engine), server_io).await });
+    let mut info = ClientInfo::default();
+    info.protocol_version = version;
+    let client = rmcp::serve_client(info, client_io).await.unwrap();
+    let server = server_task.await.unwrap().unwrap();
+    let text = instructions(&client);
+    drop(client);
+    drop(server);
+    text
+}
+
+/// The instructions a modern peer reads out of its `server/discover` answer.
+///
+/// Driven through rmcp's own discover lifecycle rather than a hand-built
+/// request, so the `_meta` the era requires (`protocolVersion` plus
+/// `clientCapabilities`) is exactly what a real client would send.
+async fn instructions_via_discover(h: &Harness, version: ProtocolVersion) -> String {
+    use rmcp::service::{ClientLifecycleMode, ClientServiceExt};
+
+    let (client_io, server_io) = tokio::io::duplex(1 << 16);
+    let engine = h.engine.clone();
+    let server_task =
+        tokio::spawn(async move { rmcp::serve_server(McpServer::new(engine), server_io).await });
+    let client = ClientInfo::default()
+        .serve_with_lifecycle(
+            client_io,
+            ClientLifecycleMode::Discover {
+                preferred_versions: vec![version],
+            },
+        )
+        .await
+        .expect("the server answered server/discover");
+    let server = server_task.await.unwrap().unwrap();
+    let text = instructions(&client);
+    drop(client);
+    drop(server);
+    text
+}
+
+/// The routing block arrives by the path its era uses, for every revision this
+/// server advertises.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_routing_block_arrives_by_every_served_revisions_own_path() {
+    let h = Harness::build(&[("eng", &["Route here for eng questions"])], &[], false).await;
+
+    let served = crystalline_service::mcp::SERVED_PROTOCOL_VERSIONS;
+    assert!(
+        !served.is_empty(),
+        "a server that serves nothing onboards nobody"
+    );
+    for version in served {
+        let text = match arrival_path(version) {
+            Arrival::Initialize => instructions_via_initialize(&h, version.clone()).await,
+            Arrival::Discover => instructions_via_discover(&h, version.clone()).await,
+        };
+        assert!(
+            text.starts_with("CRYSTALLINE KNOWLEDGE ROUTING"),
+            "{version:?} received no routing block by its own arrival path:\n{text}"
+        );
+        assert!(
+            text.contains("- eng: Route here for eng questions"),
+            "{version:?} received a block with no routing lines in it:\n{text}"
+        );
+    }
+}
+
+/// The block itself is one block: whichever path an era uses, the bytes are
+/// identical. `DiscoverResult::from_server_info` carries `instructions` out of
+/// `ServerInfo` untouched (rmcp 3.1.2 `model.rs:1246-1268`), and both paths
+/// build that `ServerInfo` through `McpServer::arrival_info`, so this pins
+/// that neither ever grows a variant the other does not have.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_block_is_byte_identical_whichever_path_delivers_it() {
+    let h = Harness::build(&[("eng", &["Route here for eng questions"])], &[], false).await;
+    let newest = crystalline_service::mcp::SERVED_PROTOCOL_VERSIONS
+        .last()
+        .unwrap()
+        .clone();
+
+    let by_initialize = instructions_via_initialize(&h, newest.clone()).await;
+    let by_discover = instructions_via_discover(&h, newest).await;
+    assert_eq!(by_initialize, by_discover);
+    assert!(!by_discover.is_empty());
+}
+
+/// The documented mitigation for a client that never calls `server/discover`,
+/// pinned because it is the only thing standing between that client and no
+/// onboarding at all. Both routes are pull-shaped, which is exactly the
+/// weakness: they work, and they need the client to know to ask.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_client_that_never_discovers_can_still_pull_the_block() {
+    use rmcp::model::{CallToolRequestParams, GetPromptRequestParams};
+
+    let h = Harness::build(&[("eng", &["Route here for eng questions"])], &[], false).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    let onboarding = peer
+        .get_prompt(GetPromptRequestParams::new("onboarding"))
+        .await
+        .expect("the onboarding prompt answers");
+    let text = serde_json::to_value(&onboarding).unwrap();
+    let text = text
+        .pointer("/messages/0/content/text")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        text.starts_with("CRYSTALLINE KNOWLEDGE ROUTING")
+            && text.contains("- eng: Route here for eng questions"),
+        "the onboarding prompt carries the live block:\n{text}"
+    );
+
+    let mut params = CallToolRequestParams::new("list_domains".to_string());
+    params = params.with_arguments(
+        serde_json::json!({ "include_routing": true })
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
+    let listed = peer.call_tool(params).await.expect("list_domains answers");
+    let listed = serde_json::to_value(&listed).unwrap().to_string();
+    assert!(
+        listed.contains("Route here for eng questions"),
+        "list_domains with include_routing carries the same routing text:\n{listed}"
     );
 }

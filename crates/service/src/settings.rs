@@ -209,9 +209,9 @@ pub fn registry() -> &'static [SettingSpec] {
         },
         SettingSpec {
             key: "skills.serve",
-            doc: "Serve the shipped agent skills over MCP: the skills tool, skill:// resources and the onboarding and connector prompts. auto (default) serves them to every client except a local harness this machine's install receipt already onboarded with session hooks, true always serves them, false never does",
+            doc: "Serve the shipped agent skills over MCP: the skills tool, skill:// resources and the onboarding and connector prompts. auto (default) serves them to every client except a stdio session spawned by a harness this machine's install receipt already onboarded with session hooks, which has the skills as files already; true always serves them, false never does. Applies at the next daemon start",
             kind: SettingKind::String,
-            startup_effective: false,
+            startup_effective: true,
             apply: set_skills_serve,
             clear: clear_skills_serve,
             effective: skills_serve_effective,
@@ -1296,6 +1296,10 @@ mod tests {
         assert!(change_note("search.retired_weight", &no_env).is_none());
         assert!(change_note("index.files", &no_env).is_none());
         assert!(change_note("identity.actor", &no_env).is_none());
+        // The effective value is snapshotted at engine construction
+        // (`Engine::skills_serve`), so a write really does wait for the next
+        // start and the note is the honest label on that.
+        assert!(change_note("skills.serve", &no_env).is_some());
         assert!(change_note("auth.trusted_header", &no_env).is_some());
         assert!(change_note("auth.anonymous", &no_env).is_some());
         assert!(change_note("auth.max_users", &no_env).is_some());

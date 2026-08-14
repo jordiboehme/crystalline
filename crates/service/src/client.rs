@@ -155,6 +155,62 @@ where
     }
 }
 
+/// Whether the harness that spawned this process already has the shipped
+/// skills on disk and onboards itself at session start, from the `--harness`
+/// argument its MCP registration carries plus this machine's install receipt.
+///
+/// Neither input is the connecting client: one is the deployment's own
+/// configuration, the other is machine state. That is what makes the answer
+/// legal as a gate on a list endpoint (SEP-2567), where reading the client's
+/// `initialize` name for the same purpose was not.
+///
+/// **The receipt is read here rather than persisted at install time**, so it
+/// stays fresh: uninstalling the skills, or reinstalling with `--skip-hooks`,
+/// flips the answer at the next spawn with nothing to re-register. And it is
+/// read in this process rather than in the daemon because the state directory
+/// can be overridden by the environment, which this process inherits from the
+/// harness and the daemon does not.
+///
+/// Every uncertain input resolves to `false`, meaning serve: no argument (a
+/// registration predating the flag), an id this binary does not know, a
+/// missing or corrupt receipt, or a harness the receipt does not list with
+/// hooks. An over-served client pays duplicated context; an under-served one
+/// loses onboarding it cannot rediscover.
+fn resolve_harness_onboarded(harness: Option<&str>) -> bool {
+    let Ok(receipt) = crystalline_core::provision::install_receipt_path() else {
+        return false;
+    };
+    resolve_harness_onboarded_at(harness, &receipt)
+}
+
+/// [`resolve_harness_onboarded`] against an explicit receipt path, so the
+/// decision table can be tested without touching this machine's real state
+/// directory or its environment.
+fn resolve_harness_onboarded_at(harness: Option<&str>, receipt: &Path) -> bool {
+    let Some(id) = harness else {
+        return false;
+    };
+    // Parsed permissively rather than as a clap value enum: a downgraded
+    // binary meeting a newer registration, or a harness id rolled out ahead of
+    // the binaries, must degrade to serving rather than exit with a usage
+    // error, which the harness would see as a server that will not start.
+    let Some(kind) = crystalline_core::HarnessKind::from_id(id) else {
+        tracing::warn!(
+            harness = %id,
+            "unknown --harness value; serving the full skill surface. \
+             Upgrade crystalline if this harness is newer than this binary."
+        );
+        return false;
+    };
+    let onboarded = crystalline_core::harnesses_with_hooks(receipt).contains(&kind);
+    tracing::debug!(
+        harness = %id,
+        onboarded,
+        "resolved the skill surface for this session from the install receipt"
+    );
+    onboarded
+}
+
 /// The `crystalline mcp` stdio entry: attach to (or spawn) a daemon and relay
 /// the session, or run the full stack in-process when embedded or when no
 /// daemon can be started. The relay survives a daemon restart (a version
@@ -166,11 +222,19 @@ pub async fn run_mcp(
     db: Option<&Path>,
     config_path: Option<&Path>,
     read_only: bool,
+    harness: Option<&str>,
 ) -> anyhow::Result<()> {
     // Log to stderr from the start, for both modes: the relay's takeover and
     // reconnect notices and any embedded startup failure must be visible in the
     // harness's server log, not swallowed.
     init_tracing();
+
+    // Resolve the onboarding answer once, here, before anything connects: this
+    // process serves exactly one MCP client for its whole life, so a value
+    // fixed at startup is invariant for every connection it can ever serve,
+    // which is what SEP-2567 needs of a gate that stays on a listing. It is
+    // re-sent on each daemon reconnect and never re-derived daemon-side.
+    let harness_onboarded = resolve_harness_onboarded(harness);
 
     // Answering the version-negotiation probe (Claude Desktop chat mode's
     // `server/discover`, see [`preinit_probe_reply`]) needs only stdin and
@@ -209,8 +273,18 @@ pub async fn run_mcp(
     // still yields a working in-process server instead of a mid-window close.
     if let Some(daemon) = daemon {
         match daemon {
-            Ok(conn) => match conn.into_mcp().await {
-                Ok(stream) => return pump_stdio(stream, primed, db, config_path, read_only).await,
+            Ok(conn) => match conn.into_mcp(harness_onboarded).await {
+                Ok(stream) => {
+                    return pump_stdio(
+                        stream,
+                        primed,
+                        db,
+                        config_path,
+                        read_only,
+                        harness_onboarded,
+                    )
+                    .await;
+                }
                 Err(e) => tracing::warn!("daemon MCP handshake failed ({e}); running embedded"),
             },
             Err(e) => tracing::warn!("no daemon available ({e}); running embedded"),
@@ -228,7 +302,7 @@ pub async fn run_mcp(
     // still intact for the stub. Only if the stub itself fails to serve do we
     // fall back to the old `-32000` reply and a non-zero exit (stderr carries
     // the chain for the Desktop log).
-    match build_embedded(db, config_path, read_only).await {
+    match build_embedded(db, config_path, read_only, harness_onboarded).await {
         Ok(stack) => run_embedded_stdio(stack, primed).await,
         Err(e) => {
             tracing::error!(
@@ -483,6 +557,7 @@ async fn pump_stdio<R>(
     db: Option<&Path>,
     config_path: Option<&Path>,
     read_only: bool,
+    harness_onboarded: bool,
 ) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -518,7 +593,11 @@ where
                     continue;
                 }
             };
-            let Ok(stream) = conn.into_mcp().await else {
+            // Re-sent on every reconnect: the daemon builds a fresh
+            // `McpServer` per accepted socket (`daemon.rs`), so a restart
+            // would otherwise flip an onboarded harness back to served in the
+            // middle of a live session.
+            let Ok(stream) = conn.into_mcp(harness_onboarded).await else {
                 continue;
             };
             session = Session::new(stream);
@@ -553,6 +632,7 @@ async fn build_embedded(
     db: Option<&Path>,
     config_path: Option<&Path>,
     read_only: bool,
+    harness_onboarded: bool,
 ) -> anyhow::Result<EmbeddedStack> {
     let ownership = acquire_ownership()
         .map_err(|e| anyhow::anyhow!("cannot run an embedded MCP server: {e}"))?;
@@ -593,7 +673,7 @@ async fn build_embedded(
     engine.refresh_routing_cache().await;
 
     Ok(EmbeddedStack {
-        server: McpServer::new(engine),
+        server: McpServer::new(engine).with_onboarded_harness(harness_onboarded),
         ownership,
     })
 }
@@ -1308,6 +1388,75 @@ mod tests {
 
     fn lines_from(bytes: &'static [u8]) -> tokio::io::Lines<BufReader<&'static [u8]>> {
         BufReader::new(bytes).lines()
+    }
+
+    // --- the resolved skill-surface answer ------------------------------------
+    //
+    // The whole decision table for `--harness`, against a receipt written by
+    // hand in the shape `crystalline install` writes. Every uncertain row
+    // resolves to false, meaning "serve the surface": an over-served client
+    // pays some duplicated context, an under-served one loses onboarding it
+    // has no way to rediscover.
+
+    /// A receipt in the shape `crystalline install` writes, recording
+    /// `harness` with its session hooks wired or skipped.
+    fn write_receipt(path: &std::path::Path, harness: &str, hooks: bool) {
+        std::fs::write(
+            path,
+            format!(
+                r#"{{"format":1,"installs":[{{"harness":"{harness}","scope":"user","version":"0.13.0","parts":{{"mcp":true,"hooks":{hooks},"skills":true}},"skills":[]}}]}}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn the_resolved_answer_is_the_named_harness_plus_this_machines_receipt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let receipt = tmp.path().join("installs.json");
+
+        // The row the feature exists for.
+        write_receipt(&receipt, "claude-code", true);
+        assert!(resolve_harness_onboarded_at(Some("claude-code"), &receipt));
+
+        // Per harness, not per machine: the receipt knows claude-code, and a
+        // codex-spawned process still gets the surface. This is the whole
+        // reason the argument exists rather than the receipt alone.
+        assert!(!resolve_harness_onboarded_at(Some("codex"), &receipt));
+
+        // Hooks skipped: nothing onboards that session, so the block and the
+        // surface both have to come from here.
+        write_receipt(&receipt, "claude-code", false);
+        assert!(!resolve_harness_onboarded_at(Some("claude-code"), &receipt));
+    }
+
+    #[test]
+    fn every_uncertain_input_resolves_to_serving() {
+        let tmp = tempfile::tempdir().unwrap();
+        let receipt = tmp.path().join("installs.json");
+        write_receipt(&receipt, "claude-code", true);
+
+        // No argument at all: a registration written before `--harness`
+        // existed. This is the pre-existing-install case and it must behave
+        // exactly as it did before the flag.
+        assert!(!resolve_harness_onboarded_at(None, &receipt));
+
+        // An id this binary does not know: a downgrade meeting a newer
+        // registration, or a harness rolled out ahead of the binaries. Warns
+        // and serves; it must never be a usage error, which would leave the
+        // harness with a server that will not start.
+        assert!(!resolve_harness_onboarded_at(
+            Some("nextgen-harness"),
+            &receipt
+        ));
+        assert!(!resolve_harness_onboarded_at(Some(""), &receipt));
+
+        // A missing receipt and a corrupt one both read as "nothing onboarded"
+        // through the tolerant shallow reader, never as an error.
+        let missing = tmp.path().join("nope.json");
+        assert!(!resolve_harness_onboarded_at(Some("claude-code"), &missing));
+        std::fs::write(&receipt, "not json at all").unwrap();
+        assert!(!resolve_harness_onboarded_at(Some("claude-code"), &receipt));
     }
 
     #[test]

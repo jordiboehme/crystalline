@@ -5,9 +5,10 @@
 //! the real `McpServer` over JSON-RPC), narrowed to what a remote client that
 //! never runs the CLI can read, and to the one `skills.serve` gate all three
 //! surfaces share. The last three tests cover that gate's `auto` default,
-//! which is decided per connection from the client's `initialize` name and
-//! this machine's install receipt: `connect_as` drives a handshake under a
-//! chosen client name against a stand-in receipt.
+//! whose answer the spawned `crystalline mcp` process resolves before the
+//! session starts, from its `--harness` argument plus this machine's install
+//! receipt: `connect_onboarded` drives a session with that answer already
+//! decided, the way the bridge and the daemon hand it over.
 
 use std::sync::Arc;
 
@@ -37,16 +38,24 @@ struct Harness {
 
 impl Harness {
     async fn new(domains: &[&str]) -> Harness {
-        Harness::build(domains, false).await
+        Harness::build(domains, false, None).await
     }
 
     /// A harness whose engine serves the content API read-only, where the
     /// `skills` tool must stay visible: reading a skill is a read.
     async fn new_read_only(domains: &[&str]) -> Harness {
-        Harness::build(domains, true).await
+        Harness::build(domains, true, None).await
     }
 
-    async fn build(domains: &[&str], read_only: bool) -> Harness {
+    /// A harness whose config sets `skills.serve` before the engine is built.
+    /// That is the only way to change the served surface now: the effective
+    /// value is snapshotted at engine construction, so a `configure` call on a
+    /// live engine writes the setting for the next start and moves nothing.
+    async fn with_skills_serve(domains: &[&str], value: &str) -> Harness {
+        Harness::build(domains, false, Some(value)).await
+    }
+
+    async fn build(domains: &[&str], read_only: bool, skills_serve: Option<&str>) -> Harness {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();
         let mut cfg = GlobalConfig::default();
@@ -68,6 +77,9 @@ impl Harness {
             response_format: Some(ResponseFormat::Json),
             ..ServiceConfig::default()
         });
+        if let Some(value) = skills_serve {
+            crystalline_service::settings::apply(&mut cfg, "skills.serve", value).unwrap();
+        }
         let config_path = root.join("config.yaml");
         crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
         // The `configure` tool's snapshot reads the GitHub credential once
@@ -103,48 +115,33 @@ impl Harness {
         (client, server)
     }
 
-    /// Open a stdio connection whose client announces itself as `client_name`,
-    /// against a server reading this harness's stand-in install receipt. This
-    /// is how the per-connection `auto` gate is exercised.
-    async fn connect_as(
+    /// Open a stdio connection served the way the `crystalline mcp` bridge
+    /// serves one whose spawning harness this machine has already onboarded.
+    ///
+    /// The client's own `initialize` name is deliberately not part of it any
+    /// more: the answer is resolved by the spawned process before the session
+    /// starts (from its `--harness` argument and this machine's receipt) and
+    /// handed to the server, so a test drives the resolved answer rather than
+    /// a client name.
+    async fn connect_onboarded(
         &self,
-        client_name: &str,
+        onboarded: bool,
     ) -> (
-        RunningService<RoleClient, rmcp::model::ClientInfo>,
+        RunningService<RoleClient, ()>,
         RunningService<rmcp::RoleServer, McpServer>,
     ) {
         let (client_io, server_io) = tokio::io::duplex(1 << 16);
         let engine = self.engine.clone();
-        let receipt = self.receipt_path();
         let server_task = tokio::spawn(async move {
             rmcp::serve_server(
-                McpServer::new(engine).with_install_receipt(receipt),
+                McpServer::new(engine).with_onboarded_harness(onboarded),
                 server_io,
             )
             .await
         });
-        let mut info = rmcp::model::ClientInfo::default();
-        info.client_info = rmcp::model::Implementation::new(client_name, "1.2.3");
-        let client = rmcp::serve_client(info, client_io).await.unwrap();
+        let client = rmcp::serve_client((), client_io).await.unwrap();
         let server = server_task.await.unwrap().unwrap();
         (client, server)
-    }
-
-    /// Where this harness's stand-in install receipt lives.
-    fn receipt_path(&self) -> std::path::PathBuf {
-        self._tmp.path().join("installs.json")
-    }
-
-    /// Write an install receipt in the shape `crystalline install` writes,
-    /// recording `harness` with its session hooks wired.
-    fn write_hooked_receipt(&self, harness: &str) {
-        std::fs::write(
-            self.receipt_path(),
-            format!(
-                r#"{{"format":1,"installs":[{{"harness":"{harness}","scope":"user","version":"0.11.0","parts":{{"mcp":true,"hooks":true,"skills":true}},"skills":[]}}]}}"#
-            ),
-        )
-        .unwrap();
     }
 }
 
@@ -328,19 +325,21 @@ fn prompt_text(result: &rmcp::model::GetPromptResult) -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn turning_skills_serve_off_empties_the_lists_while_direct_reads_answer() {
+    // The setting is now read once, while the engine is built: SEP-2567
+    // forbids a list moving as a side effect of a request on the connection,
+    // and this file's whole subject is three lists that `skills.serve` shapes.
+    // So the flip happens before anything connects, where it used to happen
+    // through `configure` mid-session. The hidden-not-disabled assertions
+    // below are unchanged and are why this test was not replaced.
     let h = Harness::new(&["eng"]).await;
     let (client, _server) = h.connect().await;
     let peer = client.peer();
-
     assert!(tool_names(peer).await.contains(&"skills".to_string()));
+    drop(client);
 
-    call_text(
-        peer,
-        "configure",
-        json!({ "set": { "skills.serve": "false" } }),
-    )
-    .await
-    .unwrap();
+    let h = Harness::with_skills_serve(&["eng"], "false").await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
 
     assert!(
         !tool_names(peer).await.contains(&"skills".to_string()),
@@ -387,26 +386,28 @@ async fn turning_skills_serve_off_empties_the_lists_while_direct_reads_answer() 
         .expect("a direct prompt read answers while the gate is off");
     assert_eq!(prompt_text(&connector), crystalline_core::CONNECTOR_SNIPPET);
 
-    // Unsetting the key restores the default, which is on.
-    call_text(peer, "configure", json!({ "unset": ["skills.serve"] }))
+    // And the write still lands, it just applies at the next start: the value
+    // is saved and reported, while this connection keeps the surface it was
+    // built with.
+    let snapshot: Value = serde_json::from_str(
+        &call_text(
+            peer,
+            "configure",
+            json!({ "set": { "skills.serve": "true" } }),
+        )
         .await
-        .unwrap();
-    assert!(tool_names(peer).await.contains(&"skills".to_string()));
-    assert_eq!(
-        peer.list_resources(Default::default())
-            .await
-            .unwrap()
-            .resources
-            .len(),
-        SKILL_NAMES.len()
-    );
-    assert_eq!(
-        peer.list_prompts(Default::default())
-            .await
-            .unwrap()
-            .prompts
-            .len(),
-        2
+        .unwrap(),
+    )
+    .expect("the snapshot is JSON");
+    let written = snapshot["settings"]
+        .as_array()
+        .and_then(|s| s.iter().find(|v| v["key"] == json!("skills.serve")))
+        .cloned()
+        .expect("the key is in the registry snapshot");
+    assert_eq!(written["value"], json!("true"), "the write lands");
+    assert!(
+        !tool_names(peer).await.contains(&"skills".to_string()),
+        "and does not move this connection's list"
     );
 }
 
@@ -430,44 +431,42 @@ async fn read_only_serving_still_teaches_the_skills() {
     );
 }
 
-/// The listing no longer varies with who connected. A stdio client this
-/// machine's install receipt knows as an onboarded harness used to be served
-/// three empty lists; SEP-2567 forbids exactly that ("MUST NOT vary
-/// per-connection"), so it now sees the same surface as everyone else. The
-/// deduplication it bought is not lost - Task 5 of the rmcp 3.x migration
-/// resolves it before the session starts, from an argument and this machine's
-/// receipt, where it is a property of the deployment rather than of the
-/// client. The instructions half of the `auto` decision still keys on the
-/// receipt match and is unchanged here.
+/// The row the feature exists for: a session spawned by a harness this
+/// machine has already onboarded is served none of the three lists, because
+/// that harness has the five skills as files and onboards itself from its own
+/// session hook.
+///
+/// **This is the same saving the receipt match used to buy, from an input
+/// SEP-2567 allows.** The old version keyed on the client's own `initialize`
+/// name, which is per-connection variation; this one keys on what the spawned
+/// process was registered with, which is deployment configuration and is
+/// identical for every connection this endpoint can serve.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_receipt_matched_connection_is_served_the_same_surface_as_every_other() {
+async fn an_onboarded_harness_is_served_none_of_the_three_lists() {
     let h = Harness::new(&["eng"]).await;
-    h.write_hooked_receipt("claude-code");
 
-    let (client, _server) = h.connect_as("claude-code").await;
+    let (client, _server) = h.connect_onboarded(true).await;
     let peer = client.peer();
 
     assert!(
-        tool_names(peer).await.contains(&"skills".to_string()),
-        "the tool is listed for an onboarded harness too"
+        !tool_names(peer).await.contains(&"skills".to_string()),
+        "the tool is withheld from a harness that already has the skills"
     );
-    assert_eq!(
+    assert!(
         peer.list_resources(Default::default())
             .await
             .unwrap()
             .resources
-            .len(),
-        SKILL_NAMES.len(),
-        "every skill resource is advertised"
+            .is_empty(),
+        "and so are the resources"
     );
-    assert_eq!(
+    assert!(
         peer.list_prompts(Default::default())
             .await
             .unwrap()
             .prompts
-            .len(),
-        2,
-        "both prompts are advertised"
+            .is_empty(),
+        "and the prompts"
     );
 
     // And the direct reads answer, as they always did.
@@ -494,16 +493,16 @@ async fn a_receipt_matched_connection_is_served_the_same_surface_as_every_other(
     assert_eq!(prompt_text(&connector), crystalline_core::CONNECTOR_SNIPPET);
 }
 
-/// The other side of the same coin: an unrecognized client on a machine with
-/// a receipt gets the whole surface, as it always did. Kept beside the test
-/// above so the pair reads as one assertion - the two connections are served
-/// the same list.
+/// The other side of the same coin, and it is the default: every session
+/// whose answer is anything but "already onboarded" keeps the whole surface.
+/// That covers a registration predating the `--harness` argument, an
+/// unrecognized harness id, a missing receipt and every HTTP client. Kept
+/// beside the test above so the pair reads as one decision.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_unmatched_connection_keeps_the_whole_surface() {
+async fn a_session_with_no_resolved_harness_keeps_the_whole_surface() {
     let h = Harness::new(&["eng"]).await;
-    h.write_hooked_receipt("claude-code");
 
-    let (client, _server) = h.connect_as("mcp-inspector").await;
+    let (client, _server) = h.connect_onboarded(false).await;
     let peer = client.peer();
 
     assert!(tool_names(peer).await.contains(&"skills".to_string()));
@@ -525,52 +524,33 @@ async fn an_unmatched_connection_keeps_the_whole_surface() {
     );
 }
 
-/// `skills.serve` still decides the surface, and it no longer consults who
-/// connected: an onboarded harness follows the setting exactly like anybody
-/// else. **The mid-session flip this exercises is the last remaining SEP-2567
-/// side effect on the listing**; Task 5 freezes the value at engine
-/// construction and this test becomes "takes effect at the next start" there.
+/// `skills.serve` decides the surface, and it no longer consults who
+/// connected. **This test's subject was the mid-session flip** - it used to
+/// straddle a `configure` on one connection and assert the same peer saw the
+/// change, which is SEP-2567's side-effect prohibition verbatim. The value is
+/// snapshotted at engine construction now, so the same three rows are proved
+/// the way a user actually gets them: one engine per value.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_setting_decides_the_surface_for_an_onboarded_harness_too() {
-    let h = Harness::new(&["eng"]).await;
-    h.write_hooked_receipt("claude-code");
+    for (value, listed) in [("auto", false), ("true", true), ("false", false)] {
+        let h = Harness::with_skills_serve(&["eng"], value).await;
 
-    let (client, _server) = h.connect_as("claude-code").await;
-    let peer = client.peer();
-    assert!(
-        tool_names(peer).await.contains(&"skills".to_string()),
-        "auto serves everyone now"
-    );
-
-    call_text(
-        peer,
-        "configure",
-        json!({ "set": { "skills.serve": "true" } }),
-    )
-    .await
-    .unwrap();
-    assert!(tool_names(peer).await.contains(&"skills".to_string()));
-    assert_eq!(
-        peer.list_prompts(Default::default())
-            .await
-            .unwrap()
-            .prompts
-            .len(),
-        2
-    );
-
-    call_text(
-        peer,
-        "configure",
-        json!({ "set": { "skills.serve": "false" } }),
-    )
-    .await
-    .unwrap();
-    assert!(!tool_names(peer).await.contains(&"skills".to_string()));
-
-    // Back to the default: served again, whoever is connected.
-    call_text(peer, "configure", json!({ "unset": ["skills.serve"] }))
-        .await
-        .unwrap();
-    assert!(tool_names(peer).await.contains(&"skills".to_string()));
+        let (client, _server) = h.connect_onboarded(true).await;
+        let peer = client.peer();
+        assert_eq!(
+            tool_names(peer).await.contains(&"skills".to_string()),
+            listed,
+            "skills.serve={value} decides the surface for an onboarded harness: \
+             an explicit value always wins over the resolved answer"
+        );
+        assert_eq!(
+            peer.list_prompts(Default::default())
+                .await
+                .unwrap()
+                .prompts
+                .len(),
+            if listed { 2 } else { 0 },
+            "the prompts follow the same gate"
+        );
+    }
 }

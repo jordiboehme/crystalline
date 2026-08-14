@@ -516,6 +516,10 @@ pub struct Engine {
     // `EngineError::ReadOnly`. Set at construction from the effective mode
     // (explicit flag or `service.read_only`). Index maintenance is unaffected.
     read_only: bool,
+    // The effective `skills.serve` value, snapshotted while this engine is
+    // built and never re-read. See `Engine::skills_serve` for why it is frozen
+    // and `Engine::with_env_overlay` for why the snapshot is taken twice.
+    skills_serve: crystalline_core::config::SkillsServe,
     // This instance's stable id for shared-database collaboration, or empty when
     // collaboration is off (standalone commands and the embedded stdio stack).
     // Only a non-empty id claims host locks, scopes embedding and refuses a
@@ -720,6 +724,7 @@ impl Engine {
         // No overlay yet: file and effective start identical, so an engine
         // built without `with_env_overlay` behaves exactly as before the split.
         let file_config = config.clone();
+        let skills_serve = config.skills_serve();
         Engine {
             store,
             config: std::sync::RwLock::new(config),
@@ -733,6 +738,7 @@ impl Engine {
             model_id,
             chunk_params,
             read_only: false,
+            skills_serve,
             instance_id: String::new(),
             label: String::new(),
             hosted: std::sync::RwLock::new(HashMap::new()),
@@ -801,8 +807,19 @@ impl Engine {
     /// call this with the overlay parsed at startup; every existing call site
     /// leaves the default empty overlay in place, so file and effective stay
     /// identical there.
+    ///
+    /// **The `skills.serve` snapshot is retaken here, and that is load
+    /// bearing.** The overlay arrives through this builder *after*
+    /// [`Engine::new`] has run (the daemon and `build_embedded` both spell
+    /// `Engine::new(store, loaded.file, ...).with_env_overlay(loaded.overlay)`,
+    /// passing the **file** config to the constructor), so a snapshot taken
+    /// only in the constructor would miss `CRYSTALLINE_SKILLS_SERVE` and serve
+    /// the wrong answer to exactly the deployments that set it. Both builders
+    /// take `self` by value and the engine is then shared behind an `Arc`, so
+    /// the value is still frozen for the engine's lifetime.
     pub fn with_env_overlay(mut self, overlay: EnvOverlay) -> Engine {
         let effective = overlay.apply(&self.file_config.read().unwrap());
+        self.skills_serve = effective.skills_serve();
         *self.config.write().unwrap() = effective;
         self.overlay = overlay;
         self
@@ -876,12 +893,27 @@ impl Engine {
         self.config.read().unwrap().github_enabled()
     }
 
-    /// How the shipped agent skills are served over MCP, read fresh under
-    /// the config guard the same way [`Engine::github_enabled`] is, so a
-    /// runtime `configure` flip of `skills.serve` applies from the next call
-    /// on rather than at the next daemon start.
+    /// How the shipped agent skills are served over MCP: the value this engine
+    /// was **built** with, not the live setting.
+    ///
+    /// Deliberately unlike [`Engine::github_enabled`] beside it. This one
+    /// shapes three MCP list endpoints (the `skills` tool, the five
+    /// `skill://` resources and the two prompts), and MCP 2026-07-28's
+    /// SEP-2567 says a list "MUST NOT vary per-connection or as a side effect
+    /// of other requests on the connection". Read live, a `configure set
+    /// skills.serve` moved all three lists on the very connection that made
+    /// the call. So the effective value is snapshotted while the engine is
+    /// built and never re-read, which is the only layer where stdio, HTTP,
+    /// embedded and the degraded stub all agree - over HTTP rmcp rebuilds the
+    /// server per request from this same shared engine, so freezing anything
+    /// higher up would have left that transport moving.
+    ///
+    /// `configure` still writes the setting; it applies at the next daemon
+    /// start, which is what `startup_effective: true` (`settings.rs`) tells
+    /// the user through `change_note`. That flag is the label on this
+    /// behaviour, never the mechanism: its only consumer is that note.
     pub fn skills_serve(&self) -> crystalline_core::config::SkillsServe {
-        self.config.read().unwrap().skills_serve()
+        self.skills_serve
     }
 
     /// How the MCP server encodes list-shaped tool results, from the

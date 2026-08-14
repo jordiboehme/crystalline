@@ -144,10 +144,12 @@ Hooks land in a dedicated `~/.copilot/hooks/crystalline.json` and skills in `~/.
 Crystalline runs as an MCP server over stdio; the server command is always `crystalline mcp`. Everything the installer does can also be done by hand:
 
 ```sh
-claude mcp add crystalline --scope user crystalline mcp   # Claude Code, all projects
-codex mcp add crystalline -- crystalline mcp              # Codex CLI
-copilot mcp add crystalline -- crystalline mcp            # GitHub Copilot CLI
+claude mcp add crystalline --scope user -- crystalline mcp --harness claude-code
+codex mcp add crystalline -- crystalline mcp --harness codex
+copilot mcp add crystalline -- crystalline mcp --harness copilot
 ```
+
+`--harness` is optional and tells the server which harness spawned it, so a harness that already has the skills installed as files is not served them a second time over MCP (see [Skills over MCP](#skills-over-mcp)). Leave it out and the full surface is served. The `--` matters on the Claude Code line: without it, `claude mcp add` reads the server's own flags as its options.
 
 The first agent to connect starts a background daemon that loads the embedding model once and watches every registered domain; every later connection - other agents, other terminals, other harnesses - attaches to that same daemon, so there is always one shared instance and one consistent view of the index. A daemon running in a container is reached over HTTP instead of stdio - see [Run in a container](docs/deployment.md#run-in-a-container).
 
@@ -300,7 +302,11 @@ Other harnesses that support a similar skill or instruction-file convention can 
 
 ### Skills over MCP
 
-Installing the folders is not the only way in: every server also serves the same five skills to remote clients that never run the CLI at all. A chat surface calls the `skills` tool - with no arguments it lists all five, by name it returns one skill's full `SKILL.md`. A harness whose agents read MCP resources instead reaches the same content at `skill://<name>/SKILL.md`. And a harness that shows the model MCP prompts can insert the `onboarding` or `connector` prompt directly, the same text described in [Remote clients](#remote-clients) below. All three are governed by the one `skills.serve` setting. Its default, `auto`, serves them to every client except a locally installed harness: a stdio client this machine's install receipt knows as an onboarded harness with session hooks already has the five skills as files and gets its routing block from its own hook, so it is served neither the skill surface nor a second copy of the onboarding block. Set `skills.serve` to `true` to serve everything to everyone regardless, or to `false` to serve the skills to nobody, for an operator who would rather ship them only as zips.
+Installing the folders is not the only way in: every server also serves the same five skills to remote clients that never run the CLI at all. A chat surface calls the `skills` tool - with no arguments it lists all five, by name it returns one skill's full `SKILL.md`. A harness whose agents read MCP resources instead reaches the same content at `skill://<name>/SKILL.md`. And a harness that shows the model MCP prompts can insert the `onboarding` or `connector` prompt directly, the same text described in [Remote clients](#remote-clients) below. All three are governed by the one `skills.serve` setting. Its default, `auto`, serves them to every client except a session spawned by a harness this machine has already onboarded: `crystalline install` registers the MCP server as `crystalline mcp --harness <name>`, and a session started that way asks the local install receipt whether that harness has its session hooks wired. If it has, it already carries the five skills as files and gets its routing block from its own hook, so it is served neither the skill surface nor a second copy of the onboarding block. Everything else is served in full, including a registration made before that flag existed, a harness the receipt does not know and every HTTP client - a remote client never ran the CLI here, so nothing on this machine says what it has.
+
+`claude mcp get crystalline` (and the Codex and Copilot equivalents) shows whether a registration carries the flag, which is how to tell which answer a stdio session will get. Set `skills.serve` to `true` to serve everything to everyone regardless, or to `false` to serve the skills to nobody, for an operator who would rather ship them only as zips; either explicit value overrides the resolved answer and makes every client identical, on both transports. The value is read once when the daemon starts, so changing it with `configure` applies from the next start.
+
+After upgrading from a version before this flag existed, rerun `crystalline install <harness>` once so the server learns which harness it is serving. Until you do, the skill surface stays on, exactly as it was.
 
 ## Ship tools with a domain
 

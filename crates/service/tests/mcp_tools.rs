@@ -344,14 +344,12 @@ async fn the_tool_list_does_not_move_across_a_configure_that_flips_github_enable
     );
 }
 
-/// The same prohibition for the one gate this task leaves on the listing with
-/// a request-mutable input: `skills.serve` is `configure`-settable
-/// (`settings.rs:211`, `startup_effective: false`) and `Engine::skills_serve`
-/// (`engine.rs:883-885`) reads it live, so a flip still moves three lists.
-/// **Task 5 owns the fix** (freeze the effective value at engine
-/// construction); this test is its red, left ignored so the remaining
-/// violation is visible rather than forgotten.
-#[ignore = "red for Task 5: skills.serve is still read live, so a configure flip moves the listing"]
+/// The same prohibition for the last gate that had a request-mutable input.
+/// `skills.serve` is `configure`-settable, and it used to be read live on
+/// every list call, so a flip moved three lists on the connection that flipped
+/// it. The effective value is now snapshotted while the engine is built
+/// (`Engine::skills_serve`), so `configure` writes the setting for the next
+/// daemon start and this connection's lists cannot move.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_tool_list_does_not_move_across_a_configure_that_flips_skills_serve() {
     let h = Harness::new(&["eng"]).await;
@@ -367,13 +365,26 @@ async fn the_tool_list_does_not_move_across_a_configure_that_flips_skills_serve(
         .map(|t| t.name.to_string())
         .collect();
 
-    call(
+    // Prove the write really landed, so the invariance below cannot pass
+    // because the call failed: in rmcp 3.1.2 a bad-parameters call comes back
+    // as a tool-level error, which `call(...).unwrap()` would not catch.
+    let snapshot = call(
         peer,
         "configure",
         json!({ "set": { "skills.serve": "false" } }),
     )
     .await
     .unwrap();
+    let written = snapshot["settings"]
+        .as_array()
+        .and_then(|s| s.iter().find(|v| v["key"] == json!("skills.serve")))
+        .cloned()
+        .expect("the key is in the registry snapshot");
+    assert_eq!(
+        written["value"],
+        json!("false"),
+        "the setting must actually be written: {snapshot}"
+    );
 
     let after: Vec<String> = peer
         .list_tools(Default::default())
@@ -383,7 +394,10 @@ async fn the_tool_list_does_not_move_across_a_configure_that_flips_skills_serve(
         .iter()
         .map(|t| t.name.to_string())
         .collect();
-    assert_eq!(before, after);
+    assert_eq!(
+        before, after,
+        "the surface a connection is listed cannot move under it"
+    );
 }
 
 /// The other half of the remedy SEP-2567 prescribes: the dependency moves into

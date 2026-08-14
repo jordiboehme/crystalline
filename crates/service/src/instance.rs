@@ -57,6 +57,50 @@ pub struct LockInfo {
     pub started_at: String,
 }
 
+/// The first Crystalline release whose daemon parses an `mcp` handshake line
+/// with options after the mode token. An older daemon compares the whole
+/// trimmed line against `"mcp"` (see `daemon::handle_conn` before this
+/// release) and silently drops anything else, which costs the bridge its
+/// socket rather than one option, so the extended line is only ever sent to a
+/// daemon at or above this version.
+const HARNESS_LINE_MIN_VERSION: &str = "0.13.0";
+
+/// The option token that tells the daemon this stdio session's harness is
+/// already onboarded, so the skill surface and the second copy of the routing
+/// block are both withheld. Absence means "serve", which is what every older
+/// bridge's bare `mcp` line already meant.
+pub(crate) const SKILLS_OFF_OPTION: &str = "skills=off";
+
+/// The version of the daemon this process is about to hand its handshake to,
+/// read from the lock record. `None` when there is no readable record, which
+/// reads as "too old to be sure".
+fn daemon_version() -> Option<String> {
+    read_lock_info().map(|info| info.version)
+}
+
+/// The `mcp` handshake line for a resolved answer against a daemon of
+/// `daemon_version`. Bare `mcp` unless there is something to say **and** the
+/// daemon is new enough to hear it. Pure so the decision is testable without
+/// a daemon.
+fn mcp_mode_line(harness_onboarded: bool, daemon_version: Option<&str>) -> String {
+    // Positively "at least the minimum", never "not older than": an
+    // unparseable or missing version has to read as too old, and a negated
+    // `strictly_newer` reads it as new enough because that helper answers
+    // false for an unparseable pair on either side.
+    let understood = match (
+        daemon_version.and_then(version_triple),
+        version_triple(HARNESS_LINE_MIN_VERSION),
+    ) {
+        (Some(daemon), Some(minimum)) => daemon >= minimum,
+        _ => false,
+    };
+    if harness_onboarded && understood {
+        format!("mcp {SKILLS_OFF_OPTION}\n")
+    } else {
+        "mcp\n".to_string()
+    }
+}
+
 /// A connected client stream, before the handshake line is written.
 pub struct Connection {
     stream: IpcStream,
@@ -65,8 +109,25 @@ pub struct Connection {
 impl Connection {
     /// Write the `mcp` handshake and hand back the stream for an rmcp session or
     /// a byte pump.
-    pub async fn into_mcp(self) -> io::Result<IpcStream> {
-        self.handshake(b"mcp\n").await
+    ///
+    /// `harness_onboarded` is the answer the bridge process resolved at
+    /// startup from its `--harness` argument and this machine's install
+    /// receipt; the daemon builds its per-socket `McpServer` with it. It rides
+    /// the handshake line rather than being re-derived daemon-side on purpose:
+    /// the bridge inherits the harness's own environment (and therefore its
+    /// state directory), while a long-lived daemon carries whatever
+    /// environment spawned it first, and a value resolved once per process
+    /// cannot drift across a reconnect.
+    ///
+    /// **The extended line is only sent to a daemon that can parse it**, see
+    /// [`HARNESS_LINE_MIN_VERSION`]. An older daemon compares the whole line
+    /// against `"mcp"` and drops anything else, and a failed displacement can
+    /// leave one running (`try_attach_reporting` attaches to a daemon that
+    /// would not shut down), so the fallback is the bare line, which resolves
+    /// to "serve" - the safe direction, and exactly today's behaviour.
+    pub async fn into_mcp(self, harness_onboarded: bool) -> io::Result<IpcStream> {
+        let line = mcp_mode_line(harness_onboarded, daemon_version().as_deref());
+        self.handshake(line.as_bytes()).await
     }
 
     /// Write the `ctl` handshake and hand back the stream for the NDJSON control
@@ -990,19 +1051,50 @@ pub fn acquire_ownership() -> anyhow::Result<Ownership> {
     })
 }
 
+/// How many bytes of handshake line are read before giving up on finding the
+/// newline. The line is `mcp`, `ctl` or `mcp` plus options; 64 leaves room for
+/// several options without letting a misbehaving client stall the accept loop.
+/// It was 16, which fit `mcp claude-code` with one byte to spare, so the cap
+/// is raised well clear of the shapes this protocol can grow.
+const MODE_LINE_CAP: usize = 64;
+
 /// Read the one-line handshake from an accepted stream without consuming past
 /// the newline. Bounded so a misbehaving client cannot stall the accept loop.
+///
+/// **A line longer than the cap is an error rather than a prefix.** Returning
+/// the truncated head would leave the rest of the line in the stream to be
+/// read as JSON-RPC, which is a wedged session; the caller drops the
+/// connection instead, which the bridge sees as a dead socket and reports.
 pub async fn read_mode_line(stream: &mut IpcStream) -> io::Result<String> {
     let mut buf = Vec::with_capacity(8);
     let mut byte = [0u8; 1];
-    for _ in 0..16 {
+    loop {
         let n = stream.read(&mut byte).await?;
         if n == 0 || byte[0] == b'\n' {
             break;
         }
         buf.push(byte[0]);
+        if buf.len() >= MODE_LINE_CAP {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "handshake line longer than the mode-line cap",
+            ));
+        }
     }
     Ok(String::from_utf8_lossy(&buf).trim().to_string())
+}
+
+/// Split a handshake line into its mode and its options: the first
+/// whitespace-delimited token is the mode, the rest are options.
+///
+/// Deliberately tolerant in both directions of version skew. An older bridge's
+/// bare `mcp` line yields no options, and an option this binary does not know
+/// is ignored rather than fatal, so a newer bridge talking to this daemon
+/// degrades to the default instead of losing its socket.
+pub fn split_mode_line(line: &str) -> (&str, Vec<&str>) {
+    let mut parts = line.split_whitespace();
+    let mode = parts.next().unwrap_or("");
+    (mode, parts.collect())
 }
 
 /// Best-effort process liveness. On unix a signal-0 probe, on Windows an
@@ -1051,6 +1143,99 @@ pub fn process_alive(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- the mcp handshake line ---------------------------------------------
+
+    /// The extended line only goes to a daemon that can parse it. An older one
+    /// compares the whole trimmed line against `"mcp"` and drops anything
+    /// else, and a displacement that times out leaves exactly such a daemon
+    /// running and attached to (`try_attach_reporting` says so in as many
+    /// words), so the fallback has to be the bare line rather than a dead
+    /// socket.
+    #[test]
+    fn the_extended_mode_line_is_only_sent_to_a_daemon_that_parses_it() {
+        assert_eq!(mcp_mode_line(true, Some("0.13.0")), "mcp skills=off\n");
+        assert_eq!(mcp_mode_line(true, Some("0.14.2")), "mcp skills=off\n");
+        assert_eq!(
+            mcp_mode_line(true, Some("0.12.9")),
+            "mcp\n",
+            "an older daemon gets the line it understands, and serves the surface"
+        );
+        assert_eq!(
+            mcp_mode_line(true, None),
+            "mcp\n",
+            "no readable lock record is not a licence to guess"
+        );
+        assert_eq!(
+            mcp_mode_line(true, Some("not-a-version")),
+            "mcp\n",
+            "an unparseable version reads as too old, never as new enough"
+        );
+        // Nothing to say, nothing added, whatever the daemon can parse.
+        for version in [Some("0.13.0"), Some("0.12.0"), None] {
+            assert_eq!(mcp_mode_line(false, version), "mcp\n");
+        }
+    }
+
+    /// The reader used to stop at 16 bytes and return the truncated head,
+    /// leaving the rest of the line in the stream to be read as JSON-RPC.
+    /// `mcp claude-code` was 15 bytes, so the old cap had one byte of
+    /// headroom. Both halves of the fix are pinned here: a longer line arrives
+    /// whole, and a line past the new cap is an error the caller drops the
+    /// connection on rather than a prefix that wedges the session.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_long_handshake_line_arrives_whole_and_an_endless_one_errors() {
+        async fn round_trip(payload: Vec<u8>) -> io::Result<String> {
+            let dir = tempfile::tempdir().unwrap();
+            let sock = dir.path().join("crystalline.sock");
+            let listener = ListenerOptions::new()
+                .name(socket_name(&sock).unwrap())
+                .create_tokio()
+                .unwrap();
+            let server = tokio::spawn(async move {
+                let mut stream = listener.accept().await.unwrap();
+                read_mode_line(&mut stream).await
+            });
+            let mut client = IpcStream::connect(socket_name(&sock).unwrap())
+                .await
+                .unwrap();
+            client.write_all(&payload).await.unwrap();
+            client.flush().await.unwrap();
+            let out = server.await.unwrap();
+            drop(client);
+            out
+        }
+
+        let long = b"mcp skills=off future=1\n".to_vec();
+        assert!(long.len() > 16, "longer than the old cap: {}", long.len());
+        assert_eq!(round_trip(long).await.unwrap(), "mcp skills=off future=1");
+
+        let endless = vec![b'x'; MODE_LINE_CAP + 8];
+        assert!(
+            round_trip(endless).await.is_err(),
+            "a line past the cap must not come back as a prefix"
+        );
+    }
+
+    /// The daemon's half: the first token is the mode and the rest are
+    /// options, so an old bridge's bare `mcp` and a new bridge's extended line
+    /// both serve, and an option this binary does not know is ignored rather
+    /// than fatal.
+    #[test]
+    fn a_mode_line_splits_into_a_mode_and_its_options() {
+        assert_eq!(split_mode_line("mcp"), ("mcp", vec![]));
+        assert_eq!(
+            split_mode_line("mcp skills=off"),
+            ("mcp", vec![SKILLS_OFF_OPTION])
+        );
+        assert_eq!(
+            split_mode_line("mcp skills=off future=1"),
+            ("mcp", vec![SKILLS_OFF_OPTION, "future=1"])
+        );
+        assert_eq!(split_mode_line("ctl"), ("ctl", vec![]));
+        assert_eq!(split_mode_line(""), ("", vec![]));
+    }
 
     #[cfg(windows)]
     #[test]

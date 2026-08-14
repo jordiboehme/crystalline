@@ -306,6 +306,18 @@ enum Command {
         /// already-running daemon uses that daemon's mode instead.
         #[arg(long)]
         read_only: bool,
+        /// Which harness spawned this server, as `crystalline install` wrote
+        /// it into the MCP registration (claude-code, codex, copilot). Used
+        /// with this machine's install receipt to decide whether that harness
+        /// already has the shipped skills on disk, in which case they are not
+        /// served a second time. Omit it and the whole surface is served.
+        ///
+        /// A plain string rather than a value enum on purpose: a value this
+        /// binary does not recognize (a downgrade meeting a newer
+        /// registration) must serve the surface with a warning, never fail to
+        /// start the server.
+        #[arg(long)]
+        harness: Option<String>,
         /// Load the global config from this file instead of the default path.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -1272,8 +1284,9 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Mcp {
             embedded,
             read_only,
+            harness,
             config,
-        }) => on_runtime(move || mcp_dispatch(embedded, read_only, config, cli.db)),
+        }) => on_runtime(move || mcp_dispatch(embedded, read_only, harness, config, cli.db)),
         Some(Command::Ctl { command }) => on_runtime(move || run_ctl(command, cli.json)),
         Some(Command::Users { command }) => on_runtime(move || users::run(command, cli.json)),
         Some(
@@ -2552,10 +2565,18 @@ async fn delete_dispatch(
 async fn mcp_dispatch(
     embedded: bool,
     read_only: bool,
+    harness: Option<String>,
     config: Option<PathBuf>,
     db: Option<PathBuf>,
 ) -> anyhow::Result<()> {
-    crystalline_service::run_mcp(embedded, db.as_deref(), config.as_deref(), read_only).await
+    crystalline_service::run_mcp(
+        embedded,
+        db.as_deref(),
+        config.as_deref(),
+        read_only,
+        harness.as_deref(),
+    )
+    .await
 }
 
 /// `domain add`: register locally (always, regardless of a running daemon),

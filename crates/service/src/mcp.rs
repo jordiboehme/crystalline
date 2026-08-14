@@ -91,20 +91,50 @@
 //! answering, the same hidden-not-disabled doctrine the tool gates follow.
 //!
 //! That gate is tri-state. `true` and `false` force always and never, and
-//! `auto`, the default, currently serves everyone. It used to be decided per
-//! connection - a stdio client whose `initialize` name mapped to a harness
-//! this machine's install receipt had onboarded with session hooks was served
-//! neither the surface nor the full instructions block - and the surface half
-//! of that decision is exactly what clause (a) of the rule above forbids, so
-//! it is gone from `hidden_skills_surface`. The deduplication it bought is
-//! not being dropped: Task 5 of the rmcp 3.x migration resolves the same
-//! answer before the session starts, from the `--harness` argument the
-//! spawned process was registered with plus this machine's receipt, which are
-//! deployment configuration and machine state rather than client identity.
-//! The instructions half still keys on the receipt match, in
-//! `minimal_instructions` and the `initialize` override; Task 5 owns that
-//! too. An HTTP session was never suppressed either way: a remote client is
-//! exactly who the served surface is for.
+//! `auto`, the default, withholds the surface from a session whose spawning
+//! harness already has the five skills on disk. **That answer is resolved
+//! before the session starts and is fixed for the serving process's life**:
+//! `crystalline install` registers the server as `crystalline mcp --harness
+//! <name>`, the spawned process asks this machine's install receipt whether
+//! that harness has session hooks wired, and it carries the answer for the
+//! connection's lifetime (over the daemon relay it rides the private
+//! handshake line, re-sent on every reconnect, and the daemon never
+//! re-derives it). Both inputs are deployment configuration and machine
+//! state; neither is the connecting client, which is what clause (a) of the
+//! rule above needs.
+//!
+//! It used to be decided from the client's own `initialize` name matched
+//! against the same receipt, which is per-connection variation verbatim. The
+//! saving survives the move; the mechanism could not.
+//!
+//! Two consequences worth stating where they cannot be missed. The value the
+//! setting resolves to is snapshotted at engine construction
+//! (`Engine::skills_serve`), so a `configure` write applies at the next daemon
+//! start rather than to the connection that wrote it, which is clause (b). And
+//! an HTTP session is never suppressed: one daemon serves every HTTP client, a
+//! remote client never ran the CLI here, and a remote client is exactly who
+//! the served surface exists for. `docs/deployment.md` documents that
+//! asymmetry, how to see which answer a stdio session will get and how to turn
+//! it off.
+//!
+//! # The routing block, and the one way it can silently not arrive
+//!
+//! `get_info` fills `instructions` with the live routing block and
+//! `arrival_info` applies the decision above to it. Which channel carries it
+//! to the client is the protocol revision's business, not ours: every
+//! revision before 2026-07-28 reads it out of `InitializeResult`, and
+//! 2026-07-28 deletes the handshake outright and moves `instructions` to
+//! `DiscoverResult`, where `discover` answers it.
+//!
+//! **A modern client is free never to call `server/discover`, and if it does
+//! not it receives no instructions and nothing errors anywhere.** That is the
+//! failure mode this file's `discover` doc comment spells out with its
+//! evidence. The mitigations - the `onboarding` prompt, `list_domains` with
+//! `include_routing=true`, the served skills - are all pull-shaped and all
+//! need the client to know to ask. `tests/mcp_instructions.rs` drives the
+//! block over every advertised revision by that revision's own path, so a
+//! revision added without an onboarding path fails there rather than shipping
+//! silence.
 //!
 //! The resource shape follows the converging skills-over-MCP proposal
 //! without advertising its extension id, which is not ratified yet. The
@@ -137,17 +167,17 @@
 //! `add_domain` through team mode, `share_changes`, `update_domain` and
 //! `origin_status`.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use rmcp::handler::server::prompt::PromptContext;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, ContentBlock, ErrorData, GetPromptRequestParams, GetPromptResponse,
-    Implementation, InitializeRequestParams, InitializeResult, ListPromptsResult,
-    ListResourcesResult, ListToolsResult, PaginatedRequestParams, ProgressNotificationParam,
-    PromptMessage, ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse,
-    ReadResourceResult, Resource, ResourceContents, Role, ServerCapabilities, ServerInfo, Tool,
+    CallToolResult, ContentBlock, DiscoverResult, ErrorData, GetPromptRequestParams,
+    GetPromptResponse, Implementation, InitializeRequestParams, InitializeResult,
+    ListPromptsResult, ListResourcesResult, ListToolsResult, PaginatedRequestParams,
+    ProgressNotificationParam, PromptMessage, ProtocolVersion, ReadResourceRequestParams,
+    ReadResourceResponse, ReadResourceResult, Resource, ResourceContents, Role, ServerCapabilities,
+    ServerInfo, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::{
@@ -335,55 +365,54 @@ fn skill_uris() -> String {
 /// - `false`: always hidden.
 /// - `auto`: served.
 ///
-/// **`auto` used to consult the connecting client**, hiding the surface from a
-/// stdio client this machine's install receipt knew as an onboarded harness.
-/// That is SEP-2567's first prohibition - a list endpoint "MUST NOT vary
-/// per-connection" - so the input is gone from here. The deduplication it
-/// bought is not: Task 5 of the rmcp 3.x migration resolves the same answer
-/// before the session starts, from the `--harness` argument the spawned
-/// process was registered with plus this machine's receipt, which is
-/// deployment configuration rather than client identity. Until it lands,
-/// `auto` serves everyone. [`minimal_instructions`] still keys on the receipt
-/// match; that is the instructions lever, and Task 5 owns it too.
+/// Both inputs are fixed before this server exists, which is what makes the
+/// gate legal on a listing at all. `skills_serve` is the effective setting
+/// snapshotted at engine construction ([`Engine::skills_serve`]);
+/// `harness_onboarded` is [`McpServer::with_onboarded_harness`], resolved by
+/// the `crystalline mcp` process from its own `--harness` argument plus this
+/// machine's install receipt before the session starts.
 ///
-/// `skills_serve` is still the engine's live setting, read fresh on every
-/// call, which means a `configure` flip still moves three lists mid-session.
-/// **That is SEP-2567's second prohibition and it is the last one standing**;
-/// Task 5 freezes the effective value at engine construction, which is the
-/// only layer where stdio, HTTP, embedded and the degraded stub agree.
+/// **`auto` used to consult the connecting client**, hiding the surface from a
+/// stdio client this machine's install receipt knew as an onboarded harness by
+/// its `initialize` name. That is SEP-2567's first prohibition - a list
+/// endpoint "MUST NOT vary per-connection" - so the client's identity is gone
+/// from here. What replaces it is the same fact learned from the deployment
+/// instead of from the wire: the harness that spawned this process already has
+/// the five skills on disk and is onboarded by its own session hook, so
+/// serving them again spends the tokens twice.
+///
+/// An HTTP session never sets `harness_onboarded`: one daemon serves every
+/// HTTP client, a remote client never ran `crystalline install` here, and a
+/// remote client is exactly who the served surface exists for.
 ///
 /// Hidden means hidden, not disabled: the lists come back empty while the
 /// tool, the resources and the prompts all keep answering a direct call.
 /// Read-only mode is not part of it either: reading a skill is a read.
-fn hidden_skills_surface(skills_serve: SkillsServe) -> bool {
+fn hidden_skills_surface(skills_serve: SkillsServe, harness_onboarded: bool) -> bool {
     match skills_serve {
         SkillsServe::Always => false,
         SkillsServe::Never => true,
-        SkillsServe::Auto => false,
+        SkillsServe::Auto => harness_onboarded,
     }
 }
 
-/// Whether one connection gets the minimal `instructions` block instead of the
-/// full routing block: only under `auto`, and only for a receipt-matched
-/// client, whose own session hook has already delivered the full block.
+/// Whether this server hands out the minimal `instructions` block instead of
+/// the full routing block: only under `auto`, and only when the harness that
+/// spawned this process is one whose own session hook has already delivered
+/// the full block.
 ///
-/// `false` deliberately does not shrink the instructions. That setting gates
-/// serving skills, not onboarding: an operator who turns the skill surface off
-/// still wants a connecting agent to learn which domains exist.
-fn minimal_instructions(skills_serve: SkillsServe, receipt_matched: bool) -> bool {
-    skills_serve == SkillsServe::Auto && receipt_matched
-}
-
-/// Whether the client that sent `client_name` in its `initialize` handshake is
-/// a harness this machine has onboarded with session hooks wired, given
-/// `hooked` (the receipt's hooks-installed harnesses). An unrecognized client
-/// name never matches, and a harness whose install skipped hooks is not in
-/// `hooked`, so it does not match either.
-fn receipt_matches_client(client_name: &str, hooked: &[crystalline_core::HarnessKind]) -> bool {
-    match crystalline_core::HarnessKind::from_mcp_client_name(client_name) {
-        Some(kind) => hooked.contains(&kind),
-        None => false,
-    }
+/// The same two inputs as [`hidden_skills_surface`], deliberately: the surface
+/// and the instructions used to diverge (the surface keyed on the client's
+/// name, then stopped), and one input for both is what makes the two eras
+/// converge rather than split - a legacy peer reading `initialize` and a
+/// modern peer reading `server/discover` are told the same thing.
+///
+/// `skills.serve = false` deliberately does not shrink the instructions. That
+/// setting gates serving skills, not onboarding: an operator who turns the
+/// skill surface off still wants a connecting agent to learn which domains
+/// exist.
+fn minimal_instructions(skills_serve: SkillsServe, harness_onboarded: bool) -> bool {
+    skills_serve == SkillsServe::Auto && harness_onboarded
 }
 
 /// Whether collaboration tool `name` is hidden given the engine's `read_only`
@@ -430,12 +459,27 @@ use crate::params::*;
 /// name; [`Engine::actor`] then falls back. A version of `0.0.0` (rmcp's
 /// stand-in for a client that sent none) is dropped rather than recorded.
 fn client_actor(ctx: &RequestContext<RoleServer>) -> Option<String> {
-    let info = ctx.peer.peer_info()?;
-    let name = info.client_info.name.trim();
+    // The modern era first: with no handshake there is no peer info to read,
+    // and rmcp synthesizes one carrying `Implementation::default()` (an empty
+    // name), so without this every write by a 2026-07-28 peer would fall back
+    // to the generic actor rather than naming who asked.
+    //
+    // **Reading `clientInfo` here is what the specification intends it for and
+    // is not the thing it forbids.** The SHOULD NOT on `clientInfo` is about
+    // changing *behaviour* on the client's self-reported identity: which tools
+    // it is listed, what instructions it is handed. Recording who wrote an
+    // engram is provenance, and the same page names "display, logging, and
+    // debugging" as the intended uses.
+    let from_meta = ctx.meta.client_info();
+    let info = match from_meta.as_ref() {
+        Some(info) => info,
+        None => &ctx.peer.peer_info()?.client_info,
+    };
+    let name = info.name.trim();
     if name.is_empty() {
         return None;
     }
-    let version = info.client_info.version.trim();
+    let version = info.version.trim();
     if version.is_empty() || version == "0.0.0" {
         return Some(name.to_string());
     }
@@ -464,18 +508,29 @@ pub enum Transport {
 /// per accepted `mcp` socket, the HTTP transport per session, the stdio bridge
 /// once for its single session).
 ///
-/// **Nothing per connection is carried past the handshake any more.** The
-/// install-receipt match used to live here as an `AtomicBool` that every list
-/// gate read, which is the per-connection variation SEP-2567 forbids; it is
-/// now computed inside [`McpServer::initialize`], used there for the
-/// instructions decision and dropped.
+/// **Nothing about the connecting client is read any more.** The
+/// install-receipt match used to live here as an `AtomicBool` set from the
+/// client's own `initialize` name, which is the per-connection variation
+/// SEP-2567 forbids. What is here instead was decided before the connection
+/// existed: see `harness_onboarded`.
 #[derive(Clone)]
 pub struct McpServer {
     engine: Arc<Engine>,
     transport: Transport,
-    /// Where to read this machine's install receipt. `None` when the state
-    /// directory could not be resolved at all, which reads as "no receipt".
-    install_receipt: Option<PathBuf>,
+    /// Whether the harness that spawned the serving process already has the
+    /// shipped skills on disk and onboards itself at session start.
+    ///
+    /// **Resolved before the session starts and constant for this server's
+    /// life.** The `crystalline mcp` process reads its own `--harness`
+    /// argument (written into the harness's MCP registration by `crystalline
+    /// install`) and asks this machine's install receipt whether that harness
+    /// has session hooks wired. Neither input is the client's identity: one is
+    /// deployment configuration, the other is machine state. False everywhere
+    /// it cannot be known - HTTP, a registration predating the flag, an
+    /// unrecognized harness id, a missing receipt - which serves the surface,
+    /// the safe direction (an over-served client pays duplicated context, an
+    /// under-served one loses onboarding it cannot rediscover).
+    harness_onboarded: bool,
 }
 
 impl McpServer {
@@ -493,15 +548,17 @@ impl McpServer {
         McpServer {
             engine,
             transport,
-            install_receipt: crystalline_core::provision::install_receipt_path().ok(),
+            harness_onboarded: false,
         }
     }
 
-    /// Point this server at an explicit install receipt instead of the one
-    /// under this machine's state directory. Tests use it to exercise the
-    /// `auto` matching without touching the developer's real receipt.
-    pub fn with_install_receipt(mut self, path: PathBuf) -> McpServer {
-        self.install_receipt = Some(path);
+    /// Record that the harness this process serves is already onboarded (see
+    /// the field). Set by the two stdio paths from the resolved answer the
+    /// `crystalline mcp` process computed at startup: the embedded stack
+    /// directly, the daemon relay from the value the bridge writes on its
+    /// handshake line. Never set on the HTTP path.
+    pub fn with_onboarded_harness(mut self, onboarded: bool) -> McpServer {
+        self.harness_onboarded = onboarded;
         self
     }
 }
@@ -805,33 +862,21 @@ impl McpServer {
         }
 
         let before = self.engine.github_enabled();
-        // Compare the surface, not the raw setting: a flip between `auto` and
-        // `true` changes the value and moves nothing, and announcing a change
-        // that did not happen is its own defect.
-        let skills_before = hidden_skills_surface(self.engine.skills_serve());
         self.apply_settings(&p).await?;
         let after = self.engine.github_enabled();
-        let skills_after = hidden_skills_surface(self.engine.skills_serve());
-        // A `skills.serve` flip moves three lists at once (the `skills` tool,
-        // the `skill://` resources and the two prompts). A `github.enabled`
-        // flip moves nothing any more, since that gate refuses at call time
-        // rather than shaping the listing; the push survives here only
-        // because Task 6 of the rmcp 3.x migration owns pruning and routing
-        // every push site through subscription sinks, and pruning it here
-        // would leave that task auditing a set that had already changed.
-        let skills_flipped = skills_before != skills_after;
-        if (before != after || skills_flipped)
+        // Nothing this call can write moves a list any more. `github.enabled`
+        // refuses at call time instead of shaping the listing, and
+        // `skills.serve` is frozen at engine construction
+        // ([`Engine::skills_serve`]), so its own before/after comparison went
+        // with the freeze: it could only ever report "no change". This push
+        // survives only because Task 6 of the rmcp 3.x migration owns pruning
+        // and routing every push site through subscription sinks, and pruning
+        // it here would leave that task auditing a set that had already
+        // changed.
+        if before != after
             && let Err(e) = peer.notify_tool_list_changed().await
         {
             tracing::warn!("failed to send tools/list_changed after configure: {e}");
-        }
-        if skills_flipped {
-            if let Err(e) = peer.notify_prompt_list_changed().await {
-                tracing::warn!("failed to send prompts/list_changed after configure: {e}");
-            }
-            if let Err(e) = peer.notify_resource_list_changed().await {
-                tracing::warn!("failed to send resources/list_changed after configure: {e}");
-            }
         }
 
         self.engine
@@ -1187,6 +1232,34 @@ impl McpServer {
 }
 
 impl McpServer {
+    /// [`ServerHandler::get_info`] with this deployment's onboarding decision
+    /// applied: the one place the routing block is shaped, so every era's
+    /// arrival path hands out the same bytes.
+    ///
+    /// A legacy peer reads the result out of `InitializeResult.instructions`
+    /// and a 2026-07-28 peer out of `DiscoverResult.instructions`; both call
+    /// this, which is what the per-era arrival test in
+    /// `tests/mcp_instructions.rs` pins.
+    ///
+    /// When [`minimal_instructions`] says so, the full routing prose is
+    /// replaced by the header plus a pointer: the harness that spawned this
+    /// process delivers the block itself at session start, so repeating it
+    /// would spend the tokens twice. The TOON note is appended all the same -
+    /// no hook carries it, it describes this connection's wire format rather
+    /// than the knowledge, and a client that cannot read a tool result is
+    /// worse off than one that read the routing block twice.
+    fn arrival_info(&self) -> ServerInfo {
+        let mut info = self.get_info();
+        if minimal_instructions(self.engine.skills_serve(), self.harness_onboarded) {
+            let mut instructions = crystalline_core::render_minimal_instructions();
+            if self.engine.response_format() == ResponseFormat::Toon {
+                instructions.push_str(TOON_INSTRUCTIONS_NOTE);
+            }
+            info.instructions = Some(instructions);
+        }
+        info
+    }
+
     /// Wrap a list-shaped engine value as a successful tool result: TOON
     /// under the default `service.response_format`, byte-identical to [`ok`]
     /// under `json`. The format is read per response, so a runtime configure
@@ -1304,24 +1377,24 @@ impl ServerHandler for McpServer {
         info
     }
 
-    /// Complete the handshake, and decide there and then whether this
-    /// connection is one Crystalline has already onboarded by other means.
+    /// Complete the legacy handshake: publish the peer info and echo the
+    /// negotiated protocol version.
     ///
-    /// This is where the receipt-aware `auto` behaviour lives, for one blunt
-    /// reason: `get_info` takes `&self` and no request, so a server cannot see
-    /// who is connecting from inside it, while rmcp's `ServerHandler::
-    /// initialize` receives the client's own `InitializeRequestParams`. It is
-    /// therefore the earliest and the only point at which the instructions
-    /// this connection receives can depend on who asked, and it is a plain
-    /// trait override rather than a transport-level rewrite: the daemon relay,
-    /// the embedded stdio stack and the HTTP transport all serve through this
-    /// same handler, so all three behave identically without the raw
-    /// JSON-RPC interception in `crate::client` growing a second job.
+    /// **This is the onboarding path for the four revisions below 2026-07-28
+    /// and no others.** In the 2026-07-28 schema there is no
+    /// `InitializeResult` at all - the handshake is deleted and `instructions`
+    /// lives on `DiscoverResult` - so a modern peer is onboarded through
+    /// [`McpServer::discover`] instead. Both build their block from
+    /// [`McpServer::arrival_info`], so the two eras hand out the same bytes.
     ///
-    /// The two things rmcp's default implementation does are done here too and
-    /// must stay: publishing the peer info (which is what `client_actor` and
-    /// every `generated.by` write read afterwards) and echoing a client's
-    /// protocol version when it is one we serve.
+    /// **Nothing here reads who is connecting any more.** This used to be the
+    /// only point at which the instructions could depend on the client, so the
+    /// receipt match lived here; that is exactly what SEP-2567's
+    /// per-connection prohibition forbids, and the decision moved to the
+    /// spawned process (see `McpServer::harness_onboarded`). What survives is
+    /// what rmcp's own default does: publishing the peer info, which is what
+    /// `client_actor` and every `generated.by` write read afterwards, and the
+    /// version echo.
     ///
     /// # A version we do not serve is refused here, but only over HTTP
     ///
@@ -1387,31 +1460,7 @@ impl ServerHandler for McpServer {
         }
         context.peer.set_peer_info(request);
 
-        // Only a stdio client is same-machine, so only there does this
-        // machine's receipt say anything about what the client already has.
-        let matched = self.transport == Transport::Stdio
-            && match &self.install_receipt {
-                Some(path) => receipt_matches_client(
-                    &client_name,
-                    &crystalline_core::harnesses_with_hooks(path),
-                ),
-                None => false,
-            };
-
-        let mut info = self.get_info();
-        if minimal_instructions(self.engine.skills_serve(), matched) {
-            // The client's own session hook delivers the full routing block at
-            // session start, so repeating it here would spend the tokens twice.
-            // The TOON note is appended all the same: no hook carries it, it
-            // describes this connection's wire format rather than the
-            // knowledge, and a client that cannot read a tool result is worse
-            // off than one that read the routing block twice.
-            let mut instructions = crystalline_core::render_minimal_instructions();
-            if self.engine.response_format() == ResponseFormat::Toon {
-                instructions.push_str(TOON_INSTRUCTIONS_NOTE);
-            }
-            info.instructions = Some(instructions);
-        }
+        let mut info = self.arrival_info();
         // Echo what the client asked for when we serve it, and answer with our
         // newest otherwise. The fallback is read from our own list rather than
         // left at `ServerInfo::default()`'s `ProtocolVersion::LATEST`, so an
@@ -1423,6 +1472,52 @@ impl ServerHandler for McpServer {
             newest_served_protocol_version()
         };
         Ok(info)
+    }
+
+    /// Answer `server/discover`: **the modern era's only onboarding channel,
+    /// and a channel the client is free never to open.**
+    ///
+    /// From 2026-07-28 there is no `initialize` and no `InitializeResult`;
+    /// `grep -i initialize` over `schema/2026-07-28/schema.ts` returns zero
+    /// hits. `instructions` appears exactly twice in that schema, once in an
+    /// unrelated doc comment and once as `DiscoverResult.instructions` (line
+    /// 696). No reserved `_meta` key carries onboarding, no notification does,
+    /// and the method list is closed. So this method is the whole of it.
+    ///
+    /// **A modern client that never calls `server/discover` is never handed
+    /// the routing block, and nothing errors when that happens.** The
+    /// specification permits it in as many words ("Clients MAY call it but are
+    /// not required to - version negotiation can also happen inline via
+    /// per-request `_meta`"). The mitigations are all pull-shaped and all
+    /// require the client to already know to ask: the `onboarding` prompt,
+    /// `list_domains` with `include_routing=true`, and the served skills.
+    /// `tests/mcp_instructions.rs` pins that this server offers the block by
+    /// every era's own path; no server-side test can prove a client pulled it.
+    ///
+    /// Overridden rather than inherited for one reason: rmcp's default builds
+    /// straight from `get_info()`, and the routing cache has to be refreshed
+    /// first, exactly as the daemon does before an `initialize`
+    /// (`daemon.rs`), or a discover-first client reads a stale virtual-domain
+    /// index. The rest is rmcp's own construction:
+    /// `DiscoverResult::from_server_info` carries `instructions` out of
+    /// `ServerInfo` untouched and sets `ttl_ms: 0` with `cache_scope: Private`
+    /// (rmcp 3.1.2 `model.rs:1246-1268`), which already satisfies the
+    /// caching MUST for this operation.
+    ///
+    /// The client's own `_meta.clientInfo` is deliberately not read here. The
+    /// specification says implementations "SHOULD NOT use them to change the
+    /// behavior of the client or server", and keying instructions on it would
+    /// additionally force a private cache scope on a result the spec wants
+    /// cacheable.
+    async fn discover(
+        &self,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<DiscoverResult, ErrorData> {
+        self.engine.refresh_routing_cache().await;
+        Ok(DiscoverResult::from_server_info(
+            self.supported_protocol_versions().into_owned(),
+            self.arrival_info(),
+        ))
     }
 
     /// List the exposed tools.
@@ -1459,7 +1554,8 @@ impl ServerHandler for McpServer {
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
         let read_only = self.engine.read_only();
-        let skills_hidden = hidden_skills_surface(self.engine.skills_serve());
+        let skills_hidden =
+            hidden_skills_surface(self.engine.skills_serve(), self.harness_onboarded);
         let mut tools = Self::tool_router().list_all();
         tools.retain(|t| {
             if is_write_tool(&t.name) && read_only {
@@ -1501,7 +1597,9 @@ impl ServerHandler for McpServer {
         if name == "provision" && hidden_provision_tool(read_only) {
             return None;
         }
-        if name == "skills" && hidden_skills_surface(self.engine.skills_serve()) {
+        if name == "skills"
+            && hidden_skills_surface(self.engine.skills_serve(), self.harness_onboarded)
+        {
             return None;
         }
         let mut tool = Self::tool_router().get(name).cloned()?;
@@ -1518,7 +1616,7 @@ impl ServerHandler for McpServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, ErrorData> {
-        if hidden_skills_surface(self.engine.skills_serve()) {
+        if hidden_skills_surface(self.engine.skills_serve(), self.harness_onboarded) {
             return Ok(ListResourcesResult::with_all_items(Vec::new()));
         }
         let resources = SKILL_ASSETS
@@ -1567,7 +1665,7 @@ impl ServerHandler for McpServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListPromptsResult, ErrorData> {
-        let prompts = if hidden_skills_surface(self.engine.skills_serve()) {
+        let prompts = if hidden_skills_surface(self.engine.skills_serve(), self.harness_onboarded) {
             Vec::new()
         } else {
             Self::prompt_router().list_all()
@@ -1755,24 +1853,36 @@ mod tests {
         assert!(!is_collab_tool("search_engrams"));
     }
 
-    /// One assertion per row of the value set, and no second argument: the
-    /// decision no longer looks at who connected, because SEP-2567 forbids a
-    /// list endpoint varying per connection.
+    /// The locked matrix, one row per (setting, resolved answer) pair. The
+    /// second argument is never the connecting client: it is what the spawned
+    /// process resolved from its `--harness` argument and this machine's
+    /// receipt before the session started.
     #[test]
-    fn hidden_skills_surface_follows_the_setting_alone() {
-        assert!(!hidden_skills_surface(SkillsServe::Always));
-        assert!(hidden_skills_surface(SkillsServe::Never));
+    fn hidden_skills_surface_matches_the_locked_matrix() {
+        for onboarded in [true, false] {
+            assert!(
+                !hidden_skills_surface(SkillsServe::Always, onboarded),
+                "true always serves, whoever spawned us"
+            );
+            assert!(
+                hidden_skills_surface(SkillsServe::Never, onboarded),
+                "false never serves, whoever spawned us"
+            );
+        }
         assert!(
-            !hidden_skills_surface(SkillsServe::Auto),
-            "the default serves everyone; Task 5 resolves the suppression \
-             before the session starts instead"
+            hidden_skills_surface(SkillsServe::Auto, true),
+            "auto plus an onboarded harness is the whole point of the feature"
+        );
+        assert!(
+            !hidden_skills_surface(SkillsServe::Auto, false),
+            "auto serves everyone else, which is every case we cannot resolve"
         );
     }
 
-    /// Only `auto` plus a match shrinks the instructions: `false` gates skill
-    /// serving, never onboarding.
+    /// Only `auto` plus an onboarded harness shrinks the instructions: `false`
+    /// gates skill serving, never onboarding.
     #[test]
-    fn minimal_instructions_are_auto_and_matched_only() {
+    fn minimal_instructions_are_auto_and_onboarded_only() {
         assert!(minimal_instructions(SkillsServe::Auto, true));
         assert!(!minimal_instructions(SkillsServe::Auto, false));
         assert!(!minimal_instructions(SkillsServe::Always, true));
@@ -1783,35 +1893,23 @@ mod tests {
         assert!(!minimal_instructions(SkillsServe::Never, false));
     }
 
-    /// The client-name table: the three verified harness names match when the
-    /// receipt has them with hooks, every other name never matches.
+    /// The two gates take the same two inputs, so the surface and the
+    /// instructions can never disagree about whether this deployment is
+    /// already onboarded. They diverged once, when one keyed on the client's
+    /// name and the other did not, and that divergence is what SEP-2567
+    /// forbade.
     #[test]
-    fn receipt_matching_is_by_verified_client_name_and_hooked_harness() {
-        use crystalline_core::HarnessKind;
-        let all = [
-            HarnessKind::ClaudeCode,
-            HarnessKind::Codex,
-            HarnessKind::Copilot,
-        ];
-        assert!(receipt_matches_client("claude-code", &all));
-        assert!(receipt_matches_client("codex-mcp-client", &all));
-        assert!(receipt_matches_client("github-copilot-developer", &all));
-        // Case-insensitive on the name.
-        assert!(receipt_matches_client("Claude-Code", &all));
-
-        // A harness the receipt does not list with hooks never matches.
-        assert!(!receipt_matches_client(
-            "claude-code",
-            &[HarnessKind::Codex]
-        ));
-        assert!(!receipt_matches_client("claude-code", &[]));
-
-        // An unknown client name never matches, whatever is installed.
-        for name in ["", "cursor", "claude", "codex", "copilot", "crystalline"] {
-            assert!(
-                !receipt_matches_client(name, &all),
-                "'{name}' is not a name any onboarded harness sends"
-            );
+    fn the_surface_and_the_instructions_read_the_same_answer() {
+        for serve in [SkillsServe::Auto, SkillsServe::Always, SkillsServe::Never] {
+            for onboarded in [true, false] {
+                if serve == SkillsServe::Auto {
+                    assert_eq!(
+                        hidden_skills_surface(serve, onboarded),
+                        minimal_instructions(serve, onboarded),
+                        "auto decides both together"
+                    );
+                }
+            }
         }
     }
 

@@ -487,18 +487,29 @@ async fn accept_loop(listener: interprocess::local_socket::tokio::Listener, shar
 
 /// Dispatch one accepted connection by its `mcp` or `ctl` handshake.
 async fn handle_conn(mut stream: IpcStream, shared: Arc<Shared>) {
-    let mode = match read_mode_line(&mut stream).await {
+    let line = match read_mode_line(&mut stream).await {
         Ok(m) => m,
         Err(_) => return,
     };
-    match mode.as_str() {
+    // The first token is the mode, the rest are options. A bridge older than
+    // the extended line sends a bare `mcp`, which parses to the same mode and
+    // no options, so both shapes are served.
+    let (mode, options) = crate::instance::split_mode_line(&line);
+    match mode {
         "mcp" => {
             let id = shared.begin_session("mcp");
             // Refresh the routing cache before this connection initializes so its
             // instructions reflect the latest virtual MANIFESTs, including edits
             // made by other instances sharing the database.
             shared.engine.refresh_routing_cache().await;
-            let server = McpServer::new(shared.engine.clone());
+            // The bridge resolved this once at its own startup, from the
+            // `--harness` argument its registration carries and this machine's
+            // install receipt, and re-sends it on every reconnect. The daemon
+            // never re-derives it: its own environment is whoever spawned it
+            // first, and a value re-derived per accepted socket could change
+            // the surface under a live client across a daemon restart.
+            let onboarded = options.contains(&crate::instance::SKILLS_OFF_OPTION);
+            let server = McpServer::new(shared.engine.clone()).with_onboarded_harness(onboarded);
             match rmcp::serve_server(server, stream).await {
                 Ok(running) => {
                     let _ = running.waiting().await;
