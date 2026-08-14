@@ -225,9 +225,11 @@ fn is_write_tool(name: &str) -> bool {
 /// `server/discover`, restricts `tools/list_changed` to subscribers and requires
 /// caching hints on six operations. All four are implemented now - see
 /// [`McpServer::list_tools`], [`McpServer::discover`], [`McpServer::listen`] and
-/// [`CacheHinted`] - and what remains before the constant is added here is the
-/// `server/discover` probe on the stdio bridge (`crate::client`), which still
-/// answers a probing client that this server is legacy.
+/// [`CacheHinted`] - and so is the stdio bridge's half: a bare `server/discover`
+/// probe is normalized and forwarded rather than answered `-32601`
+/// (`crate::client`), so a probing client reaches [`McpServer::discover`] and
+/// reads this list instead of being told this server is legacy. What remains is
+/// the decision itself and the per-client evidence it is gated on.
 ///
 /// **The bottom is deliberately NOT a decision.** `V_2024_11_05` is served today
 /// and stays served: rmcp branches nowhere between it and `V_2025_11_25`
@@ -243,9 +245,11 @@ pub const SERVED_PROTOCOL_VERSIONS: &[ProtocolVersion] = &[
 ];
 
 /// The newest revision we serve: what a client asking for one we do not serve
-/// is answered with over stdio. Reads the last element, so the ordering of
-/// [`SERVED_PROTOCOL_VERSIONS`] is load bearing rather than cosmetic.
-fn newest_served_protocol_version() -> ProtocolVersion {
+/// is answered with over stdio, and the version the stdio bridge injects into a
+/// bare `server/discover` probe (`crate::client`). Reads the last element, so
+/// the ordering of [`SERVED_PROTOCOL_VERSIONS`] is load bearing rather than
+/// cosmetic.
+pub(crate) fn newest_served_protocol_version() -> ProtocolVersion {
     SERVED_PROTOCOL_VERSIONS
         .last()
         .expect("SERVED_PROTOCOL_VERSIONS is never empty")
