@@ -1,5 +1,5 @@
 /**
- * A state whose whole document is parsed, for tests that read the syntax tree.
+ * A finished parse, for tests that read the syntax tree.
  *
  * What this compensates for is a wall-clock budget inside
  * `@codemirror/language`: `LanguageState.init` gives the first parse of a new
@@ -14,26 +14,44 @@
  * fixture came out parsed to 21, 32, 55 or all 69 characters across repeated
  * runs, and every short tree was a failed assertion.
  *
- * The budget is wall clock rather than work, so the honest fix is to remove it
- * rather than to widen it: `Number.POSITIVE_INFINITY` below says "parse all of
- * it" where a bigger number would only say "be luckier". A `waitFor` or a retry
- * around the assertion would be papering over - the parse these tests need is
- * not asynchronous work they are racing, it is work nobody has asked for yet,
- * and letting the event loop turn would only hand it to the idle worker by
- * accident. Asking for it outright is what makes the assertion mean what it
- * says.
+ * A `waitFor` or a retry around the assertion would be papering over. The parse
+ * these tests need is not asynchronous work they are racing, it is work nobody
+ * has asked for yet, and letting the event loop turn would only hand it to the
+ * idle worker by accident. Asking for it outright is what makes the assertion
+ * mean what it says.
  *
- * Ask for it BEFORE the view is built. A decoration plugin reads the tree in
- * its constructor, and the plugins here rebuild on a document, selection or
- * viewport change rather than on parse progress, so a tree that grows after
- * mounting does not redraw anything by itself.
+ * Two shapes, because tests come in two:
+ *
+ * - `parsedState` for a test that builds the state itself, which is most of
+ *   them. Parsing before the view is built means every layer sees a whole tree
+ *   in its constructor.
+ * - `parsedView` for a test that only ever gets a mounted view - a React screen
+ *   the test did not construct the buffer for. It is also the app's own path:
+ *   advance the parse under a live view, publish it, and let the decoration
+ *   layers redraw off `parseAdvanced`.
  */
 
 import { ensureSyntaxTree, syntaxTree } from "@codemirror/language";
 import type { EditorState } from "@codemirror/state";
+import type { EditorView } from "@codemirror/view";
 
-/** No budget at all, which is the point. See the note above. */
-const NO_BUDGET = Number.POSITIVE_INFINITY;
+/**
+ * The wall clock this allows the parse, which is a watchdog and not a
+ * tolerance.
+ *
+ * Thirty seconds against fixtures that parse in well under a millisecond is
+ * four orders of magnitude of headroom, where the 20 milliseconds this works
+ * around is the same order as the work itself - that difference is the whole
+ * point, not a bigger number in the same game. It is finite rather than
+ * `Infinity` deliberately, and the trade is worth naming: infinity would make a
+ * parse that stopped making progress hang the worker forever, and a
+ * synchronous hang is the one failure a test runner cannot interrupt or report.
+ * A finite deadline turns that same case into the throw below, which names how
+ * far the parse got. What it costs is that a machine starved past all
+ * plausibility would fail the run rather than survive it - loudly, at this
+ * line, which is the outcome to want.
+ */
+const PARSE_DEADLINE_MS = 30_000;
 
 /**
  * How far the tree reaches, which is the only thing the callers depend on.
@@ -47,19 +65,36 @@ function covered(state: EditorState): boolean {
   return syntaxTree(state).length >= state.doc.length;
 }
 
+function refuse(state: EditorState): never {
+  throw new Error(
+    `the parse stopped at ${syntaxTree(state).length} of ${state.doc.length} characters`,
+  );
+}
+
 export function parsedState(state: EditorState): EditorState {
   if (covered(state)) {
     return state;
   }
-  ensureSyntaxTree(state, state.doc.length, NO_BUDGET);
+  ensureSyntaxTree(state, state.doc.length, PARSE_DEADLINE_MS);
   // The empty update is what publishes the advanced parse into the state
   // field: `ensureSyntaxTree` moves the parse context on, but `syntaxTree`
   // reads the snapshot the field is holding, which only a transaction renews.
   const settled = state.update({}).state;
-  if (!covered(settled)) {
-    throw new Error(
-      `the parse stopped at ${syntaxTree(settled).length} of ${settled.doc.length} characters`,
-    );
+  return covered(settled) ? settled : refuse(settled);
+}
+
+/**
+ * The same for a view that is already mounted, which is the shape the
+ * `parseWorker` itself uses: advance, then publish through a transaction that
+ * changes no document, no selection and no viewport. Every tree-driven layer
+ * has to notice that transaction on its own, which is what `parseAdvanced`
+ * is for.
+ */
+export function parsedView<V extends EditorView>(view: V): V {
+  if (covered(view.state)) {
+    return view;
   }
-  return settled;
+  ensureSyntaxTree(view.state, view.state.doc.length, PARSE_DEADLINE_MS);
+  view.dispatch({});
+  return covered(view.state) ? view : refuse(view.state);
 }

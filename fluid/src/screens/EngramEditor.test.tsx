@@ -33,6 +33,7 @@ import {
   soloCollabSession,
   userFixture,
 } from "../test/harness";
+import { parsedView } from "../test/parse";
 
 vi.mock("../api/client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../api/client")>();
@@ -210,6 +211,27 @@ function mountedView(content: HTMLElement): EditorView {
 }
 
 /**
+ * The screen's own buffer, up and fully parsed.
+ *
+ * The last line is what makes the decoration assertions in this file mean
+ * something. The buffer belongs to the screen rather than to the test, so the
+ * parse cannot be finished on the state before mounting the way the editor
+ * unit tests do it; it is finished through the mounted view instead, which is
+ * the same path the idle `parseWorker` takes. Without it these tests read
+ * whatever of the syntax tree fitted in CodeMirror's 20ms wall-clock budget,
+ * and under load that was measured here twice: "# Alpha" still carrying its
+ * heading mark, and a json fence still drawn in the prose face.
+ */
+async function openBuffer(shows = "A rule."): Promise<HTMLElement> {
+  const editor = await screen.findByLabelText("Engram source");
+  await waitFor(() => {
+    expect(editor.textContent).toContain(shows);
+  });
+  parsedView(mountedView(editor));
+  return editor;
+}
+
+/**
  * Insert a table the way the bar now offers one: the button opens a size
  * picker, and the default cell under the keyboard reproduces exactly what the
  * button used to insert on its own. The grid is portalled out of the toolbar,
@@ -231,6 +253,14 @@ async function insertTable(bar?: HTMLElement): Promise<void> {
   await userEvent.click(
     await screen.findByRole("button", { name: "2 columns by 2 rows" }),
   );
+  // The table these tests then act on is found through the syntax tree, and
+  // the parse of the buffer the insertion just changed is cut off after 20ms
+  // of wall clock - so on a loaded machine the verbs would be asked about a
+  // table that is not in the tree yet. The screen builds its own buffer, so
+  // the parse is finished through the mounted view rather than through the
+  // state. It lives here because every table these tests use comes through
+  // this route.
+  parsedView(mountedView(screen.getByLabelText("Engram source")));
 }
 
 /**
@@ -293,10 +323,7 @@ describe("the engram editor", () => {
   it("loads the exact file text into the buffer", async () => {
     serveEditor();
     renderApp("/d/eng/edit/alpha");
-    const editor = await screen.findByLabelText("Engram source");
-    await waitFor(() => {
-      expect(editor.textContent).toContain("A rule.");
-    });
+    const editor = await openBuffer();
     // Frontmatter is in the buffer too: the whole file is the document. In
     // preview mode the block is behind its summary chip - the form beside the
     // buffer is the metadata surface there - so the plain text of it is what
@@ -354,10 +381,7 @@ describe("the engram editor", () => {
   it("renders live preview and hands the raw text back on demand", async () => {
     serveEditor();
     renderApp("/d/eng/edit/alpha");
-    const editor = await screen.findByLabelText("Engram source");
-    await waitFor(() => {
-      expect(editor.textContent).toContain("A rule.");
-    });
+    const editor = await openBuffer();
     // The cursor sits at the top of the document, so the heading line is
     // inactive and its marker is folded away.
     expect(editor.textContent).toContain("Alpha");
@@ -397,10 +421,7 @@ describe("the engram editor", () => {
   it("inserts a table from the format bar and leaves one undo behind", async () => {
     serveEditor();
     renderApp("/d/eng/edit/alpha");
-    const editor = await screen.findByLabelText("Engram source");
-    await waitFor(() => {
-      expect(editor.textContent).toContain("A rule.");
-    });
+    const editor = await openBuffer();
 
     const bar = screen.getByRole("toolbar", { name: "Formatting" });
     const view = mountedView(editor);
@@ -436,10 +457,7 @@ describe("the engram editor", () => {
     // listener at all, which is the piece a buffer rebuild can silently drop.
     serveEditor();
     renderApp("/d/eng/edit/alpha");
-    const editor = await screen.findByLabelText("Engram source");
-    await waitFor(() => {
-      expect(editor.textContent).toContain("A rule.");
-    });
+    const editor = await openBuffer();
     const bar = screen.getByRole("toolbar", { name: "Formatting" });
     const view = mountedView(editor);
     expect(
@@ -473,10 +491,7 @@ describe("the engram editor", () => {
     // behind the chip, and the file would stop parsing.
     serveEditor();
     renderApp("/d/eng/edit/alpha");
-    const editor = await screen.findByLabelText("Engram source");
-    await waitFor(() => {
-      expect(editor.textContent).toContain("A rule.");
-    });
+    const editor = await openBuffer();
     const view = mountedView(editor);
 
     await insertTable();
@@ -492,10 +507,7 @@ describe("the engram editor", () => {
   it("runs format-bar buttons from the keyboard", async () => {
     serveEditor();
     renderApp("/d/eng/edit/alpha");
-    const editor = await screen.findByLabelText("Engram source");
-    await waitFor(() => {
-      expect(editor.textContent).toContain("A rule.");
-    });
+    const editor = await openBuffer();
     const bar = screen.getByRole("toolbar", { name: "Formatting" });
     const view = mountedView(editor);
     act(() => {
@@ -540,10 +552,7 @@ describe("the engram editor", () => {
       "/domains/eng/engrams/alpha": () => detailResponse({ content: fenced }),
     });
     renderApp("/d/eng/edit/alpha");
-    const editor = await screen.findByLabelText("Engram source");
-    await waitFor(() => {
-      expect(editor.textContent).toContain('{ "answer": 42 }');
-    });
+    const editor = await openBuffer('{ "answer": 42 }');
     const body = Array.from(editor.querySelectorAll(".cm-line")).find(
       (line) => line.textContent === '{ "answer": 42 }',
     );
@@ -1579,10 +1588,7 @@ describe("the engram editor", () => {
       },
     });
     renderApp("/d/eng/edit/alpha");
-    const editor = await screen.findByLabelText("Engram source");
-    await waitFor(() => {
-      expect(editor.textContent).toContain("A rule.");
-    });
+    await openBuffer();
     await userEvent.click(screen.getByRole("button", { name: "Save" }));
     await screen.findByRole("dialog", { name: /someone else saved/i });
     await userEvent.click(
@@ -1622,10 +1628,7 @@ describe("the engram editor", () => {
       },
     });
     renderApp("/d/eng/edit/alpha");
-    const editor = await screen.findByLabelText("Engram source");
-    await waitFor(() => {
-      expect(editor.textContent).toContain("A rule.");
-    });
+    await openBuffer();
     await userEvent.click(screen.getByRole("button", { name: "Raw" }));
     await waitFor(() => {
       expect(screen.getByLabelText("Engram source").textContent).toContain(
@@ -1866,10 +1869,7 @@ describe("the engram editor in a session", () => {
     const room = joinedSession(overrides);
     serveEditor();
     renderApp("/d/eng/edit/alpha");
-    const editor = await screen.findByLabelText("Engram source");
-    await waitFor(() => {
-      expect(editor.textContent).toContain("A rule.");
-    });
+    const editor = await openBuffer();
     return { ...room, editor };
   }
 
@@ -2257,10 +2257,7 @@ describe("the engram editor resolving a session conflict", () => {
     });
     serveEditor();
     renderApp("/d/eng/edit/alpha");
-    const editor = await screen.findByLabelText("Engram source");
-    await waitFor(() => {
-      expect(editor.textContent).toContain("A rule.");
-    });
+    const editor = await openBuffer();
     return { ...room, resolve, editor };
   }
 
@@ -2319,10 +2316,7 @@ describe("the engram editor resolving a session conflict", () => {
     });
     serveEditor();
     renderApp("/d/eng/edit/alpha");
-    const editor = await screen.findByLabelText("Engram source");
-    await waitFor(() => {
-      expect(editor.textContent).toContain("A rule.");
-    });
+    await openBuffer();
     await userEvent.click(screen.getByRole("button", { name: "Resolve" }));
     await userEvent.click(
       screen.getByRole("button", { name: "Take the file version" }),

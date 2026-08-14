@@ -20,6 +20,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, test } from "vitest";
 
 import { Tooltips } from "../components/primitives";
+import { parsedState } from "../test/parse";
 import { EditorToolbar } from "./EditorToolbar";
 import { frontmatterFold } from "./frontmatterFold";
 import { baseExtensions, docText, lineSeparatorFor } from "./setup";
@@ -66,16 +67,23 @@ function mount(
   extensions: Extension[] = [],
 ): EditorView {
   view = new EditorView({
-    state: EditorState.create({
-      doc,
-      selection: EditorSelection.single(anchor, head),
-      // The markdown language, because table detection reads the syntax tree.
-      extensions: [
-        ...lineSeparatorFor(doc),
-        ...baseExtensions(false),
-        ...extensions,
-      ],
-    }),
+    // `parsedState` for the same reason the comment below gives: the whole
+    // table segment reaches through `tableContextAt` into the syntax tree, and
+    // a new state's first parse is cut off after 20ms of wall clock. Nothing
+    // here was seen failing, but neither was `tableVerbs.test.ts` in sixteen
+    // loaded runs, and it is the same read of the same tree.
+    state: parsedState(
+      EditorState.create({
+        doc,
+        selection: EditorSelection.single(anchor, head),
+        // The markdown language, because table detection reads the syntax tree.
+        extensions: [
+          ...lineSeparatorFor(doc),
+          ...baseExtensions(false),
+          ...extensions,
+        ],
+      }),
+    ),
     parent: document.body,
   });
   bar = render(<EditorToolbar view={view} tableActive={tableActive} />, {
