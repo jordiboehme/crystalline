@@ -143,17 +143,20 @@
 //! `#[prompt_handler]` replaces any `list_prompts` in its impl block and the
 //! gate needs one it can empty.
 //!
-//! rmcp 2.1 supports a server pushing `notifications/tools/list_changed` to
-//! a connected client (`Peer::notify_tool_list_changed`, gated behind
-//! `ServerCapabilities::enable_tool_list_changed`); `configure` sends one
-//! whenever a `set`/`unset` call flips `github.enabled`, and `add_domain`/
-//! `update_domain` send one whenever they flip whether any domain declares
-//! provisioning. Neither of those two moves a list any more, now that both
-//! gates refuse at call time; the pushes survive because Task 6 of the rmcp
-//! 3.x migration owns pruning them and routing whatever genuinely survives
-//! through subscription sinks. A `skills.serve` flip does still move three
-//! lists at once, so `configure` sends the prompt and resource list-changed
-//! notifications alongside the tool one.
+//! # Nothing is pushed, because nothing can change
+//!
+//! This server sends no `notifications/*/list_changed` at all. `configure`
+//! used to push one whenever it flipped `github.enabled`, and `add_domain` and
+//! `update_domain` whenever they flipped whether any domain declares
+//! provisioning; after those gates moved to call-time refusals and
+//! `skills.serve` was snapshotted at engine construction, every input to every
+//! list is fixed before the first request arrives, so each of those pushes
+//! announced a change that had not happened. MCP 2026-07-28 removes the
+//! unsolicited channel outright - a notification either rides a
+//! `subscriptions/listen` stream the client opened or it does not exist - so
+//! [`McpServer::accepted_subscription_filter`] and [`McpServer::listen`] serve
+//! that stream, and its doc comment carries what a future dynamic list would
+//! have to do to announce itself.
 //!
 //! Every tool also advertises MCP tool annotations: a display `title` plus the
 //! readOnly/destructive/idempotent/openWorld hints, so a client can tune its
@@ -177,12 +180,10 @@ use rmcp::model::{
     ListPromptsResult, ListResourcesResult, ListToolsResult, PaginatedRequestParams,
     ProgressNotificationParam, PromptMessage, ProtocolVersion, ReadResourceRequestParams,
     ReadResourceResponse, ReadResourceResult, Resource, ResourceContents, Role, ServerCapabilities,
-    ServerInfo, Tool,
+    ServerInfo, SubscriptionFilter, Tool,
 };
-use rmcp::service::RequestContext;
-use rmcp::{
-    Peer, RoleServer, ServerHandler, prompt, prompt_router, tool, tool_handler, tool_router,
-};
+use rmcp::service::{RequestContext, SubscriptionContext};
+use rmcp::{RoleServer, ServerHandler, prompt, prompt_router, tool, tool_handler, tool_router};
 use serde_json::{Value, json};
 
 use crystalline_core::SKILL_ASSETS;
@@ -839,7 +840,6 @@ impl McpServer {
     async fn configure(
         &self,
         Parameters(p): Parameters<ConfigureParams>,
-        peer: Peer<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         if self.engine.read_only() {
             return Err(to_error(EngineError::ReadOnly));
@@ -861,23 +861,14 @@ impl McpServer {
             return result.map_err(to_error).and_then(ok);
         }
 
-        let before = self.engine.github_enabled();
+        // No list-changed notification follows, and none is owed: nothing this
+        // call can write moves a list. `github.enabled` refuses at call time
+        // instead of shaping the listing, and `skills.serve` is frozen at
+        // engine construction ([`Engine::skills_serve`]). The unsolicited push
+        // that used to fire here announced a change that had not happened, and
+        // from MCP 2026-07-28 an unsolicited notification has no channel at all
+        // (see [`McpServer::listen`]).
         self.apply_settings(&p).await?;
-        let after = self.engine.github_enabled();
-        // Nothing this call can write moves a list any more. `github.enabled`
-        // refuses at call time instead of shaping the listing, and
-        // `skills.serve` is frozen at engine construction
-        // ([`Engine::skills_serve`]), so its own before/after comparison went
-        // with the freeze: it could only ever report "no change". This push
-        // survives only because Task 6 of the rmcp 3.x migration owns pruning
-        // and routing every push site through subscription sinks, and pruning
-        // it here would leave that task auditing a set that had already
-        // changed.
-        if before != after
-            && let Err(e) = peer.notify_tool_list_changed().await
-        {
-            tracing::warn!("failed to send tools/list_changed after configure: {e}");
-        }
 
         self.engine
             .configure_snapshot()
@@ -933,9 +924,9 @@ impl McpServer {
 
         // A newly added (or adopted) domain may already carry a MANIFEST that
         // declares a `Provisioning` section, so `provisioning_declared` can
-        // flip on this call; notify the same way `configure` does for
-        // `github.enabled`.
-        let before = self.engine.provisioning_declared();
+        // flip on this call. That no longer moves any list - `provision` is
+        // listed whatever is declared and refuses its mutating actions instead
+        // - so nothing is announced; see [`McpServer::listen`].
         let result: Result<Value, EngineError> = if let Some(repo) = p.repo.as_deref() {
             self.engine
                 .origin_add_with_progress(
@@ -966,13 +957,6 @@ impl McpServer {
                 .domain_add_local(p.domain.as_deref(), p.folder.as_deref())
                 .await
         };
-        let after = self.engine.provisioning_declared();
-        if before != after
-            && let Err(e) = ctx.peer.notify_tool_list_changed().await
-        {
-            tracing::warn!("failed to send tools/list_changed after add_domain: {e}");
-        }
-
         result.map_err(to_error).and_then(ok)
     }
 
@@ -1015,22 +999,14 @@ impl McpServer {
     async fn update_domain(
         &self,
         Parameters(p): Parameters<UpdateDomainParams>,
-        peer: Peer<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         if refused_collab_tool("update_domain", self.engine.github_enabled()) {
             return refuse(RemoteError::NotEnabled.to_string());
         }
         // A pull can rewrite a domain's MANIFEST, so `provisioning_declared`
-        // can flip here too; notify the same way `add_domain` and `configure`
-        // do.
-        let before = self.engine.provisioning_declared();
+        // can flip here too, and like `add_domain` that announces nothing: the
+        // gate it feeds refuses at call time instead of shaping a list.
         let result = self.engine.origin_update(p.domain.as_deref()).await;
-        let after = self.engine.provisioning_declared();
-        if before != after
-            && let Err(e) = peer.notify_tool_list_changed().await
-        {
-            tracing::warn!("failed to send tools/list_changed after update_domain: {e}");
-        }
         result.map_err(to_error).and_then(|v| self.ok_list(v))
     }
 
@@ -1366,6 +1342,13 @@ impl ServerHandler for McpServer {
         // mid-session. Resource subscribe is deliberately not enabled: the
         // shipped skills are static for a binary's lifetime, so there is
         // nothing to subscribe to.
+        //
+        // The three list-changed capabilities are what a modern client is
+        // allowed to open a `subscriptions/listen` stream for: rmcp intersects
+        // any requested filter with exactly this set (rmcp 3.1.2
+        // `handler/server.rs:157-160`), and
+        // [`McpServer::accepted_subscription_filter`] names the same three, so
+        // the advertisement and the accepted filter cannot drift.
         info.capabilities = ServerCapabilities::builder()
             .enable_tools()
             .enable_tool_list_changed()
@@ -1520,6 +1503,89 @@ impl ServerHandler for McpServer {
         ))
     }
 
+    /// What a `subscriptions/listen` stream may carry: the three list-changed
+    /// categories this server advertises in [`ServerHandler::get_info`], and
+    /// nothing else.
+    ///
+    /// Returning `Some` is what makes the method exist at all: rmcp's default
+    /// returns `None` and answers `method not found` (rmcp 3.1.2
+    /// `handler/server.rs:151-155`, default at `:411-416`). rmcp then intersects
+    /// this candidate with the request and again with the capabilities
+    /// `get_info` advertises (`:157-160`), so `resource_subscriptions`
+    /// (`notifications/resources/updated`) is dropped twice over: it is absent
+    /// here, and `resources.subscribe` is deliberately not advertised because
+    /// the shipped skills are static for a binary's lifetime.
+    ///
+    /// The requested filter is not read. Accepting a category is a statement
+    /// about what this server can deliver, not about who is asking, which is
+    /// the same rule the list endpoints follow.
+    fn accepted_subscription_filter(
+        &self,
+        _requested: &SubscriptionFilter,
+    ) -> Option<SubscriptionFilter> {
+        Some(
+            SubscriptionFilter::builder()
+                .tools_list_changed()
+                .prompts_list_changed()
+                .resources_list_changed()
+                .build(),
+        )
+    }
+
+    /// Hold one acknowledged subscription open until the client ends it.
+    ///
+    /// # This stream is silent, and that is the finding rather than a shortcut
+    ///
+    /// Nothing this server can be asked to do moves any of the three lists.
+    /// [`McpServer::list_tools`] reads `Engine::read_only`,
+    /// `Engine::skills_serve` and `harness_onboarded`; `list_resources` and
+    /// `list_prompts` read the last two. All three are fixed before the first
+    /// request arrives - read-only at engine construction, `skills.serve`
+    /// snapshotted there too, the harness answer resolved by the spawned
+    /// process before the session started - so no request on any transport can
+    /// change what a later `tools/list`, `resources/list` or `prompts/list`
+    /// returns. There is therefore no truthful `notifications/*/list_changed`
+    /// to send, and the three unsolicited pushes that used to fire from
+    /// `configure`, `add_domain` and `update_domain` were deleted rather than
+    /// routed here: after the gates they keyed on moved to call-time refusals,
+    /// each announced a change that had not happened.
+    ///
+    /// **So no sink is registered anywhere, deliberately.** The plan for this
+    /// work called for a registry of cloned `SubscriptionSink`s on the shared
+    /// `Arc<Engine>`; a registry nothing writes to is worse than none, because
+    /// it reads as implemented. What the registry would have needed is recorded
+    /// here instead, since the next person to add a genuinely dynamic list has
+    /// to get it right: the sink cannot live on this handler, because on the
+    /// stateless HTTP path rmcp builds a fresh service per request
+    /// (`get_service()` at rmcp 3.1.2 `tower.rs:1822` and `:1948`) and every
+    /// modern peer routes statelessly, so the handler that would push and the
+    /// handler that took the subscription are different objects sharing only
+    /// the engine. (The legacy session path builds one service per session,
+    /// `tower.rs:1855`, and stdio one per connection, so a handler-local
+    /// registry would have worked there and nowhere else.) `SubscriptionSink`
+    /// is `Clone` and every field is `Send + Sync + 'static`
+    /// (`service/server.rs:139-144`), so `Arc<Engine>` can hold one; it also
+    /// holds a `Peer` and a child cancellation token, so it must be removed
+    /// when this method returns or the engine accumulates dead peers.
+    ///
+    /// # What the client is guaranteed before this runs
+    ///
+    /// rmcp has already sent `notifications/subscriptions/acknowledged` with
+    /// the subscription id in its `_meta`
+    /// (`SubscriptionContext::establish`, `service/server.rs:337-375`), which
+    /// is the specification's "acknowledgment first, id in `_meta`" pair, and
+    /// `SubscriptionSink::send` re-attaches that id and enforces the accepted
+    /// filter on anything sent later (`:184-257`). Both are pinned by
+    /// `tests/mcp_subscriptions.rs` off the wire, not assumed.
+    async fn listen(&self, context: SubscriptionContext) -> Result<(), ErrorData> {
+        tracing::debug!(
+            accepted = ?context.accepted(),
+            "subscription opened; this server has no list that can change, so the stream stays silent"
+        );
+        context.cancelled().await;
+        Ok(())
+    }
+
     /// List the exposed tools.
     ///
     /// # Only inputs no request can move may gate this list
@@ -1534,8 +1600,11 @@ impl ServerHandler for McpServer {
     /// What is left is `read_only`, which is fixed at engine construction
     /// (`Engine::with_read_only`, `engine.rs:788-791`, takes `self` by value;
     /// the engine is shared behind an `Arc`), plus the `skills.serve` setting,
-    /// which is still read live and is the one remaining side effect - see
-    /// [`hidden_skills_surface`].
+    /// snapshotted at the same point (`Engine::skills_serve`), and the harness
+    /// answer the spawned process resolved before the session started - see
+    /// [`hidden_skills_surface`]. All three are fixed before the first request,
+    /// which is why this list can never move and why [`McpServer::listen`] has
+    /// nothing to announce.
     ///
     /// `github.enabled` and whether any domain declares provisioning both left
     /// this list for a call-time refusal, which is the remedy SEP-2567

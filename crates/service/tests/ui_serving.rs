@@ -965,12 +965,13 @@ async fn the_standby_stream_reaches_the_transport_at_every_ui_path() {
             response.status(),
             400,
             "GET {path} with `Accept: {accept}` is streamable HTTP's second \
-             half - the client-opened stream every server-initiated message \
-             rides, tools/list_changed among them - and it must reach the \
-             transport, which asks it for a session id. Answering it with the \
-             app shell is a 200 the client reads as UnexpectedContentType, so \
-             the stream never opens and the agent silently stops learning that \
-             the tool surface changed"
+             half - the client-opened stream every server-initiated message a \
+             legacy session receives rides, this server's progress \
+             notifications among them - and it must reach the transport, which \
+             asks it for a session id. Answering it with the app shell is a 200 \
+             the client reads as UnexpectedContentType, so the stream never \
+             opens and the agent silently stops hearing anything the server \
+             starts"
         );
         assert!(
             !head(&response, header::CONTENT_TYPE).contains("text/html"),

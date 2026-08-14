@@ -171,9 +171,11 @@ pub fn wants_spa(method: &Method, accept: Option<&str>) -> bool {
 ///
 /// Streamable HTTP has a second half beside the request/response POST: a
 /// client-opened GET at the endpoint path, held open, carrying every
-/// server-initiated message - which for this server means the
-/// `tools/list_changed` an agent needs to see after `configure` or
-/// `add_domain`. It arrives at whatever path the client was pointed at,
+/// server-initiated message a legacy session receives, which for this server
+/// means the progress notifications a long `add_domain` reports through. (No
+/// list-changed notification rides it any more: nothing can move a list, and
+/// MCP 2026-07-28 removes the unsolicited channel outright - see
+/// `mcp::McpServer::listen`.) It arrives at whatever path the client was pointed at,
 /// including `/`, which is the endpoint the deployment docs hand out, so the
 /// routes the UI declares there have to let it past or the stream is answered
 /// with HTML and never opens.

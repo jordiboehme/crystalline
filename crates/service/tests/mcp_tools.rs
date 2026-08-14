@@ -3595,7 +3595,7 @@ async fn provision_call_by_name_while_hidden_reaches_engine() {
     assert!(err.contains("read-only"), "{err}");
 }
 
-// --- provision: tools/list_changed on a declaration flip ---------------------
+// --- provision: a declaration flip announces nothing --------------------------
 
 /// A client handler that records whether it ever received
 /// `notifications/tools/list_changed`, mirroring
@@ -3619,10 +3619,19 @@ impl rmcp::ClientHandler for ProvisionNotifyClient {
 
 /// `add_domain` adopting a folder whose MANIFEST already declares a
 /// `Provisioning` section flips `provisioning_declared` from false to true,
-/// which must push a `tools/list_changed` notification the same way
-/// `configure` does for `github.enabled`.
+/// and that must announce **nothing**.
+///
+/// This test is the inversion of `add_domain_flip_notifies_tool_list_changed`,
+/// which locked the push. The flip stopped moving the tool list when
+/// `provision` became always-listed with its mutating actions refused at call
+/// time, so the notification described a change that had not happened; and from
+/// MCP 2026-07-28 an unsolicited notification has no channel at all
+/// (`/basic/patterns/subscriptions`: a server "MUST NOT send notification types
+/// the client has not explicitly requested"). `tests/mcp_subscriptions.rs`
+/// carries the same inversion for `configure` and the subscription path that
+/// replaces it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn add_domain_flip_notifies_tool_list_changed() {
+async fn add_domain_declaring_provisioning_announces_nothing() {
     let tmp = tempfile::tempdir().unwrap();
     // A real tempdir config path, never the developer's actual global config:
     // `add_domain` persists a freshly registered domain through it.
@@ -3673,13 +3682,25 @@ async fn add_domain_flip_notifies_tool_list_changed() {
 
     assert!(engine.provisioning_declared());
 
-    tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        handler.got_list_changed.notified(),
-    )
-    .await
-    .expect(
-        "expected a tools/list_changed notification after add_domain flipped provisioning_declared",
+    // The tool list is the same either side of the flip, so there is nothing to
+    // announce and nothing may be sent. The wait is what proves the silence.
+    let listed_after: Vec<String> = peer
+        .list_tools(Default::default())
+        .await
+        .unwrap()
+        .tools
+        .iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    assert!(listed_after.iter().any(|n| n == "provision"));
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            handler.got_list_changed.notified(),
+        )
+        .await
+        .is_err(),
+        "a declaration flip moves no list, so it must not be announced"
     );
 }
 

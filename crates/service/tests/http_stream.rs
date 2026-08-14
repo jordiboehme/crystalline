@@ -451,8 +451,16 @@ async fn the_wire_format_baseline_the_conformance_tasks_measure_against() {
     );
     assert_eq!(
         handshake["result"]["capabilities"]["tools"]["listChanged"], true,
-        "all three list-changed capabilities are advertised (mcp.rs:1143-1152)"
+        "all three list-changed capabilities are advertised (`get_info` in mcp.rs)"
     );
+    // **Task 6 kept all three deliberately, and this line records the
+    // decision.** It removed the unsolicited pushes and gave the capability the
+    // only delivery channel the 2026-07-28 era has: a client may open a
+    // `subscriptions/listen` stream for exactly these three categories
+    // (`tests/mcp_subscriptions.rs`). Nothing is ever sent on it, because after
+    // Tasks 4 and 5 no request can move a list; retracting the capability would
+    // have been a user-visible change to every client we serve today for no
+    // behavioural gain, so it stays and the stream stays silent.
 
     let _ = post(
         addr,

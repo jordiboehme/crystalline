@@ -558,7 +558,7 @@ async fn configure_set_stops_at_the_first_bad_key_and_reports_what_applied() {
     assert!(eng.config().github_enabled());
 }
 
-// --- configure: tools/list_changed -------------------------------------------
+// --- configure: the flip announces nothing ------------------------------------
 
 /// A client handler that records whether it ever received
 /// `notifications/tools/list_changed`.
@@ -579,8 +579,16 @@ impl ClientHandler for NotifyClient {
     }
 }
 
+/// Flipping `github.enabled` announces **nothing**, which is the inversion of
+/// `configure_flipping_github_enabled_pushes_a_tool_list_changed_notification`.
+///
+/// The four collaboration tools are listed whatever the setting says and refuse
+/// at call time instead, so the flip moves no list and the push described a
+/// change that had not happened. MCP 2026-07-28 removes the unsolicited channel
+/// as well: `tests/mcp_subscriptions.rs` carries the subscription stream that
+/// replaces it, and the same silence asserted for a subscriber.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn configure_flipping_github_enabled_pushes_a_tool_list_changed_notification() {
+async fn configure_flipping_github_enabled_announces_nothing() {
     let tmp = tempfile::tempdir().unwrap();
     let eng = Arc::new(engine(&tmp.path().join("config.yaml"), false, false).await);
     let (client_io, server_io) = tokio::io::duplex(1 << 16);
@@ -593,20 +601,31 @@ async fn configure_flipping_github_enabled_pushes_a_tool_list_changed_notificati
     let _server = server_task.await.unwrap().unwrap();
     let peer = client.peer();
 
-    call(
+    let snapshot = call(
         peer,
         "configure",
         json!({"set": {"github.enabled": "true"}}),
     )
     .await
     .unwrap();
+    // Prove the write landed: a malformed `configure` comes back as a
+    // tool-level error in rmcp 3.1.2, so a silence test could otherwise pass
+    // because nothing happened at all.
+    assert_ne!(
+        snapshot["github"]["github_enabled"],
+        json!(false),
+        "the setting must actually be on: {snapshot}"
+    );
 
-    tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        handler.got_list_changed.notified(),
-    )
-    .await
-    .expect("expected a tools/list_changed notification after configure flipped github.enabled");
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            handler.got_list_changed.notified(),
+        )
+        .await
+        .is_err(),
+        "the flip moves no list, so nothing may be pushed to a client that asked for nothing"
+    );
 }
 
 // --- configure: GitHub connect state machine (engine-level) -----------------
