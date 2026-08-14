@@ -272,6 +272,18 @@ async fn flipping_github_enabled_mid_session_moves_the_refusal_not_the_list() {
         .await
         .expect("a listed tool answers");
     assert_eq!(refused.is_error, Some(true));
+    // The text as well as the flag: in rmcp 3.1.2 a parameter-deserialization
+    // failure is itself a tool-level error, so `is_error` alone can be
+    // satisfied by a call that never reached the gate under test.
+    let text = serde_json::to_value(&refused).unwrap();
+    let text = text
+        .pointer("/content/0/text")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    assert!(
+        text.contains("github.enabled"),
+        "the refusal names the setting to change: {text}"
+    );
 
     call(
         peer,

@@ -232,6 +232,96 @@ fn a_hand_edited_registration_is_reported_and_never_removed() {
     );
 }
 
+/// The arm where the user momentarily has no registration at all, which is
+/// the state most worth exercising end to end. The shim accepts the remove and
+/// then refuses the add, exactly as a CLI that broke between the two calls
+/// would.
+#[test]
+fn a_repair_whose_add_fails_says_there_is_no_registration_right_now() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let bin_dir = work.path().join("bin");
+    let log = work.path().join("claude.log");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let script = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$1\" = mcp ] && [ \"$2\" = get ]; then\n  printf '%b' '{}'\n  exit 0\nfi\nif [ \"$1\" = mcp ] && [ \"$2\" = add ]; then\n  exit 1\nfi\nexit 0\n",
+        log.display(),
+        get_output(
+            "User config (available in all your projects)",
+            "crystalline",
+            "mcp",
+        )
+    );
+    let path = bin_dir.join("claude");
+    std::fs::write(&path, script).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let out = install_cmd(&home, &bin_dir)
+        .args(["install", "claude-code"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "a failed MCP registration is never fatal to the install"
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains("no registration right now"),
+        "the user has to learn their working entry is gone: {stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "claude mcp add crystalline --scope user -- crystalline mcp --harness claude-code"
+        ),
+        "with the plain add, which now succeeds because the remove already \
+         emptied the name: {stdout}"
+    );
+    let logged = read_log(&log);
+    assert!(
+        logged.contains("mcp remove crystalline --scope user"),
+        "{logged}"
+    );
+    assert!(logged.contains("mcp add crystalline"), "{logged}");
+}
+
+/// An entry carrying the user's own environment block is never repaired: the
+/// repair is remove-then-add and the add carries no `-e` pairs, so it would
+/// delete the environment with no message. The shape comes from live `claude
+/// mcp get` output.
+#[test]
+fn an_entry_carrying_an_environment_block_is_left_alone() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let bin_dir = work.path().join("bin");
+    let log = work.path().join("claude.log");
+    let body = format!(
+        "{}    CRYSTALLINE_SKILLS_SERVE=true\\n    FOO=bar\\n",
+        get_output(
+            "User config (available in all your projects)",
+            "crystalline",
+            "mcp",
+        )
+    );
+    write_get_shim(&bin_dir, "claude", &log, &body);
+
+    let out = install_cmd(&home, &bin_dir)
+        .args(["install", "claude-code"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("left as it is"), "{stdout}");
+    assert!(
+        stdout.contains("mcp remove crystalline --scope user && claude mcp add"),
+        "and the printed command removes first, because a same-name add is \
+         refused: {stdout}"
+    );
+    assert!(
+        !read_log(&log).contains("mcp remove"),
+        "the user's environment is never destroyed to deliver a context optimisation"
+    );
+}
+
 #[test]
 fn an_unreadable_read_back_leaves_the_entry_alone() {
     let work = tempfile::tempdir().unwrap();

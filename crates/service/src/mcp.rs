@@ -1609,8 +1609,10 @@ impl ServerHandler for McpServer {
 
     /// List the shipped agent skills as `skill://<name>/SKILL.md` resources,
     /// so a remote client that never runs the CLI can read the same playbooks
-    /// an installed harness gets. Empty while `skills.serve` is off, read
-    /// fresh here the way the tool gates are.
+    /// an installed harness gets. Empty while the surface is withheld, on the
+    /// same two construction-time inputs the tool gate reads (see
+    /// [`hidden_skills_surface`]); nothing about this list can move under a
+    /// live connection.
     async fn list_resources(
         &self,
         _request: Option<PaginatedRequestParams>,

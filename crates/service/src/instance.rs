@@ -55,15 +55,20 @@ pub struct LockInfo {
     pub version: String,
     /// RFC 3339 start time.
     pub started_at: String,
+    /// Whether this daemon parses an `mcp` handshake line carrying options
+    /// after the mode token.
+    ///
+    /// **A declared capability rather than a version comparison, because the
+    /// version cannot answer this question.** A daemon predating the extended
+    /// line compares the whole trimmed line against `"mcp"` and drops anything
+    /// else, so sending it costs the bridge its socket; and the version that
+    /// first learned to parse it is a version *this very tree* already
+    /// carries, so any threshold spelled here would let a daemon built one
+    /// commit earlier through. An older daemon writes no such field and
+    /// `serde(default)` reads it as `false`, which is exactly right.
+    #[serde(default)]
+    pub mcp_line_options: bool,
 }
-
-/// The first Crystalline release whose daemon parses an `mcp` handshake line
-/// with options after the mode token. An older daemon compares the whole
-/// trimmed line against `"mcp"` (see `daemon::handle_conn` before this
-/// release) and silently drops anything else, which costs the bridge its
-/// socket rather than one option, so the extended line is only ever sent to a
-/// daemon at or above this version.
-const HARNESS_LINE_MIN_VERSION: &str = "0.13.0";
 
 /// The option token that tells the daemon this stdio session's harness is
 /// already onboarded, so the skill surface and the second copy of the routing
@@ -71,30 +76,19 @@ const HARNESS_LINE_MIN_VERSION: &str = "0.13.0";
 /// bridge's bare `mcp` line already meant.
 pub(crate) const SKILLS_OFF_OPTION: &str = "skills=off";
 
-/// The version of the daemon this process is about to hand its handshake to,
-/// read from the lock record. `None` when there is no readable record, which
-/// reads as "too old to be sure".
-fn daemon_version() -> Option<String> {
-    read_lock_info().map(|info| info.version)
+/// Whether the daemon this process is about to hand its handshake to has
+/// declared that it parses handshake options. A record that is missing,
+/// unreadable or written by a daemon that predates the field all read as
+/// `false`, which is the safe direction.
+fn daemon_parses_mcp_line_options() -> bool {
+    read_lock_info().is_some_and(|info| info.mcp_line_options)
 }
 
-/// The `mcp` handshake line for a resolved answer against a daemon of
-/// `daemon_version`. Bare `mcp` unless there is something to say **and** the
-/// daemon is new enough to hear it. Pure so the decision is testable without
-/// a daemon.
-fn mcp_mode_line(harness_onboarded: bool, daemon_version: Option<&str>) -> String {
-    // Positively "at least the minimum", never "not older than": an
-    // unparseable or missing version has to read as too old, and a negated
-    // `strictly_newer` reads it as new enough because that helper answers
-    // false for an unparseable pair on either side.
-    let understood = match (
-        daemon_version.and_then(version_triple),
-        version_triple(HARNESS_LINE_MIN_VERSION),
-    ) {
-        (Some(daemon), Some(minimum)) => daemon >= minimum,
-        _ => false,
-    };
-    if harness_onboarded && understood {
+/// The `mcp` handshake line for a resolved answer. Bare `mcp` unless there is
+/// something to say **and** the daemon has declared it can hear it. Pure so
+/// the decision is testable without a daemon.
+fn mcp_mode_line(harness_onboarded: bool, daemon_parses_options: bool) -> String {
+    if harness_onboarded && daemon_parses_options {
         format!("mcp {SKILLS_OFF_OPTION}\n")
     } else {
         "mcp\n".to_string()
@@ -119,14 +113,15 @@ impl Connection {
     /// environment spawned it first, and a value resolved once per process
     /// cannot drift across a reconnect.
     ///
-    /// **The extended line is only sent to a daemon that can parse it**, see
-    /// [`HARNESS_LINE_MIN_VERSION`]. An older daemon compares the whole line
-    /// against `"mcp"` and drops anything else, and a failed displacement can
-    /// leave one running (`try_attach_reporting` attaches to a daemon that
-    /// would not shut down), so the fallback is the bare line, which resolves
-    /// to "serve" - the safe direction, and exactly today's behaviour.
+    /// **The extended line is only sent to a daemon that declared it parses
+    /// one**, through [`LockInfo::mcp_line_options`]. An older daemon compares
+    /// the whole line against `"mcp"` and drops anything else, and a failed
+    /// displacement can leave one running (`try_attach_reporting` attaches to
+    /// a daemon that would not shut down), so the fallback is the bare line,
+    /// which resolves to "serve" - the safe direction, and exactly today's
+    /// behaviour.
     pub async fn into_mcp(self, harness_onboarded: bool) -> io::Result<IpcStream> {
-        let line = mcp_mode_line(harness_onboarded, daemon_version().as_deref());
+        let line = mcp_mode_line(harness_onboarded, daemon_parses_mcp_line_options());
         self.handshake(line.as_bytes()).await
     }
 
@@ -173,6 +168,9 @@ impl Ownership {
             socket_path: self.socket_display(),
             version: crystalline_core::VERSION.to_string(),
             started_at: chrono::Utc::now().to_rfc3339(),
+            // This daemon's `handle_conn` splits the handshake line into a
+            // mode and its options, so a bridge may send them.
+            mcp_line_options: true,
         };
         let json = serde_json::to_string(&info).unwrap_or_default();
         let tmp = self.info_path.with_extension("json.tmp");
@@ -1146,35 +1144,51 @@ mod tests {
 
     // --- the mcp handshake line ---------------------------------------------
 
-    /// The extended line only goes to a daemon that can parse it. An older one
-    /// compares the whole trimmed line against `"mcp"` and drops anything
-    /// else, and a displacement that times out leaves exactly such a daemon
-    /// running and attached to (`try_attach_reporting` says so in as many
-    /// words), so the fallback has to be the bare line rather than a dead
+    /// The extended line only goes to a daemon that declared it parses one. An
+    /// older one compares the whole trimmed line against `"mcp"` and drops
+    /// anything else, and a displacement that times out leaves exactly such a
+    /// daemon running and attached to (`try_attach_reporting` says so in as
+    /// many words), so the fallback has to be the bare line rather than a dead
     /// socket.
     #[test]
-    fn the_extended_mode_line_is_only_sent_to_a_daemon_that_parses_it() {
-        assert_eq!(mcp_mode_line(true, Some("0.13.0")), "mcp skills=off\n");
-        assert_eq!(mcp_mode_line(true, Some("0.14.2")), "mcp skills=off\n");
+    fn the_extended_mode_line_is_only_sent_to_a_daemon_that_declared_it() {
+        assert_eq!(mcp_mode_line(true, true), "mcp skills=off\n");
         assert_eq!(
-            mcp_mode_line(true, Some("0.12.9")),
+            mcp_mode_line(true, false),
             "mcp\n",
-            "an older daemon gets the line it understands, and serves the surface"
-        );
-        assert_eq!(
-            mcp_mode_line(true, None),
-            "mcp\n",
-            "no readable lock record is not a licence to guess"
-        );
-        assert_eq!(
-            mcp_mode_line(true, Some("not-a-version")),
-            "mcp\n",
-            "an unparseable version reads as too old, never as new enough"
+            "a daemon that did not declare it gets the line it understands, and \
+             serves the surface"
         );
         // Nothing to say, nothing added, whatever the daemon can parse.
-        for version in [Some("0.13.0"), Some("0.12.0"), None] {
-            assert_eq!(mcp_mode_line(false, version), "mcp\n");
-        }
+        assert_eq!(mcp_mode_line(false, true), "mcp\n");
+        assert_eq!(mcp_mode_line(false, false), "mcp\n");
+    }
+
+    /// The capability is read off the record, and a record written before the
+    /// field existed reads as "cannot parse options" rather than failing to
+    /// deserialize at all. That is the whole reason it is a declared
+    /// capability and not a version threshold: the version that first learned
+    /// to parse options is one this tree already carries, so no threshold
+    /// could tell a daemon built from this commit apart from one built the
+    /// commit before.
+    #[test]
+    fn a_lock_record_without_the_capability_field_reads_as_unable() {
+        let legacy =
+            r#"{"pid":1,"socket_path":"s","version":"0.13.0","started_at":"2026-08-14T00:00:00Z"}"#;
+        let info: LockInfo = serde_json::from_str(legacy).expect("an older record still parses");
+        assert!(!info.mcp_line_options);
+        assert_eq!(mcp_mode_line(true, info.mcp_line_options), "mcp\n");
+
+        let current = serde_json::to_string(&LockInfo {
+            pid: 1,
+            socket_path: "s".to_string(),
+            version: crystalline_core::VERSION.to_string(),
+            started_at: "2026-08-14T00:00:00Z".to_string(),
+            mcp_line_options: true,
+        })
+        .unwrap();
+        let info: LockInfo = serde_json::from_str(&current).unwrap();
+        assert!(info.mcp_line_options);
     }
 
     /// The reader used to stop at 16 bytes and return the truncated head,
@@ -1504,6 +1518,7 @@ mod tests {
             socket_path: sock.display().to_string(),
             version: "0.0.1".to_string(),
             started_at: chrono::Utc::now().to_rfc3339(),
+            mcp_line_options: true,
         };
         std::fs::write(&info_path, serde_json::to_string(&info).unwrap()).unwrap();
 
@@ -1551,6 +1566,7 @@ mod tests {
             socket_path: sock.display().to_string(),
             version: crystalline_core::VERSION.to_string(),
             started_at: chrono::Utc::now().to_rfc3339(),
+            mcp_line_options: true,
         };
         std::fs::write(&info_path, serde_json::to_string(&info).unwrap()).unwrap();
 
@@ -1618,6 +1634,7 @@ mod tests {
             socket_path: "legacy".to_string(),
             version: "0.8.2".to_string(),
             started_at: chrono::Utc::now().to_rfc3339(),
+            mcp_line_options: true,
         };
         std::fs::write(
             config::service_lock_path().unwrap(),
@@ -1806,6 +1823,7 @@ mod tests {
             socket_path: config::service_sock_path().unwrap().display().to_string(),
             version: crystalline_core::VERSION.to_string(),
             started_at: chrono::Utc::now().to_rfc3339(),
+            mcp_line_options: true,
         };
         std::fs::write(
             config::service_info_path().unwrap(),
