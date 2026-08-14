@@ -328,6 +328,19 @@ impl RestState {
 /// A body over the limit is refused with 413 before a handler runs, in
 /// problem+json like every other failure here: `ApiJson` re-renders axum's
 /// rejection and keeps the status it chose.
+///
+/// **Three other surfaces read this number, so it is not local to the REST
+/// API any more.** `daemon::http_config` hands it to rmcp as the
+/// streamable-HTTP transport's `max_request_body_bytes`, so an engram written
+/// through an MCP tool call meets the same boundary as one saved through
+/// `/api/v1` (rmcp refuses in its own words there, `413 Payload Too Large:
+/// request body exceeds {max} bytes`, rather than in problem+json).
+/// `collab::ws::WS_MAX_MESSAGE_BYTES` sits a megabyte above it, so a
+/// collaborative edit that can be saved can also be transmitted. And
+/// `fluid/nginx.conf.template` sets `client_max_body_size` to match, guarded
+/// by `tests/nginx_body_cap.rs` because nginx cannot read a Rust constant.
+/// Changing this value moves the first two by construction; the third is the
+/// one that needs the template edited with it.
 pub const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 
 /// Build the REST router. Mounted with `nest("/api/v1", ...)`, so the paths

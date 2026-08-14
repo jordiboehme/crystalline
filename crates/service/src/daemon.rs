@@ -1563,11 +1563,34 @@ fn resolve_allowed_hosts(flag: &[String], config: &GlobalConfig) -> Vec<String> 
 /// stream is the compatibility baseline the ecosystem already assumes; the
 /// reconnection hint itself is worthless for the sub-second request/response
 /// streams this server produces.
+///
+/// Two further settings are spelled out rather than inherited.
+///
+/// `legacy_session_mode` is rmcp's own default (`tower.rs:169`), written down
+/// so an upstream flip cannot silently take the `Mcp-Session-Id` routing away
+/// from every client that speaks a revision below 2026-07-28 - the only branch
+/// that inserts that header (`tower.rs:1911`).
+///
+/// The body limit is a **new refusal boundary**, not a default being pinned.
+/// rmcp 2.2.0 had no limit at all: its `expect_json(body)` collected the whole
+/// body unbounded and `max_request_body_bytes` did not exist. rmcp 3.1.2
+/// introduces the cap and defaults it to 4 MiB
+/// (`DEFAULT_MAX_REQUEST_BODY_BYTES`, `tower.rs:55`), which would start
+/// refusing engram writes that succeed today: bodies of 2.5 MB and 8.8 MB are
+/// documented in this project's own corpus. So we pick the number, and we pick
+/// the one the REST API already enforces - [`crate::rest::MAX_BODY_BYTES`],
+/// read from that constant rather than spelled again here, so an MCP write and
+/// a `/api/v1` write of the same engram always get the same answer. A body
+/// past it is refused with `413 Payload Too Large: request body exceeds
+/// {max} bytes` before any handler runs.
 fn http_config(
     allowed_hosts: &[String],
 ) -> rmcp::transport::streamable_http_server::tower::StreamableHttpServerConfig {
     use rmcp::transport::streamable_http_server::tower::StreamableHttpServerConfig;
-    let base = StreamableHttpServerConfig::default().with_sse_retry(None);
+    let base = StreamableHttpServerConfig::default()
+        .with_sse_retry(None)
+        .with_legacy_session_mode(true)
+        .with_max_request_body_bytes(crate::rest::MAX_BODY_BYTES);
     if allowed_hosts.iter().any(|h| h == "*") {
         return base.disable_allowed_hosts();
     }
@@ -1816,6 +1839,42 @@ mod tests {
         assert!(
             cfg.allowed_hosts.is_empty(),
             "an empty allow-list makes rmcp accept any Host"
+        );
+    }
+
+    /// The two `http_config` settings that are decisions rather than
+    /// inherited defaults, pinned together because they fail for different
+    /// reasons.
+    ///
+    /// `legacy_session_mode` is today's default (rmcp 3.1.2 `tower.rs:169`)
+    /// spelled out, so an upstream flip cannot silently drop every legacy
+    /// client's session. That half passes before and after the pin exists.
+    ///
+    /// The body limit is the real assertion. rmcp 2.2.0 had **no** limit:
+    /// `expect_json(body)` collected the whole body unbounded
+    /// (`rmcp-2.2.0/src/transport/common/server_side_http.rs:171-201`) and
+    /// `max_request_body_bytes` did not exist. So this is a new refusal
+    /// boundary we are introducing, not a default we inherited, and 3.1.2's
+    /// own default of 4 MiB (`DEFAULT_MAX_REQUEST_BODY_BYTES`, `tower.rs:55`)
+    /// would refuse writes that succeed today - engram bodies of 2.5 MB and
+    /// 8.8 MB are documented in this project's own corpus
+    /// (`research/2026-07-28-turso-sorter-spill.md`).
+    ///
+    /// Asserting equality with `crate::rest::MAX_BODY_BYTES` rather than with
+    /// a literal is the whole divergence guard: it fails the moment someone
+    /// spells the number a second time, which is the only way the MCP and
+    /// REST surfaces can drift apart.
+    #[test]
+    fn http_config_pins_the_session_mode_and_the_body_limit() {
+        let cfg = http_config(&[]);
+        assert!(
+            cfg.legacy_session_mode,
+            "legacy clients keep their Mcp-Session-Id routing"
+        );
+        assert_eq!(
+            cfg.max_request_body_bytes,
+            crate::rest::MAX_BODY_BYTES,
+            "the MCP transport and the REST API refuse the same body size"
         );
     }
 
