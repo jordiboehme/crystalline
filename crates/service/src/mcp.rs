@@ -102,11 +102,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use rmcp::handler::server::prompt::PromptContext;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, ContentBlock, ErrorData, GetPromptRequestParams, GetPromptResult,
+    CallToolResult, ContentBlock, ErrorData, GetPromptRequestParams, GetPromptResponse,
     Implementation, InitializeRequestParams, InitializeResult, ListPromptsResult,
     ListResourcesResult, ListToolsResult, PaginatedRequestParams, ProgressNotificationParam,
-    PromptMessage, ProtocolVersion, ReadResourceRequestParams, ReadResourceResult, Resource,
-    ResourceContents, Role, ServerCapabilities, ServerInfo, Tool,
+    PromptMessage, ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse,
+    ReadResourceResult, Resource, ResourceContents, Role, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::{
@@ -1262,11 +1262,7 @@ impl ServerHandler for McpServer {
         for tool in &mut tools {
             crate::tool_schema::sanitize_tool(tool);
         }
-        Ok(ListToolsResult {
-            tools,
-            meta: None,
-            next_cursor: None,
-        })
+        Ok(ListToolsResult::with_all_items(tools))
     }
 
     /// Resolve a tool definition by name, hiding the content-mutating and
@@ -1333,11 +1329,12 @@ impl ServerHandler for McpServer {
         &self,
         request: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<ReadResourceResult, ErrorData> {
+    ) -> Result<ReadResourceResponse, ErrorData> {
         match skill_for_uri(&request.uri) {
             Some(asset) => Ok(ReadResourceResult::new(vec![
                 ResourceContents::text(asset.content, &request.uri).with_mime_type(SKILL_MIME_TYPE),
-            ])),
+            ])
+            .into()),
             None => Err(ErrorData::invalid_params(
                 format!(
                     "unknown resource '{}'; this server serves {}",
@@ -1363,11 +1360,7 @@ impl ServerHandler for McpServer {
         } else {
             Self::prompt_router().list_all()
         };
-        Ok(ListPromptsResult {
-            prompts,
-            meta: None,
-            next_cursor: None,
-        })
+        Ok(ListPromptsResult::with_all_items(prompts))
     }
 
     /// Render one prompt through the macro-declared router. Answers while the
@@ -1376,7 +1369,7 @@ impl ServerHandler for McpServer {
         &self,
         request: GetPromptRequestParams,
         context: RequestContext<RoleServer>,
-    ) -> Result<GetPromptResult, ErrorData> {
+    ) -> Result<GetPromptResponse, ErrorData> {
         Self::prompt_router()
             .get_prompt(PromptContext::new(
                 self,

@@ -59,12 +59,16 @@ async fn initialize_succeeds_and_identifies_as_crystalline_with_degraded_copy() 
         .peer()
         .peer_info()
         .expect("the server sent its handshake");
+    // `ServerPeerInfo::server_info` is optional because a discovery response
+    // need not carry an identity (rmcp 3.1.2 `model.rs:1102`); an `initialize`
+    // answer always does, so the unwrap is part of the assertion.
+    let server_info = info
+        .server_info
+        .as_ref()
+        .expect("the server identified itself");
+    assert_eq!(server_info.name, "crystalline", "identifies as crystalline");
     assert_eq!(
-        info.server_info.name, "crystalline",
-        "identifies as crystalline"
-    );
-    assert_eq!(
-        info.server_info.version,
+        server_info.version,
         crystalline_core::VERSION,
         "at this binary's version"
     );

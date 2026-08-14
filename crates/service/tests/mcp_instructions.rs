@@ -25,7 +25,7 @@ use crystalline_index::TursoStore;
 use crystalline_service::Engine;
 use crystalline_service::mcp::McpServer;
 use rmcp::RoleClient;
-use rmcp::model::{ClientInfo, Implementation};
+use rmcp::model::{ClientInfo, Implementation, ProtocolVersion};
 use rmcp::service::RunningService;
 use tokio::sync::Mutex;
 
@@ -144,6 +144,30 @@ impl Harness {
         (client, server)
     }
 
+    /// Open one connection whose client declares `version` in its `initialize`
+    /// request, and return the protocol version the server answered with.
+    async fn negotiate(&self, version: ProtocolVersion) -> ProtocolVersion {
+        let (client_io, server_io) = tokio::io::duplex(1 << 16);
+        let engine = self.engine.clone();
+        let server_task =
+            tokio::spawn(
+                async move { rmcp::serve_server(McpServer::new(engine), server_io).await },
+            );
+        let mut info = ClientInfo::default();
+        info.protocol_version = version;
+        let client = rmcp::serve_client(info, client_io).await.unwrap();
+        let server = server_task.await.unwrap().unwrap();
+        let answered = client
+            .peer()
+            .peer_info()
+            .as_ref()
+            .map(|i| i.protocol_version.clone())
+            .expect("the server answered initialize");
+        drop(client);
+        drop(server);
+        answered
+    }
+
     /// Where this harness's stand-in install receipt lives.
     fn receipt_path(&self) -> PathBuf {
         self.root.join("installs.json")
@@ -225,8 +249,15 @@ async fn instructions_carry_a_routing_line_per_file_domain() {
     let text = instructions(&client);
 
     let peer_info = client.peer().peer_info().unwrap();
-    assert_eq!(peer_info.server_info.name, "crystalline");
-    assert_eq!(peer_info.server_info.version, crystalline_core::VERSION);
+    // `ServerPeerInfo::server_info` is optional because a discovery response
+    // need not carry an identity (rmcp 3.1.2 `model.rs:1102`); an `initialize`
+    // answer always does, so the unwrap is part of the assertion.
+    let server_info = peer_info
+        .server_info
+        .as_ref()
+        .expect("the server identified itself");
+    assert_eq!(server_info.name, "crystalline");
+    assert_eq!(server_info.version, crystalline_core::VERSION);
 
     assert!(
         text.starts_with("CRYSTALLINE KNOWLEDGE ROUTING"),
@@ -495,4 +526,20 @@ async fn the_setting_overrides_the_receipt_in_both_directions() {
             if expect_full { "" } else { " not" }
         );
     }
+}
+
+/// A client asking for a revision this server does not yet honour is answered
+/// with the newest one it does. Today that is 2025-11-25: 2026-07-28 carries
+/// obligations this server has not implemented, so echoing it back would be a
+/// false claim. Ignored until the version block is rewritten to negotiate
+/// against our own advertised set rather than rmcp's `KNOWN_VERSIONS`, which is
+/// Task 2 of the rmcp 3.x migration plan.
+#[ignore = "the advertised set lands in Task 2 of the rmcp 3.x migration"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_client_asking_for_an_unserved_protocol_version_is_answered_with_ours() {
+    let h = Harness::build(&[("eng", &["Route here for eng questions"])], &[], false).await;
+    assert_eq!(
+        h.negotiate(ProtocolVersion::V_2026_07_28).await,
+        ProtocolVersion::V_2025_11_25
+    );
 }

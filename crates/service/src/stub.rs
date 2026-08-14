@@ -28,8 +28,9 @@
 use std::sync::Arc;
 
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, ContentBlock, ErrorData, Implementation, JsonObject,
-    ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool, ToolAnnotations,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData,
+    Implementation, JsonObject, ListToolsResult, PaginatedRequestParams, ServerCapabilities,
+    ServerInfo, Tool, ToolAnnotations,
 };
 use rmcp::service::RequestContext;
 use rmcp::{RoleServer, ServerHandler};
@@ -239,11 +240,7 @@ impl ServerHandler for DegradedServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
-        Ok(ListToolsResult {
-            tools: vec![Self::status_tool()],
-            meta: None,
-            next_cursor: None,
-        })
+        Ok(ListToolsResult::with_all_items(vec![Self::status_tool()]))
     }
 
     /// Resolve `status` by name; every other name is unknown here.
@@ -261,14 +258,14 @@ impl ServerHandler for DegradedServer {
         &self,
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, ErrorData> {
+    ) -> Result<CallToolResponse, ErrorData> {
         if request.name == "status" {
             let text = serde_json::to_string(&self.status.tool_payload())
                 .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-            Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+            Ok(CallToolResult::success(vec![ContentBlock::text(text)]).into())
         } else {
             let text = format!("{}\n\n{}", self.status.instructions(), self.status.fix());
-            Ok(CallToolResult::error(vec![ContentBlock::text(text)]))
+            Ok(CallToolResult::error(vec![ContentBlock::text(text)]).into())
         }
     }
 }
