@@ -375,9 +375,11 @@ fn like_escape(s: &str) -> String {
 ///    it; harmonize it toward these.
 ///
 /// The fold is ASCII-exact and Unicode-approximate: Turso's `lower()` is
-/// ASCII-only while Postgres follows the database collation, so `Notes/` and
-/// `notes/` fold alike on both backends while a non-ASCII case pair may fold on
-/// one and not the other.
+/// `to_ascii_lowercase` while Postgres follows the database collation, so
+/// `Notes/` and `notes/` fold alike on both backends while a non-ASCII case pair
+/// may fold on one and not the other. Being ASCII-only, this side can only ever
+/// widen the match set and always preserves length; the Postgres twin of this
+/// helper carries the collation caveats that do not apply here.
 fn path_prefix_like(n: usize, negated: bool) -> String {
     let not = if negated { " NOT" } else { "" };
     format!("lower(e.path){not} LIKE lower(?{n}) ESCAPE '\\'")

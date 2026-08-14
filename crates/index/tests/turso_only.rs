@@ -129,6 +129,11 @@ async fn temporal_current_filter_uses_the_promoted_index() {
 /// cap. Change the shipped filter and this literal has to be re-derived from it
 /// in the same commit, or the guard goes on explaining a query the code no
 /// longer issues: it stays green and quietly stops guarding.
+///
+/// It also spells as literals what the shipped statement BINDS, and a binding is
+/// itself a plan input - a planner may treat a parameter differently from a
+/// constant it can see. So this pins the plan for the shape, not for the exact
+/// statement the store executes.
 #[tokio::test]
 async fn the_lexical_candidate_scan_stays_index_ordered_under_a_folder_filter() {
     let store = open().await;

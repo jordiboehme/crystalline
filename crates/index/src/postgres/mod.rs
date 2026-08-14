@@ -609,12 +609,29 @@ pub(super) fn like_escape(s: &str) -> String {
 /// What it costs, stated because it is a real trade and not a free lunch: on a C
 /// or POSIX collated database `e.path LIKE 'notes/%'` can drive
 /// `idx_engram_path(domain_id, path)` as a prefix range scan, and wrapping the
-/// column in `lower()` gives that up for a sequential scan (measured: a 50k-row
-/// C-collated database goes from an index range scan at cost 723 to a sequential
-/// scan at cost 1597). Correctness first, and such a deployment can buy the plan
-/// back with an expression index on `(domain_id, lower(path))`. On any other
-/// collation the prefix never drove that index in the first place, so nothing is
-/// lost.
+/// column in `lower()` gives that up. The filter becomes O(table) rather than
+/// O(result), which is the part that matters: it scales with how much the
+/// database holds, not with how much the query returns. Measured on a
+/// 50,505-row C-collated replica, a filtered `list_engrams` goes from 0.4-2.7 ms
+/// on the index scan to 153-250 ms on a sequential scan that discards 50,000
+/// rows in the filter, and the browse page's estimated cost goes from 9.6 to
+/// 1735. Correctness first. A deployment that meets this buys the plan back with
+/// an expression index on `(domain_id, lower(path) text_pattern_ops)` - the
+/// opclass is not optional, since the plain `(domain_id, lower(path))` shape is
+/// used on a C-collated database and ignored entirely on a UTF-8 one, while the
+/// `text_pattern_ops` variant serves both (0.375 ms on the same replica). None
+/// exists yet; on any non-C collation the prefix never drove `idx_engram_path`
+/// in the first place, so this fold took nothing away there, and that collation
+/// was already scanning the table before the fold.
+///
+/// A note on how `lower()` behaves, because folding can NARROW as well as widen:
+/// where `lower()` is context-sensitive (an ICU provider), a prefix ending in a
+/// capital sigma folds to a FINAL sigma while the same letter mid-path folds to
+/// a medial one, so a row that matched before the fold can stop matching. It is
+/// unreachable through the service today - every caller-supplied folder prefix
+/// is slash-terminated, and the three prefix-passing `list_engrams` callers pass
+/// exact `.md` paths - but a future caller that hands a bare word must know the
+/// fold is not purely a widening.
 pub(super) fn path_prefix_like(n: usize, negated: bool) -> String {
     let not = if negated { " NOT" } else { "" };
     format!("lower(e.path){not} LIKE lower(${n}) ESCAPE '\\'")
