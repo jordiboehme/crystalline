@@ -32,7 +32,7 @@
 
 import { useMutation } from "@tanstack/react-query";
 import { useId, useState } from "react";
-import { Link, Navigate, useLocation, useNavigate } from "react-router";
+import { Link, Navigate, useLocation } from "react-router";
 
 import { ApiProblem } from "../api/client";
 import { BUTTON, FOCUS_RING } from "../components/primitives";
@@ -60,7 +60,6 @@ const GEM = ` ▄▄▄▄▄▄▄▄▄▄▄
 
 export default function LoginPage() {
   const { user, capabilities, login } = useAuth();
-  const navigate = useNavigate();
   const location = useLocation();
   const nameField = useId();
   const passwordField = useId();
@@ -81,13 +80,35 @@ export default function LoginPage() {
     // alone: a refused login is not an expired session.
     mutationKey: LOGIN_MUTATION_KEY,
     mutationFn: () => login(name, password),
-    onSuccess: () => {
-      void navigate(destination, { replace: true });
-    },
   });
 
-  // Someone who is already signed in has no business on this screen; the
-  // anonymous viewer does, since logging in is how they stop being anonymous.
+  // Signed in and no longer pending covers both the person who lands here
+  // already authenticated and the one whose attempt just succeeded - one
+  // condition, not two, and that is deliberate rather than an economy.
+  //
+  // An earlier version navigated imperatively from `onSuccess` instead, the
+  // instant `login()` resolved. That call is not itself wrong, but it fires
+  // from a promise continuation, and `login()`'s own success already means
+  // the capability probe's cache entry is invalidated and refetched - `await
+  // queryClient.invalidateQueries` in `AuthProvider` only resolves once that
+  // refetch is done. What it does NOT mean is that this component has
+  // re-rendered with the refetched `user` yet: TanStack Query delivers that
+  // update to React through its own notify queue, which schedules onto a
+  // macrotask (`setTimeout(fn, 0)` in `notifyManager`), one tick behind the
+  // plain promise chain `onSuccess` runs on. So the imperative navigate
+  // reliably fired a beat before `user` was visible anywhere else, including
+  // to `RequireAuth` on the route it was sending the browser to. Once in a
+  // while - reliably under load, rarely without it - `RequireAuth` mounted
+  // for that route, read the still-stale signed-out value, and rendered its
+  // own redirect back to `/login`; a moment later the real `user` update
+  // landed, this guard fired and sent the browser forward again, but the
+  // stray redirect's effect had already been scheduled and fired anyway,
+  // bouncing a screen that had already mounted correctly.
+  //
+  // Deriving the navigation from this render instead closes it: `user` here
+  // is read from the same context `RequireAuth` reads, so by the time this
+  // guard can see it as signed in, every other consumer of that context
+  // already agrees - there is no earlier, staler read left to race.
   if (user && !attempt.isPending) {
     return <Navigate to={destination} replace />;
   }
