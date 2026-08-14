@@ -21,6 +21,20 @@ server {
     gzip_min_length 1024;
     gzip_types text/css application/javascript application/json image/svg+xml;
 
+    # nginx's own default here is 1 MiB, an order of magnitude below what the
+    # daemon behind this proxy accepts: MAX_BODY_BYTES in
+    # crates/service/src/rest/mod.rs is 10 MiB. Left at the default, this
+    # proxy would silently cap every browser save and every archive import to
+    # 1 MiB, after the editing was already done. Set at server level so both
+    # proxied locations inherit it rather than repeating it. `10m` is binary
+    # in nginx, so this is exactly MAX_BODY_BYTES rather than approximately -
+    # a literal rather than a substituted variable, because envsubst in this
+    # image only fills in CRYSTALLINE_-prefixed names and has no default
+    # syntax, so an unset one would render an empty directive and nginx would
+    # refuse to start. crates/service/tests/nginx_body_cap.rs is what notices
+    # if the two numbers ever drift apart.
+    client_max_body_size 10m;
+
     # A build emits about a hundred content-hashed chunks under /assets, so a
     # name never survives a change to what is behind it: these can be held for
     # as long as a browser is willing to hold anything.
