@@ -899,18 +899,20 @@ type McpService = rmcp::transport::streamable_http_server::tower::StreamableHttp
 /// sessionless POST at an advertised revision is served today, and
 /// `validate_standard_headers` arms on the **client's** `MCP-Protocol-Version`
 /// header rather than on our advertised set (`tower.rs:678-684`), so a
-/// `tools/call` naming 2026-07-28 reaches the schema cache before the request
-/// is refused. `tests/http_stream.rs::http_sessions_counts_sessions_rather_than_service_constructions`
+/// `tools/call` naming 2026-07-28 reaches the schema cache whatever we
+/// advertise - it did so while that call was still being refused, and it does
+/// so now that the call is served.
+/// `tests/http_stream.rs::http_sessions_counts_sessions_rather_than_service_constructions`
 /// is the guard.
 ///
-/// # What the number means, and what it will stop meaning
+/// # What the number means
 ///
 /// A session, in this transport, is the legacy `Mcp-Session-Id` lifecycle. From
-/// 2026-07-28 there are none: modern peers route statelessly by design, so once
-/// that revision is advertised this counter reports only the legacy clients
-/// still connecting. That is the honest reading of the name it already has; a
-/// figure covering modern traffic would be a different metric, not a repair of
-/// this one.
+/// 2026-07-28 there are none: modern peers route statelessly by design, and
+/// that revision is advertised, so this counter reports only the legacy clients
+/// still connecting. That is the honest reading of the name it already has, and
+/// on a modern-only fleet the number stops growing. A figure covering modern
+/// traffic would be a different metric, not a repair of this one.
 pub(crate) struct CountingSessions<M> {
     inner: M,
     created: Arc<AtomicUsize>,

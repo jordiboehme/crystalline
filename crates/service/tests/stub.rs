@@ -86,13 +86,51 @@ async fn initialize_succeeds_and_identifies_as_crystalline_with_degraded_copy() 
     );
 }
 
-/// The degraded server narrows the advertised protocol set exactly as the
-/// healthy one does. It is stdio-only (`client.rs` builds it on the bridge
-/// path), so it warns and answers with ours rather than refusing: a client that
-/// arrives here is already in a failure it is meant to be told about, and
-/// refusing its handshake would replace the explanation with a dead session.
+/// The degraded server serves the same protocol set as the healthy one, and
+/// answers a version nobody serves the same way. It is stdio-only (`client.rs`
+/// builds it on the bridge path), so it warns and answers rather than refusing:
+/// a client that arrives here is already in a failure it is meant to be told
+/// about, and refusing its handshake would replace the explanation with a dead
+/// session.
+///
+/// The downgrade target is the newest revision that still has a handshake
+/// rather than the newest we serve, which for the degraded server is
+/// `get_info().protocol_version` itself - it keeps rmcp's default `initialize`,
+/// so that field **is** `negotiate_protocol_version`'s `server_fallback`
+/// (rmcp 3.1.2 `service/server.rs:590`). Left at `ServerInfo::default()` it
+/// would be rmcp's `LATEST`, which moves when the crate does.
+///
+/// The requested string is deliberately one nobody implements: 2026-07-28 is
+/// served now, and asking for it here would test the echo rather than the
+/// downgrade.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_client_asking_for_an_unserved_protocol_version_is_answered_with_ours() {
+    let (client_io, server_io) = tokio::io::duplex(1 << 16);
+    let server_task = tokio::spawn(async move {
+        rmcp::serve_server(DegradedServer::new(mcpb_skew_status()), server_io).await
+    });
+    let mut info = ClientInfo::default();
+    info.protocol_version =
+        serde_json::from_value(serde_json::Value::String("2027-01-01".to_string())).unwrap();
+    let client = rmcp::serve_client(info, client_io).await.unwrap();
+    let server = server_task.await.unwrap().unwrap();
+    let answered = client
+        .peer()
+        .peer_info()
+        .as_ref()
+        .map(|i| i.protocol_version.clone())
+        .expect("the server answered initialize");
+    assert_eq!(answered, ProtocolVersion::V_2025_11_25);
+    drop(client);
+    drop(server);
+}
+
+/// The degraded server echoes 2026-07-28 to a client that asks for it, exactly
+/// as the healthy one does: a client cannot learn a different answer from a
+/// failed start than it would have got from a healthy one, which is the whole
+/// reason `supported_protocol_versions` is shared rather than duplicated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_degraded_server_serves_the_era_too() {
     let (client_io, server_io) = tokio::io::duplex(1 << 16);
     let server_task = tokio::spawn(async move {
         rmcp::serve_server(DegradedServer::new(mcpb_skew_status()), server_io).await
@@ -107,7 +145,7 @@ async fn a_client_asking_for_an_unserved_protocol_version_is_answered_with_ours(
         .as_ref()
         .map(|i| i.protocol_version.clone())
         .expect("the server answered initialize");
-    assert_eq!(answered, ProtocolVersion::V_2025_11_25);
+    assert_eq!(answered, ProtocolVersion::V_2026_07_28);
     drop(client);
     drop(server);
 }

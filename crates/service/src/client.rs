@@ -102,12 +102,14 @@ const META_KEY_CLIENT_CAPABILITIES: &str = "io.modelcontextprotocol/clientCapabi
 /// divergence is real and it is why Task 10's client matrix, not an argument,
 /// decides whether this stays.
 ///
-/// One case makes that fallback likelier and it disappears with the next task:
-/// while `crate::mcp::SERVED_PROTOCOL_VERSIONS` holds no 2026-07-28, our
-/// `DiscoverResult` advertises only legacy revisions, and a dual-era client
-/// reading a `supportedVersions` with nothing modern in it may reasonably
-/// decide to use the legacy handshake on the same connection. The latch is
-/// already armed by then.
+/// One case used to make that fallback likelier and it is closed: while
+/// `crate::mcp::SERVED_PROTOCOL_VERSIONS` held no 2026-07-28, our
+/// `DiscoverResult` advertised only legacy revisions, and a dual-era client
+/// reading a `supportedVersions` with nothing modern in it could reasonably
+/// have decided to use the legacy handshake on the same connection, where the
+/// latch was already armed. The era is served now, so the probe answer names a
+/// revision the client can stay on, and the version this bridge injects is that
+/// same revision rather than a legacy one - both read from the one list.
 ///
 /// # Scope
 ///
@@ -187,10 +189,12 @@ fn probe_meta(msg: &Value) -> rmcp::model::RequestMetaObject {
 ///   server currently advertises**, read from `crate::mcp`, never a literal.
 ///   That is load bearing: `handler/server.rs:64-72` refuses an inline request
 ///   naming a version outside `supported_protocol_versions()` with `-32022`
-///   **before dispatch reaches `discover()`**, so a hardcoded revision we do
-///   not yet serve would turn every probing client's onboarding into a refusal.
-///   Reading the advertised set means the probe is answered at every point in
-///   the migration, with the honest `supportedVersions` of the moment.
+///   **before dispatch reaches `discover()`**, so a hardcoded revision we did
+///   not serve would have turned every probing client's onboarding into a
+///   refusal. Reading the advertised set meant the probe was answered at every
+///   point in the migration, with the honest `supportedVersions` of the moment,
+///   and it is what makes the probe a 2026-07-28 one now that the era is
+///   served, without a second edit here.
 /// - `io.modelcontextprotocol/clientCapabilities` gets `{}`. **Scoped claim:**
 ///   an empty object is not harmless in general - a server needing a capability
 ///   the client did not declare must answer `-32021`

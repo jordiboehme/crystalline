@@ -220,16 +220,18 @@ fn is_write_tool(name: &str) -> bool {
 /// learns a new revision fails the build and asks for the decision instead of
 /// taking it.
 ///
-/// **The top is a decision.** `V_2026_07_28` is deliberately absent. That
-/// revision makes list endpoints connection-invariant, moves `instructions` to
-/// `server/discover`, restricts `tools/list_changed` to subscribers and requires
-/// caching hints on six operations. All four are implemented now - see
-/// [`McpServer::list_tools`], [`McpServer::discover`], [`McpServer::listen`] and
-/// [`CacheHinted`] - and so is the stdio bridge's half: a bare `server/discover`
-/// probe is normalized and forwarded rather than answered `-32601`
-/// (`crate::client`), so a probing client reaches [`McpServer::discover`] and
-/// reads this list instead of being told this server is legacy. What remains is
-/// the decision itself and the per-client evidence it is gated on.
+/// **The top is a decision, and it was taken on 2026-08-14.** `V_2026_07_28`
+/// is served. That revision makes list endpoints connection-invariant, moves
+/// `instructions` to `server/discover`, restricts `tools/list_changed` to
+/// subscribers and requires caching hints on six operations; all four are
+/// implemented here - see [`McpServer::list_tools`], [`McpServer::discover`],
+/// [`McpServer::listen`] and [`CacheHinted`] - and so is the stdio bridge's
+/// half, where a bare `server/discover` probe is normalized and forwarded
+/// rather than answered `-32601` (`crate::client`). A fifth obligation,
+/// `ping`'s removal, is rmcp's: it answers `method_not_found` to any peer that
+/// is not on the legacy lifecycle (`handler/server.rs:112-118`), and we
+/// implement no `ping`. `tests/mcp_modern_era.rs` is what a client at this
+/// revision actually receives, over both transports.
 ///
 /// **The bottom is deliberately NOT a decision.** `V_2024_11_05` is served today
 /// and stays served: rmcp branches nowhere between it and `V_2025_11_25`
@@ -242,6 +244,7 @@ pub const SERVED_PROTOCOL_VERSIONS: &[ProtocolVersion] = &[
     ProtocolVersion::V_2025_03_26,
     ProtocolVersion::V_2025_06_18,
     ProtocolVersion::V_2025_11_25,
+    ProtocolVersion::V_2026_07_28,
 ];
 
 /// The newest revision we serve: what a client asking for one we do not serve
@@ -254,6 +257,31 @@ pub(crate) fn newest_served_protocol_version() -> ProtocolVersion {
         .last()
         .expect("SERVED_PROTOCOL_VERSIONS is never empty")
         .clone()
+}
+
+/// The newest revision we serve that still **has** an `initialize` handshake,
+/// which is what a legacy-shaped handshake naming a version we do not serve is
+/// answered with.
+///
+/// **Not simply the newest we serve, and the difference is the point.** The
+/// 2026-07-28 schema deletes the handshake outright (`grep -i initialize` over
+/// its `schema.ts` returns zero hits), so answering an `initialize` with that
+/// revision tells a client "speak the era that has no such request", and under
+/// the legacy lifecycle rules a client that cannot speak the returned version
+/// SHOULD disconnect rather than proceed. It also has a concrete cost: rmcp
+/// keys `ping`'s removal, the `resultType` discriminator and the subscription
+/// dispatch on the peer's **negotiated** version (`handler/server.rs:112-118`,
+/// `:246-260`, `uses_legacy_lifecycle` at `service.rs:196-202`), so a client
+/// downgraded onto the era would lose `ping` without ever having asked for the
+/// era. Capping the downgrade means a peer reaches the modern lifecycle only
+/// by asking for it - by opening with `server/discover`, or by naming
+/// 2026-07-28 in its own handshake, both of which are still echoed verbatim.
+pub(crate) fn newest_legacy_handshake_version() -> ProtocolVersion {
+    SERVED_PROTOCOL_VERSIONS
+        .iter()
+        .rfind(|version| **version < ProtocolVersion::V_2026_07_28)
+        .cloned()
+        .unwrap_or_else(newest_served_protocol_version)
 }
 
 /// How long a cacheable result may be treated as fresh, in milliseconds.
@@ -1428,6 +1456,14 @@ impl ServerHandler for McpServer {
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::default();
         info.server_info = Implementation::new("crystalline", crystalline_core::VERSION);
+        // This field is the default `initialize` answer, and `initialize`
+        // belongs to the legacy lifecycle, so it names the newest revision that
+        // still has a handshake rather than the newest we serve. What we serve
+        // is advertised through `supported_protocol_versions` and echoed by
+        // `initialize` when a client asks for it. Set explicitly because
+        // `ServerInfo::default()` would leave rmcp's own `ProtocolVersion::
+        // LATEST` here, which moves when the crate does.
+        info.protocol_version = newest_legacy_handshake_version();
         let mut instructions = self.engine.routing_text();
         if self.engine.response_format() == ResponseFormat::Toon {
             instructions.push_str(TOON_INSTRUCTIONS_NOTE);
@@ -1482,36 +1518,55 @@ impl ServerHandler for McpServer {
     /// *request*, not from our advertised set: `use_session =
     /// legacy_session_mode && is_legacy_request(...)` (rmcp 3.1.2
     /// `tower.rs:1727`), and `is_legacy_request` (`tower.rs:358-408`) reads the
-    /// version out of the request body and compares it against the crate-wide
-    /// `KNOWN_VERSIONS`, never against [`SERVED_PROTOCOL_VERSIONS`].
-    /// `Mcp-Session-Id` is inserted at exactly one site (`tower.rs:1911`),
-    /// inside the session branch. So an `initialize` naming a version at or
-    /// above 2026-07-28 routes statelessly and gets no session id, while our
-    /// answer names a version we do serve; the client's next request declares
-    /// that older version, takes the session branch with no session id to
-    /// present, and gets `422 Unprocessable Entity: Unexpected message, expect
-    /// initialize request` (`tower.rs:1833`/`:1851`) for the rest of its life.
-    /// A successful handshake followed by permanent failures, observed on this
-    /// endpoint before this refusal existed.
+    /// version out of the request body and compares it against 2026-07-28,
+    /// never against [`SERVED_PROTOCOL_VERSIONS`]. `Mcp-Session-Id` is inserted
+    /// at exactly one site (`tower.rs:1911`), inside the session branch. So an
+    /// `initialize` naming a version at or above 2026-07-28 routes statelessly
+    /// and gets no session id, while our answer named a version we do serve;
+    /// the client's next request declared that older version, took the session
+    /// branch with no session id to present, and got `422 Unprocessable Entity:
+    /// Unexpected message, expect initialize request` (`tower.rs:1833`/`:1851`)
+    /// for the rest of its life. A successful handshake followed by permanent
+    /// failures, observed on this endpoint before this refusal existed.
     ///
-    /// The trigger is wider than the one real revision: `ProtocolVersion`
-    /// deserializes any string (`model.rs:204-220`) and the comparison is
-    /// lexicographic, so `"2027-01-01"` or any future-dated or malformed string
-    /// sorting at or above `"2026-07-28"` wedges the same way, with or without
-    /// our narrowed list. That class is what this refusal actually protects
-    /// against.
+    /// **What is left of that once 2026-07-28 is served, which is much less.**
+    /// A client naming the era is now answered the era, so it stays on the
+    /// stateless routing its own request chose and the two halves agree; if it
+    /// goes on to send the era's request shape (per-request `_meta` plus the
+    /// standard headers) it is served with no session at all, which is what
+    /// SEP-2575 asks for. `tests/mcp_modern_era.rs` drives exactly that. The
+    /// one ragged corner left is a client that declares the era in a handshake
+    /// and then sends *legacy-shaped* requests: those ask for the session
+    /// branch, there is no session, and rmcp answers 422. That is a client
+    /// contradicting itself - the revision it named has no handshake - and it
+    /// is pinned rather than papered over.
+    ///
+    /// **What the refusal still protects, and why it is not deleted.**
+    /// `ProtocolVersion` deserializes any string (`model.rs:204-220`) and the
+    /// comparison is lexicographic, so `"2027-01-01"`, `"banana"` or any other
+    /// string sorting at or above `"2026-07-28"` routes statelessly while being
+    /// a revision nobody implements. Answering it with one of ours would leave
+    /// the original wedge exactly as it was. That class exists independently of
+    /// anything we advertise, which is why the branch narrows rather than goes.
     ///
     /// `ErrorData::unsupported_protocol_version` (`model.rs:601-613`, code
     /// `-32022` at `model.rs:546`) is the shape the specification's versioning
     /// page documents, and it carries the set we do serve so a client can
-    /// retry. Because `json_response` defaults to false (`tower.rs:169`), it
-    /// reaches the client as HTTP 200 with an SSE-framed JSON-RPC error rather
-    /// than a 4xx.
+    /// retry. It has two wire shapes, both observed rather than derived: a
+    /// plain `initialize` carrying no per-request `_meta` lands on
+    /// `stateless_sse_response` (`tower.rs:2027`) and arrives as **HTTP 200
+    /// with an SSE-framed JSON-RPC error**, because `json_response` defaults to
+    /// false (`tower.rs:169`); a request that took the negotiated-direct path
+    /// (`tower.rs:1255`) goes through `jsonrpc_http_status` (`:617-630`) and
+    /// arrives as **400 with `application/json`**. Assert the code, never a
+    /// status.
     ///
     /// **Stdio keeps warn-and-downgrade.** There is no session routing there,
     /// so the wedge cannot occur, and a hard refusal would regress the day a
     /// harness bumps its version string ahead of us: a client that asks for
-    /// tomorrow's revision over stdio gets today's and a working session.
+    /// tomorrow's revision over stdio gets a working session at the newest
+    /// revision that still has a handshake (see
+    /// [`newest_legacy_handshake_version`]).
     async fn initialize(
         &self,
         request: InitializeRequestParams,
@@ -1535,21 +1590,24 @@ impl ServerHandler for McpServer {
                 requested = %requested,
                 "client requested a protocol version this server does not serve; \
                  serving {} instead",
-                newest_served_protocol_version()
+                newest_legacy_handshake_version()
             );
         }
         context.peer.set_peer_info(request);
 
         let mut info = self.arrival_info();
-        // Echo what the client asked for when we serve it, and answer with our
-        // newest otherwise. The fallback is read from our own list rather than
-        // left at `ServerInfo::default()`'s `ProtocolVersion::LATEST`, so an
-        // rmcp whose LATEST moves outside the set above can never make us
-        // answer with a revision we do not serve.
+        // Echo what the client asked for when we serve it - 2026-07-28
+        // included, which is how a client asks for the modern lifecycle
+        // through a handshake - and downgrade to the newest revision that
+        // still has a handshake otherwise. The fallback is read from our own
+        // list rather than left at `ServerInfo::default()`'s
+        // `ProtocolVersion::LATEST`, so an rmcp whose LATEST moves cannot make
+        // us answer with a revision we do not serve, and it is capped below
+        // the era for the reasons on [`newest_legacy_handshake_version`].
         info.protocol_version = if served {
             requested
         } else {
-            newest_served_protocol_version()
+            newest_legacy_handshake_version()
         };
         Ok(info)
     }

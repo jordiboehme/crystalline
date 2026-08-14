@@ -9,13 +9,12 @@
 //!
 //! # Why these tests call the handler methods rather than driving a wire
 //!
-//! **A modern peer is not reachable over any transport until the era is
-//! advertised, and that was established by reading the code rather than by
-//! trying.** The gate is `RequestContext::protocol_version()` (rmcp 3.1.2
-//! `service.rs:1223-1229`): the request's own `_meta` version first, then the
-//! peer's negotiated version. Both are bounded by
-//! `crystalline_service::mcp::SERVED_PROTOCOL_VERSIONS`, which does not yet
-//! carry 2026-07-28:
+//! **They were written while a modern peer was unreachable over any transport,
+//! which was established by reading the code rather than by trying.** The gate
+//! is `RequestContext::protocol_version()` (rmcp 3.1.2 `service.rs:1223-1229`):
+//! the request's own `_meta` version first, then the peer's negotiated version.
+//! Both are bounded by `crystalline_service::mcp::SERVED_PROTOCOL_VERSIONS`,
+//! and while that list did not carry 2026-07-28:
 //!
 //! - a `_meta` version outside the advertised set is refused
 //!   `-32022 unsupported protocol version` before dispatch
@@ -32,15 +31,19 @@
 //!   (`tower.rs:498-530`), and a matching `_meta` lands back on the `-32022`
 //!   above.
 //!
-//! So there is no wire path to a modern `protocol_version()` before the era is
-//! advertised. These tests therefore build a `RequestContext` directly - which
-//! is what `RequestContext::new` (`service.rs:1209`) plus the public
-//! `meta` field and `RequestMetaObject::set_protocol_version`
-//! (`model/meta.rs:451`) exist for - and call the handler methods the
-//! dispatcher would call. **The task that advertises the era owes the wire leg**
-//! and this file cannot supply it; the legacy halves below do run through the
-//! same methods a live session reaches, and `http_stream.rs`'s baseline pins
-//! the legacy absence on real bytes.
+//! So there was no wire path to a modern `protocol_version()` at all. These
+//! tests therefore build a `RequestContext` directly - which is what
+//! `RequestContext::new` (`service.rs:1209`) plus the public `meta` field and
+//! `RequestMetaObject::set_protocol_version` (`model/meta.rs:451`) exist for -
+//! and call the handler methods the dispatcher would call.
+//!
+//! **The era is advertised now and the wire leg exists**, in
+//! `tests/mcp_modern_era.rs`: all six operations over stdio and five of them
+//! over HTTP, hints asserted on real bytes. These tests keep their place
+//! rather than being folded into it, because they reach two things a wire
+//! cannot: `DegradedServer`, which is stdio-only and built on a failure path,
+//! and a revision *newer* than the era, which pins the `>=` in the gate.
+//! `http_stream.rs`'s baseline pins the legacy absence on real bytes.
 
 use std::sync::Arc;
 

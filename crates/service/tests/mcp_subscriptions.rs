@@ -8,7 +8,9 @@
 //! notification either rides a subscription stream the client opened or it does
 //! not exist.
 //!
-//! **Why these tests can run before the era is advertised.** rmcp refuses
+//! **Why these tests could run before the era was advertised**, which is why
+//! they drive stdio and a discover opener rather than the advertised revision.
+//! rmcp refuses
 //! `subscriptions/listen` with `method_not_found` while `legacy_request` is true
 //! (rmcp 3.1.2 `handler/server.rs:147-150`), and `uses_legacy_lifecycle`
 //! (`service.rs:196-202`) is `!requires_request_metadata && version <
@@ -16,10 +18,14 @@
 //! peer's one-way metadata latch (`service/server.rs:541`, the only call site in
 //! the crate), which makes `requires_request_metadata` true for every later
 //! request on that connection. So the modern dispatch is reachable over stdio at
-//! an advertised legacy revision, and every test here drives it that way. The
-//! HTTP transport arms nothing, so the same request is classified legacy there
-//! and stays unreachable until the era is advertised; that is a sequencing note
-//! for the task that flips it, not a gap here.
+//! any advertised revision, and every test here drives it that way.
+//!
+//! The HTTP transport arms nothing, so before 2026-07-28 was advertised the
+//! same request was classified legacy there and refused `method not found`.
+//! That gap is closed: a `subscriptions/listen` POST declaring the era in its
+//! own `_meta` reaches this handler, and
+//! `tests/mcp_modern_era.rs::the_http_subscription_stream_acknowledges_first_and_stays_silent`
+//! drives it.
 //!
 //! **What this file pins that is not ours.** The two server MUSTs on a
 //! subscription - the acknowledgment is the first message on the stream, and it

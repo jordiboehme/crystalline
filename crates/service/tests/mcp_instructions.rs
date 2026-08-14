@@ -521,20 +521,28 @@ async fn the_setting_overrides_the_receipt_in_both_directions() {
     }
 }
 
-/// A client asking for a revision this server does not yet honour is answered
-/// with the newest one it does. Today that is 2025-11-25: 2026-07-28 carries
-/// obligations this server has not implemented, so echoing it back would be a
-/// false claim.
+/// **A handshake naming 2026-07-28 is now echoed, not downgraded.**
+///
+/// This assertion was the program's opening red and it read the other way for
+/// eight commits: while the era carried obligations this server had not
+/// implemented, echoing it back would have been a false claim. All of them are
+/// implemented, the revision is advertised, and a client asking for it through
+/// a handshake gets it - which is also how a client opts into the modern
+/// lifecycle without opening with `server/discover`. **Rebaselined
+/// deliberately** rather than adjusted to keep a test green.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_client_asking_for_an_unserved_protocol_version_is_answered_with_ours() {
+async fn a_client_asking_for_the_era_through_a_handshake_is_answered_with_it() {
     let h = Harness::build(&[("eng", &["Route here for eng questions"])], &[], false).await;
     assert_eq!(
         h.negotiate(ProtocolVersion::V_2026_07_28).await,
-        ProtocolVersion::V_2025_11_25
+        ProtocolVersion::V_2026_07_28
     );
 }
 
-/// Every revision we advertise is echoed back verbatim, oldest included.
+/// Every revision we advertise is echoed back verbatim, oldest and newest
+/// included, driven off the advertised set so a revision added without a
+/// decision about the echo fails here.
+///
 /// 2024-11-05 is the bottom-end pin: it is served today, keeping it costs one
 /// array element because rmcp branches nowhere between it and 2025-11-25
 /// (`uses_legacy_lifecycle`, rmcp 3.1.2 `service.rs:196-202`, a single `<`
@@ -543,15 +551,10 @@ async fn a_client_asking_for_an_unserved_protocol_version_is_answered_with_ours(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_revision_we_serve_is_echoed_verbatim() {
     let h = Harness::build(&[("eng", &["Route here for eng questions"])], &[], false).await;
-    for version in [
-        ProtocolVersion::V_2024_11_05,
-        ProtocolVersion::V_2025_03_26,
-        ProtocolVersion::V_2025_06_18,
-        ProtocolVersion::V_2025_11_25,
-    ] {
+    for version in crystalline_service::mcp::SERVED_PROTOCOL_VERSIONS {
         assert_eq!(
             h.negotiate(version.clone()).await,
-            version,
+            *version,
             "{version} is one we serve, so it comes back unchanged"
         );
     }
@@ -559,11 +562,21 @@ async fn every_revision_we_serve_is_echoed_verbatim() {
 
 /// `ProtocolVersion` deserializes any string (rmcp 3.1.2 `model.rs:204-220`
 /// falls through to `Cow::Owned(s)`), so a client can declare a future-dated or
-/// malformed revision. On stdio that is answered with ours rather than refused:
-/// there is no session routing to wedge, and a hard refusal would regress the
-/// day a harness bumps its version string ahead of us.
+/// malformed revision. On stdio that is answered rather than refused: there is
+/// no session routing to wedge, and a hard refusal would regress the day a
+/// harness bumps its version string ahead of us.
+///
+/// **What it is answered with is a decision this task took, and it is not the
+/// newest revision we serve.** A client that sent an `initialize` is speaking
+/// the legacy lifecycle, so it is answered the newest revision that still has
+/// one; 2026-07-28 deletes the handshake, and rmcp keys `ping`'s removal and
+/// the modern dispatch on the negotiated version, so downgrading a client onto
+/// the era would take `ping` away from a client that never asked for the era.
+/// A peer reaches the modern lifecycle only by asking - see
+/// `a_client_asking_for_the_era_through_a_handshake_is_answered_with_it` and
+/// `tests/mcp_modern_era.rs`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_unknown_protocol_version_string_is_answered_with_ours() {
+async fn an_unknown_protocol_version_string_is_answered_with_the_newest_handshake_revision() {
     let h = Harness::build(&[("eng", &["Route here for eng questions"])], &[], false).await;
     for garbage in ["2027-01-01", "banana"] {
         assert_eq!(
@@ -583,9 +596,13 @@ async fn an_unknown_protocol_version_string_is_answered_with_ours() {
 /// pins what we actually advertise, which is spelled out literally in
 /// `SERVED_PROTOCOL_VERSIONS` rather than filtered from the crate's list.
 ///
-/// 2026-07-28 is absent on purpose until Tasks 4 to 7 of the rmcp 3.x migration
-/// land and Task 9 adds it; 2024-11-05 is present on purpose and its removal
-/// would be a deprecation, not a cleanup.
+/// 2026-07-28 was added on 2026-08-14, once the four obligations it carries
+/// were implemented and verified over both transports
+/// (`tests/mcp_modern_era.rs`); 2024-11-05 is present on purpose and its
+/// removal would be a deprecation, not a cleanup. The two lists are equal
+/// today, and they are asserted separately on purpose: that is a fact about
+/// this moment rather than a rule, and the day rmcp learns a sixth revision
+/// only the second assertion should fail.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_advertised_protocol_set_is_exactly_this() {
     let h = Harness::build(&[("eng", &["Route here for eng questions"])], &[], false).await;
@@ -597,6 +614,7 @@ async fn the_advertised_protocol_set_is_exactly_this() {
             ProtocolVersion::V_2025_03_26,
             ProtocolVersion::V_2025_06_18,
             ProtocolVersion::V_2025_11_25,
+            ProtocolVersion::V_2026_07_28,
         ]
     );
     assert_eq!(

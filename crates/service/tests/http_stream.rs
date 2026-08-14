@@ -174,30 +174,43 @@ fn init_body(version: &str) -> String {
     )
 }
 
-/// Every revision we advertise still gets the legacy HTTP treatment: a session
-/// id and its own version echoed. `is_legacy_request` (rmcp 3.1.2
-/// `tower.rs:358-408`) routes anything below 2026-07-28 through the session
-/// branch, which is the only site that inserts `Mcp-Session-Id`
-/// (`tower.rs:1911`), so this pins the transport behaviour our advertised set
-/// keeps working rather than merely the negotiated string.
+/// Every revision we advertise is served at the HTTP handshake and echoed back
+/// verbatim - and the session model splits at the era, which is the transport
+/// half of adopting it.
+///
+/// `is_legacy_request` (rmcp 3.1.2 `tower.rs:358-408`) routes anything below
+/// 2026-07-28 through the session branch, the only site that inserts
+/// `Mcp-Session-Id` (`tower.rs:1911`); at or above it the request routes
+/// statelessly and there is no session to issue. Driven off
+/// `SERVED_PROTOCOL_VERSIONS` rather than a literal list, so a revision added
+/// without a decision about its session model fails here.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn every_revision_we_serve_gets_a_session_and_its_version_back() {
+async fn every_revision_we_serve_is_echoed_and_only_the_legacy_ones_get_a_session() {
     let addr = spawn_router().await;
-    for version in ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"] {
+    for version in crystalline_service::mcp::SERVED_PROTOCOL_VERSIONS {
+        let version = version.as_str();
         let response = post(addr, &init_body(version), None).await;
         assert!(
             response.starts_with("HTTP/1.1 200 "),
             "{version} initialize is served:\n{response}"
         );
-        let session_id = extract_session_id(&response);
-        assert!(
-            !session_id.is_empty(),
-            "{version} gets a session id:\n{response}"
-        );
         assert!(
             response.contains(&format!("\"protocolVersion\":\"{version}\"")),
             "{version} is echoed back:\n{response}"
         );
+        if version < "2026-07-28" {
+            assert!(
+                !extract_session_id(&response).is_empty(),
+                "{version} gets a session id:\n{response}"
+            );
+        } else {
+            assert!(
+                !response
+                    .split("\r\n")
+                    .any(|line| line.to_ascii_lowercase().starts_with("mcp-session-id")),
+                "{version} is sessionless by design (SEP-2575):\n{response}"
+            );
+        }
     }
 }
 
@@ -205,16 +218,25 @@ async fn every_revision_we_serve_gets_a_session_and_its_version_back() {
 /// instead of being negotiated down into a wedge.
 ///
 /// The wedge this closes: `use_session` (`tower.rs:1727`) reads the version off
-/// the *request* and validates it against rmcp's crate-wide `KNOWN_VERSIONS`,
-/// never against our narrowed list, so an `initialize` at 2026-07-28 routes
-/// statelessly and gets no `Mcp-Session-Id`. Whatever version the handshake
-/// then answers with, every follow-up that does not itself declare 2026-07-28
-/// takes the session branch, has no session id to present, and gets
-/// `422 Unprocessable Entity: Unexpected message, expect initialize request`
-/// (`tower.rs:1833`/`:1851`) for the rest of its life. Observed on this
-/// endpoint before the refusal existed: a 200 handshake carrying
-/// `"protocolVersion":"2026-07-28"` and no session header, then
-/// `HTTP/1.1 422 Unprocessable Entity` on a plain `tools/list`.
+/// the *request* and compares it against 2026-07-28, never against our list, so
+/// an `initialize` at or above that revision routes statelessly and gets no
+/// `Mcp-Session-Id`. Whatever version the handshake then answers with, every
+/// follow-up that does not itself declare 2026-07-28 takes the session branch,
+/// has no session id to present, and gets `422 Unprocessable Entity: Unexpected
+/// message, expect initialize request` (`tower.rs:1833`/`:1851`) for the rest
+/// of its life. Observed on this endpoint before the refusal existed: a 200
+/// handshake carrying `"protocolVersion":"2026-07-28"` and no session header,
+/// then `HTTP/1.1 422 Unprocessable Entity` on a plain `tools/list`.
+///
+/// **The trigger class shrank when the era was adopted, and the branch stayed.**
+/// 2026-07-28 is served now, so a client naming it is answered it and routes
+/// statelessly throughout, which is what `mcp_modern_era.rs` drives. What is
+/// left is the case that never depended on any decision of ours: a string
+/// sorting at or above 2026-07-28 that no revision matches. `ProtocolVersion`
+/// deserializes any string (`model.rs:204-220`) and the comparison is
+/// lexicographic, so a future-dated or malformed version takes the stateless
+/// route while being a revision nobody implements, and answering it with one of
+/// ours would leave the original wedge exactly as it was.
 ///
 /// The refusal's wire shape is read from source, not assumed:
 /// `StreamableHttpServerConfig::default()` leaves `json_response` false
@@ -225,11 +247,9 @@ async fn every_revision_we_serve_gets_a_session_and_its_version_back() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_version_we_do_not_serve_is_refused_at_the_http_handshake() {
     let addr = spawn_router().await;
-    // 2026-07-28 is a real revision rmcp knows and we do not yet honour;
-    // 2027-01-01 is any string sorting at or above it, which `ProtocolVersion`
-    // deserializes happily (`model.rs:204-220`) and which takes the identical
-    // path.
-    for version in ["2026-07-28", "2027-01-01"] {
+    // Both are strings sorting at or above 2026-07-28 that match no revision:
+    // one future-dated, one not a date at all. They take the identical path.
+    for version in ["2027-01-01", "zzzz"] {
         let response = post(addr, &init_body(version), None).await;
         assert!(
             response.starts_with("HTTP/1.1 200 "),
@@ -576,10 +596,10 @@ async fn the_wire_format_baseline_the_conformance_tasks_measure_against() {
     // `CacheHinted` gate withholds the other two on the same test
     // (`RequestContext::protocol_version()`). Emitting them here would be
     // inventing wire shape for a revision that has none, so these five stay
-    // absent for the whole program. What moves when the era is advertised is a
-    // **new** modern-peer leg, not these lines; `tests/mcp_cache_hints.rs`
-    // holds that half today, and explains why it cannot yet be driven over a
-    // wire.
+    // absent for the whole program. Advertising the era added a **new**
+    // modern-peer leg below rather than moving these lines, which is what that
+    // prediction should have said; `tests/mcp_modern_era.rs` carries the rest
+    // of the modern surface.
     for (label, result) in [
         ("tools/list", &tools),
         ("resources/list", &resources),
@@ -620,16 +640,17 @@ async fn the_wire_format_baseline_the_conformance_tasks_measure_against() {
         22
     );
 
-    // The same shape at the era we do not yet serve is refused, and this is the
-    // **second** wire shape of the same refusal: `jsonrpc_http_status`
-    // (`tower.rs:617-630`) maps -32022 to HTTP 400 on the
-    // `serve_negotiated_request_directly` path (`tower.rs:1255`), and the body
-    // is plain `application/json` rather than an SSE frame. A plain
-    // `initialize` carrying neither `_meta` nor the headers takes the other
-    // path and keeps its 200 SSE shape, which
-    // `a_version_we_do_not_serve_is_refused_at_the_http_handshake` pins.
-    // Task 9 turns both of these into served responses.
-    let refused = post_with_standard_headers(
+    // **Task 9 moved this assertion, deliberately.** The same shape at
+    // 2026-07-28 used to be refused `-32022` in the second of the refusal's two
+    // wire shapes (`jsonrpc_http_status`, `tower.rs:617-630`, maps it to HTTP
+    // 400 with `application/json` on the `serve_negotiated_request_directly`
+    // path, `tower.rs:1255`). That refusal now applies only to strings no
+    // revision matches, which
+    // `a_version_we_do_not_serve_is_refused_at_the_http_handshake` pins in both
+    // of its shapes. Here the era is served: statelessly, with its caching
+    // hints, and with the same 22 tools every other client is served.
+    // `tests/mcp_modern_era.rs` is where the rest of that surface lives.
+    let era = post_with_standard_headers(
         addr,
         r#"{"jsonrpc":"2.0","id":7,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}"#,
         "2026-07-28",
@@ -637,16 +658,21 @@ async fn the_wire_format_baseline_the_conformance_tasks_measure_against() {
     )
     .await;
     assert!(
-        refused.starts_with("HTTP/1.1 400 Bad Request"),
-        "the negotiated-direct path maps the refusal to a status:\n{}",
-        head_of(&refused)
+        era.starts_with("HTTP/1.1 200 OK"),
+        "the era is served on this endpoint:\n{}",
+        head_of(&era)
     );
     assert!(
-        refused.to_ascii_lowercase().contains("application/json"),
-        "and answers plain JSON, not SSE:\n{}",
-        head_of(&refused)
+        !era.split("\r\n")
+            .any(|line| line.to_ascii_lowercase().starts_with("mcp-session-id")),
+        "and it is sessionless:\n{}",
+        head_of(&era)
     );
-    assert_eq!(payload(&refused)["error"]["code"], -32022);
+    let era_result = &payload(&era)["result"];
+    assert_eq!(era_result["tools"].as_array().unwrap().len(), 22);
+    assert_eq!(era_result["resultType"], "complete");
+    assert_eq!(era_result["ttlMs"], 0);
+    assert_eq!(era_result["cacheScope"], "public");
 
     // --- the standard-header rules, inherited from rmcp and already enforced ---
     // Only a client declaring 2026-07-28 or above reaches them, so this bites
@@ -780,8 +806,12 @@ async fn http_sessions_counts_sessions_rather_than_service_constructions() {
     );
 
     // A `tools/call` whose header declares the era reaches the SEP-2243
-    // tool-schema cache during header validation, then is refused because we
-    // do not serve that revision yet. Neither step is a session.
+    // tool-schema cache during header validation, which builds a service of its
+    // own, and then dispatches. **Task 9 moved this leg**: the same request used
+    // to be refused `-32022` for a revision we did not serve, and the counter
+    // had to stay put through a refusal; now it has to stay put through a
+    // served call, which is the stronger version of the same assertion - two
+    // service constructions, one request, no session.
     let schema_probe = post_with_named_headers(
         addr,
         r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"search_engrams","arguments":{"query":"anything"},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}"#,
@@ -791,15 +821,15 @@ async fn http_sessions_counts_sessions_rather_than_service_constructions() {
     )
     .await;
     assert_eq!(
-        payload(&schema_probe)["error"]["code"],
-        -32022,
-        "the era is not advertised yet, so the call is refused:\n{}",
+        payload(&schema_probe)["result"]["isError"],
+        false,
+        "the era is served, so the call runs:\n{}",
         head_of(&schema_probe)
     );
     assert_eq!(
         count(),
         1,
-        "neither the schema cache nor the refusal is a session:\n{}",
+        "neither the schema cache nor the stateless dispatch is a session:\n{}",
         head_of(&schema_probe)
     );
 }

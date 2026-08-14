@@ -246,6 +246,17 @@ impl ServerHandler for DegradedServer {
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::default();
         info.server_info = Implementation::new("crystalline", crystalline_core::VERSION);
+        // The degraded server keeps rmcp's default `initialize`, so this field
+        // **is** its downgrade target for a version it does not serve
+        // (`negotiate_protocol_version`'s `server_fallback`, rmcp 3.1.2
+        // `service/server.rs:590`). It names the newest revision that still has
+        // a handshake, for the reasons on
+        // [`crate::mcp::newest_legacy_handshake_version`], and it is set
+        // explicitly because `ServerInfo::default()` would otherwise leave
+        // rmcp's own `LATEST` here - a value that moves when the crate does and
+        // would one day answer a legacy handshake with a revision that has no
+        // handshake at all.
+        info.protocol_version = crate::mcp::newest_legacy_handshake_version();
         info.instructions = Some(self.status.instructions());
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info
