@@ -410,8 +410,8 @@ fn single_daemon_two_clients_and_stale_recovery() {
 }
 
 /// End to end: a daemon started read-only reports it over ctl status, hides
-/// the four content-mutating tools from tools/list and refuses a write call by
-/// name with the read-only error.
+/// the write-gated tools from tools/list and refuses a write call by name with
+/// the read-only error.
 #[test]
 fn read_only_daemon_reports_hides_and_refuses() {
     let env = Env::new("ro");
@@ -428,12 +428,15 @@ fn read_only_daemon_reports_hides_and_refuses() {
     let status: Value = serde_json::from_str(&out).unwrap();
     assert_eq!(status["read_only"], json!(true), "status: {status}");
 
-    // tools/list hides the four content-mutating tools and keeps the ten
-    // reads, `skills` among them: reading a skill is a read. `evolve_engrams`
-    // is hidden too, on its own gate: it reads, but every finding it returns
-    // prescribes a mutation.
+    // tools/list hides the write-gated tools and keeps the reads, `skills`
+    // among them: reading a skill is a read. `evolve_engrams` is hidden too,
+    // on its own gate: it reads, but every finding it returns prescribes a
+    // mutation. `update_domain` and `origin_status` are listed even with
+    // GitHub off (that gate refuses at call time now) because a read-only
+    // instance exempts them: a pull is a derived-truth update like sync, and
+    // status is a pure read.
     let names = c1.list_tools();
-    assert_eq!(names.len(), 10, "read-only exposes 10 tools: {names:?}");
+    assert_eq!(names.len(), 12, "read-only exposes 12 tools: {names:?}");
     for hidden in [
         "write_engram",
         "edit_engram",
@@ -939,11 +942,13 @@ fn http_smoke_initialize_list_and_search() {
         .pointer("/result/tools")
         .and_then(Value::as_array)
         .unwrap();
-    // The core tools plus `configure` and `add_domain`: GitHub collaboration
-    // is off by default, so the five collaboration tools stay hidden, but
-    // `add_domain` is write-gated not collab-gated, so it is visible (see
-    // crystalline-service's mcp_collab test suite for the full gating matrix).
-    assert_eq!(tools.len(), 17, "17 tools over HTTP");
+    // Every tool this server implements. The instance is writable, and the
+    // only gates left on the listing are the read-only ones: GitHub
+    // collaboration being off and nothing declaring provisioning both refuse
+    // at call time now, because a tool list may not vary per connection or as
+    // a side effect of another request on it (see crystalline-service's
+    // mcp_collab test suite for the full gating matrix).
+    assert_eq!(tools.len(), 22, "every tool over HTTP");
     let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
     assert!(names.contains(&"configure"), "{names:?}");
     assert!(names.contains(&"add_domain"), "{names:?}");

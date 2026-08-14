@@ -462,12 +462,14 @@ async fn the_wire_format_baseline_the_conformance_tasks_measure_against() {
     .await;
 
     // --- the three list endpoints, per connection and uncached ---
-    // Counts as served to a client that is not receipt-matched, with GitHub
-    // off, nothing provisioned and the instance writable. Task 4 makes these
-    // lists invariant (the tool count moves as gates come off the listing) and
-    // Task 5 decides the skills surface at construction instead. The
-    // `tools/list` payload measured 32288 bytes on the day this was recorded,
-    // which is the before-number for Task 4's byte-delta measurement.
+    // Counts as served with GitHub off, nothing provisioned and the instance
+    // writable. **Task 4 moved the tool count from 17 to 22**: `github.enabled`
+    // and `provisioning_declared` are settable by a request on the connection,
+    // so they gate the call instead of the listing (SEP-2567), which puts
+    // `share_changes`, `update_domain`, `origin_status`, `resolve_conflict` and
+    // `provision` on every list. The `tools/list` payload measured 32288 bytes
+    // at 17 tools and 36959 bytes at 22, both recorded here rather than
+    // re-derived. Task 5 decides the skills surface at construction instead.
     let list = |id: u8, method: &'static str| {
         let body = format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"{method}","params":{{}}}}"#);
         let session_id = session_id.clone();
@@ -483,8 +485,8 @@ async fn the_wire_format_baseline_the_conformance_tasks_measure_against() {
         .collect();
     assert_eq!(
         names.len(),
-        17,
-        "17 tools today, the `skills` surface among them: {names:?}"
+        22,
+        "every tool, the `skills` surface among them: {names:?}"
     );
     let mut sorted = names.clone();
     sorted.sort_unstable();
@@ -555,7 +557,7 @@ async fn the_wire_format_baseline_the_conformance_tasks_measure_against() {
             .as_array()
             .unwrap()
             .len(),
-        17
+        22
     );
 
     // The same shape at the era we do not yet serve is refused, and this is the

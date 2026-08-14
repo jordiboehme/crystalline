@@ -1,5 +1,33 @@
-//! The rmcp tool router: the core tools of the v1 MCP surface plus the gated
-//! collaboration tools, visible only when the engine's live settings allow.
+//! The rmcp tool router: the core tools of the v1 MCP surface plus the
+//! collaboration tools, which are always listed and refuse while team
+//! collaboration is off.
+//!
+//! # One list for every client (SEP-2567)
+//!
+//! MCP 2026-07-28 says a server's `tools/list` result "MAY change over time
+//! [...] but MUST NOT vary per-connection or as a side effect of other
+//! requests on the connection", and the same sentence governs
+//! `resources/list` and `prompts/list`. The rule this file applies, which
+//! covers both halves of that sentence:
+//!
+//! > A gate may stay on the listing if and only if (a) its input is not
+//! > derived from the identity, capabilities or configuration of the
+//! > connecting client, and (b) its input cannot be changed by any request on
+//! > that connection. Anything failing either half refuses at call time.
+//!
+//! `read_only` passes both: it is a construction field on the engine
+//! (`Engine::with_read_only` takes `self` by value) and the engine is shared
+//! behind an `Arc`, so nothing a client sends can move it. `github.enabled`
+//! and whether any domain declares provisioning both fail (b) - `configure`,
+//! `add_domain` and `update_domain` change them on the very connection that
+//! then lists - so they refuse at call time. The client's install-receipt
+//! match failed (a) and is gone from the listing entirely.
+//!
+//! Refusing rather than hiding is SEP-2567's own prescription: expose the tool
+//! unconditionally and put the dependency "in the tool's input schema and
+//! description rather than in the list result". Half of it was already true
+//! here, since every gate hid a tool without unregistering its route, so what
+//! changed is the listing rather than the guarding.
 //!
 //! Each tool is a thin wrapper over [`crate::engine::Engine`], which does the
 //! real work and is shared with the CLI data commands. Tool descriptions are
@@ -17,19 +45,23 @@
 //! required. It re-fetches mid-session through `list_domains` with
 //! `include_routing=true`, the same index the instructions carry.
 //!
-//! In read-only mode (the engine's `read_only` flag) the four content-mutating
-//! tools are filtered out of `list_tools` and `get_tool`, so the surface is the
-//! ten read tools; the routes stay registered so a client that calls a hidden
-//! tool by name reaches the engine's read-only guard and gets a clean error.
+//! In read-only mode (the engine's `read_only` flag) the write-gated tools are
+//! filtered out of `list_tools` and `get_tool`; the routes stay registered so
+//! a client that calls a hidden tool by name reaches the engine's read-only
+//! guard and gets a clean error. That gate is legitimate on the listing
+//! because the mode is fixed for the engine's lifetime.
 //!
 //! The collaboration tools (`configure`, `add_domain`, `share_changes`,
-//! `update_domain`, `origin_status`, `resolve_conflict`) are gated the same
-//! way, on the engine's live `github.enabled` setting and `read_only` flag
-//! rather than a startup snapshot, since `configure` can flip
-//! `github.enabled` mid-session: every collaboration tool but `configure`
-//! needs `github.enabled`, and `configure`/`add_domain`/`share_changes`/
-//! `resolve_conflict` additionally disappear read-only. See `COLLAB_TOOLS`,
-//! `COLLAB_WRITE_TOOLS` and `hidden_collab_tool`.
+//! `update_domain`, `origin_status`, `resolve_conflict`) split their two
+//! gates across the two sides of the rule above.
+//! `configure`/`add_domain`/`share_changes`/`resolve_conflict` disappear
+//! read-only, which stays on the listing. `github.enabled` is needed by every
+//! collaboration tool but `configure`, and it refuses at call time: the four
+//! tools that need it are listed whatever it says and answer with
+//! `RemoteError::NotEnabled`'s message, which names the setting and both ways
+//! to change it. Their descriptions say the same thing, so a client's tool
+//! search reads the dependency without having to call. See `COLLAB_TOOLS`,
+//! `COLLAB_WRITE_TOOLS`, `hidden_collab_tool` and `refused_collab_tool`.
 //!
 //! `evolve_engrams` is gated a third way, on the read-only flag alone. It is a
 //! pure read, so it is not one of the `WRITE_TOOLS`, but every finding it
@@ -38,13 +70,15 @@
 //! stays registered like every other hidden tool, so a call by name still
 //! sweeps and answers.
 //!
-//! One more tool, `provision`, is gated a fourth way: hidden whenever no
-//! registered domain's MANIFEST declares a `## Provisioning` section (see
-//! [`Engine::provisioning_declared`]) or the instance is read-only, so an
-//! install with nothing to provision never carries the tool's context cost.
-//! Its route stays registered like every other hidden tool, so a call by
-//! name still reaches the engine: `status` answers for real even with no
-//! declaring domain, and a mutating action still hits the read-only guard.
+//! One more tool, `provision`, is gated a fourth way, and it splits across
+//! the rule too: hidden read-only, since every action but `status` writes,
+//! and refusing while no registered domain's MANIFEST declares a
+//! `## Provisioning` section (see [`Engine::provisioning_declared`], which
+//! `add_domain` and `update_domain` can flip on the same connection).
+//! `status` is never refused - with nothing declared it answers a real, empty
+//! report, which is how a caller learns there is nothing to decide - and the
+//! three reconciling actions refuse rather than report a success that changed
+//! nothing. See `hidden_provision_tool` and `refused_provision_action`.
 //!
 //! The shipped agent skills are served here too, so a remote client that never
 //! runs `crystalline install` can still learn how to use Crystalline well:
@@ -56,16 +90,21 @@
 //! the resource list and the prompt list are empty while direct reads keep
 //! answering, the same hidden-not-disabled doctrine the tool gates follow.
 //!
-//! That gate is tri-state and its default, `auto`, is decided per connection:
-//! a stdio client whose `initialize` name maps to a harness this machine's
-//! install receipt onboarded with session hooks already carries those skills
-//! as files and gets the routing block from its own hook, so it is served
-//! neither the surface nor the full instructions block (see
-//! `hidden_skills_surface`, `minimal_instructions` and the `initialize`
-//! override, which is the only place a server can see who is connecting).
-//! `true` and `false` force the old always and never behaviour. An HTTP
-//! session is never suppressed: a remote client is exactly who the served
-//! surface is for.
+//! That gate is tri-state. `true` and `false` force always and never, and
+//! `auto`, the default, currently serves everyone. It used to be decided per
+//! connection - a stdio client whose `initialize` name mapped to a harness
+//! this machine's install receipt had onboarded with session hooks was served
+//! neither the surface nor the full instructions block - and the surface half
+//! of that decision is exactly what clause (a) of the rule above forbids, so
+//! it is gone from `hidden_skills_surface`. The deduplication it bought is
+//! not being dropped: Task 5 of the rmcp 3.x migration resolves the same
+//! answer before the session starts, from the `--harness` argument the
+//! spawned process was registered with plus this machine's receipt, which are
+//! deployment configuration and machine state rather than client identity.
+//! The instructions half still keys on the receipt match, in
+//! `minimal_instructions` and the `initialize` override; Task 5 owns that
+//! too. An HTTP session was never suppressed either way: a remote client is
+//! exactly who the served surface is for.
 //!
 //! The resource shape follows the converging skills-over-MCP proposal
 //! without advertising its extension id, which is not ratified yet. The
@@ -79,16 +118,19 @@
 //! `ServerCapabilities::enable_tool_list_changed`); `configure` sends one
 //! whenever a `set`/`unset` call flips `github.enabled`, and `add_domain`/
 //! `update_domain` send one whenever they flip whether any domain declares
-//! provisioning, so a client that honours the notification refreshes its
-//! tool list immediately rather than waiting for its own next poll. A
-//! `skills.serve` flip moves three lists at once, so `configure` sends the
-//! prompt and resource list-changed notifications alongside the tool one.
+//! provisioning. Neither of those two moves a list any more, now that both
+//! gates refuse at call time; the pushes survive because Task 6 of the rmcp
+//! 3.x migration owns pruning them and routing whatever genuinely survives
+//! through subscription sinks. A `skills.serve` flip does still move three
+//! lists at once, so `configure` sends the prompt and resource list-changed
+//! notifications alongside the tool one.
 //!
 //! Every tool also advertises MCP tool annotations: a display `title` plus the
 //! readOnly/destructive/idempotent/openWorld hints, so a client can tune its
 //! confirmation UX and batch the read-only calls. The hints are advisory only;
-//! enforcement stays the runtime gating (`WRITE_TOOLS`, `hidden_collab_tool`)
-//! and the engine guards. Two calls are deliberate: `write_engram` advertises
+//! enforcement stays the runtime gating (`WRITE_TOOLS`, `hidden_collab_tool`,
+//! `refused_collab_tool`) and the engine guards. Two calls are deliberate:
+//! `write_engram` advertises
 //! non-destructive because its default behaviour is additive (it errors on an
 //! existing permalink unless `overwrite`), and `open_world` is true only for
 //! the tools that talk to GitHub - `configure` through its connect flow,
@@ -97,7 +139,6 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use rmcp::handler::server::prompt::PromptContext;
 use rmcp::handler::server::wrapper::Parameters;
@@ -219,15 +260,33 @@ fn hidden_evolve_tool(read_only: bool) -> bool {
     read_only
 }
 
-/// Whether the `provision` tool is hidden given the engine's live read-only
-/// state and whether any registered domain currently declares a
-/// `## Provisioning` section. A fresh install with nothing to provision never
-/// carries the tool's context cost; the route stays registered regardless
-/// (see `list_tools` and `get_tool`), so a call by name still reaches the
-/// engine either way.
-fn hidden_provision_tool(read_only: bool, provisioning_declared: bool) -> bool {
-    read_only || !provisioning_declared
+/// Whether the `provision` tool is hidden given the engine's read-only state.
+/// Every action but `status` writes, so the tool follows the write gate.
+///
+/// Whether anything currently declares a `## Provisioning` section used to be
+/// half of this predicate and is not any more: `add_domain` and
+/// `update_domain` can create a declaration on the same connection, which is
+/// SEP-2567's side-effect prohibition, so it gates the call instead. See
+/// [`refused_provision_action`].
+fn hidden_provision_tool(read_only: bool) -> bool {
+    read_only
 }
+
+/// Whether one `provision` action is refused because no registered domain
+/// declares a `## Provisioning` section.
+///
+/// `status` is never refused: with nothing declared it answers a real, empty
+/// report, which is precisely how a caller learns there is nothing to decide.
+/// The three actions that reconcile artifacts are refused, because with
+/// nothing declared they would report success while doing nothing at all.
+fn refused_provision_action(action: &ProvisionAction, provisioning_declared: bool) -> bool {
+    !provisioning_declared && !matches!(action, ProvisionAction::Status)
+}
+
+/// What a refused `provision` action tells the caller: the thing that has to
+/// exist before it can do anything, and the read that reports the state either
+/// way.
+const PROVISION_NOT_DECLARED: &str = "No registered domain declares a '## Provisioning' section in its MANIFEST, so there is nothing to allow, deny or reconcile. Add one to a domain's MANIFEST first; provision with action status reports the current state either way.";
 
 /// The MIME type every shipped skill is served with, as a resource and in the
 /// `skills` tool's full read: a `SKILL.md` is plain markdown.
@@ -268,28 +327,39 @@ fn skill_uris() -> String {
 }
 
 /// Whether the whole skill-serving surface (the `skills` tool, the `skill://`
-/// resources and the two prompts) is hidden for one connection.
+/// resources and the two prompts) is hidden.
 ///
-/// `skills_serve` is the engine's live setting, read fresh on every call
-/// rather than cached, since `configure` can flip it mid-session.
-/// `receipt_matched` is the connection fact [`McpServer::initialize`] decided
-/// once at handshake time: a local (stdio) client this machine's install
-/// receipt knows as an onboarded harness with session hooks wired. The three
-/// rows are exactly the setting's value set:
+/// The three rows are exactly the setting's value set:
 ///
-/// - `true`: never hidden, whoever connects.
-/// - `false`: always hidden, whoever connects.
-/// - `auto`: hidden for a receipt-matched connection only, since that client
-///   already carries the same skills as files.
+/// - `true`: never hidden.
+/// - `false`: always hidden.
+/// - `auto`: served.
+///
+/// **`auto` used to consult the connecting client**, hiding the surface from a
+/// stdio client this machine's install receipt knew as an onboarded harness.
+/// That is SEP-2567's first prohibition - a list endpoint "MUST NOT vary
+/// per-connection" - so the input is gone from here. The deduplication it
+/// bought is not: Task 5 of the rmcp 3.x migration resolves the same answer
+/// before the session starts, from the `--harness` argument the spawned
+/// process was registered with plus this machine's receipt, which is
+/// deployment configuration rather than client identity. Until it lands,
+/// `auto` serves everyone. [`minimal_instructions`] still keys on the receipt
+/// match; that is the instructions lever, and Task 5 owns it too.
+///
+/// `skills_serve` is still the engine's live setting, read fresh on every
+/// call, which means a `configure` flip still moves three lists mid-session.
+/// **That is SEP-2567's second prohibition and it is the last one standing**;
+/// Task 5 freezes the effective value at engine construction, which is the
+/// only layer where stdio, HTTP, embedded and the degraded stub agree.
 ///
 /// Hidden means hidden, not disabled: the lists come back empty while the
 /// tool, the resources and the prompts all keep answering a direct call.
 /// Read-only mode is not part of it either: reading a skill is a read.
-fn hidden_skills_surface(skills_serve: SkillsServe, receipt_matched: bool) -> bool {
+fn hidden_skills_surface(skills_serve: SkillsServe) -> bool {
     match skills_serve {
         SkillsServe::Always => false,
         SkillsServe::Never => true,
-        SkillsServe::Auto => receipt_matched,
+        SkillsServe::Auto => false,
     }
 }
 
@@ -316,20 +386,34 @@ fn receipt_matches_client(client_name: &str, hooked: &[crystalline_core::Harness
     }
 }
 
-/// Whether collaboration tool `name` is hidden given the engine's live
-/// `github.enabled` and `read_only` state. Not meaningful for a non-collab
-/// tool name; callers check [`is_write_tool`] separately for those. The net
-/// matrix: disabled and read-write shows only `configure`; disabled and
-/// read-only shows none of the five; enabled and read-write shows all five;
-/// enabled and read-only shows `update_domain` and `origin_status` only.
-fn hidden_collab_tool(name: &str, github_enabled: bool, read_only: bool) -> bool {
-    if read_only && COLLAB_WRITE_TOOLS.contains(&name) {
-        return true;
-    }
-    if !github_enabled && name != "configure" {
-        return true;
-    }
-    false
+/// Whether collaboration tool `name` is hidden given the engine's `read_only`
+/// state. Not meaningful for a non-collab tool name; callers check
+/// [`is_write_tool`] separately for those. The net matrix: read-write shows
+/// all five, read-only shows `update_domain` and `origin_status` only.
+///
+/// `github.enabled` used to be the other half of this predicate. It left the
+/// listing for [`refused_collab_tool`]: `configure` can flip it on this very
+/// connection, and SEP-2567 forbids a list varying "as a side effect of other
+/// requests on the connection". `read_only` stays because it cannot move -
+/// `Engine::with_read_only` (`engine.rs:788-791`) takes `self` by value at
+/// construction and the engine is shared behind an `Arc`, so no request can
+/// reach it.
+fn hidden_collab_tool(name: &str, read_only: bool) -> bool {
+    read_only && COLLAB_WRITE_TOOLS.contains(&name)
+}
+
+/// Whether collaboration tool `name` refuses at call time because
+/// `github.enabled` is off. Every collaboration tool but `configure` needs it,
+/// and `configure` is deliberately exempt: it is how the setting gets turned
+/// on.
+///
+/// The refusal itself is [`RemoteError::NotEnabled`]'s message, which names
+/// the setting and both ways to change it. The engine keeps its own copy of
+/// this guard (`engine.rs:6075` and friends) for the REST and CLI surfaces;
+/// this one exists so the MCP caller reads the reason as tool output rather
+/// than as a JSON-RPC error the client renders opaquely.
+fn refused_collab_tool(name: &str, github_enabled: bool) -> bool {
+    !github_enabled && name != "configure"
 }
 
 use crystalline_core::config::{ResponseFormat, SkillsServe};
@@ -378,8 +462,13 @@ pub enum Transport {
 /// The MCP server for one connection: one tool router over one shared engine.
 /// Cheap to clone; every serving path builds one per connection (the daemon
 /// per accepted `mcp` socket, the HTTP transport per session, the stdio bridge
-/// once for its single session), which is what lets it hold the per-connection
-/// handshake decision below.
+/// once for its single session).
+///
+/// **Nothing per connection is carried past the handshake any more.** The
+/// install-receipt match used to live here as an `AtomicBool` that every list
+/// gate read, which is the per-connection variation SEP-2567 forbids; it is
+/// now computed inside [`McpServer::initialize`], used there for the
+/// instructions decision and dropped.
 #[derive(Clone)]
 pub struct McpServer {
     engine: Arc<Engine>,
@@ -387,12 +476,6 @@ pub struct McpServer {
     /// Where to read this machine's install receipt. `None` when the state
     /// directory could not be resolved at all, which reads as "no receipt".
     install_receipt: Option<PathBuf>,
-    /// Whether the client that completed this connection's `initialize` is a
-    /// locally installed harness with session hooks wired. Decided once in
-    /// [`McpServer::initialize`] and read by every gate afterwards, so the
-    /// receipt is read once per connection rather than once per list call.
-    /// Shared through the clone rmcp keeps, hence the atomic.
-    receipt_matched: Arc<AtomicBool>,
 }
 
 impl McpServer {
@@ -411,7 +494,6 @@ impl McpServer {
             engine,
             transport,
             install_receipt: crystalline_core::provision::install_receipt_path().ok(),
-            receipt_matched: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -421,13 +503,6 @@ impl McpServer {
     pub fn with_install_receipt(mut self, path: PathBuf) -> McpServer {
         self.install_receipt = Some(path);
         self
-    }
-
-    /// Whether this connection's client matched the install receipt, the fact
-    /// [`hidden_skills_surface`] and [`minimal_instructions`] gate on. Always
-    /// `false` before `initialize` has run and always `false` on HTTP.
-    fn receipt_matched(&self) -> bool {
-        self.receipt_matched.load(Ordering::Relaxed)
     }
 }
 
@@ -730,20 +805,20 @@ impl McpServer {
         }
 
         let before = self.engine.github_enabled();
-        // Compare the surface this connection actually sees, not the raw
-        // setting: under `auto` the same value can mean hidden for a
-        // receipt-matched client and visible for everyone else, so a flip
-        // between `auto` and `true` moves nothing for a client that was never
-        // matched and must not claim otherwise.
-        let matched = self.receipt_matched();
-        let skills_before = hidden_skills_surface(self.engine.skills_serve(), matched);
+        // Compare the surface, not the raw setting: a flip between `auto` and
+        // `true` changes the value and moves nothing, and announcing a change
+        // that did not happen is its own defect.
+        let skills_before = hidden_skills_surface(self.engine.skills_serve());
         self.apply_settings(&p).await?;
         let after = self.engine.github_enabled();
-        let skills_after = hidden_skills_surface(self.engine.skills_serve(), matched);
+        let skills_after = hidden_skills_surface(self.engine.skills_serve());
         // A `skills.serve` flip moves three lists at once (the `skills` tool,
-        // the `skill://` resources and the two prompts), a `github.enabled`
-        // flip only the tool list; one call can do both, and the tool
-        // notification is sent once either way.
+        // the `skill://` resources and the two prompts). A `github.enabled`
+        // flip moves nothing any more, since that gate refuses at call time
+        // rather than shaping the listing; the push survives here only
+        // because Task 6 of the rmcp 3.x migration owns pruning and routing
+        // every push site through subscription sinks, and pruning it here
+        // would leave that task auditing a set that had already changed.
         let skills_flipped = skills_before != skills_after;
         if (before != after || skills_flipped)
             && let Err(e) = peer.notify_tool_list_changed().await
@@ -859,7 +934,7 @@ impl McpServer {
     #[tool(
         name = "share_changes",
         title = "Share changes",
-        description = "Share this domain's new knowledge and experience with the team as a proposal they review on GitHub; returns the review URL to hand to the user. Refuses while conflicts are unsettled so the team always reviews a clean proposal.",
+        description = "Share this domain's new knowledge and experience with the team as a proposal they review on GitHub; returns the review URL to hand to the user. Refuses while conflicts are unsettled so the team always reviews a clean proposal. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -871,6 +946,9 @@ impl McpServer {
         &self,
         Parameters(p): Parameters<ShareChangesParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        if refused_collab_tool("share_changes", self.engine.github_enabled()) {
+            return refuse(RemoteError::NotEnabled.to_string());
+        }
         self.engine
             .origin_share(&p.domain, p.title.as_deref(), p.description.as_deref())
             .await
@@ -881,7 +959,7 @@ impl McpServer {
     #[tool(
         name = "update_domain",
         title = "Update domain",
-        description = "Learn the team's latest knowledge: pulls what was merged upstream into the domain (or every shared domain), merging cleanly where possible and flagging real conflicts for resolve_conflict.",
+        description = "Learn the team's latest knowledge: pulls what was merged upstream into the domain (or every shared domain), merging cleanly where possible and flagging real conflicts for resolve_conflict. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -894,6 +972,9 @@ impl McpServer {
         Parameters(p): Parameters<UpdateDomainParams>,
         peer: Peer<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        if refused_collab_tool("update_domain", self.engine.github_enabled()) {
+            return refuse(RemoteError::NotEnabled.to_string());
+        }
         // A pull can rewrite a domain's MANIFEST, so `provisioning_declared`
         // can flip here too; notify the same way `add_domain` and `configure`
         // do.
@@ -911,13 +992,16 @@ impl McpServer {
     #[tool(
         name = "origin_status",
         title = "Origin status",
-        description = "Review each shared domain's standing: whether the team has new knowledge to learn, what is waiting to be shared, open and declined proposals and any conflicts to settle.",
+        description = "Review each shared domain's standing: whether the team has new knowledge to learn, what is waiting to be shared, open and declined proposals and any conflicts to settle. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure.",
         annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn origin_status(
         &self,
         Parameters(p): Parameters<OriginStatusParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        if refused_collab_tool("origin_status", self.engine.github_enabled()) {
+            return refuse(RemoteError::NotEnabled.to_string());
+        }
         self.engine
             .origin_status(p.domain.as_deref())
             .await
@@ -928,7 +1012,7 @@ impl McpServer {
     #[tool(
         name = "resolve_conflict",
         title = "Resolve conflict",
-        description = "Settle a flagged conflict by keeping your version (mine), taking the team's version (theirs) or providing merged content. The engram then counts as ordinary local knowledge you can share.",
+        description = "Settle a flagged conflict by keeping your version (mine), taking the team's version (theirs) or providing merged content. The engram then counts as ordinary local knowledge you can share. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -940,6 +1024,9 @@ impl McpServer {
         &self,
         Parameters(p): Parameters<ResolveConflictParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        if refused_collab_tool("resolve_conflict", self.engine.github_enabled()) {
+            return refuse(RemoteError::NotEnabled.to_string());
+        }
         let (keep, content): (Option<&str>, Option<&[u8]>) = match p.resolution.as_str() {
             "mine" => (Some("mine"), None),
             "theirs" => (Some("theirs"), None),
@@ -971,7 +1058,7 @@ impl McpServer {
     #[tool(
         name = "provision",
         title = "Provision harness artifacts",
-        description = "Provision the skills, commands, agents and MCP servers a domain ships into the user's coding harnesses. A domain declares artifact folders in its MANIFEST; each domain needs a one-time allow or deny decision from the user before anything installs. status shows decisions and pending domains, allow or deny records a decision and applies it, apply reconciles updates and removals. Installed artifacts update when the domain's files change and disappear when the domain is denied or removed.",
+        description = "Provision the skills, commands, agents and MCP servers a domain ships into the user's coding harnesses. A domain declares artifact folders in its MANIFEST; each domain needs a one-time allow or deny decision from the user before anything installs. status shows decisions and pending domains, allow or deny records a decision and applies it, apply reconciles updates and removals. Installed artifacts update when the domain's files change and disappear when the domain is denied or removed. Until some registered domain's MANIFEST declares a '## Provisioning' section, status reports an empty state and allow, deny and apply refuse and say so.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -1006,6 +1093,13 @@ impl McpServer {
                 ));
             }
         };
+        // The declaration gate, which used to hide this tool from the listing
+        // and now refuses the actions it would make pointless. `status` is
+        // deliberately not one of them: it answers an empty report, which is
+        // how a caller learns there is nothing to decide.
+        if refused_provision_action(&action, self.engine.provisioning_declared()) {
+            return refuse(PROVISION_NOT_DECLARED);
+        }
         self.engine
             .provision(&action)
             .await
@@ -1303,7 +1397,6 @@ impl ServerHandler for McpServer {
                 ),
                 None => false,
             };
-        self.receipt_matched.store(matched, Ordering::Relaxed);
 
         let mut info = self.get_info();
         if minimal_instructions(self.engine.skills_serve(), matched) {
@@ -1332,39 +1425,53 @@ impl ServerHandler for McpServer {
         Ok(info)
     }
 
-    /// List the exposed tools. In read-only mode the write-gated tools (the
-    /// four content-mutating engram tools plus `add_domain`) are filtered out so
-    /// they are absent from `tools/list`, while their routes stay registered for
-    /// the call-by-name guard (see `WRITE_TOOLS`). The five collaboration tools
-    /// are filtered the same way against the engine's live `github.enabled` and
-    /// `read_only` state (see `hidden_collab_tool`), consulted fresh on every
-    /// call rather than cached, since `configure` can flip `github.enabled`
-    /// mid-session. Both this method and `get_tool` run every surviving
-    /// tool's schema through `crate::tool_schema::sanitize_tool` before
-    /// returning it, so advertised schemas stay in the conservative
-    /// client-compatible shape.
+    /// List the exposed tools.
+    ///
+    /// # Only inputs no request can move may gate this list
+    ///
+    /// MCP 2026-07-28 (SEP-2567, `/server/tools`) says a server's tool list
+    /// "MAY change over time [...] but MUST NOT vary per-connection or as a
+    /// side effect of other requests on the connection", and the identical
+    /// sentence governs `resources/list` and `prompts/list`. So a gate may
+    /// stay here only if its input is neither derived from the connecting
+    /// client nor changeable by a request on that connection.
+    ///
+    /// What is left is `read_only`, which is fixed at engine construction
+    /// (`Engine::with_read_only`, `engine.rs:788-791`, takes `self` by value;
+    /// the engine is shared behind an `Arc`), plus the `skills.serve` setting,
+    /// which is still read live and is the one remaining side effect - see
+    /// [`hidden_skills_surface`].
+    ///
+    /// `github.enabled` and whether any domain declares provisioning both left
+    /// this list for a call-time refusal, which is the remedy SEP-2567
+    /// prescribes itself: expose the tool unconditionally and put the
+    /// dependency "in the tool's input schema and description rather than in
+    /// the list result". The routes were always registered - the gates hid
+    /// rather than disabled - so what changed is the listing, not the
+    /// guarding.
+    ///
+    /// Both this method and `get_tool` run every surviving tool's schema
+    /// through `crate::tool_schema::sanitize_tool` before returning it, so
+    /// advertised schemas stay in the conservative client-compatible shape.
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
         let read_only = self.engine.read_only();
-        let github_enabled = self.engine.github_enabled();
-        let provisioning_declared = self.engine.provisioning_declared();
-        let skills_hidden =
-            hidden_skills_surface(self.engine.skills_serve(), self.receipt_matched());
+        let skills_hidden = hidden_skills_surface(self.engine.skills_serve());
         let mut tools = Self::tool_router().list_all();
         tools.retain(|t| {
             if is_write_tool(&t.name) && read_only {
                 return false;
             }
-            if is_collab_tool(&t.name) && hidden_collab_tool(&t.name, github_enabled, read_only) {
+            if is_collab_tool(&t.name) && hidden_collab_tool(&t.name, read_only) {
                 return false;
             }
             if t.name == crate::EVOLVE_TOOL_NAME && hidden_evolve_tool(read_only) {
                 return false;
             }
-            if t.name == "provision" && hidden_provision_tool(read_only, provisioning_declared) {
+            if t.name == "provision" && hidden_provision_tool(read_only) {
                 return false;
             }
             if t.name == "skills" && skills_hidden {
@@ -1378,31 +1485,23 @@ impl ServerHandler for McpServer {
         Ok(ListToolsResult::with_all_items(tools))
     }
 
-    /// Resolve a tool definition by name, hiding the content-mutating and
-    /// gated collaboration tools the same way `list_tools` does, so a hidden
-    /// tool never surfaces through `get_tool` either.
+    /// Resolve a tool definition by name, hiding exactly what `list_tools`
+    /// hides, so the two enforcement points cannot drift apart.
     fn get_tool(&self, name: &str) -> Option<Tool> {
         let read_only = self.engine.read_only();
         if is_write_tool(name) && read_only {
             return None;
         }
-        if is_collab_tool(name) {
-            let github_enabled = self.engine.github_enabled();
-            if hidden_collab_tool(name, github_enabled, read_only) {
-                return None;
-            }
+        if is_collab_tool(name) && hidden_collab_tool(name, read_only) {
+            return None;
         }
         if name == crate::EVOLVE_TOOL_NAME && hidden_evolve_tool(read_only) {
             return None;
         }
-        if name == "provision"
-            && hidden_provision_tool(read_only, self.engine.provisioning_declared())
-        {
+        if name == "provision" && hidden_provision_tool(read_only) {
             return None;
         }
-        if name == "skills"
-            && hidden_skills_surface(self.engine.skills_serve(), self.receipt_matched())
-        {
+        if name == "skills" && hidden_skills_surface(self.engine.skills_serve()) {
             return None;
         }
         let mut tool = Self::tool_router().get(name).cloned()?;
@@ -1419,7 +1518,7 @@ impl ServerHandler for McpServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, ErrorData> {
-        if hidden_skills_surface(self.engine.skills_serve(), self.receipt_matched()) {
+        if hidden_skills_surface(self.engine.skills_serve()) {
             return Ok(ListResourcesResult::with_all_items(Vec::new()));
         }
         let resources = SKILL_ASSETS
@@ -1468,7 +1567,7 @@ impl ServerHandler for McpServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListPromptsResult, ErrorData> {
-        let prompts = if hidden_skills_surface(self.engine.skills_serve(), self.receipt_matched()) {
+        let prompts = if hidden_skills_surface(self.engine.skills_serve()) {
             Vec::new()
         } else {
             Self::prompt_router().list_all()
@@ -1500,6 +1599,24 @@ fn ok(value: Value) -> Result<CallToolResult, ErrorData> {
     let text = serde_json::to_string(&value)
         .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
     Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+}
+
+/// A call-time refusal: the tool ran and could not do its job because a
+/// server-side condition is off.
+///
+/// **Deliberately a tool-level error rather than a JSON-RPC one.** Every gate
+/// that stopped shaping the tool list under SEP-2567 refuses here instead, so
+/// the model that called the tool has to be able to read why: rmcp's own
+/// guidance is that "MCP clients typically render protocol errors opaquely
+/// [...] the caller will not see your message" and that `CallToolResult::error`
+/// is the right shape for a failure the caller should act on (rmcp 3.1.2
+/// `handler/server.rs:454-480`, `model.rs:3892-3913`). The message names the
+/// condition and how to change it, which is the same thing the tool's
+/// description says, exactly as SEP-2567 prescribes.
+fn refuse(message: impl Into<String>) -> Result<CallToolResult, ErrorData> {
+    Ok(CallToolResult::error(vec![ContentBlock::text(
+        message.into(),
+    )]))
 }
 
 /// Map an engine error to an rmcp tool error with an actionable message.
@@ -1638,25 +1755,17 @@ mod tests {
         assert!(!is_collab_tool("search_engrams"));
     }
 
-    /// The whole per-connection decision, one assertion per row of the value
-    /// set: `true` and `false` ignore the connection entirely, `auto` follows
-    /// it.
+    /// One assertion per row of the value set, and no second argument: the
+    /// decision no longer looks at who connected, because SEP-2567 forbids a
+    /// list endpoint varying per connection.
     #[test]
-    fn hidden_skills_surface_covers_every_setting_and_connection_pair() {
-        assert!(!hidden_skills_surface(SkillsServe::Always, false));
+    fn hidden_skills_surface_follows_the_setting_alone() {
+        assert!(!hidden_skills_surface(SkillsServe::Always));
+        assert!(hidden_skills_surface(SkillsServe::Never));
         assert!(
-            !hidden_skills_surface(SkillsServe::Always, true),
-            "true serves an installed harness too, on purpose"
-        );
-        assert!(hidden_skills_surface(SkillsServe::Never, false));
-        assert!(hidden_skills_surface(SkillsServe::Never, true));
-        assert!(
-            !hidden_skills_surface(SkillsServe::Auto, false),
-            "the default serves everyone the receipt does not know"
-        );
-        assert!(
-            hidden_skills_surface(SkillsServe::Auto, true),
-            "the default hides the surface from a harness that has it on disk"
+            !hidden_skills_surface(SkillsServe::Auto),
+            "the default serves everyone; Task 5 resolves the suppression \
+             before the session starts instead"
         );
     }
 
@@ -1718,35 +1827,83 @@ mod tests {
         assert!(skill_for_uri("https://example.com/SKILL.md").is_none());
     }
 
+    /// The listing half of the collaboration gating, which is `read_only`
+    /// alone now: read-write shows all five, read-only shows the two that a
+    /// read-only instance still exempts.
     #[test]
-    fn hidden_collab_tool_matches_the_locked_gating_matrix() {
-        // disabled + read-write: only configure of the five is visible.
-        assert!(!hidden_collab_tool("configure", false, false));
+    fn hidden_collab_tool_matches_the_locked_read_only_matrix() {
+        for name in COLLAB_TOOLS {
+            assert!(!hidden_collab_tool(name, false), "{name}");
+        }
+        for name in ["update_domain", "origin_status"] {
+            assert!(!hidden_collab_tool(name, true), "{name}");
+        }
+        for name in COLLAB_WRITE_TOOLS {
+            assert!(hidden_collab_tool(name, true), "{name}");
+        }
+    }
+
+    /// The call-time half: `github.enabled` off refuses everything but
+    /// `configure`, which is exempt because it is how the setting is turned
+    /// on. On it, nothing is refused.
+    #[test]
+    fn refused_collab_tool_matches_the_locked_github_matrix() {
+        assert!(!refused_collab_tool("configure", false));
         for name in [
             "share_changes",
             "update_domain",
             "origin_status",
             "resolve_conflict",
         ] {
-            assert!(hidden_collab_tool(name, false, false), "{name}");
+            assert!(refused_collab_tool(name, false), "{name}");
         }
-
-        // disabled + read-only: none of the five are visible.
         for name in COLLAB_TOOLS {
-            assert!(hidden_collab_tool(name, false, true), "{name}");
+            assert!(!refused_collab_tool(name, true), "{name}");
         }
+    }
 
-        // enabled + read-write: all five are visible.
-        for name in COLLAB_TOOLS {
-            assert!(!hidden_collab_tool(name, true, false), "{name}");
-        }
+    /// `provision` splits the same way: read-only hides it, and an
+    /// undeclared instance refuses the three actions that would otherwise
+    /// report a success that reconciled nothing.
+    #[test]
+    fn provision_gating_splits_between_the_listing_and_the_call() {
+        assert!(hidden_provision_tool(true));
+        assert!(!hidden_provision_tool(false));
 
-        // enabled + read-only: only update_domain and origin_status are visible.
-        for name in ["update_domain", "origin_status"] {
-            assert!(!hidden_collab_tool(name, true, true), "{name}");
+        let status = ProvisionAction::Status;
+        let apply = ProvisionAction::Apply;
+        let allow = ProvisionAction::Allow {
+            domain: "eng".to_string(),
+        };
+        let deny = ProvisionAction::Deny {
+            domain: "eng".to_string(),
+        };
+        assert!(
+            !refused_provision_action(&status, false),
+            "an empty report is the answer, not a refusal"
+        );
+        for action in [&apply, &allow, &deny] {
+            assert!(refused_provision_action(action, false), "{action:?}");
         }
-        for name in ["configure", "share_changes", "resolve_conflict"] {
-            assert!(hidden_collab_tool(name, true, true), "{name}");
+        for action in [&status, &apply, &allow, &deny] {
+            assert!(!refused_provision_action(action, true), "{action:?}");
         }
+    }
+
+    /// The refusal a caller reads has to name what to change; a listed tool
+    /// that fails opaquely is worse than a hidden one.
+    #[test]
+    fn the_call_time_refusals_name_what_to_change() {
+        let github = RemoteError::NotEnabled.to_string();
+        assert!(github.contains("github.enabled"), "{github}");
+        assert!(github.contains("configure"), "{github}");
+        assert!(
+            PROVISION_NOT_DECLARED.contains("## Provisioning"),
+            "{PROVISION_NOT_DECLARED}"
+        );
+        assert!(
+            PROVISION_NOT_DECLARED.contains("status"),
+            "{PROVISION_NOT_DECLARED}"
+        );
     }
 }

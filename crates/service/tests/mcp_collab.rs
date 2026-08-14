@@ -1,6 +1,6 @@
 //! MCP-layer tests for the five GitHub collaboration tools: the runtime
-//! gating matrix over `list_tools`/`get_tool`, the clean refusal a direct
-//! call to a hidden tool still gets, the `configure` tool's snapshot, set
+//! gating matrix over `list_tools`/`get_tool`, the call-time refusal the four
+//! GitHub-gated ones give while collaboration is off, the `configure` tool's snapshot, set
 //! flow and GitHub connect state machine, and wiring smoke tests for the
 //! origin tools against the engine with an injected `MockProvider`. Also the
 //! non-GitHub `add_domain` modes (local and virtual), which are not
@@ -164,11 +164,15 @@ const ALL_FIVE: [&str; 5] = [
 
 // --- gating matrix -----------------------------------------------------------
 
+/// The locked matrix, now on `read_only` alone. `github.enabled` left the
+/// listing in the SEP-2567 work: it is settable by `configure` on the same
+/// connection, so a list that varied with it varied as a side effect of
+/// another request. Both rows for a given `read_only` are therefore identical.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gating_matrix_over_list_tools() {
     let cases: [(bool, bool, &[&str]); 4] = [
-        (false, false, &["configure"]),
-        (false, true, &[]),
+        (false, false, &ALL_FIVE),
+        (false, true, &["update_domain", "origin_status"]),
         (true, false, &ALL_FIVE),
         (true, true, &["update_domain", "origin_status"]),
     ];
@@ -190,13 +194,14 @@ async fn gating_matrix_over_list_tools() {
     }
 }
 
+/// `get_tool` agrees with `list_tools`, on the same narrowed matrix.
 #[tokio::test]
 async fn gating_matrix_over_get_tool() {
     use rmcp::ServerHandler;
 
     let cases: [(bool, bool, &[&str]); 4] = [
-        (false, false, &["configure"]),
-        (false, true, &[]),
+        (false, false, &ALL_FIVE),
+        (false, true, &["update_domain", "origin_status"]),
         (true, false, &ALL_FIVE),
         (true, true, &["update_domain", "origin_status"]),
     ];
@@ -239,16 +244,34 @@ async fn add_domain_is_visible_unless_read_only_regardless_of_github() {
     }
 }
 
+/// Flipping `github.enabled` mid-session moves the refusal, never the
+/// listing. This test used to assert the opposite, which is SEP-2567's second
+/// prohibition word for word: results "MUST NOT vary per-connection or as a
+/// side effect of other requests on the connection".
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn flipping_github_enabled_mid_session_changes_the_next_list_tools_result() {
+async fn flipping_github_enabled_mid_session_moves_the_refusal_not_the_list() {
     let tmp = tempfile::tempdir().unwrap();
     let eng = Arc::new(engine(&tmp.path().join("config.yaml"), false, false).await);
     let (client, _server) = connect(eng.clone()).await;
     let peer = client.peer();
 
-    // share_changes is a collaboration tool, so it is hidden while github is off.
-    let tools = peer.list_tools(Default::default()).await.unwrap();
-    assert!(!tools.tools.iter().any(|t| t.name == "share_changes"));
+    let before: Vec<String> = peer
+        .list_tools(Default::default())
+        .await
+        .unwrap()
+        .tools
+        .iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    assert!(before.contains(&"share_changes".to_string()));
+
+    // It refuses while the setting is off, and the refusal is what the caller
+    // reads.
+    let refused = peer
+        .call_tool(CallToolRequestParams::new("origin_status".to_string()))
+        .await
+        .expect("a listed tool answers");
+    assert_eq!(refused.is_error, Some(true));
 
     call(
         peer,
@@ -258,17 +281,40 @@ async fn flipping_github_enabled_mid_session_changes_the_next_list_tools_result(
     .await
     .unwrap();
 
-    let tools = peer.list_tools(Default::default()).await.unwrap();
-    assert!(
-        tools.tools.iter().any(|t| t.name == "share_changes"),
-        "share_changes must appear once github.enabled flips to true"
+    let after: Vec<String> = peer
+        .list_tools(Default::default())
+        .await
+        .unwrap()
+        .tools
+        .iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    assert_eq!(
+        before, after,
+        "the listing is the same on both sides of the flip"
+    );
+
+    // And now the same call reaches the engine instead of the gate.
+    let served = peer
+        .call_tool(CallToolRequestParams::new("origin_status".to_string()))
+        .await
+        .expect("a listed tool answers");
+    assert_ne!(
+        served.is_error,
+        Some(true),
+        "origin_status runs once collaboration is on"
     );
 }
 
-// --- hidden tools still route to the clean engine refusal -------------------
+// --- listed tools refuse at call time ---------------------------------------
 
+/// The four GitHub-gated tools are listed whatever `github.enabled` says
+/// (SEP-2567: the setting is `configure`-settable on this very connection, so
+/// it cannot gate a listing) and refuse when it is off. The refusal is a
+/// tool-level error rather than a JSON-RPC one, because a listed tool's
+/// failure has to be readable by the model that called it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn hidden_collab_tools_route_to_not_enabled_when_github_is_disabled() {
+async fn listed_collab_tools_refuse_at_call_time_when_github_is_disabled() {
     let tmp = tempfile::tempdir().unwrap();
     let eng = Arc::new(engine(&tmp.path().join("config.yaml"), false, false).await);
     let (client, _server) = connect(eng).await;
@@ -284,10 +330,22 @@ async fn hidden_collab_tools_route_to_not_enabled_when_github_is_disabled() {
         ),
     ];
     for (tool, args) in cases {
-        let err = call(peer, tool, args).await.unwrap_err();
+        let mut params = rmcp::model::CallToolRequestParams::new(tool.to_string());
+        if let Value::Object(map) = args {
+            params = params.with_arguments(map);
+        }
+        let result = peer
+            .call_tool(params)
+            .await
+            .unwrap_or_else(|e| panic!("{tool} must answer rather than fail at the protocol: {e}"));
+        assert_eq!(result.is_error, Some(true), "{tool} should refuse");
+        let text = serde_json::to_value(&result).unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
         assert!(
-            err.contains("not enabled"),
-            "{tool} should refuse with the not-enabled message, got: {err}"
+            text.contains("not enabled") && text.contains("github.enabled"),
+            "{tool} should refuse with the not-enabled message, got: {text}"
         );
     }
 }

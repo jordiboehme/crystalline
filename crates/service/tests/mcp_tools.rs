@@ -130,6 +130,35 @@ async fn call(peer: &Peer<RoleClient>, tool: &str, args: Value) -> Result<Value,
     }
 }
 
+/// Call a tool and return the whole `CallToolResult`, so a test can tell a
+/// tool-level refusal (`is_error: true`, whose text the caller's client
+/// renders) from a JSON-RPC protocol error (which clients render opaquely).
+/// The gates this task moved off the listing refuse in the first shape, on
+/// purpose: see rmcp 3.1.2 `handler/server.rs:454-480`.
+async fn call_result(
+    peer: &Peer<RoleClient>,
+    tool: &str,
+    args: Value,
+) -> rmcp::model::CallToolResult {
+    let mut params = CallToolRequestParams::new(tool.to_string());
+    if let Value::Object(map) = args {
+        params = params.with_arguments(map);
+    }
+    peer.call_tool(params).await.unwrap_or_else(|e| {
+        panic!("{tool} must answer rather than fail at the protocol level: {e}")
+    })
+}
+
+/// The text of a tool result's first content block.
+fn result_text(result: &rmcp::model::CallToolResult) -> String {
+    serde_json::to_value(result)
+        .unwrap()
+        .pointer("/content/0/text")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
 /// Call a tool, returning the raw text of its first content block on success.
 async fn call_text(peer: &Peer<RoleClient>, tool: &str, args: Value) -> Result<String, String> {
     let mut params = CallToolRequestParams::new(tool.to_string());
@@ -213,50 +242,221 @@ async fn list_shaped_responses_default_to_toon_and_configure_restores_json() {
     );
 }
 
+/// Every tool this server implements is listed on a writable instance,
+/// whatever the GitHub setting says and whether or not anything declares
+/// provisioning. MCP 2026-07-28 (SEP-2567) forbids `tools/list` varying per
+/// connection or as a side effect of another request on the connection, and
+/// both `github.enabled` and `provisioning_declared` are settable by a request
+/// on the same connection (`configure`, `add_domain`, `update_domain`), so
+/// they gate the call instead of the listing. `read_only` still gates the
+/// listing: it is fixed at engine construction (`Engine::with_read_only` takes
+/// `self` by value) and no request can move it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn list_tools_exposes_the_core_tools_plus_configure_and_add_domain() {
-    // With GitHub collaboration off (the default), `configure` is the only
-    // one of the five collaboration tools that is ever visible: see
-    // `crate::mcp::hidden_collab_tool` and its dedicated gating matrix tests.
-    // `add_domain` is not collaboration-gated: it creates domains of every kind
-    // and is visible whenever the instance is writable.
+async fn every_tool_is_listed_on_a_writable_instance_whatever_the_gates_say() {
     let h = Harness::new(&["eng"]).await;
     let (client, _server) = h.connect().await;
     let tools = client.peer().list_tools(Default::default()).await.unwrap();
     let names: Vec<String> = tools.tools.iter().map(|t| t.name.to_string()).collect();
     for expected in [
-        "write_engram",
-        "read_engram",
-        "edit_engram",
-        "move_engram",
-        "delete_engram",
-        "search_engrams",
-        "build_context",
-        "recent_activity",
-        "list_domains",
-        "browse_domain",
-        "validate_engrams",
-        "infer_schema",
-        "vocabulary",
-        "evolve_engrams",
-        "configure",
         "add_domain",
+        "browse_domain",
+        "build_context",
+        "configure",
+        "delete_engram",
+        "edit_engram",
+        "evolve_engrams",
+        "infer_schema",
+        "list_domains",
+        "move_engram",
+        // GitHub collaboration is off in this harness and these four are
+        // listed all the same; calling one refuses and says how to turn it on.
+        "origin_status",
+        "resolve_conflict",
+        "share_changes",
+        "update_domain",
+        // Nothing here declares a `## Provisioning` section, and `provision`
+        // is listed all the same, for the same reason.
+        "provision",
+        "read_engram",
+        "recent_activity",
+        "search_engrams",
         "skills",
+        "validate_engrams",
+        "vocabulary",
+        "write_engram",
     ] {
         assert!(names.contains(&expected.to_string()), "missing {expected}");
     }
-    for hidden in [
+    assert_eq!(names.len(), 22, "every tool, exactly once: {names:?}");
+
+    // The deterministic-ordering SHOULD on `/server/tools`, satisfied by
+    // rmcp's `ToolRouter::list_all` (3.1.2 `handler/server/router/tool.rs:588`
+    // sorts by name). Pinned here rather than inherited by luck.
+    let mut sorted = names.clone();
+    sorted.sort_unstable();
+    assert_eq!(names, sorted, "tools/list is ordered by name");
+}
+
+/// SEP-2567's second prohibition, as a test: `tools/list` must not change as a
+/// side effect of another request on the same connection. `configure` flipping
+/// `github.enabled` used to add four tools to the next listing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_tool_list_does_not_move_across_a_configure_that_flips_github_enabled() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    let before: Vec<String> = peer
+        .list_tools(Default::default())
+        .await
+        .unwrap()
+        .tools
+        .iter()
+        .map(|t| t.name.to_string())
+        .collect();
+
+    // Prove the flip really landed, so the invariance below cannot pass
+    // because nothing happened.
+    let snapshot = call(
+        peer,
+        "configure",
+        json!({ "set": { "github.enabled": "true" } }),
+    )
+    .await
+    .unwrap();
+    assert_ne!(
+        snapshot["github"]["github_enabled"],
+        json!(false),
+        "the setting must actually be on: {snapshot}"
+    );
+
+    let after: Vec<String> = peer
+        .list_tools(Default::default())
+        .await
+        .unwrap()
+        .tools
+        .iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    assert_eq!(
+        before, after,
+        "turning collaboration on must not change what this connection is listed"
+    );
+}
+
+/// The same prohibition for the one gate this task leaves on the listing with
+/// a request-mutable input: `skills.serve` is `configure`-settable
+/// (`settings.rs:211`, `startup_effective: false`) and `Engine::skills_serve`
+/// (`engine.rs:883-885`) reads it live, so a flip still moves three lists.
+/// **Task 5 owns the fix** (freeze the effective value at engine
+/// construction); this test is its red, left ignored so the remaining
+/// violation is visible rather than forgotten.
+#[ignore = "red for Task 5: skills.serve is still read live, so a configure flip moves the listing"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_tool_list_does_not_move_across_a_configure_that_flips_skills_serve() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    let before: Vec<String> = peer
+        .list_tools(Default::default())
+        .await
+        .unwrap()
+        .tools
+        .iter()
+        .map(|t| t.name.to_string())
+        .collect();
+
+    call(
+        peer,
+        "configure",
+        json!({ "set": { "skills.serve": "false" } }),
+    )
+    .await
+    .unwrap();
+
+    let after: Vec<String> = peer
+        .list_tools(Default::default())
+        .await
+        .unwrap()
+        .tools
+        .iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    assert_eq!(before, after);
+}
+
+/// The other half of the remedy SEP-2567 prescribes: the dependency moves into
+/// the call. All four GitHub-gated tools refuse with a **tool-level** error -
+/// the shape whose text the caller's client actually renders - naming the
+/// setting and the call that flips it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_github_gated_tools_refuse_at_call_time_and_name_the_setting() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    let cases: [(&str, Value); 4] = [
+        ("share_changes", json!({ "domain": "eng" })),
+        ("update_domain", json!({})),
+        ("origin_status", json!({})),
+        (
+            "resolve_conflict",
+            json!({ "domain": "eng", "path": "a.md", "resolution": "mine" }),
+        ),
+    ];
+    for (tool, args) in cases {
+        let result = call_result(peer, tool, args).await;
+        assert_eq!(
+            result.is_error,
+            Some(true),
+            "{tool} must refuse while github.enabled is off"
+        );
+        let text = result_text(&result);
+        assert!(
+            text.contains("github.enabled") && text.contains("configure"),
+            "{tool}'s refusal must name the setting and how to change it: {text}"
+        );
+    }
+}
+
+/// And the descriptions carry the same dependency, because SEP-2567 puts it
+/// "in the tool's input schema and description rather than in the list
+/// result". A tool that is always listed and sometimes refuses has to say so
+/// where a client's tool search can read it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_descriptions_of_the_call_time_gated_tools_state_their_condition() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let tools = client.peer().list_tools(Default::default()).await.unwrap();
+    let description = |name: &str| {
+        tools
+            .tools
+            .iter()
+            .find(|t| t.name == name)
+            .unwrap_or_else(|| panic!("{name} is listed"))
+            .description
+            .as_deref()
+            .unwrap_or_default()
+            .to_string()
+    };
+    for name in [
         "share_changes",
         "update_domain",
         "origin_status",
         "resolve_conflict",
     ] {
+        let text = description(name);
         assert!(
-            !names.contains(&hidden.to_string()),
-            "{hidden} must be hidden while github.enabled is off: {names:?}"
+            text.contains("github.enabled"),
+            "{name}'s description must name the setting it needs: {text}"
         );
     }
-    assert_eq!(names.len(), 17, "exactly 17 tools: {names:?}");
+    let provision = description("provision");
+    assert!(
+        provision.contains("## Provisioning"),
+        "provision's description must name what has to declare before it can act: {provision}"
+    );
 }
 
 /// The salience prior (Tasks 1-4) is invisible to an agent unless the tool
@@ -445,25 +645,34 @@ async fn read_only_hides_the_write_gated_tools() {
     ] {
         assert!(names.contains(&expected.to_string()), "missing {expected}");
     }
-    // Read-only and GitHub collaboration off together hide all five
-    // collaboration tools too (the full gating matrix lives in
-    // tests/mcp_collab.rs). `evolve_engrams` is hidden on its own gate: it is a
-    // read, but every finding it returns prescribes a mutation, so the queue is
-    // noise where mutation is impossible.
+    // Read-only hides the three write-shaped collaboration tools and
+    // `provision` (the full gating matrix lives in tests/mcp_collab.rs).
+    // `evolve_engrams` is hidden on its own gate: it is a read, but every
+    // finding it returns prescribes a mutation, so the queue is noise where
+    // mutation is impossible.
     for hidden in [
         "configure",
         "share_changes",
-        "update_domain",
-        "origin_status",
         "resolve_conflict",
         "evolve_engrams",
+        "provision",
     ] {
         assert!(
             !names.contains(&hidden.to_string()),
             "{hidden} must be hidden read-only: {names:?}"
         );
     }
-    assert_eq!(names.len(), 10, "exactly 10 tools in read-only: {names:?}");
+    // `update_domain` and `origin_status` are listed here even though GitHub
+    // is off: that gate refuses at call time now, and read-only exempts these
+    // two the way it exempts sync (a pull is a derived-truth update, status is
+    // a pure read).
+    for visible in ["update_domain", "origin_status"] {
+        assert!(
+            names.contains(&visible.to_string()),
+            "{visible} stays listed read-only: {names:?}"
+        );
+    }
+    assert_eq!(names.len(), 12, "exactly 12 tools in read-only: {names:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2919,9 +3128,10 @@ const EXPECTED_ANNOTATIONS: [AnnotationRow; 20] = [
 ];
 
 /// A GitHub-enabled server with no domains, built solely to inspect the tool
-/// surface and its annotations. GitHub on plus read-write makes all 20 tools
-/// visible through `get_tool`; read-only narrows it to the read tools plus
-/// `update_domain` and `origin_status`.
+/// surface and its annotations. Read-write makes every tool visible through
+/// `get_tool`; read-only narrows it to the read tools plus `update_domain` and
+/// `origin_status`. The 20 rows below are every tool except `skills` and
+/// `provision`, which carry their own dedicated tests.
 async fn annotation_server(read_only: bool) -> McpServer {
     let cfg = GlobalConfig {
         github: Some(GitHubConfig {
@@ -2939,8 +3149,7 @@ async fn annotation_server(read_only: bool) -> McpServer {
 
 /// Every tool advertises exactly the title and the four annotation hints from
 /// the locked table, and never the annotation-level title (only the top-level
-/// `Tool.title`). GitHub is enabled and the engine read-write so all 20 tools
-/// are visible.
+/// `Tool.title`). The engine is read-write, so every row is visible.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tool_annotations_match_the_locked_table() {
     use rmcp::ServerHandler;
@@ -3032,17 +3241,39 @@ fn declare_provisioning(root: &std::path::Path, domain: &str) {
     .unwrap();
 }
 
-/// A domain with no `Provisioning` section never surfaces the tool.
+/// A domain with no `Provisioning` section still gets the tool listed - the
+/// declaration can be created by `add_domain` or `update_domain` on this very
+/// connection, so it cannot gate a listing (SEP-2567). It gates the mutating
+/// actions instead, where the refusal can say what is missing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn provision_tool_hidden_when_no_domain_declares() {
+async fn provision_is_listed_when_no_domain_declares_and_refuses_the_mutations() {
     let h = Harness::new(&["eng"]).await;
     let (client, _server) = h.connect().await;
-    let tools = client.peer().list_tools(Default::default()).await.unwrap();
+    let peer = client.peer();
+    let tools = peer.list_tools(Default::default()).await.unwrap();
     assert!(
-        !tools.tools.iter().any(|t| t.name == "provision"),
-        "provision must be hidden when no domain declares a Provisioning section: {:?}",
+        tools.tools.iter().any(|t| t.name == "provision"),
+        "provision is listed whether or not anything declares: {:?}",
         tools.tools.iter().map(|t| &t.name).collect::<Vec<_>>()
     );
+
+    for (action, args) in [
+        ("allow", json!({ "action": "allow", "domain": "eng" })),
+        ("deny", json!({ "action": "deny", "domain": "eng" })),
+        ("apply", json!({ "action": "apply" })),
+    ] {
+        let result = call_result(peer, "provision", args).await;
+        assert_eq!(
+            result.is_error,
+            Some(true),
+            "provision {action} must refuse while nothing declares"
+        );
+        let text = result_text(&result);
+        assert!(
+            text.contains("## Provisioning"),
+            "provision {action}'s refusal must name what is missing: {text}"
+        );
+    }
 }
 
 /// Once a domain's MANIFEST declares a `Provisioning` section, the tool shows
@@ -3067,8 +3298,8 @@ async fn provision_tool_visible_once_a_domain_declares() {
         .get_tool("provision")
         .expect("get_tool must agree with list_tools");
 
-    // The annotation row `EXPECTED_ANNOTATIONS` cannot carry (its fixture has
-    // no declaring domain, so the tool is hidden there): destructive because
+    // The annotations `EXPECTED_ANNOTATIONS` does not carry a row for:
+    // destructive because
     // deny removes installed artifacts, idempotent because re-running any
     // action reconciles to the same state, closed-world because everything
     // happens on this machine.
@@ -3296,10 +3527,11 @@ async fn provision_allow_then_status_flow() {
     drop(server);
 }
 
-/// Calling `provision` by name while it is hidden still reaches the engine:
-/// `status` with no declaring domain answers for real (an empty report), not
-/// "tool not found", and `allow` on a read-only instance gets the read-only
-/// refusal rather than a bare not-found error.
+/// `provision status` reaches the engine whatever the gates say: with no
+/// declaring domain it answers for real (an empty report) rather than
+/// refusing, which is how a client learns there is nothing to decide. On a
+/// read-only instance the tool is hidden from the listing and `allow` by name
+/// still gets the read-only refusal rather than a bare not-found error.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn provision_call_by_name_while_hidden_reaches_engine() {
@@ -3310,16 +3542,16 @@ async fn provision_call_by_name_while_hidden_reaches_engine() {
     std::fs::create_dir_all(&xdg_state_home).unwrap();
     let _env = ProvisionScratchEnv::new(&home, &xdg_state_home).await;
 
-    // No declaring domain at all: the tool is absent from list_tools, but a
-    // direct call by name still reaches the engine.
+    // No declaring domain at all: the tool is listed all the same, and
+    // `status` reaches the engine.
     let h = Harness::new(&[]).await;
     let (client, _server) = h.connect().await;
     let peer = client.peer();
 
     let tools = peer.list_tools(Default::default()).await.unwrap();
     assert!(
-        !tools.tools.iter().any(|t| t.name == "provision"),
-        "provision must be hidden with no declaring domain"
+        tools.tools.iter().any(|t| t.name == "provision"),
+        "provision is listed with no declaring domain too"
     );
 
     let status = call(peer, "provision", json!({"action": "status"}))
@@ -3333,7 +3565,10 @@ async fn provision_call_by_name_while_hidden_reaches_engine() {
     assert!(status["pending"].as_array().unwrap().is_empty(), "{status}");
 
     // Read-only + allow by name: the read-only refusal, not "tool not found".
+    // The domain declares provisioning here so the declaration guard is out of
+    // the way and this really exercises the read-only one.
     let ro = Harness::new_read_only(&["eng"]).await;
+    declare_provisioning(&ro.root, "eng");
     let (ro_client, _ro_server) = ro.connect().await;
     let ro_peer = ro_client.peer();
     let err = call(

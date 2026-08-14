@@ -430,12 +430,17 @@ async fn read_only_serving_still_teaches_the_skills() {
     );
 }
 
-/// The default `auto` gate, decided per connection: a stdio client the install
-/// receipt knows as an onboarded harness with hooks already has these five
-/// skills as files, so its three lists come back empty while every direct read
-/// still answers - the same hidden-not-disabled doctrine `false` follows.
+/// The listing no longer varies with who connected. A stdio client this
+/// machine's install receipt knows as an onboarded harness used to be served
+/// three empty lists; SEP-2567 forbids exactly that ("MUST NOT vary
+/// per-connection"), so it now sees the same surface as everyone else. The
+/// deduplication it bought is not lost - Task 5 of the rmcp 3.x migration
+/// resolves it before the session starts, from an argument and this machine's
+/// receipt, where it is a property of the deployment rather than of the
+/// client. The instructions half of the `auto` decision still keys on the
+/// receipt match and is unchanged here.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_receipt_matched_connection_is_served_no_skill_surface() {
+async fn a_receipt_matched_connection_is_served_the_same_surface_as_every_other() {
     let h = Harness::new(&["eng"]).await;
     h.write_hooked_receipt("claude-code");
 
@@ -443,27 +448,29 @@ async fn a_receipt_matched_connection_is_served_no_skill_surface() {
     let peer = client.peer();
 
     assert!(
-        !tool_names(peer).await.contains(&"skills".to_string()),
-        "the tool is hidden for a harness that carries the skills already"
+        tool_names(peer).await.contains(&"skills".to_string()),
+        "the tool is listed for an onboarded harness too"
     );
-    assert!(
+    assert_eq!(
         peer.list_resources(Default::default())
             .await
             .unwrap()
             .resources
-            .is_empty(),
-        "no skill resources are advertised"
+            .len(),
+        SKILL_NAMES.len(),
+        "every skill resource is advertised"
     );
-    assert!(
+    assert_eq!(
         peer.list_prompts(Default::default())
             .await
             .unwrap()
             .prompts
-            .is_empty(),
-        "no prompts are advertised"
+            .len(),
+        2,
+        "both prompts are advertised"
     );
 
-    // Hidden, not disabled.
+    // And the direct reads answer, as they always did.
     let routing = call_text(peer, "skills", json!({ "name": "crystalline-routing" }))
         .await
         .unwrap();
@@ -478,17 +485,19 @@ async fn a_receipt_matched_connection_is_served_no_skill_surface() {
             "skill://crystalline-routing/SKILL.md",
         ))
         .await
-        .expect("a direct resource read answers for a matched connection");
+        .expect("a direct resource read answers");
     assert!(!read.contents.is_empty());
     let connector = peer
         .get_prompt(GetPromptRequestParams::new("connector"))
         .await
-        .expect("a direct prompt read answers for a matched connection");
+        .expect("a direct prompt read answers");
     assert_eq!(prompt_text(&connector), crystalline_core::CONNECTOR_SNIPPET);
 }
 
-/// The decision is per connection, not per server: an unrecognized client on
-/// the same machine, with the same receipt, keeps the whole surface.
+/// The other side of the same coin: an unrecognized client on a machine with
+/// a receipt gets the whole surface, as it always did. Kept beside the test
+/// above so the pair reads as one assertion - the two connections are served
+/// the same list.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unmatched_connection_keeps_the_whole_surface() {
     let h = Harness::new(&["eng"]).await;
@@ -516,16 +525,22 @@ async fn an_unmatched_connection_keeps_the_whole_surface() {
     );
 }
 
-/// `skills.serve` forces the decision either way, mid-session: `true` restores
-/// the surface for a matched connection, `false` takes it from everyone.
+/// `skills.serve` still decides the surface, and it no longer consults who
+/// connected: an onboarded harness follows the setting exactly like anybody
+/// else. **The mid-session flip this exercises is the last remaining SEP-2567
+/// side effect on the listing**; Task 5 freezes the value at engine
+/// construction and this test becomes "takes effect at the next start" there.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_setting_overrides_the_receipt_match_mid_session() {
+async fn the_setting_decides_the_surface_for_an_onboarded_harness_too() {
     let h = Harness::new(&["eng"]).await;
     h.write_hooked_receipt("claude-code");
 
     let (client, _server) = h.connect_as("claude-code").await;
     let peer = client.peer();
-    assert!(!tool_names(peer).await.contains(&"skills".to_string()));
+    assert!(
+        tool_names(peer).await.contains(&"skills".to_string()),
+        "auto serves everyone now"
+    );
 
     call_text(
         peer,
@@ -534,10 +549,7 @@ async fn the_setting_overrides_the_receipt_match_mid_session() {
     )
     .await
     .unwrap();
-    assert!(
-        tool_names(peer).await.contains(&"skills".to_string()),
-        "true serves an installed harness too, on purpose"
-    );
+    assert!(tool_names(peer).await.contains(&"skills".to_string()));
     assert_eq!(
         peer.list_prompts(Default::default())
             .await
@@ -556,9 +568,9 @@ async fn the_setting_overrides_the_receipt_match_mid_session() {
     .unwrap();
     assert!(!tool_names(peer).await.contains(&"skills".to_string()));
 
-    // Back to the default: the receipt decides again, and it says hide.
+    // Back to the default: served again, whoever is connected.
     call_text(peer, "configure", json!({ "unset": ["skills.serve"] }))
         .await
         .unwrap();
-    assert!(!tool_names(peer).await.contains(&"skills".to_string()));
+    assert!(tool_names(peer).await.contains(&"skills".to_string()));
 }
