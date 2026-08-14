@@ -194,6 +194,14 @@ enum ServedTransport {
     Http,
 }
 
+/// Build a `ProtocolVersion` from an arbitrary string, the way the wire does.
+/// The type has no public constructor for unknown revisions, but its
+/// `Deserialize` accepts any string (rmcp 3.1.2 `model.rs:204-220`), which is
+/// exactly how a client's declared version reaches us.
+fn protocol_version(s: &str) -> ProtocolVersion {
+    serde_json::from_value(serde_json::Value::String(s.to_string())).unwrap()
+}
+
 /// The `instructions` string the server handed this client at initialize.
 fn instructions<H: rmcp::handler::client::ClientHandler>(
     client: &RunningService<RoleClient, H>,
@@ -531,15 +539,91 @@ async fn the_setting_overrides_the_receipt_in_both_directions() {
 /// A client asking for a revision this server does not yet honour is answered
 /// with the newest one it does. Today that is 2025-11-25: 2026-07-28 carries
 /// obligations this server has not implemented, so echoing it back would be a
-/// false claim. Ignored until the version block is rewritten to negotiate
-/// against our own advertised set rather than rmcp's `KNOWN_VERSIONS`, which is
-/// Task 2 of the rmcp 3.x migration plan.
-#[ignore = "the advertised set lands in Task 2 of the rmcp 3.x migration"]
+/// false claim.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_client_asking_for_an_unserved_protocol_version_is_answered_with_ours() {
     let h = Harness::build(&[("eng", &["Route here for eng questions"])], &[], false).await;
     assert_eq!(
         h.negotiate(ProtocolVersion::V_2026_07_28).await,
         ProtocolVersion::V_2025_11_25
+    );
+}
+
+/// Every revision we advertise is echoed back verbatim, oldest included.
+/// 2024-11-05 is the bottom-end pin: it is served today, keeping it costs one
+/// array element because rmcp branches nowhere between it and 2025-11-25
+/// (`uses_legacy_lifecycle`, rmcp 3.1.2 `service.rs:196-202`, a single `<`
+/// against 2026-07-28), and dropping a revision is a deprecation with a release
+/// note rather than a side effect of a dependency bump.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_revision_we_serve_is_echoed_verbatim() {
+    let h = Harness::build(&[("eng", &["Route here for eng questions"])], &[], false).await;
+    for version in [
+        ProtocolVersion::V_2024_11_05,
+        ProtocolVersion::V_2025_03_26,
+        ProtocolVersion::V_2025_06_18,
+        ProtocolVersion::V_2025_11_25,
+    ] {
+        assert_eq!(
+            h.negotiate(version.clone()).await,
+            version,
+            "{version} is one we serve, so it comes back unchanged"
+        );
+    }
+}
+
+/// `ProtocolVersion` deserializes any string (rmcp 3.1.2 `model.rs:204-220`
+/// falls through to `Cow::Owned(s)`), so a client can declare a future-dated or
+/// malformed revision. On stdio that is answered with ours rather than refused:
+/// there is no session routing to wedge, and a hard refusal would regress the
+/// day a harness bumps its version string ahead of us.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unknown_protocol_version_string_is_answered_with_ours() {
+    let h = Harness::build(&[("eng", &["Route here for eng questions"])], &[], false).await;
+    for garbage in ["2027-01-01", "banana"] {
+        assert_eq!(
+            h.negotiate(protocol_version(garbage)).await,
+            ProtocolVersion::V_2025_11_25,
+            "{garbage} is not a revision anybody serves"
+        );
+    }
+}
+
+/// The advertised set, pinned deliberately.
+///
+/// An rmcp upgrade that adds or removes a revision must surface here as a
+/// visible test change, never as silent drift: the second assertion pins
+/// `ProtocolVersion::KNOWN_VERSIONS` (rmcp 3.1.2 `model.rs:181-187`) so a
+/// widened crate list fails the build and forces the decision, and the first
+/// pins what we actually advertise, which is spelled out literally in
+/// `SERVED_PROTOCOL_VERSIONS` rather than filtered from the crate's list.
+///
+/// 2026-07-28 is absent on purpose until Tasks 4 to 7 of the rmcp 3.x migration
+/// land and Task 9 adds it; 2024-11-05 is present on purpose and its removal
+/// would be a deprecation, not a cleanup.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_advertised_protocol_set_is_exactly_this() {
+    let h = Harness::build(&[("eng", &["Route here for eng questions"])], &[], false).await;
+    let server = McpServer::new(h.engine.clone());
+    assert_eq!(
+        <McpServer as rmcp::ServerHandler>::supported_protocol_versions(&server).as_ref(),
+        [
+            ProtocolVersion::V_2024_11_05,
+            ProtocolVersion::V_2025_03_26,
+            ProtocolVersion::V_2025_06_18,
+            ProtocolVersion::V_2025_11_25,
+        ]
+    );
+    assert_eq!(
+        ProtocolVersion::KNOWN_VERSIONS,
+        [
+            ProtocolVersion::V_2024_11_05,
+            ProtocolVersion::V_2025_03_26,
+            ProtocolVersion::V_2025_06_18,
+            ProtocolVersion::V_2025_11_25,
+            ProtocolVersion::V_2026_07_28,
+        ],
+        "rmcp's own list changed: decide which revisions we serve, then edit \
+         SERVED_PROTOCOL_VERSIONS and this pin together"
     );
 }

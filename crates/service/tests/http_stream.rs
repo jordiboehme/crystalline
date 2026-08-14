@@ -154,6 +154,103 @@ fn assert_no_priming_frame(raw: &str, context: &str) {
     );
 }
 
+/// An `initialize` body declaring `version`, with no `_meta`: the shape every
+/// client that speaks a revision below 2026-07-28 sends.
+fn init_body(version: &str) -> String {
+    format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"{version}","capabilities":{{}},"clientInfo":{{"name":"http-stream-test","version":"0.0.0"}}}}}}"#
+    )
+}
+
+/// Every revision we advertise still gets the legacy HTTP treatment: a session
+/// id and its own version echoed. `is_legacy_request` (rmcp 3.1.2
+/// `tower.rs:358-408`) routes anything below 2026-07-28 through the session
+/// branch, which is the only site that inserts `Mcp-Session-Id`
+/// (`tower.rs:1911`), so this pins the transport behaviour our advertised set
+/// keeps working rather than merely the negotiated string.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_revision_we_serve_gets_a_session_and_its_version_back() {
+    let addr = spawn_router().await;
+    for version in ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"] {
+        let response = post(addr, &init_body(version), None).await;
+        assert!(
+            response.starts_with("HTTP/1.1 200 "),
+            "{version} initialize is served:\n{response}"
+        );
+        let session_id = extract_session_id(&response);
+        assert!(
+            !session_id.is_empty(),
+            "{version} gets a session id:\n{response}"
+        );
+        assert!(
+            response.contains(&format!("\"protocolVersion\":\"{version}\"")),
+            "{version} is echoed back:\n{response}"
+        );
+    }
+}
+
+/// A version outside our advertised set is refused at the HTTP handshake
+/// instead of being negotiated down into a wedge.
+///
+/// The wedge this closes: `use_session` (`tower.rs:1727`) reads the version off
+/// the *request* and validates it against rmcp's crate-wide `KNOWN_VERSIONS`,
+/// never against our narrowed list, so an `initialize` at 2026-07-28 routes
+/// statelessly and gets no `Mcp-Session-Id`. Whatever version the handshake
+/// then answers with, every follow-up that does not itself declare 2026-07-28
+/// takes the session branch, has no session id to present, and gets
+/// `422 Unprocessable Entity: Unexpected message, expect initialize request`
+/// (`tower.rs:1833`/`:1851`) for the rest of its life. Observed on this
+/// endpoint before the refusal existed: a 200 handshake carrying
+/// `"protocolVersion":"2026-07-28"` and no session header, then
+/// `HTTP/1.1 422 Unprocessable Entity` on a plain `tools/list`.
+///
+/// The refusal's wire shape is read from source, not assumed:
+/// `StreamableHttpServerConfig::default()` leaves `json_response` false
+/// (`tower.rs:169`) and the plain stateless path answers through
+/// `stateless_sse_response` (`tower.rs:2027`) without the status mapper, so
+/// this arrives as **HTTP 200 with an SSE-framed JSON-RPC error**, code -32022
+/// (`model.rs:546`, `model.rs:601-613`), never a 4xx.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_version_we_do_not_serve_is_refused_at_the_http_handshake() {
+    let addr = spawn_router().await;
+    // 2026-07-28 is a real revision rmcp knows and we do not yet honour;
+    // 2027-01-01 is any string sorting at or above it, which `ProtocolVersion`
+    // deserializes happily (`model.rs:204-220`) and which takes the identical
+    // path.
+    for version in ["2026-07-28", "2027-01-01"] {
+        let response = post(addr, &init_body(version), None).await;
+        assert!(
+            response.starts_with("HTTP/1.1 200 "),
+            "{version} is refused in-band, not by status:\n{response}"
+        );
+        assert!(
+            response.to_ascii_lowercase().contains("text/event-stream"),
+            "{version} refusal is SSE framed:\n{response}"
+        );
+        assert!(
+            response.contains("\"code\":-32022"),
+            "{version} refusal carries the unsupported-protocol-version code:\n{response}"
+        );
+        assert!(
+            response.contains("\"supported\":[\"2024-11-05\""),
+            "{version} refusal names what we do serve:\n{response}"
+        );
+        assert!(
+            !response.contains("\"result\""),
+            "{version} gets no handshake result:\n{response}"
+        );
+    }
+
+    // The refusal does not poison the endpoint: a fresh initialize at a version
+    // we serve still gets a session. (A bare follow-up would get the 422 above,
+    // which has nothing to do with poisoning.)
+    let response = post(addr, &init_body("2025-06-18"), None).await;
+    assert!(
+        !extract_session_id(&response).is_empty(),
+        "a served version still works after a refusal:\n{response}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn http_post_responses_carry_no_sse_priming_frame() {
     let addr = spawn_router().await;

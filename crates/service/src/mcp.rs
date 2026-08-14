@@ -137,6 +137,47 @@ fn is_write_tool(name: &str) -> bool {
     WRITE_TOOLS.contains(&name)
 }
 
+/// Every MCP protocol revision this server serves, oldest first.
+///
+/// **Spelled out literally rather than filtered from
+/// [`ProtocolVersion::KNOWN_VERSIONS`]** so an rmcp upgrade can never widen what
+/// we advertise as a side effect of a dependency bump: adding a revision here is
+/// an edit somebody made on purpose. Both ends of the range are pinned by
+/// `the_advertised_protocol_set_is_exactly_this` in
+/// `tests/mcp_instructions.rs`, which also pins rmcp's own list, so a crate that
+/// learns a new revision fails the build and asks for the decision instead of
+/// taking it.
+///
+/// **The top is a decision.** `V_2026_07_28` is deliberately absent: that
+/// revision makes list endpoints connection-invariant, moves `instructions` to
+/// `server/discover`, restricts `tools/list_changed` to subscribers and requires
+/// cache hints, none of which this server does yet. Advertising it would be a
+/// false claim. Tasks 4 to 7 of the rmcp 3.x migration implement those four, and
+/// Task 9 adds the constant here.
+///
+/// **The bottom is deliberately NOT a decision.** `V_2024_11_05` is served today
+/// and stays served: rmcp branches nowhere between it and `V_2025_11_25`
+/// (`uses_legacy_lifecycle`, rmcp 3.1.2 `service.rs:196-202`, one `<` comparison
+/// against 2026-07-28), so keeping the oldest costs one array element, and
+/// dropping a revision is a deprecation with a release note rather than a
+/// side effect of an upgrade.
+pub const SERVED_PROTOCOL_VERSIONS: &[ProtocolVersion] = &[
+    ProtocolVersion::V_2024_11_05,
+    ProtocolVersion::V_2025_03_26,
+    ProtocolVersion::V_2025_06_18,
+    ProtocolVersion::V_2025_11_25,
+];
+
+/// The newest revision we serve: what a client asking for one we do not serve
+/// is answered with over stdio. Reads the last element, so the ordering of
+/// [`SERVED_PROTOCOL_VERSIONS`] is load bearing rather than cosmetic.
+fn newest_served_protocol_version() -> ProtocolVersion {
+    SERVED_PROTOCOL_VERSIONS
+        .last()
+        .expect("SERVED_PROTOCOL_VERSIONS is never empty")
+        .clone()
+}
+
 /// The five GitHub collaboration tools, gated on the engine's live
 /// `github.enabled` setting (all but `configure`) and `read_only` flag (see
 /// `COLLAB_WRITE_TOOLS`). `add_domain` is not among them: it creates domains of
@@ -1119,6 +1160,20 @@ fn applied_failure(applied: &[String], failed_key: &str, e: EngineError) -> Erro
 
 #[tool_handler]
 impl ServerHandler for McpServer {
+    /// The revisions this server serves, narrowed from rmcp's crate-wide
+    /// `KNOWN_VERSIONS` default to [`SERVED_PROTOCOL_VERSIONS`].
+    ///
+    /// rmcp consults this in three places, so overriding it once covers every
+    /// path: `negotiate_protocol_version` after `initialize` on stdio
+    /// (rmcp 3.1.2 `service/server.rs:590`), the same call inside
+    /// `NegotiatingStatelessHttpService` on the HTTP stateless path
+    /// (`tower.rs:322-326`), and the inline per-request version check modern
+    /// requests take instead of a handshake (`handler/server.rs:65-72`). It
+    /// also fills `DiscoverResult.supportedVersions`.
+    fn supported_protocol_versions(&self) -> std::borrow::Cow<'static, [ProtocolVersion]> {
+        std::borrow::Cow::Borrowed(SERVED_PROTOCOL_VERSIONS)
+    }
+
     /// The server handshake: hand the connecting agent the live routing block
     /// as its `instructions`. rmcp calls `get_info` once per connection at
     /// initialize, so [`Engine::routing_text`] renders the currently registered
@@ -1172,7 +1227,44 @@ impl ServerHandler for McpServer {
     /// The two things rmcp's default implementation does are done here too and
     /// must stay: publishing the peer info (which is what `client_actor` and
     /// every `generated.by` write read afterwards) and echoing a client's
-    /// protocol version when it is one rmcp knows.
+    /// protocol version when it is one we serve.
+    ///
+    /// # A version we do not serve is refused here, but only over HTTP
+    ///
+    /// On the streamable-HTTP transport rmcp decides session routing from the
+    /// *request*, not from our advertised set: `use_session =
+    /// legacy_session_mode && is_legacy_request(...)` (rmcp 3.1.2
+    /// `tower.rs:1727`), and `is_legacy_request` (`tower.rs:358-408`) reads the
+    /// version out of the request body and compares it against the crate-wide
+    /// `KNOWN_VERSIONS`, never against [`SERVED_PROTOCOL_VERSIONS`].
+    /// `Mcp-Session-Id` is inserted at exactly one site (`tower.rs:1911`),
+    /// inside the session branch. So an `initialize` naming a version at or
+    /// above 2026-07-28 routes statelessly and gets no session id, while our
+    /// answer names a version we do serve; the client's next request declares
+    /// that older version, takes the session branch with no session id to
+    /// present, and gets `422 Unprocessable Entity: Unexpected message, expect
+    /// initialize request` (`tower.rs:1833`/`:1851`) for the rest of its life.
+    /// A successful handshake followed by permanent failures, observed on this
+    /// endpoint before this refusal existed.
+    ///
+    /// The trigger is wider than the one real revision: `ProtocolVersion`
+    /// deserializes any string (`model.rs:204-220`) and the comparison is
+    /// lexicographic, so `"2027-01-01"` or any future-dated or malformed string
+    /// sorting at or above `"2026-07-28"` wedges the same way, with or without
+    /// our narrowed list. That class is what this refusal actually protects
+    /// against.
+    ///
+    /// `ErrorData::unsupported_protocol_version` (`model.rs:601-613`, code
+    /// `-32022` at `model.rs:546`) is the shape the specification's versioning
+    /// page documents, and it carries the set we do serve so a client can
+    /// retry. Because `json_response` defaults to false (`tower.rs:169`), it
+    /// reaches the client as HTTP 200 with an SSE-framed JSON-RPC error rather
+    /// than a 4xx.
+    ///
+    /// **Stdio keeps warn-and-downgrade.** There is no session routing there,
+    /// so the wedge cannot occur, and a hard refusal would regress the day a
+    /// harness bumps its version string ahead of us: a client that asks for
+    /// tomorrow's revision over stdio gets today's and a working session.
     async fn initialize(
         &self,
         request: InitializeRequestParams,
@@ -1180,6 +1272,25 @@ impl ServerHandler for McpServer {
     ) -> Result<InitializeResult, ErrorData> {
         let requested = request.protocol_version.clone();
         let client_name = request.client_info.name.clone();
+        let served = SERVED_PROTOCOL_VERSIONS.contains(&requested);
+        if !served {
+            if self.transport == Transport::Http {
+                return Err(ErrorData::unsupported_protocol_version(
+                    requested,
+                    SERVED_PROTOCOL_VERSIONS,
+                ));
+            }
+            // Named rather than counted: the first time this line appears in a
+            // field log for a client we support is the signal that the newest
+            // revision has stopped being a follow-up and become urgent.
+            tracing::warn!(
+                client = %client_name,
+                requested = %requested,
+                "client requested a protocol version this server does not serve; \
+                 serving {} instead",
+                newest_served_protocol_version()
+            );
+        }
         context.peer.set_peer_info(request);
 
         // Only a stdio client is same-machine, so only there does this
@@ -1208,14 +1319,16 @@ impl ServerHandler for McpServer {
             }
             info.instructions = Some(instructions);
         }
-        if !ProtocolVersion::KNOWN_VERSIONS.contains(&requested) {
-            tracing::warn!(
-                "client requested unsupported protocol version {requested}; serving {}",
-                info.protocol_version
-            );
+        // Echo what the client asked for when we serve it, and answer with our
+        // newest otherwise. The fallback is read from our own list rather than
+        // left at `ServerInfo::default()`'s `ProtocolVersion::LATEST`, so an
+        // rmcp whose LATEST moves outside the set above can never make us
+        // answer with a revision we do not serve.
+        info.protocol_version = if served {
+            requested
         } else {
-            info.protocol_version = requested;
-        }
+            newest_served_protocol_version()
+        };
         Ok(info)
     }
 

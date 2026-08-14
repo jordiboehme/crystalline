@@ -29,8 +29,8 @@ use std::sync::Arc;
 
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData,
-    Implementation, JsonObject, ListToolsResult, PaginatedRequestParams, ServerCapabilities,
-    ServerInfo, Tool, ToolAnnotations,
+    Implementation, JsonObject, ListToolsResult, PaginatedRequestParams, ProtocolVersion,
+    ServerCapabilities, ServerInfo, Tool, ToolAnnotations,
 };
 use rmcp::service::RequestContext;
 use rmcp::{RoleServer, ServerHandler};
@@ -223,6 +223,20 @@ impl DegradedServer {
 }
 
 impl ServerHandler for DegradedServer {
+    /// The degraded server serves exactly the revisions the healthy one does
+    /// ([`crate::mcp::SERVED_PROTOCOL_VERSIONS`]), so a client cannot learn a
+    /// different answer from a failure than it would have got from a healthy
+    /// start. rmcp negotiates its default `initialize` against this list
+    /// (rmcp 3.1.2 `service/server.rs:590`), which is the whole implementation:
+    /// a client asking for a revision we do not serve is answered with ours.
+    /// There is no HTTP refusal here because this server is stdio-only
+    /// (`crate::client` builds it on the bridge path), and refusing the
+    /// handshake would replace the explanation this server exists to deliver
+    /// with a dead session.
+    fn supported_protocol_versions(&self) -> std::borrow::Cow<'static, [ProtocolVersion]> {
+        std::borrow::Cow::Borrowed(crate::mcp::SERVED_PROTOCOL_VERSIONS)
+    }
+
     /// The degraded handshake: identify as `crystalline` at this binary's
     /// version and hand the connecting agent the per-case degraded copy as its
     /// `instructions`, advertising only the tools capability.

@@ -7,7 +7,7 @@
 //! environment involved; the same duplex pattern as `tests/mcp_instructions.rs`.
 
 use crystalline_service::{DegradedServer, StubStatus};
-use rmcp::model::CallToolRequestParams;
+use rmcp::model::{CallToolRequestParams, ClientInfo, ProtocolVersion};
 use rmcp::service::RunningService;
 use rmcp::{RoleClient, RoleServer};
 use serde_json::Value;
@@ -84,6 +84,32 @@ async fn initialize_succeeds_and_identifies_as_crystalline_with_degraded_copy() 
         instructions.contains("https://github.com/jordiboehme/crystalline/releases"),
         "the mcpb skew points at the releases page:\n{instructions}"
     );
+}
+
+/// The degraded server narrows the advertised protocol set exactly as the
+/// healthy one does. It is stdio-only (`client.rs` builds it on the bridge
+/// path), so it warns and answers with ours rather than refusing: a client that
+/// arrives here is already in a failure it is meant to be told about, and
+/// refusing its handshake would replace the explanation with a dead session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_client_asking_for_an_unserved_protocol_version_is_answered_with_ours() {
+    let (client_io, server_io) = tokio::io::duplex(1 << 16);
+    let server_task = tokio::spawn(async move {
+        rmcp::serve_server(DegradedServer::new(mcpb_skew_status()), server_io).await
+    });
+    let mut info = ClientInfo::default();
+    info.protocol_version = ProtocolVersion::V_2026_07_28;
+    let client = rmcp::serve_client(info, client_io).await.unwrap();
+    let server = server_task.await.unwrap().unwrap();
+    let answered = client
+        .peer()
+        .peer_info()
+        .as_ref()
+        .map(|i| i.protocol_version.clone())
+        .expect("the server answered initialize");
+    assert_eq!(answered, ProtocolVersion::V_2025_11_25);
+    drop(client);
+    drop(server);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
