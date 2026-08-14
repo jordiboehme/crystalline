@@ -120,6 +120,15 @@ async fn temporal_current_filter_uses_the_promoted_index() {
 /// [`the_candidate_projection_is_never_unbounded`] pins. Recorded here so the
 /// next reader of the "never reaches a sorter" comment beside the query knows
 /// which shape it was written about.
+///
+/// **The SQL below is a hand-copy of the shipped statement and only guards what
+/// it copies.** It mirrors `scored_lexical` in `src/turso/search.rs`: the
+/// `CANDIDATE_COLUMNS` projection, the folder filter `build_scalar_filters`
+/// pushes in (both sides lowered, since a path filter folds case), one term
+/// group over title, description and content, `ORDER BY e.id` and the candidate
+/// cap. Change the shipped filter and this literal has to be re-derived from it
+/// in the same commit, or the guard goes on explaining a query the code no
+/// longer issues: it stays green and quietly stops guarding.
 #[tokio::test]
 async fn the_lexical_candidate_scan_stays_index_ordered_under_a_folder_filter() {
     let store = open().await;
@@ -136,7 +145,7 @@ async fn the_lexical_candidate_scan_stays_index_ordered_under_a_folder_filter() 
             "SELECT e.id, d.name, e.permalink, e.title, e.engram_type, e.status, \
                     e.description, e.content, CAST(json_extract(e.metadata, '$.salience') AS REAL) \
              FROM engram e JOIN domain d ON d.id=e.domain_id \
-             WHERE e.path LIKE 'notes/%' ESCAPE '\\' \
+             WHERE lower(e.path) LIKE lower('notes/%') ESCAPE '\\' \
                AND (lower(e.title) LIKE '%term%' ESCAPE '\\' \
                     OR lower(e.description) LIKE '%term%' ESCAPE '\\' \
                     OR lower(e.content) LIKE '%term%' ESCAPE '\\') \

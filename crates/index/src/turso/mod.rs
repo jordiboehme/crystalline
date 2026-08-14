@@ -353,6 +353,36 @@ fn like_escape(s: &str) -> String {
     out
 }
 
+/// The folder-prefix comparison every path filter uses, with BOTH sides lowered
+/// in SQL: `lower(e.path) LIKE lower(?n) ESCAPE '\'`, negated for a depth cut.
+///
+/// Three things about this shape, because they are the reasons and not the
+/// spelling:
+///
+/// 1. **Both sides are lowered by the same expression, in SQL.** The database
+///    decides what "lowered" means for the column and for the pattern in one
+///    place, so the comparison cannot disagree with itself. The parameter
+///    arrives escaped but unfolded; `lower()` in the statement folds it.
+/// 2. **The other folding shape in this crate was deliberately not copied.**
+///    The inbound-links `q` filter lowercases its parameter in Rust and wraps
+///    only the column. That loses rows on a C or POSIX collated Postgres:
+///    `lower()` there follows the argument's collation and returns `Ünter/a.md`
+///    unchanged, while Rust's `to_lowercase()` has already folded the pattern to
+///    `ünter/`, so a row that matches today stops matching. Measured on a
+///    `--lc-collate=C` database, not assumed.
+/// 3. **That `q` filter's own instance of the Rust-side shape is a known
+///    follow-up, not the house convention.** Do not harmonize these sites toward
+///    it; harmonize it toward these.
+///
+/// The fold is ASCII-exact and Unicode-approximate: Turso's `lower()` is
+/// ASCII-only while Postgres follows the database collation, so `Notes/` and
+/// `notes/` fold alike on both backends while a non-ASCII case pair may fold on
+/// one and not the other.
+fn path_prefix_like(n: usize, negated: bool) -> String {
+    let not = if negated { " NOT" } else { "" };
+    format!("lower(e.path){not} LIKE lower(?{n}) ESCAPE '\\'")
+}
+
 fn cell_text(row: &Row, idx: usize) -> Option<String> {
     match row.get_value(idx) {
         Ok(Value::Text(s)) => Some(s),
@@ -916,7 +946,7 @@ impl Store for TursoStore {
         let mut params = vec![Value::Text(domain.to_string())];
         let mut n = 2;
         if let Some(prefix) = path_prefix.filter(|p| !p.is_empty()) {
-            clauses.push(format!("e.path LIKE ?{n} ESCAPE '\\'"));
+            clauses.push(path_prefix_like(n, false));
             params.push(Value::Text(format!("{}%", like_escape(prefix))));
             n += 1;
         }
@@ -949,12 +979,13 @@ impl Store for TursoStore {
         let escaped = like_escape(&prefix);
 
         // Under the prefix. The pattern is escaped, so a folder named `50%` is
-        // a folder rather than a wildcard.
+        // a folder rather than a wildcard, and both sides are lowered so the
+        // filter folds case (see `path_prefix_like`).
         let mut clauses = vec!["d.name=?1".to_string()];
         let mut params = vec![Value::Text(domain.to_string())];
         let mut n = 2;
         if !prefix.is_empty() {
-            clauses.push(format!("e.path LIKE ?{n} ESCAPE '\\'"));
+            clauses.push(path_prefix_like(n, false));
             params.push(Value::Text(format!("{escaped}%")));
             n += 1;
         }
@@ -965,10 +996,15 @@ impl Store for TursoStore {
         // `<prefix>%/%` with one `/%` per level, so excluding that pattern is
         // the depth cut - pushed into SQL rather than applied after the fact,
         // because a cap over unfiltered rows could otherwise spend the whole
-        // page on engrams too deep to show.
+        // page on engrams too deep to show. It folds case exactly as the
+        // under-prefix clause does, and that is not optional: folding one and
+        // not the other would let a case-variant path pass the folded
+        // under-prefix test AND pass the unfolded depth cut, landing an engram
+        // two levels down in a one-level listing - a leak that does not exist
+        // while neither side folds.
         let mut level = clauses.clone();
         let mut level_params = params.clone();
-        level.push(format!("e.path NOT LIKE ?{n} ESCAPE '\\'"));
+        level.push(path_prefix_like(n, true));
         level_params.push(Value::Text(format!("{escaped}%{}", "/%".repeat(depth))));
         let level = level.join(" AND ");
 
@@ -1001,6 +1037,16 @@ impl Store for TursoStore {
         // segment below the prefix - so no body is read to learn that a folder
         // exists and the row cap above can never hide one. `substr` and `instr`
         // count characters, so the offset is a character count.
+        //
+        // The offset is the caller's prefix length, and the folded filter above
+        // admits rows whose own leading characters are a case VARIANT of that
+        // prefix rather than the prefix itself. It still cuts in the right place
+        // for one reason only: every fold in play is LENGTH-PRESERVING (Turso's
+        // `lower()` is ASCII-only, and the per-character mappings of the locales
+        // in use map one code point to one). A provider whose `lower()` is not -
+        // an ICU Postgres folding U+0130 to two code points - would cut here in
+        // the wrong place and derive a wrong or empty folder name. That is what
+        // a future reader has to re-check, not where the number came from.
         let rel = format!("substr(e.path, {})", prefix.chars().count() + 1);
         let folder_rows = query_all(
             &self.conn,

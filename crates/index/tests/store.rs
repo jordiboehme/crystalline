@@ -4254,3 +4254,135 @@ async fn browse_level_bounds(store: &dyn Store) {
     assert!(empty.engrams.is_empty() && empty.folders.is_empty());
 }
 parity!(browse_level_caps_rows_but_not_folders, browse_level_bounds);
+
+/// Every path filter folds case, and both backends fold it the same way.
+///
+/// SQLite-family `LIKE` is ASCII-case-insensitive while Postgres `LIKE` is
+/// case-sensitive, so a folder filter of `notes` used to take `Notes/b.md` on
+/// turso and miss it on postgres. The three surfaces that carry such a filter -
+/// `list_engrams`, `browse_level` and the search planner - now lower both sides
+/// in SQL, so the two backends answer alike.
+///
+/// **The fold is ASCII-exact and Unicode-approximate.** SQLite's `lower()` is
+/// ASCII-only while Postgres follows the database collation, so `Notes/` and
+/// `notes/` fold identically on both while a non-ASCII case pair may fold on
+/// one and not the other. Every case pair here is ASCII on purpose; this is not
+/// a promise about `Ünter/` versus `ünter/`.
+///
+/// **The rows are upserted into a virtual domain rather than synced from
+/// disk**, because macOS's default filesystem is case-insensitive: writing
+/// `notes/a.md` and `Notes/b.md` under one temp dir produces a single folder
+/// and the case variant this test is about would never reach the store.
+///
+/// `Notes/deep/e.md` is not decoration. It is the row that catches a PARTIAL
+/// fold: with only the under-prefix clause folded, it passes
+/// `lower(e.path) LIKE 'notes/%'` and also passes the unfolded
+/// `e.path NOT LIKE 'notes/%/%'` (which no case variant matches), so a
+/// two-level-deep engram would surface in a one-level listing - a leak that
+/// does not exist while neither side is folded.
+async fn path_filters_fold_case(store: &dyn Store) {
+    let did = store
+        .upsert_domain("eng", None, DomainKind::Virtual)
+        .await
+        .unwrap();
+    for (path, permalink) in [
+        ("notes/a.md", "a"),
+        ("Notes/b.md", "b"),
+        ("notes/deep/c.md", "c"),
+        ("Notes/deep/e.md", "e"),
+        ("other/d.md", "d"),
+    ] {
+        store
+            .upsert_engram(
+                did,
+                &record(
+                    path,
+                    permalink,
+                    "shared body term",
+                    &format!("sha-{permalink}"),
+                ),
+            )
+            .await
+            .unwrap();
+    }
+
+    // `list_engrams` takes both spellings of the folder and still refuses a
+    // path that is merely a different folder.
+    let listed = store
+        .list_engrams("eng", Some("notes"), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        listed.iter().map(|d| d.path.as_str()).collect::<Vec<_>>(),
+        vec![
+            "Notes/b.md",
+            "Notes/deep/e.md",
+            "notes/a.md",
+            "notes/deep/c.md"
+        ],
+        "a prefix filter takes every case spelling of the folder, in byte order, \
+         and nothing outside it"
+    );
+
+    // The one-level listing under `notes/`: the shallow engrams from both
+    // spellings, the folder derived from both, and neither two-level engram.
+    let level = store
+        .browse_level("eng", Some("notes"), 1, 50)
+        .await
+        .unwrap();
+    assert_eq!(
+        level
+            .engrams
+            .iter()
+            .map(|d| d.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Notes/b.md", "notes/a.md"],
+        "one level under the folder, both spellings"
+    );
+    assert_eq!(level.total, 2, "the count runs under the same depth filter");
+    assert!(
+        !level.engrams.iter().any(|d| d.path.contains("/deep/")),
+        "the depth cut folds too, so no case variant slips two levels deep into \
+         a one-level listing: {:?}",
+        level.engrams
+    );
+    assert_eq!(
+        level.folders,
+        vec!["deep"],
+        "the subfolder is derived from both spellings and collapses to one name"
+    );
+
+    // Folding merges case-variant folders in the FILTER, never in the derived
+    // folder names: browsing the root still reports each folder's own spelling.
+    let root = store.browse_level("eng", None, 1, 50).await.unwrap();
+    assert_eq!(
+        root.folders,
+        vec!["Notes", "notes", "other"],
+        "two case-variant folders stay two folder rows"
+    );
+
+    // The search planner's folder filter, filter-only and lexical alike.
+    let under = |text: Option<&str>| SearchQuery {
+        text: text.map(str::to_string),
+        domains: Some(vec!["eng".to_string()]),
+        path_prefix: Some("notes/".to_string()),
+        limit: 50,
+        page: 1,
+        ..SearchQuery::default()
+    };
+    for text in [None, Some("term")] {
+        let hits = store.search(&under(text)).await.unwrap();
+        let mut found: Vec<&str> = hits.items.iter().map(|h| h.permalink.as_str()).collect();
+        found.sort();
+        assert_eq!(
+            found,
+            vec!["a", "b", "c", "e"],
+            "a folder-scoped search takes both spellings and stops at the folder \
+             (text: {text:?})"
+        );
+    }
+}
+parity!(
+    path_filters_fold_case_on_both_backends,
+    path_filters_fold_case
+);
