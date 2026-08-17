@@ -7,9 +7,10 @@
  * no second route definition to keep in step. The builders that make links to
  * these patterns live in `paths.ts`, next door.
  *
- * `/evolve` is deliberately absent. It is reserved for the maintenance sweep
- * and unrouted in this slice, so it lands on the not-found screen rather than
- * existing as an empty promise; whoever adds it adds a screen with it.
+ * `/evolve` is deliberately absent. That is the endpoint's name and the name of
+ * the tool an agent works the queue with; the screen a person opens to see what
+ * is owed lives at `/maintenance`, and the bare `/evolve` lands on the
+ * not-found screen rather than existing as a second address for one page.
  */
 
 import { Suspense, lazy } from "react";
@@ -22,6 +23,7 @@ import { Skeleton } from "./components/Skeleton";
 import DomainHome from "./screens/DomainHome";
 import GraphView from "./screens/GraphView";
 import Home from "./screens/Home";
+import Maintenance from "./screens/Maintenance";
 import ManifestPage from "./screens/ManifestPage";
 import NotFound from "./screens/NotFound";
 import Search from "./screens/Search";
@@ -138,6 +140,12 @@ export function AppRoutes() {
           />
           <Route path="/search" element={<Search />} />
           <Route path="/graph" element={<GraphView />} />
+          {/*
+            Eager, unlike the two admin screens below it: this one is offered
+            to every role from the frame, so nobody would be spared its weight
+            by making it wait, and it carries no editor and no graph engine.
+          */}
+          <Route path="/maintenance" element={<Maintenance />} />
           {/*
             Routed for everybody and rendered for admins only: the screen
             itself answers with the not-found screen for anyone else, so the
