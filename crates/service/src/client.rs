@@ -559,6 +559,18 @@ struct RelayState {
     init_id: Option<Value>,
     initialized_note: Option<String>,
     outstanding: std::collections::HashMap<String, Value>,
+    /// The next client line is the session opener [`read_session_opener`]
+    /// already classified, rewrote if it was a bare probe and logged, so
+    /// [`relay_loop`] must forward it without classifying it again. Set by
+    /// [`pump_stdio`], which only ever runs after that read; cleared on the
+    /// first client line, so a probe that arrives later - the one shape that
+    /// can still meet a fresh daemon's init loop, after a restart resynced a
+    /// session no `initialize` opened - is normalized as usual.
+    ///
+    /// Without this one bare probe produced two WARN lines, the second
+    /// ("arrived with the required _meta; forwarding it unchanged", read off
+    /// the already-rewritten line) contradicting the first.
+    opener_already_classified: bool,
 }
 
 impl RelayState {
@@ -657,9 +669,17 @@ where
                     // A bare `server/discover` reaching the relay is rewritten
                     // rather than answered, so the daemon's rmcp handles it and
                     // the client gets a real DiscoverResult. See
-                    // [`DiscoverProbe`]. From here on it is an ordinary
-                    // request: recorded, forwarded, settled by its response.
-                    let line = observe_discover_probe(&line).unwrap_or(line);
+                    // [`DiscoverProbe`]. The session opener is exempt: it was
+                    // classified, rewritten and logged by `read_session_opener`
+                    // before being re-fronted onto stdin, and describing it a
+                    // second time here contradicted the first line. From here
+                    // on it is an ordinary request: recorded, forwarded,
+                    // settled by its response.
+                    let line = if std::mem::take(&mut relay.opener_already_classified) {
+                        line
+                    } else {
+                        observe_discover_probe(&line).unwrap_or(line)
+                    };
                     relay.note_client_line(&line);
                     let sent = session.sock_write.write_all(line.as_bytes()).await.is_ok()
                         && session.sock_write.write_all(b"\n").await.is_ok()
@@ -762,7 +782,12 @@ async fn pump_stdio<R>(
 where
     R: AsyncRead + Unpin,
 {
-    let mut relay = RelayState::default();
+    // `run_mcp` read and classified the session opener before priming it back
+    // onto this reader, so the first line below is already described in the log.
+    let mut relay = RelayState {
+        opener_already_classified: true,
+        ..RelayState::default()
+    };
     let mut stdin = BufReader::new(reader).lines();
     let mut stdout = tokio::io::stdout();
     let mut session = Session::new(stream);
@@ -2238,6 +2263,12 @@ mod tests {
         assert_eq!(out, "hello world");
     }
 
+    /// A probe the relay has to classify itself: `opener_already_classified`
+    /// is clear, which is the state after a restart resynced a session no
+    /// `initialize` opened, so this line meets a fresh daemon's init loop as
+    /// its first message and has to arrive normalized.
+    /// `a_bare_probe_on_the_relay_path_is_classified_once` covers the other
+    /// side, the opener the bridge already handled.
     #[tokio::test]
     async fn relay_loop_forwards_a_normalized_discover_probe_to_the_daemon() {
         let (bridge_side, daemon_side) = tokio::io::duplex(4096);
@@ -2330,6 +2361,102 @@ mod tests {
             "the probe was tracked like any other request and the daemon's \
              answer settled it: {:?}",
             relay.outstanding
+        );
+    }
+
+    /// A capturing writer for the WARN lines the bridge emits, so a test can
+    /// count how many times one probe was described.
+    struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// One probe, one classification line, on the relay path.
+    ///
+    /// `run_mcp` reads the session opener through [`read_session_opener`],
+    /// which classifies it, rewrites a bare probe and logs what it did, then
+    /// re-fronts that rewritten line onto stdin for the relay. The relay
+    /// therefore reads a line that has already been described. Classifying it
+    /// a second time logged "arrived with the required _meta; forwarding it
+    /// unchanged" directly after "arrived without the required _meta; ...
+    /// injected": one probe described twice, the second line contradicting the
+    /// first for an operator reading stderr (Task 10, anomaly A1).
+    ///
+    /// The daemon still receives the normalized probe, so suppressing the
+    /// second log does not suppress the fix it reports.
+    #[tokio::test]
+    async fn a_bare_probe_on_the_relay_path_is_classified_once() {
+        let logged = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer({
+                let logged = std::sync::Arc::clone(&logged);
+                move || CapturedLog(std::sync::Arc::clone(&logged))
+            })
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // What `run_mcp` does with the client's first line.
+        let bare: &[u8] = b"{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"server/discover\"}\n";
+        let mut reader = BufReader::new(bare);
+        let opener = read_session_opener(&mut reader)
+            .await
+            .unwrap()
+            .expect("the probe is the session opener");
+        assert!(
+            opener.contains(META_KEY_PROTOCOL_VERSION),
+            "the opener read rewrites a bare probe: {opener}"
+        );
+
+        // What `pump_stdio` then hands the relay: the rewritten opener,
+        // re-fronted onto stdin exactly as `prime_reader` builds it.
+        let mut prefix = opener.clone().into_bytes();
+        prefix.push(b'\n');
+        let inner: &[u8] = b"";
+        let mut stdin = BufReader::new(Prefixed { prefix, inner }).lines();
+
+        let (bridge_side, daemon_side) = tokio::io::duplex(4096);
+        let daemon = tokio::spawn(async move {
+            let (read, _write) = tokio::io::split(daemon_side);
+            let mut lines = BufReader::new(read).lines();
+            lines.next_line().await.unwrap()
+        });
+
+        let mut relay = RelayState {
+            opener_already_classified: true,
+            ..RelayState::default()
+        };
+        let mut stdout = Vec::new();
+        let mut session = Session::new(bridge_side);
+        let (end, _) = relay_loop(&mut relay, &mut stdin, &mut stdout, &mut session)
+            .await
+            .unwrap();
+        assert_eq!(end, SessionEnd::StdinClosed);
+
+        let seen = daemon
+            .await
+            .unwrap()
+            .expect("the normalized probe still reaches the daemon");
+        assert!(seen.contains(META_KEY_CLIENT_CAPABILITIES), "{seen}");
+        assert!(seen.contains(META_KEY_PROTOCOL_VERSION), "{seen}");
+
+        let log = String::from_utf8(logged.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            log.matches("server/discover probe arrived").count(),
+            1,
+            "one probe must be described exactly once on the relay path: {log}"
+        );
+        assert!(
+            log.contains("without the required _meta"),
+            "the surviving line is the one that describes what was done: {log}"
         );
     }
 

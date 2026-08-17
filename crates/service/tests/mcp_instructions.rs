@@ -501,7 +501,7 @@ async fn an_unresolved_session_gets_the_full_block() {
 /// this test used to `configure` them on a live engine between connections:
 /// the effective value is snapshotted at engine construction now.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_setting_overrides_the_receipt_in_both_directions() {
+async fn the_skills_serve_setting_decides_in_both_directions() {
     for (value, expect_full) in [("true", true), ("false", true), ("auto", false)] {
         let h = Harness::build_with(
             &[("eng", &["Route here for eng questions"])],
