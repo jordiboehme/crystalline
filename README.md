@@ -64,7 +64,7 @@ Once knowledge grows into the thousands or tens of thousands of units, reading a
 
 ## Fluid, the web UI
 
-The primary author in Crystalline is the agent: it captures and refines engrams as it works. Fluid is how you take part directly - read what was learned, correct a fact, add knowledge of your own - in the browser, without going through the LLM or spending a token on it. Fluid is built into the binary and on by default at `http://localhost:7411`, so the daemon your agents already talk to serves people and agents on one port: nothing to deploy, and the first visit creates your admin account right in the browser.
+The primary author in Crystalline is the agent: it captures and refines engrams as it works. Fluid is how you take part directly - read what was learned, correct a fact, add knowledge of your own - in the browser, without going through the LLM or spending a token on it. What you write does not sit unreviewed: the agent's next maintenance pass verifies it, aligns the tags and wires it into the graph. Fluid is built into the binary and on by default at `http://localhost:7411`, so the daemon your agents already talk to serves people and agents on one port: nothing to deploy, and the first visit creates your admin account right in the browser.
 
 ![An engram in Fluid: frontmatter details, observations, typed relations and the agent's-eye view](assets/fluid-engram.jpg)
 
@@ -72,6 +72,7 @@ The primary author in Crystalline is the agent: it captures and refines engrams 
 - **Edit in place.** A live-preview markdown editor with table editing, a frontmatter form, mermaid previews and wikilink completion across every domain. The file on disk stays the source of truth.
 - **Collaborate in real time.** Everyone in the same engram sees everyone else's cursors and edits live; changes merge conflict-free and land as one save.
 - **Search it all.** Faceted search across the whole instance, backed by the same hybrid text-plus-semantic ranking the agents use.
+- **See what the knowledge needs next.** A maintenance page with the ranked queue of everything due - stale dates, half-finished retirements, unreviewed human captures - the same queue the agent works.
 - **See the shape of it.** An interactive graph of any engram's neighborhood, and an agent's-eye view showing exactly what the tools serve an agent for that page.
 - **Accounts when you need them, none when you don't.** Admin, editor and viewer roles managed in the UI or with `crystalline users`; an anonymous read-only mode for a published archive; a trusted-header mode behind an SSO proxy. See [deployment](docs/deployment.md) for the container and team-server variants.
 
