@@ -7,6 +7,8 @@
 //! what makes a run reproducible: the detectors never read the clock, the
 //! engine supplies the date.
 
+mod support;
+
 use std::sync::Arc;
 
 use crystalline_core::config::{DomainEntry, GlobalConfig};
@@ -208,9 +210,14 @@ fn files() -> Vec<(String, String)> {
 }
 
 /// A sweep over the fixture as of `today`, with the given extra parameters.
+///
+/// The detection half rather than [`Engine::evolve_engrams`]: the response is
+/// identical, and detection records no maintenance run, so the rule assertions
+/// below neither depend on the state directory nor write to it. The recording
+/// wrapper has its own tests at the end of this file.
 async fn sweep(engine: &Engine, today: &str, p: EvolveParams) -> Value {
     engine
-        .evolve_engrams(&EvolveParams {
+        .evolve_detect(&EvolveParams {
             today: Some(today.to_string()),
             ..p
         })
@@ -675,4 +682,69 @@ async fn the_queue_rows_stay_tabular_for_toon() {
             assert!(row.as_object().unwrap().values().all(|c| !c.is_array()));
         }
     }
+}
+
+// --- the run recorder --------------------------------------------------------
+
+/// `evolve_engrams` is `evolve_detect` plus exactly one side effect: it stamps
+/// the maintenance state file so the Stop hook stops nudging about the domains
+/// this sweep just looked at. Both halves are asserted in one test because
+/// they share one state file, and a sweep that recorded nothing would pass a
+/// detection-only assertion made anywhere else.
+///
+/// The state directory is redirected into a scratch home for the duration, so
+/// the run never touches the developer's own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_run_recorder_stamps_a_sweep_and_leaves_detection_pure() {
+    let scratch = support::ScratchStateDir::acquire();
+    let (_tmp, engine) = fixture().await;
+
+    // Two domains owe a sweep; the run below is scoped to one of them.
+    crystalline_service::maintenance::record_pending("eng");
+    crystalline_service::maintenance::record_pending("ops");
+    let started = crystalline_service::maintenance::load().pending_since;
+    assert!(started.is_some(), "the backlog carries its start");
+    let before = std::fs::read(scratch.maintenance_path()).unwrap();
+
+    // Detection changes nothing at all, which is what lets a queue view show
+    // this page without claiming anybody worked it.
+    engine
+        .evolve_detect(&EvolveParams {
+            domains: vec!["eng".to_string()],
+            today: Some(TODAY.to_string()),
+            ..EvolveParams::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read(scratch.maintenance_path()).unwrap(),
+        before,
+        "detection must not write the maintenance state"
+    );
+
+    let v = engine
+        .evolve_engrams(&EvolveParams {
+            domains: vec!["eng".to_string()],
+            today: Some(TODAY.to_string()),
+            ..EvolveParams::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(v["scope"]["domains"], serde_json::json!(["eng"]));
+
+    let state = crystalline_service::maintenance::load();
+    assert!(state.last_run_at.is_some(), "the run was stamped");
+    assert_eq!(
+        state.pending_domains,
+        vec!["ops".to_string()],
+        "only the swept domain leaves the backlog"
+    );
+    assert_eq!(
+        state.pending_since, started,
+        "what is left keeps the age it had"
+    );
+    assert!(
+        scratch.maintenance_path().starts_with(scratch.home()),
+        "the state file must land in the scratch home, never the developer's"
+    );
 }

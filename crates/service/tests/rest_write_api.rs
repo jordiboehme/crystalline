@@ -29,10 +29,17 @@ struct Options {
 struct Fixture {
     addr: std::net::SocketAddr,
     auth: Arc<AuthStore>,
+    /// Every successful write on this surface marks its domain pending in the
+    /// maintenance state file under the state directory, so every fixture here
+    /// redirects that directory into a scratch home for the test's duration.
+    /// Held rather than dropped: the redirection lasts exactly as long as this
+    /// value, and the requests that write happen while a test holds it.
+    state: support::ScratchStateDir,
     _tmp: tempfile::TempDir,
 }
 
 async fn serve(opts: Options) -> Fixture {
+    let state = support::ScratchStateDir::acquire();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
     let mut cfg = GlobalConfig {
@@ -145,6 +152,7 @@ async fn serve(opts: Options) -> Fixture {
     Fixture {
         addr,
         auth,
+        state,
         _tmp: tmp,
     }
 }
@@ -426,6 +434,73 @@ async fn a_save_writes_verbatim_and_answers_at_the_new_address() {
     .await
     .unwrap();
     assert_eq!(again.status(), 200);
+}
+
+/// A human write marks its domain pending in the maintenance state file, which
+/// is how the Stop hook learns this machine owes a consolidation sweep.
+///
+/// The save route stands for all three authoring routes here: create and
+/// retire mark the same way at the same seam. A refused write must not mark,
+/// which is what the failing leg pins - a 412 leaves nothing behind, so a
+/// conflict an author never resolved cannot put a domain on the queue.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_human_save_marks_its_domain_pending_for_the_sweep() {
+    let fx = serve(Options::default()).await;
+    let editor = login(fx.addr, "eddy", "eddypw").await;
+    let (etag, content) = read_alpha(fx.addr, &editor).await;
+    let before = crystalline_service::maintenance::load();
+    assert!(
+        !before.pending_domains.contains(&"eng".to_string()),
+        "nothing is pending before the first write"
+    );
+
+    // A stale token: refused, and nothing recorded.
+    let stale = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/eng/engrams/alpha",
+        &editor,
+    )
+    .header("if-match", "\"not-the-current-checksum\"")
+    .json(&serde_json::json!({ "content": content.clone() }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(stale.status(), 412);
+    assert_eq!(
+        crystalline_service::maintenance::load(),
+        before,
+        "a refused write owes the sweep nothing"
+    );
+
+    let saved = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/eng/engrams/alpha",
+        &editor,
+    )
+    .header("if-match", format!("\"{etag}\""))
+    .json(&serde_json::json!({ "content": content.replace("A rule", "A revised rule") }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(saved.status(), 200);
+
+    let state = crystalline_service::maintenance::load();
+    assert!(
+        state.pending_domains.contains(&"eng".to_string()),
+        "the written domain owes a sweep: {:?}",
+        state.pending_domains
+    );
+    assert!(
+        state.pending_since.is_some(),
+        "the backlog carries the moment it started"
+    );
+    assert!(state.last_run_at.is_none(), "no sweep has run here");
+    assert!(
+        fx.state.maintenance_path().starts_with(fx.state.home()),
+        "the state file must land in the scratch home, never the developer's"
+    );
 }
 
 /// A body past the API's limit is refused with 413 rather than truncated or
@@ -997,6 +1072,7 @@ async fn the_manifest_reads_with_an_etag_and_saves_under_if_match() {
 /// `the_manifest_reads_with_an_etag_and_saves_under_if_match` already pins
 /// for a file domain.
 async fn serve_with_a_virtual_domain() -> Fixture {
+    let state = support::ScratchStateDir::acquire();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
     let mut cfg = GlobalConfig {
@@ -1071,6 +1147,7 @@ async fn serve_with_a_virtual_domain() -> Fixture {
     Fixture {
         addr,
         auth,
+        state,
         _tmp: tmp,
     }
 }

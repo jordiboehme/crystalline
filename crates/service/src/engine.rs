@@ -4155,7 +4155,38 @@ impl Engine {
     // --- evolve --------------------------------------------------------------
 
     /// Run the consolidation sweep over a scope and return one page of its
-    /// ranked queue.
+    /// ranked queue, recording that the sweep ran.
+    ///
+    /// The thin half of the seam: [`Engine::evolve_detect`] does the work and
+    /// this adds the one side effect, stamping the swept scope into the
+    /// maintenance state so the Stop hook stops nudging about domains this
+    /// sweep just looked at. Detection is shared and pure, so a surface that
+    /// only wants to show the queue (the REST queue view) calls `evolve_detect`
+    /// and never counts as a run; an agent that actually works the queue comes
+    /// through here.
+    ///
+    /// The recording is best effort by design - see [`crate::maintenance`] -
+    /// and the response is returned exactly as detection built it.
+    pub async fn evolve_engrams(&self, p: &EvolveParams) -> Result<Value> {
+        let value = self.evolve_detect(p).await?;
+        // The swept scope is read back out of the response rather than
+        // re-derived from the parameters: an unscoped call defaults to every
+        // registered domain, and only the response knows which those were.
+        let swept: Vec<String> = value["scope"]["domains"]
+            .as_array()
+            .map(|domains| {
+                domains
+                    .iter()
+                    .filter_map(|d| d.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        crate::maintenance::record_run(&swept);
+        Ok(value)
+    }
+
+    /// The detection half of the consolidation sweep: one page of the ranked
+    /// queue over a scope, with no side effect of any kind.
     ///
     /// Read-only end to end: it resolves the scope, assembles the facts every
     /// detector reads, runs [`crystalline_index::detect`] once per domain and
@@ -4182,7 +4213,7 @@ impl Engine {
     ///   unregistered target domain apart from a target that does not exist,
     ///   and the graph is taken at depth 1 so cross-domain targets carry a
     ///   status for `V101` to read.
-    pub async fn evolve_engrams(&self, p: &EvolveParams) -> Result<Value> {
+    pub async fn evolve_detect(&self, p: &EvolveParams) -> Result<Value> {
         let today = match p.today.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
             Some(s) => NaiveDate::parse_from_str(s, "%Y-%m-%d").map_err(|_| {
                 EngineError::Invalid(format!("today '{s}' is not an ISO date (YYYY-MM-DD)"))
