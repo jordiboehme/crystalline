@@ -18,6 +18,11 @@ use assert_cmd::Command;
 /// The exact reminder text `hook.rs` prints, duplicated here because the
 /// `crystalline` binary has no library target for a test to import it from;
 /// this is a black-box check on what the subprocess actually printed.
+/// The ride-along maintenance paragraph, duplicated here for the same reason
+/// [`NUDGE_REASON`] is: this is a black-box check on what the subprocess
+/// printed.
+const EVOLVE_NUDGE_REASON: &str = "Also due now: knowledge maintenance. Call the crystalline evolve_engrams tool and work the queue it returns: apply mechanical findings directly and summarize once at the end; propose judgment findings one at a time and wait for a yes. Engrams captured by a person are judgment class - never rewrite a human's words without asking.";
+
 const NUDGE_REASON: &str = "Review this conversation for durable learnings before finishing: new facts, decisions, patterns and antipatterns, gotchas, corrections from the user or researched answers worth keeping. Corrections include ones that make an existing engram wrong - for those propose the reconciling edit or supersession, not a new capture beside the old. If any are not yet captured, propose capturing each one as an engram into the fitting crystalline domain: name the insight, the domain and the folder when one fits and wait for a yes. If a recalled engram proved to be the key to the task, raise its salience. If nothing qualifies or everything is already captured, finish normally without mentioning this check.";
 
 fn bin() -> Command {
@@ -71,6 +76,170 @@ fn stop_payload(session_id: &str, transcript_path: Option<&Path>) -> String {
 /// Where `hook stop` writes session state under an isolated `home`.
 fn state_hooks_dir(home: &Path) -> PathBuf {
     home.join("state").join("crystalline").join("hooks")
+}
+
+/// The per-machine maintenance throttle record under an isolated `home`, the
+/// file `crystalline-service` writes and this hook reads from another
+/// process.
+fn maintenance_path(home: &Path) -> PathBuf {
+    state_hooks_dir(home).join("maintenance.json")
+}
+
+/// Install a maintenance state under `home`, creating the hooks folder.
+fn write_maintenance(home: &Path, state: serde_json::Value) {
+    let path = maintenance_path(home);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
+}
+
+fn read_maintenance(home: &Path) -> serde_json::Value {
+    let bytes = std::fs::read(maintenance_path(home)).expect("the maintenance state exists");
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+/// Backdate a file's modification time past the sweep's one-week cutoff.
+fn backdate(path: &Path) {
+    let stale = std::time::SystemTime::now()
+        .checked_sub(std::time::Duration::from_secs(8 * 24 * 60 * 60))
+        .unwrap();
+    let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    file.set_modified(stale).unwrap();
+}
+
+/// The clock behind the fresh-install quiet week starts on the first Stop
+/// hook this machine ever runs, including one that says nothing.
+#[test]
+fn the_first_silent_call_seeds_the_maintenance_clock() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let config = work.path().join("config.yaml");
+    write_domain_config(&config);
+    // No transcript: the fallback counter keeps this first call silent.
+    let payload = stop_payload("session-seed", None);
+
+    let mut cmd = bin();
+    isolate(&mut cmd, &home);
+    let out = cmd
+        .env("CRYSTALLINE_CONFIG", &config)
+        .args(["hook", "stop"])
+        .write_stdin(payload)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(out.stdout.is_empty(), "{:?}", out.stdout);
+
+    let state = read_maintenance(&home);
+    assert!(
+        state["first_seen"].is_string(),
+        "a silent call still starts the clock: {state}"
+    );
+    assert!(
+        state["last_nudge_at"].is_null(),
+        "a silent call never stamps an ask: {state}"
+    );
+}
+
+/// A domain a human wrote to arms the ask, and the emitted reason carries the
+/// capture nudge, the maintenance paragraph and the focus domains in one
+/// string. Firing stamps `last_nudge_at`, which is what the 24 hour cooldown
+/// reads next time.
+#[test]
+fn the_ride_along_ask_names_the_pending_domains_and_stamps_the_nudge() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let config = work.path().join("config.yaml");
+    write_domain_config(&config);
+    let transcript = substantial_transcript(work.path());
+    write_maintenance(
+        &home,
+        serde_json::json!({
+            "v": 1,
+            "pending_domains": ["playground"],
+            "pending_since": "2026-08-15T09:00:00Z",
+            // Recent enough that the weekly arm is not what fires here.
+            "last_run_at": "2026-08-16T09:00:00Z",
+            "last_nudge_at": null,
+            "first_seen": "2026-07-01T09:00:00Z",
+        }),
+    );
+
+    let mut cmd = bin();
+    isolate(&mut cmd, &home);
+    let out = cmd
+        .env("CRYSTALLINE_CONFIG", &config)
+        .args(["hook", "stop"])
+        .write_stdin(stop_payload("session-ride-along", Some(&transcript)))
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let decision: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(decision["decision"], "block");
+    assert_eq!(
+        decision["reason"],
+        serde_json::Value::String(format!(
+            "{NUDGE_REASON} {EVOLVE_NUDGE_REASON} Focus domains: playground."
+        ))
+    );
+
+    let state = read_maintenance(&home);
+    assert!(
+        state["last_nudge_at"].is_string(),
+        "the ask stamps the cooldown before printing: {state}"
+    );
+    assert_eq!(
+        state["pending_domains"],
+        serde_json::json!(["playground"]),
+        "the hook never clears the backlog - only a sweep does"
+    );
+}
+
+/// The stale sweep removes week-old session files, but the maintenance
+/// record is per-machine and long-lived: a quiet week must not erase the
+/// throttle and re-arm the fresh-install grace period.
+#[test]
+fn the_stale_sweep_spares_the_maintenance_file() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let config = work.path().join("config.yaml");
+    write_domain_config(&config);
+    // `first_seen` already set, and a silent call: nothing rewrites the file
+    // during this run, so its backdated mtime is what the sweep sees.
+    write_maintenance(
+        &home,
+        serde_json::json!({
+            "v": 1,
+            "pending_domains": [],
+            "pending_since": null,
+            "last_run_at": "2026-08-16T09:00:00Z",
+            "last_nudge_at": null,
+            "first_seen": "2026-07-01T09:00:00Z",
+        }),
+    );
+    backdate(&maintenance_path(&home));
+    let stale_session = state_hooks_dir(&home).join("old-session.json");
+    std::fs::write(&stale_session, b"{}").unwrap();
+    backdate(&stale_session);
+
+    let mut cmd = bin();
+    isolate(&mut cmd, &home);
+    let out = cmd
+        .env("CRYSTALLINE_CONFIG", &config)
+        .args(["hook", "stop"])
+        .write_stdin(stop_payload("session-sweep", None))
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(out.stdout.is_empty(), "{:?}", out.stdout);
+
+    assert!(
+        !stale_session.exists(),
+        "a week-old session file is still swept"
+    );
+    assert!(
+        maintenance_path(&home).exists(),
+        "the maintenance throttle record must survive a quiet week"
+    );
 }
 
 #[test]

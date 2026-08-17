@@ -33,13 +33,26 @@
 //! missed nudge, never a repeated one. Every call also opportunistically
 //! sweeps state files older than a week, so a long-lived install never
 //! accumulates one file per session forever.
+//!
+//! One more file lives beside those, `maintenance.json`, and it is
+//! per-machine rather than per-session: the throttle record
+//! [`crystalline_service::maintenance`] keeps, saying which domains a human
+//! has written to since the last consolidation sweep and when this machine
+//! last swept or last asked. This handler reads it on every call that gets
+//! as far as a decision, seeds its `first_seen` stamp the first time it ever
+//! runs, and on the sessions where the capture nudge already fired it may
+//! append a second paragraph asking for a sweep - a ride-along, never a
+//! reason of its own to speak. Being long-lived by design, that file is the
+//! one thing the stale sweep above spares.
 
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
+use chrono::{DateTime, TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
 
 use crystalline_core::config;
+use crystalline_service::maintenance::{self, MAINTENANCE_FILE, MaintenanceState};
 
 /// The reminder printed on the one Stop call per session that earns it. Exact
 /// wording is load-bearing: it is the whole of what the agent sees, so it
@@ -52,6 +65,22 @@ use crystalline_core::config;
 /// already captured engram wrong is an edit or a supersession, not a second
 /// engram written beside the first.
 pub const NUDGE_REASON: &str = "Review this conversation for durable learnings before finishing: new facts, decisions, patterns and antipatterns, gotchas, corrections from the user or researched answers worth keeping. Corrections include ones that make an existing engram wrong - for those propose the reconciling edit or supersession, not a new capture beside the old. If any are not yet captured, propose capturing each one as an engram into the fitting crystalline domain: name the insight, the domain and the folder when one fits and wait for a yes. If a recalled engram proved to be the key to the task, raise its salience. If nothing qualifies or everything is already captured, finish normally without mentioning this check.";
+
+/// The ride-along maintenance ask, appended to [`NUDGE_REASON`] on the
+/// sessions where the throttle says evolve is due. Wording is load-bearing:
+/// it names the tool, restates the two authority classes and carries the
+/// human-authored contract.
+pub const EVOLVE_NUDGE_REASON: &str = "Also due now: knowledge maintenance. Call the crystalline evolve_engrams tool and work the queue it returns: apply mechanical findings directly and summarize once at the end; propose judgment findings one at a time and wait for a yes. Engrams captured by a person are judgment class - never rewrite a human's words without asking.";
+
+/// How long a machine may go without a consolidation sweep before the ask
+/// arms itself: one week. Measured from the last recorded sweep, or from
+/// [`MaintenanceState::first_seen`] when this machine has never swept.
+pub const EVOLVE_RUN_INTERVAL_DAYS: i64 = 7;
+
+/// The floor between two maintenance asks, whichever arm raised them: a day.
+/// Both arms are gated by it, so a backlog that stays pending asks once a
+/// day rather than once a session.
+pub const EVOLVE_NUDGE_COOLDOWN_HOURS: i64 = 24;
 
 /// A transcript byte size at or above this is substantial on its own, no
 /// read required: `run_stop` stats the file first and only reads it when the
@@ -223,6 +252,67 @@ pub fn decide(
     }
 }
 
+/// Whether this machine owes the human a consolidation sweep, and which
+/// domains a human has written to since the last one.
+///
+/// Pure, and deliberately separate from [`decide`]: the capture nudge is
+/// decided without ever consulting this, and only a call that already earned
+/// that nudge asks here whether a maintenance paragraph rides along. `Some`
+/// carries the pending domains, which is empty for an ask raised by the
+/// weekly arm alone.
+///
+/// Due when the cooldown is clear and either arm is up:
+///
+/// - the weekly arm, [`EVOLVE_RUN_INTERVAL_DAYS`] since the last sweep, or
+///   since this file was first seen when no sweep was ever recorded - so a
+///   fresh install gets a quiet first week rather than an ask on day one;
+/// - the pending arm, any domain a human has written to since the last
+///   sweep. It fires inside the quiet week too: a human write is evidence
+///   there is something to consolidate, which the calendar alone is not.
+///
+/// [`EVOLVE_NUDGE_COOLDOWN_HOURS`] gates both arms, so a machine with a
+/// standing backlog asks once a day at most.
+pub fn evolve_ask(m: &MaintenanceState, now: DateTime<Utc>) -> Option<Vec<String>> {
+    if let Some(nudged) = m.last_nudge_at
+        && now.signed_duration_since(nudged) < TimeDelta::hours(EVOLVE_NUDGE_COOLDOWN_HOURS)
+    {
+        return None;
+    }
+    let interval = TimeDelta::days(EVOLVE_RUN_INTERVAL_DAYS);
+    let weekly_due = match m.last_run_at {
+        Some(ran) => now.signed_duration_since(ran) >= interval,
+        // No sweep ever recorded: the clock runs from the first time this
+        // hook saw the machine. Absent (the very first call, which seeds it)
+        // nothing is due yet.
+        None => m
+            .first_seen
+            .is_some_and(|seen| now.signed_duration_since(seen) >= interval),
+    };
+    if weekly_due || !m.pending_domains.is_empty() {
+        Some(m.pending_domains.clone())
+    } else {
+        None
+    }
+}
+
+/// The full reason string this handler prints, composed from the capture
+/// nudge and, when [`evolve_ask`] said the sweep is due, the maintenance
+/// paragraph. The pending domains are named only when there are any: an ask
+/// raised by the weekly arm alone has nothing to point at.
+fn nudge_reason(evolve: Option<&[String]>) -> String {
+    let Some(domains) = evolve else {
+        return NUDGE_REASON.to_string();
+    };
+    if domains.is_empty() {
+        format!("{NUDGE_REASON} {EVOLVE_NUDGE_REASON}")
+    } else {
+        format!(
+            "{NUDGE_REASON} {EVOLVE_NUDGE_REASON} Focus domains: {}.",
+            domains.join(", ")
+        )
+    }
+}
+
 /// Run the `hook stop` command: read the payload from stdin, decide, persist
 /// state and print the nudge when earned. Never panics on ordinary bad
 /// input and never returns an error - every failure mode this function can
@@ -286,10 +376,44 @@ pub fn run_stop() {
     // never risking a second nudge is worth more than reporting the error.
     let _ = write_state(&path, &new_state);
 
+    // The per-machine throttle record, read on every call that gets this far
+    // rather than only on the ones that nudge: seeding `first_seen` from the
+    // first Stop hook this machine ever ran is what starts the fresh-install
+    // quiet week, and a call that stays silent is still evidence the machine
+    // exists. Seeding it with `now` cannot arm the weekly arm below - an age
+    // of zero is inside every interval.
+    let now = chrono::Utc::now();
+    let mut maintenance_state = maintenance::load();
+    let mut maintenance_dirty = false;
+    if maintenance_state.first_seen.is_none() {
+        maintenance_state.first_seen = Some(now);
+        maintenance_dirty = true;
+    }
+    // The ride-along: only a call that already earned the capture nudge ever
+    // asks, so the maintenance throttle can never be the reason this handler
+    // breaks its silence.
+    let evolve = if decision == StopDecision::Nudge {
+        evolve_ask(&maintenance_state, now)
+    } else {
+        None
+    };
+    if evolve.is_some() {
+        maintenance_state.last_nudge_at = Some(now);
+        maintenance_dirty = true;
+    }
+    // Persisted before the print, the same crash-safety order the session
+    // state follows: a crash in between can only cost a missed ask, never a
+    // repeated one. The write goes through the same serialized, atomic
+    // writer the daemon uses, and a failure is silent like every other bail.
+    if maintenance_dirty {
+        let _ = maintenance::save(&maintenance_state);
+    }
+
     sweep_stale_state();
 
     if decision == StopDecision::Nudge {
-        let payload = serde_json::json!({ "decision": "block", "reason": NUDGE_REASON });
+        let payload =
+            serde_json::json!({ "decision": "block", "reason": nudge_reason(evolve.as_deref()) });
         if let Ok(line) = serde_json::to_string(&payload) {
             println!("{line}");
         }
@@ -355,12 +479,20 @@ fn transcript_stats(path: Option<&Path>) -> TranscriptStats {
 /// on every `hook stop` call, so a long-lived install never accumulates one
 /// file per session forever. A missing hooks directory or any per-entry IO
 /// error is silently skipped - this is housekeeping, never load-bearing for
-/// the decision just made.
+/// the decision just made. `maintenance.json` is exempt: it is per-machine
+/// and long-lived, so a quiet week must not erase it.
 fn sweep_stale_state() {
     let Ok(dir) = config::state_dir().map(|d| d.join("hooks")) else {
         return;
     };
-    let Ok(entries) = std::fs::read_dir(&dir) else {
+    sweep_dir(&dir);
+}
+
+/// [`sweep_stale_state`] against an explicit directory, so the sweep's rules
+/// are testable without the real state directory or a process-global
+/// environment override.
+fn sweep_dir(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     let Some(cutoff) =
@@ -371,6 +503,12 @@ fn sweep_stale_state() {
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        // The maintenance throttle record shares this folder but is
+        // per-machine and long-lived: sweeping it after a quiet week would
+        // erase the throttle and re-arm the fresh-install grace period.
+        if path.file_name().and_then(|n| n.to_str()) == Some(MAINTENANCE_FILE) {
             continue;
         }
         if let Ok(meta) = entry.metadata()
@@ -536,6 +674,162 @@ mod tests {
             decision,
             StopDecision::Nudge,
             "the third stop (stops=2 going in) should fire"
+        );
+    }
+
+    // --- evolve_ask ------------------------------------------------------------
+
+    /// The fixed instant every throttle case below measures against, so no
+    /// test depends on the wall clock.
+    fn now() -> chrono::DateTime<chrono::Utc> {
+        "2026-08-17T12:00:00Z".parse().unwrap()
+    }
+
+    fn days_ago(days: i64) -> chrono::DateTime<chrono::Utc> {
+        now() - chrono::TimeDelta::days(days)
+    }
+
+    fn hours_ago(hours: i64) -> chrono::DateTime<chrono::Utc> {
+        now() - chrono::TimeDelta::hours(hours)
+    }
+
+    #[test]
+    fn evolve_ask_fires_on_the_weekly_arm() {
+        let state = MaintenanceState {
+            last_run_at: Some(days_ago(8)),
+            first_seen: Some(days_ago(30)),
+            ..MaintenanceState::default()
+        };
+        assert_eq!(
+            evolve_ask(&state, now()),
+            Some(Vec::new()),
+            "a sweep older than a week is due, with no domains to focus on"
+        );
+    }
+
+    #[test]
+    fn evolve_ask_stays_quiet_inside_the_week() {
+        let state = MaintenanceState {
+            last_run_at: Some(days_ago(2)),
+            first_seen: Some(days_ago(30)),
+            ..MaintenanceState::default()
+        };
+        assert_eq!(evolve_ask(&state, now()), None);
+    }
+
+    #[test]
+    fn a_fresh_install_gets_a_quiet_first_week() {
+        let fresh = MaintenanceState {
+            first_seen: Some(days_ago(3)),
+            ..MaintenanceState::default()
+        };
+        assert_eq!(
+            evolve_ask(&fresh, now()),
+            None,
+            "an install three days old owes nothing yet"
+        );
+
+        let settled = MaintenanceState {
+            first_seen: Some(days_ago(8)),
+            ..MaintenanceState::default()
+        };
+        assert_eq!(
+            evolve_ask(&settled, now()),
+            Some(Vec::new()),
+            "once the first week is up, a machine that never swept is due"
+        );
+
+        // The very first hook call ever, before `first_seen` is seeded: the
+        // clock has not started, so nothing is due.
+        assert_eq!(evolve_ask(&MaintenanceState::default(), now()), None);
+    }
+
+    #[test]
+    fn pending_domains_fire_after_the_cooldown() {
+        let state = MaintenanceState {
+            pending_domains: vec!["a".to_string()],
+            pending_since: Some(hours_ago(30)),
+            last_nudge_at: Some(hours_ago(25)),
+            first_seen: Some(days_ago(3)),
+            ..MaintenanceState::default()
+        };
+        assert_eq!(
+            evolve_ask(&state, now()),
+            Some(vec!["a".to_string()]),
+            "a human write is due even inside the fresh-install quiet week"
+        );
+    }
+
+    #[test]
+    fn the_cooldown_silences_both_arms() {
+        let state = MaintenanceState {
+            pending_domains: vec!["a".to_string()],
+            pending_since: Some(hours_ago(3)),
+            last_run_at: Some(days_ago(9)),
+            last_nudge_at: Some(hours_ago(2)),
+            first_seen: Some(days_ago(30)),
+            ..MaintenanceState::default()
+        };
+        assert_eq!(
+            evolve_ask(&state, now()),
+            None,
+            "a nudge two hours ago silences the weekly and the pending arm alike"
+        );
+    }
+
+    // --- nudge_reason ----------------------------------------------------------
+
+    #[test]
+    fn the_reason_names_the_focus_domains() {
+        let focused = nudge_reason(Some(&["playground".to_string(), "ops".to_string()]));
+        assert!(
+            focused.starts_with(NUDGE_REASON),
+            "the capture nudge stays first and whole: {focused}"
+        );
+        assert!(focused.contains(EVOLVE_NUDGE_REASON));
+        assert!(
+            focused.contains("Focus domains: playground, ops."),
+            "the pending domains are named: {focused}"
+        );
+
+        let weekly_only = nudge_reason(Some(&[]));
+        assert!(weekly_only.contains(EVOLVE_NUDGE_REASON));
+        assert!(
+            !weekly_only.contains("Focus domains"),
+            "a weekly-arm ask has nothing to focus on: {weekly_only}"
+        );
+
+        assert_eq!(
+            nudge_reason(None),
+            NUDGE_REASON,
+            "no ask means the capture nudge alone, byte for byte"
+        );
+    }
+
+    // --- sweep -----------------------------------------------------------------
+
+    #[test]
+    fn the_stale_sweep_spares_the_maintenance_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let stale = std::time::SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(STATE_STALE_SECS + 3600))
+            .unwrap();
+        for name in ["old-session.json", MAINTENANCE_FILE] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, b"{}").unwrap();
+            let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            file.set_modified(stale).unwrap();
+        }
+
+        sweep_dir(dir.path());
+
+        assert!(
+            !dir.path().join("old-session.json").exists(),
+            "a week-old session file is still swept"
+        );
+        assert!(
+            dir.path().join(MAINTENANCE_FILE).exists(),
+            "the maintenance throttle record is long-lived and must survive a quiet week"
         );
     }
 }
