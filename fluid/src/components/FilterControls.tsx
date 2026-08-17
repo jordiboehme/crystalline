@@ -255,9 +255,15 @@ export const MAX_VISIBLE_TAGS = 12;
  * expander would put the wall back one click away; the filter answers the
  * question a reader with three hundred tags actually has, which is "is there a
  * tag for this", and it costs no request because the whole vocabulary is
- * already in hand. Two rules keep the cap honest: a chosen tag is drawn first
- * and so is never the one hidden, and while the filter is narrowing, the
- * matches live in a box that scrolls rather than in a page that grows.
+ * already in hand. Three rules keep the cap honest. The cap applies to the
+ * unselected fill alone, so every chosen tag is drawn whatever the count - a
+ * reader who turned a filter on is owed the control that turns it off, and a
+ * rail that hid one would strand its own filter. While the filter is
+ * narrowing, the matches live in a box that scrolls rather than in a page that
+ * grows. And the filter outlives the vocabulary that justified it: the input
+ * stays while it holds anything, so a reader who narrows a three-hundred-tag
+ * domain and then moves to an eight-tag one still has the box that is hiding
+ * their chips.
  */
 export function TagChips({
   tags,
@@ -276,15 +282,24 @@ export function TagChips({
   // Selected first, in the order they were turned on, then the vocabulary as
   // it arrived - which is commonest first, so this is a slice and not a sort.
   const byName = new Map(tags.map((tag) => [tag.name, tag]));
-  const ordered = [
-    ...chosen
-      .map((name) => byName.get(name))
-      .filter((tag) => tag !== undefined),
-    ...tags.filter((tag) => !chosen.includes(tag.name)),
-  ];
+  const selected = chosen
+    .map((name) => byName.get(name))
+    .filter((tag) => tag !== undefined);
+  const rest = tags.filter((tag) => !chosen.includes(tag.name));
+  // The cap bounds the fill, not the selection: a reader with thirteen tags on
+  // sees thirteen chips, because the thirteenth is a filter they can only turn
+  // off from the chip that says it is on.
   const shown = narrowing
-    ? ordered.filter((tag) => tag.name.toLowerCase().includes(needle))
-    : ordered.slice(0, MAX_VISIBLE_TAGS);
+    ? [...selected, ...rest].filter((tag) =>
+        tag.name.toLowerCase().includes(needle),
+      )
+    : [
+        ...selected,
+        ...rest.slice(0, Math.max(0, MAX_VISIBLE_TAGS - selected.length)),
+      ];
+  // The controls appear for the vocabulary that needs them and stay for as
+  // long as the filter holds anything, so the escape hatch outlives the
+  // condition that opened it.
   const overflowing = tags.length > MAX_VISIBLE_TAGS;
   const hidden = tags.length - shown.length;
 
@@ -296,7 +311,7 @@ export function TagChips({
     <ChipRow
       label="Tags"
       listClassName={narrowing ? "max-h-32 overflow-y-auto" : ""}
-      {...(overflowing
+      {...(overflowing || narrowing
         ? {
             control: (
               <span className="flex items-baseline gap-2">

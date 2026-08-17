@@ -83,11 +83,30 @@ describe("the tag facet", () => {
     render(<Harness tags={vocabulary(300)} initial={["tag-299"]} />);
 
     const names = chipNames();
-    // Selected first, and the cap still holds: the rail does not grow by one
-    // for every tag a reader turns on.
+    // Selected first, and the fill gives up a place for it rather than the
+    // rail growing: one chosen plus eleven commonest is still twelve.
     expect(names[0]).toContain("#tag-299");
     expect(names).toHaveLength(MAX_VISIBLE_TAGS);
     expect(screen.getByRole("button", { name: "+288 more" })).toBeVisible();
+  });
+
+  it("draws every chosen tag, cap or no cap: the cap bounds the fill", () => {
+    const chosen = Array.from(
+      { length: MAX_VISIBLE_TAGS + 1 },
+      (_, index) => `tag-${String(200 + index)}`,
+    );
+    render(<Harness tags={vocabulary(300)} initial={chosen} />);
+
+    const names = chipNames();
+    // Thirteen on means thirteen chips. A filter a reader turned on can only
+    // be turned off from its own chip, so hiding one would strand it.
+    expect(names).toHaveLength(chosen.length);
+    // In selection order, and every one of them: a chip reads `#name` and
+    // then its engram count.
+    for (const [index, name] of chosen.entries()) {
+      expect(names[index]?.startsWith(`#${name}`)).toBe(true);
+    }
+    expect(screen.getByRole("button", { name: "+287 more" })).toBeVisible();
   });
 
   it("narrows to the substring matches, inside a box that scrolls", async () => {
@@ -112,6 +131,24 @@ describe("the tag facet", () => {
 
     expect(chipNames()).toHaveLength(0);
     expect(screen.getByText("no tag matches")).toBeVisible();
+  });
+
+  it("keeps the filter reachable when the vocabulary shrinks under it", async () => {
+    const user = userEvent.setup();
+    const { rerender } = render(<Harness tags={vocabulary(300)} />);
+
+    await user.type(screen.getByLabelText("Filter tags"), "nothing-like-this");
+    expect(screen.getByText("no tag matches")).toBeVisible();
+
+    // The reader moves to a small domain whose vocabulary is already cached:
+    // same component, new tags, and a filter nobody unmounted. The box that
+    // is hiding every chip has to still be there to be cleared.
+    rerender(<Harness tags={vocabulary(8)} />);
+    expect(chipNames()).toHaveLength(0);
+
+    const box = screen.getByLabelText("Filter tags");
+    await user.clear(box);
+    expect(chipNames()).toHaveLength(8);
   });
 
   it("sends the reader to the filter when they ask what is hidden", async () => {
