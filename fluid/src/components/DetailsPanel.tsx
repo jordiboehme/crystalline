@@ -85,9 +85,7 @@ export function DetailsPanel({ frontmatter, address }: DetailsPanelProps) {
         )}
         {generatedBy !== null && (
           <Row label="Captured by">
-            <span className="text-slate-500 dark:text-slate-400">
-              {formatActor(generatedBy)}
-            </span>
+            <span>{formatActor(generatedBy)}</span>
           </Row>
         )}
         {stamp !== null && (
