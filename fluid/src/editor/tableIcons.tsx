@@ -75,6 +75,13 @@ const ROW_STROKES = [
  * The two uprights every alignment mark is drawn between: the delete glyph's
  * own outer columns, at the same coordinates, so the family is recognisably
  * one family and the frame never shifts a hair from row to row.
+ *
+ * Written out again rather than sliced off the front of `COLUMN_STROKES`,
+ * even though the four strings are identical today. A slice would tie five
+ * drawings to one edit: nudging the delete glyph's uprights - a decision about
+ * that glyph, made looking at that glyph - would silently move the frame under
+ * all four alignment marks. They match because both were drawn that way, not
+ * because one is defined in terms of the other.
  */
 const COLUMN_FRAME = ["M4 4v16", "M20 4v16"];
 
