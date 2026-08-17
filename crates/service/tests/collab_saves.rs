@@ -2,6 +2,8 @@
 //! saver pass takes `now`, so a debounce window is a value rather than a wait.
 //! Every assertion is about what reaches the file and what the room is told.
 
+mod support;
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -37,7 +39,8 @@ fn write_manifest(dir: &std::path::Path, name: &str) {
 /// `oak` holding MANIFEST and one note - synced into an in-memory store.
 /// Mirrors `collab_session.rs::engine_fixture`; integration test crates share
 /// no helpers, so it is copied rather than imported.
-async fn engine_fixture() -> (tempfile::TempDir, Arc<Engine>) {
+async fn engine_fixture() -> (tempfile::TempDir, Arc<Engine>, support::ScratchStateDir) {
+    let scratch = support::ScratchStateDir::acquire();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
     let mut cfg = GlobalConfig::default();
@@ -72,7 +75,7 @@ async fn engine_fixture() -> (tempfile::TempDir, Arc<Engine>) {
         Some(config_path),
     ));
     engine.sync(None).await.unwrap();
-    (tmp, engine)
+    (tmp, engine, scratch)
 }
 
 /// Frame one client update the way the provider sends it.
@@ -166,7 +169,7 @@ async fn next_control(rx: &mut tokio::sync::broadcast::Receiver<Frame>) -> Contr
 
 #[tokio::test]
 async fn a_pause_lands_the_save_with_the_separator_reapplied() {
-    let (tmp, engine) = engine_fixture().await;
+    let (tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine.clone());
     let mut joined = sessions.join("eng", "crlf").await.unwrap();
     let doc = sync_client(&joined).await;
@@ -189,12 +192,23 @@ async fn a_pause_lands_the_save_with_the_separator_reapplied() {
     );
     let saved = next_control(&mut joined.rx).await;
     assert!(matches!(saved, Control::Saved { .. }));
+
+    // The editor is the surface most human authoring comes through, and it
+    // reaches the engine directly rather than through the REST write handler,
+    // so the domain owes a consolidation sweep from here too.
+    assert!(
+        crystalline_service::maintenance::load()
+            .pending_domains
+            .contains(&"eng".to_string()),
+        "a landed co-editing save marks its domain pending"
+    );
 }
 
 #[tokio::test]
 async fn an_untouched_session_never_writes() {
-    let (tmp, engine) = engine_fixture().await;
+    let (tmp, engine, _scratch) = engine_fixture().await;
     let before = std::fs::read(tmp.path().join("eng/crlf.md")).unwrap();
+    let maintenance_before = crystalline_service::maintenance::load();
     let sessions = CollabSessions::new(engine);
     let joined = sessions.join("eng", "crlf").await.unwrap();
     let _doc = sync_client(&joined).await;
@@ -204,6 +218,11 @@ async fn an_untouched_session_never_writes() {
     sessions.dispose_if_empty(&joined.session).await;
     let after = std::fs::read(tmp.path().join("eng/crlf.md")).unwrap();
     assert_eq!(before, after, "open-then-close is byte-identical");
+    assert_eq!(
+        crystalline_service::maintenance::load(),
+        maintenance_before,
+        "a session that wrote nothing owes no sweep"
+    );
 }
 
 #[tokio::test]
@@ -212,7 +231,7 @@ async fn a_joining_client_alone_never_arms_a_save() {
     // its own, which marks the session dirty while carrying no edit. The
     // debounce gates on the text comparison, not on that flag, so the elapsed
     // window still writes nothing and the file keeps its mtime.
-    let (tmp, engine) = engine_fixture().await;
+    let (tmp, engine, _scratch) = engine_fixture().await;
     let path = tmp.path().join("eng/alpha.md");
     let before = std::fs::metadata(&path).unwrap().modified().unwrap();
     let sessions = CollabSessions::new(engine);
@@ -244,7 +263,7 @@ async fn a_joining_client_alone_never_arms_a_save() {
 
 #[tokio::test]
 async fn the_last_leave_lands_the_final_save() {
-    let (tmp, engine) = engine_fixture().await;
+    let (tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
     let joined = sessions.join("eng", "alpha").await.unwrap();
     let doc = sync_client(&joined).await;
@@ -259,7 +278,7 @@ async fn the_last_leave_lands_the_final_save() {
 
 #[tokio::test]
 async fn a_flush_request_saves_now_not_after_the_debounce() {
-    let (tmp, engine) = engine_fixture().await;
+    let (tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
     let joined = sessions.join("eng", "alpha").await.unwrap();
     let doc = sync_client(&joined).await;
@@ -278,7 +297,7 @@ async fn a_flush_request_saves_now_not_after_the_debounce() {
 async fn a_tick_inside_the_debounce_window_holds_the_save_back() {
     // Typing is not a save: the pass that runs while the window is still open
     // writes nothing, and the one past it writes everything.
-    let (tmp, engine) = engine_fixture().await;
+    let (tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
     let joined = sessions.join("eng", "alpha").await.unwrap();
     let doc = sync_client(&joined).await;
@@ -301,7 +320,7 @@ async fn a_tick_inside_the_debounce_window_holds_the_save_back() {
 
 #[tokio::test]
 async fn a_refused_save_blocks_saving_not_editing_and_recovers() {
-    let (tmp, engine) = engine_fixture().await;
+    let (tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
     let mut joined = sessions.join("eng", "alpha").await.unwrap();
     let doc = sync_client(&joined).await;
@@ -367,7 +386,7 @@ async fn a_joiner_into_a_blocked_room_is_greeted_with_the_standing_refusal() {
     // never repeats a detail it has already announced: the greeting is the
     // only place a joiner can learn that the room cannot save. Without it the
     // second author reads "Saved" over an engram nothing has written since.
-    let (_tmp, engine) = engine_fixture().await;
+    let (_tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
     let mut first = sessions.join("eng", "alpha").await.unwrap();
     let doc = sync_client(&first).await;
@@ -404,7 +423,7 @@ async fn a_joiner_into_a_blocked_room_is_greeted_with_the_standing_refusal() {
 
 #[tokio::test]
 async fn a_frontmatter_rename_moves_the_session_and_the_receipt_says_so() {
-    let (_tmp, engine) = engine_fixture().await;
+    let (_tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine.clone());
     let mut joined = sessions.join("eng", "alpha").await.unwrap();
     let doc = sync_client(&joined).await;
@@ -460,7 +479,7 @@ async fn a_rename_moves_the_registry_key_so_the_new_permalink_finds_the_same_roo
     // Without the re-key a client that follows the Saved { permalink }
     // broadcast would open a SECOND room over the same file, and the two would
     // fight over one CAS token.
-    let (_tmp, engine) = engine_fixture().await;
+    let (_tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
     let joined = sessions.join("eng", "alpha").await.unwrap();
     let doc = sync_client(&joined).await;
@@ -479,7 +498,7 @@ async fn the_old_permalink_stops_resolving_after_a_rename() {
     // The stale key is gone rather than left pointing at the renamed room: a
     // client that asks for alpha gets the engine's own miss and falls back to
     // solo editing, instead of adopting a room whose content is now beta.
-    let (_tmp, engine) = engine_fixture().await;
+    let (_tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
     let joined = sessions.join("eng", "alpha").await.unwrap();
     let doc = sync_client(&joined).await;
@@ -498,7 +517,7 @@ async fn the_old_permalink_stops_resolving_after_a_rename() {
 
 #[tokio::test]
 async fn a_renamed_session_still_disposes_cleanly() {
-    let (_tmp, engine) = engine_fixture().await;
+    let (_tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
     let joined = sessions.join("eng", "alpha").await.unwrap();
     let doc = sync_client(&joined).await;
@@ -520,7 +539,7 @@ async fn a_blocked_session_backs_off_instead_of_hammering_the_engine() {
     // The edit timers stay armed while a document is unsaveable, so an
     // unguarded retry would call the engine on every 250ms tick for as long as
     // the author leaves the frontmatter broken.
-    let (tmp, engine) = engine_fixture().await;
+    let (tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
     let mut joined = sessions.join("eng", "alpha").await.unwrap();
     let doc = sync_client(&joined).await;
@@ -570,7 +589,7 @@ async fn a_blocked_session_backs_off_instead_of_hammering_the_engine() {
 
 #[tokio::test]
 async fn a_flush_retries_a_blocked_save_immediately() {
-    let (tmp, engine) = engine_fixture().await;
+    let (tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
     let mut joined = sessions.join("eng", "alpha").await.unwrap();
     let doc = sync_client(&joined).await;
@@ -613,7 +632,7 @@ async fn a_flush_retries_a_blocked_save_immediately() {
 async fn a_poisoned_session_closes_the_room_and_never_saves_again() {
     // The containment a panicked saver pass buys: the room is told, the
     // session stops writing, and no later join can adopt the dead room.
-    let (tmp, engine) = engine_fixture().await;
+    let (tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
     let mut joined = sessions.join("eng", "alpha").await.unwrap();
     let doc = sync_client(&joined).await;
@@ -651,7 +670,7 @@ async fn a_poisoned_session_closes_the_room_and_never_saves_again() {
 /// are untouched.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dispose_domain_saves_then_closes_only_that_domains_rooms() {
-    let (tmp, engine) = engine_fixture().await;
+    let (tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine.clone());
     let mut joined_eng = sessions.join("eng", "alpha").await.unwrap();
     let joined_oak = sessions.join("oak", "oak-note").await.unwrap();
@@ -689,7 +708,7 @@ async fn a_second_refusal_with_a_new_reason_reaches_the_room() {
     // The room's alert must name the reason that applies NOW: a save-blocked
     // session that breaks a different way has to re-broadcast, or the author
     // keeps reading the refusal before last.
-    let (_tmp, engine) = engine_fixture().await;
+    let (_tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
     let mut joined = sessions.join("eng", "alpha").await.unwrap();
     let doc = sync_client(&joined).await;

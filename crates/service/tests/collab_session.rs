@@ -2,6 +2,8 @@
 //! clients and exchange encoded protocol frames through handle_frame, so
 //! every assertion is about session semantics rather than transport.
 
+mod support;
+
 use std::sync::Arc;
 
 use crystalline_core::config::{DomainEntry, GlobalConfig, ResponseFormat, ServiceConfig};
@@ -26,7 +28,8 @@ const WIDE: &str = "---\ntype: engram\ntitle: Wide\npermalink: wide\ntags:\n  - 
 /// mixed-endings one, synced into an in-memory store. Mirrors
 /// `engine_writes.rs::engine_fixture`; integration test crates share no
 /// helpers, so it is copied rather than imported.
-async fn engine_fixture() -> (tempfile::TempDir, Arc<Engine>) {
+async fn engine_fixture() -> (tempfile::TempDir, Arc<Engine>, support::ScratchStateDir) {
+    let scratch = support::ScratchStateDir::acquire();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
     let mut cfg = GlobalConfig::default();
@@ -65,7 +68,7 @@ async fn engine_fixture() -> (tempfile::TempDir, Arc<Engine>) {
         Some(config_path),
     ));
     engine.sync(None).await.unwrap();
-    (tmp, engine)
+    (tmp, engine, scratch)
 }
 
 /// A JS-shaped client: a plain yjs-compatible doc mirroring the session.
@@ -106,7 +109,7 @@ async fn synced_client(
 
 #[tokio::test]
 async fn the_first_join_loads_the_file_and_greets_with_hello_and_step1() {
-    let (_tmp, engine) = engine_fixture().await;
+    let (_tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
     let joined = sessions.join("eng", "crlf").await.unwrap();
 
@@ -139,7 +142,7 @@ async fn the_first_join_loads_the_file_and_greets_with_hello_and_step1() {
 
 #[tokio::test]
 async fn a_client_syncs_and_reads_the_lf_session_text() {
-    let (_tmp, engine) = engine_fixture().await;
+    let (_tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
     let joined = sessions.join("eng", "crlf").await.unwrap();
 
@@ -162,7 +165,7 @@ async fn a_non_ascii_engram_round_trips_byte_for_byte() {
     // The session doc counts UTF-16 units, the way the JS client does; a
     // document full of multi-byte characters must still come back out of the
     // session exactly as it went in, or the first save would rewrite it.
-    let (_tmp, engine) = engine_fixture().await;
+    let (_tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
     let joined = sessions.join("eng", "wide").await.unwrap();
 
@@ -178,7 +181,7 @@ async fn a_non_ascii_engram_round_trips_byte_for_byte() {
 
 #[tokio::test]
 async fn an_update_from_one_conn_fans_out_tagged_with_its_origin() {
-    let (_tmp, engine) = engine_fixture().await;
+    let (_tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
     let alice = sessions.join("eng", "alpha").await.unwrap();
     let mut bob = sessions.join("eng", "alpha").await.unwrap();
@@ -219,7 +222,7 @@ async fn an_update_from_one_conn_fans_out_tagged_with_its_origin() {
 
 #[tokio::test]
 async fn awareness_states_fan_out_and_null_on_disconnect() {
-    let (_tmp, engine) = engine_fixture().await;
+    let (_tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
     let alice = sessions.join("eng", "alpha").await.unwrap();
     let mut bob = sessions.join("eng", "alpha").await.unwrap();
@@ -260,7 +263,7 @@ async fn awareness_states_fan_out_and_null_on_disconnect() {
 
 #[tokio::test]
 async fn a_late_joiner_is_greeted_with_the_presence_already_in_the_room() {
-    let (_tmp, engine) = engine_fixture().await;
+    let (_tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
     let alice = sessions.join("eng", "alpha").await.unwrap();
     let update = yrs::sync::AwarenessUpdate {
@@ -287,7 +290,7 @@ async fn a_late_joiner_is_greeted_with_the_presence_already_in_the_room() {
 
 #[tokio::test]
 async fn an_awareness_query_is_answered_directly_not_broadcast() {
-    let (_tmp, engine) = engine_fixture().await;
+    let (_tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
     let alice = sessions.join("eng", "alpha").await.unwrap();
     let update = yrs::sync::AwarenessUpdate {
@@ -316,7 +319,7 @@ async fn an_awareness_query_is_answered_directly_not_broadcast() {
 
 #[tokio::test]
 async fn a_malformed_frame_is_dropped_without_killing_the_session() {
-    let (_tmp, engine) = engine_fixture().await;
+    let (_tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
     let joined = sessions.join("eng", "alpha").await.unwrap();
 
@@ -336,7 +339,7 @@ async fn a_malformed_frame_is_dropped_without_killing_the_session() {
 
 #[tokio::test]
 async fn mixed_endings_and_full_rooms_are_refused() {
-    let (_tmp, engine) = engine_fixture().await;
+    let (_tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
     let refused = sessions.join("eng", "mixed").await.unwrap_err();
     assert!(matches!(
@@ -357,7 +360,7 @@ async fn mixed_endings_and_full_rooms_are_refused() {
 
 #[tokio::test]
 async fn an_unknown_engram_is_an_engine_error_not_a_session() {
-    let (_tmp, engine) = engine_fixture().await;
+    let (_tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
     let refused = sessions.join("eng", "ghost").await.unwrap_err();
     assert!(matches!(
@@ -373,7 +376,7 @@ async fn an_unknown_engram_is_an_engine_error_not_a_session() {
 
 #[tokio::test]
 async fn the_last_leave_disposes_the_session() {
-    let (_tmp, engine) = engine_fixture().await;
+    let (_tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine.clone());
     let joined = sessions.join("eng", "alpha").await.unwrap();
     assert_eq!(sessions.session_count().await, 1);
@@ -388,7 +391,7 @@ async fn the_last_leave_disposes_the_session() {
 
 #[tokio::test]
 async fn a_populated_session_survives_dispose_if_empty() {
-    let (_tmp, engine) = engine_fixture().await;
+    let (_tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
     let alice = sessions.join("eng", "alpha").await.unwrap();
     let bob = sessions.join("eng", "alpha").await.unwrap();

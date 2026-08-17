@@ -16,13 +16,24 @@
 //! - the Stop hook, which reads the file to decide whether to nudge and
 //!   stamps `last_nudge_at` when it does.
 //!
-//! Concurrency is deliberately last-write-wins. Every write is a
-//! load-merge-save through [`crystalline_core::config::save_bytes`], so a
-//! reader never observes a half-written file, but two writers racing on the
-//! same instant can lose one of the two merges. That is the right trade here:
-//! the loser costs a nudge that arrives one session later, and the alternative
-//! (a lock file around a throttle record) would let a stuck lock block the
-//! write path it is meant to annotate.
+//! Concurrency has two halves, and only one of them is last-write-wins.
+//!
+//! Within this process every write - load, merge, encode, install - runs under
+//! `WRITE_LOCK`, a plain mutex held for the few microseconds the sequence
+//! takes and never across an `.await`. That is not tidiness: the atomic write
+//! underneath ([`crystalline_core::config::save_bytes`]) names its temporary
+//! sibling after the process id alone, so two writers in one process share one
+//! temporary path, and two unsynchronized handlers could interleave their
+//! truncating writes into it and rename the splice into place. The lock is
+//! what makes "the file a reader sees is one writer's complete bytes" true
+//! here; the rename itself is what makes it true against a reader.
+//!
+//! Across processes it stays last-write-wins, and deliberately so. Two
+//! installs writing at the same instant can lose one of the two merges - the
+//! temporary names differ, so the loser is a whole coherent file rather than a
+//! splice - and the loser costs a nudge that arrives one session later. The
+//! alternative, a lock file around a throttle record, would let a stuck lock
+//! block the write path it exists to annotate.
 //!
 //! For the same reason every writer treats failure as log-and-continue.
 //! [`record_pending`] and [`record_run`] swallow their errors at
@@ -163,8 +174,35 @@ fn load_from(path: &Path) -> MaintenanceState {
     }
 }
 
-/// [`save`] against an explicit file.
+/// Serializes this process's writers. Held across the whole load-merge-write
+/// sequence and never across an `.await`, which is why every function that
+/// takes it is synchronous and stays that way.
+///
+/// Poisoning is ignored (`unwrap_or_else(PoisonError::into_inner)`): a writer
+/// that panicked mid-sequence installed nothing, since the install is one
+/// rename of a fully written temporary file, so the next writer's own
+/// load-merge starts from a coherent file. Aborting the whole daemon over a
+/// throttle record would be the larger failure by far.
+static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take [`WRITE_LOCK`], ignoring poisoning.
+fn write_lock() -> std::sync::MutexGuard<'static, ()> {
+    WRITE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// [`save`] against an explicit file, under [`WRITE_LOCK`].
 fn save_to(path: &Path, state: &MaintenanceState) -> Result<(), ConfigError> {
+    let _write = write_lock();
+    write_locked(path, state)
+}
+
+/// Encode and install one state. The caller must already hold [`WRITE_LOCK`],
+/// which is why this is separate from [`save_to`]: the recorders below hold it
+/// across their load-merge, and a second acquisition here would deadlock on a
+/// mutex that is not reentrant.
+fn write_locked(path: &Path, state: &MaintenanceState) -> Result<(), ConfigError> {
     let stamped = MaintenanceState {
         v: STATE_VERSION,
         ..state.clone()
@@ -180,8 +218,11 @@ fn save_to(path: &Path, state: &MaintenanceState) -> Result<(), ConfigError> {
     config::save_bytes(path, &bytes)
 }
 
-/// [`record_pending`] against an explicit file.
+/// [`record_pending`] against an explicit file. The read and the write are one
+/// critical section, so a concurrent recorder in this process merges onto what
+/// this one installed rather than onto what it read.
 fn record_pending_at(path: &Path, domain: &str) -> Result<(), ConfigError> {
+    let _write = write_lock();
     let mut state = load_from(path);
     if !state.pending_domains.iter().any(|d| d == domain) {
         state.pending_domains.push(domain.to_string());
@@ -189,11 +230,13 @@ fn record_pending_at(path: &Path, domain: &str) -> Result<(), ConfigError> {
     if state.pending_since.is_none() {
         state.pending_since = Some(Utc::now());
     }
-    save_to(path, &state)
+    write_locked(path, &state)
 }
 
-/// [`record_run`] against an explicit file.
+/// [`record_run`] against an explicit file, one critical section like
+/// [`record_pending_at`].
 fn record_run_at(path: &Path, swept_domains: &[String]) -> Result<(), ConfigError> {
+    let _write = write_lock();
     let mut state = load_from(path);
     state.last_run_at = Some(Utc::now());
     state
@@ -202,7 +245,7 @@ fn record_run_at(path: &Path, swept_domains: &[String]) -> Result<(), ConfigErro
     if state.pending_domains.is_empty() {
         state.pending_since = None;
     }
-    save_to(path, &state)
+    write_locked(path, &state)
 }
 
 #[cfg(test)]
@@ -311,6 +354,31 @@ mod tests {
 
         record_run_at(&path, &[]).unwrap();
         assert_eq!(load_from(&path).pending_domains, vec!["eng".to_string()]);
+    }
+
+    /// Concurrent writers in one process never splice their bytes together and
+    /// never lose a domain: the atomic write's temporary sibling is named after
+    /// the process id alone, so two handlers writing at once would share one
+    /// scratch path without [`WRITE_LOCK`] holding them apart.
+    #[test]
+    fn concurrent_writers_in_one_process_all_land() {
+        let (_dir, path) = scratch();
+        let domains: Vec<String> = (0..16).map(|i| format!("d{i}")).collect();
+
+        std::thread::scope(|scope| {
+            for domain in &domains {
+                let path = path.clone();
+                scope.spawn(move || record_pending_at(&path, domain).unwrap());
+            }
+        });
+
+        let state = load_from(&path);
+        assert_eq!(state.v, STATE_VERSION, "the file parsed as this schema");
+        let mut landed = state.pending_domains.clone();
+        landed.sort();
+        let mut expected = domains.clone();
+        expected.sort();
+        assert_eq!(landed, expected, "every writer's domain survived");
     }
 
     #[test]
