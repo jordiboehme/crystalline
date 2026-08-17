@@ -31,9 +31,16 @@
 //!    `BEGIN IMMEDIATE` so they serialize against each other rather than
 //!    interleaving. Covering test:
 //!    `users_add_works_while_another_process_holds_the_auth_db` in the CLI's
-//!    `tests/users.rs`, which is the only one that spawns a second process.
-//!    `two_stores_on_one_file_interleave_writes` below covers the ordering
-//!    within one process and nothing about the locking.
+//!    `tests/users.rs`, which is the only one that spawns a second process, and
+//!    which is `#[cfg(unix)]` because turso 0.7.2 has no shared WAL
+//!    coordination on the default Windows IO backend (that file says the whole
+//!    of it). `two_stores_on_one_file_interleave_writes` below covers the
+//!    ordering within one process and nothing about the locking.
+//!
+//!    Where layer 1 cannot be had, the fallback open is what runs, and a
+//!    second process is then refused at open time: [`legacy_open_error`] turns
+//!    that refusal into a message that names the daemon holding the file and
+//!    the ways out, instead of turso's byte-range wording.
 //! 2. *Within one process*, every method serializes on `AuthStore::guard`,
 //!    because turso's [`Connection`] refuses concurrent use outright rather
 //!    than queueing. The daemon shares one `AuthStore` across axum handlers, so
@@ -386,13 +393,56 @@ async fn open_database(path: &Path) -> Result<Database> {
     tracing::warn!(
         error = %err,
         path = %path.display(),
-        "this filesystem does not support cross-process access to the auth database; \
+        "this platform does not support cross-process access to the auth database; \
          `crystalline users` will fail while the daemon is running"
     );
     Builder::new_local(&name)
         .build()
         .await
-        .with_context(|| format!("opening auth database {}", path.display()))
+        .map_err(|err| legacy_open_error(err, path))
+}
+
+/// Word a failed *fallback* open, the one that runs after multiprocess WAL
+/// turned out to be unavailable here.
+///
+/// One of its failures is not a defect but the predicted consequence of that
+/// fallback: with no shared WAL coordination the open takes an exclusive,
+/// process-scoped lock on the file, so whichever of the daemon and the CLI
+/// opens second is refused at open time. That is today's situation on Windows,
+/// where turso 0.7.2's default IO backend reports no shared WAL coordination
+/// (only the off-by-default `experimental_win_iocp` backend does), and it is
+/// also what a state directory on a network filesystem gets. Turso words it as
+/// a byte-range lock failure, which is true and useless: what the person at the
+/// terminal needs is what holds the file and which two ways out exist. Every
+/// other failure keeps the plain context, so a corrupt file is never reported
+/// as a running daemon.
+///
+/// Kept as a pure function of the error so it is testable on any OS, not only
+/// on the one platform that can produce the lock failure. Covering tests:
+/// `a_locked_fallback_open_says_what_holds_the_database` and
+/// `a_fallback_open_that_fails_for_another_reason_keeps_the_plain_context`.
+fn legacy_open_error(err: turso::Error, path: &Path) -> anyhow::Error {
+    if is_locked_by_another_process(&err) {
+        anyhow::Error::new(err).context(format!(
+            "the auth database {} is held by a running daemon and this platform cannot share it: \
+             manage accounts in the web UI, or stop the daemon (`crystalline ctl shutdown`) and \
+             try again",
+            path.display()
+        ))
+    } else {
+        anyhow::Error::new(err).context(format!("opening auth database {}", path.display()))
+    }
+}
+
+/// Whether an open failed because another process already holds the file.
+///
+/// Matched on the message for the same reason as
+/// [`is_multiprocess_unsupported`]: turso flattens `LimboError` into the
+/// catch-all `turso::Error::Error(String)`, so the `Locking error:` prefix that
+/// `LimboError::LockingError`'s `Display` writes is the only thing left to
+/// match on.
+fn is_locked_by_another_process(err: &turso::Error) -> bool {
+    err.to_string().contains("Locking error")
 }
 
 /// Whether this open failed because multiprocess WAL cannot be had here at
@@ -2032,6 +2082,54 @@ mod tests {
         assert!(
             is_multiprocess_unsupported(&err),
             "the fallback no longer recognizes turso's message: {err}"
+        );
+    }
+
+    /// A locked fallback open is the one failure a user can do something
+    /// about, so it must say what to do rather than hand back turso's byte
+    /// range wording. The error is synthesized here because the platform that
+    /// produces it (Windows, whose default IO backend has no shared WAL
+    /// coordination) is not the platform this test usually runs on: the
+    /// mapping is a pure function of the message, so it is testable
+    /// everywhere.
+    #[test]
+    fn a_locked_fallback_open_says_what_holds_the_database() {
+        let locked = turso::Error::Error(
+            "Locking error: Failed locking file, The process cannot access the file because \
+             another process has locked a portion of the file. (os error 33)"
+                .to_string(),
+        );
+        let err = legacy_open_error(locked, Path::new("/state/web-auth.db"));
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("held by a running daemon"),
+            "the message must name what holds the file: {text}"
+        );
+        assert!(
+            text.contains("crystalline ctl shutdown"),
+            "the message must name the way out: {text}"
+        );
+        assert!(
+            text.contains("web-auth.db"),
+            "the message must name the file: {text}"
+        );
+    }
+
+    /// Any other reason a fallback open fails is not the locked case and must
+    /// keep the plain context, so a corrupt file or a missing directory is not
+    /// reported as a running daemon.
+    #[test]
+    fn a_fallback_open_that_fails_for_another_reason_keeps_the_plain_context() {
+        let other = turso::Error::Error("file is not a database".to_string());
+        let err = legacy_open_error(other, Path::new("/state/web-auth.db"));
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("opening auth database"),
+            "an unrelated failure keeps the plain wording: {text}"
+        );
+        assert!(
+            !text.contains("running daemon"),
+            "an unrelated failure must not blame a daemon: {text}"
         );
     }
 

@@ -8,6 +8,12 @@
 //! store serializes its writers across processes - so account management works
 //! whether or not a daemon is running, and a running daemon picks the change
 //! up on its next lookup without a restart.
+//!
+//! Except on Windows, where the database engine has no cross-process
+//! coordination on its default IO backend yet, so a running daemon holds the
+//! file exclusively: a command here then fails at open time with the message
+//! `legacy_open_error` in `crystalline-service`'s `rest::auth_store` writes,
+//! which points at the web UI or at stopping the daemon.
 
 use std::io::{IsTerminal, Read, Write};
 

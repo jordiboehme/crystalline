@@ -6,7 +6,10 @@
 use assert_cmd::Command;
 
 mod common;
-use common::{isolate, isolation_env};
+use common::isolate;
+// Used only by the cross-process test below, which is unix-only (see there).
+#[cfg(unix)]
+use common::isolation_env;
 
 fn bin() -> Command {
     Command::cargo_bin("crystalline").unwrap()
@@ -327,14 +330,41 @@ fn a_password_is_required_and_a_non_terminal_run_must_pass_password_stdin() {
     assert!(err.contains("password"), "{err}");
 }
 
+// Everything from here to the end of the file is the cross-process test and
+// its machinery, and all of it is `#[cfg(unix)]`, because the promise it pins
+// is unix-only today.
+//
+// `AuthStore` opens `web-auth.db` with turso's experimental multiprocess WAL
+// so that two processes can hold it at once. turso 0.7.2 grants that only on
+// an IO backend that reports `supports_shared_wal_coordination`, and on
+// Windows the default backend (`WindowsIO`) does not: the trait default is
+// `false` and only `WindowsIOCP`, behind the off-by-default
+// `experimental_win_iocp` cargo feature, overrides it. So the multiprocess
+// open is refused there, `AuthStore` falls back to a legacy open, and a legacy
+// open on Windows takes an exclusive one-byte lock on the file with
+// `LOCKFILE_FAIL_IMMEDIATELY`, which refuses the second process outright. The
+// holder below wins the race and the CLI's open dies with a locking error, so
+// this test fails deterministically on Windows rather than flakily. What a
+// Windows user gets instead is the message `legacy_open_error` in
+// `crystalline-service`'s `rest::auth_store` writes, which names the daemon
+// and the way out; that mapping is tested there, on every platform.
+//
+// Delete the `cfg(unix)` attributes and this comment once either unlock
+// lands: turso shipping shared WAL coordination on the default Windows
+// backend, or `experimental_win_iocp` shedding its experimental label so we
+// can select it. Nothing else about the test needs to change.
+
 /// Names the auth database this process must hold open, turning this test
 /// binary into the stand-in for a running daemon (see [`holds_the_auth_db`]).
 /// The value is the isolated home, from which the child derives every path.
+#[cfg(unix)]
 const HOLD_ENV: &str = "CRYSTALLINE_TEST_AUTH_HOLD";
 
 /// The child touches this file once its `AuthStore` is open, and exits once
 /// the parent creates [`STOP_FILE`] beside it.
+#[cfg(unix)]
 const READY_FILE: &str = "auth-hold-ready";
+#[cfg(unix)]
 const STOP_FILE: &str = "auth-hold-stop";
 
 /// The daemon stand-in, run as a child process by
@@ -347,6 +377,7 @@ const STOP_FILE: &str = "auth-hold-stop";
 /// `Database` and never touches the file lock that the CLI trips over. See
 /// `two_stores_on_one_file_interleave_writes` in `crystalline-service`, which
 /// is the same-process test and says so.
+#[cfg(unix)]
 #[test]
 fn holds_the_auth_db() {
     let Ok(home) = std::env::var(HOLD_ENV) else {
@@ -403,6 +434,12 @@ fn holds_the_auth_db() {
 /// both come after the open. `AuthStore` therefore opens with turso's
 /// multiprocess WAL, and this test is the only one that can tell the
 /// difference: it holds the database open in a second, real process.
+///
+/// Unix-only, for the upstream reason spelled out above the constants: turso
+/// 0.7.2's default Windows IO backend reports no shared WAL coordination, so
+/// the multiprocess open is refused there and the legacy fallback's exclusive
+/// file lock refuses the second process.
+#[cfg(unix)]
 #[test]
 fn users_add_works_while_another_process_holds_the_auth_db() {
     let home = tempfile::tempdir().unwrap();
@@ -464,8 +501,10 @@ fn users_add_works_while_another_process_holds_the_auth_db() {
 /// path shut the holder down at once. On the success path the child has
 /// already exited through `STOP_FILE` by the time this runs, and both calls
 /// below are no-ops.
+#[cfg(unix)]
 struct Holder(std::process::Child);
 
+#[cfg(unix)]
 impl Drop for Holder {
     fn drop(&mut self) {
         let _ = self.0.kill();
