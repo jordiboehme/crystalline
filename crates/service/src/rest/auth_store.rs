@@ -1497,6 +1497,29 @@ async fn verify_hash(hash: String, password: String) -> Result<bool> {
 mod tests {
     use super::*;
 
+    /// Whether [`open_database`] is expected to reach multiprocess WAL on the
+    /// platform these tests are running on, rather than falling back to a
+    /// legacy open. Observable as the `web-auth.db-tshm` coordination file
+    /// beside the database, which only the multiprocess open creates.
+    ///
+    /// Stated once here, with its two upstream conditions, so no assertion has
+    /// to carry a `cfg` of its own:
+    ///
+    /// * turso_core's `host_shared_wal` cfg, which its `build.rs` sets to
+    ///   `all(any(unix, target_os = "windows"), target_pointer_width = "64")`.
+    ///   Where it is off the flag is a documented no-op and legacy behavior
+    ///   stays, so a 32-bit target never gets the coordination file.
+    /// * an IO backend whose `supports_shared_wal_coordination` is true
+    ///   (turso_core 0.7.2 `io/mod.rs`, where the trait default is `false`).
+    ///   The unix and io_uring backends override it to `true`; the default
+    ///   Windows backend, `WindowsIO`, does not, and only `WindowsIOCP`,
+    ///   compiled only under the off-by-default `experimental_win_iocp` cargo
+    ///   feature, does. So a Windows open takes the fallback.
+    ///
+    /// The day either changes upstream, whatever reads this goes red rather
+    /// than quietly stale, which is the point of asserting the mode at all.
+    const MULTIPROCESS_WAL_EXPECTED: bool = cfg!(unix) && cfg!(target_pointer_width = "64");
+
     async fn store() -> (tempfile::TempDir, AuthStore) {
         let dir = tempfile::tempdir().unwrap();
         let store = AuthStore::open(&dir.path().join("web-auth.db"))
@@ -2031,6 +2054,12 @@ mod tests {
     /// `-tshm` sibling created on demand, so an existing state directory needs
     /// no migration. This writes the file exactly as the previous build did,
     /// closes it and reopens it the way [`open_database`] now does.
+    ///
+    /// The title's promise - that it still opens, with its accounts, and stays
+    /// writable - is asserted everywhere. Which mode did the opening is
+    /// asserted against [`MULTIPROCESS_WAL_EXPECTED`], because on Windows
+    /// multiprocess WAL is refused and the fallback is the correct outcome
+    /// there, not a defect.
     #[tokio::test]
     async fn a_database_written_without_the_multiprocess_flag_still_opens() {
         let dir = tempfile::tempdir().unwrap();
@@ -2053,16 +2082,19 @@ mod tests {
 
         let store = AuthStore::open(&path)
             .await
-            .expect("an existing legacy-mode database must open in multiprocess mode");
+            .expect("an existing legacy-mode database must open");
         let users = store.list_users().await.unwrap();
         assert_eq!(users.len(), 1, "the accounts survived the mode change");
         assert_eq!(users[0].name, "ada");
         // The account is still editable, so the reopen is a real read-write
         // open and not a degraded one.
         store.set_role("ada", Role::Admin).await.unwrap();
-        assert!(
+        assert_eq!(
             path.with_file_name("web-auth.db-tshm").exists(),
-            "multiprocess mode is what actually opened the file"
+            MULTIPROCESS_WAL_EXPECTED,
+            "the mode that opened the file must be the one this platform can \
+             have (see MULTIPROCESS_WAL_EXPECTED): multiprocess leaves the \
+             coordination file beside the database, the fallback leaves none"
         );
     }
 
