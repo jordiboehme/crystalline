@@ -1040,7 +1040,7 @@ fn detect_lifecycle(input: &SweepInput, graph: &Graph<'_>, report: &mut SweepRep
             && fact.recorded_at.is_some_and(|d| d < today)
         {
             let evidence = format!(
-                "generated.by {}, recorded {}, no verified entry",
+                "generated.by {}; recorded {}; no verified entry",
                 fact.generated_by.as_deref().unwrap_or(""),
                 fact.recorded_at.map(|d| d.to_string()).unwrap_or_default(),
             );

@@ -418,6 +418,13 @@ fn v006_fires_on_an_unreviewed_human_capture() {
         vec!["V006"],
         "nothing else speaks about a fresh human capture"
     );
+
+    // The actor prefix is read case-insensitively, so an actor a person typed
+    // by hand counts the same as one Crystalline wrote.
+    let mut shouted = fact(1, "incident-decision");
+    shouted.generated_by = Some("Human:Jordi".to_string());
+    let report = detect(&input(vec![shouted]));
+    assert_eq!(only(&report, "V006").priority, 58);
 }
 
 #[test]
@@ -436,12 +443,27 @@ fn v006_stays_quiet_when_any_condition_is_unmet() {
     reviewed.verified_on = Some(day("2026-07-20"));
     let mut written_today = human();
     written_today.recorded_at = Some(today());
+    // The sixth byte of this actor sits inside a three-byte character, which a
+    // byte slice would panic on. It simply does not match instead.
+    let mut split_character = human();
+    split_character.generated_by = Some("huma\u{65e5}n:jordi".to_string());
+    assert!(
+        !split_character
+            .generated_by
+            .as_deref()
+            .unwrap()
+            .is_char_boundary(6)
+    );
 
     for (label, quiet) in [
         ("an agent wrote it", agent),
         ("nothing records who wrote it", anonymous),
         ("somebody already verified it", reviewed),
         ("it is still being written today", written_today),
+        (
+            "the actor splits a character at the prefix",
+            split_character,
+        ),
     ] {
         let report = detect(&input(vec![quiet]));
         assert!(
