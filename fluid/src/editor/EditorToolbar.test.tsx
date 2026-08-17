@@ -382,10 +382,11 @@ describe("the table segment", () => {
   });
 
   test("the align menu says which alignment each row is", async () => {
-    // Taste again, and the reason the trigger changed glyph: a bar of icons
-    // has to say what it does before it is pressed, so the trigger wears the
-    // conventional alignment mark - the same one its own centre row wears -
-    // and each row carries its own, all three different from one another.
+    // Taste again, and the reason all four glyphs are hand drawn: the verb
+    // acts on a COLUMN, so every mark in this menu is framed as one, and the
+    // trigger no longer impersonates its own centre row. Four drawings, four
+    // different things said, none of them borrowed from the icon set - a row
+    // that drifted back to a bare text-alignment mark would lose the column.
     const user = userEvent.setup();
     mount(TABLE_DOC, IN_TABLE, IN_TABLE, true);
     const glyphOf = (element: HTMLElement) =>
@@ -400,11 +401,15 @@ describe("the table segment", () => {
     const rows = ["Align left", "Align center", "Align right"].map((name) =>
       glyphOf(screen.getByRole("menuitem", { name })),
     );
-    for (const row of rows) {
-      expect(row).toBeTruthy();
+    const glyphs = [trigger, ...rows];
+    for (const drawn of glyphs) {
+      expect(drawn).toBeTruthy();
+      // The set's own marks carry its stem; these carry ours, so a swap back
+      // to a borrowed glyph reads here rather than in a screenshot.
+      expect(drawn).not.toContain("lucide");
+      expect(drawn).toContain("crystalline-icon-align-column");
     }
-    expect(new Set(rows).size).toBe(3);
-    expect(trigger).toBe(rows[1]);
+    expect(new Set(glyphs).size).toBe(4);
   });
 
   /*
