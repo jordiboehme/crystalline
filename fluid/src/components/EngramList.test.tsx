@@ -289,6 +289,123 @@ describe("the engram list", () => {
     ).toBeVisible();
   });
 
+  it("leads with the match: a well-tagged row still shows its snippet", async () => {
+    const tags = Array.from({ length: 8 }, (_, i) => `tag-${String(i)}`);
+    mount(
+      <EngramList
+        queryKey={["test", "many-tags"]}
+        loadPage={() =>
+          Promise.resolve(
+            pageOf(
+              1,
+              [row(0, { tags, snippet: "The rule of thumb here." })],
+              1,
+            ),
+          )
+        }
+        label="Engrams"
+        emptyMessage="Nothing here."
+      />,
+    );
+
+    const link = await screen.findByRole("link", { name: /Alpha 0/ });
+    // The reason the row matched survives the tags rather than being pushed
+    // off the end of the line by them.
+    expect(link).toHaveTextContent("The rule of thumb here.");
+    expect(screen.getByText("#tag-0")).toBeVisible();
+    expect(screen.getByText("#tag-1")).toBeVisible();
+    expect(screen.queryByText("#tag-7")).toBeNull();
+
+    // What is hidden is said, and what it hides is one hover away.
+    const overflow = screen.getByText("+6");
+    expect(overflow).toHaveAttribute("title", tags.join(" "));
+  });
+
+  it("caps the row tags at two, and counts nothing it did not hide", async () => {
+    mount(
+      <EngramList
+        queryKey={["test", "tag-cap"]}
+        loadPage={() =>
+          Promise.resolve(
+            pageOf(
+              1,
+              [
+                row(0, { tags: [] }),
+                row(1, { tags: ["one", "two"] }),
+                row(2, { tags: ["one", "two", "three"] }),
+              ],
+              3,
+            ),
+          )
+        }
+        label="Engrams"
+        emptyMessage="Nothing here."
+      />,
+    );
+
+    const none = await screen.findByRole("link", { name: /Alpha 0/ });
+    expect(none.textContent).not.toContain("#");
+
+    const two = screen.getByRole("link", { name: /Alpha 1/ });
+    expect(two).toHaveTextContent("#one");
+    expect(two).toHaveTextContent("#two");
+    expect(two.textContent).not.toContain("+");
+
+    const three = screen.getByRole("link", { name: /Alpha 2/ });
+    expect(three).toHaveTextContent("#one");
+    expect(three).toHaveTextContent("#two");
+    expect(three.textContent).not.toContain("#three");
+    expect(screen.getByText("+1")).toHaveAttribute("title", "one two three");
+  });
+
+  it("says which domain a hit lives in only when it is asked to", async () => {
+    const page = () => Promise.resolve(pageOf(1, [row(0)], 1));
+
+    const { unmount } = mount(
+      <EngramList
+        queryKey={["test", "no-domain"]}
+        loadPage={page}
+        label="Engrams"
+        emptyMessage="Nothing here."
+      />,
+    );
+    expect(await screen.findByText("alpha-0")).toBeVisible();
+    expect(screen.queryByText("eng/alpha-0")).toBeNull();
+    unmount();
+
+    mount(
+      <EngramList
+        queryKey={["test", "with-domain"]}
+        loadPage={page}
+        label="Engrams"
+        emptyMessage="Nothing here."
+        showDomain
+      />,
+    );
+    expect(await screen.findByText("eng/alpha-0")).toBeVisible();
+  });
+
+  it("marks the searched words in a title the way it marks them in a snippet", async () => {
+    mount(
+      <EngramList
+        queryKey={["test", "title-mark"]}
+        loadPage={() =>
+          Promise.resolve(
+            pageOf(1, [row(0, { title: "The lantern protocol" })], 1),
+          )
+        }
+        label="Engrams"
+        emptyMessage="Nothing here."
+        highlight={["lantern"]}
+      />,
+    );
+
+    const link = await screen.findByRole("link", { name: /lantern protocol/ });
+    const marked = link.querySelector("mark");
+    expect(marked).not.toBeNull();
+    expect(marked).toHaveTextContent("lantern");
+  });
+
   it("offers the way out a caller hands it, beside the empty message", async () => {
     mount(
       <EngramList
