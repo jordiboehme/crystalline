@@ -64,7 +64,7 @@ Once knowledge grows into the thousands or tens of thousands of units, reading a
 
 ## Fluid, the web UI
 
-Everything an agent captures is a page you can read. Fluid is built into the binary and on by default at `http://localhost:7411`, so the daemon your agents already talk to serves people and agents on one port: nothing to deploy, and the first visit creates your admin account right in the browser.
+The primary author in Crystalline is the agent: it captures and refines engrams as it works. Fluid is how you take part directly - read what was learned, correct a fact, add knowledge of your own - in the browser, without going through the LLM or spending a token on it. Fluid is built into the binary and on by default at `http://localhost:7411`, so the daemon your agents already talk to serves people and agents on one port: nothing to deploy, and the first visit creates your admin account right in the browser.
 
 ![An engram in Fluid: frontmatter details, observations, typed relations and the agent's-eye view](assets/fluid-engram.jpg)
 
