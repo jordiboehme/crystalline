@@ -91,6 +91,39 @@ describe("the markdown renderer", () => {
     expect(screen.getByRole("columnheader", { name: "a" })).toBeVisible();
   });
 
+  it("aligns a table column the way its delimiter row asks", async () => {
+    // The colons in the delimiter row are the only place a markdown table can
+    // say how a column reads, and they arrive here as a `style` prop carrying
+    // `textAlign` - not as an `align` attribute - so a component map that
+    // takes only `children` drops them and every column renders left. Header
+    // and body cells both, because the alignment is the column's rather than
+    // the row's.
+    const { container } = await renderMarkdown(
+      [
+        "| mid | end | plain |",
+        "| :-: | --: | --- |",
+        "| 1 | 2 | 3 |",
+        "",
+      ].join("\n"),
+    );
+
+    const headers = [...container.querySelectorAll("th")];
+    const cells = [...container.querySelectorAll("td")];
+    expect(headers.map((cell) => cell.style.textAlign)).toEqual([
+      "center",
+      "right",
+      "",
+    ]);
+    expect(cells.map((cell) => cell.style.textAlign)).toEqual([
+      "center",
+      "right",
+      "",
+    ]);
+    // A column that says nothing keeps today's default: a header reading left
+    // from its class, a body cell with no alignment of its own at all.
+    expect(headers[2]?.className).toContain("text-left");
+  });
+
   it("highlights a fenced code block", async () => {
     const { container } = await renderMarkdown(
       ["```ts", "const answer = 42;", "```", ""].join("\n"),

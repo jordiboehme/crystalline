@@ -401,13 +401,27 @@ const components: Components = {
       <table className="w-full border-collapse text-sm">{children}</table>
     </div>
   ),
-  th: ({ children }) => (
-    <th className="border-b border-slate-300 px-3 py-1.5 text-left font-semibold dark:border-slate-700">
+  // The colons in a table's delimiter row are the only way markdown can say
+  // how a column reads, and they reach a cell component as a `style` prop
+  // carrying `textAlign` rather than as an `align` attribute, so both kinds of
+  // cell hand it straight through. A column that says nothing arrives with no
+  // style at all and keeps what it always had: a header reading left from its
+  // own class, a body cell with no alignment of its own. Where a column does
+  // say something the inline style outranks that class, which is why the
+  // header keeps `text-left` rather than making it conditional.
+  th: ({ children, style }) => (
+    <th
+      style={style}
+      className="border-b border-slate-300 px-3 py-1.5 text-left font-semibold dark:border-slate-700"
+    >
       {children}
     </th>
   ),
-  td: ({ children }) => (
-    <td className="border-b border-slate-200 px-3 py-1.5 align-top dark:border-slate-800">
+  td: ({ children, style }) => (
+    <td
+      style={style}
+      className="border-b border-slate-200 px-3 py-1.5 align-top dark:border-slate-800"
+    >
       {children}
     </td>
   ),
