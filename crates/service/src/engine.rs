@@ -4291,6 +4291,7 @@ impl Engine {
                     token_budget: resolve_token_budget(verify_config.as_ref(), &d.path),
                     inbound: inbound.get(&d.id.0).copied().unwrap_or(0),
                     outbound: outbound.get(&d.id.0).copied().unwrap_or(0),
+                    generated_by: fm.generated.as_ref().map(|g| g.by.clone()),
                     body: engram.body,
                 });
             }

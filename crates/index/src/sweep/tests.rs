@@ -401,6 +401,73 @@ fn speculative_statuses_are_exempt_from_v001_v002_and_v003() {
     }
 }
 
+#[test]
+fn v006_fires_on_an_unreviewed_human_capture() {
+    let mut captured = fact(1, "incident-decision");
+    captured.generated_by = Some("human:jordi".to_string());
+
+    let report = detect(&input(vec![captured]));
+    let finding = only(&report, "V006");
+    assert_eq!(finding.class, Class::Judgment);
+    assert_eq!(finding.family, Family::Temporal);
+    assert_eq!(finding.priority, 58, "base 50 plus the human boost of 8");
+    assert!(finding.evidence.contains("generated.by human:jordi"));
+    assert!(finding.evidence.contains("recorded 2026-07-01"));
+    assert_eq!(
+        fired(&report),
+        vec!["V006"],
+        "nothing else speaks about a fresh human capture"
+    );
+}
+
+#[test]
+fn v006_stays_quiet_when_any_condition_is_unmet() {
+    let human = || {
+        let mut f = fact(1, "incident-decision");
+        f.generated_by = Some("human:jordi".to_string());
+        f
+    };
+
+    let mut agent = human();
+    agent.generated_by = Some("claude-code/2.1".to_string());
+    let mut anonymous = human();
+    anonymous.generated_by = None;
+    let mut reviewed = human();
+    reviewed.verified_on = Some(day("2026-07-20"));
+    let mut written_today = human();
+    written_today.recorded_at = Some(today());
+
+    for (label, quiet) in [
+        ("an agent wrote it", agent),
+        ("nothing records who wrote it", anonymous),
+        ("somebody already verified it", reviewed),
+        ("it is still being written today", written_today),
+    ] {
+        let report = detect(&input(vec![quiet]));
+        assert!(
+            !fired(&report).contains(&"V006"),
+            "{label} drew {:?}",
+            fired(&report)
+        );
+    }
+}
+
+#[test]
+fn v006_ignores_retired_and_speculative_statuses() {
+    for status in RETIRED_STATUSES.iter().chain(SPECULATIVE_STATUSES.iter()) {
+        let mut captured = fact(1, "incident-decision");
+        captured.status = status.to_string();
+        captured.generated_by = Some("human:jordi".to_string());
+
+        let report = detect(&input(vec![captured]));
+        assert!(
+            !fired(&report).contains(&"V006"),
+            "status {status} drew {:?}",
+            fired(&report)
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // V1xx - structural integrity
 // ---------------------------------------------------------------------------
@@ -775,16 +842,24 @@ fn v203_respects_declared_tag_aliases() {
 
 #[test]
 fn ranking_is_deterministic_and_clamped() {
-    // The clamp holds at both ends: base plus both boosts overshoots 100 and a
+    // The clamp holds at both ends: base plus every boost overshoots 100 and a
     // negative or non-finite salience never subtracts.
-    assert_eq!(priority(90, Some(20.0), 10), MAX_PRIORITY);
-    assert_eq!(priority(90, Some(10.0), HUB_INBOUND_DEGREE), MAX_PRIORITY);
-    assert_eq!(priority(25, Some(-4.0), 0), 25);
-    assert_eq!(priority(25, None, HUB_INBOUND_DEGREE), 30);
-    assert_eq!(priority(25, None, HUB_INBOUND_DEGREE - 1), 25);
-    assert_eq!(priority(25, Some(f64::NAN), 0), 25);
-    assert_eq!(priority(25, Some(f64::INFINITY), 0), 25);
-    assert_eq!(priority(0, None, 0), 0);
+    assert_eq!(priority(90, Some(20.0), 10, false), MAX_PRIORITY);
+    assert_eq!(
+        priority(90, Some(10.0), HUB_INBOUND_DEGREE, false),
+        MAX_PRIORITY
+    );
+    assert_eq!(priority(25, Some(-4.0), 0, false), 25);
+    assert_eq!(priority(25, None, HUB_INBOUND_DEGREE, false), 30);
+    assert_eq!(priority(25, None, HUB_INBOUND_DEGREE - 1, false), 25);
+    assert_eq!(priority(25, Some(f64::NAN), 0, false), 25);
+    assert_eq!(priority(25, Some(f64::INFINITY), 0, false), 25);
+    assert_eq!(priority(0, None, 0, false), 0);
+    assert_eq!(priority(25, None, 0, true), 33);
+    assert_eq!(
+        priority(95, Some(10.0), HUB_INBOUND_DEGREE, true),
+        MAX_PRIORITY
+    );
 
     let mut findings = vec![
         Finding::about_domain("V203", "zulu"),
@@ -806,6 +881,25 @@ fn ranking_is_deterministic_and_clamped() {
             ("V203", "zulu"),
         ]
     );
+}
+
+#[test]
+fn human_authored_boost_applies_to_every_rule_not_only_v006() {
+    let mut big = fact(1, "everything-guide");
+    big.tokens = 3200;
+    big.generated_by = Some("human:jordi".to_string());
+
+    let report = detect(&input(vec![big]));
+    let finding = only(&report, "V105");
+    assert_eq!(finding.priority, 68, "base 60 plus the human boost of 8");
+}
+
+#[test]
+fn the_catalog_carries_fifteen_rules_and_v006_is_temporal() {
+    assert_eq!(RULES.len(), 15);
+    let info = rule_info("V006").expect("V006 is in the catalog");
+    assert_eq!(info.family, Family::Temporal);
+    assert_eq!(info.base, 50);
 }
 
 #[test]
@@ -844,8 +938,8 @@ fn the_catalog_covers_every_rule_id_exactly_once() {
     assert_eq!(
         ids,
         vec![
-            "V001", "V002", "V003", "V004", "V005", "V101", "V102", "V103", "V104", "V105", "V106",
-            "V201", "V202", "V203",
+            "V001", "V002", "V003", "V004", "V005", "V006", "V101", "V102", "V103", "V104", "V105",
+            "V106", "V201", "V202", "V203",
         ]
     );
     for rule in RULES {
