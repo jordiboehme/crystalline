@@ -1,51 +1,82 @@
 /**
  * One domain: what it is for, and what is in it.
  *
- * The two ways of looking at what is in it come from two endpoints, and that
- * split is the server's rather than this screen's: the tree owns navigation by
- * folder and knows nothing about frontmatter, while the engram listing owns the
- * frontmatter filters and knows nothing about folders. So the list has two
- * sources, exactly one is on screen at a time, and a line above it says which -
- * blending them would mean showing a folder that quietly contained engrams from
- * elsewhere, or filters that quietly ignored the folder they sit under.
+ * There are two ways of looking at what is in it, and exactly one is on screen
+ * at a time with a line above the list saying which: a folder, or a
+ * frontmatter filter across the whole domain. Blending them would mean filters
+ * that quietly ignored the folder they sit under, or a folder that quietly
+ * dropped what the filter did not match.
+ *
+ * Both are the same endpoint now. The listing pages a folder (`path`) exactly
+ * as it pages a filter, so a folder holding thousands of engrams costs one
+ * page rather than the folder, and the count above the rows is the server's
+ * own. What the tree is still for is navigation: the subfolders of the folder
+ * being browsed and the trail back out of it, which is a level rather than a
+ * list.
  *
  * Both views live in the URL, so a folder or a filter is a link somebody can
- * send.
+ * send, and the back button moves between them.
  */
 
-import { useQuery } from "@tanstack/react-query";
-import { useMemo } from "react";
-import { Link, useParams, useSearchParams } from "react-router";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { Link, useNavigate, useParams, useSearchParams } from "react-router";
 
+import { archiveDownloadUrl, unregisterDomain } from "../api/admin";
 import { ApiProblem, problemDetail } from "../api/client";
-import { fetchManifest, fetchTree, manifestKey, treeKey } from "../api/domain";
+import { fetchManifest, manifestKey, treeQuery } from "../api/domain";
 import { DOMAINS_QUERY_KEY, fetchDomains } from "../api/domains";
 import type { EngramFilters } from "../api/engrams";
 import {
+  NO_FILTERS,
   domainEngramsKey,
   fetchDomainEngrams,
   hasFilters,
-  singlePage,
 } from "../api/engrams";
 import { fetchTags, vocabularyKey } from "../api/vocabulary";
 import type { TagCount } from "../api/vocabulary";
+import { useAuth } from "../auth/AuthContext";
+import { NO_COMMANDS, useRegisterCommands } from "../commands";
+import type { PaletteCommand } from "../commands";
+import { CreateEngramDialog } from "../components/CreateEngramDialog";
 import { EngramList } from "../components/EngramList";
 import { FilterFields, TagChips } from "../components/FilterControls";
-import { Markdown } from "../components/Markdown";
+import { ImportArchiveDialog } from "../components/ImportArchiveDialog";
+import { Skeleton } from "../components/Skeleton";
+import { SyncCard } from "../components/SyncCard";
+import { BUTTON, Chip, FOCUS_RING } from "../components/primitives";
+import { frontmatterFilters } from "../filters";
 import { plural } from "../format";
+import { manifestRoute } from "../paths";
+import { stripSnippetMarkup } from "../snippet";
 
 export default function DomainHome() {
   const { domain = "" } = useParams();
   const [params, setParams] = useSearchParams();
+  const { capabilities } = useAuth();
+  const navigate = useNavigate();
+  const queryClient = useQueryClient();
+  const [creating, setCreating] = useState(false);
+  const [importing, setImporting] = useState(false);
+  const [confirmingUnregister, setConfirmingUnregister] = useState(false);
+  const [problem, setProblem] = useState<string | null>(null);
 
   const path = params.get("path") ?? "";
+  // The frontmatter view, which is the whole domain: the shared reader leaves
+  // `path` empty deliberately, because scoping a filter to the folder being
+  // browsed is a different feature - the line above the list says "every
+  // folder included" and means it. Shared with the sidebar, which reads the
+  // same URL to decide whether any folder may call itself the current page:
+  // one reading, so the frame and the screen cannot disagree about which of
+  // the two views is up.
   const filters: EngramFilters = useMemo(
-    () => ({
-      type: params.get("type"),
-      status: params.get("status"),
-      tags: (params.get("tags") ?? "").split(",").filter((tag) => tag !== ""),
-    }),
+    () => frontmatterFilters(params),
     [params],
+  );
+  // The browse view: one folder, no frontmatter filter, paged by the server.
+  const browse: EngramFilters = useMemo(
+    () => ({ ...NO_FILTERS, path }),
+    [path],
   );
   const filtering = hasFilters(filters);
 
@@ -59,13 +90,95 @@ export default function DomainHome() {
     queryKey: manifestKey(domain),
     queryFn: () => fetchManifest(domain),
   });
-  const tree = useQuery({
-    queryKey: treeKey(domain, path),
-    queryFn: () => fetchTree(domain, path),
-  });
+  // The tree is what the folder navigation above the list is drawn from - the
+  // subfolders of the folder being browsed, and the trail back out of it. It
+  // no longer carries the listing: a level of it is capped by the server, and
+  // a folder of any size is what the paged listing below is for.
+  const tree = useQuery(treeQuery(domain, path));
   const tags = useQuery({
     queryKey: vocabularyKey(domain),
     queryFn: () => fetchTags(domain),
+  });
+
+  // A domain nobody registered is a wrong address, not an empty shelf. The
+  // tree is what says so: a 404 from the manifest also means a domain that
+  // simply has not been introduced yet.
+  const unknownDomain = isMissing(tree.error);
+
+  // The one write this screen offers, on the palette under both of the gates
+  // the button is under: what this session may do, and whether this screen is
+  // showing a domain at all. The not-found branch below draws no button and
+  // mounts no dialog, so a row there would set a flag nothing reads.
+  //
+  // The dialog it opens picks its own folder from the URL, so the keyboard
+  // route lands exactly where the pointer route does.
+  //
+  // Unregistering rides on the same two gates, one role higher: the palette
+  // row does what the button does, which is to ASK - the second press is the
+  // point of the control and the keyboard route does not get to skip it.
+  const commands = useMemo<readonly PaletteCommand[]>(() => {
+    const rows: PaletteCommand[] = [];
+    if (unknownDomain) {
+      return NO_COMMANDS;
+    }
+    if (capabilities.canWrite) {
+      rows.push({
+        id: "create",
+        title: "New engram",
+        run: () => {
+          setCreating(true);
+        },
+      });
+    }
+    if (capabilities.canAdminister) {
+      rows.push({
+        id: "download-archive",
+        title: "Download archive",
+        // The address, navigated: the download is a cookie-authenticated GET
+        // that the browser saves on its own, so the keyboard route goes to the
+        // same URL the anchor carries rather than reaching into the DOM to
+        // press a link that may not even be rendered.
+        run: () => {
+          window.location.assign(archiveDownloadUrl(domain));
+        },
+      });
+      rows.push({
+        id: "import-archive",
+        title: "Import archive",
+        run: () => {
+          setImporting(true);
+        },
+      });
+      rows.push({
+        id: "unregister-domain",
+        title: "Unregister domain",
+        run: () => {
+          setConfirmingUnregister(true);
+        },
+      });
+    }
+    return rows.length === 0 ? NO_COMMANDS : rows;
+  }, [
+    capabilities.canAdminister,
+    capabilities.canWrite,
+    domain,
+    unknownDomain,
+  ]);
+  useRegisterCommands(commands);
+
+  const unregister = useMutation({
+    mutationFn: () => unregisterDomain(domain),
+    onSuccess: () => {
+      // The listing is what every sidebar, card and switcher draws from, and
+      // the domain this screen is about is no longer in it.
+      void queryClient.invalidateQueries({ queryKey: DOMAINS_QUERY_KEY });
+      // Nowhere to stay: this address is now a wrong address.
+      void navigate("/");
+    },
+    onError: (error: Error) => {
+      setConfirmingUnregister(false);
+      setProblem(problemDetail(error));
+    },
   });
 
   /** Change the URL, which is the whole of this screen's state. */
@@ -87,37 +200,42 @@ export default function DomainHome() {
     setParams(updated);
   }
 
-  /** The folder's own rows, once the tree has answered. */
-  const folderRows = tree.data?.engrams;
-
-  // A domain nobody registered is a wrong address, not an empty shelf. The
-  // tree is what says so: a 404 from the manifest also means a domain that
-  // simply has not been introduced yet.
-  if (isMissing(tree.error)) {
+  if (unknownDomain) {
     return <DomainNotFound domain={domain} />;
   }
 
   return (
     <div className="flex flex-col gap-8">
       <header>
-        <h1 className="text-xl font-semibold">{domain}</h1>
+        <h1 className="text-display">{domain}</h1>
         {summary && (
-          <p className="mt-1 flex flex-wrap gap-x-3 text-sm text-slate-500 dark:text-slate-400">
+          <p className="mt-1 flex flex-wrap items-center gap-2 text-sm text-slate-500 dark:text-slate-400">
             {summary.engrams !== null && (
               <span className="tabular-nums">
                 {plural(summary.engrams, "engram", "engrams")}
               </span>
             )}
-            {summary.kind !== null && <span>{summary.kind}</span>}
+            {/* The same fact wears the same chip the home card gives it. */}
+            {summary.kind !== null && <Chip>{summary.kind}</Chip>}
           </p>
         )}
       </header>
 
+      {/*
+        Admin only, because the endpoints behind it are: a viewer's screen must
+        knock on nothing it would be refused. The card draws nothing at all on
+        a domain with no origin, which is most of them, so this is the whole of
+        the gate the screen owns - and an unregistered domain never reaches
+        here, the not-found branch above returns first.
+      */}
+      {capabilities.canAdminister && <SyncCard domain={domain} />}
+
       <section aria-labelledby="domain-manifest">
-        <h2 id="domain-manifest" className="mb-2 text-lg font-semibold">
+        <h2 id="domain-manifest" className="mb-2 text-section">
           Manifest
         </h2>
         <ManifestPanel
+          domain={domain}
           markdown={manifest.data}
           pending={manifest.isPending}
           error={manifest.error}
@@ -125,9 +243,91 @@ export default function DomainHome() {
       </section>
 
       <section aria-labelledby="domain-engrams">
-        <h2 id="domain-engrams" className="mb-3 text-lg font-semibold">
-          Engrams
-        </h2>
+        <div className="mb-3 flex flex-wrap items-baseline justify-between gap-3">
+          <h2 id="domain-engrams" className="text-section">
+            Engrams
+          </h2>
+          <div className="flex flex-wrap items-center gap-2">
+            {capabilities.canWrite && (
+              <button
+                type="button"
+                onClick={() => {
+                  setCreating(true);
+                }}
+                // Primary: writing an engram is what a writer opens a domain to
+                // do. The sidebar's launcher hides on this screen, so the two
+                // never sit on one page competing for the same attention.
+                className={BUTTON.primary}
+              >
+                New engram
+              </button>
+            )}
+            {capabilities.canAdminister && (
+              <>
+                {/*
+                  An anchor rather than a button that fetches: the archive
+                  route is a cookie-authenticated GET, so the browser saves the
+                  file itself and this app never holds a whole domain in
+                  memory to hand it back. `download` is what makes it a save
+                  rather than a navigation into a zip.
+                */}
+                <a
+                  href={archiveDownloadUrl(domain)}
+                  download
+                  className={`inline-flex items-center ${BUTTON.secondary}`}
+                >
+                  Download archive
+                </a>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setImporting(true);
+                  }}
+                  className={BUTTON.secondary}
+                >
+                  Import archive
+                </button>
+              </>
+            )}
+            {capabilities.canAdminister && (
+              <UnregisterDomain
+                kind={summary?.kind ?? null}
+                confirming={confirmingUnregister}
+                pending={unregister.isPending}
+                onConfirmingChange={setConfirmingUnregister}
+                onUnregister={() => {
+                  setProblem(null);
+                  unregister.mutate();
+                }}
+              />
+            )}
+          </div>
+        </div>
+        {problem !== null && (
+          <p
+            role="alert"
+            className="mb-3 rounded bg-red-50 px-3 py-2 text-sm text-red-800 dark:bg-red-950 dark:text-red-200"
+          >
+            {problem}
+          </p>
+        )}
+        {creating && (
+          <CreateEngramDialog
+            domain={domain}
+            initialFolder={path}
+            onClose={() => {
+              setCreating(false);
+            }}
+          />
+        )}
+        {importing && (
+          <ImportArchiveDialog
+            domain={domain}
+            onClose={() => {
+              setImporting(false);
+            }}
+          />
+        )}
 
         <FolderNav
           domain={domain}
@@ -153,11 +353,17 @@ export default function DomainHome() {
         />
 
         <p className="py-3 text-sm text-slate-500 dark:text-slate-400">
+          {/*
+            What the list below is a list of, in one line. The browse view is
+            a folder and everything under it, which is what the endpoint's
+            `path` means, so the line says so rather than letting a reader read
+            "Browsing notes" as the four files sitting directly in it.
+          */}
           {filtering
             ? "Filtered across the whole domain, every folder included."
             : path === ""
-              ? "Browsing the root folder."
-              : `Browsing ${path}.`}
+              ? "Browsing this domain, every folder included."
+              : `Browsing ${path}, subfolders included.`}
         </p>
 
         {filtering ? (
@@ -167,53 +373,211 @@ export default function DomainHome() {
             label={`Engrams in ${domain}`}
             emptyMessage="No engram matches these filters."
           />
-        ) : folderRows ? (
+        ) : (
           <EngramList
-            // The rows are already in hand from the tree, so this loader hands
-            // them over rather than asking the server a second time. The key
-            // carries the folder, so opening another one starts another list.
-            queryKey={["folder-engrams", domain, path]}
-            loadPage={() => Promise.resolve(singlePage(folderRows))}
+            // The same endpoint the filtered view pages, scoped to the folder
+            // instead of filtered: a folder holding thousands of engrams costs
+            // one page here rather than the whole folder, and the key carries
+            // the scope, so opening another folder starts another list.
+            queryKey={domainEngramsKey(domain, browse)}
+            loadPage={(page) => fetchDomainEngrams(domain, browse, page)}
             label={`Engrams in ${domain}`}
+            // The count this list would draw on its own is "50 of 620 shown",
+            // which says nothing about where those 620 are, and reads as a
+            // contradiction of the "4 engrams" under the domain's name, which
+            // counts the whole domain. Naming the scope is what settles it.
+            summary={(page) => (
+              <p className="text-caption pb-2 text-slate-500 tabular-nums dark:text-slate-400">
+                {plural(page.total, "engram", "engrams")}{" "}
+                {path === "" ? "in this domain" : "in this folder"}
+              </p>
+            )}
             emptyMessage={
               path === ""
                 ? "This domain has no engrams yet."
                 : "This folder has no engrams."
             }
           />
-        ) : tree.error ? (
-          <p
-            role="alert"
-            className="rounded bg-red-50 px-3 py-2 text-sm text-red-800 dark:bg-red-950 dark:text-red-200"
-          >
-            {problemDetail(tree.error)}
-          </p>
-        ) : (
-          <p className="text-sm text-slate-500 dark:text-slate-400">
-            Loading engrams
-          </p>
         )}
       </section>
     </div>
   );
 }
 
-/** The MANIFEST, or the fact that there is not one. */
+/**
+ * Unregistering a domain, behind a second press that says what is lost.
+ *
+ * Two steps rather than a browser confirm, for the reason the account screen
+ * gives: a dialog the browser owns cannot be reached by a test, cannot be
+ * styled and cannot be dismissed by the keyboard the way the rest of this can.
+ *
+ * What the second step says is not one sentence but two, and which one it is
+ * is a fact about the domain rather than a softening: a file domain keeps its
+ * markdown on disk and can be registered again from it, while a virtual
+ * domain's engrams are the database's and go with it. Saying "the files stay"
+ * over a virtual domain would be the app telling somebody their engrams are
+ * safe on the way to deleting them.
+ *
+ * A `kind` of null - a listing that has not landed, which is also a listing
+ * that left the chips under the domain's name unwritten - falls back to the
+ * file sentence, because virtual is the kind that has to be declared and every
+ * domain this app has ever registered from a folder answers `file`.
+ */
+function UnregisterDomain({
+  kind,
+  confirming,
+  pending,
+  onConfirmingChange,
+  onUnregister,
+}: {
+  /** `file`, `virtual`, or null when the listing did not say. */
+  kind: string | null;
+  confirming: boolean;
+  pending: boolean;
+  onConfirmingChange: (confirming: boolean) => void;
+  onUnregister: () => void;
+}) {
+  const trigger = useRef<HTMLButtonElement>(null);
+  const wasConfirming = useRef(confirming);
+
+  /** Give up on the pending unregister, and hand the focus back to what asked. */
+  function abandon() {
+    onConfirmingChange(false);
+    trigger.current?.focus();
+  }
+
+  // The safety net for every path that collapses `confirming` without going
+  // through `abandon()` - today that is only the refusal: `unregister`'s
+  // mutation lives in the PARENT (`onError` at DomainHome.tsx), which sets
+  // `confirming` false directly and has no way to reach this ref. Escape and
+  // "Keep" both already call `abandon()` and focus the trigger synchronously,
+  // so by the time this effect runs afterward, focus is already there and
+  // the check below is a no-op for them.
+  //
+  // The body check is the discriminator that keeps the deliberate blur path
+  // honest: that path (the wrapper's own `onBlur`) also collapses
+  // `confirming`, but BECAUSE focus already moved somewhere else on purpose -
+  // stealing it back here would undo that intent. When the confirm buttons
+  // unmount out from under a refusal, the browser drops focus to the
+  // document body, which is exactly what distinguishes "focus was lost" from
+  // "focus moved on purpose".
+  useEffect(() => {
+    if (wasConfirming.current && !confirming) {
+      const active = document.activeElement;
+      if (active === document.body || active === null) {
+        trigger.current?.focus();
+      }
+    }
+    wasConfirming.current = confirming;
+  }, [confirming]);
+
+  return (
+    <div
+      className="flex flex-wrap items-center gap-2"
+      onKeyDown={(event) => {
+        if (event.key === "Escape" && confirming) {
+          event.stopPropagation();
+          abandon();
+        }
+      }}
+      onBlur={(event) => {
+        // Only when the focus actually landed somewhere else: a `focusout`
+        // with no destination is what a click looks like mid-flight, and
+        // taking the confirmation away there would eat the second press this
+        // exists to require.
+        const next = event.relatedTarget;
+        if (
+          confirming &&
+          next instanceof Node &&
+          !event.currentTarget.contains(next)
+        ) {
+          onConfirmingChange(false);
+        }
+      }}
+    >
+      <button
+        ref={trigger}
+        type="button"
+        aria-expanded={confirming}
+        disabled={pending}
+        onClick={() => {
+          onConfirmingChange(true);
+        }}
+        className={BUTTON.destructive}
+      >
+        Unregister domain
+      </button>
+      {confirming && (
+        <>
+          <button
+            type="button"
+            autoFocus
+            // Disabled while the unregister is in flight, like the trigger it
+            // replaced: a second press would send a second DELETE for a domain
+            // that is already on its way out.
+            disabled={pending}
+            onClick={onUnregister}
+            className={BUTTON.destructive}
+          >
+            Confirm unregister
+          </button>
+          <button type="button" onClick={abandon} className={BUTTON.secondary}>
+            Keep
+          </button>
+          <span className="text-sm text-slate-500 dark:text-slate-400">
+            {kind === "virtual"
+              ? "This domain's engrams live in the database and will be removed from search; download the archive first if you need a copy."
+              : "The files stay on disk. This instance forgets the domain and drops it from search; registering the folder again brings it back."}
+          </span>
+        </>
+      )}
+    </div>
+  );
+}
+
+/**
+ * The first prose paragraph of the manifest, after frontmatter and headings.
+ *
+ * Blocks are split on the blank line rather than parsed: the lede feeds a plain
+ * paragraph, so what comes back has to be prose and never markdown syntax
+ * rendered as text. A manifest that opens with a heading and a list has no
+ * lede, and says so by answering null.
+ */
+function manifestLede(markdown: string): string | null {
+  const body = markdown.replace(/^---\r?\n[\s\S]*?\r?\n---[ \t]*\r?\n?/, "");
+  for (const block of body.split(/\r?\n\s*\r?\n/)) {
+    const line = block.trim();
+    if (line === "" || line.startsWith("#") || PROSE_EXCLUDED.test(line)) {
+      continue;
+    }
+    // The same stripper the search snippets use, for the same reason: this
+    // feeds a plain paragraph, and a lede wearing its own asterisks would be
+    // the raw-markdown bug one screen over.
+    const lede = stripSnippetMarkup(line).replace(/\s+/g, " ").trim();
+    if (lede !== "") {
+      return lede;
+    }
+  }
+  return null;
+}
+
+/** Blocks that are structure rather than prose: lists, quotes, rules, fences. */
+const PROSE_EXCLUDED = /^([-*+>|]|\d+\.|```|---)/;
+
+/** The MANIFEST in one line, and the way to the whole of it. */
 function ManifestPanel({
+  domain,
   markdown,
   pending,
   error,
 }: {
+  domain: string;
   markdown: string | undefined;
   pending: boolean;
   error: Error | null;
 }) {
   if (pending) {
-    return (
-      <p className="text-sm text-slate-500 dark:text-slate-400">
-        Loading the manifest
-      </p>
-    );
+    return <Skeleton label="Loading the manifest" />;
   }
   // A missing MANIFEST is a gap in the domain rather than a failure of the
   // screen, and it is the one thing every domain is supposed to have, so it is
@@ -236,9 +600,18 @@ function ManifestPanel({
       </p>
     );
   }
+  const lede = manifestLede(markdown);
   return (
-    <div className="rounded border border-slate-200 px-4 py-1 dark:border-slate-800">
-      <Markdown source={markdown} />
+    // The one measure, from the one class: a lede that ran the width of a
+    // wide monitor would be the reading problem this app fixed elsewhere.
+    <div className="measured flex flex-col items-start gap-2">
+      {lede !== null && <p className="text-sm">{lede}</p>}
+      <Link
+        to={manifestRoute(domain)}
+        className={`text-sm text-accent-700 underline underline-offset-2 hover:no-underline dark:text-accent-400 ${FOCUS_RING}`}
+      >
+        Read the MANIFEST
+      </Link>
     </div>
   );
 }
@@ -303,7 +676,7 @@ function FolderNav({
             <li key={folder}>
               <button
                 type="button"
-                className="rounded border border-slate-200 px-2 py-1 text-sm hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:outline-none dark:border-slate-800 dark:hover:bg-slate-800"
+                className="rounded border border-slate-200 px-2 py-1 text-sm hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:border-slate-800 dark:hover:bg-slate-800"
                 onClick={() => {
                   onOpen(path === "" ? folder : `${path}/${folder}`);
                 }}
@@ -341,7 +714,10 @@ function FilterBar({
   }) => void;
 }) {
   return (
-    <div className="flex flex-col gap-3">
+    // Set off from the folder row above it: browsing and filtering are two
+    // ways of asking, and stacked flush they read as one dense block of small
+    // grey labels, which is worst in dark.
+    <div className="mt-4 flex flex-col gap-3">
       <FilterFields
         type={filters.type}
         status={filters.status}
@@ -368,7 +744,7 @@ function FilterBar({
 function DomainNotFound({ domain }: { domain: string }) {
   return (
     <div className="flex flex-col items-start gap-3">
-      <h1 className="text-xl font-semibold">Domain not found</h1>
+      <h1 className="text-display">Domain not found</h1>
       <p className="text-sm">
         No domain named {`"${domain}"`} is registered on this instance.
       </p>

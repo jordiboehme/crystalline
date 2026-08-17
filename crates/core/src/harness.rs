@@ -62,6 +62,16 @@ impl HarnessKind {
     /// case-insensitive on the name alone; the client's version is never part
     /// of it, so a harness upgrade cannot silently stop matching.
     ///
+    /// **The MCP path no longer consults this.** Per-harness gating of the
+    /// skill surface resolves once at startup, from the `--harness` argument
+    /// the registration carries plus this machine's install receipt, because
+    /// `clientInfo` is optional under the 2026-07-28 lifecycle and a server
+    /// SHOULD NOT change behaviour on it. Do not wire this back into a
+    /// handshake or a listing: a gate that varies per connection also breaks
+    /// SEP-2567's list invariance. It stays as the name table for callers that
+    /// want to identify a client for their own reasons, never to decide what
+    /// to serve it.
+    ///
     /// The table is deliberately small and conservative, because an unknown
     /// name must never match: a false match would cost a client the onboarding
     /// it depends on, while a missed match only costs some duplicated context.

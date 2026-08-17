@@ -24,11 +24,34 @@ export const GRAPH_LAYOUT: LayoutOptions = {
   padding: 24,
 };
 
-/** The stylesheet, for a dark page or a light one. */
+/**
+ * The class an arrow wears while the pointer is on it, which is the only time
+ * it says what relation it is.
+ */
+export const HOVERED_CLASS = "hovered";
+
+/**
+ * The stylesheet, for a dark page or a light one.
+ *
+ * Restraint is the whole design here. A neighborhood of three engrams is fitted
+ * to the frame and comes out enormous, so every label was reading as a headline
+ * while the arrows underneath carried a second layer of type at every angle -
+ * a picture that shouted a handful of facts. So: node names at the app's own
+ * small size, cut out of the surface behind them with an outline so a name
+ * crossing an arrow stays legible, one accent for the engram the reader is
+ * standing on, and arrows that are silent geometry until the pointer names one.
+ * The zoom cap that keeps the fitted picture from magnifying all of this lives
+ * with the instance, in `GraphCanvas.tsx`.
+ *
+ * `surface` has to be the color the canvas actually sits on, since the label
+ * outline is a fake cut-out rather than real transparency: it is the container's
+ * own background in `NeighborhoodGraph.tsx` - white, and slate-900 in the dark.
+ */
 export function graphStylesheet(dark: boolean): StylesheetJson {
   const ink = dark ? "#e2e8f0" : "#0f172a";
-  const muted = dark ? "#94a3b8" : "#64748b";
-  const line = dark ? "#475569" : "#cbd5e1";
+  const muted = dark ? "#94a3b8" : "#475569";
+  const line = dark ? "#475569" : "#94a3b8";
+  const surface = dark ? "#0f172a" : "#ffffff";
   return [
     {
       selector: "node",
@@ -36,23 +59,27 @@ export function graphStylesheet(dark: boolean): StylesheetJson {
         "background-color": dark ? "#64748b" : "#94a3b8",
         label: "data(label)",
         color: ink,
-        "font-size": 10,
+        "font-size": 11,
         "text-valign": "bottom",
-        "text-margin-y": 4,
+        "text-margin-y": 5,
         "text-wrap": "ellipsis",
-        "text-max-width": "120px",
-        width: 18,
-        height: 18,
+        "text-max-width": "140px",
+        "text-outline-color": surface,
+        "text-outline-width": 2,
+        "text-outline-opacity": 0.9,
+        width: 14,
+        height: 14,
       },
     },
     {
       // The engram the neighborhood was drawn around, so the reader can tell
-      // where they are standing.
+      // where they are standing: the one thing on the picture that is not
+      // neutral geometry, in the accent every other screen uses to say "here".
       selector: `node.${ANCHOR_CLASS}`,
       style: {
-        "background-color": dark ? "#38bdf8" : "#0284c7",
-        width: 26,
-        height: 26,
+        "background-color": dark ? "#2dd4bf" : "#0f766e",
+        width: 20,
+        height: 20,
         "font-weight": "bold",
       },
     },
@@ -68,12 +95,24 @@ export function graphStylesheet(dark: boolean): StylesheetJson {
         "line-color": line,
         "target-arrow-color": line,
         "target-arrow-shape": "triangle",
-        "arrow-scale": 0.8,
+        "arrow-scale": 0.7,
         "curve-style": "bezier",
+        label: "",
+      },
+    },
+    {
+      // What an arrow is, on demand. Horizontal rather than following the line,
+      // because a label that rotates with its arrow is read at whatever angle
+      // the layout happened to leave it at. Anything that cannot hover reads
+      // the same arrows written out under the picture.
+      selector: `edge.${HOVERED_CLASS}`,
+      style: {
         label: "data(label)",
         color: muted,
-        "font-size": 8,
-        "text-rotation": "autorotate",
+        "font-size": 10,
+        "text-outline-color": surface,
+        "text-outline-width": 2,
+        "text-rotation": "none",
       },
     },
   ];

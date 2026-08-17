@@ -90,11 +90,12 @@ use tokio::sync::{Mutex as TokioMutex, MutexGuard};
 use crate::alias::{AliasMap, query_uses_tags};
 use crate::error::{IndexError, Result};
 use crate::store::{
-    ChunkJob, ChunkModelCount, DomainHost, DomainId, DomainKind, DomainStats, EdgeKind,
-    EmbeddingCoverage, EmbeddingRow, EngramDescriptor, EngramId, EngramRecord, EngramSummary,
-    FileStamp, FtsMode, GraphSlice, HostClaim, InboundRef, NewChunk, OutboundRef, Page,
-    RecentFilter, SearchHit, SearchMode, SearchQuery, Store, StoreInfo, StoredEngram, Vocabulary,
-    build_vocabulary,
+    BrowseLevel, ChunkJob, ChunkModelCount, DomainHost, DomainId, DomainKind, DomainStats,
+    EdgeKind, EmbeddingCoverage, EmbeddingRow, EngramDescriptor, EngramId, EngramRecord,
+    EngramSummary, FileStamp, FtsMode, GraphSlice, HostClaim, InboundHit, InboundPage,
+    InboundQuery, InboundRef, LINKS_TO, NamedCount, NewChunk, OutboundRef, Page, RecentFilter,
+    SearchHit, SearchMode, SearchQuery, Store, StoreInfo, StoredEngram, Vocabulary,
+    build_vocabulary, folder_slash, page_window,
 };
 use crate::sweep::UnresolvedRef;
 
@@ -582,6 +583,58 @@ pub(super) fn like_escape(s: &str) -> String {
         out.push(c);
     }
     out
+}
+
+/// The folder-prefix comparison every path filter uses, with BOTH sides lowered
+/// in SQL: `lower(e.path) LIKE lower($n) ESCAPE '\'`, negated for a depth cut.
+///
+/// Three things about this shape, because they are the reasons and not the
+/// spelling:
+///
+/// 1. **Both sides are lowered by the same expression, in SQL.** The database
+///    decides what "lowered" means for the column and for the pattern in one
+///    place, so the comparison cannot disagree with itself. The parameter
+///    arrives escaped but unfolded; `lower()` in the statement folds it.
+/// 2. **The other folding shape in this crate was deliberately not copied.**
+///    The inbound-links `q` filter lowercases its parameter in Rust and wraps
+///    only the column. That loses rows on a C or POSIX collated database:
+///    `lower()` there follows the argument's collation and returns `Ünter/a.md`
+///    unchanged, while Rust's `to_lowercase()` has already folded the pattern to
+///    `ünter/`, so a row that matches today stops matching. Measured on a
+///    `--lc-collate=C` database, not assumed.
+/// 3. **That `q` filter's own instance of the Rust-side shape is a known
+///    follow-up, not the house convention.** Do not harmonize these sites toward
+///    it; harmonize it toward these.
+///
+/// What it costs, stated because it is a real trade and not a free lunch: on a C
+/// or POSIX collated database `e.path LIKE 'notes/%'` can drive
+/// `idx_engram_path(domain_id, path)` as a prefix range scan, and wrapping the
+/// column in `lower()` gives that up. The filter becomes O(table) rather than
+/// O(result), which is the part that matters: it scales with how much the
+/// database holds, not with how much the query returns. Measured on a
+/// 50,505-row C-collated replica, a filtered `list_engrams` goes from 0.4-2.7 ms
+/// on the index scan to 153-250 ms on a sequential scan that discards 50,000
+/// rows in the filter, and the browse page's estimated cost goes from 9.6 to
+/// 1735. Correctness first. A deployment that meets this buys the plan back with
+/// an expression index on `(domain_id, lower(path) text_pattern_ops)` - the
+/// opclass is not optional, since the plain `(domain_id, lower(path))` shape is
+/// used on a C-collated database and ignored entirely on a UTF-8 one, while the
+/// `text_pattern_ops` variant serves both (0.375 ms on the same replica). None
+/// exists yet; on any non-C collation the prefix never drove `idx_engram_path`
+/// in the first place, so this fold took nothing away there, and that collation
+/// was already scanning the table before the fold.
+///
+/// A note on how `lower()` behaves, because folding can NARROW as well as widen:
+/// where `lower()` is context-sensitive (an ICU provider), a prefix ending in a
+/// capital sigma folds to a FINAL sigma while the same letter mid-path folds to
+/// a medial one, so a row that matched before the fold can stop matching. It is
+/// unreachable through the service today - every caller-supplied folder prefix
+/// is slash-terminated, and the three prefix-passing `list_engrams` callers pass
+/// exact `.md` paths - but a future caller that hands a bare word must know the
+/// fold is not purely a widening.
+pub(super) fn path_prefix_like(n: usize, negated: bool) -> String {
+    let not = if negated { " NOT" } else { "" };
+    format!("lower(e.path){not} LIKE lower(${n}) ESCAPE '\\'")
 }
 
 /// Quote a schema identifier for interpolation, doubling any embedded quote. The
@@ -1120,7 +1173,7 @@ impl Store for PostgresStore {
         let mut params = vec![Param::Text(domain.to_string())];
         let mut n = 2;
         if let Some(prefix) = path_prefix.filter(|p| !p.is_empty()) {
-            clauses.push(format!("e.path LIKE ${n} ESCAPE '\\'"));
+            clauses.push(path_prefix_like(n, false));
             params.push(Param::Text(format!("{}%", like_escape(prefix))));
             n += 1;
         }
@@ -1137,6 +1190,118 @@ impl Store for PostgresStore {
         let mut conn = self.acquire().await?;
         let rows = query_all(conn.as_mut(), &sql, params).await?;
         Ok(rows.iter().map(descriptor_from_row).collect())
+    }
+
+    async fn browse_level(
+        &self,
+        domain: &str,
+        path_prefix: Option<&str>,
+        depth: usize,
+        limit: usize,
+    ) -> Result<BrowseLevel> {
+        // The trailing slash is what makes the prefix a folder, so it is added
+        // here when a caller left it off rather than trusted: without it the
+        // folder derivation would cut its first segment out of a `rel` that
+        // starts with a slash and report a folder with no name.
+        let prefix = folder_slash(path_prefix.unwrap_or_default());
+        let depth = depth.max(1);
+        let escaped = like_escape(&prefix);
+
+        // Under the prefix. The pattern is escaped, so a folder named `50%` is
+        // a folder rather than a wildcard, and both sides are lowered so the
+        // filter folds case (see `path_prefix_like`).
+        // Bound values are collected as text and turned into parameters at each
+        // use: three queries share this filter, and `Param` is not `Clone`.
+        let mut clauses = vec!["d.name=$1".to_string()];
+        let mut binds = vec![domain.to_string()];
+        let mut n = 2;
+        if !prefix.is_empty() {
+            clauses.push(path_prefix_like(n, false));
+            binds.push(format!("{escaped}%"));
+            n += 1;
+        }
+        let under = clauses.join(" AND ");
+        let bound =
+            |values: &[String]| -> Vec<Param> { values.iter().cloned().map(Param::Text).collect() };
+
+        // The level itself: no more than `depth` segments below the prefix. A
+        // path with at least `depth` slashes under the prefix matches
+        // `<prefix>%/%` with one `/%` per level, so excluding that pattern is
+        // the depth cut - pushed into SQL rather than applied after the fact,
+        // because a cap over unfiltered rows could otherwise spend the whole
+        // page on engrams too deep to show. It folds case exactly as the
+        // under-prefix clause does, and that is not optional: folding one and
+        // not the other would let a case-variant path pass the folded
+        // under-prefix test AND pass the unfolded depth cut, landing an engram
+        // two levels down in a one-level listing - a leak that does not exist
+        // while neither side folds.
+        let mut level = clauses.clone();
+        let mut level_binds = binds.clone();
+        level.push(path_prefix_like(n, true));
+        level_binds.push(format!("{escaped}%{}", "/%".repeat(depth)));
+        let level = level.join(" AND ");
+
+        let mut conn = self.acquire().await?;
+        // The count runs under exactly the filter the page runs under, so a
+        // truncated level can say how much it is not showing without the two
+        // queries ever disagreeing.
+        let total = scalar_i64(
+            conn.as_mut(),
+            &format!(
+                "SELECT count(*) FROM engram e JOIN domain d ON d.id=e.domain_id WHERE {level}"
+            ),
+            bound(&level_binds),
+        )
+        .await?
+        .max(0) as usize;
+
+        let rows = query_all(
+            conn.as_mut(),
+            &format!(
+                "SELECT e.id, e.domain_id, d.name, e.path, e.permalink, e.title, e.engram_type, e.status \
+                 FROM engram e JOIN domain d ON d.id=e.domain_id WHERE {level} \
+                 ORDER BY e.path COLLATE \"C\" LIMIT {limit}"
+            ),
+            bound(&level_binds),
+        )
+        .await?;
+        let engrams: Vec<EngramDescriptor> = rows.iter().map(descriptor_from_row).collect();
+
+        // The folder names come from the path column alone - the distinct first
+        // segment below the prefix - so no body is read to learn that a folder
+        // exists and the row cap above can never hide one. `substr` and `strpos`
+        // count characters, so the offset is a character count.
+        //
+        // The offset is the caller's prefix length, and the folded filter above
+        // admits rows whose own leading characters are a case VARIANT of that
+        // prefix rather than the prefix itself. It still cuts in the right place
+        // for one reason only: every fold in play is LENGTH-PRESERVING (the
+        // per-character mappings of the locales in use map one code point to
+        // one). A provider whose `lower()` is not - an ICU build folding U+0130
+        // to two code points - would cut here in the wrong place and derive a
+        // wrong or empty folder name. That is what a future reader has to
+        // re-check, not where the number came from.
+        let rel = format!("substr(e.path, {})", prefix.chars().count() + 1);
+        let folder_rows = query_all(
+            conn.as_mut(),
+            &format!(
+                "SELECT DISTINCT split_part({rel}, '/', 1) \
+                 FROM engram e JOIN domain d ON d.id=e.domain_id \
+                 WHERE {under} AND strpos({rel}, '/') > 0"
+            ),
+            bound(&binds),
+        )
+        .await?;
+        let mut folders: Vec<String> = folder_rows.iter().filter_map(|r| cell_text(r, 0)).collect();
+        // Sorted here rather than in SQL, so both backends order folder names
+        // by bytes without either dialect's collation having a say.
+        folders.sort();
+
+        Ok(BrowseLevel {
+            engrams,
+            folders,
+            total,
+        })
     }
 
     async fn engrams_with_tag(
@@ -1301,6 +1466,134 @@ impl Store for PostgresStore {
                 },
             })
             .collect())
+    }
+
+    async fn inbound_page(&self, query: &InboundQuery<'_>) -> Result<InboundPage> {
+        // The Turso twin's query, param for param; see it for what the
+        // predicate is and why it is `inbound_refs`'s unchanged. Two things are
+        // this backend's own: the relation label is cast to `text` so the union
+        // of a column and a literal has a type, and every text sort key carries
+        // an explicit `COLLATE "C"`, because a locale collation here would not
+        // merely reorder a page - it would hand a reader a different page than
+        // Turso does under the same offset.
+        let source = format!(
+            "SELECT d.name AS domain, e.permalink AS permalink, e.title AS title, \
+                    e.path AS path, e.status AS status, r.rel_type AS rel \
+             FROM relation r JOIN engram e ON e.id=r.engram_id JOIN domain d ON d.id=e.domain_id \
+             WHERE r.to_id=$1 \
+                OR (r.to_id IS NULL AND r.domain_id=$2 AND r.to_domain IS NULL \
+                    AND (r.to_target=$3 OR lower(r.to_target)=lower($4))) \
+             UNION ALL \
+             SELECT d.name, e.permalink, e.title, e.path, e.status, '{LINKS_TO}'::text \
+             FROM link l JOIN engram e ON e.id=l.engram_id JOIN domain d ON d.id=e.domain_id \
+             WHERE l.to_id=$1 \
+                OR (l.to_id IS NULL AND l.domain_id=$2 AND l.to_domain IS NULL \
+                    AND (l.to_target=$3 OR lower(l.to_target)=lower($4)))"
+        );
+        let target = || {
+            vec![
+                Param::Int(query.engram_id.0),
+                Param::Int(query.domain_id.0),
+                Param::Text(query.permalink.to_string()),
+                Param::Text(query.title.to_string()),
+            ]
+        };
+
+        // The filters are held as values and bound freshly per statement: the
+        // count and the page take the same list, and `Param` is deliberately
+        // not `Clone` (it carries embedding vectors elsewhere).
+        let rel = query.rel.filter(|r| !r.is_empty()).map(str::to_string);
+        let pattern = query
+            .q
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(|text| format!("%{}%", like_escape(&text.to_lowercase())));
+        let mut clauses: Vec<String> = Vec::new();
+        let mut n = 5;
+        if rel.is_some() {
+            clauses.push(format!("i.rel=${n}"));
+            n += 1;
+        }
+        if pattern.is_some() {
+            clauses.push(format!(
+                "(lower(i.title) LIKE ${n} ESCAPE '\\' OR lower(i.path) LIKE ${} ESCAPE '\\')",
+                n + 1
+            ));
+            n += 2;
+        }
+        let where_sql = if clauses.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", clauses.join(" AND "))
+        };
+        let filtered = || {
+            let mut params = target();
+            if let Some(rel) = &rel {
+                params.push(Param::Text(rel.clone()));
+            }
+            if let Some(pattern) = &pattern {
+                params.push(Param::Text(pattern.clone()));
+                params.push(Param::Text(pattern.clone()));
+            }
+            params
+        };
+
+        let mut conn = self.acquire().await?;
+        let total = scalar_i64(
+            conn.as_mut(),
+            &format!("SELECT COUNT(*) FROM ({source}) i{where_sql}"),
+            filtered(),
+        )
+        .await?
+        .max(0) as usize;
+
+        let (limit, offset) = page_window(query.page, query.limit);
+        let mut paged = filtered();
+        paged.push(Param::Int(limit));
+        paged.push(Param::Int(offset));
+        let rows = query_all(
+            conn.as_mut(),
+            &format!(
+                "SELECT i.domain, i.permalink, i.title, i.path, i.status, i.rel \
+                 FROM ({source}) i{where_sql} \
+                 ORDER BY i.title COLLATE \"C\", i.permalink COLLATE \"C\", \
+                          i.domain COLLATE \"C\", i.rel COLLATE \"C\" \
+                 LIMIT ${n} OFFSET ${}",
+                n + 1
+            ),
+            paged,
+        )
+        .await?;
+        let hits = rows
+            .iter()
+            .map(|r| InboundHit {
+                domain: cell_text(r, 0).unwrap_or_default(),
+                permalink: cell_text(r, 1).unwrap_or_default(),
+                title: cell_text(r, 2).unwrap_or_default(),
+                path: cell_text(r, 3).unwrap_or_default(),
+                status: cell_text(r, 4).unwrap_or_default(),
+                rel: cell_text(r, 5).unwrap_or_default(),
+            })
+            .collect();
+
+        let summary = query_all(
+            conn.as_mut(),
+            &format!(
+                "SELECT i.rel, COUNT(*) FROM ({source}) i GROUP BY i.rel \
+                 ORDER BY COUNT(*) DESC, i.rel COLLATE \"C\""
+            ),
+            target(),
+        )
+        .await?;
+        let types = summary
+            .iter()
+            .map(|r| NamedCount {
+                name: cell_text(r, 0).unwrap_or_default(),
+                count: cell_i64(r, 1).unwrap_or(0),
+            })
+            .collect();
+
+        Ok(InboundPage { total, types, hits })
     }
 
     async fn outbound_refs(&self, engram_id: EngramId) -> Result<Vec<OutboundRef>> {

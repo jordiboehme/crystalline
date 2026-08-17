@@ -287,6 +287,59 @@ async fn a_relation_and_its_prose_link_are_one_edge() {
     assert_eq!(edges[0]["rel_type"], "links_to");
 }
 
+/// An anchor with one live neighbor and one retired one, for the tests that
+/// prove retired knowledge yields first when the cap bites. Beta (the
+/// anchor, stable) relates to Gamma (stable) and Delta (deprecated).
+async fn fixture_with_retired_neighbor() -> ((), Engine) {
+    let engine = engine().await;
+    write(
+        &engine,
+        "Beta",
+        "stable",
+        "The anchor.\n\n- relates_to [[Gamma]]\n- relates_to [[Delta]]\n",
+    )
+    .await;
+    write(&engine, "Gamma", "stable", "A live neighbor.\n").await;
+    write(&engine, "Delta", "deprecated", "A retired neighbor.\n").await;
+    ((), engine)
+}
+
+/// Over the cap, retired knowledge yields first: the live neighborhood
+/// survives and the payload counts what was cut. Under the cap (the sibling
+/// tests) nothing changes - same node set, hidden stays zero.
+#[tokio::test]
+async fn the_cap_prunes_retired_nodes_first_and_counts_them() {
+    // Fixture: an anchor with one live and one retired neighbor, capped to 2
+    // (the anchor plus one). The survivor must be the live one.
+    let (_tmp, engine) = fixture_with_retired_neighbor().await;
+    let value = engine
+        .graph_neighborhood("crystalline://notes/beta", 1, 2)
+        .await
+        .unwrap();
+    let nodes = value["nodes"].as_array().unwrap();
+    assert_eq!(nodes.len(), 2);
+    assert!(
+        nodes.iter().all(|n| !crystalline_index::is_retired_status(
+            n["status"].as_str().unwrap_or("")
+        ) || n["permalink"] == "beta"),
+        "a retired non-anchor node survived while a live one was cut: {value}"
+    );
+    assert_eq!(value["truncated"], true);
+    assert!(value["hidden"].as_u64().unwrap() >= 1);
+}
+
+/// Under the cap the count is an honest zero.
+#[tokio::test]
+async fn an_uncapped_neighborhood_hides_nothing() {
+    let (_tmp, engine) = fixture_with_retired_neighbor().await;
+    let value = engine
+        .graph_neighborhood("crystalline://notes/beta", 1, 100)
+        .await
+        .unwrap();
+    assert_eq!(value["hidden"], 0);
+    assert_eq!(value["truncated"], false);
+}
+
 /// The two ways an anchor can be wrong are two different errors, so the HTTP
 /// surface above can map them apart.
 #[tokio::test]

@@ -1,11 +1,11 @@
 ---
-name: crystalline-memory
+name: crystalline-intelligence
 description: Use when the crystalline MCP tools are available and the task involves recalling, storing or sharing knowledge - searching domains, capturing engrams or sharing with a team.
 ---
 
-# Crystalline Memory
+# Crystalline Intelligence
 
-Crystalline gives you durable memory across sessions: what you have been taught lives in Domains as Engrams you search, read and, where allowed, capture into.
+Crystalline is your crystallized intelligence across sessions: what you have been taught and what you have learned lives in Domains as Engrams you search, read and, where allowed, capture into.
 
 ## Start from the routing block
 

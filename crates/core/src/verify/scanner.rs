@@ -141,6 +141,18 @@ where
     Ok(domains)
 }
 
+/// A [`ScannedFile`] over in-memory content, for the single-document checks:
+/// the same parse the directory scan applies, with `rel_path` standing in for
+/// both path fields since there is no filesystem underneath.
+pub(crate) fn scanned_file_from_source(rel_path: &Path, source: &str) -> ScannedFile {
+    ScannedFile {
+        path: rel_path.to_path_buf(),
+        rel_path: rel_path.to_path_buf(),
+        source: source.to_string(),
+        parsed: parse::parse_engram(source),
+    }
+}
+
 fn domain_name(root: &Path) -> String {
     root.file_name()
         .map(|s| s.to_string_lossy().into_owned())

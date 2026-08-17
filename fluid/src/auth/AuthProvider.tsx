@@ -16,7 +16,10 @@
  * The probe is also where the CSRF token comes from. The session cookie is
  * `HttpOnly`, so a reloaded tab cannot read its token back out; the server
  * reissues it here, and handing it straight to the client on the way past is
- * what keeps a reload from locking the tab out of every write.
+ * what keeps a reload from locking the tab out of every write. Behind an SSO
+ * proxy the same call mints the session outright, so the trusted-header mode
+ * gets its token from here too: there is one CSRF rule for every identity
+ * mode, and no write goes out without a token whichever mode the app is in.
  */
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -24,12 +27,12 @@ import { useCallback, useMemo } from "react";
 import type { ReactNode } from "react";
 
 import { ApiProblem, api, setCsrfToken } from "../api/client";
-import type { LoginResponse, MeResponse } from "../api/model";
+import type { LoginResponse, MeResponse, SetupBody } from "../api/model";
 import { AccountDisabled } from "../components/AccountDisabled";
 import { ServerDown } from "../components/ServerDown";
 import { AuthContext } from "./AuthContext";
 import type { AuthValue, Capabilities } from "./AuthContext";
-import { ME_QUERY_KEY } from "./keys";
+import { LOGIN_MUTATION_KEY, ME_QUERY_KEY, SETUP_MUTATION_KEY } from "./keys";
 
 /**
  * Run the probe, and hand the token it carries to the client on the way past.
@@ -54,6 +57,7 @@ function capabilitiesOf(me: MeResponse | undefined): Capabilities {
     role,
     canWrite: !readOnly && (role === "editor" || role === "admin"),
     canAdminister: role === "admin",
+    needsSetup: me?.needs_setup ?? false,
     serverVersion: me?.version ?? "",
   };
 }
@@ -67,6 +71,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const me = useQuery({ queryKey: ME_QUERY_KEY, queryFn: probe });
 
   const loginMutation = useMutation({
+    // The key rides the mutation that issues the request, which is the one the
+    // expired-session recovery inspects: a refusal here is not an expired
+    // session, since nobody has a session yet.
+    mutationKey: LOGIN_MUTATION_KEY,
     mutationFn: async ({ name, password }: Credentials) => {
       const session = await api<LoginResponse>("/auth/login", {
         method: "POST",
@@ -89,6 +97,52 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       await runLogin({ name, password });
     },
     [runLogin],
+  );
+
+  const setupMutation = useMutation({
+    // The key rides the mutation that issues the request, which is the one the
+    // expired-session recovery inspects: a refusal here is not an expired
+    // session, since nobody has a session yet.
+    mutationKey: SETUP_MUTATION_KEY,
+    // No automatic retry on the one request that creates an account. A 500 or
+    // a dropped connection is for the person to decide about, and the default
+    // would turn one submit into a pair of POSTs the server has to race
+    // against itself.
+    retry: 0,
+    mutationFn: async ({ name, password, token }: FirstAdmin) => {
+      // The token is omitted rather than sent empty: an instance that never
+      // printed one treats "no token configured" as a closed path, and a
+      // caller that has none has nothing to say about it.
+      const body: SetupBody = { name, password, ...(token ? { token } : {}) };
+      const session = await api<LoginResponse>("/auth/setup", {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
+      setCsrfToken(session.csrf);
+      return session;
+    },
+    onSuccess: async () => {
+      // Same reasoning as login: the identity is re-read from the probe, which
+      // is also what flips `needs_setup` false and takes the wizard away.
+      await queryClient.invalidateQueries({ queryKey: ME_QUERY_KEY });
+    },
+    onError: async (error: Error) => {
+      // A 410 says the setup slot closed while this form was open, which makes
+      // the probe's `needs_setup` a stale answer. Re-reading it is what turns
+      // the wizard back into the login form the person now needs; every other
+      // refusal leaves the instance exactly as the probe described it.
+      if (error instanceof ApiProblem && error.status === 410) {
+        await queryClient.invalidateQueries({ queryKey: ME_QUERY_KEY });
+      }
+    },
+  });
+  const { mutateAsync: runSetup } = setupMutation;
+
+  const setup = useCallback(
+    async (name: string, password: string, token?: string) => {
+      await runSetup({ name, password, token });
+    },
+    [runSetup],
   );
 
   const logout = useCallback(async () => {
@@ -122,9 +176,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       user: identity?.user ?? null,
       capabilities: capabilitiesOf(identity),
       login,
+      setup,
       logout,
     }),
-    [identity, login, logout],
+    [identity, login, setup, logout],
   );
 
   if (me.isPending) {
@@ -158,6 +213,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 interface Credentials {
   name: string;
   password: string;
+}
+
+/** What first-run setup takes: credentials, plus a token when one was asked for. */
+interface FirstAdmin extends Credentials {
+  token?: string | undefined;
 }
 
 /**

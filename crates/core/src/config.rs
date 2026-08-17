@@ -107,6 +107,23 @@ impl GlobalConfig {
             .unwrap_or(false)
     }
 
+    /// Whether the HTTP endpoint serves the JSON API under `/api/v1`, from
+    /// `service.api`. Absent config or an absent key means on (true): a daemon
+    /// with the HTTP transport enabled serves the API. False leaves the MCP
+    /// endpoint and `/health` only. Read once when the HTTP surface starts.
+    pub fn api_enabled(&self) -> bool {
+        self.service.as_ref().and_then(|s| s.api).unwrap_or(true)
+    }
+
+    /// Whether the HTTP endpoint serves the embedded web UI, from
+    /// `service.ui`. Absent config or an absent key means on (true), and
+    /// `service.api = false` turns the UI off with it: a UI without its API is
+    /// a dead shell that can only render a login error. Read once when the HTTP
+    /// surface starts.
+    pub fn ui_enabled(&self) -> bool {
+        self.api_enabled() && self.service.as_ref().and_then(|s| s.ui).unwrap_or(true)
+    }
+
     /// How the MCP server encodes list-shaped tool results, from
     /// `service.response_format`. Absent config or an absent key means TOON,
     /// the token-efficient default; `json` restores plain compact JSON for
@@ -205,6 +222,15 @@ impl GlobalConfig {
             .as_ref()
             .and_then(|a| a.anonymous)
             .unwrap_or(false)
+    }
+
+    /// `auth.max_users`. Absent config or an absent key means the default cap.
+    pub fn auth_max_users(&self) -> usize {
+        self.auth
+            .as_ref()
+            .and_then(|a| a.max_users)
+            .map(|n| n as usize)
+            .unwrap_or(DEFAULT_MAX_USERS)
     }
 }
 
@@ -513,6 +539,12 @@ pub struct IdentityConfig {
     pub actor: Option<String>,
 }
 
+/// `auth.max_users`'s default: how many accounts trusted-header provisioning
+/// may mint in total when the setting is absent. Beside [`AuthConfig`] rather
+/// than buried in [`GlobalConfig::auth_max_users`] so a caller that needs the
+/// number without a config in hand (a test, a settings default) has it too.
+pub const DEFAULT_MAX_USERS: usize = 100;
+
 /// The `auth` block: how the served API identifies a caller. Reads like a
 /// settings-page section - see the `configure` tool, which exposes exactly
 /// these keys.
@@ -527,6 +559,11 @@ pub struct AuthConfig {
     /// Serve requests that carry no identity at all. Absent means off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anonymous: Option<bool>,
+    /// `auth.max_users`. How many accounts trusted-header provisioning may
+    /// mint in total; absent means the default of 100. The CLI is never
+    /// capped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_users: Option<u32>,
 }
 
 /// Service configuration.
@@ -541,6 +578,17 @@ pub struct ServiceConfig {
     /// Absent means read-write.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_only: Option<bool>,
+    /// Serve the embedded web UI on the HTTP endpoint. Absent means on: a
+    /// daemon with the HTTP transport enabled serves Fluid itself, so a browser
+    /// and an agent share one port. False serves the API and MCP only, the
+    /// shape a separately deployed Fluid fronts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui: Option<bool>,
+    /// Serve the JSON API under `/api/v1` on the HTTP endpoint. Absent means
+    /// on. False also disables the web UI (a UI without its API can only render
+    /// a login error), leaving the MCP endpoint and `/health`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api: Option<bool>,
     /// Extra `Host` header values the HTTP transport accepts, on top of the
     /// always-allowed loopback set. This is the DNS-rebinding guard: rmcp
     /// rejects any request whose `Host` is not allowed. A single `*` entry
@@ -1015,6 +1063,56 @@ mod tests {
                 "{value:?} renders as {expected}:\n{yaml}"
             );
         }
+    }
+
+    /// The two HTTP-surface toggles default to on, `service.api = false` takes
+    /// the UI down with it (a UI whose API is gone can only render a login
+    /// error), and neither key is written back into a config that never set it.
+    #[test]
+    fn ui_and_api_default_to_on_and_the_api_toggle_carries_the_ui() {
+        let empty = GlobalConfig::default();
+        assert!(empty.ui_enabled(), "an absent config serves the UI");
+        assert!(empty.api_enabled(), "an absent config serves the API");
+
+        let absent_keys: GlobalConfig = serde_yaml_ng::from_str("service: {}\n").unwrap();
+        assert!(absent_keys.ui_enabled(), "an absent key serves the UI");
+        assert!(absent_keys.api_enabled(), "an absent key serves the API");
+
+        let ui_off: GlobalConfig = serde_yaml_ng::from_str("service:\n  ui: false\n").unwrap();
+        assert!(!ui_off.ui_enabled());
+        assert!(ui_off.api_enabled(), "the UI toggle leaves the API alone");
+
+        let api_off: GlobalConfig = serde_yaml_ng::from_str("service:\n  api: false\n").unwrap();
+        assert!(!api_off.api_enabled());
+        assert!(
+            !api_off.ui_enabled(),
+            "the API toggle takes the UI down with it"
+        );
+
+        let both_on: GlobalConfig =
+            serde_yaml_ng::from_str("service:\n  ui: true\n  api: true\n").unwrap();
+        assert!(both_on.ui_enabled());
+        assert!(both_on.api_enabled());
+    }
+
+    #[test]
+    fn ui_and_api_round_trip_and_stay_absent_when_unset() {
+        // An explicit false survives a round trip through the yaml.
+        let off: GlobalConfig =
+            serde_yaml_ng::from_str("service:\n  ui: false\n  api: false\n").unwrap();
+        let yaml = serde_yaml_ng::to_string(&off).unwrap();
+        assert!(yaml.contains("ui: false"), "{yaml}");
+        assert!(yaml.contains("api: false"), "{yaml}");
+        let back: GlobalConfig = serde_yaml_ng::from_str(&yaml).unwrap();
+        assert_eq!(back, off);
+
+        // Unset fields never appear, so a config written before the keys
+        // existed round-trips unchanged.
+        let read_only_only: GlobalConfig =
+            serde_yaml_ng::from_str("service:\n  read_only: true\n").unwrap();
+        let yaml = serde_yaml_ng::to_string(&read_only_only).unwrap();
+        assert!(!yaml.contains("ui:"), "{yaml}");
+        assert!(!yaml.contains("api:"), "{yaml}");
     }
 
     #[test]

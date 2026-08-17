@@ -27,6 +27,10 @@ pub struct ApiError {
     pub title: &'static str,
     /// The specific occurrence, safe to show to the caller.
     pub detail: String,
+    /// The one RFC 9457 extension member this surface sends. See
+    /// [`ApiError::token_required`]; `None` on every other failure, and the
+    /// member is then absent from the body entirely.
+    pub token_required: Option<bool>,
 }
 
 impl ApiError {
@@ -36,6 +40,7 @@ impl ApiError {
             status: StatusCode::NOT_FOUND,
             title: "not found",
             detail: detail.into(),
+            token_required: None,
         }
     }
 
@@ -46,6 +51,7 @@ impl ApiError {
             status: StatusCode::UNAUTHORIZED,
             title: "unauthorized",
             detail: detail.into(),
+            token_required: None,
         }
     }
 
@@ -58,6 +64,7 @@ impl ApiError {
             status: StatusCode::FORBIDDEN,
             title: "forbidden",
             detail: detail.into(),
+            token_required: None,
         }
     }
 
@@ -72,6 +79,7 @@ impl ApiError {
             status: StatusCode::CONFLICT,
             title: "conflict",
             detail: detail.into(),
+            token_required: None,
         }
     }
 
@@ -86,6 +94,30 @@ impl ApiError {
         internal_error(detail.into())
     }
 
+    /// A 428 for a write that arrived without its `If-Match`. The detail names
+    /// the header and where its token comes from (the detail read's ETag).
+    pub fn precondition_required(detail: impl Into<String>) -> ApiError {
+        ApiError {
+            status: StatusCode::PRECONDITION_REQUIRED,
+            title: "precondition required",
+            detail: detail.into(),
+            token_required: None,
+        }
+    }
+
+    /// A 400 for a header the server can parse as HTTP but whose shape this
+    /// surface refuses to accept - a comma-separated `If-Match` list, for
+    /// instance, which RFC 9110 allows but this API's "exactly one strong
+    /// checksum" contract does not.
+    pub fn bad_request(detail: impl Into<String>) -> ApiError {
+        ApiError {
+            status: StatusCode::BAD_REQUEST,
+            title: "invalid request",
+            detail: detail.into(),
+            token_required: None,
+        }
+    }
+
     /// A 405 for a path that exists but does not serve this method. Mounted as
     /// the router's `method_not_allowed_fallback`, which is the one answer axum
     /// would otherwise produce with an empty body; the `Allow` header axum adds
@@ -95,7 +127,31 @@ impl ApiError {
             status: StatusCode::METHOD_NOT_ALLOWED,
             title: "method not allowed",
             detail: "this path does not serve that method".to_string(),
+            token_required: None,
         }
+    }
+
+    /// Mark this problem document with the `token_required` extension member,
+    /// for the one refusal that has a machine-readable answer to "what would
+    /// make this work": `POST /auth/setup` refused for a non-local caller by an
+    /// instance that actually holds a setup token.
+    ///
+    /// RFC 9457 extension members are the standard way to say something a
+    /// client can act on without parsing prose, and this one exists because the
+    /// first-run wizard must decide whether to render a token field at all. It
+    /// is set ONLY when a token exists to be entered: an instance that has none
+    /// (the loopback bind, which generates no token) refuses without the
+    /// member, so the wizard never draws an input that cannot lead anywhere.
+    /// The detail stays display-only copy either way.
+    ///
+    /// A member on [`ProblemDetail`] rather than a second problem type in
+    /// [`ConflictDetail`]'s style: this one adds a flag to an ordinary
+    /// refusal rather than a payload the caller has to be handed, and a handler
+    /// returning `Result<_, ApiError>` can carry it through `?` without giving
+    /// up the shared error type.
+    pub fn token_required(mut self) -> ApiError {
+        self.token_required = Some(true);
+        self
     }
 
     /// Re-render an axum extractor rejection as a problem detail.
@@ -121,6 +177,7 @@ impl ApiError {
             status,
             title,
             detail,
+            token_required: None,
         }
     }
 }
@@ -216,6 +273,15 @@ pub struct ProblemDetail {
     /// The specific occurrence, safe to show to the caller.
     #[schema(example = "no engram 'ghost' in domain 'eng'")]
     pub detail: String,
+    /// An RFC 9457 extension member, present only on the `403` of
+    /// `POST /auth/setup` and only when this instance holds a setup token: the
+    /// first-run wizard renders its token field on this member rather than on
+    /// the detail prose, so an instance that has no token to enter (the
+    /// loopback bind generates none) never causes a dead-end input to be
+    /// drawn. Absent from every other problem document on this surface.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = true)]
+    pub token_required: Option<bool>,
 }
 
 impl IntoResponse for ApiError {
@@ -225,6 +291,7 @@ impl IntoResponse for ApiError {
             status: self.status.as_u16(),
             title: self.title,
             detail: self.detail,
+            token_required: self.token_required,
         };
         let mut resp = (self.status, axum::Json(body)).into_response();
         // `axum::Json` writes `application/json`; RFC 9457 requires the
@@ -237,25 +304,106 @@ impl IntoResponse for ApiError {
     }
 }
 
+/// The If-Match token: the unquoted strong checksum a write compares against.
+///
+/// 428 when the header is absent - the client forgot the contract, and the
+/// answer says where the token comes from. `*`, a weak `W/` validator and an
+/// empty token are 422: this surface versions by strong content checksum only,
+/// and matching "any version" would make If-Match decorative. A
+/// comma-separated list (`"a", "b"`) is RFC 9110-legal but 400: naively
+/// trimming quotes off it would silently mangle it into a malformed token
+/// instead of refusing it, and this surface's tokens are hex, so a comma can
+/// never appear in a legitimate one.
+pub fn if_match(headers: &axum::http::HeaderMap) -> Result<String, ApiError> {
+    let raw = headers
+        .get(axum::http::header::IF_MATCH)
+        .ok_or_else(|| {
+            ApiError::precondition_required(
+                "this write requires an If-Match header carrying the ETag \
+                 from the detail read, so a stale save is refused instead of \
+                 clobbering someone else's change",
+            )
+        })?
+        .to_str()
+        .map_err(|_| ApiError::unprocessable("the If-Match header is not readable text"))?
+        .trim();
+    if raw.contains(',') {
+        return Err(ApiError::bad_request(
+            "the If-Match header carries more than one entity tag; this \
+             surface expects exactly one strong checksum from the detail \
+             read, not a comma-separated list",
+        ));
+    }
+    if raw == "*" || raw.starts_with("W/") {
+        return Err(ApiError::unprocessable(
+            "If-Match must carry the strong content checksum from the detail \
+             read, not a wildcard or a weak validator",
+        ));
+    }
+    let token = raw.trim_matches('"');
+    if token.is_empty() {
+        return Err(ApiError::unprocessable("the If-Match token is empty"));
+    }
+    Ok(token.to_string())
+}
+
+/// The wire form of a 412: a problem detail carrying the version the server
+/// holds now, so a client can show a merge view instead of just failing.
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct ConflictDetail {
+    #[serde(rename = "type")]
+    pub problem_type: &'static str, // "about:blank"
+    pub status: u16,         // 412
+    pub title: &'static str, // "precondition failed"
+    pub detail: String,
+    /// The ETag of the version the server holds now, quoted.
+    pub current_etag: String,
+    /// The full markdown the server holds now, so a client can merge.
+    pub current_content: String,
+}
+
+/// A 412 for a write whose `If-Match` no longer matches the server's copy,
+/// carrying that copy so the caller can merge instead of retrying blind.
+pub fn precondition_failed(detail: String, checksum: &str, content: String) -> Response {
+    let body = ConflictDetail {
+        problem_type: "about:blank",
+        status: StatusCode::PRECONDITION_FAILED.as_u16(),
+        title: "precondition failed",
+        detail,
+        current_etag: format!("\"{checksum}\""),
+        current_content: content,
+    };
+    let mut resp = (StatusCode::PRECONDITION_FAILED, axum::Json(body)).into_response();
+    // `axum::Json` writes `application/json`; RFC 9457 requires the problem
+    // media type, so the header is replaced rather than appended.
+    resp.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/problem+json"),
+    );
+    resp
+}
+
 impl From<EngineError> for ApiError {
     /// Mirror `mcp::to_error`'s classification, projected onto HTTP: the
     /// variants it calls caller errors split into "the thing is not there"
     /// (404) and "the request was wrong" (422), and the variants it calls
-    /// internal errors become 500. `ReadOnly` stays in the caller-error class
-    /// it has on the MCP side rather than becoming a 403, so the two surfaces
-    /// keep one classification; the task that adds write endpoints owns any
-    /// refinement. The match is exhaustive so a new variant must be
-    /// classified here instead of silently defaulting.
+    /// internal errors become 500. `ReadOnly` is the one divergence from
+    /// `mcp::to_error`: HTTP has a status for "the server knows you and
+    /// refuses" that MCP does not reach for, and a browser client already
+    /// learns `read_only` from `/auth/me`, so this surface answers 403
+    /// instead of folding it into the generic 422 caller-error class. The
+    /// match is exhaustive so a new variant must be classified here instead
+    /// of silently defaulting.
     fn from(e: EngineError) -> ApiError {
         let detail = e.to_string();
         match e {
             EngineError::UnknownDomain { .. } | EngineError::NotFound(_) => {
                 ApiError::not_found(detail)
             }
+            EngineError::ReadOnly => ApiError::forbidden(detail),
             EngineError::Ambiguous(_)
             | EngineError::Conflict(_)
             | EngineError::Invalid(_)
-            | EngineError::ReadOnly
             | EngineError::EnvTokenConnect => unprocessable_error(detail),
             EngineError::Remote(remote) => remote_to_api_error(remote, detail),
             EngineError::Io { .. } | EngineError::Internal(_) => internal_error(detail),
@@ -307,6 +455,7 @@ fn unprocessable_error(detail: String) -> ApiError {
         status: StatusCode::UNPROCESSABLE_ENTITY,
         title: "invalid request",
         detail,
+        token_required: None,
     }
 }
 
@@ -316,6 +465,7 @@ fn internal_error(detail: String) -> ApiError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
         title: "internal error",
         detail,
+        token_required: None,
     }
 }
 
@@ -342,6 +492,119 @@ mod tests {
             ApiError::from(EngineError::Internal("store blew up".into())).status,
             StatusCode::INTERNAL_SERVER_ERROR
         );
+    }
+
+    /// The write-endpoint refinement: a read-only instance answers 403, matching
+    /// the /auth/me read_only flag a client already branches on. MCP keeps its own
+    /// classification; this is the HTTP projection only.
+    #[test]
+    fn read_only_is_forbidden_on_this_surface() {
+        let api = ApiError::from(EngineError::ReadOnly);
+        assert_eq!(api.status, StatusCode::FORBIDDEN);
+        assert!(api.detail.contains("read-only"), "{}", api.detail);
+    }
+
+    /// If-Match parsing: 428 without the header, the unquoted checksum with it,
+    /// and the shapes RFC 9110 allows but a strong-checksum contract refuses.
+    #[test]
+    fn if_match_demands_one_quoted_strong_validator() {
+        use axum::http::{HeaderMap, HeaderValue, header};
+        let with = |raw: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(header::IF_MATCH, HeaderValue::from_str(raw).unwrap());
+            h
+        };
+
+        assert_eq!(
+            if_match(&HeaderMap::new()).unwrap_err().status,
+            StatusCode::PRECONDITION_REQUIRED
+        );
+        assert_eq!(if_match(&with("\"abc123\"")).unwrap(), "abc123");
+        assert_eq!(
+            if_match(&with("abc123")).unwrap(),
+            "abc123",
+            "quotes optional on the way in"
+        );
+        for bad in ["*", "W/\"abc\"", "\"\"", ""] {
+            assert_eq!(
+                if_match(&with(bad)).unwrap_err().status,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{bad:?} is not a strong checksum"
+            );
+        }
+    }
+
+    /// RFC 9110 allows a comma-separated `If-Match` list; this surface refuses
+    /// it outright (400) rather than mangling it into a bogus single token by
+    /// trimming quotes off the whole thing.
+    #[test]
+    fn if_match_rejects_a_comma_separated_list() {
+        use axum::http::{HeaderMap, HeaderValue, header};
+        let mut h = HeaderMap::new();
+        h.insert(
+            header::IF_MATCH,
+            HeaderValue::from_str("\"abc123\", \"def456\"").unwrap(),
+        );
+        let err = if_match(&h).unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(
+            err.detail.contains("one") && err.detail.to_lowercase().contains("if-match"),
+            "the detail says one ETag is expected: {}",
+            err.detail
+        );
+    }
+
+    /// The 412 payload is a problem detail with extension members, sent as
+    /// application/problem+json like every other failure here.
+    #[tokio::test]
+    async fn a_precondition_failure_carries_the_current_version() {
+        let resp = precondition_failed(
+            "the engram changed since it was read".to_string(),
+            "abc123",
+            "---\ntitle: Now\n---\n".to_string(),
+        );
+        assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);
+        assert_eq!(
+            resp.headers()[axum::http::header::CONTENT_TYPE],
+            "application/problem+json"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["status"], 412);
+        assert_eq!(body["title"], "precondition failed");
+        assert_eq!(body["current_etag"], "\"abc123\"");
+        assert!(
+            body["current_content"]
+                .as_str()
+                .unwrap()
+                .contains("title: Now")
+        );
+    }
+
+    /// The one extension member: present when a refusal was asked to carry it,
+    /// and absent from the body entirely otherwise - not `null`, which a client
+    /// checking for the key would have to special-case.
+    #[tokio::test]
+    async fn the_token_required_member_appears_only_when_it_is_set() {
+        let body = |error: ApiError| async {
+            let resp = error.into_response();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        };
+
+        let plain = body(ApiError::forbidden("no")).await;
+        assert!(
+            plain.get("token_required").is_none(),
+            "an ordinary refusal carries no extension member: {plain}"
+        );
+        let marked = body(ApiError::forbidden("no").token_required()).await;
+        assert_eq!(marked["token_required"], true);
+        assert_eq!(marked["status"], 403, "and the rest of the shape is intact");
+        assert_eq!(marked["title"], "forbidden");
     }
 
     /// An axum rejection keeps the status axum chose and gains a title from

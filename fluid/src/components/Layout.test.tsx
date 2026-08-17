@@ -87,6 +87,16 @@ function treeResponse(path: string) {
     path: "/",
     folders: ["notes"],
     engrams: [
+      // The engine lists the MANIFEST as an engram of the domain like any
+      // other, which is what the sidebar's pinned row above the tree would
+      // otherwise say twice.
+      {
+        permalink: "manifest",
+        title: "MANIFEST",
+        type: "manifest",
+        status: "current",
+        path: "MANIFEST.md",
+      },
       {
         permalink: "alpha",
         title: "Alpha",
@@ -112,14 +122,29 @@ function serveInDomain(extra: Record<string, (path: string) => unknown> = {}) {
     "/domains": twoDomainsResponse,
     "/domains/eng/tree": treeResponse,
     "/domains/eng/manifest": () => ({ domain: "eng", markdown: "" }),
-    "/domains/eng/engrams": () => ({
-      mode: "text",
-      total: 0,
-      page: 1,
-      limit: 50,
-      count: 0,
-      hits: [],
-    }),
+    // The domain screen behind the frame pages this, scoped to the folder it
+    // is browsing: the tree is navigation, the listing is what is in there.
+    "/domains/eng/engrams": (path) =>
+      path.includes("path=notes")
+        ? {
+            mode: "text",
+            total: 1,
+            page: 1,
+            limit: 50,
+            count: 1,
+            hits: [
+              {
+                domain: "eng",
+                permalink: "notes/beta",
+                title: "Beta",
+                engram_type: "engram",
+                kind: "engram",
+                status: "stable",
+                tags: [],
+              },
+            ],
+          }
+        : { mode: "text", total: 0, page: 1, limit: 50, count: 0, hits: [] },
     "/domains/eng/engrams/alpha": () => ({
       domain: "eng",
       permalink: "alpha",
@@ -158,13 +183,60 @@ function requested(): string[] {
   return apiMock.mock.calls.map((call) => call[0]);
 }
 
+/**
+ * A window narrower than the medium breakpoint.
+ *
+ * jsdom answers no media queries at all - it ships no `matchMedia` - so a
+ * frame asking about the viewport is told, by default, that it is on the wide
+ * side, and a test that wants a phone says so by installing an API that
+ * answers no to everything: narrow, and light while it is at it, which is what
+ * the theme provider asks the same call.
+ */
+function stubNarrowWindow() {
+  // On `window` itself rather than through `vi.stubGlobal`: this environment
+  // keeps jsdom's window beside the Node globals rather than as them (see
+  // `test/setup.ts`), and the frame asks `window`.
+  Object.defineProperty(window, "matchMedia", {
+    configurable: true,
+    value: (query: string) => ({
+      matches: false,
+      media: query,
+      addEventListener: () => undefined,
+      removeEventListener: () => undefined,
+    }),
+  });
+}
+
 beforeEach(() => {
   apiMock.mockReset();
   setCsrfTokenMock.mockReset();
   document.documentElement.removeAttribute("data-theme");
+  Reflect.deleteProperty(window, "matchMedia");
+  // The sidebar's own width is remembered across sessions, so each test
+  // starts from a browser that has never been told anything.
+  localStorage.clear();
 });
 
 describe("the layout", () => {
+  it("moves focus to the main region on navigation", async () => {
+    // /auth/me + /domains + a domain tree/engrams, the way the sidebar and
+    // the screen behind it both need it.
+    serveInDomain();
+
+    renderApp("/");
+    // Scoped to the sidebar: the same domain is also named by a card on the
+    // home screen behind it, and an unscoped query would match both.
+    const domains = await screen.findByRole("navigation", { name: "Domains" });
+    const domainLink = await within(domains).findByRole("link", {
+      name: /^eng/,
+    });
+    await userEvent.click(domainLink);
+
+    await waitFor(() => {
+      expect(document.activeElement).toBe(screen.getByRole("main"));
+    });
+  });
+
   it("lists the instance's domains in the sidebar", async () => {
     serveSignedIn();
 
@@ -225,6 +297,98 @@ describe("the layout", () => {
       expect(screen.getByText(/no engram matches/i)).toBeVisible();
     });
     expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("names every control in the top bar, icon-shaped ones included", async () => {
+    // An administrator, because the graph icon is the one control the frame
+    // only offers to a session that may use it.
+    serve({
+      "/auth/me": () => meResponse({ user: userFixture({ role: "admin" }) }),
+      "/domains": domainsResponse,
+      "/activity": () => ({ timeframe: "7d", count: 0, engrams: [] }),
+    });
+
+    renderApp("/");
+    await screen.findByRole("heading", { name: "Home" });
+
+    // The icons carry no text, so the name is the only thing a reader
+    // arriving by keyboard or by screen reader has to go on.
+    expect(screen.getByRole("button", { name: "Domains" })).toHaveAttribute(
+      "aria-controls",
+      "domain-sidebar",
+    );
+    // GitHub settings are reached through the identity menu's Settings item;
+    // the top bar carries no separate door to the same screen.
+    expect(screen.queryByRole("link", { name: "GitHub" })).toBeNull();
+    expect(screen.getByRole("button", { name: /^Theme:/ })).toBeVisible();
+    expect(screen.getByRole("link", { name: "Fluid" })).toHaveAttribute(
+      "href",
+      "/",
+    );
+    // Who you are is one item, not a strip: the accounts screen is reached
+    // from inside it rather than from an icon of its own beside it.
+    expect(screen.queryByRole("link", { name: "Users" })).toBeNull();
+
+    // And the pointer is told the same names the screen reader is, by the
+    // app's own tooltip rather than the browser's - so none of these three
+    // carries a `title` for a second label to be drawn from.
+    for (const control of [
+      screen.getByRole("button", { name: "Domains" }),
+      screen.getByRole("button", { name: /^Theme:/ }),
+    ]) {
+      expect(control).not.toHaveAttribute("title");
+    }
+    const user = userEvent.setup();
+    await user.hover(screen.getByRole("button", { name: "Domains" }));
+    expect(
+      await screen.findByRole("tooltip", {}, { timeout: 2000 }),
+    ).toHaveTextContent("Domains");
+  });
+
+  it("gathers who you are and what only you can reach into one menu", async () => {
+    serve({
+      "/auth/me": () => meResponse({ user: userFixture({ role: "admin" }) }),
+      "/domains": domainsResponse,
+      "/activity": () => ({ timeframe: "7d", count: 0, engrams: [] }),
+    });
+
+    renderApp("/");
+    await screen.findByRole("heading", { name: "Home" });
+
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Ada Lovelace" }));
+
+    // The header line says who, in the account's own name and its role, and is
+    // not something to press - it is what the rest of the menu is about.
+    expect(await screen.findByText("ada (admin)")).toBeVisible();
+    expect(screen.queryByRole("menuitem", { name: "ada (admin)" })).toBeNull();
+    // Then the two screens this session may reach, then the way out.
+    expect(
+      await screen.findByRole("menuitem", { name: "Users" }),
+    ).toHaveAttribute("href", "/users");
+    expect(screen.getByRole("menuitem", { name: "Settings" })).toHaveAttribute(
+      "href",
+      "/settings/github",
+    );
+    expect(screen.getByRole("menuitem", { name: "Log out" })).toBeVisible();
+  });
+
+  it("offers no accounts row to a session that may not administer", async () => {
+    serveSignedIn();
+
+    renderApp("/");
+    await screen.findByRole("heading", { name: "Home" });
+
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Ada Lovelace" }));
+
+    // The editor's own identity, and the way out. The screens behind Users and
+    // Settings both refuse anyone but an admin, and the frame offers no door
+    // that will not open.
+    expect(await screen.findByText("ada (editor)")).toBeVisible();
+    expect(screen.getByRole("menuitem", { name: "Log out" })).toBeVisible();
+    expect(screen.queryByRole("menuitem", { name: "Users" })).toBeNull();
+    expect(screen.queryByRole("menuitem", { name: "Settings" })).toBeNull();
   });
 
   it("writes the chosen theme onto the document", async () => {
@@ -316,7 +480,7 @@ describe("the sidebar inside a domain", () => {
     ).toHaveAttribute("href", "/");
     // And below it, what this domain holds: its folders and its engrams.
     expect(
-      await within(nav).findByRole("button", { name: "notes" }),
+      await within(nav).findByRole("button", { name: "Expand notes" }),
     ).toHaveAttribute("aria-expanded", "false");
     expect(within(nav).getByRole("link", { name: "Alpha" })).toHaveAttribute(
       "href",
@@ -366,6 +530,149 @@ describe("the sidebar inside a domain", () => {
     ).toBeVisible();
   });
 
+  it("splits a folder row: the name browses it, the icon opens it here", async () => {
+    serveInDomain();
+
+    renderApp("/d/eng");
+    const nav = await sidebar();
+
+    // Two controls, side by side rather than one inside the other: a link
+    // nested in a button is an accessibility violation and a guess about
+    // which of the two a click meant.
+    const name = await within(nav).findByRole("link", { name: "notes" });
+    expect(name).toHaveAttribute("href", "/d/eng?path=notes");
+    const toggle = within(nav).getByRole("button", { name: "Expand notes" });
+    expect(toggle.contains(name)).toBe(false);
+    expect(name.contains(toggle)).toBe(false);
+
+    // The icon looks inside without moving the screen beside it, and says
+    // which of the two things it does next.
+    await userEvent.click(toggle);
+    expect(
+      await within(nav).findByRole("button", { name: "Collapse notes" }),
+    ).toHaveAttribute("aria-expanded", "true");
+    expect(
+      await within(nav).findByRole("link", { name: "Beta" }),
+    ).toBeVisible();
+  });
+
+  it("draws one folder glyph per row, on the control that opens it", async () => {
+    serveInDomain();
+
+    renderApp("/d/eng");
+    const nav = await sidebar();
+
+    // The chevron beside the folder icon read as a dot rather than a control,
+    // so the two became one: the icon IS the toggle now, and its open face is
+    // what the chevron used to say.
+    const toggle = await within(nav).findByRole("button", {
+      name: "Expand notes",
+    });
+    const name = within(nav).getByRole("link", { name: "notes" });
+    expect(toggle.querySelectorAll("svg")).toHaveLength(1);
+    expect(toggle.querySelector("svg")?.getAttribute("class")).toContain(
+      "lucide-folder",
+    );
+    expect(name.querySelectorAll("svg")).toHaveLength(0);
+    expect(toggle).not.toHaveTextContent(/\S/);
+
+    // Open, and the same one glyph says so.
+    await userEvent.click(toggle);
+    const opened = await within(nav).findByRole("button", {
+      name: "Collapse notes",
+    });
+    expect(opened.querySelectorAll("svg")).toHaveLength(1);
+    expect(opened.querySelector("svg")?.getAttribute("class")).toContain(
+      "lucide-folder-open",
+    );
+  });
+
+  it("offers the whole of a folder too big to draw, without quoting a count", async () => {
+    serveInDomain({
+      "/domains/eng/tree": (path) =>
+        path.includes("path=notes")
+          ? {
+              domain: "eng",
+              path: "notes",
+              folders: [],
+              engrams: [
+                {
+                  permalink: "notes/beta",
+                  title: "Beta",
+                  type: "engram",
+                  status: "stable",
+                  path: "notes/beta.md",
+                },
+              ],
+              truncated: true,
+              total: 620,
+            }
+          : { ...treeResponse(path), truncated: true, total: 500 },
+    });
+
+    renderApp("/d/eng");
+    const nav = await sidebar();
+
+    // The root level was cut too, and the row that says so names the domain
+    // rather than a folder, because the root is not a folder somebody opened.
+    const whole = await within(nav).findByRole("link", {
+      name: "Browse all engrams in this domain",
+    });
+    expect(whole).toHaveAttribute("href", "/d/eng");
+
+    await userEvent.click(
+      await within(nav).findByRole("button", { name: "Expand notes" }),
+    );
+
+    // The sidebar never tries to show a big folder whole: it hands the folder
+    // to the screen, which pages it. No number: this is a link, so its words
+    // are a promise about where it goes, and the count this level knows is the
+    // engrams directly in it while the screen counts everything below it too.
+    const all = await within(nav).findByRole("link", {
+      name: "Browse all of notes",
+    });
+    expect(all).toHaveAttribute("href", "/d/eng?path=notes");
+    expect(within(nav).queryByText(/620/)).toBeNull();
+  });
+
+  it("marks the folder being browsed and opens it", async () => {
+    serveInDomain();
+
+    renderApp("/d/eng?path=notes");
+    const nav = await sidebar();
+
+    // Browsing a folder is being somewhere, so the tree says where: the same
+    // mark an engram row wears, on the row that is the place.
+    const name = await within(nav).findByRole("link", { name: "notes" });
+    expect(name).toHaveAttribute("aria-current", "page");
+    expect(
+      within(nav).getByRole("button", { name: "Collapse notes" }),
+    ).toHaveAttribute("aria-expanded", "true");
+  });
+
+  it("stops calling a folder current once a filter is on", async () => {
+    serveInDomain();
+
+    // Browsing `notes`, then filtering: the screen leaves the folder and
+    // lists the whole domain, and it says so above the rows.
+    renderApp("/d/eng?path=notes&tags=eng");
+    const nav = await sidebar();
+    expect(
+      await screen.findByText(/Filtered across the whole domain/),
+    ).toBeVisible();
+
+    // So the tree does not claim the reader is in that folder. The mark would
+    // be a plain misstatement: it names a page the reader is not on, and the
+    // link under it drops the filter rather than staying put.
+    const name = await within(nav).findByRole("link", { name: "notes" });
+    expect(name).not.toHaveAttribute("aria-current");
+    // The branch stays open, though: the filter is a lens over the domain,
+    // not a reason to fold away where the reader just was.
+    expect(
+      within(nav).getByRole("button", { name: "Collapse notes" }),
+    ).toHaveAttribute("aria-expanded", "true");
+  });
+
   it("asks for a folder only when it is opened", async () => {
     serveInDomain();
 
@@ -373,7 +680,7 @@ describe("the sidebar inside a domain", () => {
     // Scoped to the sidebar: the domain screen beside it browses by folder
     // too, and this is about the tree in the frame.
     const folder = await within(await sidebar()).findByRole("button", {
-      name: "notes",
+      name: "Expand notes",
     });
     // Nothing below the root was fetched: the tree is walked, not downloaded.
     expect(requested().some((path) => path.includes("path=notes"))).toBe(false);
@@ -400,7 +707,7 @@ describe("the sidebar inside a domain", () => {
     // The folder on the way to it is open, because a mark nobody can see is
     // not a mark at all.
     expect(
-      await within(nav).findByRole("button", { name: "notes" }),
+      await within(nav).findByRole("button", { name: "Collapse notes" }),
     ).toHaveAttribute("aria-expanded", "true");
     const current = await within(nav).findByRole("link", { name: "Beta" });
     expect(current).toHaveAttribute("aria-current", "page");
@@ -414,7 +721,9 @@ describe("the sidebar inside a domain", () => {
 
     renderApp("/d/eng");
     const nav = await sidebar();
-    const folder = await within(nav).findByRole("button", { name: "notes" });
+    const folder = await within(nav).findByRole("button", {
+      name: "Expand notes",
+    });
     expect(folder).toHaveAttribute("aria-expanded", "false");
 
     // Into the folder the long way round, through the screen's own browse
@@ -445,6 +754,20 @@ describe("the sidebar inside a domain", () => {
     expect(retired.className).toContain("opacity-60");
   });
 
+  it("says the MANIFEST once, above the tree rather than inside it", async () => {
+    serveInDomain();
+
+    renderApp("/d/eng");
+
+    const nav = await sidebar();
+    // The tree has arrived, so a row the engine listed would be on screen by
+    // now if the sidebar were drawing it.
+    await within(nav).findByRole("link", { name: "Alpha" });
+    const pinned = within(nav).getAllByRole("link", { name: "MANIFEST" });
+    expect(pinned).toHaveLength(1);
+    expect(pinned[0]).toHaveAttribute("href", "/d/eng/manifest");
+  });
+
   it("says why a folder is empty instead of showing an empty one", async () => {
     serveInDomain({
       "/domains/eng/tree": () => {
@@ -465,5 +788,187 @@ describe("the sidebar inside a domain", () => {
     expect(
       within(await sidebar()).getByRole("button", { name: "Domain: eng" }),
     ).toBeVisible();
+  });
+});
+
+/**
+ * The sidebar is the widest thing on screen that is not what the reader came
+ * for, so it folds down to a column of icons and stays that way: a choice
+ * about the shape of the frame is a choice about every screen after it, not
+ * about the one that happened to be open when it was made.
+ */
+describe("the sidebar's own width", () => {
+  it("collapses to a rail and remembers it", async () => {
+    serveSignedIn();
+
+    renderApp("/");
+    const user = userEvent.setup();
+    const collapse = await screen.findByRole("button", {
+      name: "Collapse the sidebar",
+    });
+    expect(collapse).toHaveAttribute("aria-expanded", "true");
+    // The same element the top bar's own disclosure names, so the two
+    // controls of one sidebar say so in the same words.
+    expect(collapse).toHaveAttribute("aria-controls", "domain-sidebar");
+
+    await user.click(collapse);
+
+    const nav = screen.getByRole("navigation", { name: "Domains" });
+    // The listing is gone rather than squeezed into three rem of column.
+    expect(within(nav).queryByRole("link", { name: /^eng/ })).toBeNull();
+    const expand = within(nav).getByRole("button", {
+      name: "Expand the sidebar",
+    });
+    expect(expand).toHaveAttribute("aria-expanded", "false");
+    expect(expand).toHaveAttribute("aria-controls", "domain-sidebar");
+    // What survives the fold is the way home, named for the keyboard and the
+    // screen reader as much as for the eye.
+    expect(
+      within(nav).getByRole("button", { name: "All domains" }),
+    ).toBeVisible();
+    expect(localStorage.getItem("fluid.nav")).toBe("rail");
+  });
+
+  it("hands the keyboard on to the control that replaces the one it used", async () => {
+    serveSignedIn();
+
+    renderApp("/");
+    const user = userEvent.setup();
+    // By keyboard throughout: the control that folds the sidebar unmounts in
+    // the act of doing it, and focus dropped on the document is a reader sent
+    // back to the top of the page to find their way in again.
+    (
+      await screen.findByRole("button", { name: "Collapse the sidebar" })
+    ).focus();
+    await user.keyboard("{Enter}");
+
+    const expand = await screen.findByRole("button", {
+      name: "Expand the sidebar",
+    });
+    expect(document.activeElement).toBe(expand);
+
+    await user.keyboard("{Enter}");
+    expect(document.activeElement).toBe(
+      await screen.findByRole("button", { name: "Collapse the sidebar" }),
+    );
+  });
+
+  it("reads a stored rail preference at mount", async () => {
+    localStorage.setItem("fluid.nav", "rail");
+    serveSignedIn();
+
+    renderApp("/");
+
+    expect(
+      await screen.findByRole("button", { name: "Expand the sidebar" }),
+    ).toBeVisible();
+    expect(
+      screen.queryByRole("button", { name: "Collapse the sidebar" }),
+    ).toBeNull();
+  });
+
+  it("ignores a stored rail below the medium breakpoint", async () => {
+    // The stored width is a choice about a column beside the reading surface,
+    // and below `md` there is no such column: the sidebar is a drawer the top
+    // bar opens over the screen. A rail applied there would hand a phone a
+    // three-rem strip of icons, put the way out of it behind a control the
+    // stylesheet hides, and leave the two disclosures of one sidebar saying
+    // different things about whether it is open.
+    localStorage.setItem("fluid.nav", "rail");
+    stubNarrowWindow();
+    serveSignedIn();
+
+    renderApp("/");
+
+    const nav = await screen.findByRole("navigation", { name: "Domains" });
+    expect(
+      await within(nav).findByRole("link", { name: /^eng/ }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Expand the sidebar" }),
+    ).toBeNull();
+    // And the one control a narrow window does offer says what the drawer is
+    // doing, with nothing beside it to contradict it.
+    expect(screen.getByRole("button", { name: "Domains" })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+  });
+
+  it("survives a move to another screen", async () => {
+    localStorage.setItem("fluid.nav", "rail");
+    serveInDomain();
+
+    renderApp("/");
+    const user = userEvent.setup();
+    await user.click(
+      await screen.findByRole("button", { name: "All domains" }),
+    );
+    await screen.findByRole("heading", { name: "Home" });
+
+    // Still folded on the screen it landed on: the choice is the frame's, not
+    // one screen's.
+    expect(
+      await screen.findByRole("button", { name: "Expand the sidebar" }),
+    ).toBeVisible();
+  });
+
+  it("keeps a launcher inside the rail while a domain is open", async () => {
+    localStorage.setItem("fluid.nav", "rail");
+    serveInDomain();
+
+    renderApp("/d/eng/e/alpha");
+    const user = userEvent.setup();
+    const nav = await sidebar();
+    // The folded sidebar, not the one that still has room for a tree.
+    expect(
+      within(nav).getByRole("button", { name: "Expand the sidebar" }),
+    ).toBeVisible();
+    expect(within(nav).queryByRole("link", { name: "Alpha" })).toBeNull();
+
+    await user.click(within(nav).getByRole("button", { name: "New engram" }));
+
+    expect(
+      await screen.findByRole("dialog", { name: /new engram/i }),
+    ).toBeVisible();
+  });
+
+  it("leaves the launcher to the domain's own home screen", async () => {
+    localStorage.setItem("fluid.nav", "rail");
+    serveInDomain();
+
+    renderApp("/d/eng");
+    const nav = await sidebar();
+    await screen.findByRole("heading", { level: 1, name: "eng" });
+
+    // The frame folds to a rail and still keeps out of the way: this screen
+    // carries its own launcher, prefilled with the folder being browsed, and
+    // a second one in the rail beside it would be two controls for one act.
+    // The rule is `DomainNav`'s, unchanged by the fold.
+    expect(
+      within(nav).queryByRole("button", { name: "New engram" }),
+    ).toBeNull();
+    expect(
+      within(await screen.findByRole("main")).getByRole("button", {
+        name: "New engram",
+      }),
+    ).toBeVisible();
+  });
+
+  it("unfolds again, and remembers that too", async () => {
+    localStorage.setItem("fluid.nav", "rail");
+    serveSignedIn();
+
+    renderApp("/");
+    const user = userEvent.setup();
+    await user.click(
+      await screen.findByRole("button", { name: "Expand the sidebar" }),
+    );
+
+    const nav = screen.getByRole("navigation", { name: "Domains" });
+    expect(
+      await within(nav).findByRole("link", { name: /^eng/ }),
+    ).toBeVisible();
+    expect(localStorage.getItem("fluid.nav")).toBe("expanded");
   });
 });

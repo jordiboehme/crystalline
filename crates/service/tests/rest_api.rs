@@ -1,4 +1,4 @@
-//! Drives the REST surface `serve --http` mounts at `/api/v1` over a live TCP
+//! Drives the REST surface the HTTP endpoint mounts at `/api/v1` over a live TCP
 //! listener, through the production router construction
 //! (`crystalline_service::daemon::http_router`) rather than a hand-built
 //! sub-router, so a regression in the mount point or in the nesting order
@@ -16,7 +16,7 @@ use crystalline_service::daemon::http_router;
 use crystalline_service::rest::{AuthStore, Role};
 use tokio::sync::Mutex;
 
-/// The two startup-effective auth settings a test varies. Everything else is
+/// The startup-effective auth settings a test varies. Everything else is
 /// the shared fixture below.
 #[derive(Default)]
 struct AuthOptions {
@@ -24,19 +24,33 @@ struct AuthOptions {
     anonymous: bool,
     /// `auth.trusted_header`: the header a trusted proxy names the user in.
     trusted_header: Option<&'static str>,
+    /// `auth.max_users`: how many accounts trusted-header provisioning may
+    /// mint in total. `None` leaves the default cap (100) in place.
+    max_users: Option<u32>,
 }
 
 /// Build the same kind of engine the other service integration tests use: a
 /// real temp-directory domain (files are the source of truth) synced into an
 /// in-memory Turso store, response format pinned to plain JSON so assertions
 /// don't have to account for TOON framing, and `opts` in the auth block.
-async fn build_engine(opts: AuthOptions) -> (tempfile::TempDir, Arc<Engine>) {
+///
+/// `extra` engrams are seeded into `eng` beyond [`FIXTURE_ENGRAMS`], named by
+/// domain-relative path. The shared fixture is
+/// three engrams because most tests want a small, stable domain; the folder
+/// and tree tests want shapes it deliberately does not have (a sibling folder
+/// whose name starts like another, or more engrams in one folder than a tree
+/// level shows), so they seed their own rather than growing everyone's.
+async fn build_engine_with(
+    opts: AuthOptions,
+    extra: &[String],
+) -> (tempfile::TempDir, Arc<Engine>) {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
     let mut cfg = GlobalConfig {
         auth: Some(AuthConfig {
             trusted_header: opts.trusted_header.map(str::to_string),
             anonymous: Some(opts.anonymous),
+            max_users: opts.max_users,
         }),
         ..GlobalConfig::default()
     };
@@ -53,6 +67,20 @@ async fn build_engine(opts: AuthOptions) -> (tempfile::TempDir, Arc<Engine>) {
         let path = dir.join(engram.path);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, engram.markdown()).unwrap();
+    }
+    for rel in extra {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // The permalink is the path without its suffix, which is what a real
+        // domain writes for an engram in a folder.
+        let permalink = rel.trim_end_matches(".md");
+        std::fs::write(
+            &path,
+            format!(
+                "---\ntype: engram\ntitle: {permalink}\npermalink: {permalink}\ntags:\n  - eng\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# {permalink}\n\nA seeded engram.\n"
+            ),
+        )
+        .unwrap();
     }
     cfg.domains
         .insert("eng".to_string(), DomainEntry::file(dir));
@@ -157,13 +185,21 @@ const FIXTURE_ENGRAMS: [FixtureEngram; 3] = [
 /// Bind `http_router` on an ephemeral loopback port and serve it on a
 /// background task for the duration of the test.
 fn serve_test_router(engine: Arc<Engine>, auth: Arc<AuthStore>) -> std::net::SocketAddr {
-    let router = http_router(engine, Arc::new(AtomicUsize::new(0)), &[], auth).unwrap();
+    let router = http_router(engine, Arc::new(AtomicUsize::new(0)), &[], auth, None).unwrap();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         let listener = tokio::net::TcpListener::from_std(listener).unwrap();
-        axum::serve(listener, router).await.unwrap();
+        // Served the way `run_http` serves it, connect info included: the peer
+        // address the first-run setup route reads lives in the extensions this
+        // adds, and a plain router would leave it missing.
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
     addr
 }
@@ -195,7 +231,13 @@ async fn serve_test_router_with_fixture() -> (std::net::SocketAddr, tempfile::Te
 /// The auth fixture: the production router over an engine carrying `opts`, with
 /// an auth database in the same temp directory the test can seed accounts in.
 async fn serve_with_auth(opts: AuthOptions) -> Fixture {
-    let (tmp, engine) = build_engine(opts).await;
+    serve_with_auth_and(opts, &[]).await
+}
+
+/// [`serve_with_auth`] over a domain carrying `extra` engrams beyond the
+/// shared fixture.
+async fn serve_with_auth_and(opts: AuthOptions, extra: &[String]) -> Fixture {
+    let (tmp, engine) = build_engine_with(opts, extra).await;
     let auth = Arc::new(
         AuthStore::open(&tmp.path().join("web-auth.db"))
             .await
@@ -216,6 +258,19 @@ async fn serve_anonymous() -> Fixture {
         anonymous: true,
         ..AuthOptions::default()
     })
+    .await
+}
+
+/// The anonymous fixture over a domain carrying `extra` engrams beyond the
+/// shared three, for the tests about folder shape and scale.
+async fn serve_anonymous_with(extra: &[String]) -> Fixture {
+    serve_with_auth_and(
+        AuthOptions {
+            anonymous: true,
+            ..AuthOptions::default()
+        },
+        extra,
+    )
     .await
 }
 
@@ -278,7 +333,7 @@ fn as_session(
 }
 
 /// The field names one user object carries, which is the whole contract: the
-/// five columns the CLI's `users list --json` prints and nothing else.
+/// six columns the CLI's `users list --json` prints and nothing else.
 fn user_fields(user: &serde_json::Value) -> Vec<String> {
     let mut keys: Vec<String> = user
         .as_object()
@@ -626,6 +681,7 @@ async fn data_routes_401_without_identity_when_not_anonymous() {
         "/api/v1/domains/eng/engrams",
         "/api/v1/domains/eng/engrams/alpha",
         "/api/v1/domains/eng/engrams/notes/deep/gamma",
+        "/api/v1/domains/eng/inbound/alpha",
         "/api/v1/search",
         "/api/v1/vocabulary",
         "/api/v1/context",
@@ -702,23 +758,25 @@ async fn trusted_header_maps_identity() {
         ..AuthOptions::default()
     })
     .await;
-    let me: serde_json::Value = client()
+    let probe = client()
         .get(format!("http://{}/api/v1/auth/me", fixture.addr))
         .header("remote-user", "Bob")
         .send()
         .await
-        .unwrap()
-        .json()
-        .await
         .unwrap();
+    assert!(
+        session_cookie(&probe).is_some(),
+        "the probe mints a session for a trusted-header identity too"
+    );
+    let me: serde_json::Value = probe.json().await.unwrap();
     assert_eq!(me["user"]["name"], "bob", "the name is folded by the store");
     assert_eq!(me["user"]["display"], "Bob");
     assert_eq!(me["user"]["role"], "viewer");
     assert!(
-        me["csrf"].is_null(),
-        "a trusted-header identity carries no session and so no token; what \
-         keeps its mutating requests off another origin is the shape they are \
-         allowed to have. See `check_csrf`. Body: {me}"
+        me["csrf"].as_str().is_some_and(|tok| !tok.is_empty()),
+        "one CSRF rule for every identity mode: the probe hands a \
+         trusted-header identity the token its mutating requests must echo. \
+         See `check_csrf`. Body: {me}"
     );
 
     let users = fixture.auth.list_users().await.unwrap();
@@ -775,6 +833,94 @@ async fn a_disabled_account_is_refused_on_the_trusted_header() {
         .unwrap();
     assert_eq!(resp.status(), 403);
     assert_eq!(resp.headers()["content-type"], "application/problem+json");
+}
+
+/// A trusted-header value with internal whitespace cannot normalize into a
+/// login name (see `auth_store::normalize_name`). Before this task that
+/// refusal fell through the generic `anyhow` conversion and answered `500`;
+/// the caller cannot fix the proxy's header, so it must be a `403` naming the
+/// problem, not an opaque server error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_trusted_header_name_with_spaces_is_refused_as_403() {
+    let fixture = serve_with_auth(AuthOptions {
+        trusted_header: Some("remote-user"),
+        ..AuthOptions::default()
+    })
+    .await;
+    let resp = client()
+        .get(format!("http://{}/api/v1/auth/me", fixture.addr))
+        .header("remote-user", "ada lovelace")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+    assert_eq!(resp.headers()["content-type"], "application/problem+json");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body["detail"].as_str().unwrap().contains("whitespace"),
+        "the message must be actionable, not opaque: {body}"
+    );
+    assert!(
+        fixture.auth.list_users().await.unwrap().is_empty(),
+        "no account was minted for a name that cannot normalize"
+    );
+}
+
+/// `auth.max_users` bounds trusted-header provisioning: once the cap is
+/// reached, a request naming a new identity is refused `403` rather than
+/// minting past it, while an account that already exists keeps resolving.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn trusted_header_provisioning_is_capped() {
+    let fixture = serve_with_auth(AuthOptions {
+        trusted_header: Some("remote-user"),
+        max_users: Some(1),
+        ..AuthOptions::default()
+    })
+    .await;
+
+    let first = client()
+        .get(format!("http://{}/api/v1/auth/me", fixture.addr))
+        .header("remote-user", "ada")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), 200, "the first account is under the cap");
+
+    let refused = client()
+        .get(format!("http://{}/api/v1/auth/me", fixture.addr))
+        .header("remote-user", "bob")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 403);
+    assert_eq!(
+        refused.headers()["content-type"],
+        "application/problem+json"
+    );
+    let body: serde_json::Value = refused.json().await.unwrap();
+    assert!(
+        body["detail"].as_str().unwrap().contains("auth.max_users"),
+        "the refusal names the setting: {body}"
+    );
+
+    // The existing account still resolves, whatever the count-vs-cap state.
+    let still = client()
+        .get(format!("http://{}/api/v1/auth/me", fixture.addr))
+        .header("remote-user", "ada")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(still.status(), 200);
+
+    let names: Vec<String> = fixture
+        .auth
+        .list_users()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|u| u.name)
+        .collect();
+    assert_eq!(names, vec!["ada".to_string()]);
 }
 
 /// Logout is a mutating request, so it carries the CSRF token the session was
@@ -1146,6 +1292,194 @@ async fn engram_list_filters_and_carries_the_page_envelope() {
     unique.sort();
     unique.dedup();
     assert_eq!(unique.len(), 4, "the pages do not overlap: {paged:?}");
+
+    // The page size is the server's to bound. This listing is a filter-only
+    // search, whose SQL carries whole engram bodies through a sorter that the
+    // database bounds by exactly this number, so a client-chosen `limit` is a
+    // client-chosen amount of memory. An enormous one is clamped and the
+    // envelope reports the clamp, the same contract the inbound route states.
+    let huge: serde_json::Value = get(
+        fixture.addr,
+        "/api/v1/domains/eng/engrams?limit=18446744073709551615",
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(
+        huge["limit"], 100,
+        "an enormous page size is clamped to the ceiling and reported as clamped: {huge}"
+    );
+    assert_eq!(huge["total"], 4, "and the total is still the truth: {huge}");
+}
+
+/// The listing takes a folder, and a folder is a folder rather than a string:
+/// `path=notes` lists everything under `notes/` and never the sibling
+/// `notes-misc/`, whose name merely starts the same way.
+///
+/// This is what a center pane pages a big folder from: the folder narrows the
+/// same filter-only search the rest of the query string narrows, so `total`
+/// stays exact under it and paging works unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn engram_list_scopes_to_a_folder() {
+    let fixture = serve_anonymous_with(&[
+        "notes-misc/zeta.md".to_string(),
+        "notes/deep/delta.md".to_string(),
+    ])
+    .await;
+
+    let under_notes: serde_json::Value =
+        get(fixture.addr, "/api/v1/domains/eng/engrams?path=notes")
+            .await
+            .json()
+            .await
+            .unwrap();
+    assert_eq!(
+        hit_permalinks(&under_notes),
+        vec![
+            "notes/beta".to_string(),
+            "notes/deep/delta".to_string(),
+            "notes/deep/gamma".to_string()
+        ],
+        "the folder and its descendants, and not notes-misc: {under_notes}"
+    );
+    assert_eq!(
+        under_notes["total"], 3,
+        "the total counts the folder exactly: {under_notes}"
+    );
+
+    // The sibling is reachable under its own name, which is the other half of
+    // the segment-safety contract.
+    let misc: serde_json::Value = get(fixture.addr, "/api/v1/domains/eng/engrams?path=notes-misc")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(hit_permalinks(&misc), vec!["notes-misc/zeta".to_string()]);
+
+    // A nested folder, with or without the slashes a client may send.
+    for path in ["notes/deep", "/notes/deep/", "notes%2Fdeep"] {
+        let deep: serde_json::Value = get(
+            fixture.addr,
+            &format!("/api/v1/domains/eng/engrams?path={path}"),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+        assert_eq!(deep["total"], 2, "path={path}: {deep}");
+    }
+
+    // An absent or empty folder is the whole domain, which is what every
+    // client that never sends the parameter keeps getting.
+    let all: serde_json::Value = get(fixture.addr, "/api/v1/domains/eng/engrams")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(all["total"], 6, "the MANIFEST and five engrams: {all}");
+    let empty: serde_json::Value = get(fixture.addr, "/api/v1/domains/eng/engrams?path=")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(empty["total"], 6, "an empty folder is no folder: {empty}");
+
+    // It narrows the other filters rather than replacing them.
+    let typed: serde_json::Value = get(
+        fixture.addr,
+        "/api/v1/domains/eng/engrams?path=notes&type=guide",
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(hit_permalinks(&typed), vec!["notes/beta".to_string()]);
+
+    // And it pages: the total is the folder's, not the domain's.
+    let page: serde_json::Value = get(
+        fixture.addr,
+        "/api/v1/domains/eng/engrams?path=notes&limit=2&page=2",
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(page["total"], 3, "{page}");
+    assert_eq!(page["count"], 1, "the last page of three: {page}");
+}
+
+/// The tree is a navigation aid, not the listing, so a level it cannot show
+/// whole is cut at `TREE_LEVEL_CAP` and says so.
+///
+/// The two additive fields carry that: `total` is what the level really holds
+/// and `truncated` says the rows were cut. What is never cut is `folders` - a
+/// reader whose level was truncated must still be able to descend into every
+/// folder under it, so the folder list is derived from the paths themselves
+/// rather than from the rows that survived the cap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn domain_tree_caps_a_level_and_keeps_its_folders() {
+    let cap = crystalline_service::engine::TREE_LEVEL_CAP;
+    let mut extra: Vec<String> = (0..cap + 1).map(|i| format!("big/e{i:05}.md")).collect();
+    extra.push("big/inner/deep.md".to_string());
+    let fixture = serve_anonymous_with(&extra).await;
+
+    let big: serde_json::Value = get(fixture.addr, "/api/v1/domains/eng/tree?path=big")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        big["engrams"].as_array().unwrap().len(),
+        cap,
+        "the level is cut at the cap"
+    );
+    assert_eq!(big["truncated"], true, "and says so: {}", big["truncated"]);
+    assert_eq!(
+        big["total"],
+        cap + 1,
+        "the count is the level's own, so a client knows what it is not seeing"
+    );
+    assert_eq!(
+        big["folders"].as_array().unwrap(),
+        &["inner"],
+        "a truncated level still names every folder under it"
+    );
+
+    // A depth nobody could mean is clamped rather than turned into a pattern
+    // proportional to it: the level answers, cut and honest about it.
+    let absurd: serde_json::Value = get(
+        fixture.addr,
+        "/api/v1/domains/eng/tree?path=big&depth=100000",
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(absurd["truncated"], true, "{}", absurd["total"]);
+    assert_eq!(
+        absurd["total"],
+        cap + 2,
+        "everything under big, the nested one included"
+    );
+
+    // A level that fits is not truncated, and carries the same two fields: a
+    // client reads one shape, never two.
+    let root: serde_json::Value = get(fixture.addr, "/api/v1/domains/eng/tree")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(root["truncated"], false, "{root}");
+    assert_eq!(
+        root["total"], 2,
+        "the MANIFEST and the one root engram: {root}"
+    );
+    assert_eq!(
+        root["folders"].as_array().unwrap(),
+        &["big", "notes"],
+        "{root}"
+    );
 }
 
 /// The two states a client must be able to tell apart, which is why the
@@ -1273,6 +1607,159 @@ async fn an_unknown_permalink_is_a_404_problem_detail() {
     assert!(detail.contains("eng"), "{detail}");
 }
 
+/// What points at an engram comes back in the page envelope every listing on
+/// this surface uses, with the referencing engram's address rather than only
+/// its path, and with the per-relation summary a client draws its chips from.
+///
+/// The fixture domain holds one inbound reference - Beta declares
+/// `relates_to [[Alpha]]` - which is enough to pin the shape end to end. What
+/// paging and ordering do across many references is pinned at the store level,
+/// on both backends, where the fixture can hold as many as the assertions need.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbound_references_carry_the_page_envelope_and_the_relation_summary() {
+    let fixture = serve_anonymous().await;
+    let resp = get(fixture.addr, "/api/v1/domains/eng/inbound/alpha").await;
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+
+    assert_eq!(body["total"], 1, "{body}");
+    assert_eq!(body["page"], 1, "{body}");
+    assert_eq!(body["limit"], 10, "{body}");
+    assert_eq!(body["count"], 1, "{body}");
+    assert_eq!(
+        body["types"],
+        serde_json::json!([{ "rel": "relates_to", "count": 1 }]),
+        "the summary is one entry per relation type pointing here: {body}"
+    );
+    let hit = &body["hits"][0];
+    assert_eq!(hit["domain"], "eng", "{body}");
+    assert_eq!(
+        hit["permalink"], "notes/beta",
+        "a hit is addressed, so a client can link to it: {body}"
+    );
+    assert_eq!(hit["title"], "Beta", "{body}");
+    assert_eq!(hit["path"], "notes/beta.md", "{body}");
+    assert_eq!(
+        hit["status"], "current",
+        "with its lifecycle, so a retired linker reads as one: {body}"
+    );
+    assert_eq!(hit["rel"], "relates_to", "{body}");
+}
+
+/// `rel` and `q` narrow the page and its total, and neither touches the
+/// summary: it is the map a reader filters with, so it may not redraw itself
+/// while it is being used.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbound_references_filter_without_changing_the_summary() {
+    let fixture = serve_anonymous().await;
+    let summary = serde_json::json!([{ "rel": "relates_to", "count": 1 }]);
+
+    let matched = get(fixture.addr, "/api/v1/domains/eng/inbound/alpha?q=BET").await;
+    let body: serde_json::Value = matched.json().await.unwrap();
+    assert_eq!(body["total"], 1, "q matches the title, folded: {body}");
+    assert_eq!(body["hits"][0]["permalink"], "notes/beta", "{body}");
+
+    for path in [
+        // A relation type nothing points here with.
+        "/api/v1/domains/eng/inbound/alpha?rel=links_to",
+        // Text no linker's title or path carries.
+        "/api/v1/domains/eng/inbound/alpha?q=nobody",
+        // A page past the end, which is empty rather than an error.
+        "/api/v1/domains/eng/inbound/alpha?page=9",
+    ] {
+        let resp = get(fixture.addr, path).await;
+        assert_eq!(resp.status(), 200, "{path}");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["count"], 0, "{path}: {body}");
+        assert_eq!(
+            body["hits"],
+            serde_json::json!([]),
+            "{path} selects nothing: {body}"
+        );
+        assert_eq!(
+            body["types"], summary,
+            "{path} leaves the summary alone: {body}"
+        );
+    }
+}
+
+/// How much of an index one request may materialize is not the caller's to
+/// choose, and a number too big for the database's own integer is answered
+/// rather than obeyed.
+///
+/// Both halves matter. An enormous `limit` is clamped to the ceiling and the
+/// envelope says so, instead of being cast to a negative bound that SQLite reads
+/// as "no limit" and Postgres refuses; an enormous `page` is an empty page
+/// carrying the true total, instead of a wrapped offset serving page one under
+/// any page number.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbound_paging_bounds_are_the_servers_to_set() {
+    let fixture = serve_anonymous().await;
+
+    let resp = get(
+        fixture.addr,
+        "/api/v1/domains/eng/inbound/alpha?limit=18446744073709551615",
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["limit"], 100,
+        "the page size is clamped to the ceiling, and reported as clamped: {body}"
+    );
+    assert_eq!(body["count"], 1, "{body}");
+    assert_eq!(body["total"], 1, "{body}");
+
+    let resp = get(
+        fixture.addr,
+        "/api/v1/domains/eng/inbound/alpha?page=18446744073709551615&limit=1",
+    )
+    .await;
+    assert_eq!(resp.status(), 200, "a huge page number is not a 500");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["hits"],
+        serde_json::json!([]),
+        "a page past the end is empty, not page one: {body}"
+    );
+    assert_eq!(body["count"], 0, "{body}");
+    assert_eq!(body["total"], 1, "the total is still the truth: {body}");
+
+    // The ordinary page still echoes what it was given, so the clamp above is a
+    // ceiling rather than a fixed answer.
+    let resp = get(
+        fixture.addr,
+        "/api/v1/domains/eng/inbound/alpha?page=2&limit=1",
+    )
+    .await;
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["page"], 2, "{body}");
+    assert_eq!(body["limit"], 1, "{body}");
+    assert_eq!(body["hits"], serde_json::json!([]), "{body}");
+}
+
+/// The same 404s the detail route answers, for the same reasons: a path segment
+/// names a resource, and an engram retired out from under an open page is told
+/// plainly rather than answered with an empty panel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unknown_inbound_targets_are_404_problem_details() {
+    let fixture = serve_anonymous().await;
+    for (path, needle) in [
+        ("/api/v1/domains/eng/inbound/notes/ghost", "notes/ghost"),
+        ("/api/v1/domains/ghost/inbound/alpha", "ghost"),
+    ] {
+        let resp = get(fixture.addr, path).await;
+        assert_eq!(resp.status(), 404, "{path} must be a 404");
+        assert_eq!(resp.headers()["content-type"], "application/problem+json");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["status"], 404, "{path}: {body}");
+        assert!(
+            body["detail"].as_str().unwrap().contains(needle),
+            "{path}: {body}"
+        );
+    }
+}
+
 /// A domain nobody registered is a 404 problem detail that names the domains
 /// that do exist, the same answer the engine's other verbs give.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1320,8 +1807,12 @@ async fn a_malformed_query_parameter_is_a_problem_detail() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_wrong_method_is_a_405_problem_detail() {
     let fixture = serve_anonymous().await;
+    // `PUT` rather than `POST`: the domain listing serves a POST now (domain
+    // registration), so the probe has to be a method the path genuinely does
+    // not serve, or this would test a handler's 415 instead of the router's
+    // 405.
     let resp = client()
-        .post(format!("http://{}/api/v1/domains", fixture.addr))
+        .put(format!("http://{}/api/v1/domains", fixture.addr))
         .send()
         .await
         .unwrap();
@@ -1890,6 +2381,11 @@ async fn user_routes_are_refused_to_a_viewer_and_an_editor() {
                 "/api/v1/users/ada",
                 Some(serde_json::json!({"role": "admin"})),
             ),
+            (
+                reqwest::Method::POST,
+                "/api/v1/users/ada/password",
+                Some(serde_json::json!({"password": "hunter2"})),
+            ),
             (reqwest::Method::DELETE, "/api/v1/users/ada", None),
         ];
         for (method, path, body) in cases {
@@ -1945,7 +2441,7 @@ async fn an_admin_creates_lists_edits_and_removes_an_account() {
     assert_eq!(body["user"]["disabled"], false);
     assert_eq!(
         user_fields(&body["user"]),
-        vec!["disabled", "display", "email", "name", "role"],
+        vec!["disabled", "display", "email", "last_seen", "name", "role"],
         "no password material may reach the client: {body}"
     );
 
@@ -1962,7 +2458,7 @@ async fn an_admin_creates_lists_edits_and_removes_an_account() {
     );
     assert_eq!(
         user_fields(&body["users"][0]),
-        vec!["disabled", "display", "email", "name", "role"],
+        vec!["disabled", "display", "email", "last_seen", "name", "role"],
         "the listing carries no hashes either: {body}"
     );
 
@@ -1982,16 +2478,28 @@ async fn an_admin_creates_lists_edits_and_removes_an_account() {
     assert_eq!(body["user"]["role"], "viewer", "{body}");
     assert_eq!(body["user"]["disabled"], true, "{body}");
 
-    // A password change lands too, which the store only proves by accepting it
-    // at login - so the account is re-enabled and asked to log in with it.
-    let repaired = as_session(
+    // Re-enable, then reset the password on its own route, which the store
+    // only proves by accepting it at login.
+    let re_enabled = as_session(
         addr,
         reqwest::Method::PATCH,
         "/api/v1/users/bob",
         &token,
         &csrf,
     )
-    .json(&serde_json::json!({"disabled": false, "password": "corrected horse"}))
+    .json(&serde_json::json!({"disabled": false}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(re_enabled.status(), 200);
+    let repaired = as_session(
+        addr,
+        reqwest::Method::POST,
+        "/api/v1/users/bob/password",
+        &token,
+        &csrf,
+    )
+    .json(&serde_json::json!({"password": "corrected horse"}))
     .send()
     .await
     .unwrap();
@@ -2185,13 +2693,15 @@ async fn creating_an_account_needs_the_csrf_token() {
     assert_eq!(ok.status(), 201, "with the token it goes through");
 }
 
-/// The invariant the trusted-header path leans on, asserted rather than
-/// assumed: that identity carries no CSRF token, so what keeps a cross-site
-/// form off these routes is the JSON content type this API demands. A form or
-/// text body - all a cross-site form can send without a CORS preflight, and no
-/// CORS layer exists on this surface - is refused by the extractor.
+/// The settlement, from the other side: a trusted-header admin that has not
+/// called `/auth/me` carries no token, and every mutating request it sends is
+/// refused - the JSON one it means to send as much as the form-shaped one a
+/// cross-site page could. Before this task the header alone was enough and what
+/// kept a cross-site form off these routes was the JSON content type the API
+/// demands; that argument is now a second line of defence rather than the only
+/// one, so a request that clears it is still refused without the token.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_cross_site_shaped_body_is_refused_on_the_trusted_header_path() {
+async fn a_trusted_header_mutation_without_a_token_is_refused() {
     let fixture = serve_with_auth(AuthOptions {
         trusted_header: Some("remote-user"),
         ..AuthOptions::default()
@@ -2200,13 +2710,17 @@ async fn a_cross_site_shaped_body_is_refused_on_the_trusted_header_path() {
     let addr = fixture.addr;
     fixture
         .auth
-        .ensure_user("proxy", Role::Viewer)
+        .ensure_user("proxy", Role::Viewer, usize::MAX)
         .await
         .unwrap();
     fixture.auth.set_role("proxy", Role::Admin).await.unwrap();
     let url = format!("http://{addr}/api/v1/users");
 
-    for content_type in ["application/x-www-form-urlencoded", "text/plain"] {
+    for content_type in [
+        "application/x-www-form-urlencoded",
+        "text/plain",
+        "application/json",
+    ] {
         let resp = client()
             .post(&url)
             .header("remote-user", "proxy")
@@ -2217,10 +2731,15 @@ async fn a_cross_site_shaped_body_is_refused_on_the_trusted_header_path() {
             .unwrap();
         assert_eq!(
             resp.status(),
-            415,
-            "a {content_type} body must not be acted on"
+            403,
+            "a {content_type} body must not be acted on without the token"
         );
         assert_eq!(resp.headers()["content-type"], "application/problem+json");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(
+            body["detail"].as_str().unwrap().contains("/auth/me"),
+            "the refusal says where the token comes from: {body}"
+        );
     }
     let names: Vec<String> = fixture
         .auth
@@ -2231,15 +2750,309 @@ async fn a_cross_site_shaped_body_is_refused_on_the_trusted_header_path() {
         .map(|u| u.name)
         .collect();
     assert_eq!(names, vec!["proxy".to_string()], "nothing was created");
+}
 
-    let ok = client()
-        .post(&url)
-        .header("remote-user", "proxy")
-        .json(&serde_json::json!({"name": "bob", "role": "viewer", "password": "hunter2"}))
+/// Nothing between this server and the browser may keep an auth answer.
+///
+/// `GET /auth/me` is the one that matters: a 200 answer to a GET carrying no
+/// freshness information is exactly what a shared cache may store on a
+/// heuristic, and the trusted-header mode puts a reverse proxy in front of this
+/// surface by definition. A cached probe would hand the next user through that
+/// proxy the previous one's identity, CSRF token and session cookie. Login and
+/// logout carry the same material, so they are marked the same way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_auth_endpoints_are_never_cached() {
+    let fixture = serve_with_ada(AuthOptions {
+        anonymous: true,
+        ..AuthOptions::default()
+    })
+    .await;
+    let addr = fixture.addr;
+
+    let anonymous_probe = get(addr, "/api/v1/auth/me").await;
+    assert_eq!(anonymous_probe.status(), 200);
+    assert_eq!(
+        anonymous_probe.headers()["cache-control"],
+        "no-store",
+        "the probe must never be served from a cache"
+    );
+
+    let login = client()
+        .post(format!("http://{addr}/api/v1/auth/login"))
+        .json(&serde_json::json!({"name": "ada", "password": "s3cret"}))
         .send()
         .await
         .unwrap();
-    assert_eq!(ok.status(), 201, "the JSON request is served");
+    assert_eq!(login.status(), 200);
+    assert_eq!(login.headers()["cache-control"], "no-store");
+    let token = session_cookie(&login).unwrap();
+    let body: serde_json::Value = login.json().await.unwrap();
+    let csrf = body["csrf"].as_str().unwrap().to_string();
+
+    // The probe that carries a real identity and reissues its token, which is
+    // the answer with the most to lose.
+    let session_probe = client()
+        .get(format!("http://{addr}/api/v1/auth/me"))
+        .header("cookie", format!("fluid_session={token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(session_probe.status(), 200);
+    assert_eq!(session_probe.headers()["cache-control"], "no-store");
+
+    let logout = as_session(
+        addr,
+        reqwest::Method::POST,
+        "/api/v1/auth/logout",
+        &token,
+        &csrf,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(logout.status(), 200);
+    assert_eq!(logout.headers()["cache-control"], "no-store");
+}
+
+/// The probe ensures a session rather than issuing one per call.
+///
+/// A trusted-header client that keeps no cookie jar - a script, a health check,
+/// a second tab opened before the first answer landed - would otherwise add a
+/// session row every time it asked who it was. It reuses instead, which also
+/// means every caller of one identity is handed the same token: the second tab
+/// keeps working rather than being outvoted by whichever `Set-Cookie` arrived
+/// last. The token alone authorizes the write, because in this mode the header
+/// is what names the identity and the cookie carries nothing it does not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeated_probes_reuse_one_session_for_a_trusted_header_identity() {
+    let fixture = serve_with_auth(AuthOptions {
+        trusted_header: Some("remote-user"),
+        ..AuthOptions::default()
+    })
+    .await;
+    let addr = fixture.addr;
+    fixture
+        .auth
+        .add_user("root", "Root", None, Role::Admin, "rootpw")
+        .await
+        .unwrap();
+    assert_eq!(fixture.auth.session_count().await.unwrap(), 0);
+
+    // A session that has already lapsed. Resolving a cookie is what usually
+    // prunes, and a cookieless probe never resolves one, so the probe has to
+    // clear this itself or a lapsed SSO session leaves a row behind for good.
+    fixture.auth.create_session("root", -1).await.unwrap();
+    assert_eq!(fixture.auth.session_count().await.unwrap(), 1);
+
+    // The first probe issues the session; four more, each as cookieless as the
+    // first, reuse it.
+    let mut tokens = Vec::new();
+    let mut cookies = Vec::new();
+    for _ in 0..5 {
+        let probe = client()
+            .get(format!("http://{addr}/api/v1/auth/me"))
+            .header("remote-user", "root")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(probe.status(), 200);
+        cookies.push(session_cookie(&probe));
+        let body: serde_json::Value = probe.json().await.unwrap();
+        tokens.push(body["csrf"].as_str().unwrap().to_string());
+    }
+    assert_eq!(
+        fixture.auth.session_count().await.unwrap(),
+        1,
+        "five probes, one session: the probe must not mint per call, and the \
+         expired row must be gone rather than counted alongside"
+    );
+    assert!(
+        cookies[0].is_some(),
+        "the first probe issued the session, so it set the cookie"
+    );
+    assert!(
+        cookies[1..].iter().all(Option::is_none),
+        "a reused session has no unhashed token left to put in a cookie"
+    );
+    assert!(
+        tokens.iter().all(|t| *t == tokens[0]),
+        "every probe of one identity is handed the same token: {tokens:?}"
+    );
+
+    // The token from the last probe, which never saw a cookie, authorizes a
+    // write on its own. This is the second tab, and the cookieless client.
+    let created = client()
+        .post(format!("http://{addr}/api/v1/users"))
+        .header("remote-user", "root")
+        .header("x-csrf-token", tokens.last().unwrap())
+        .json(&serde_json::json!({"name": "bob", "role": "viewer", "password": "pw"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201);
+    assert_eq!(
+        fixture.auth.session_count().await.unwrap(),
+        1,
+        "and the write added no session either"
+    );
+
+    // A wrong token is still refused, so the fallback is a lookup and not a
+    // way past the check.
+    let refused = client()
+        .post(format!("http://{addr}/api/v1/users"))
+        .header("remote-user", "root")
+        .header("x-csrf-token", "not-the-token")
+        .json(&serde_json::json!({"name": "cyd", "role": "viewer", "password": "pw"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 403);
+}
+
+/// A cookie that belongs to somebody else does not survive the probe.
+///
+/// This is the fixation rule login applies, on the path that needs it just as
+/// much: behind an SSO proxy the header names who the caller is, so a cookie
+/// planted on them names somebody else by definition, and leaving it live would
+/// keep a session the victim never asked for open on their browser. The
+/// judgement is on who the cookie belongs to rather than on whether the request
+/// resolved a token, because an identity that already holds a session arrives
+/// with a token either way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_foreign_cookie_does_not_survive_the_probe() {
+    let fixture = serve_with_auth(AuthOptions {
+        trusted_header: Some("remote-user"),
+        ..AuthOptions::default()
+    })
+    .await;
+    let addr = fixture.addr;
+    fixture
+        .auth
+        .add_user("root", "Root", None, Role::Admin, "rootpw")
+        .await
+        .unwrap();
+    fixture
+        .auth
+        .add_user("ada", "Ada", None, Role::Viewer, "s3cret")
+        .await
+        .unwrap();
+    let (adas_cookie, _) = login(addr, "ada", "s3cret").await;
+    assert_eq!(
+        fixture.auth.session_owner(&adas_cookie).await.unwrap(),
+        Some("ada".to_string())
+    );
+
+    // Root probes with Ada's cookie on it: root's own session is issued, and
+    // Ada's is retired rather than left live beside it.
+    let probe = client()
+        .get(format!("http://{addr}/api/v1/auth/me"))
+        .header("remote-user", "root")
+        .header("cookie", format!("fluid_session={adas_cookie}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(probe.status(), 200);
+    let own = session_cookie(&probe).expect("the probe issued root a session");
+    let body: serde_json::Value = probe.json().await.unwrap();
+    assert_eq!(body["user"]["name"], "root", "the header is the authority");
+    assert!(
+        fixture
+            .auth
+            .session_owner(&adas_cookie)
+            .await
+            .unwrap()
+            .is_none(),
+        "the foreign session was retired"
+    );
+
+    // And it is gone for real: the cookie no longer authenticates anybody.
+    let stale = client()
+        .get(format!("http://{addr}/api/v1/domains"))
+        .header("cookie", format!("fluid_session={adas_cookie}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), 401);
+
+    // The identity's own cookie is not collateral: probing again with the
+    // session this call issued leaves it alone.
+    let again = client()
+        .get(format!("http://{addr}/api/v1/auth/me"))
+        .header("remote-user", "root")
+        .header("cookie", format!("fluid_session={own}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(again.status(), 200);
+    assert_eq!(
+        fixture.auth.session_owner(&own).await.unwrap(),
+        Some("root".to_string()),
+        "a caller's own session survives its own probe"
+    );
+}
+
+/// The settlement end to end: a trusted-header admin is minted a session by
+/// the probe, and only the minted token authorizes a mutation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_trusted_header_identity_is_minted_a_csrf_token_by_the_probe() {
+    let fixture = serve_with_auth(AuthOptions {
+        trusted_header: Some("x-forwarded-user"),
+        ..AuthOptions::default()
+    })
+    .await;
+    fixture
+        .auth
+        .add_user("root", "Root", None, Role::Admin, "rootpw")
+        .await
+        .unwrap();
+
+    // Without the probe: refused, told where the token comes from.
+    let refused = client()
+        .post(format!("http://{}/api/v1/users", fixture.addr))
+        .header("x-forwarded-user", "root")
+        .json(&serde_json::json!({"name": "bob", "role": "viewer", "password": "pw"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 403);
+
+    // The probe mints a session and hands the token back.
+    let probe = client()
+        .get(format!("http://{}/api/v1/auth/me", fixture.addr))
+        .header("x-forwarded-user", "root")
+        .send()
+        .await
+        .unwrap();
+    let cookie = session_cookie(&probe).expect("the probe set a session cookie");
+    let body: serde_json::Value = probe.json().await.unwrap();
+    let csrf = body["csrf"].as_str().expect("the probe carries the token");
+
+    // Header + cookie + token: the mutation goes through.
+    let created = client()
+        .post(format!("http://{}/api/v1/users", fixture.addr))
+        .header("x-forwarded-user", "root")
+        .header("cookie", format!("fluid_session={cookie}"))
+        .header("x-csrf-token", csrf)
+        .json(&serde_json::json!({"name": "bob", "role": "viewer", "password": "pw"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201);
+
+    // A second probe with the cookie reissues the same token, not a new session.
+    let again = client()
+        .get(format!("http://{}/api/v1/auth/me", fixture.addr))
+        .header("x-forwarded-user", "root")
+        .header("cookie", format!("fluid_session={cookie}"))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        session_cookie(&again).is_none(),
+        "no second mint while the session lives"
+    );
+    let again: serde_json::Value = again.json().await.unwrap();
+    assert_eq!(again["csrf"].as_str().unwrap(), csrf);
 }
 
 /// The anonymous viewer never reaches these routes, which is what keeps the
@@ -2335,6 +3148,37 @@ async fn user_request_failures_are_classified() {
         assert!(body["detail"].as_str().unwrap().contains("ghost"), "{body}");
     }
 
+    // The password route is classified the same way: unknown account is 404,
+    // and an empty replacement is 422 before the store is ever asked.
+    let unknown = as_session(
+        addr,
+        reqwest::Method::POST,
+        "/api/v1/users/ghost/password",
+        &token,
+        &csrf,
+    )
+    .json(&serde_json::json!({"password": "hunter2"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(unknown.status(), 404);
+    let body: serde_json::Value = unknown.json().await.unwrap();
+    assert_eq!(body["title"], "not found");
+    assert!(body["detail"].as_str().unwrap().contains("ghost"), "{body}");
+
+    let empty = as_session(
+        addr,
+        reqwest::Method::POST,
+        "/api/v1/users/root/password",
+        &token,
+        &csrf,
+    )
+    .json(&serde_json::json!({"password": ""}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(empty.status(), 422);
+
     let nothing = as_session(
         addr,
         reqwest::Method::PATCH,
@@ -2377,8 +3221,8 @@ async fn a_password_reset_revokes_the_targets_sessions() {
 
     let reset = as_session(
         addr,
-        reqwest::Method::PATCH,
-        "/api/v1/users/ada",
+        reqwest::Method::POST,
+        "/api/v1/users/ada/password",
         &token,
         &csrf,
     )
@@ -2401,6 +3245,42 @@ async fn a_password_reset_revokes_the_targets_sessions() {
     );
     // And the account is usable again with the password the admin set.
     login(addr, "ada", "corrected horse").await;
+}
+
+/// An admin resetting its own password is not a special case: the store call
+/// is unconditional on whose account it names, so the caller's own session is
+/// revoked exactly like any other target's would be, this one included.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_admin_resetting_its_own_password_revokes_its_own_session() {
+    let (fixture, token, csrf) = serve_as_admin(AuthOptions::default()).await;
+    let addr = fixture.addr;
+
+    let reset = as_session(
+        addr,
+        reqwest::Method::POST,
+        "/api/v1/users/root/password",
+        &token,
+        &csrf,
+    )
+    .json(&serde_json::json!({"password": "corrected horse"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(reset.status(), 200);
+
+    let after = client()
+        .get(format!("http://{addr}/api/v1/domains"))
+        .header("cookie", format!("fluid_session={token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        after.status(),
+        401,
+        "the admin's own cookie from before the reset is dead"
+    );
+    // And the account is usable again with the password it just set.
+    login(addr, "root", "corrected horse").await;
 }
 
 /// Disabling revokes rather than hides: re-enabling the account must not hand

@@ -1,28 +1,35 @@
-//! The JSON API `serve --http` nests at `/api/v1`, the surface the Fluid UI
+//! The JSON API the HTTP endpoint nests at `/api/v1`, the surface the Fluid UI
 //! talks to. Handlers pass the engine's own JSON values through unchanged, so
 //! the MCP tools and this API stay one source of truth, and every failure is
 //! an [`ApiError`] rendered as RFC 9457 problem detail.
 
+mod archive;
 mod auth;
 mod auth_store;
 mod discovery;
 mod domains;
+mod domains_admin;
 mod engrams;
 mod error;
+mod github_settings;
 mod graph;
 mod users_api;
 
 use std::sync::Arc;
 
 use axum::Router;
-use axum::routing::{get, patch, post};
+use axum::extract::DefaultBodyLimit;
+use axum::routing::{delete, get, patch, post};
 use tokio::sync::Semaphore;
 
 pub use auth::{
     AuthCfg, CSRF_HEADER, Caller, Identity, LOGIN_SLOTS, SESSION_COOKIE, SESSION_TTL_SECS,
 };
 pub use auth_store::*;
-pub use error::{ApiError, ApiJson, ApiPath, ApiQuery, ProblemDetail};
+pub use error::{
+    ApiError, ApiJson, ApiPath, ApiQuery, ConflictDetail, ProblemDetail, if_match,
+    precondition_failed,
+};
 
 use crate::engine::Engine;
 
@@ -40,11 +47,15 @@ use crate::engine::Engine;
     info(
         title = "Crystalline Fluid API",
         version = "v1",
-        description = "The JSON API `crystalline serve --http` mounts at \
-                       `/api/v1`, the surface the Fluid UI talks to. Read-only \
-                       in this version apart from the session and account \
-                       routes.\n\nEvery path but `/auth/login`, `/auth/logout` \
-                       and `/auth/me` is closed by default: a request that \
+        description = "The JSON API the Crystalline daemon mounts at `/api/v1` \
+                       on its HTTP endpoint (127.0.0.1:7411 by default), the \
+                       surface the Fluid UI talks to. Reading is \
+                       open to any signed-in viewer; writing content needs an \
+                       editor account and the `If-Match` token of the version \
+                       being replaced, and account management needs an \
+                       admin.\n\nEvery path but `/auth/login`, `/auth/logout`, \
+                       `/auth/me` and `/auth/setup` is closed by default: a \
+                       request that \
                        carries no identity is answered 401 ahead of routing, so \
                        an unauthenticated caller never learns which paths \
                        exist. Every failure is an RFC 9457 problem detail sent \
@@ -59,21 +70,39 @@ use crate::engine::Engine;
         (name = "meta", description = "The API's description of itself."),
         (name = "auth", description = "Sessions and the capability probe."),
         (name = "domains", description = "Which domains this instance serves and what each holds."),
-        (name = "engrams", description = "Listing and reading engrams."),
+        (name = "engrams", description = "Listing, reading and writing engrams."),
         (name = "discovery", description = "Search, vocabulary, context and recent activity."),
         (name = "graph", description = "The neighborhood graph around an anchor."),
         (name = "users", description = "Account management. Admin only."),
+        (name = "settings", description = "Instance settings. Admin only."),
     ),
     paths(
         openapi_json,
         auth::login,
         auth::logout,
         auth::me,
+        auth::setup,
         domains::list,
+        domains_admin::create,
+        domains_admin::remove,
+        domains_admin::sync_status,
+        domains_admin::sync_now,
+        archive::download,
+        archive::preview,
+        archive::import,
         domains::tree,
         domains::manifest,
+        domains::save_manifest,
         engrams::list,
         engrams::detail,
+        engrams::inbound,
+        engrams::create,
+        engrams::save,
+        engrams::retire,
+        engrams::move_action,
+        engrams::remove,
+        engrams::validate,
+        crate::collab::ws::join,
         discovery::search,
         discovery::vocabulary,
         discovery::context,
@@ -82,20 +111,42 @@ use crate::engine::Engine;
         users_api::list,
         users_api::create,
         users_api::update,
+        users_api::reset_password,
         users_api::remove,
+        github_settings::status,
+        github_settings::connect,
+        github_settings::token,
+        github_settings::disconnect,
     ),
     components(schemas(
         ProblemDetail,
+        ConflictDetail,
         User,
         Role,
+        domains::SaveManifestBody,
+        domains_admin::CreateDomainBody,
+        archive::ArchiveEntryReport,
+        archive::ArchiveReport,
+        engrams::CreateEngramBody,
+        engrams::SaveEngramBody,
+        engrams::RetireBody,
+        engrams::MoveBody,
+        engrams::ValidateBody,
+        engrams::ValidateFinding,
+        engrams::ValidateResponse,
         auth::LoginBody,
         auth::LoginResponse,
         auth::LogoutResponse,
         auth::MeResponse,
+        auth::SetupBody,
         users_api::CreateBody,
         users_api::PatchBody,
+        users_api::PasswordBody,
         users_api::UserResponse,
         users_api::UsersResponse,
+        github_settings::TokenBody,
+        github_settings::GithubStatusResponse,
+        github_settings::GithubPendingView,
     )),
 )]
 struct ApiDoc;
@@ -123,9 +174,26 @@ pub struct RestState {
     pub auth: Arc<AuthStore>,
     /// The auth settings as of startup. See [`AuthCfg`].
     pub auth_cfg: AuthCfg,
+    /// The open co-editing sessions, one registry for this process: the
+    /// collab upgrade route joins rooms in it, and every save it makes goes
+    /// back through the engine above.
+    pub collab: Arc<crate::collab::session::CollabSessions>,
+    /// The one-time token that lets a non-local caller reach
+    /// `POST /auth/setup`, generated once per `serve` process and only for a
+    /// non-loopback bind. `None` means the token path is closed: there is no
+    /// token, so no non-local caller can create the first admin and the
+    /// refusal says so rather than pointing at a secret that does not exist.
+    /// Set through [`RestState::with_setup_token`].
+    setup_token: Option<String>,
     /// Caps how many password verifications run at once. See
     /// [`LOGIN_SLOTS`].
     login_slots: Arc<Semaphore>,
+    /// Serializes domain create against domain unregister, process-wide. See
+    /// [`RestState::domain_admin`].
+    domain_admin: Arc<tokio::sync::Mutex<()>>,
+    /// The fence an unregistration raises against new co-editing joins. See
+    /// [`RestState::fence_joins`].
+    join_fence: Arc<tokio::sync::RwLock<()>>,
 }
 
 impl RestState {
@@ -136,11 +204,99 @@ impl RestState {
     pub fn new(engine: Arc<Engine>, auth: Arc<AuthStore>) -> anyhow::Result<RestState> {
         let auth_cfg = AuthCfg::resolve(&engine.config())?;
         Ok(RestState {
+            collab: crate::collab::session::CollabSessions::new(engine.clone()),
             engine,
             auth,
             auth_cfg,
+            setup_token: None,
             login_slots: auth::login_slots(),
+            domain_admin: Arc::new(tokio::sync::Mutex::new(())),
+            join_fence: Arc::new(tokio::sync::RwLock::new(())),
         })
+    }
+
+    /// Hand this state the process's one-time setup token, or `None` to leave
+    /// the token path closed.
+    ///
+    /// A builder rather than a parameter on [`RestState::new`] so the call
+    /// sites that have no token to offer - every test state, and any future
+    /// caller - stay as they are, and so the token is visibly opt-in at the one
+    /// place that has it: `run_serve`, which generates it for a non-loopback
+    /// bind and prints it once.
+    ///
+    /// A blank token is stored as no token. Nothing generates one today, but a
+    /// token nobody could type is not a token, and the handler that compares it
+    /// would otherwise be handed a value that matches a caller who sends
+    /// nothing at all - see `auth::authorize_setup`, which fails closed on it a
+    /// second time rather than trusting this to be the only way the field is
+    /// ever set.
+    pub fn with_setup_token(mut self, token: Option<String>) -> RestState {
+        self.setup_token = token.filter(|token| !token.trim().is_empty());
+        self
+    }
+
+    /// The process's one-time setup token, if it has one. Read by
+    /// [`auth::setup`] alone, and never rendered into a response: see the
+    /// handler for what it is compared with and why the comparison is
+    /// constant-time.
+    pub(super) fn setup_token(&self) -> Option<&str> {
+        self.setup_token.as_deref()
+    }
+
+    /// Hold the domain-admin lock for the whole of a create or an unregister.
+    ///
+    /// The engine has no serialization of its own across a same-name
+    /// `domain_add_*` and `domain_remove` (its `domain_remove` doc comment
+    /// records the race and points here): the remove persists the config,
+    /// releases both config locks and only then forgets the watcher entry and
+    /// clears the index rows, so an add of the same name landing inside that
+    /// window has its fresh registration and its freshly-indexed rows wiped
+    /// by the remove's tail. One lock over both handlers closes it for this
+    /// surface, which is the layer that has more than one caller.
+    ///
+    /// Deliberately NOT the join fence below. A team-domain create downloads
+    /// and indexes a repository inside the request, which can run for
+    /// minutes, and fencing co-editing joins for that long would hang every
+    /// editor on the instance over a registration that closes no rooms. A
+    /// create never sweeps anything, so it has no join window to close.
+    ///
+    /// Serializing "for this surface" is the whole claim: the mutex lives in
+    /// `RestState`, so it does NOT serialize the other callers of the same
+    /// engine verbs - MCP's `add_domain` (and the CLI) reach
+    /// `domain_add_local`/`domain_add_virtual` with no REST state in hand and
+    /// can still race a REST unregister into the engine window above. That is
+    /// accepted: closing it needs the per-name lock inside the engine, and
+    /// the REST surface is the one with more than one concurrent caller.
+    ///
+    /// Lock order where both are taken (unregister): this one, then
+    /// [`RestState::fence_joins`]. Nothing else takes both.
+    pub(super) async fn domain_admin(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.domain_admin.lock().await
+    }
+
+    /// Raise the join fence: while this guard lives, no collab upgrade may
+    /// open a room, because [`RestState::join_pass`] is what the upgrade
+    /// route waits on before it joins.
+    ///
+    /// Held by an unregistration across its sweep and the engine's
+    /// `domain_remove`, which is what makes the sweep final rather than a
+    /// snapshot: a join already in flight finishes and inserts its room
+    /// before the guard is granted (so the sweep collects it), and a join
+    /// that arrives afterwards waits, then finds a domain that no longer
+    /// exists and is refused 404. The fence is process-wide rather than
+    /// per-domain because an unregistration is short and a second primitive
+    /// per domain name would buy nothing measurable.
+    pub(super) async fn fence_joins(&self) -> tokio::sync::RwLockWriteGuard<'_, ()> {
+        self.join_fence.write().await
+    }
+
+    /// The pass a collab upgrade holds across its join, so a join and an
+    /// unregistration of the same domain cannot interleave. See
+    /// [`RestState::fence_joins`] for the argument this half completes; the
+    /// guard is dropped as soon as the join returns, never held across the
+    /// socket's life.
+    pub(crate) async fn join_pass(&self) -> tokio::sync::RwLockReadGuard<'_, ()> {
+        self.join_fence.read().await
     }
 
     /// Run `work` holding one of the [`LOGIN_SLOTS`] password-work permits.
@@ -158,6 +314,35 @@ impl RestState {
     }
 }
 
+/// The largest request body this API accepts, in bytes.
+///
+/// Set explicitly rather than left to axum's 2 MiB default, and set generously,
+/// because the body that matters here is one engram's markdown: a domain in the
+/// wild holds documents far past a megabyte (the semantic-search spill this
+/// project chased was provoked by exactly those), and a default that let such
+/// an engram be read but not saved back would fail at the worst moment - after
+/// its author had edited it. Ten mebibytes is comfortably past the largest
+/// document anyone writes by hand and still small enough that a hostile body
+/// cannot make this process reserve serious memory.
+///
+/// A body over the limit is refused with 413 before a handler runs, in
+/// problem+json like every other failure here: `ApiJson` re-renders axum's
+/// rejection and keeps the status it chose.
+///
+/// **Three other surfaces read this number, so it is not local to the REST
+/// API any more.** `daemon::http_config` hands it to rmcp as the
+/// streamable-HTTP transport's `max_request_body_bytes`, so an engram written
+/// through an MCP tool call meets the same boundary as one saved through
+/// `/api/v1` (rmcp refuses in its own words there, `413 Payload Too Large:
+/// request body exceeds {max} bytes`, rather than in problem+json).
+/// `collab::ws::WS_MAX_MESSAGE_BYTES` sits a megabyte above it, so a
+/// collaborative edit that can be saved can also be transmitted. And
+/// `fluid/nginx.conf.template` sets `client_max_body_size` to match, guarded
+/// by `tests/nginx_body_cap.rs` because nginx cannot read a Rust constant.
+/// Changing this value moves the first two by construction; the third is the
+/// one that needs the template edited with it.
+pub const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
+
 /// Build the REST router. Mounted with `nest("/api/v1", ...)`, so the paths
 /// here are relative to that prefix and the fallback below only ever answers
 /// for unknown paths under it.
@@ -174,16 +359,71 @@ pub fn router(state: RestState) -> Router {
         .route("/auth/login", post(auth::login))
         .route("/auth/logout", post(auth::logout))
         .route("/auth/me", get(auth::me))
-        .route("/domains", get(domains::list))
+        // The first-run path: public, CSRF-exempt by path like login, and 410
+        // for good once any account exists. See [`auth::setup`].
+        .route("/auth/setup", post(auth::setup))
+        .route("/domains", get(domains::list).post(domains_admin::create))
+        // Admin only, enforced in the handler like every other admin route
+        // here. Registered before the domain sub-paths for readability only;
+        // axum's router is order-independent.
+        .route("/domains/{domain}", delete(domains_admin::remove))
+        // Admin only as well. The GET is a pure read and stays served on a
+        // read-only instance; the POST is a pull that writes, and does not.
+        .route(
+            "/domains/{domain}/sync",
+            get(domains_admin::sync_status).post(domains_admin::sync_now),
+        )
+        // Admin only as well, and a pure read: the archive download is the
+        // backup story of a read-only mirror, so it stays served there.
+        .route("/domains/{domain}/archive", get(archive::download))
+        // The upload half, and the exception to the line above: both are
+        // writes (a preview is the first half of one), so both are admin-only
+        // AND refused on a read-only instance.
+        .route("/domains/{domain}/archive/preview", post(archive::preview))
+        .route("/domains/{domain}/archive/import", post(archive::import))
         .route("/domains/{domain}/tree", get(domains::tree))
-        .route("/domains/{domain}/manifest", get(domains::manifest))
-        .route("/domains/{domain}/engrams", get(engrams::list))
+        .route(
+            "/domains/{domain}/manifest",
+            get(domains::manifest).put(domains::save_manifest),
+        )
+        .route(
+            "/domains/{domain}/engrams",
+            get(engrams::list).post(engrams::create),
+        )
         // A wildcard, not a segment: a permalink is a path, so an engram in a
         // subfolder carries the slashes with it.
         .route(
             "/domains/{domain}/engrams/{*permalink}",
-            get(engrams::detail),
+            get(engrams::detail)
+                .put(engrams::save)
+                .delete(engrams::remove),
         )
+        // What points at one engram: a read, so it sits beside the detail
+        // route rather than among the actions below. The permalink rides last
+        // because a wildcard is terminal - the same shape, for the same
+        // reason, as the collab upgrade further down.
+        .route(
+            "/domains/{domain}/inbound/{*permalink}",
+            get(engrams::inbound),
+        )
+        // Actions rather than sub-paths of `/engrams/{*permalink}`, whose
+        // wildcard cannot be followed by another segment: the permalink of
+        // the engram being retired or moved rides in the body instead.
+        // The collab upgrade: a GET, so the guard's CSRF exemption applies by
+        // method; role, read_only and Origin are enforced in the handler,
+        // before upgrade. The wildcard is terminal, so nested permalinks ride
+        // the path exactly as the engram detail route takes them.
+        .route(
+            "/collab/{domain}/{*permalink}",
+            get(crate::collab::ws::join),
+        )
+        .route("/domains/{domain}/retire", post(engrams::retire))
+        .route("/domains/{domain}/move", post(engrams::move_action))
+        // Not domain-scoped like the routes above it: the document being
+        // validated may not exist yet, so there is no path segment to name a
+        // domain with. It lives here rather than beside `/search` and its
+        // siblings because what it checks is engram markdown.
+        .route("/validate", post(engrams::validate))
         .route("/search", get(discovery::search))
         .route("/vocabulary", get(discovery::vocabulary))
         .route("/context", get(discovery::context))
@@ -197,6 +437,16 @@ pub fn router(state: RestState) -> Router {
             "/users/{name}",
             patch(users_api::update).delete(users_api::remove),
         )
+        .route("/users/{name}/password", post(users_api::reset_password))
+        // Admin only as well, and enforced the same way. The GET is a pure
+        // read and is served on a read-only instance; the three mutations
+        // are refused there, like every other write on this surface.
+        .route(
+            "/settings/github",
+            get(github_settings::status).delete(github_settings::disconnect),
+        )
+        .route("/settings/github/connect", post(github_settings::connect))
+        .route("/settings/github/token", post(github_settings::token))
         .fallback(unknown_path)
         // Applies to every method router registered above it, so it stays
         // below the routes and above the guard.
@@ -205,6 +455,9 @@ pub fn router(state: RestState) -> Router {
             state.clone(),
             auth::guard,
         ))
+        // Outermost, so an oversized body is refused before the guard reads a
+        // cookie or the store is touched. See [`MAX_BODY_BYTES`].
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
 }
 
@@ -264,6 +517,42 @@ async fn unknown_path() -> ApiError {
 /// problem+json rather than axum's empty 405.
 async fn wrong_method() -> ApiError {
     ApiError::method_not_allowed()
+}
+
+/// Refuse a mutation on a read-only instance, ahead of every other check that
+/// would otherwise touch the store, the config or a credential.
+///
+/// One spelling for every admin module rather than one per module, so a
+/// read-only instance answers the same way whichever settings surface was
+/// asked. The `crystalline` CLI on the server that holds the data is the
+/// recovery path - there is no flag that reopens this surface, on purpose
+/// (resolved ambiguity 7 in the plan).
+pub(super) fn refuse_read_only(state: &RestState) -> Result<(), ApiError> {
+    if state.engine.read_only() {
+        return Err(ApiError::forbidden(
+            "this instance is read-only; changes are disabled here - use the \
+             `crystalline` CLI on the server that holds the data",
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse an empty password before it is hashed into an account nobody can log
+/// in as. The store would accept it; `crystalline users` refuses it, and this
+/// surface matches.
+///
+/// Here rather than in [`users_api`], which is where it started, because the
+/// first-run [`auth::setup`] creates an account too and a second spelling of
+/// the same rule is how the two surfaces would drift: an installation whose
+/// very first admin was allowed a password no later account could have is
+/// exactly the wrong place to discover that.
+pub(super) fn check_password(password: &str) -> Result<(), ApiError> {
+    if password.is_empty() {
+        return Err(ApiError::unprocessable(
+            "the password is empty; pick one with at least one character",
+        ));
+    }
+    Ok(())
 }
 
 /// Split a comma-separated query parameter into the `Vec<String>` the engine's

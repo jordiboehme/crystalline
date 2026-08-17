@@ -55,6 +55,55 @@ pub fn run_harness_cli(harness: HarnessKind, args: &[&str]) -> CliRun {
     CliRun::NotFound
 }
 
+/// The outcome of running a harness CLI once while capturing its **stdout**,
+/// for the one caller that has to read what the CLI says rather than only
+/// whether it succeeded: `install`'s repair of an existing MCP registration
+/// needs the stored command back before it may touch it.
+///
+/// Neither [`CliRun`] nor [`CliOutput`] can serve that: the first discards
+/// stdout at the pipe (`Stdio::null()`), the second collects it and then drops
+/// it, keeping only stderr.
+pub enum CliCapture {
+    /// The command exited zero; `stdout` is its captured standard output.
+    Ok {
+        /// Everything the command wrote to stdout, lossily decoded.
+        stdout: String,
+    },
+    /// The command ran but exited non-zero.
+    Failed,
+    /// The binary is not on PATH.
+    NotFound,
+}
+
+/// Run a harness CLI capturing its stdout, trying each candidate invocation in
+/// order exactly the way [`run_harness_cli`] does.
+pub fn run_harness_cli_capture(harness: HarnessKind, args: &[&str]) -> CliCapture {
+    for candidate in harness.cli_invocations() {
+        let (program, prefix) = candidate
+            .split_first()
+            .expect("a candidate invocation always names a program");
+        let full: Vec<&str> = prefix.iter().chain(args.iter()).copied().collect();
+        let outcome = match Command::new(program)
+            .args(&full)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+        {
+            Ok(out) if out.status.success() => CliCapture::Ok {
+                stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            },
+            Ok(_) => CliCapture::Failed,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => CliCapture::NotFound,
+            Err(_) => CliCapture::Failed,
+        };
+        match outcome {
+            CliCapture::NotFound => continue,
+            other => return other,
+        }
+    }
+    CliCapture::NotFound
+}
+
 /// The outcome of running a harness CLI once while capturing its stderr, so a
 /// caller can tell a harness's own refusal (an "already exists" say) apart
 /// from a plain failure. The capturing sibling of [`CliRun`], used by the

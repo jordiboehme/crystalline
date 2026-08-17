@@ -34,54 +34,258 @@ pub fn use_daemon(db: Option<&Path>, config_path: Option<&Path>) -> bool {
     db.is_none() && config_path.is_none()
 }
 
-/// If `line` is a JSON-RPC request for a known pre-`initialize` probe that
-/// rmcp 2.x cannot handle gracefully in its init loop, return the JSON-RPC
-/// `-32601 Method not found` response to send back so the client falls
-/// back to plain `initialize` instead of seeing our stdio close and
-/// classifying the connection as a network error.
+/// The two `_meta` keys the 2026-07-28 lifecycle requires on an inline
+/// request, spelled here because rmcp keeps its own copies private.
 ///
-/// The confirmed case is the TypeScript MCP SDK's dual-era negotiation
-/// probe `server/discover`, added by the `versionNegotiation.mode = "auto"`
-/// path and shipped by Claude Desktop chat mode as of July 2026. rmcp's
-/// init loop returns `ExpectedInitializeRequest` for any pre-init request
-/// that is not `ping` or `initialize` and does not send a response, so the
-/// process exits and the client sees a closed connection. The TypeScript
-/// SDK's probe classifier maps a closed connection to `network-error` and
-/// aborts the session; a `-32601` reply would be classified as `legacy`
-/// and trigger a normal `initialize` retry on the same pipe.
+/// `RequestMetaObject::DRAFT_REQUIRED_KEYS` (rmcp 3.1.2 `model/meta.rs:400-403`)
+/// is the public array these must equal;
+/// `discover_probe_classifies_by_rmcps_own_required_key_rule` asserts they do,
+/// so an upstream rename fails a test rather than silently disabling the
+/// injection below.
+const META_KEY_PROTOCOL_VERSION: &str = "io.modelcontextprotocol/protocolVersion";
+const META_KEY_CLIENT_CAPABILITIES: &str = "io.modelcontextprotocol/clientCapabilities";
+
+/// How a pre-lifecycle `server/discover` probe arrived, classified by the rule
+/// rmcp's stdio init loop applies to it.
 ///
-/// Only `server/discover` is intercepted; every other message flows to
-/// rmcp unchanged so a real client bug is still visible. Broaden the set
-/// here (or move to a "reply to any pre-init request" model) if further
-/// probe methods are observed in the wild.
-fn preinit_probe_reply(line: &str) -> Option<String> {
-    let msg: Value = serde_json::from_str(line).ok()?;
-    let method = msg.get("method")?.as_str()?;
-    if method != "server/discover" {
-        return None;
-    }
-    let id = msg.get("id")?;
-    let reply = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "error": {
-            "code": -32601,
-            "message": format!("Method not found: {method}"),
-        },
-    });
-    Some(reply.to_string())
+/// # Why this server rewrites a probe instead of answering it
+///
+/// **What rmcp 3.1.2 does with each shape.** A first request that is not
+/// `initialize` (and not `ping`) reaches `service/server.rs:527-533`, which
+/// calls `request.get_meta().missing_required_keys(&ProtocolVersion::V_2026_07_28)`,
+/// where the era is a literal, so the test is "are both required keys present
+/// and decodable", never "does the version named require them". If any
+/// is missing, the loop returns `ExpectedInitializeRequest` **with no
+/// `transport.send` before it**: no response, closed pipe. If both are present,
+/// `:534-556` arms the peer, dispatches the request, sends the response and
+/// continues into `serve_inner`, so the probe is answered with a real
+/// `DiscoverResult` and the session carries on.
+///
+/// **Answering `-32601` ourselves would now be a lie.** The specification's
+/// stdio backward-compatibility rule (`/basic/transports/stdio`) reads a probe
+/// answer in three branches: a `DiscoverResult` means the server is modern; a
+/// recognized modern JSON-RPC error means modern but at another version, "do
+/// **not** fall back to `initialize`"; "any other error, or does not respond
+/// within a reasonable timeout" means the server is legacy. The fallback
+/// "**MUST NOT** be keyed to one specific error code", so `-32601` is not a
+/// signal we can spend on politeness: it lands in branch three and tells a
+/// conforming client we are a legacy server. And the verdict outlives the
+/// connection - `/basic/versioning`: "The era determination is a property of
+/// the server, not of an individual request. Clients **SHOULD** cache the
+/// result for the lifetime of the server process (stdio) or origin (HTTP), and
+/// **MAY** persist it across restarts of the same server configuration." One
+/// wrong answer can pin a harness to the legacy lifecycle for as long as that
+/// registration lives.
+///
+/// **So the bare probe is normalized rather than answered**, and this exists
+/// solely because of upstream rust-sdk issue **#1157** ("stdio server:
+/// malformed-`_meta` 2026 request as first message gets no error response
+/// (connection wedges silently)", `bug`/`P1`, filed against 3.1.2). When that
+/// ships fixed, rmcp answers the bare probe itself and everything here goes.
+/// The whole list, kept complete because this is the copy a future deleter
+/// reads first and it must agree with the one in `CLAUDE.md` and
+/// `plans/backlog.md`: [`DiscoverProbe`], [`discover_probe`], [`probe_meta`],
+/// [`normalize_discover_probe`], [`observe_discover_probe`], the two
+/// `META_KEY_*` constants above, the rewrite in [`read_session_opener`], and
+/// the hook in [`relay_loop`] together with `RelayState`'s
+/// `opener_already_classified` field and the `Default` impl that sets it.
+/// `a_normalized_probe_reaches_our_discover_handler_and_a_bare_one_is_dropped`
+/// pins the bug, so the fix arriving shows up as a red test here.
+///
+/// # What forwarding costs, stated rather than smoothed over
+///
+/// Forwarding arms `peer.require_request_metadata()` (`service/server.rs:541`),
+/// the crate's only call site, a one-way `AtomicBool` (`service.rs:1032-1040`;
+/// `store(false)` appears nowhere in the crate). From then on every non-
+/// `initialize` request on that connection must carry the two keys or it is
+/// answered `-32602` (`handler/server.rs:78-99`). `initialize` itself is exempt
+/// (`:63`), so a client that probes, reads a `DiscoverResult` and then falls
+/// back to the legacy handshake **anyway** gets a session that handshakes and
+/// dies on its first `tools/list` - where a `-32601` would have handed it a
+/// working legacy session. A conforming client never does that (branch one of
+/// the rule above says continue, and branch two says do not fall back), but the
+/// divergence is real and it is why Task 10's client matrix, not an argument,
+/// decides whether this stays.
+///
+/// One case used to make that fallback likelier and it is closed: while
+/// `crate::mcp::SERVED_PROTOCOL_VERSIONS` held no 2026-07-28, our
+/// `DiscoverResult` advertised only legacy revisions, and a dual-era client
+/// reading a `supportedVersions` with nothing modern in it could reasonably
+/// have decided to use the legacy handshake on the same connection, where the
+/// latch was already armed. The era is served now, so the probe answer names a
+/// revision the client can stay on, and the version this bridge injects is that
+/// same revision rather than a legacy one - both read from the one list.
+///
+/// # Scope
+///
+/// **stdio only, and deliberately.** Over streamable HTTP there is no
+/// long-lived peer to latch: each POST is independent and `get_service()`
+/// builds a fresh handler on the stateless path (`tower.rs:1822`, `:1948`).
+/// That is not the same as "HTTP already works" - a bare probe there is
+/// classified as a legacy request, takes the session branch and is answered
+/// `422 Unprocessable Entity: Unexpected message, expect initialize request`,
+/// which `tests/http_stream.rs` pins. This bridge is stdio, so that gap is not
+/// something it can close.
+///
+/// **Absence of the WARN is not evidence.** Both sites log one line when a
+/// probe passes through them. A session that never sends a probe produces no
+/// line at all, so a silent log means "no probe was observed", never "no probe
+/// was sent" and never "the probe was handled".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiscoverProbe {
+    /// Missing at least one of the required keys, so rmcp's init loop drops it
+    /// without a response. This is the shape that gets rewritten.
+    Bare,
+    /// Carries both required keys, so rmcp answers it itself. Forwarded byte
+    /// for byte.
+    WithRequiredMeta,
 }
 
-/// Build a JSON-RPC error response to the `initialize` request in `init_line`,
+/// Classify `line` as a `server/discover` probe, or `None` when it is anything
+/// else: another method, a `server/discover` notification (no id, so nothing to
+/// answer and rmcp drops it as an unexpected message), or a line that is not
+/// JSON at all. Everything that classifies `None` is forwarded untouched, so a
+/// real client bug stays visible.
+///
+/// The `Bare` / `WithRequiredMeta` split is made by rmcp's own
+/// `missing_required_keys` against the same version literal its init loop uses,
+/// so the classification here cannot drift from the branch it predicts.
+fn discover_probe(line: &str) -> Option<DiscoverProbe> {
+    let msg: Value = serde_json::from_str(line).ok()?;
+    if msg.get("method")?.as_str()? != "server/discover" {
+        return None;
+    }
+    msg.get("id")?;
+    Some(
+        if probe_meta(&msg)
+            .missing_required_keys(&rmcp::model::ProtocolVersion::V_2026_07_28)
+            .is_empty()
+        {
+            DiscoverProbe::WithRequiredMeta
+        } else {
+            DiscoverProbe::Bare
+        },
+    )
+}
+
+/// The probe's `params._meta` as rmcp's typed map, empty when there is none.
+///
+/// `params._meta` is the wire location: rmcp deserializes a request's `_meta`
+/// out of `params` into the request extensions (`model/serde_impl.rs:159-174`),
+/// which is where `get_meta()` reads it.
+fn probe_meta(msg: &Value) -> rmcp::model::RequestMetaObject {
+    msg.get("params")
+        .and_then(|params| params.get("_meta"))
+        .and_then(Value::as_object)
+        .cloned()
+        .map(rmcp::model::RequestMetaObject::from)
+        .unwrap_or_default()
+}
+
+/// Rewrite a bare `server/discover` probe into the SEP-2575 shape rmcp answers,
+/// or `None` when there is nothing to rewrite (a complete probe, or not a probe
+/// at all) and the line should be forwarded as it stands. See [`DiscoverProbe`]
+/// for why this is a rewrite rather than a reply.
+///
+/// Only the keys rmcp reports missing are inserted, so a capability set the
+/// client declared for itself is never overwritten:
+///
+/// - `io.modelcontextprotocol/protocolVersion` gets **the newest revision this
+///   server currently advertises**, read from `crate::mcp`, never a literal.
+///   That is load bearing: `handler/server.rs:64-72` refuses an inline request
+///   naming a version outside `supported_protocol_versions()` with `-32022`
+///   **before dispatch reaches `discover()`**, so a hardcoded revision we did
+///   not serve would have turned every probing client's onboarding into a
+///   refusal. Reading the advertised set meant the probe was answered at every
+///   point in the migration, with the honest `supportedVersions` of the moment,
+///   and it is what makes the probe a 2026-07-28 one now that the era is
+///   served, without a second edit here.
+/// - `io.modelcontextprotocol/clientCapabilities` gets `{}`. **Scoped claim:**
+///   an empty object is not harmless in general - a server needing a capability
+///   the client did not declare must answer `-32021`
+///   (`MissingRequiredClientCapability`, rmcp `model.rs:547`) rather than
+///   degrade - but capabilities are per-request, servers "MUST NOT infer
+///   capabilities from prior requests" (`schema.ts:92-98`), and `server/discover`
+///   requires none. The specification's own discovery-page example probe sends
+///   exactly `"io.modelcontextprotocol/clientCapabilities": {}`.
+///
+/// Every other field survives by value: the id (so the answer is routable), the
+/// method, any other params and any other `_meta` key the client set. Key
+/// *order* is not preserved - this workspace bans serde_json's `preserve_order`
+/// feature, so the map re-serializes sorted - and JSON object order carries no
+/// meaning in JSON-RPC.
+fn normalize_discover_probe(line: &str) -> Option<String> {
+    if discover_probe(line)? != DiscoverProbe::Bare {
+        return None;
+    }
+    let mut msg: Value = serde_json::from_str(line).ok()?;
+    let mut meta = probe_meta(&msg);
+    let missing = meta.missing_required_keys(&rmcp::model::ProtocolVersion::V_2026_07_28);
+    if missing.contains(&META_KEY_PROTOCOL_VERSION) {
+        meta.set_protocol_version(crate::mcp::newest_served_protocol_version());
+    }
+    if missing.contains(&META_KEY_CLIENT_CAPABILITIES) {
+        meta.set_client_capabilities(rmcp::model::ClientCapabilities::default());
+    }
+
+    let params = msg
+        .as_object_mut()?
+        .entry("params")
+        .or_insert_with(|| Value::Object(Default::default()));
+    if !params.is_object() {
+        *params = Value::Object(Default::default());
+    }
+    params
+        .as_object_mut()?
+        .insert("_meta".to_string(), Value::Object(meta.0.0));
+    Some(msg.to_string())
+}
+
+/// Log a probe passing one of the two stdio sites and return the line to
+/// forward in its place, or `None` to forward what arrived.
+///
+/// Both shapes are logged, at WARN because that is the only level the bridge's
+/// subscriber passes (`init_tracing`) and stderr is the only channel a harness
+/// keeps. It is at most one line per session: a probe is a first message, and
+/// this process serves exactly one client for its life.
+fn observe_discover_probe(line: &str) -> Option<String> {
+    match discover_probe(line)? {
+        DiscoverProbe::Bare => {
+            let normalized = normalize_discover_probe(line)?;
+            tracing::warn!(
+                version = %crate::mcp::newest_served_protocol_version(),
+                "a server/discover probe arrived without the required _meta; \
+                 forwarding it with the two SEP-2575 keys injected so it is \
+                 answered rather than dropped (upstream rust-sdk #1157)"
+            );
+            Some(normalized)
+        }
+        DiscoverProbe::WithRequiredMeta => {
+            tracing::warn!(
+                "a server/discover probe arrived with the required _meta; \
+                 forwarding it unchanged"
+            );
+            None
+        }
+    }
+}
+
+/// Build a JSON-RPC error response to the session opener in `opener_line`,
 /// answering it with `err_text` when the embedded startup fails before rmcp
 /// ever takes over stdio. Without this the client would see nothing but a
 /// closed pipe; the TypeScript SDK's negotiation window reads a mid-handshake
 /// close as an unrecoverable network error and never retries, so a readable
-/// `initialize` failure is strictly better than dying silently. Returns `None`
-/// when the line carries no id to answer (malformed JSON, or a notification),
-/// in which case the caller skips the write and just propagates the error.
-fn initialize_error_reply(init_line: &str, err_text: &str) -> Option<String> {
-    let msg: Value = serde_json::from_str(init_line).ok()?;
+/// failure is strictly better than dying silently. Returns `None` when the line
+/// carries no id to answer (malformed JSON, or a notification), in which case
+/// the caller skips the write and just propagates the error.
+///
+/// This is the terminal path: it runs only when the embedded stack **and** the
+/// degraded status server both failed, and the process exits non-zero straight
+/// after. If the opener was a `server/discover` probe, this error tells the
+/// client we are a legacy server (see [`DiscoverProbe`]) - true only in the
+/// sense that we are about to stop being any kind of server at all.
+fn initialize_error_reply(opener_line: &str, err_text: &str) -> Option<String> {
+    let msg: Value = serde_json::from_str(opener_line).ok()?;
     let id = msg.get("id")?;
     let reply = serde_json::json!({
         "jsonrpc": "2.0",
@@ -95,11 +299,11 @@ fn initialize_error_reply(init_line: &str, err_text: &str) -> Option<String> {
 }
 
 /// An [`AsyncRead`] wrapper that yields a buffered `prefix` slice before
-/// delegating to `inner`. [`run_mcp`] builds one after the pre-init probe
-/// drain to re-front the `initialize` line it already read off stdin, together
-/// with anything the underlying `BufReader` had buffered past it, so the
-/// serving path (the daemon relay or the embedded rmcp server) sees the
-/// `initialize` as its first line with no special replay.
+/// delegating to `inner`. [`run_mcp`] builds one after reading the session
+/// opener to re-front the line it already took off stdin, together with
+/// anything the underlying `BufReader` had buffered past it, so the serving
+/// path (the daemon relay or the embedded rmcp server) sees that opener as its
+/// first line with no special replay.
 struct Prefixed<R> {
     prefix: Vec<u8>,
     inner: R,
@@ -121,38 +325,88 @@ impl<R: AsyncRead + Unpin> AsyncRead for Prefixed<R> {
     }
 }
 
-/// Read lines off `reader` until an `initialize` request arrives, replying
-/// to any [`preinit_probe_reply`]-eligible line on `stdout` in the
-/// meantime. Returns the raw `initialize` line so the caller can prepend
-/// it to a wrapped reader before handing to `rmcp::serve_server`, or
-/// `None` on stdin EOF before any `initialize`. Non-JSON, notifications
-/// and unrecognized requests fall through untouched so rmcp still sees
-/// them and rejects them the way it always has.
-async fn drain_preinit_probes<R, W>(
-    reader: &mut BufReader<R>,
-    stdout: &mut W,
-) -> std::io::Result<Option<String>>
+/// Read the line that opens the session off `reader`: an `initialize` request
+/// in the legacy era, a `server/discover` probe in the modern one, or whatever
+/// else the client sent first. Returns it so the caller can prepend it to a
+/// wrapped reader before handing that to the daemon relay or to
+/// `rmcp::serve_server`, or `None` on stdin EOF before anything arrived.
+///
+/// A bare probe is rewritten here (see [`normalize_discover_probe`]); every
+/// other line is returned exactly as it came, so rmcp still sees and judges it
+/// the way it always has. **Nothing is answered here** - the function takes no
+/// writer, which is the type-level version of that statement.
+///
+/// This used to drain and answer probes in a loop, which is why it could return
+/// only an `initialize`. Forwarding replaces answering, so exactly one line is
+/// read and the loop is gone.
+async fn read_session_opener<R>(reader: &mut BufReader<R>) -> std::io::Result<Option<String>>
 where
     R: AsyncRead + Unpin,
-    W: AsyncWriteExt + Unpin,
 {
     let mut buf = String::new();
-    loop {
-        buf.clear();
-        let n = reader.read_line(&mut buf).await?;
-        if n == 0 {
-            return Ok(None);
-        }
-        // read_line keeps the trailing newline; strip it to canonicalize.
-        let line = buf.trim_end_matches(['\r', '\n']).to_string();
-        if let Some(reply) = preinit_probe_reply(&line) {
-            stdout.write_all(reply.as_bytes()).await?;
-            stdout.write_all(b"\n").await?;
-            stdout.flush().await?;
-            continue;
-        }
-        return Ok(Some(line));
+    let n = reader.read_line(&mut buf).await?;
+    if n == 0 {
+        return Ok(None);
     }
+    // read_line keeps the trailing newline; strip it to canonicalize.
+    let line = buf.trim_end_matches(['\r', '\n']).to_string();
+    Ok(Some(observe_discover_probe(&line).unwrap_or(line)))
+}
+
+/// Whether the harness that spawned this process already has the shipped
+/// skills on disk and onboards itself at session start, from the `--harness`
+/// argument its MCP registration carries plus this machine's install receipt.
+///
+/// Neither input is the connecting client: one is the deployment's own
+/// configuration, the other is machine state. That is what makes the answer
+/// legal as a gate on a list endpoint (SEP-2567), where reading the client's
+/// `initialize` name for the same purpose was not.
+///
+/// **The receipt is read here rather than persisted at install time**, so it
+/// stays fresh: uninstalling the skills, or reinstalling with `--skip-hooks`,
+/// flips the answer at the next spawn with nothing to re-register. And it is
+/// read in this process rather than in the daemon because the state directory
+/// can be overridden by the environment, which this process inherits from the
+/// harness and the daemon does not.
+///
+/// Every uncertain input resolves to `false`, meaning serve: no argument (a
+/// registration predating the flag), an id this binary does not know, a
+/// missing or corrupt receipt, or a harness the receipt does not list with
+/// hooks. An over-served client pays duplicated context; an under-served one
+/// loses onboarding it cannot rediscover.
+fn resolve_harness_onboarded(harness: Option<&str>) -> bool {
+    let Ok(receipt) = crystalline_core::provision::install_receipt_path() else {
+        return false;
+    };
+    resolve_harness_onboarded_at(harness, &receipt)
+}
+
+/// [`resolve_harness_onboarded`] against an explicit receipt path, so the
+/// decision table can be tested without touching this machine's real state
+/// directory or its environment.
+fn resolve_harness_onboarded_at(harness: Option<&str>, receipt: &Path) -> bool {
+    let Some(id) = harness else {
+        return false;
+    };
+    // Parsed permissively rather than as a clap value enum: a downgraded
+    // binary meeting a newer registration, or a harness id rolled out ahead of
+    // the binaries, must degrade to serving rather than exit with a usage
+    // error, which the harness would see as a server that will not start.
+    let Some(kind) = crystalline_core::HarnessKind::from_id(id) else {
+        tracing::warn!(
+            harness = %id,
+            "unknown --harness value; serving the full skill surface. \
+             Upgrade crystalline if this harness is newer than this binary."
+        );
+        return false;
+    };
+    let onboarded = crystalline_core::harnesses_with_hooks(receipt).contains(&kind);
+    tracing::debug!(
+        harness = %id,
+        onboarded,
+        "resolved the skill surface for this session from the install receipt"
+    );
+    onboarded
 }
 
 /// The `crystalline mcp` stdio entry: attach to (or spawn) a daemon and relay
@@ -166,51 +420,76 @@ pub async fn run_mcp(
     db: Option<&Path>,
     config_path: Option<&Path>,
     read_only: bool,
+    harness: Option<&str>,
 ) -> anyhow::Result<()> {
     // Log to stderr from the start, for both modes: the relay's takeover and
     // reconnect notices and any embedded startup failure must be visible in the
     // harness's server log, not swallowed.
     init_tracing();
 
-    // Answering the version-negotiation probe (Claude Desktop chat mode's
-    // `server/discover`, see [`preinit_probe_reply`]) needs only stdin and
-    // stdout, so drive the drain concurrently with daemon acquisition: the
-    // probe is answered in milliseconds while a cold daemon spawns in parallel,
-    // instead of the client waiting out the whole startup for its reply. A
-    // transport close during that window is a terminal error the SDK never
-    // retries, so a slow start is survivable but an exit here is not. Embedded
-    // mode has no daemon half; it only drains.
+    // Resolve the onboarding answer once, here, before anything connects: this
+    // process serves exactly one MCP client for its whole life, so a value
+    // fixed at startup is invariant for every connection it can ever serve,
+    // which is what SEP-2567 needs of a gate that stays on a listing. It is
+    // re-sent on each daemon reconnect and never re-derived daemon-side.
+    let harness_onboarded = resolve_harness_onboarded(harness);
+
+    // Read the client's first line concurrently with daemon acquisition, so a
+    // cold daemon spawns while the client is still composing its opener rather
+    // than afterwards.
+    //
+    // **What this no longer buys, since it used to buy more.** While the bridge
+    // answered the `server/discover` probe itself (see [`DiscoverProbe`]) the
+    // answer went out in milliseconds regardless of how slow the daemon was.
+    // Forwarding means the probe is answered by whoever ends up serving, so its
+    // reply now waits out daemon acquisition or embedded startup. That matters
+    // because branch three of the stdio rule is "any other error, **or does not
+    // respond within a reasonable timeout**: the server is legacy", and that
+    // verdict is cacheable for the server process's lifetime. Measured on this
+    // machine, cold: see the transcripts in the migration ledger. A transport
+    // close during the window is still the unsurvivable case, and nothing here
+    // closes stdio.
     let mut stdout = tokio::io::stdout();
     let mut reader = BufReader::new(tokio::io::stdin());
-    let (drained, daemon) = if embedded {
-        (drain_preinit_probes(&mut reader, &mut stdout).await, None)
+    let (opened, daemon) = if embedded {
+        (read_session_opener(&mut reader).await, None)
     } else {
         // `read_only` is forwarded only to a daemon this call spawns; attaching
         // to an already-running daemon uses that daemon's own mode.
-        let (drained, daemon) = tokio::join!(
-            drain_preinit_probes(&mut reader, &mut stdout),
+        let (opened, daemon) = tokio::join!(
+            read_session_opener(&mut reader),
             ensure_daemon(true, db, config_path, read_only),
         );
-        (drained, Some(daemon))
+        (opened, Some(daemon))
     };
 
-    // Stdin EOF before any `initialize` means the client left mid-window; a
+    // Stdin EOF before the client said anything means it left mid-window; a
     // daemon this call spawned staying up is fine by design, so exit cleanly.
-    // A real drain I/O error propagates.
-    let Some(init_line) = drained? else {
+    // A real read error propagates.
+    let Some(opener_line) = opened? else {
         return Ok(());
     };
-    // Re-front the drained `initialize` (plus anything buffered past it) so the
-    // serving path reads it as its first stdin line with no special replay.
-    let primed = prime_reader(&init_line, reader);
+    // Re-front the opener (plus anything buffered past it) so the serving path
+    // reads it as its first stdin line with no special replay.
+    let primed = prime_reader(&opener_line, reader);
 
     // A daemon is up: relay through it. A failed `mcp` handshake falls through
     // to the embedded path rather than propagating, so an unreachable daemon
     // still yields a working in-process server instead of a mid-window close.
     if let Some(daemon) = daemon {
         match daemon {
-            Ok(conn) => match conn.into_mcp().await {
-                Ok(stream) => return pump_stdio(stream, primed, db, config_path, read_only).await,
+            Ok(conn) => match conn.into_mcp(harness_onboarded).await {
+                Ok(stream) => {
+                    return pump_stdio(
+                        stream,
+                        primed,
+                        db,
+                        config_path,
+                        read_only,
+                        harness_onboarded,
+                    )
+                    .await;
+                }
                 Err(e) => tracing::warn!("daemon MCP handshake failed ({e}); running embedded"),
             },
             Err(e) => tracing::warn!("no daemon available ({e}); running embedded"),
@@ -228,7 +507,7 @@ pub async fn run_mcp(
     // still intact for the stub. Only if the stub itself fails to serve do we
     // fall back to the old `-32000` reply and a non-zero exit (stderr carries
     // the chain for the Desktop log).
-    match build_embedded(db, config_path, read_only).await {
+    match build_embedded(db, config_path, read_only, harness_onboarded).await {
         Ok(stack) => run_embedded_stdio(stack, primed).await,
         Err(e) => {
             tracing::error!(
@@ -239,7 +518,7 @@ pub async fn run_mcp(
                 Ok(()) => Ok(()),
                 Err(stub_err) => {
                     tracing::warn!("degraded status server failed ({stub_err:#})");
-                    if let Some(reply) = initialize_error_reply(&init_line, &format!("{e:#}")) {
+                    if let Some(reply) = initialize_error_reply(&opener_line, &format!("{e:#}")) {
                         let _ = stdout.write_all(reply.as_bytes()).await;
                         let _ = stdout.write_all(b"\n").await;
                         let _ = stdout.flush().await;
@@ -251,17 +530,17 @@ pub async fn run_mcp(
     }
 }
 
-/// Re-front the drained `initialize` line ahead of stdin: the prefix is the
-/// line, a newline and whatever the `BufReader` buffered past it, the inner is
-/// the raw stdin. See [`Prefixed`].
+/// Re-front the session opener ahead of stdin: the prefix is the line, a
+/// newline and whatever the `BufReader` buffered past it, the inner is the raw
+/// stdin. See [`Prefixed`].
 fn prime_reader(
-    init_line: &str,
+    opener_line: &str,
     reader: BufReader<tokio::io::Stdin>,
 ) -> Prefixed<tokio::io::Stdin> {
     let buffered = reader.buffer().to_vec();
     let inner = reader.into_inner();
-    let mut prefix = Vec::with_capacity(init_line.len() + 1 + buffered.len());
-    prefix.extend_from_slice(init_line.as_bytes());
+    let mut prefix = Vec::with_capacity(opener_line.len() + 1 + buffered.len());
+    prefix.extend_from_slice(opener_line.as_bytes());
     prefix.push(b'\n');
     prefix.extend_from_slice(&buffered);
     Prefixed { prefix, inner }
@@ -279,12 +558,53 @@ enum SessionEnd {
 /// What the relay remembers across daemon restarts: the client's handshake
 /// lines to replay verbatim and the ids of requests still waiting for a
 /// response, which get an error answer after a restart instead of silence.
-#[derive(Default)]
 struct RelayState {
     init_request: Option<String>,
     init_id: Option<Value>,
     initialized_note: Option<String>,
     outstanding: std::collections::HashMap<String, Value>,
+    /// The next client line is the session opener [`read_session_opener`]
+    /// already classified, rewrote if it was a bare probe and logged, so
+    /// [`relay_loop`] must forward it without classifying it again. Cleared on
+    /// the first client line, so a probe that arrives later - the one shape
+    /// that can still meet a fresh daemon's init loop, after a restart
+    /// resynced a session no `initialize` opened - is normalized as usual.
+    ///
+    /// Without this one bare probe produced two WARN lines, the second
+    /// ("arrived with the required _meta; forwarding it unchanged", read off
+    /// the already-rewritten line) contradicting the first.
+    ///
+    /// **True by default on purpose**, see [`RelayState::default`]: the flag is
+    /// a fact about how every production relay is reached, not an option a
+    /// call site chooses, so no call site can drop it.
+    opener_already_classified: bool,
+}
+
+impl Default for RelayState {
+    /// The state every relay in this binary starts from. Written by hand
+    /// rather than derived for one field: `opener_already_classified` is
+    /// **true**, because [`pump_stdio`] is reachable only from [`run_mcp`],
+    /// which has already read and classified the session opener through
+    /// [`read_session_opener`] and re-fronted it onto stdin. Deriving `Default`
+    /// and setting the flag at the call site instead put the invariant in a
+    /// line nothing tested, where reverting it silently brought back the
+    /// double WARN; here it is the one place the value is decided, both
+    /// production and `a_bare_probe_on_the_relay_path_is_classified_once` go
+    /// through it, and flipping it turns that test red.
+    ///
+    /// A test that wants the other shape - a probe the relay itself must
+    /// classify, which is what a fresh daemon sees after a restart resynced a
+    /// session no `initialize` opened - clears the flag explicitly. That is
+    /// the only place in the tree that does.
+    fn default() -> Self {
+        RelayState {
+            init_request: None,
+            init_id: None,
+            initialized_note: None,
+            outstanding: std::collections::HashMap::new(),
+            opener_already_classified: true,
+        }
+    }
 }
 
 impl RelayState {
@@ -380,12 +700,20 @@ where
                     return Ok((SessionEnd::StdinClosed, served_any));
                 }
                 Some(line) => {
-                    if let Some(reply) = preinit_probe_reply(&line) {
-                        stdout.write_all(reply.as_bytes()).await?;
-                        stdout.write_all(b"\n").await?;
-                        stdout.flush().await?;
-                        continue;
-                    }
+                    // A bare `server/discover` reaching the relay is rewritten
+                    // rather than answered, so the daemon's rmcp handles it and
+                    // the client gets a real DiscoverResult. See
+                    // [`DiscoverProbe`]. The session opener is exempt: it was
+                    // classified, rewritten and logged by `read_session_opener`
+                    // before being re-fronted onto stdin, and describing it a
+                    // second time here contradicted the first line. From here
+                    // on it is an ordinary request: recorded, forwarded,
+                    // settled by its response.
+                    let line = if std::mem::take(&mut relay.opener_already_classified) {
+                        line
+                    } else {
+                        observe_discover_probe(&line).unwrap_or(line)
+                    };
                     relay.note_client_line(&line);
                     let sent = session.sock_write.write_all(line.as_bytes()).await.is_ok()
                         && session.sock_write.write_all(b"\n").await.is_ok()
@@ -483,10 +811,14 @@ async fn pump_stdio<R>(
     db: Option<&Path>,
     config_path: Option<&Path>,
     read_only: bool,
+    harness_onboarded: bool,
 ) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin,
 {
+    // `run_mcp` read and classified the session opener before priming it back
+    // onto this reader, so the first line below is already described in the
+    // log. That is what `RelayState::default()` encodes; nothing is set here.
     let mut relay = RelayState::default();
     let mut stdin = BufReader::new(reader).lines();
     let mut stdout = tokio::io::stdout();
@@ -518,7 +850,11 @@ where
                     continue;
                 }
             };
-            let Ok(stream) = conn.into_mcp().await else {
+            // Re-sent on every reconnect: the daemon builds a fresh
+            // `McpServer` per accepted socket (`daemon.rs`), so a restart
+            // would otherwise flip an onboarded harness back to served in the
+            // middle of a live session.
+            let Ok(stream) = conn.into_mcp(harness_onboarded).await else {
                 continue;
             };
             session = Session::new(stream);
@@ -553,6 +889,7 @@ async fn build_embedded(
     db: Option<&Path>,
     config_path: Option<&Path>,
     read_only: bool,
+    harness_onboarded: bool,
 ) -> anyhow::Result<EmbeddedStack> {
     let ownership = acquire_ownership()
         .map_err(|e| anyhow::anyhow!("cannot run an embedded MCP server: {e}"))?;
@@ -593,7 +930,7 @@ async fn build_embedded(
     engine.refresh_routing_cache().await;
 
     Ok(EmbeddedStack {
-        server: McpServer::new(engine),
+        server: McpServer::new(engine).with_onboarded_harness(harness_onboarded),
         ownership,
     })
 }
@@ -1310,6 +1647,75 @@ mod tests {
         BufReader::new(bytes).lines()
     }
 
+    // --- the resolved skill-surface answer ------------------------------------
+    //
+    // The whole decision table for `--harness`, against a receipt written by
+    // hand in the shape `crystalline install` writes. Every uncertain row
+    // resolves to false, meaning "serve the surface": an over-served client
+    // pays some duplicated context, an under-served one loses onboarding it
+    // has no way to rediscover.
+
+    /// A receipt in the shape `crystalline install` writes, recording
+    /// `harness` with its session hooks wired or skipped.
+    fn write_receipt(path: &std::path::Path, harness: &str, hooks: bool) {
+        std::fs::write(
+            path,
+            format!(
+                r#"{{"format":1,"installs":[{{"harness":"{harness}","scope":"user","version":"0.13.0","parts":{{"mcp":true,"hooks":{hooks},"skills":true}},"skills":[]}}]}}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn the_resolved_answer_is_the_named_harness_plus_this_machines_receipt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let receipt = tmp.path().join("installs.json");
+
+        // The row the feature exists for.
+        write_receipt(&receipt, "claude-code", true);
+        assert!(resolve_harness_onboarded_at(Some("claude-code"), &receipt));
+
+        // Per harness, not per machine: the receipt knows claude-code, and a
+        // codex-spawned process still gets the surface. This is the whole
+        // reason the argument exists rather than the receipt alone.
+        assert!(!resolve_harness_onboarded_at(Some("codex"), &receipt));
+
+        // Hooks skipped: nothing onboards that session, so the block and the
+        // surface both have to come from here.
+        write_receipt(&receipt, "claude-code", false);
+        assert!(!resolve_harness_onboarded_at(Some("claude-code"), &receipt));
+    }
+
+    #[test]
+    fn every_uncertain_input_resolves_to_serving() {
+        let tmp = tempfile::tempdir().unwrap();
+        let receipt = tmp.path().join("installs.json");
+        write_receipt(&receipt, "claude-code", true);
+
+        // No argument at all: a registration written before `--harness`
+        // existed. This is the pre-existing-install case and it must behave
+        // exactly as it did before the flag.
+        assert!(!resolve_harness_onboarded_at(None, &receipt));
+
+        // An id this binary does not know: a downgrade meeting a newer
+        // registration, or a harness rolled out ahead of the binaries. Warns
+        // and serves; it must never be a usage error, which would leave the
+        // harness with a server that will not start.
+        assert!(!resolve_harness_onboarded_at(
+            Some("nextgen-harness"),
+            &receipt
+        ));
+        assert!(!resolve_harness_onboarded_at(Some(""), &receipt));
+
+        // A missing receipt and a corrupt one both read as "nothing onboarded"
+        // through the tolerant shallow reader, never as an error.
+        let missing = tmp.path().join("nope.json");
+        assert!(!resolve_harness_onboarded_at(Some("claude-code"), &missing));
+        std::fs::write(&receipt, "not json at all").unwrap();
+        assert!(!resolve_harness_onboarded_at(Some("claude-code"), &receipt));
+    }
+
     #[test]
     fn relay_state_tracks_the_handshake_and_outstanding_requests() {
         let mut relay = RelayState::default();
@@ -1476,77 +1882,405 @@ mod tests {
         assert!(buf.is_empty());
     }
 
+    // --- the discover probe: classified, normalized, forwarded ---------------
+    //
+    // These four replace the four that pinned the `-32601` answer
+    // (`preinit_probe_reply_answers_server_discover_only`, the two
+    // `drain_preinit_probes` tests and
+    // `relay_loop_intercepts_server_discover_without_forwarding_to_daemon`).
+    // The answer is gone, so what they pinned is gone with it; what replaces it
+    // is the shape on the wire and the fact that our own handler runs.
+
+    /// A bare probe as the TypeScript SDK's auto-negotiation window sends it.
+    const BARE_PROBE: &str = r#"{"jsonrpc":"2.0","id":0,"method":"server/discover"}"#;
+
+    /// The `_meta` a complete probe carries: both `DRAFT_REQUIRED_KEYS`
+    /// (rmcp 3.1.2 `model/meta.rs:400-403`).
+    fn complete_probe(id: Value, version: &str) -> String {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "server/discover",
+            "params": { "_meta": {
+                "io.modelcontextprotocol/protocolVersion": version,
+                "io.modelcontextprotocol/clientCapabilities": {},
+            }},
+        })
+        .to_string()
+    }
+
     #[test]
-    fn preinit_probe_reply_answers_server_discover_only() {
-        // The TypeScript SDK dual-era probe with a numeric id.
-        let reply = preinit_probe_reply(r#"{"jsonrpc":"2.0","id":0,"method":"server/discover"}"#)
-            .expect("server/discover is intercepted");
-        let v: Value = serde_json::from_str(&reply).unwrap();
-        assert_eq!(v["id"], serde_json::json!(0));
-        assert_eq!(v["error"]["code"], serde_json::json!(-32601));
-        assert!(
-            v["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("server/discover")
+    fn discover_probe_classifies_by_rmcps_own_required_key_rule() {
+        use rmcp::model::{ProtocolVersion, RequestMetaObject};
+
+        // Our two constants are rmcp's, checked rather than copied: a rename
+        // upstream must fail here instead of silently disabling the injection.
+        assert_eq!(
+            [META_KEY_PROTOCOL_VERSION, META_KEY_CLIENT_CAPABILITIES],
+            RequestMetaObject::DRAFT_REQUIRED_KEYS
         );
 
-        // A string id must round-trip verbatim.
-        let reply = preinit_probe_reply(
-            r#"{"jsonrpc":"2.0","id":"abc","method":"server/discover","params":{}}"#,
-        )
-        .unwrap();
-        let v: Value = serde_json::from_str(&reply).unwrap();
-        assert_eq!(v["id"], serde_json::json!("abc"));
-
-        // initialize, notifications, tool calls, and garbage all fall through.
-        assert!(preinit_probe_reply(r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#).is_none());
-        assert!(
-            preinit_probe_reply(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
-                .is_none()
+        // No `_meta` at all, in either of the two shapes a probe arrives in.
+        assert_eq!(discover_probe(BARE_PROBE), Some(DiscoverProbe::Bare));
+        assert_eq!(
+            discover_probe(r#"{"jsonrpc":"2.0","id":0,"method":"server/discover","params":{}}"#),
+            Some(DiscoverProbe::Bare)
         );
-        assert!(preinit_probe_reply(r#"{"jsonrpc":"2.0","id":2,"method":"tools/call"}"#).is_none());
-        assert!(preinit_probe_reply("not json at all").is_none());
+
+        // One key only is still `Bare`: rmcp's `missing_required_keys`
+        // (`model/meta.rs:518-528`) reports every absent key and the init loop
+        // drops the request unless the list is empty
+        // (`service/server.rs:527-533`).
+        for meta in [
+            serde_json::json!({ "io.modelcontextprotocol/protocolVersion": "2025-11-25" }),
+            serde_json::json!({ "io.modelcontextprotocol/clientCapabilities": {} }),
+            serde_json::json!({ "progressToken": 7 }),
+            // Present but not decodable counts as missing, which is rmcp's own
+            // rule ("a key counts as missing when it is not present *or* when
+            // its value does not decode", `model/meta.rs:491-497`).
+            serde_json::json!({
+                "io.modelcontextprotocol/protocolVersion": 7,
+                "io.modelcontextprotocol/clientCapabilities": {},
+            }),
+        ] {
+            let line = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "server/discover",
+                "params": { "_meta": meta },
+            })
+            .to_string();
+            assert_eq!(
+                discover_probe(&line),
+                Some(DiscoverProbe::Bare),
+                "rmcp would drop this one: {line}"
+            );
+        }
+
+        // Both keys: rmcp answers it itself, at any version string.
+        assert_eq!(
+            discover_probe(&complete_probe(serde_json::json!(1), "2025-11-25")),
+            Some(DiscoverProbe::WithRequiredMeta)
+        );
+        assert_eq!(
+            discover_probe(&complete_probe(
+                serde_json::json!("abc"),
+                ProtocolVersion::V_2026_07_28.as_str()
+            )),
+            Some(DiscoverProbe::WithRequiredMeta)
+        );
+
+        // Everything else is not a probe: other methods, a notification with
+        // nothing to answer, and garbage.
+        assert!(discover_probe(r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#).is_none());
+        assert!(discover_probe(r#"{"jsonrpc":"2.0","id":2,"method":"tools/call"}"#).is_none());
+        assert!(discover_probe(r#"{"jsonrpc":"2.0","method":"server/discover"}"#).is_none());
+        assert!(discover_probe("not json at all").is_none());
     }
 
-    #[tokio::test]
-    async fn drain_preinit_probes_answers_probes_and_returns_initialize() {
-        let input: &[u8] = b"{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"server/discover\"}\n\
-            {\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n\
-            extra-buffered-past-initialize\n";
-        let mut reader = BufReader::new(input);
-        let mut stdout = Vec::new();
-        let init = drain_preinit_probes(&mut reader, &mut stdout)
-            .await
-            .unwrap()
-            .expect("initialize is returned");
-        assert!(init.contains("\"initialize\""), "{init}");
+    #[test]
+    fn normalize_discover_probe_injects_the_two_keys_and_nothing_else() {
+        use rmcp::model::ProtocolVersion;
 
-        // The probe got a -32601 answer on stdout.
-        let out = String::from_utf8(stdout).unwrap();
-        let reply_line = out.lines().next().unwrap();
-        let v: Value = serde_json::from_str(reply_line).unwrap();
-        assert_eq!(v["id"], serde_json::json!(0));
-        assert_eq!(v["error"]["code"], serde_json::json!(-32601));
+        // A bare probe carrying fields of its own: everything it sent survives,
+        // and the only addition is `params._meta`.
+        let line = r#"{"jsonrpc":"2.0","id":"abc","method":"server/discover","params":{"_meta":{"progressToken":7},"extra":true}}"#;
+        let normalized = normalize_discover_probe(line).expect("a bare probe is rewritten");
+        let v: Value = serde_json::from_str(&normalized).unwrap();
+        assert_eq!(v["jsonrpc"], serde_json::json!("2.0"));
+        assert_eq!(v["id"], serde_json::json!("abc"), "the id is answerable");
+        assert_eq!(v["method"], serde_json::json!("server/discover"));
+        assert_eq!(v["params"]["extra"], serde_json::json!(true));
+        assert_eq!(
+            v["params"]["_meta"]["progressToken"],
+            serde_json::json!(7),
+            "a key the client set is untouched"
+        );
+        assert_eq!(
+            v["params"]["_meta"][META_KEY_CLIENT_CAPABILITIES],
+            serde_json::json!({}),
+            "an empty object claims nothing on the client's behalf"
+        );
 
-        // The bytes buffered past `initialize` are still readable off the reader.
-        let mut rest = String::new();
-        reader.read_to_string(&mut rest).await.unwrap();
-        assert!(rest.contains("extra-buffered-past-initialize"), "{rest}");
+        // The injected version is READ FROM THE ADVERTISED SET, never written
+        // as a literal: `handler/server.rs:64-72` refuses an inline request
+        // naming a version outside `supported_protocol_versions()` with -32022
+        // before dispatch reaches `discover()`, so a hardcoded "2026-07-28"
+        // would turn every probe into a refusal until that revision is served.
+        assert_eq!(
+            v["params"]["_meta"][META_KEY_PROTOCOL_VERSION],
+            serde_json::json!(crate::mcp::newest_served_protocol_version().as_str())
+        );
+        assert!(
+            crate::mcp::SERVED_PROTOCOL_VERSIONS
+                .contains(&crate::mcp::newest_served_protocol_version()),
+            "the injected version is one we advertise"
+        );
+
+        // A probe missing only one key gets only that one.
+        let one_key = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "server/discover",
+            "params": { "_meta": {
+                "io.modelcontextprotocol/clientCapabilities": { "elicitation": {} },
+            }},
+        })
+        .to_string();
+        let normalized = normalize_discover_probe(&one_key).unwrap();
+        let v: Value = serde_json::from_str(&normalized).unwrap();
+        assert_eq!(
+            v["params"]["_meta"][META_KEY_CLIENT_CAPABILITIES],
+            serde_json::json!({ "elicitation": {} }),
+            "a capability the client declared is never overwritten"
+        );
+        assert!(v["params"]["_meta"][META_KEY_PROTOCOL_VERSION].is_string());
+
+        // A complete probe is forwarded untouched: nothing to rewrite. Same for
+        // anything that is not a probe.
+        assert!(
+            normalize_discover_probe(&complete_probe(
+                serde_json::json!(1),
+                ProtocolVersion::V_2026_07_28.as_str()
+            ))
+            .is_none()
+        );
+        assert!(
+            normalize_discover_probe(r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#).is_none()
+        );
+        assert!(normalize_discover_probe("not json at all").is_none());
     }
 
-    #[tokio::test]
-    async fn drain_preinit_probes_returns_none_on_eof_before_initialize() {
-        let input: &[u8] = b"{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"server/discover\"}\n";
-        let mut reader = BufReader::new(input);
-        let mut stdout = Vec::new();
-        let got = drain_preinit_probes(&mut reader, &mut stdout)
+    #[test]
+    fn a_normalized_probe_is_what_rmcps_init_loop_accepts() {
+        use rmcp::model::{ClientJsonRpcMessage, ClientRequest, GetMeta, ProtocolVersion};
+
+        // The gate, quoted from the function that executes it
+        // (`service/server.rs:527-533`): a first request that is not
+        // `initialize` is dropped when
+        // `request.get_meta().missing_required_keys(&V_2026_07_28)` is
+        // non-empty. `V_2026_07_28` is a literal there, so the check is about
+        // the two keys being present, never about the version they name.
+        let decode = |line: &str| match serde_json::from_str::<ClientJsonRpcMessage>(line) {
+            Ok(ClientJsonRpcMessage::Request(req)) => Some(req.request),
+            _ => None,
+        };
+
+        let normalized = normalize_discover_probe(BARE_PROBE).unwrap();
+        let request = decode(&normalized).expect("the normalized line parses as a request");
+        assert!(
+            matches!(request, ClientRequest::DiscoverRequest(_)),
+            "it must reach the DiscoverRequest arm of `handler/server.rs:107-110`, \
+             not the custom-request fallback"
+        );
+        assert!(
+            request
+                .get_meta()
+                .missing_required_keys(&ProtocolVersion::V_2026_07_28)
+                .is_empty(),
+            "rmcp's own rule says this one is answered rather than dropped"
+        );
+
+        // And the bare one is what upstream #1157 drops: whatever it parses as,
+        // its `_meta` is missing both keys.
+        let missing = decode(BARE_PROBE)
+            .map(|r| {
+                r.get_meta()
+                    .missing_required_keys(&ProtocolVersion::V_2026_07_28)
+            })
+            .unwrap_or_else(|| rmcp::model::RequestMetaObject::DRAFT_REQUIRED_KEYS.to_vec());
+        assert_eq!(
+            missing,
+            rmcp::model::RequestMetaObject::DRAFT_REQUIRED_KEYS.to_vec()
+        );
+    }
+
+    /// The acceptance criterion, end to end and over a real transport: the
+    /// normalized probe reaches `McpServer::discover` and comes back as a
+    /// `DiscoverResult` carrying our routing block, while the bare probe rmcp
+    /// is handed today gets no answer at all (upstream #1157).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_normalized_probe_reaches_our_discover_handler_and_a_bare_one_is_dropped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let build_engine = || {
+            let config_path = tmp.path().join("config.yaml");
+            async move {
+                let store = crystalline_index::TursoStore::open_in_memory()
+                    .await
+                    .unwrap();
+                Arc::new(Engine::new(
+                    Arc::new(tokio::sync::Mutex::new(store)),
+                    crystalline_core::config::GlobalConfig::default(),
+                    None,
+                    Some(config_path),
+                ))
+            }
+        };
+
+        // 1. The bare probe: rmcp's init loop returns without ever calling
+        //    `transport.send` (`service/server.rs:527-533`), so the client sees
+        //    a closed pipe. This is the bug the normalization exists for, and
+        //    it is pinned here so its fix upstream shows up as a failure.
+        let (client_io, server_io) = tokio::io::duplex(1 << 16);
+        let server = tokio::spawn({
+            let engine = build_engine().await;
+            async move { rmcp::serve_server(McpServer::new(engine), server_io).await }
+        });
+        let (read, mut write) = tokio::io::split(client_io);
+        let mut lines = BufReader::new(read).lines();
+        write
+            .write_all(format!("{BARE_PROBE}\n").as_bytes())
             .await
             .unwrap();
-        assert!(got.is_none());
-        // But the probe still got answered before EOF.
-        let out = String::from_utf8(stdout).unwrap();
-        assert!(out.contains("\"code\":-32601"), "{out}");
+        write.flush().await.unwrap();
+        let answer = tokio::time::timeout(std::time::Duration::from_secs(5), lines.next_line())
+            .await
+            .expect("rmcp closes the connection rather than hanging")
+            .unwrap();
+        assert!(
+            answer.is_none(),
+            "rmcp 3.1.2 answers a bare probe after all; the normalization can go \
+             (upstream rust-sdk #1157): {answer:?}"
+        );
+        assert!(
+            server.await.unwrap().is_err(),
+            "the bare probe ends the session with ExpectedInitializeRequest"
+        );
+
+        // 2. The same probe, normalized: our handler runs.
+        let (client_io, server_io) = tokio::io::duplex(1 << 16);
+        let server = tokio::spawn({
+            let engine = build_engine().await;
+            async move { rmcp::serve_server(McpServer::new(engine), server_io).await }
+        });
+        let (read, mut write) = tokio::io::split(client_io);
+        let mut lines = BufReader::new(read).lines();
+        let normalized = normalize_discover_probe(BARE_PROBE).unwrap();
+        write
+            .write_all(format!("{normalized}\n").as_bytes())
+            .await
+            .unwrap();
+        write.flush().await.unwrap();
+        let answer = tokio::time::timeout(std::time::Duration::from_secs(5), lines.next_line())
+            .await
+            .expect("the normalized probe is answered")
+            .unwrap()
+            .expect("with a message rather than a closed pipe");
+        let v: Value = serde_json::from_str(&answer).unwrap();
+        assert_eq!(v["id"], serde_json::json!(0), "{answer}");
+        assert!(v["error"].is_null(), "not an error of any kind: {answer}");
+        assert!(
+            v["result"]["instructions"]
+                .as_str()
+                .is_some_and(|s| s.starts_with("CRYSTALLINE KNOWLEDGE ROUTING")),
+            "the DiscoverResult carries our routing block: {answer}"
+        );
+        let advertised: Vec<String> = crate::mcp::SERVED_PROTOCOL_VERSIONS
+            .iter()
+            .map(|v| v.as_str().to_string())
+            .collect();
+        assert_eq!(
+            v["result"]["supportedVersions"],
+            serde_json::json!(advertised),
+            "and it advertises exactly what we serve: {answer}"
+        );
+
+        // 3. What forwarding costs, pinned rather than argued. The probe armed
+        //    `peer.require_request_metadata()` (`service/server.rs:541`), which
+        //    is one-way (`service.rs:1032-1040`). A client that ignores the
+        //    specification's "do not fall back to `initialize`" and hands us a
+        //    legacy handshake anyway is served it - `initialize` is exempt at
+        //    `handler/server.rs:63` - and then dies on its first real call.
+        //    This is the divergence Task 10's client matrix decides on.
+        write
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\
+                   \"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\
+                   \"clientInfo\":{\"name\":\"dual-era\",\"version\":\"0\"}}}\n",
+            )
+            .await
+            .unwrap();
+        write
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}\n")
+            .await
+            .unwrap();
+        write.flush().await.unwrap();
+        // Both answers are in flight at once, so index them by id rather than
+        // by arrival: rmcp dispatches concurrently and the refusal is quicker
+        // than the handshake.
+        let mut answers = std::collections::HashMap::new();
+        for _ in 0..2 {
+            let v: Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            answers.insert(v["id"].clone(), v);
+        }
+        let handshake = &answers[&serde_json::json!(1)];
+        assert!(
+            handshake["result"]["protocolVersion"].is_string(),
+            "the legacy handshake still succeeds: {handshake}"
+        );
+        let refused = &answers[&serde_json::json!(2)];
+        assert_eq!(
+            refused["error"]["code"],
+            serde_json::json!(-32602),
+            "{refused}"
+        );
+        assert_eq!(
+            refused["error"]["message"],
+            "request _meta is missing or has malformed required fields: \
+             io.modelcontextprotocol/protocolVersion, \
+             io.modelcontextprotocol/clientCapabilities",
+            "the latch is what refuses it, not our own guard: {refused}"
+        );
+
+        drop(write);
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn the_session_opener_is_the_normalized_probe_and_nothing_is_answered_here() {
+        let input: &[u8] = b"{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"server/discover\"}\n\
+            extra-buffered-past-the-opener\n";
+        let mut reader = BufReader::new(input);
+        let opener = read_session_opener(&mut reader)
+            .await
+            .unwrap()
+            .expect("the probe opens the session instead of being consumed");
+        let v: Value = serde_json::from_str(&opener).unwrap();
+        assert_eq!(v["method"], serde_json::json!("server/discover"));
+        assert!(
+            v["params"]["_meta"][META_KEY_PROTOCOL_VERSION].is_string(),
+            "{opener}"
+        );
+        assert_eq!(
+            v["params"]["_meta"][META_KEY_CLIENT_CAPABILITIES],
+            serde_json::json!({}),
+            "{opener}"
+        );
+
+        // The bytes buffered past it are still readable off the reader, so the
+        // primed handoff is unchanged.
+        let mut rest = String::new();
+        reader.read_to_string(&mut rest).await.unwrap();
+        assert!(rest.contains("extra-buffered-past-the-opener"), "{rest}");
+
+        // An `initialize` opener is returned verbatim: the legacy era is
+        // untouched by any of this.
+        let init: &[u8] =
+            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n";
+        let mut reader = BufReader::new(init);
+        let opener = read_session_opener(&mut reader).await.unwrap().unwrap();
+        assert_eq!(
+            opener,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn read_session_opener_returns_none_on_eof() {
+        let input: &[u8] = b"";
+        let mut reader = BufReader::new(input);
+        assert!(read_session_opener(&mut reader).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -1561,39 +2295,205 @@ mod tests {
         assert_eq!(out, "hello world");
     }
 
+    /// A probe the relay has to classify itself: this is the one place in the
+    /// tree that clears `opener_already_classified`, which is the state after
+    /// a restart resynced a session no `initialize` opened, so this line meets
+    /// a fresh daemon's init loop as its first message and has to arrive
+    /// normalized. `a_bare_probe_on_the_relay_path_is_classified_once` covers
+    /// the other side, the opener the bridge already handled.
     #[tokio::test]
-    async fn relay_loop_intercepts_server_discover_without_forwarding_to_daemon() {
-        let (bridge_side, mut daemon_side) = tokio::io::duplex(4096);
+    async fn relay_loop_forwards_a_normalized_discover_probe_to_the_daemon() {
+        let (bridge_side, daemon_side) = tokio::io::duplex(4096);
         let (mut stdin_feed, stdin_read) = tokio::io::duplex(4096);
         stdin_feed
             .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"server/discover\"}\n")
             .await
             .unwrap();
-        drop(stdin_feed);
 
-        let mut relay = RelayState::default();
+        // The daemon end of the relay: read the one line the bridge sends,
+        // answer it the way rmcp's inline branch does, then close. stdin stays
+        // open (the writer half is held), so the loop ends on the daemon's EOF
+        // and the answer cannot race a client close.
+        let daemon = tokio::spawn(async move {
+            let (read, mut write) = tokio::io::split(daemon_side);
+            let mut lines = BufReader::new(read).lines();
+            let seen = lines.next_line().await.unwrap();
+            write
+                .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"instructions\":\"x\"}}\n")
+                .await
+                .unwrap();
+            write.flush().await.unwrap();
+            drop(write);
+            drop(lines);
+            seen
+        });
+
+        // The one place in the tree that clears the flag: this probe is not a
+        // session opener anybody has classified, so the relay owns it.
+        let mut relay = RelayState {
+            opener_already_classified: false,
+            ..RelayState::default()
+        };
         let mut stdin = BufReader::new(stdin_read).lines();
         let mut stdout = Vec::new();
         let mut session = Session::new(bridge_side);
 
+        // Bounded: a bridge that answers the probe itself leaves both sides
+        // waiting forever (stdin has no more lines, the daemon never speaks),
+        // so the failure has to be a timeout with a message rather than a hang.
+        let looped = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            relay_loop(&mut relay, &mut stdin, &mut stdout, &mut session),
+        )
+        .await
+        .expect("the probe was forwarded to the daemon, which answered and closed");
+        let (end, _) = looped.unwrap();
+        assert_eq!(end, SessionEnd::SocketClosed);
+        drop(stdin_feed);
+
+        // The daemon saw the probe, shaped so rmcp's init loop answers it
+        // instead of dropping it: both `DRAFT_REQUIRED_KEYS`
+        // (rmcp 3.1.2 `model/meta.rs:400-403`) under `params._meta`, at a
+        // version we advertise.
+        let seen = daemon
+            .await
+            .unwrap()
+            .expect("the probe reaches the daemon rather than being answered here");
+        let sent: Value = serde_json::from_str(&seen).unwrap();
+        assert_eq!(sent["method"], "server/discover", "{seen}");
+        assert_eq!(sent["id"], serde_json::json!(0), "{seen}");
+        let meta = &sent["params"]["_meta"];
+        assert_eq!(
+            meta["io.modelcontextprotocol/clientCapabilities"],
+            serde_json::json!({}),
+            "{seen}"
+        );
+        let version = meta["io.modelcontextprotocol/protocolVersion"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            crate::mcp::SERVED_PROTOCOL_VERSIONS
+                .iter()
+                .any(|v| v.as_str() == version),
+            "the injected version must be one we advertise, or \
+             `handler/server.rs:64-72` refuses the probe -32022 before it \
+             reaches discover(): {seen}"
+        );
+
+        // Nothing was answered here: the DiscoverResult on stdout is the
+        // daemon's, and it is not an error.
+        let out = String::from_utf8(stdout).unwrap();
+        assert!(
+            !out.contains("-32601"),
+            "the bridge answered the probe: {out}"
+        );
+        assert!(out.contains("instructions"), "{out}");
+
+        // The probe is an ordinary outstanding request while it is in flight,
+        // and the daemon's answer settles it.
+        assert!(relay.init_request.is_none(), "a probe is not a handshake");
+        assert!(
+            relay.outstanding.is_empty(),
+            "the probe was tracked like any other request and the daemon's \
+             answer settled it: {:?}",
+            relay.outstanding
+        );
+    }
+
+    /// A capturing writer for the WARN lines the bridge emits, so a test can
+    /// count how many times one probe was described.
+    struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// One probe, one classification line, on the relay path.
+    ///
+    /// `run_mcp` reads the session opener through [`read_session_opener`],
+    /// which classifies it, rewrites a bare probe and logs what it did, then
+    /// re-fronts that rewritten line onto stdin for the relay. The relay
+    /// therefore reads a line that has already been described. Classifying it
+    /// a second time logged "arrived with the required _meta; forwarding it
+    /// unchanged" directly after "arrived without the required _meta; ...
+    /// injected": one probe described twice, the second line contradicting the
+    /// first for an operator reading stderr (Task 10, anomaly A1).
+    ///
+    /// The daemon still receives the normalized probe, so suppressing the
+    /// second log does not suppress the fix it reports.
+    #[tokio::test]
+    async fn a_bare_probe_on_the_relay_path_is_classified_once() {
+        let logged = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer({
+                let logged = std::sync::Arc::clone(&logged);
+                move || CapturedLog(std::sync::Arc::clone(&logged))
+            })
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // What `run_mcp` does with the client's first line.
+        let bare: &[u8] = b"{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"server/discover\"}\n";
+        let mut reader = BufReader::new(bare);
+        let opener = read_session_opener(&mut reader)
+            .await
+            .unwrap()
+            .expect("the probe is the session opener");
+        assert!(
+            opener.contains(META_KEY_PROTOCOL_VERSION),
+            "the opener read rewrites a bare probe: {opener}"
+        );
+
+        // What `pump_stdio` then hands the relay: the rewritten opener,
+        // re-fronted onto stdin exactly as `prime_reader` builds it.
+        let mut prefix = opener.clone().into_bytes();
+        prefix.push(b'\n');
+        let inner: &[u8] = b"";
+        let mut stdin = BufReader::new(Prefixed { prefix, inner }).lines();
+
+        let (bridge_side, daemon_side) = tokio::io::duplex(4096);
+        let daemon = tokio::spawn(async move {
+            let (read, _write) = tokio::io::split(daemon_side);
+            let mut lines = BufReader::new(read).lines();
+            lines.next_line().await.unwrap()
+        });
+
+        // The construction `pump_stdio` performs, not a hand-built copy of it:
+        // the invariant lives in `RelayState::default` and both go through it,
+        // so a change there fails here instead of shipping.
+        let mut relay = RelayState::default();
+        let mut stdout = Vec::new();
+        let mut session = Session::new(bridge_side);
         let (end, _) = relay_loop(&mut relay, &mut stdin, &mut stdout, &mut session)
             .await
             .unwrap();
         assert_eq!(end, SessionEnd::StdinClosed);
 
-        // The client saw the -32601 reply.
-        let out = String::from_utf8(stdout).unwrap();
-        assert!(out.contains("\"code\":-32601"), "{out}");
-        assert!(out.contains("server/discover"), "{out}");
+        let seen = daemon
+            .await
+            .unwrap()
+            .expect("the normalized probe still reaches the daemon");
+        assert!(seen.contains(META_KEY_CLIENT_CAPABILITIES), "{seen}");
+        assert!(seen.contains(META_KEY_PROTOCOL_VERSION), "{seen}");
 
-        // The daemon never saw the probe.
-        drop(session);
-        let mut buf = Vec::new();
-        daemon_side.read_to_end(&mut buf).await.unwrap();
-        assert!(buf.is_empty(), "the probe leaked to the daemon: {buf:?}");
+        let log = String::from_utf8(logged.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            log.matches("server/discover probe arrived").count(),
+            1,
+            "one probe must be described exactly once on the relay path: {log}"
+        );
         assert!(
-            relay.init_request.is_none() && !relay.outstanding.contains_key("0"),
-            "the probe polluted relay state"
+            log.contains("without the required _meta"),
+            "the surviving line is the one that describes what was done: {log}"
         );
     }
 
@@ -1646,9 +2546,12 @@ mod tests {
     async fn primed_reader_hands_relay_loop_the_initialize_then_follow_up() {
         // The primed reader carries the drained `initialize` line as its prefix
         // and whatever the client sent next in its inner reader. Fed through
-        // `BufReader::new(reader).lines()` exactly as `pump_stdio` does, the
-        // relay must forward `initialize` first and the follow-up next, proving
-        // the handoff preserves ordering with no special replay.
+        // `BufReader::new(reader).lines()` and relayed from a plain
+        // `RelayState::default()`, both exactly as `pump_stdio` does, the relay
+        // must forward `initialize` first and the follow-up next, proving the
+        // handoff preserves ordering with no special replay. The opener being
+        // exempt from classification changes nothing here: an `initialize` is
+        // not a probe, so nothing would have been logged for it either way.
         let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
         let follow: &[u8] = b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n";
         let mut prefix = Vec::with_capacity(init.len() + 1);

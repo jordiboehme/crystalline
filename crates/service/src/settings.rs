@@ -164,12 +164,30 @@ pub fn registry() -> &'static [SettingSpec] {
         },
         SettingSpec {
             key: "service.http",
-            doc: "Enable the HTTP transport (true or false) or bind it to a host:port address; the serve --http flag wins when given (applies at the next daemon start)",
+            doc: "The HTTP endpoint: on at 127.0.0.1:7411 by default; false turns it off, true spells the default, or bind a host:port address; the serve --http flag wins when given (applies at the next daemon start)",
             kind: SettingKind::String,
             startup_effective: true,
             apply: set_http,
             clear: clear_http,
             effective: http_effective,
+        },
+        SettingSpec {
+            key: "service.ui",
+            doc: "Serve the embedded Fluid web UI on the HTTP endpoint (default true); false serves the API and MCP only, the shape a separate Fluid deployment fronts. Read once when the HTTP surface starts",
+            kind: SettingKind::Bool,
+            startup_effective: true,
+            apply: set_ui,
+            clear: clear_ui,
+            effective: ui_effective,
+        },
+        SettingSpec {
+            key: "service.api",
+            doc: "Serve the JSON API under /api/v1 on the HTTP endpoint (default true); false also disables the web UI, leaving MCP and /health only. Read once when the HTTP surface starts",
+            kind: SettingKind::Bool,
+            startup_effective: true,
+            apply: set_api,
+            clear: clear_api,
+            effective: api_effective,
         },
         SettingSpec {
             key: "service.allowed_hosts",
@@ -191,9 +209,9 @@ pub fn registry() -> &'static [SettingSpec] {
         },
         SettingSpec {
             key: "skills.serve",
-            doc: "Serve the shipped agent skills over MCP: the skills tool, skill:// resources and the onboarding and connector prompts. auto (default) serves them to every client except a local harness this machine's install receipt already onboarded with session hooks, true always serves them, false never does",
+            doc: "Serve the shipped agent skills over MCP: the skills tool, skill:// resources and the onboarding and connector prompts. auto (default) serves them to every client except a stdio session spawned by a harness this machine's install receipt already onboarded with session hooks, which has the skills as files already; true always serves them, false never does. Applies at the next daemon start",
             kind: SettingKind::String,
-            startup_effective: false,
+            startup_effective: true,
             apply: set_skills_serve,
             clear: clear_skills_serve,
             effective: skills_serve_effective,
@@ -269,6 +287,15 @@ pub fn registry() -> &'static [SettingSpec] {
             apply: set_anonymous,
             clear: clear_anonymous,
             effective: anonymous_effective,
+        },
+        SettingSpec {
+            key: "auth.max_users",
+            doc: "How many accounts trusted-header provisioning may mint in total (default 100); the crystalline users CLI is never capped (applies at the next daemon start)",
+            kind: SettingKind::String,
+            startup_effective: true,
+            apply: set_max_users,
+            clear: clear_max_users,
+            effective: max_users_effective,
         },
     ]
 }
@@ -648,12 +675,71 @@ fn clear_http(config: &mut GlobalConfig) {
     drop_service_if_empty(config);
 }
 
+/// The effective value is what the daemon will actually do, so an unset setting
+/// reports the loopback address the endpoint now opens by default rather than
+/// the old `false`. It is still the default (nobody set it), which is what the
+/// second element says. `true` reports that same address for the same reason:
+/// it is a spelling of the default bind, not a different one, and reporting the
+/// word back would leave a reader guessing which address it means.
 fn http_effective(config: &GlobalConfig) -> (String, bool) {
     match config.service.as_ref().and_then(|s| s.http.as_ref()) {
-        Some(HttpSetting::Enabled(v)) => (v.to_string(), false),
+        Some(HttpSetting::Enabled(true)) => (crate::daemon::DEFAULT_HTTP_ADDR.to_string(), false),
+        Some(HttpSetting::Enabled(false)) => ("false".to_string(), false),
         Some(HttpSetting::Address(a)) => (a.clone(), false),
-        None => ("false".to_string(), true),
+        None => (crate::daemon::DEFAULT_HTTP_ADDR.to_string(), true),
     }
+}
+
+// --- service.ui ------------------------------------------------------------
+
+fn set_ui(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
+    let parsed: bool = value
+        .parse()
+        .map_err(|_| SettingsError(format!("service.ui must be true or false, got '{value}'")))?;
+    config.service.get_or_insert_with(ServiceConfig::default).ui = Some(parsed);
+    Ok(())
+}
+
+fn clear_ui(config: &mut GlobalConfig) {
+    if let Some(s) = config.service.as_mut() {
+        s.ui = None;
+    }
+    drop_service_if_empty(config);
+}
+
+/// The effective value is [`GlobalConfig::ui_enabled`], so an operator who
+/// turned the API off sees the UI reported off too - the coupling is visible in
+/// `config show` rather than only at startup. `is_default` still tracks the
+/// `service.ui` key alone: the value shown may come from `service.api`, but the
+/// source of this row is whether this key was set.
+fn ui_effective(config: &GlobalConfig) -> (String, bool) {
+    let is_default = config.service.as_ref().and_then(|s| s.ui).is_none();
+    (config.ui_enabled().to_string(), is_default)
+}
+
+// --- service.api -----------------------------------------------------------
+
+fn set_api(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
+    let parsed: bool = value
+        .parse()
+        .map_err(|_| SettingsError(format!("service.api must be true or false, got '{value}'")))?;
+    config
+        .service
+        .get_or_insert_with(ServiceConfig::default)
+        .api = Some(parsed);
+    Ok(())
+}
+
+fn clear_api(config: &mut GlobalConfig) {
+    if let Some(s) = config.service.as_mut() {
+        s.api = None;
+    }
+    drop_service_if_empty(config);
+}
+
+fn api_effective(config: &GlobalConfig) -> (String, bool) {
+    let is_default = config.service.as_ref().and_then(|s| s.api).is_none();
+    (config.api_enabled().to_string(), is_default)
 }
 
 // --- service.allowed_hosts -------------------------------------------------
@@ -1036,6 +1122,39 @@ fn anonymous_effective(config: &GlobalConfig) -> (String, bool) {
     (config.auth_anonymous().to_string(), is_default)
 }
 
+// --- auth.max_users -----------------------------------------------------------
+
+fn set_max_users(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
+    let parsed: u32 = value.trim().parse().map_err(|_| {
+        SettingsError(format!(
+            "auth.max_users must be a positive integer, got '{value}'"
+        ))
+    })?;
+    if parsed == 0 {
+        return Err(SettingsError(
+            "auth.max_users must be at least 1: zero would refuse every trusted-header identity"
+                .to_string(),
+        ));
+    }
+    config
+        .auth
+        .get_or_insert_with(AuthConfig::default)
+        .max_users = Some(parsed);
+    Ok(())
+}
+
+fn clear_max_users(config: &mut GlobalConfig) {
+    if let Some(a) = config.auth.as_mut() {
+        a.max_users = None;
+    }
+    drop_auth_if_empty(config);
+}
+
+fn max_users_effective(config: &GlobalConfig) -> (String, bool) {
+    let is_default = config.auth.as_ref().and_then(|a| a.max_users).is_none();
+    (config.auth_max_users().to_string(), is_default)
+}
+
 // --- domains_root ----------------------------------------------------------
 
 fn set_domains_root(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
@@ -1069,7 +1188,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_lists_exactly_the_eighteen_keys_in_order() {
+    fn registry_lists_exactly_the_twenty_one_keys_in_order() {
         assert_eq!(
             known_keys(),
             vec![
@@ -1080,6 +1199,8 @@ mod tests {
                 "github.oauth_client_id",
                 "service.read_only",
                 "service.http",
+                "service.ui",
+                "service.api",
                 "service.allowed_hosts",
                 "service.response_format",
                 "skills.serve",
@@ -1091,6 +1212,7 @@ mod tests {
                 "identity.actor",
                 "auth.trusted_header",
                 "auth.anonymous",
+                "auth.max_users",
             ]
         );
     }
@@ -1118,6 +1240,8 @@ mod tests {
                     "CRYSTALLINE_SERVICE_READ_ONLY".to_string()
                 ),
                 ("service.http", "CRYSTALLINE_SERVICE_HTTP".to_string()),
+                ("service.ui", "CRYSTALLINE_SERVICE_UI".to_string()),
+                ("service.api", "CRYSTALLINE_SERVICE_API".to_string()),
                 (
                     "service.allowed_hosts",
                     "CRYSTALLINE_SERVICE_ALLOWED_HOSTS".to_string()
@@ -1147,6 +1271,7 @@ mod tests {
                     "CRYSTALLINE_AUTH_TRUSTED_HEADER".to_string()
                 ),
                 ("auth.anonymous", "CRYSTALLINE_AUTH_ANONYMOUS".to_string()),
+                ("auth.max_users", "CRYSTALLINE_AUTH_MAX_USERS".to_string()),
             ]
         );
     }
@@ -1161,6 +1286,8 @@ mod tests {
         assert!(change_note("github.oauth_client_id", &no_env).is_none());
         assert!(change_note("service.read_only", &no_env).is_some());
         assert!(change_note("service.http", &no_env).is_some());
+        assert!(change_note("service.ui", &no_env).is_some());
+        assert!(change_note("service.api", &no_env).is_some());
         assert!(change_note("service.allowed_hosts", &no_env).is_some());
         assert!(change_note("service.response_format", &no_env).is_none());
         assert!(change_note("database.backend", &no_env).is_some());
@@ -1169,8 +1296,13 @@ mod tests {
         assert!(change_note("search.retired_weight", &no_env).is_none());
         assert!(change_note("index.files", &no_env).is_none());
         assert!(change_note("identity.actor", &no_env).is_none());
+        // The effective value is snapshotted at engine construction
+        // (`Engine::skills_serve`), so a write really does wait for the next
+        // start and the note is the honest label on that.
+        assert!(change_note("skills.serve", &no_env).is_some());
         assert!(change_note("auth.trusted_header", &no_env).is_some());
         assert!(change_note("auth.anonymous", &no_env).is_some());
+        assert!(change_note("auth.max_users", &no_env).is_some());
         assert!(change_note("github.bogus", &no_env).is_none());
     }
 
@@ -1469,7 +1601,7 @@ mod tests {
         apply(&mut cfg, "github.enabled", "true").unwrap();
 
         let views = snapshot(&cfg, &EnvOverlay::default());
-        assert_eq!(views.len(), 18);
+        assert_eq!(views.len(), 21);
         assert_eq!(
             views.iter().map(|v| v.key.as_str()).collect::<Vec<_>>(),
             vec![
@@ -1480,6 +1612,8 @@ mod tests {
                 "github.oauth_client_id",
                 "service.read_only",
                 "service.http",
+                "service.ui",
+                "service.api",
                 "service.allowed_hosts",
                 "service.response_format",
                 "skills.serve",
@@ -1491,6 +1625,7 @@ mod tests {
                 "identity.actor",
                 "auth.trusted_header",
                 "auth.anonymous",
+                "auth.max_users",
             ]
         );
 
@@ -1523,51 +1658,63 @@ mod tests {
         assert_eq!(read_only.value, "false");
         assert_eq!(read_only.source, SettingSource::Default);
 
+        // The endpoint is on by default, so the effective value nobody set is the
+        // loopback address the daemon will actually bind.
         let http = &views[6];
-        assert_eq!(http.value, "false");
+        assert_eq!(http.value, "127.0.0.1:7411");
         assert_eq!(http.source, SettingSource::Default);
 
-        let allowed_hosts = &views[7];
+        // Both HTTP-surface toggles default to on, so an unconfigured install
+        // gets the web UI and the JSON API on that endpoint.
+        let ui = &views[7];
+        assert_eq!(ui.value, "true");
+        assert_eq!(ui.source, SettingSource::Default);
+
+        let api = &views[8];
+        assert_eq!(api.value, "true");
+        assert_eq!(api.source, SettingSource::Default);
+
+        let allowed_hosts = &views[9];
         assert_eq!(allowed_hosts.value, "");
         assert_eq!(allowed_hosts.source, SettingSource::Default);
 
-        let response_format = &views[8];
+        let response_format = &views[10];
         assert_eq!(response_format.value, "toon");
         assert_eq!(response_format.source, SettingSource::Default);
 
-        let skills_serve = &views[9];
+        let skills_serve = &views[11];
         assert_eq!(skills_serve.value, "auto");
         assert_eq!(skills_serve.source, SettingSource::Default);
 
-        let backend = &views[10];
+        let backend = &views[12];
         assert_eq!(backend.value, "turso");
         assert_eq!(backend.source, SettingSource::Default);
 
-        let url = &views[11];
+        let url = &views[13];
         assert_eq!(url.value, "");
         assert_eq!(url.source, SettingSource::Default);
 
-        let salience_weight = &views[12];
+        let salience_weight = &views[14];
         assert_eq!(salience_weight.value, "0.15");
         assert_eq!(salience_weight.source, SettingSource::Default);
 
-        let retired_weight = &views[13];
+        let retired_weight = &views[15];
         assert_eq!(retired_weight.value, "0.6");
         assert_eq!(retired_weight.source, SettingSource::Default);
 
-        let index_files = &views[14];
+        let index_files = &views[16];
         assert_eq!(index_files.value, "true");
         assert_eq!(index_files.source, SettingSource::Default);
 
-        let identity_actor = &views[15];
+        let identity_actor = &views[17];
         assert_eq!(identity_actor.value, "");
         assert_eq!(identity_actor.source, SettingSource::Default);
 
-        let trusted_header = &views[16];
+        let trusted_header = &views[18];
         assert_eq!(trusted_header.value, "");
         assert_eq!(trusted_header.source, SettingSource::Default);
 
-        let anonymous = &views[17];
+        let anonymous = &views[19];
         assert_eq!(anonymous.value, "false");
         assert_eq!(anonymous.source, SettingSource::Default);
     }
@@ -1633,6 +1780,81 @@ mod tests {
         );
     }
 
+    // --- service.ui and service.api ------------------------------------------
+
+    #[test]
+    fn apply_service_ui_and_api_happy_path() {
+        let mut cfg = GlobalConfig::default();
+        assert!(cfg.ui_enabled(), "absent means the UI is served");
+        assert!(cfg.api_enabled(), "absent means the API is served");
+
+        apply(&mut cfg, "service.ui", "false").unwrap();
+        assert!(!cfg.ui_enabled());
+        assert!(cfg.api_enabled(), "the UI toggle leaves the API alone");
+
+        apply(&mut cfg, "service.ui", "true").unwrap();
+        apply(&mut cfg, "service.api", "false").unwrap();
+        assert!(!cfg.api_enabled());
+        assert!(
+            !cfg.ui_enabled(),
+            "a UI without its API is a dead shell, so the API toggle takes it down too"
+        );
+    }
+
+    #[test]
+    fn apply_service_ui_and_api_reject_non_bool() {
+        let mut cfg = GlobalConfig::default();
+        let err = apply(&mut cfg, "service.ui", "yes").unwrap_err();
+        assert!(err.to_string().contains("service.ui must be true or false"));
+        let err = apply(&mut cfg, "service.api", "on").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("service.api must be true or false")
+        );
+    }
+
+    #[test]
+    fn effective_reports_the_ui_and_api_defaults_and_a_set_value() {
+        let mut cfg = GlobalConfig::default();
+        assert_eq!(ui_effective(&cfg), ("true".to_string(), true));
+        assert_eq!(api_effective(&cfg), ("true".to_string(), true));
+
+        apply(&mut cfg, "service.api", "false").unwrap();
+        assert_eq!(api_effective(&cfg), ("false".to_string(), false));
+        assert_eq!(
+            ui_effective(&cfg),
+            ("false".to_string(), true),
+            "the UI is off because the API is, but the ui key itself is untouched"
+        );
+    }
+
+    #[test]
+    fn unset_service_ui_and_api_drop_an_emptied_service_block() {
+        let mut cfg = GlobalConfig::default();
+        apply(&mut cfg, "service.ui", "false").unwrap();
+        apply(&mut cfg, "service.api", "false").unwrap();
+        assert!(cfg.service.is_some());
+
+        unset(&mut cfg, "service.ui").unwrap();
+        assert!(
+            cfg.service.is_some(),
+            "service.api is still set, so the block must survive"
+        );
+        unset(&mut cfg, "service.api").unwrap();
+        assert!(
+            cfg.service.is_none(),
+            "the last set field was cleared, so the block should vanish"
+        );
+        assert!(cfg.ui_enabled());
+        assert!(cfg.api_enabled());
+
+        let yaml = serde_yaml_ng::to_string(&cfg).unwrap();
+        assert!(
+            !yaml.contains("service"),
+            "an emptied service block must not round-trip into the yaml: {yaml}"
+        );
+    }
+
     // --- service.http ----------------------------------------------------------
 
     #[test]
@@ -1655,6 +1877,34 @@ mod tests {
             cfg.service.as_ref().unwrap().http,
             Some(HttpSetting::Address("127.0.0.1:7411".to_string()))
         );
+    }
+
+    /// `config show` reports what the daemon will actually do, so an untouched
+    /// config reads as the loopback address the endpoint now opens by default -
+    /// still flagged as the default, because nobody set it. `false` is the
+    /// opt-out and reads as itself.
+    #[test]
+    fn service_http_effective_reports_the_loopback_default_when_unset() {
+        let cfg = GlobalConfig::default();
+        assert_eq!(
+            http_effective(&cfg),
+            ("127.0.0.1:7411".to_string(), true),
+            "an unset service.http serves the loopback default"
+        );
+
+        let mut off = GlobalConfig::default();
+        apply(&mut off, "service.http", "false").unwrap();
+        assert_eq!(http_effective(&off), ("false".to_string(), false));
+
+        let mut addr = GlobalConfig::default();
+        apply(&mut addr, "service.http", "0.0.0.0:7411").unwrap();
+        assert_eq!(http_effective(&addr), ("0.0.0.0:7411".to_string(), false));
+
+        // `true` binds the very address the unset case does, so it reports the
+        // address rather than the word: same endpoint, one spelling of it.
+        let mut on = GlobalConfig::default();
+        apply(&mut on, "service.http", "true").unwrap();
+        assert_eq!(http_effective(&on), ("127.0.0.1:7411".to_string(), false));
     }
 
     #[test]
@@ -2009,5 +2259,49 @@ mod tests {
         );
         assert_eq!(cfg.auth_trusted_header(), Some("X-Forwarded-User"));
         assert!(!cfg.auth_anonymous());
+    }
+
+    // --- auth.max_users -----------------------------------------------------------
+
+    #[test]
+    fn apply_auth_max_users_happy_path() {
+        let mut cfg = GlobalConfig::default();
+        assert_eq!(cfg.auth_max_users(), 100, "the default cap is 100");
+        apply(&mut cfg, "auth.max_users", "50").unwrap();
+        assert_eq!(cfg.auth_max_users(), 50);
+        assert_eq!(max_users_effective(&cfg), ("50".to_string(), false));
+    }
+
+    #[test]
+    fn auth_max_users_rejects_zero_and_non_numbers() {
+        let mut cfg = GlobalConfig::default();
+        let err = apply(&mut cfg, "auth.max_users", "0").unwrap_err();
+        assert!(err.to_string().contains("at least 1"), "{err}");
+        assert!(cfg.auth.is_none(), "a rejected value must not be written");
+
+        let err = apply(&mut cfg, "auth.max_users", "many").unwrap_err();
+        assert!(err.to_string().contains("positive integer"), "{err}");
+        assert!(cfg.auth.is_none(), "a rejected value must not be written");
+    }
+
+    #[test]
+    fn unset_auth_max_users_restores_the_default_and_drops_an_emptied_auth_block() {
+        let mut cfg = GlobalConfig::default();
+        apply(&mut cfg, "auth.max_users", "50").unwrap();
+        assert!(cfg.auth.is_some());
+
+        unset(&mut cfg, "auth.max_users").unwrap();
+        assert!(
+            cfg.auth.is_none(),
+            "the only set field was cleared, so the block should vanish"
+        );
+        assert_eq!(cfg.auth_max_users(), 100);
+        assert_eq!(max_users_effective(&cfg), ("100".to_string(), true));
+
+        let yaml = serde_yaml_ng::to_string(&cfg).unwrap();
+        assert!(
+            !yaml.contains("auth"),
+            "an emptied auth block must not round-trip into the yaml: {yaml}"
+        );
     }
 }

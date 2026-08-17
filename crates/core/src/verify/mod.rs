@@ -146,6 +146,47 @@ pub fn check_temporal(path: &Path, engram: &Engram) -> Vec<Issue> {
     issues
 }
 
+/// Run the single-document rule families - format (`E`) and temporal (`T`) -
+/// over one in-memory markdown text, without touching a filesystem or writing
+/// anything. Backs the HTTP validation dry-run, so editors and agents get the
+/// same findings `crystalline verify` would raise for these families. Link,
+/// manifest, schema and quality rules need a whole domain for context and are
+/// deliberately not run here, and `T006` is dropped from the temporal results
+/// below for the same reason - see that filter for why.
+///
+/// Like [`check_temporal`]: no `.crystalline.yaml` override and no `--strict`
+/// promotion apply - findings come out at their default severities.
+pub fn check_document(domain: &str, rel_path: &Path, source: &str) -> Vec<Issue> {
+    let file = scanner::scanned_file_from_source(rel_path, source);
+    let mut issues = Vec::new();
+    let mut summary = Summary::default();
+    let mut sink = Sink::new(&mut issues, &mut summary, None, false);
+    format::check(&file, domain, &mut sink);
+
+    // Temporal issues land in a side buffer first so `T006` ("missing
+    // `generated`") can be dropped before it reaches the caller. Write
+    // provenance is stamped by the write pipeline (`touch_generated`) at
+    // save time, not by anything this function can see - it has no notion
+    // of "has this gone through the write pipeline yet", the same missing
+    // context that already rules out the link, manifest, schema and quality
+    // families here. Without the filter, every freshly authored document
+    // shown to a dry-run before its first save - exactly what the editor's
+    // /validate panel does on every keystroke - would draw a spurious
+    // provenance warning. `temporal::check` itself is untouched and stays
+    // strict for real on-disk files scanned by `crystalline verify`.
+    let mut temporal_issues = Vec::new();
+    let mut temporal_summary = Summary::default();
+    let mut temporal_sink = Sink::new(&mut temporal_issues, &mut temporal_summary, None, false);
+    temporal::check(&file, &mut temporal_sink);
+    issues.extend(
+        temporal_issues
+            .into_iter()
+            .filter(|issue| issue.rule != "T006"),
+    );
+
+    issues
+}
+
 /// Report paths are part of the stable output schema and must be identical
 /// on every platform, so they always use forward slashes.
 pub(crate) fn forward_slashes(path: &Path) -> std::path::PathBuf {
@@ -262,4 +303,55 @@ fn run_rules(domains: &[scanner::Domain], options: &VerifyOptions) -> VerifyRepo
     }
 
     VerifyReport { summary, issues }
+}
+
+#[cfg(test)]
+mod check_document_tests {
+    use super::*;
+    use std::path::Path;
+
+    const GOOD: &str = "---\ntype: engram\ntitle: Alpha\npermalink: alpha\ntags:\n  - eng\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# Alpha\n\nA body.\n";
+
+    #[test]
+    fn a_well_formed_document_has_no_findings() {
+        assert!(check_document("eng", Path::new("alpha.md"), GOOD).is_empty());
+    }
+
+    #[test]
+    fn a_parse_failure_is_a_finding_not_a_panic() {
+        let issues = check_document("eng", Path::new("broken.md"), "no frontmatter at all");
+        assert!(!issues.is_empty());
+        assert!(
+            issues.iter().any(|i| i.severity == Severity::Error),
+            "an unparseable document is a hard error"
+        );
+        assert!(issues.iter().all(|i| i.path == Path::new("broken.md")));
+    }
+
+    #[test]
+    fn temporal_rules_run_over_the_document() {
+        // valid_to before valid_from is the classic T-family finding.
+        let bad = GOOD.replace(
+            "status: stable",
+            "status: stable\nvalid_from: 2026-06-01\nvalid_to: 2026-01-01",
+        );
+        let issues = check_document("eng", Path::new("alpha.md"), &bad);
+        assert!(
+            issues.iter().any(|i| i.rule.starts_with('T')),
+            "expected a temporal finding, got {issues:?}"
+        );
+    }
+
+    #[test]
+    fn a_fresh_document_with_no_provenance_draws_no_t006() {
+        // GOOD carries no `generated` and no legacy `timestamp`: on disk that
+        // is a T006 warning, but a document handed to the dry-run has not
+        // gone through the write pipeline that stamps provenance, so T006
+        // must not fire here.
+        let issues = check_document("eng", Path::new("alpha.md"), GOOD);
+        assert!(
+            issues.iter().all(|i| i.rule != "T006"),
+            "expected no T006 finding, got {issues:?}"
+        );
+    }
 }

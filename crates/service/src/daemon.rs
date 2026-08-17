@@ -4,15 +4,18 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use argon2::password_hash::rand_core::{OsRng, RngCore};
 use crystalline_core::config::{self, GlobalConfig, HttpSetting};
 use crystalline_index::{HostClaim, Store};
 use interprocess::local_socket::tokio::Stream as IpcStream;
 use notify::{RecursiveMode, Watcher};
+use rmcp::transport::streamable_http_server::session::{ServerSseMessage, SessionId};
 use serde_json::Value;
 use tokio::sync::{Mutex as TokioMutex, watch};
 
@@ -22,8 +25,11 @@ use crate::instance::{acquire_ownership, read_mode_line};
 use crate::mcp::McpServer;
 use crate::overlay;
 
-/// The default HTTP bind address when HTTP is enabled without an explicit one.
-const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:7411";
+/// The default HTTP bind address: where the endpoint comes up when nothing asks
+/// for another one, which since the default flip is the plain `crystalline serve`
+/// case too. `crate::settings` reports it as the effective `service.http` value
+/// so `config show` and the daemon cannot drift apart.
+pub(crate) const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:7411";
 
 /// Startup banner, shown on a foreground start when stderr is a terminal.
 const BANNER: &str = r"
@@ -132,7 +138,9 @@ impl Shared {
 }
 
 /// Run the daemon: `crystalline serve [--daemon] [--http <addr>] [--read-only]
-/// [--take-over]`. The effective read-only mode is the explicit flag or
+/// [--take-over]`. The HTTP endpoint is on at [`DEFAULT_HTTP_ADDR`] unless it was
+/// turned off, so `--http` moves it or closes it rather than opening it; see
+/// [`resolve_http`]. The effective read-only mode is the explicit flag or
 /// `service.read_only`; `take_over` forces host-lock claims for a deliberate host
 /// migration in a shared database.
 pub async fn run_serve(
@@ -158,6 +166,12 @@ pub async fn run_serve(
     let db_path = resolve_db(db.as_deref())?;
     let http_addr = resolve_http(http_flag.as_deref(), &loaded.effective);
     let allowed_hosts = resolve_allowed_hosts(&allowed_host_flag, &loaded.effective);
+    // The one-time first-run setup token, drawn once per serve process and only
+    // for a bind other machines can reach: on loopback the wizard is authorized
+    // by the peer address itself, so there is nothing to hand out and nothing to
+    // leak. See [`setup_token_for`] and the startup print below - the token is
+    // said once and never written anywhere again.
+    let setup_token = http_addr.as_deref().and_then(setup_token_for);
 
     // An env-defined domain that shadows a config file entry is worth one
     // startup warning (not one per `apply`, which runs constantly): the file
@@ -261,6 +275,12 @@ pub async fn run_serve(
         );
         if let Some(addr) = &http_addr {
             eprintln!("crystalline HTTP endpoint on http://{addr}");
+            eprintln!("{}", ui_startup_line(&loaded.effective, addr));
+            if let Some(token) = &setup_token {
+                for line in setup_token_lines(addr, token) {
+                    eprintln!("{line}");
+                }
+            }
         }
         if read_only {
             eprintln!("crystalline serving read-only: content-mutating tools are disabled");
@@ -269,6 +289,14 @@ pub async fn run_serve(
             eprintln!(
                 "no domains registered yet - agents can create one with add_domain, or run: crystalline domain add <name> <path>"
             );
+        }
+    } else if let (Some(addr), Some(token)) = (&http_addr, &setup_token) {
+        // Daemonized, so there is no terminal reading the banner: the same two
+        // lines go to the daemon log instead, once. Without them a backgrounded
+        // non-loopback serve would offer a first-run wizard nobody can get
+        // through and no way to find out why.
+        for line in setup_token_lines(addr, token) {
+            tracing::info!("{line}");
         }
     }
 
@@ -366,14 +394,45 @@ pub async fn run_serve(
         });
     }
 
-    // The optional HTTP endpoint.
+    // The HTTP endpoint, which is on unless it was turned off.
     if let Some(addr) = http_addr.clone() {
         let e = engine.clone();
         let sessions = http_sessions.clone();
         let rx = shared.watch();
+        let token = setup_token.clone();
         tokio::spawn(async move {
-            if let Err(err) = run_http(addr, allowed_hosts, e, sessions, rx).await {
-                tracing::warn!("HTTP endpoint stopped: {err}");
+            // Three failure classes, three sentences, because the remedy
+            // differs: the endpoint never came up at all, the address was
+            // already taken, or a live endpoint stopped later. With the
+            // endpoint on by default the middle one is the one most people
+            // will ever meet (an unrelated process holding 7411) and the
+            // daemon is otherwise perfectly healthy, so that line has to name
+            // the address, say what still works, and name the lever that
+            // actually applies: a `--http` address beats both `service.http`
+            // spellings, so telling a flag user to edit the config would be
+            // advice that does nothing.
+            let router = match http_service(allowed_hosts, e, sessions, token).await {
+                Ok(router) => router,
+                Err(err) => {
+                    tracing::warn!(
+                        "HTTP endpoint for {addr} could not start ({err}); MCP over the socket is unaffected"
+                    );
+                    return;
+                }
+            };
+            let listener = match tokio::net::TcpListener::bind(&addr).await {
+                Ok(listener) => listener,
+                Err(err) => {
+                    tracing::warn!(
+                        "HTTP endpoint failed on {addr} ({err}); MCP over the socket is unaffected - free the port, bind another address, or turn the endpoint off (serve --http off, or service.http=false when no flag is given)"
+                    );
+                    return;
+                }
+            };
+            if let Err(err) = run_http(listener, router, rx).await {
+                tracing::warn!(
+                    "HTTP endpoint on {addr} stopped ({err}); MCP over the socket is unaffected and a daemon restart brings it back"
+                );
             }
         });
     }
@@ -429,18 +488,29 @@ async fn accept_loop(listener: interprocess::local_socket::tokio::Listener, shar
 
 /// Dispatch one accepted connection by its `mcp` or `ctl` handshake.
 async fn handle_conn(mut stream: IpcStream, shared: Arc<Shared>) {
-    let mode = match read_mode_line(&mut stream).await {
+    let line = match read_mode_line(&mut stream).await {
         Ok(m) => m,
         Err(_) => return,
     };
-    match mode.as_str() {
+    // The first token is the mode, the rest are options. A bridge older than
+    // the extended line sends a bare `mcp`, which parses to the same mode and
+    // no options, so both shapes are served.
+    let (mode, options) = crate::instance::split_mode_line(&line);
+    match mode {
         "mcp" => {
             let id = shared.begin_session("mcp");
             // Refresh the routing cache before this connection initializes so its
             // instructions reflect the latest virtual MANIFESTs, including edits
             // made by other instances sharing the database.
             shared.engine.refresh_routing_cache().await;
-            let server = McpServer::new(shared.engine.clone());
+            // The bridge resolved this once at its own startup, from the
+            // `--harness` argument its registration carries and this machine's
+            // install receipt, and re-sends it on every reconnect. The daemon
+            // never re-derives it: its own environment is whoever spawned it
+            // first, and a value re-derived per accepted socket could change
+            // the surface under a live client across a daemon restart.
+            let onboarded = options.contains(&crate::instance::SKILLS_OFF_OPTION);
+            let server = McpServer::new(shared.engine.clone()).with_onboarded_harness(onboarded);
             match rmcp::serve_server(server, stream).await {
                 Ok(running) => {
                     let _ = running.waiting().await;
@@ -699,40 +769,448 @@ async fn run_watcher(
     Ok(())
 }
 
-/// Serve the tool router over streamable HTTP until shutdown. `allowed_hosts`
-/// carries the resolved `Host` header allow-list on top of loopback (a single
-/// `*` disables the guard); see [`http_config`].
-async fn run_http(
-    addr: String,
+/// Everything the HTTP endpoint needs before it can take a socket: the accounts
+/// store and the router that fronts it. `allowed_hosts` carries the resolved
+/// `Host` header allow-list on top of loopback (a single `*` disables the
+/// guard); see [`http_config`]. `setup_token` is this process's first-run token,
+/// if it drew one ([`setup_token_for`]).
+///
+/// Split from the bind and from [`run_http`] so the call site can tell three
+/// different failures apart: an endpoint that never came up, an address somebody
+/// else already holds, and a served endpoint that stopped. Only the middle one
+/// is about a port, and only it should ever tell an operator to free one.
+async fn http_service(
     allowed_hosts: Vec<String>,
     engine: Arc<Engine>,
     http_sessions: Arc<AtomicUsize>,
-    mut shutdown: watch::Receiver<bool>,
-) -> anyhow::Result<()> {
+    setup_token: Option<String>,
+) -> anyhow::Result<axum::Router> {
     let auth = Arc::new(
         crate::rest::AuthStore::open(&crystalline_core::config::web_auth_db_path()?).await?,
     );
-    let router = http_router(engine, http_sessions, &allowed_hosts, auth)?;
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, router)
-        .with_graceful_shutdown(async move { wait_true(&mut shutdown).await })
-        .await?;
+    http_router(engine, http_sessions, &allowed_hosts, auth, setup_token)
+}
+
+/// Serve the built router on a bound listener until shutdown.
+///
+/// The service is built with `into_make_service_with_connect_info`, which is the
+/// only thing that puts the client's socket address in each request's
+/// extensions. First-run setup reads it there to decide whether the caller is on
+/// this machine, and fails closed without it, so serving the plain router would
+/// silently make the wizard unreachable everywhere.
+async fn run_http(
+    listener: tokio::net::TcpListener,
+    router: axum::Router,
+    mut shutdown: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move { wait_true(&mut shutdown).await })
+    .await?;
     Ok(())
 }
 
-/// Build the router `serve --http` mounts: the tool router behind rmcp's
-/// streamable-HTTP service, plus the `/health` probe and the JSON API nested
-/// at `/api/v1`. Both routes are declared ahead of the fallback service, so
-/// the MCP transport only ever sees paths the API does not claim. Public and
-/// doc-commented on purpose (not `pub(crate)`) so an integration test can
-/// drive the exact production construction over a real `TcpListener` instead
-/// of reimplementing it; `run_http` is the only other caller.
+/// The first-run setup token for a resolved bind address: `None` when only this
+/// machine can reach it, `Some` 32 lower-case hex characters otherwise.
+///
+/// A loopback bind needs no token at all - the setup handler authorizes a
+/// loopback peer directly - so generating one there would be a secret with
+/// nothing to protect and one more thing to print. Any other bind is reachable
+/// by somebody else, and the token is what stands between them and the first
+/// admin account.
+///
+/// The host half is read out of `host:port` (brackets stripped for an IPv6
+/// literal). An address that is not an IP literal is loopback only when it is
+/// literally `localhost`: a name this daemon cannot resolve to a loopback
+/// interface is treated as reachable, because a token nobody needs is harmless
+/// (a local peer is never asked for one) while a missing token on a reachable
+/// bind locks the wizard shut.
+///
+/// 32 hex characters is 128 bits from the same `OsRng` the session tokens are
+/// drawn from - a one-shot secret a human retypes off a terminal, not a stored
+/// credential.
+fn setup_token_for(addr: &str) -> Option<String> {
+    if bind_is_loopback(addr) {
+        return None;
+    }
+    let mut bytes = [0u8; 16];
+    OsRng.fill_bytes(&mut bytes);
+    Some(crystalline_index::hex_lower(&bytes))
+}
+
+/// Whether a bind address can only be reached from this machine.
+fn bind_is_loopback(addr: &str) -> bool {
+    if let Ok(socket) = addr.parse::<SocketAddr>() {
+        return socket.ip().is_loopback();
+    }
+    let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr);
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    match host.parse::<IpAddr>() {
+        Ok(ip) => ip.is_loopback(),
+        Err(_) => host.eq_ignore_ascii_case("localhost"),
+    }
+}
+
+/// The two lines a serve process says about its setup token, in the order it
+/// says them. Built here rather than inlined so the exact wording is testable
+/// and so the foreground banner and the daemon log cannot drift apart.
+fn setup_token_lines(addr: &str, token: &str) -> [String; 2] {
+    [
+        format!("first-run setup token (create the first admin at http://{addr}): {token}"),
+        "this token is not shown again; a restart mints a new one".to_string(),
+    ]
+}
+
+/// The MCP streamable-HTTP service, which is what every request the rest of
+/// the router does not claim is answered by.
+type McpService = rmcp::transport::streamable_http_server::tower::StreamableHttpService<
+    McpServer,
+    CountingSessions<rmcp::transport::streamable_http_server::session::local::LocalSessionManager>,
+>;
+
+/// A session manager that counts the sessions it creates, wrapping the real
+/// one and delegating everything else untouched.
+///
+/// # Why the count cannot live in the service factory
+///
+/// It used to. `StreamableHttpService` calls that factory through
+/// `get_service()`, and rmcp 3.1.2 calls `get_service()` at five sites
+/// (`transport/streamable_http_server/tower.rs:1280`, `:1426`, `:1822`,
+/// `:1855`, `:1948`) of which exactly one - `:1855`, immediately before
+/// `session_manager.create_session()` - is a session:
+///
+/// | site | what it is |
+/// |---|---|
+/// | `:1280` | `tool_schema()`, the SEP-2243 header-validation cache, one construction per distinct tool name |
+/// | `:1426` | the external session-store restore replay, unreachable here (we configure no `session_store`) |
+/// | `:1822` | the stateless `server/discover` branch |
+/// | `:1855` | **legacy session creation** |
+/// | `:1948` | **every** stateless POST |
+///
+/// So a counter incremented in the factory was reporting session creations plus
+/// stateless requests plus schema-cache misses under the name `http_sessions`.
+/// Two of the four non-session sites are reachable on the tree as it stands,
+/// which is why this is a fix rather than a note for later: a modern-shaped
+/// sessionless POST at an advertised revision is served today, and
+/// `validate_standard_headers` arms on the **client's** `MCP-Protocol-Version`
+/// header rather than on our advertised set (`tower.rs:678-684`), so a
+/// `tools/call` naming 2026-07-28 reaches the schema cache whatever we
+/// advertise - it did so while that call was still being refused, and it does
+/// so now that the call is served.
+/// `tests/http_stream.rs::http_sessions_counts_sessions_rather_than_service_constructions`
+/// is the guard.
+///
+/// # What the number means
+///
+/// A session, in this transport, is the legacy `Mcp-Session-Id` lifecycle. From
+/// 2026-07-28 there are none: modern peers route statelessly by design, and
+/// that revision is advertised, so this counter reports only the legacy clients
+/// still connecting. That is the honest reading of the name it already has, and
+/// on a modern-only fleet the number stops growing. A figure covering modern
+/// traffic would be a different metric, not a repair of this one.
+pub(crate) struct CountingSessions<M> {
+    inner: M,
+    created: Arc<AtomicUsize>,
+}
+
+impl<M> CountingSessions<M> {
+    fn new(inner: M, created: Arc<AtomicUsize>) -> CountingSessions<M> {
+        CountingSessions { inner, created }
+    }
+}
+
+impl<M: rmcp::transport::streamable_http_server::session::SessionManager>
+    rmcp::transport::streamable_http_server::session::SessionManager for CountingSessions<M>
+{
+    type Error = M::Error;
+    type Transport = M::Transport;
+
+    async fn create_session(&self) -> Result<(SessionId, Self::Transport), Self::Error> {
+        let created = self.inner.create_session().await?;
+        self.created.fetch_add(1, Ordering::Relaxed);
+        Ok(created)
+    }
+
+    fn initialize_session(
+        &self,
+        id: &SessionId,
+        message: rmcp::model::ClientJsonRpcMessage,
+    ) -> impl Future<Output = Result<rmcp::model::ServerJsonRpcMessage, Self::Error>> + Send {
+        self.inner.initialize_session(id, message)
+    }
+
+    fn has_session(
+        &self,
+        id: &SessionId,
+    ) -> impl Future<Output = Result<bool, Self::Error>> + Send {
+        self.inner.has_session(id)
+    }
+
+    fn close_session(
+        &self,
+        id: &SessionId,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        self.inner.close_session(id)
+    }
+
+    fn create_stream(
+        &self,
+        id: &SessionId,
+        message: rmcp::model::ClientJsonRpcMessage,
+    ) -> impl Future<
+        Output = Result<
+            impl futures::Stream<Item = ServerSseMessage> + Send + Sync + 'static,
+            Self::Error,
+        >,
+    > + Send {
+        self.inner.create_stream(id, message)
+    }
+
+    fn accept_message(
+        &self,
+        id: &SessionId,
+        message: rmcp::model::ClientJsonRpcMessage,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        self.inner.accept_message(id, message)
+    }
+
+    fn create_standalone_stream(
+        &self,
+        id: &SessionId,
+    ) -> impl Future<
+        Output = Result<
+            impl futures::Stream<Item = ServerSseMessage> + Send + Sync + 'static,
+            Self::Error,
+        >,
+    > + Send {
+        self.inner.create_standalone_stream(id)
+    }
+
+    fn resume(
+        &self,
+        id: &SessionId,
+        last_event_id: String,
+    ) -> impl Future<
+        Output = Result<
+            impl futures::Stream<Item = ServerSseMessage> + Send + Sync + 'static,
+            Self::Error,
+        >,
+    > + Send {
+        self.inner.resume(id, last_event_id)
+    }
+
+    /// A restore allocates a fresh in-memory session worker, so a genuine
+    /// restore counts and the other two outcomes do not. Unreachable while no
+    /// `session_store` is configured (`tower.rs:1351-1355` returns before
+    /// calling this), and counted anyway so configuring one later cannot
+    /// silently make the number wrong again.
+    async fn restore_session(
+        &self,
+        id: SessionId,
+    ) -> Result<
+        rmcp::transport::streamable_http_server::session::RestoreOutcome<Self::Transport>,
+        Self::Error,
+    > {
+        let outcome = self.inner.restore_session(id).await?;
+        if matches!(
+            outcome,
+            rmcp::transport::streamable_http_server::session::RestoreOutcome::Restored(_)
+        ) {
+            self.created.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(outcome)
+    }
+
+    fn event_store(
+        &self,
+    ) -> Option<Arc<dyn rmcp::transport::streamable_http_server::session::EventStore>> {
+        self.inner.event_store()
+    }
+}
+
+/// Build the router the HTTP endpoint mounts. Three citizens share the one port,
+/// in this precedence:
+///
+/// 1. The declared routes: the `/health` probe, the JSON API nested at
+///    `/api/v1` (when `service.api` is on) and, when `service.ui` is on, the
+///    web UI's own `/` and `/assets/{*path}`. All of them are declared ahead of
+///    the fallback, so nothing below can shadow them: a monitor asking for
+///    `/health` with a browser's `Accept` gets JSON, and the API nest carries
+///    its own 404, so an unknown API path is an API error rather than the app
+///    shell.
+/// 2. The embedded bundle, from the fallback: a root-level file matched
+///    exactly, then a GET or HEAD that accepts `text/html` answered with the
+///    app shell (the SPA's own router owns the 404 experience).
+/// 3. The MCP streamable-HTTP transport, which sees everything the two above
+///    did not claim. What they claim is narrow and worth stating exactly: a GET
+///    or HEAD that either asks for a document or lands on `/` or an asset path,
+///    and nothing else. Every POST and DELETE reaches the transport, and so
+///    does its client-opened standby SSE stream - a GET asking for
+///    `text/event-stream`, which arrives at whatever path a client was pointed
+///    at, `/` included, and is let past every UI rung by
+///    [`crate::ui::wants_event_stream`]. That is also why the transport keeps
+///    the fallback rather than moving to a named route: a client pointed at any
+///    path on this endpoint keeps working, both halves of it.
+///
+/// With the UI off (`service.ui=false`, `service.api=false`, or a binary built
+/// without the `fluid-ui` feature) the fallback is the transport alone, exactly
+/// as it was before the UI existed.
+///
+/// There is no CORS layer here and there must never be one (`tests/no_cors.rs`
+/// fails the build over it): `GET /api/v1/auth/me` hands the caller their CSRF
+/// token, which is safe only because no other origin can read the answer. The
+/// UI adds no CORS surface at all - it is served from the same origin as the
+/// API it calls, by construction, which is precisely the deployment the auth
+/// settlement was designed around.
+///
+/// Public and doc-commented on purpose (not `pub(crate)`) so an integration
+/// test can drive the exact production construction over a real `TcpListener`
+/// instead of reimplementing it; `run_http` is the only other caller.
 pub fn http_router(
     engine: Arc<Engine>,
     http_sessions: Arc<AtomicUsize>,
     allowed_hosts: &[String],
     auth: Arc<crate::rest::AuthStore>,
+    setup_token: Option<String>,
 ) -> anyhow::Result<axum::Router> {
+    #[cfg(feature = "fluid-ui")]
+    {
+        http_router_with_assets::<crate::ui::FluidAssets>(
+            engine,
+            http_sessions,
+            allowed_hosts,
+            auth,
+            setup_token,
+        )
+    }
+    #[cfg(not(feature = "fluid-ui"))]
+    {
+        // No embed exists to serve, so the router is its pre-UI self: the
+        // declared routes and the transport behind them.
+        let api = engine.config().api_enabled();
+        let (router, service) =
+            http_base(engine, http_sessions, allowed_hosts, auth, api, setup_token)?;
+        Ok(router.fallback_service(service))
+    }
+}
+
+/// [`http_router`], told which embed to serve. The production call passes
+/// [`crate::ui::FluidAssets`]; the integration suite passes a committed fixture
+/// bundle, so the whole dispatch is driven on a machine that has never run a
+/// node toolchain.
+#[cfg(feature = "fluid-ui")]
+pub fn http_router_with_assets<E: rust_embed::RustEmbed + 'static>(
+    engine: Arc<Engine>,
+    http_sessions: Arc<AtomicUsize>,
+    allowed_hosts: &[String],
+    auth: Arc<crate::rest::AuthStore>,
+    setup_token: Option<String>,
+) -> anyhow::Result<axum::Router> {
+    // One snapshot for both keys: they are read once when the HTTP surface
+    // starts, like `service.read_only` and the `auth.*` keys, and `ui_enabled`
+    // already carries the coupling (`service.api=false` turns the UI off with
+    // it, since a shell whose data routes are gone can only render a login
+    // error).
+    let config = engine.config();
+    let (api, ui) = (config.api_enabled(), config.ui_enabled());
+    let (router, service) =
+        http_base(engine, http_sessions, allowed_hosts, auth, api, setup_token)?;
+    if !ui {
+        return Ok(router.fallback_service(service));
+    }
+    // The UI is mounted whether or not a bundle was embedded: with an empty
+    // embed every navigation gets the 503 not-built page rather than falling
+    // through to a transport error nobody can read (design decision 3).
+    //
+    // Every one of the three mounts is the transport with a rule layered in
+    // front of it, and that shape is load bearing twice over. First, each hands
+    // the methods it does not serve straight on: `/` is the path an MCP client
+    // points at by default and its calls are POSTs, so a plain `get(...)` at the
+    // root would answer every default-configured agent 405 the moment the UI
+    // mounted. Second, `any_service` is the one constructor that does not append
+    // an `Allow` header to what it falls back to, so an MCP response out of
+    // these paths is byte for byte the response the same request got before the
+    // UI existed - a `get(...).fallback_service(...)` pair would decorate every
+    // MCP answer at `/` with `Allow: GET,HEAD`.
+    Ok(router
+        .route(
+            "/",
+            axum::routing::any_service(service.clone())
+                .layer(axum::middleware::from_fn(serve_index::<E>)),
+        )
+        .route(
+            "/assets/{*path}",
+            axum::routing::any_service(service.clone())
+                .layer(axum::middleware::from_fn(serve_asset::<E>)),
+        )
+        .fallback_service(
+            axum::routing::any_service(service).layer(axum::middleware::from_fn(dispatch_ui::<E>)),
+        ))
+}
+
+/// Whether the UI may answer this request at all, which is the guard in front
+/// of every one of its rungs.
+///
+/// Two conditions, and both are about leaving the transport alone. The method
+/// has to be one a browser fetches a document or an asset with: decision 4
+/// calls every other method MCP-shaped, and an MCP client is free to point at
+/// any path on this endpoint. And the request must not be the transport's own
+/// client-opened SSE stream, which is a GET like any navigation and arrives at
+/// the same paths - see [`crate::ui::wants_event_stream`] for what that stream
+/// is and why answering it with a document breaks an agent quietly.
+#[cfg(feature = "fluid-ui")]
+fn is_ui_fetch(request: &axum::extract::Request) -> bool {
+    let is_fetch =
+        request.method() == axum::http::Method::GET || request.method() == axum::http::Method::HEAD;
+    is_fetch && !crate::ui::wants_event_stream(accept_of(request))
+}
+
+/// The `Accept` a request carries, if it carries a readable one.
+#[cfg(feature = "fluid-ui")]
+fn accept_of(request: &axum::extract::Request) -> Option<&str> {
+    request
+        .headers()
+        .get(axum::http::header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+}
+
+/// The request path as an embed key: no leading slash, and undecoded, because
+/// a bundle's names are the ASCII ones a bundler emits. The `ui` functions
+/// refuse a key that keeps its slash rather than trimming one, so this is the
+/// one place the conversion happens.
+#[cfg(feature = "fluid-ui")]
+fn embed_key(request: &axum::extract::Request) -> &str {
+    let path = request.uri().path();
+    path.strip_prefix('/').unwrap_or(path)
+}
+
+/// The `If-None-Match` a request carries, if any.
+#[cfg(feature = "fluid-ui")]
+fn if_none_match(request: &axum::extract::Request) -> Option<&str> {
+    request
+        .headers()
+        .get(axum::http::header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+}
+
+/// The part of the router that is the same whatever the UI does: the `/health`
+/// probe, the JSON API nested at `/api/v1` when `api` is on, and the MCP
+/// service the caller mounts as (or behind) the fallback. `setup_token` is this
+/// process's first-run token, handed to the REST state that answers the setup
+/// route; `None` closes the token path, which is what a loopback bind wants.
+fn http_base(
+    engine: Arc<Engine>,
+    http_sessions: Arc<AtomicUsize>,
+    allowed_hosts: &[String],
+    auth: Arc<crate::rest::AuthStore>,
+    api: bool,
+    setup_token: Option<String>,
+) -> anyhow::Result<(axum::Router, McpService)> {
     use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
     use rmcp::transport::streamable_http_server::tower::StreamableHttpService;
 
@@ -742,20 +1220,136 @@ pub fn http_router(
     // `#[non_exhaustive]` and only reachable through the `Default` instance.
     let mut session_manager = LocalSessionManager::default();
     session_manager.session_config.sse_retry = None;
-    let session_manager = Arc::new(session_manager);
-    let rest = crate::rest::router(crate::rest::RestState::new(engine.clone(), auth)?);
+    // The counter lives here rather than in the factory below, so it counts
+    // sessions rather than every construction rmcp asks for; see
+    // [`CountingSessions`].
+    let session_manager = Arc::new(CountingSessions::new(session_manager, http_sessions));
+    // The REST state is built only when the API is served. It is not free (it
+    // resolves paths and can fail), and building it to then leave it unmounted
+    // would mean `service.api=false` could still fail a start over a surface
+    // that daemon is deliberately not offering.
+    let rest = if api {
+        Some(crate::rest::router(
+            crate::rest::RestState::new(engine.clone(), auth)?.with_setup_token(setup_token),
+        ))
+    } else {
+        None
+    };
     let service = StreamableHttpService::new(
-        move || {
-            http_sessions.fetch_add(1, Ordering::Relaxed);
-            Ok(McpServer::new_http(engine.clone()))
-        },
+        move || Ok(McpServer::new_http(engine.clone())),
         session_manager,
         http_config(allowed_hosts),
     );
-    Ok(axum::Router::new()
-        .route("/health", axum::routing::get(health))
-        .nest("/api/v1", rest)
-        .fallback_service(service))
+    let mut router = axum::Router::new().route("/health", axum::routing::get(health));
+    if let Some(rest) = rest {
+        router = router.nest("/api/v1", rest);
+    }
+    Ok((router, service))
+}
+
+/// `/`: the app shell for a browser, the not-built page when nothing was
+/// embedded, and the transport for everything else - the root is where an MCP
+/// client points by default.
+///
+/// The shell answers here whatever the request accepts, with exactly one
+/// exception: a GET asking for `text/event-stream` is the transport's standby
+/// stream and is handed on. Serving the shell to `*/*`, to `application/json`
+/// and to a request naming nothing is what makes a bare
+/// `curl http://host:7411/` show the UI rather than a transport error; the
+/// narrower Accept rule applies to the app's other routes alone.
+#[cfg(feature = "fluid-ui")]
+async fn serve_index<E: rust_embed::RustEmbed>(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if !is_ui_fetch(&request) {
+        return next.run(request).await;
+    }
+    crate::ui::index_response::<E>()
+}
+
+/// `/assets/{*path}`: one content-hashed chunk, held for a year, and a plain
+/// 404 for a name nothing stands behind - never the app shell, whatever the
+/// request accepts. The standby-stream exception holds here too, for a client
+/// whose endpoint URL happens to sit under this prefix.
+#[cfg(feature = "fluid-ui")]
+async fn serve_asset<E: rust_embed::RustEmbed>(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if !is_ui_fetch(&request) {
+        return next.run(request).await;
+    }
+    crate::ui::asset_response::<E>(embed_key(&request), if_none_match(&request))
+}
+
+/// The dispatching fallback: the two path-independent bundle rungs in front of
+/// the MCP transport, which `next` runs whenever neither claims the request.
+///
+/// A layer rather than a handler that holds the transport, because that is what
+/// keeps the transport's own call path byte for byte what it was: a request the
+/// UI does not answer is handed on unmodified, and this crate needs no service
+/// plumbing of its own to do it.
+#[cfg(feature = "fluid-ui")]
+async fn dispatch_ui<E: rust_embed::RustEmbed>(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+
+    if is_ui_fetch(&request) {
+        // The exact-match rung. `exact_response` answers `None` for any key
+        // carrying a slash, so a multi-segment app route (the common case)
+        // costs a string scan and no lookup, and a hashed chunk can never be
+        // served from here under the wrong cache policy. A root-level name
+        // that misses falls through, so with a non-html Accept it ends up at
+        // the transport's 406 rather than at a 404 - the `*/*` deviation
+        // working as designed, recorded here because it reads like a bug.
+        if let Some(response) = crate::ui::exact_response::<E>(embed_key(&request)) {
+            return response;
+        }
+        // The bare asset prefix, which the `/assets/{*path}` route above does
+        // not match (a wildcard takes no empty segment). nginx answers the
+        // whole prefix with `try_files $uri =404`, so neither spelling of it
+        // may fall through to the shell below.
+        if matches!(request.uri().path(), "/assets" | "/assets/") {
+            return axum::http::StatusCode::NOT_FOUND.into_response();
+        }
+    }
+    if crate::ui::wants_spa(request.method(), accept_of(&request)) {
+        return crate::ui::index_response::<E>();
+    }
+    next.run(request).await
+}
+
+/// The one line a foreground start prints about the web UI, beside the HTTP
+/// endpoint's own line. Every state is named out loud: a UI that is off because
+/// of a config key, off because the API it needs is off, or missing because
+/// this binary was built without a bundle, is a state an operator otherwise
+/// discovers from a browser rather than from the daemon.
+fn ui_startup_line(config: &GlobalConfig, addr: &str) -> String {
+    if !config.api_enabled() {
+        return "web UI off (service.api=false)".to_string();
+    }
+    if !config.ui_enabled() {
+        return "web UI off (service.ui=false)".to_string();
+    }
+    #[cfg(feature = "fluid-ui")]
+    {
+        if crate::ui::ui_available::<crate::ui::FluidAssets>() {
+            return format!("crystalline web UI at http://{addr}");
+        }
+        // A dev build whose `fluid/dist` was never built, or was built after
+        // the last compile of this crate: see the note in `build.rs`.
+        "web UI not built into this binary".to_string()
+    }
+    #[cfg(not(feature = "fluid-ui"))]
+    {
+        // Built without the `fluid-ui` feature, so there is no bundle at all
+        // and nothing to point an address at.
+        let _ = addr;
+        "web UI not built into this binary".to_string()
+    }
 }
 
 /// Liveness probe for load balancers and uptime monitors: a static payload
@@ -1081,6 +1675,12 @@ fn is_hidden(name: &str) -> bool {
 // --- config + path resolution -----------------------------------------------
 
 /// Resolve the HTTP bind address from the flag then the config.
+///
+/// The endpoint is ON by default, at [`DEFAULT_HTTP_ADDR`]: a daemon nobody
+/// configured still serves the web UI, the JSON API and MCP over loopback, which
+/// is what makes the UI zero-config. `serve --http off` wins over everything, and
+/// `service.http: false` (or `CRYSTALLINE_SERVICE_HTTP=false`) is the config-file
+/// opt-out; every other spelling names an address or asks for the default one.
 fn resolve_http(flag: Option<&str>, config: &GlobalConfig) -> Option<String> {
     if let Some(f) = flag {
         let f = f.trim();
@@ -1091,9 +1691,10 @@ fn resolve_http(flag: Option<&str>, config: &GlobalConfig) -> Option<String> {
         };
     }
     match config.service.as_ref().and_then(|s| s.http.as_ref()) {
-        Some(HttpSetting::Enabled(true)) => Some(DEFAULT_HTTP_ADDR.to_string()),
+        Some(HttpSetting::Enabled(false)) => None,
         Some(HttpSetting::Address(a)) => Some(a.clone()),
-        _ => None,
+        // Explicitly on, and unset, are the same answer: the loopback default.
+        Some(HttpSetting::Enabled(true)) | None => Some(DEFAULT_HTTP_ADDR.to_string()),
     }
 }
 
@@ -1134,11 +1735,34 @@ fn resolve_allowed_hosts(flag: &[String], config: &GlobalConfig) -> Vec<String> 
 /// stream is the compatibility baseline the ecosystem already assumes; the
 /// reconnection hint itself is worthless for the sub-second request/response
 /// streams this server produces.
+///
+/// Two further settings are spelled out rather than inherited.
+///
+/// `legacy_session_mode` is rmcp's own default (`tower.rs:169`), written down
+/// so an upstream flip cannot silently take the `Mcp-Session-Id` routing away
+/// from every client that speaks a revision below 2026-07-28 - the only branch
+/// that inserts that header (`tower.rs:1911`).
+///
+/// The body limit is a **new refusal boundary**, not a default being pinned.
+/// rmcp 2.2.0 had no limit at all: its `expect_json(body)` collected the whole
+/// body unbounded and `max_request_body_bytes` did not exist. rmcp 3.1.2
+/// introduces the cap and defaults it to 4 MiB
+/// (`DEFAULT_MAX_REQUEST_BODY_BYTES`, `tower.rs:55`), which would start
+/// refusing engram writes that succeed today: bodies of 2.5 MB and 8.8 MB are
+/// documented in this project's own corpus. So we pick the number, and we pick
+/// the one the REST API already enforces - [`crate::rest::MAX_BODY_BYTES`],
+/// read from that constant rather than spelled again here, so an MCP write and
+/// a `/api/v1` write of the same engram always get the same answer. A body
+/// past it is refused with `413 Payload Too Large: request body exceeds
+/// {max} bytes` before any handler runs.
 fn http_config(
     allowed_hosts: &[String],
 ) -> rmcp::transport::streamable_http_server::tower::StreamableHttpServerConfig {
     use rmcp::transport::streamable_http_server::tower::StreamableHttpServerConfig;
-    let base = StreamableHttpServerConfig::default().with_sse_retry(None);
+    let base = StreamableHttpServerConfig::default()
+        .with_sse_retry(None)
+        .with_legacy_session_mode(true)
+        .with_max_request_body_bytes(crate::rest::MAX_BODY_BYTES);
     if allowed_hosts.iter().any(|h| h == "*") {
         return base.disable_allowed_hosts();
     }
@@ -1223,10 +1847,121 @@ mod tests {
         );
     }
 
+    /// The zero-config shape: no flag, no setting, and the endpoint still comes
+    /// up on loopback. This is the whole point of the default - the web UI is
+    /// there without anybody asking for it - and the address is the loopback one
+    /// so nothing is reachable from the network without a deliberate bind.
     #[test]
-    fn resolve_http_none_without_flag_or_config() {
+    fn resolve_http_defaults_to_loopback_without_flag_or_config() {
         let config = GlobalConfig::default();
+        assert_eq!(
+            resolve_http(None, &config),
+            Some(DEFAULT_HTTP_ADDR.to_string())
+        );
+    }
+
+    /// `service.http: false` is the opt-out. Before the default flipped it was
+    /// indistinguishable from an unset setting; now it is the only way to say
+    /// "no HTTP" in the config file, so it gets its own pin.
+    #[test]
+    fn resolve_http_config_false_disables() {
+        let mut config = GlobalConfig::default();
+        config.service = Some(crystalline_core::config::ServiceConfig {
+            http: Some(HttpSetting::Enabled(false)),
+            ..Default::default()
+        });
         assert_eq!(resolve_http(None, &config), None);
+    }
+
+    /// The flag still wins, including against the default nobody configured:
+    /// `serve --http off` on an untouched config serves no HTTP.
+    #[test]
+    fn resolve_http_flag_off_still_wins_over_default() {
+        let config = GlobalConfig::default();
+        assert_eq!(resolve_http(Some("off"), &config), None);
+        assert_eq!(resolve_http(Some("false"), &config), None);
+    }
+
+    /// The other direction of the same precedence, and the one every serve
+    /// spawning test harness leans on: an address on the flag beats
+    /// `service.http: false` (which is what `CRYSTALLINE_SERVICE_HTTP=false`
+    /// resolves to), so a harness can turn the endpoint off for its daemons and
+    /// still ask one of them for an endpoint on a port it picked itself.
+    #[test]
+    fn resolve_http_flag_address_wins_over_a_config_that_turned_it_off() {
+        let mut config = GlobalConfig::default();
+        config.service = Some(crystalline_core::config::ServiceConfig {
+            http: Some(HttpSetting::Enabled(false)),
+            ..Default::default()
+        });
+        assert_eq!(
+            resolve_http(Some("127.0.0.1:9999"), &config),
+            Some("127.0.0.1:9999".to_string())
+        );
+        assert_eq!(
+            resolve_http(Some("true"), &config),
+            Some(DEFAULT_HTTP_ADDR.to_string())
+        );
+    }
+
+    /// A config carrying the two HTTP-surface toggles.
+    fn config_with_ui(ui: Option<bool>, api: Option<bool>) -> GlobalConfig {
+        GlobalConfig {
+            service: Some(crystalline_core::config::ServiceConfig {
+                ui,
+                api,
+                ..Default::default()
+            }),
+            ..GlobalConfig::default()
+        }
+    }
+
+    // The startup line is how an operator learns which of the four states this
+    // daemon is in without opening a browser: serving, off by its own key, off
+    // because the API it needs is off, or built without a bundle. Each is
+    // reported for the reason that actually applies, so the line names the key
+    // to change.
+
+    #[test]
+    fn the_ui_startup_line_names_the_key_that_turned_it_off() {
+        assert_eq!(
+            ui_startup_line(&config_with_ui(Some(false), None), "127.0.0.1:7411"),
+            "web UI off (service.ui=false)"
+        );
+        assert_eq!(
+            ui_startup_line(&config_with_ui(None, Some(false)), "127.0.0.1:7411"),
+            "web UI off (service.api=false)",
+            "the API is the reason here, not the UI key: reporting service.ui \
+             would send the operator to flip a key that is already on"
+        );
+        assert_eq!(
+            ui_startup_line(&config_with_ui(Some(true), Some(false)), "127.0.0.1:7411"),
+            "web UI off (service.api=false)",
+            "even with the UI asked for explicitly, since a shell without its \
+             API can only render a login error"
+        );
+    }
+
+    #[test]
+    fn the_ui_startup_line_points_at_the_address_when_a_bundle_is_served() {
+        let line = ui_startup_line(&config_with_ui(None, None), "0.0.0.0:7411");
+        #[cfg(feature = "fluid-ui")]
+        {
+            let expected = if crate::ui::ui_available::<crate::ui::FluidAssets>() {
+                "crystalline web UI at http://0.0.0.0:7411"
+            } else {
+                // A tree whose `fluid/dist` was never built: the embed is
+                // empty and the line says so rather than pointing a browser at
+                // a 503.
+                "web UI not built into this binary"
+            };
+            assert_eq!(line, expected);
+        }
+        #[cfg(not(feature = "fluid-ui"))]
+        assert_eq!(
+            line, "web UI not built into this binary",
+            "a binary built without the feature carries no bundle at all"
+        );
     }
 
     fn config_with_allowed_hosts(hosts: Vec<String>) -> GlobalConfig {
@@ -1276,6 +2011,42 @@ mod tests {
         assert!(
             cfg.allowed_hosts.is_empty(),
             "an empty allow-list makes rmcp accept any Host"
+        );
+    }
+
+    /// The two `http_config` settings that are decisions rather than
+    /// inherited defaults, pinned together because they fail for different
+    /// reasons.
+    ///
+    /// `legacy_session_mode` is today's default (rmcp 3.1.2 `tower.rs:169`)
+    /// spelled out, so an upstream flip cannot silently drop every legacy
+    /// client's session. That half passes before and after the pin exists.
+    ///
+    /// The body limit is the real assertion. rmcp 2.2.0 had **no** limit:
+    /// `expect_json(body)` collected the whole body unbounded
+    /// (`rmcp-2.2.0/src/transport/common/server_side_http.rs:171-201`) and
+    /// `max_request_body_bytes` did not exist. So this is a new refusal
+    /// boundary we are introducing, not a default we inherited, and 3.1.2's
+    /// own default of 4 MiB (`DEFAULT_MAX_REQUEST_BODY_BYTES`, `tower.rs:55`)
+    /// would refuse writes that succeed today - engram bodies of 2.5 MB and
+    /// 8.8 MB are documented in this project's own corpus
+    /// (`research/2026-07-28-turso-sorter-spill.md`).
+    ///
+    /// Asserting equality with `crate::rest::MAX_BODY_BYTES` rather than with
+    /// a literal is the whole divergence guard: it fails the moment someone
+    /// spells the number a second time, which is the only way the MCP and
+    /// REST surfaces can drift apart.
+    #[test]
+    fn http_config_pins_the_session_mode_and_the_body_limit() {
+        let cfg = http_config(&[]);
+        assert!(
+            cfg.legacy_session_mode,
+            "legacy clients keep their Mcp-Session-Id routing"
+        );
+        assert_eq!(
+            cfg.max_request_body_bytes,
+            crate::rest::MAX_BODY_BYTES,
+            "the MCP transport and the REST API refuse the same body size"
         );
     }
 
@@ -1539,5 +2310,261 @@ mod tests {
             classify_in_root(&root.join("runbooks/index.md"), root),
             DirtyKind::Ignore
         ));
+    }
+
+    // The one-time setup token exists for exactly one reason: on a bind other
+    // machines can reach there is no loopback peer to trust, so the wizard needs
+    // a secret the operator reads off the startup output. A bind only this
+    // machine can reach protects nothing by having one, so it gets none.
+
+    #[test]
+    fn setup_token_only_for_non_loopback_binds() {
+        for addr in [
+            "127.0.0.1:7411",
+            "127.0.0.1:0",
+            "127.7.7.7:7411",
+            "[::1]:7411",
+            "localhost:7411",
+        ] {
+            assert_eq!(
+                setup_token_for(addr),
+                None,
+                "{addr} can only be reached from this machine"
+            );
+        }
+        // A host name that is not the literal `localhost` is treated as
+        // reachable: the token is additive (a loopback peer never needs it), so
+        // the unknown case fails towards having one.
+        for addr in [
+            "0.0.0.0:7411",
+            "192.168.1.5:7411",
+            "[::]:7411",
+            "[2001:db8::1]:7411",
+            "fluid.example:7411",
+        ] {
+            let token = setup_token_for(addr)
+                .unwrap_or_else(|| panic!("{addr} is reachable from elsewhere and needs a token"));
+            assert_eq!(token.len(), 32, "32 hex characters: {token}");
+            assert!(
+                token.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')),
+                "lower-case hex, nothing a terminal font can confuse: {token}"
+            );
+        }
+        assert_ne!(
+            setup_token_for("0.0.0.0:7411"),
+            setup_token_for("0.0.0.0:7411"),
+            "drawn fresh every time, so one serve process's token is its own"
+        );
+    }
+
+    #[test]
+    fn the_setup_token_lines_name_the_address_and_say_it_is_said_once() {
+        let lines = setup_token_lines("0.0.0.0:7411", "a1b2c3d4e5f60718293a4b5c6d7e8f90");
+        assert_eq!(
+            lines[0],
+            "first-run setup token (create the first admin at http://0.0.0.0:7411): a1b2c3d4e5f60718293a4b5c6d7e8f90"
+        );
+        assert_eq!(
+            lines[1],
+            "this token is not shown again; a restart mints a new one"
+        );
+        assert!(
+            !lines[1].contains("a1b2c3d4e5f60718293a4b5c6d7e8f90"),
+            "the caveat line carries no secret of its own"
+        );
+    }
+
+    /// Every file the setup token lives in, with the name a failure message
+    /// says out loud. `include_str!` resolves against this file, so the two
+    /// `rest` entries are the token's other two homes: `rest/mod.rs` stores it
+    /// (`RestState::setup_token`, `with_setup_token`, `setup_token()`) and
+    /// `rest/auth.rs` is its only reader (`SetupBody::token`,
+    /// `authorize_setup`). Neither writes any output today, which is exactly
+    /// when a guard is worth installing: the gap is vacuous now and would not
+    /// be noticed the day somebody fills it.
+    const TOKEN_BEARING_SOURCES: [(&str, &str); 3] = [
+        ("daemon.rs", include_str!("daemon.rs")),
+        ("rest/mod.rs", include_str!("rest/mod.rs")),
+        ("rest/auth.rs", include_str!("rest/auth.rs")),
+    ];
+
+    /// The output macros none of those three files may spell the token into.
+    /// `eprintln!` is in the list even though the startup banner prints the
+    /// token with it: the banner prints the strings [`setup_token_lines`]
+    /// built, so no output macro anywhere needs the secret's own name, and
+    /// under `--daemon` stderr IS the daemon log file.
+    ///
+    /// `eprintln!` sits ahead of `println!` because it ends in one: a scan for
+    /// the shorter name matches inside the longer one, and this order is what
+    /// makes a failure name the macro that is actually written there.
+    const OUTPUT_CALLS: [&str; 5] = ["tracing::", "log::", "eprintln!", "println!", "dbg!"];
+
+    /// Security invariant 3, guarded at the source: the token is named in the
+    /// startup output and nowhere else. The startup emission goes through
+    /// [`setup_token_lines`], whose text the test above pins, so an output call
+    /// that spells the variable itself is by definition a second appearance.
+    ///
+    /// The scan rejects the bare name `token` as well as `setup_token`, because
+    /// the HTTP spawn arm rebinds the secret as `token` before handing it to
+    /// [`http_service`] and the endpoint's own failure warnings sit right beside
+    /// that binding: a log line there spelling `{token}` would leak the secret
+    /// into the daemon log with every test in the tree still green.
+    ///
+    /// Two predicates, unioned, because neither alone covers the ways these
+    /// files actually write an output call:
+    ///
+    /// 1. Per INVOCATION: from the macro path to the balanced close of its
+    ///    argument list. The warnings in that arm are multi-line (rustfmt keeps
+    ///    them that way, the sentences being long), so their format string sits
+    ///    on a different line from the `tracing::` that opens the call, and a
+    ///    per-line scan sails straight past the edit this guard exists to catch.
+    ///    Delimiting on the next `;` instead would be worse than useless here:
+    ///    all three warnings in that arm carry a semicolon INSIDE their format
+    ///    string, so the slice would end after ~78 characters and everything
+    ///    after the remedy's semicolon - exactly where a careless edit lands -
+    ///    would go unread.
+    /// 2. Per LINE, the predicate this guard shipped with: an output call and
+    ///    `token` on one line. Kept so a call the paren walk delimits
+    ///    differently, or skips, can never regress out of coverage.
+    ///
+    /// What the scan deliberately does NOT read is comment-only lines, blanked
+    /// by [`served_source`] before either predicate runs. A comment emits
+    /// nothing at runtime, so flagging one is a false positive - and the
+    /// alternative is worse than a false positive: `rest/auth.rs` carries a doc
+    /// comment that names `tracing::debug!` and the token in one sentence
+    /// precisely to warn the next person off deriving [`Debug`] for
+    /// `SetupBody`, and rewording that warning to please a source scan would
+    /// trade the documentation of the hazard for the check on it. The next test
+    /// pins that trade shut. Blanking keeps the line numbering, so a failure
+    /// still names the right line.
+    ///
+    /// Honest about the rest of it, so nobody mistakes a limit for a hole:
+    ///
+    /// - The paren walk counts parentheses without parsing string literals, so
+    ///   a literal holding an unmatched `(` or `)` would skew it. The literals
+    ///   here balance (`({err})`, `(os error 48)`), and an unbalanced one panics
+    ///   with the offending text rather than silently truncating the slice.
+    /// - A path that is not a macro call (`tracing::Level::INFO`) is skipped by
+    ///   predicate 1 and left to predicate 2.
+    /// - Only comment-ONLY lines are blanked, never a `//` inside a line, which
+    ///   in these files is always a `http://` in a string literal. Block
+    ///   comments are not handled and none of the three files uses one; a
+    ///   stripper for them would be actively dangerous here, since the `*/*`
+    ///   inside daemon.rs's own doc comments would open one and swallow the
+    ///   rest of the file.
+    /// - A source scan cannot see the token under another name: rebind it, move
+    ///   it into a struct field read as `self.secret`, and no text search finds
+    ///   it. That residual is accepted. The guard catches the careless edit,
+    ///   which is the one that actually happens.
+    #[test]
+    fn the_setup_token_is_never_spelled_into_a_log_call() {
+        for (file, source) in TOKEN_BEARING_SOURCES {
+            assert_no_logged_token(file, &served_source(source));
+        }
+    }
+
+    /// The comment above is a load-bearing part of the guard, so this pins both
+    /// halves of it: `rest/auth.rs` still carries a comment naming an output
+    /// call and the token in one breath, and the guard is green with it there.
+    /// Deleting that warning to quiet a scan is the swap this test exists to
+    /// make visible; if it moves or is reworded, point this test at the new
+    /// wording rather than dropping it, because without such a line nothing
+    /// proves the comment blanking works at all.
+    #[test]
+    fn a_comment_naming_a_log_call_and_the_token_is_prose_the_guard_reads_past() {
+        let auth = include_str!("rest/auth.rs");
+        let warning = auth.lines().find(|line| {
+            line.trim_start().starts_with("//")
+                && line.contains("token")
+                && OUTPUT_CALLS.iter().any(|call| line.contains(call))
+        });
+        assert!(
+            warning.is_some(),
+            "rest/auth.rs no longer warns, in a comment, that the token is one output call away \
+             from a log file - that warning is why nobody derives Debug for SetupBody"
+        );
+        assert_no_logged_token("rest/auth.rs", &served_source(auth));
+    }
+
+    /// The part of a source file that runs in a daemon: everything above its
+    /// `#[cfg(test)]` module, with comment-only lines blanked out so the guard
+    /// reads code rather than prose. A file with no test module is taken whole,
+    /// which `split` gives for free; all three have one today. Blanking rather
+    /// than dropping keeps every following line at its own number.
+    fn served_source(source: &str) -> String {
+        source
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap()
+            .lines()
+            .map(|line| {
+                if line.trim_start().starts_with("//") {
+                    ""
+                } else {
+                    line
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The guard's predicate over one file's served region, split out from the
+    /// test so the same code can be run over a scratch copy of any of the three
+    /// files when the guard's own coverage is being proved. `file` is carried
+    /// rather than hardcoded because "daemon.rs:403" says nothing useful when
+    /// the hit is in `rest/auth.rs`.
+    fn assert_no_logged_token(file: &str, served: &str) {
+        for macro_path in OUTPUT_CALLS {
+            for (at, _) in served.match_indices(macro_path) {
+                let Some(call) = output_call(&served[at..]) else {
+                    continue;
+                };
+                assert!(
+                    !call.contains("token"),
+                    "{file}:{} logs the setup token: {}",
+                    served[..at].lines().count(),
+                    call.split_whitespace().collect::<Vec<_>>().join(" ")
+                );
+            }
+        }
+        for (n, line) in served.lines().enumerate() {
+            let Some(macro_path) = OUTPUT_CALLS.iter().find(|call| line.contains(**call)) else {
+                continue;
+            };
+            assert!(
+                !line.contains("token"),
+                "{file}:{} logs the setup token through {macro_path}: {}",
+                n + 1,
+                line.trim()
+            );
+        }
+    }
+
+    /// The text of the output macro invocation that starts at `rest[0]`, from
+    /// the macro name through the balanced close of its argument list. `None`
+    /// when it opens no argument list at all, which is a path
+    /// (`tracing::Level::INFO`) rather than a call.
+    fn output_call(rest: &str) -> Option<&str> {
+        let open = rest.find('(')?;
+        if !rest[..open].trim_end().ends_with('!') {
+            return None;
+        }
+        let mut depth = 0usize;
+        for (i, ch) in rest[open..].char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(&rest[..open + i + 1]);
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!(
+            "an output call's parentheses never balance, so this guard cannot read it: {}",
+            &rest[..rest.len().min(200)]
+        );
     }
 }

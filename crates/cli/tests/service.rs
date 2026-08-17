@@ -39,11 +39,22 @@ impl Env {
         Env { dir }
     }
 
+    /// Isolate a child (and, through inheritance, any daemon it spawns) into
+    /// this test's directories, with the HTTP endpoint turned off.
+    ///
+    /// The endpoint is on at `127.0.0.1:7411` by default, and a port is the one
+    /// thing a temp directory cannot isolate: several of these tests run daemons
+    /// concurrently under nextest, and they would race each other and the
+    /// developer's own daemon for that single real port. `CRYSTALLINE_SERVICE_HTTP=false`
+    /// makes the hermeticity explicit rather than lucky. The one test that wants
+    /// an endpoint passes `--http <free port>`, and the flag wins over this
+    /// variable.
     fn apply(&self, cmd: &mut Command) {
         cmd.env("HOME", &self.dir)
             .env("XDG_CONFIG_HOME", self.dir.join("config"))
             .env("XDG_STATE_HOME", self.dir.join("state"))
-            .env("XDG_CACHE_HOME", self.dir.join("cache"));
+            .env("XDG_CACHE_HOME", self.dir.join("cache"))
+            .env("CRYSTALLINE_SERVICE_HTTP", "false");
     }
 
     fn state_dir(&self) -> PathBuf {
@@ -399,8 +410,8 @@ fn single_daemon_two_clients_and_stale_recovery() {
 }
 
 /// End to end: a daemon started read-only reports it over ctl status, hides
-/// the four content-mutating tools from tools/list and refuses a write call by
-/// name with the read-only error.
+/// the write-gated tools from tools/list and refuses a write call by name with
+/// the read-only error.
 #[test]
 fn read_only_daemon_reports_hides_and_refuses() {
     let env = Env::new("ro");
@@ -417,12 +428,15 @@ fn read_only_daemon_reports_hides_and_refuses() {
     let status: Value = serde_json::from_str(&out).unwrap();
     assert_eq!(status["read_only"], json!(true), "status: {status}");
 
-    // tools/list hides the four content-mutating tools and keeps the ten
-    // reads, `skills` among them: reading a skill is a read. `evolve_engrams`
-    // is hidden too, on its own gate: it reads, but every finding it returns
-    // prescribes a mutation.
+    // tools/list hides the write-gated tools and keeps the reads, `skills`
+    // among them: reading a skill is a read. `evolve_engrams` is hidden too,
+    // on its own gate: it reads, but every finding it returns prescribes a
+    // mutation. `update_domain` and `origin_status` are listed even with
+    // GitHub off (that gate refuses at call time now) because a read-only
+    // instance exempts them: a pull is a derived-truth update like sync, and
+    // status is a pure read.
     let names = c1.list_tools();
-    assert_eq!(names.len(), 10, "read-only exposes 10 tools: {names:?}");
+    assert_eq!(names.len(), 12, "read-only exposes 12 tools: {names:?}");
     for hidden in [
         "write_engram",
         "edit_engram",
@@ -928,11 +942,13 @@ fn http_smoke_initialize_list_and_search() {
         .pointer("/result/tools")
         .and_then(Value::as_array)
         .unwrap();
-    // The core tools plus `configure` and `add_domain`: GitHub collaboration
-    // is off by default, so the five collaboration tools stay hidden, but
-    // `add_domain` is write-gated not collab-gated, so it is visible (see
-    // crystalline-service's mcp_collab test suite for the full gating matrix).
-    assert_eq!(tools.len(), 17, "17 tools over HTTP");
+    // Every tool this server implements. The instance is writable, and the
+    // only gates left on the listing are the read-only ones: GitHub
+    // collaboration being off and nothing declaring provisioning both refuse
+    // at call time now, because a tool list may not vary per connection or as
+    // a side effect of another request on it (see crystalline-service's
+    // mcp_collab test suite for the full gating matrix).
+    assert_eq!(tools.len(), 22, "every tool over HTTP");
     let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
     assert!(names.contains(&"configure"), "{names:?}");
     assert!(names.contains(&"add_domain"), "{names:?}");
@@ -962,6 +978,91 @@ fn http_smoke_initialize_list_and_search() {
         "search over HTTP returns content: {search}"
     );
 
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// An unrelated process holding the HTTP address is not fatal: the daemon says
+/// which address failed, why, and what still works, then keeps serving MCP and
+/// ctl over its socket. With the endpoint on by default this is the way most
+/// people will ever meet a port conflict, so the line has to be actionable.
+///
+/// The squatted address is an ephemeral port this test binds itself, never the
+/// real `127.0.0.1:7411` default: a test must not fight the developer's own
+/// daemon for the one real port. The `--http` flag also proves it wins over the
+/// `CRYSTALLINE_SERVICE_HTTP=false` this env applies.
+#[test]
+fn an_occupied_http_address_is_not_fatal_and_says_so() {
+    let env = Env::new("busy");
+    env.setup_domain("eng");
+
+    let squatter = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = squatter.local_addr().unwrap().to_string();
+
+    let mut serve = Command::new(bin());
+    env.apply(&mut serve);
+    let mut child = serve
+        .args(["serve", "--http", &addr, "--config"])
+        .arg(env.config_path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // The warning rides the daemon's stderr. Reading it on a thread keeps a line
+    // that never arrives from blocking this test forever: the deadline below
+    // fails it instead.
+    let stderr = BufReader::new(child.stderr.take().unwrap());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in stderr.lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                return;
+            }
+        }
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut warning = None;
+    while Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(line) if line.contains("HTTP endpoint failed on") => {
+                warning = Some(line);
+                break;
+            }
+            Ok(_) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    let warning = warning.expect("the daemon reports the HTTP bind it could not take");
+    assert!(
+        warning.contains(&addr),
+        "the line names the address that failed: {warning}"
+    );
+    assert!(
+        warning.contains("MCP over the socket is unaffected"),
+        "the line says what still works: {warning}"
+    );
+    // Both opt-out spellings, and the flag one first: this daemon took its
+    // address from `--http`, which beats every `service.http` spelling, so a
+    // line that named only the config key would be advice that does nothing
+    // for the very case this test drives.
+    assert!(
+        warning.contains("serve --http off"),
+        "the line names the opt-out that applies to a flag-configured bind: {warning}"
+    );
+    assert!(
+        warning.contains("service.http=false"),
+        "the line names the config opt-out too: {warning}"
+    );
+
+    // The daemon itself is healthy: its socket answers as if nothing happened.
+    env.wait_ready();
+    let (ok, out) = env.run(&["ctl", "status", "--json"]);
+    assert!(ok, "ctl status still answers over the socket: {out}");
+
+    let _ = env.run(&["ctl", "shutdown"]);
     let _ = child.kill();
     let _ = child.wait();
 }

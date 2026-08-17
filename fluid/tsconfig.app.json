@@ -28,5 +28,13 @@
     "noUncheckedIndexedAccess": true,
     "exactOptionalPropertyTypes": true
   },
-  "include": ["src"]
+  "include": ["src"],
+  // tokens.test.ts reads index.css off disk through node:fs/node:path, which
+  // is Node-context code, not browser code; it typechecks under
+  // tsconfig.node-test.json instead, the way vite.config.ts and the
+  // Playwright suite already get their own Node-scoped project. Keeping it
+  // out of this program is what keeps this program's Node-free guarantee
+  // (no ambient `process`, no Node `Timeout` shadowing DOM `number`) true for
+  // the rest of the app.
+  "exclude": ["src/theme/tokens.test.ts"]
 }

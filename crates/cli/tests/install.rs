@@ -83,6 +83,278 @@ fn read_json(path: &Path) -> Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 
+// --- repairing an existing registration --------------------------------------
+//
+// A rerun used to stop at "already registered" and never look inside, so a
+// machine installed before `--harness` existed would have kept a flagless
+// entry for ever and its sessions would have been served the skill surface and
+// a second copy of the routing block. These four tests cover what a rerun now
+// does with each shape it can find.
+
+/// A shim that answers `mcp get` on stdout with a stored entry, in the exact
+/// prose `claude mcp get` prints (measured against `claude` 2.1.228), so the
+/// repair path runs end to end against something shaped like the real thing.
+///
+/// The body is emitted with `printf`, which is a shell builtin, because the
+/// child's `PATH` is the shim folder alone: a heredoc through `cat` finds no
+/// `cat` and silently produces an empty read-back.
+fn write_get_shim(bin_dir: &Path, name: &str, log: &Path, get_stdout: &str) {
+    std::fs::create_dir_all(bin_dir).unwrap();
+    let script = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$1\" = mcp ] && [ \"$2\" = get ]; then\n  printf '%b' '{}'\n  exit 0\nfi\nexit 0\n",
+        log.display(),
+        get_stdout
+    );
+    let path = bin_dir.join(name);
+    std::fs::write(&path, script).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// A `claude mcp get` body for a stored entry, with the newlines left as
+/// `printf '%b'` escapes so the whole thing is one shell-quoted argument.
+fn get_output(scope: &str, command: &str, args: &str) -> String {
+    format!(
+        "crystalline:\\n  Scope: {scope}\\n  Status: connected\\n  Type: stdio\\n  Command: {command}\\n  Args: {args}\\n  Environment:\\n"
+    )
+}
+
+#[test]
+fn a_registration_predating_the_harness_flag_is_repaired_in_place() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let bin_dir = work.path().join("bin");
+    let log = work.path().join("claude.log");
+    write_get_shim(
+        &bin_dir,
+        "claude",
+        &log,
+        &get_output(
+            "User config (available in all your projects)",
+            "crystalline",
+            "mcp",
+        ),
+    );
+
+    let out = install_cmd(&home, &bin_dir)
+        .args(["install", "claude-code"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("re-registered"), "{stdout}");
+
+    let logged = read_log(&log);
+    assert!(
+        logged.contains("mcp remove crystalline --scope user"),
+        "the removal names the scope it read back, so nothing migrates: {logged}"
+    );
+    assert!(
+        logged
+            .contains("mcp add crystalline --scope user -- crystalline mcp --harness claude-code"),
+        "and the new entry carries the flag: {logged}"
+    );
+}
+
+#[test]
+fn a_registration_that_already_carries_the_flag_is_left_untouched() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let bin_dir = work.path().join("bin");
+    let log = work.path().join("claude.log");
+    write_get_shim(
+        &bin_dir,
+        "claude",
+        &log,
+        &get_output(
+            "User config (available in all your projects)",
+            "crystalline",
+            "mcp --harness claude-code",
+        ),
+    );
+
+    let out = install_cmd(&home, &bin_dir)
+        .args(["install", "claude-code"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .contains("already registered"),
+        "rerunning leaves what is already correct untouched"
+    );
+    let logged = read_log(&log);
+    assert!(
+        !logged.contains("mcp remove"),
+        "nothing was removed: {logged}"
+    );
+    assert!(
+        !logged.contains("mcp add"),
+        "nothing was re-added: {logged}"
+    );
+}
+
+#[test]
+fn a_hand_edited_registration_is_reported_and_never_removed() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let bin_dir = work.path().join("bin");
+    let log = work.path().join("claude.log");
+    // Somebody's own wrapper. Overwriting it to deliver a context
+    // optimisation would be its own defect.
+    write_get_shim(
+        &bin_dir,
+        "claude",
+        &log,
+        &get_output(
+            "User config (available in all your projects)",
+            "/opt/bin/crystalline",
+            "mcp --read-only",
+        ),
+    );
+
+    let out = install_cmd(&home, &bin_dir)
+        .args(["install", "claude-code"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("left as it is"), "{stdout}");
+    assert!(
+        stdout.contains(
+            "claude mcp add crystalline --scope user -- crystalline mcp --harness claude-code"
+        ),
+        "with the command the user can run themselves: {stdout}"
+    );
+    assert!(
+        !read_log(&log).contains("mcp remove"),
+        "a customised entry is never removed"
+    );
+}
+
+/// The arm where the user momentarily has no registration at all, which is
+/// the state most worth exercising end to end. The shim accepts the remove and
+/// then refuses the add, exactly as a CLI that broke between the two calls
+/// would.
+#[test]
+fn a_repair_whose_add_fails_says_there_is_no_registration_right_now() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let bin_dir = work.path().join("bin");
+    let log = work.path().join("claude.log");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let script = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$1\" = mcp ] && [ \"$2\" = get ]; then\n  printf '%b' '{}'\n  exit 0\nfi\nif [ \"$1\" = mcp ] && [ \"$2\" = add ]; then\n  exit 1\nfi\nexit 0\n",
+        log.display(),
+        get_output(
+            "User config (available in all your projects)",
+            "crystalline",
+            "mcp",
+        )
+    );
+    let path = bin_dir.join("claude");
+    std::fs::write(&path, script).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let out = install_cmd(&home, &bin_dir)
+        .args(["install", "claude-code"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "a failed MCP registration is never fatal to the install"
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains("no registration right now"),
+        "the user has to learn their working entry is gone: {stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "claude mcp add crystalline --scope user -- crystalline mcp --harness claude-code"
+        ),
+        "with the plain add, which now succeeds because the remove already \
+         emptied the name: {stdout}"
+    );
+    let logged = read_log(&log);
+    assert!(
+        logged.contains("mcp remove crystalline --scope user"),
+        "{logged}"
+    );
+    assert!(logged.contains("mcp add crystalline"), "{logged}");
+}
+
+/// An entry carrying the user's own environment block is never repaired: the
+/// repair is remove-then-add and the add carries no `-e` pairs, so it would
+/// delete the environment with no message. The shape comes from live `claude
+/// mcp get` output.
+#[test]
+fn an_entry_carrying_an_environment_block_is_left_alone() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let bin_dir = work.path().join("bin");
+    let log = work.path().join("claude.log");
+    let body = format!(
+        "{}    CRYSTALLINE_SKILLS_SERVE=true\\n    FOO=bar\\n",
+        get_output(
+            "User config (available in all your projects)",
+            "crystalline",
+            "mcp",
+        )
+    );
+    write_get_shim(&bin_dir, "claude", &log, &body);
+
+    let out = install_cmd(&home, &bin_dir)
+        .args(["install", "claude-code"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("left as it is"), "{stdout}");
+    assert!(
+        stdout.contains("mcp remove crystalline --scope user && claude mcp add"),
+        "and the printed command removes first, because a same-name add is \
+         refused: {stdout}"
+    );
+    assert!(
+        !read_log(&log).contains("mcp remove"),
+        "the user's environment is never destroyed to deliver a context optimisation"
+    );
+}
+
+#[test]
+fn an_unreadable_read_back_leaves_the_entry_alone() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let bin_dir = work.path().join("bin");
+    let log = work.path().join("claude.log");
+    // `mcp get` succeeds but prints something this binary cannot parse: a
+    // future format, a localized build, anything. A repair that cannot read
+    // what it is repairing must not act.
+    write_get_shim(
+        &bin_dir,
+        "claude",
+        &log,
+        "crystalline: registered, somehow\\n",
+    );
+
+    let out = install_cmd(&home, &bin_dir)
+        .args(["install", "claude-code"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .contains("left as it is"),
+        "an unparseable read-back reports rather than acts"
+    );
+    assert!(
+        !read_log(&log).contains("mcp remove"),
+        "and above all never removes"
+    );
+}
+
 #[test]
 fn install_into_an_empty_home_writes_the_exact_managed_shape() {
     let work = tempfile::tempdir().unwrap();
@@ -122,8 +394,10 @@ fn install_into_an_empty_home_writes_the_exact_managed_shape() {
         "get first: {logged}"
     );
     assert!(
-        logged.contains("mcp add crystalline --scope user crystalline mcp"),
-        "add at user scope: {logged}"
+        logged
+            .contains("mcp add crystalline --scope user -- crystalline mcp --harness claude-code"),
+        "add at user scope, with the command after a separator and the harness \
+         named so the server can resolve its own skill surface: {logged}"
     );
 
     // All four skills land, and only those four.
@@ -136,8 +410,8 @@ fn install_into_an_empty_home_writes_the_exact_managed_shape() {
         assert!(claude_skill(&home, name).exists(), "skill {name} installed");
     }
     assert!(
-        !claude_skill(&home, "crystalline-memory").exists(),
-        "crystalline-memory is Desktop-only and never installed"
+        !claude_skill(&home, "crystalline-intelligence").exists(),
+        "crystalline-intelligence is Desktop-only and never installed"
     );
 }
 
@@ -392,7 +666,7 @@ fn codex_writes_hooks_json_and_agents_skills_with_a_trust_notice() {
     // MCP registration uses codex's `--` argument separator.
     let logged = read_log(&log);
     assert!(
-        logged.contains("mcp add crystalline -- crystalline mcp"),
+        logged.contains("mcp add crystalline -- crystalline mcp --harness"),
         "codex add form: {logged}"
     );
 }
@@ -466,7 +740,7 @@ fn copilot_writes_an_owned_hooks_file_and_copilot_skills() {
         "get first: {logged}"
     );
     assert!(
-        logged.contains("mcp add crystalline -- crystalline mcp"),
+        logged.contains("mcp add crystalline -- crystalline mcp --harness"),
         "copilot add form: {logged}"
     );
 }
@@ -605,7 +879,7 @@ fn copilot_project_scope_writes_under_dot_github() {
         "the trust notice is printed: {stdout}"
     );
     assert!(
-        read_log(&log).contains("mcp add crystalline -- crystalline mcp"),
+        read_log(&log).contains("mcp add crystalline -- crystalline mcp --harness copilot"),
         "the add form carries no scope: {}",
         read_log(&log)
     );
@@ -681,7 +955,7 @@ fn copilot_falls_back_to_gh_when_copilot_is_missing() {
         "the get went through gh's forwarding form: {logged}"
     );
     assert!(
-        logged.contains("copilot -- mcp add crystalline -- crystalline mcp"),
+        logged.contains("copilot -- mcp add crystalline -- crystalline mcp --harness copilot"),
         "the add went through gh's forwarding form: {logged}"
     );
     assert!(
@@ -708,7 +982,7 @@ fn a_missing_copilot_and_gh_print_the_plain_manual_command() {
     assert!(out.status.success(), "a missing harness CLI is never fatal");
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(
-        stdout.contains("copilot mcp add crystalline -- crystalline mcp"),
+        stdout.contains("copilot mcp add crystalline -- crystalline mcp --harness copilot"),
         "the manual command shows the plain copilot form: {stdout}"
     );
     assert!(
@@ -734,7 +1008,7 @@ fn copilot_prefers_the_copilot_binary_over_gh() {
         .success();
 
     assert!(
-        read_log(&copilot_log).contains("mcp add crystalline -- crystalline mcp"),
+        read_log(&copilot_log).contains("mcp add crystalline -- crystalline mcp --harness copilot"),
         "the standalone binary handled the registration: {}",
         read_log(&copilot_log)
     );
@@ -781,7 +1055,9 @@ fn project_scope_writes_relative_to_the_working_directory() {
     );
     // Claude Code project MCP scope is requested explicitly.
     assert!(
-        read_log(&log).contains("mcp add crystalline --scope project crystalline mcp"),
+        read_log(&log).contains(
+            "mcp add crystalline --scope project -- crystalline mcp --harness claude-code"
+        ),
         "project scope requested: {}",
         read_log(&log)
     );
@@ -802,7 +1078,9 @@ fn a_missing_harness_cli_prints_a_manual_command_and_still_succeeds() {
     assert!(out.status.success(), "a missing harness CLI is never fatal");
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(
-        stdout.contains("claude mcp add crystalline --scope user crystalline mcp"),
+        stdout.contains(
+            "claude mcp add crystalline --scope user -- crystalline mcp --harness claude-code"
+        ),
         "the manual MCP command is printed: {stdout}"
     );
     // The hooks and skills still installed despite the missing CLI.

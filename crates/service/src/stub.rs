@@ -28,12 +28,16 @@
 use std::sync::Arc;
 
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, ContentBlock, ErrorData, Implementation, JsonObject,
-    ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool, ToolAnnotations,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData,
+    Implementation, JsonObject, ListPromptsResult, ListResourceTemplatesResult,
+    ListResourcesResult, ListToolsResult, PaginatedRequestParams, ProtocolVersion,
+    ServerCapabilities, ServerInfo, Tool, ToolAnnotations,
 };
 use rmcp::service::RequestContext;
 use rmcp::{RoleServer, ServerHandler};
 use serde_json::Value;
+
+use crate::mcp::CacheHinted;
 
 /// The install-channel marker env var. The mcpb manifest sets it to "mcpb".
 pub const CHANNEL_ENV: &str = "CRYSTALLINE_CHANNEL";
@@ -222,12 +226,37 @@ impl DegradedServer {
 }
 
 impl ServerHandler for DegradedServer {
+    /// The degraded server serves exactly the revisions the healthy one does
+    /// ([`crate::mcp::SERVED_PROTOCOL_VERSIONS`]), so a client cannot learn a
+    /// different answer from a failure than it would have got from a healthy
+    /// start. rmcp negotiates its default `initialize` against this list
+    /// (rmcp 3.1.2 `service/server.rs:590`), which is the whole implementation:
+    /// a client asking for a revision we do not serve is answered with ours.
+    /// There is no HTTP refusal here because this server is stdio-only
+    /// (`crate::client` builds it on the bridge path), and refusing the
+    /// handshake would replace the explanation this server exists to deliver
+    /// with a dead session.
+    fn supported_protocol_versions(&self) -> std::borrow::Cow<'static, [ProtocolVersion]> {
+        std::borrow::Cow::Borrowed(crate::mcp::SERVED_PROTOCOL_VERSIONS)
+    }
+
     /// The degraded handshake: identify as `crystalline` at this binary's
     /// version and hand the connecting agent the per-case degraded copy as its
     /// `instructions`, advertising only the tools capability.
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::default();
         info.server_info = Implementation::new("crystalline", crystalline_core::VERSION);
+        // The degraded server keeps rmcp's default `initialize`, so this field
+        // **is** its downgrade target for a version it does not serve
+        // (`negotiate_protocol_version`'s `server_fallback`, rmcp 3.1.2
+        // `service/server.rs:590`). It names the newest revision that still has
+        // a handshake, for the reasons on
+        // [`crate::mcp::newest_legacy_handshake_version`], and it is set
+        // explicitly because `ServerInfo::default()` would otherwise leave
+        // rmcp's own `LATEST` here - a value that moves when the crate does and
+        // would one day answer a legacy handshake with a revision that has no
+        // handshake at all.
+        info.protocol_version = crate::mcp::newest_legacy_handshake_version();
         info.instructions = Some(self.status.instructions());
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info
@@ -237,13 +266,54 @@ impl ServerHandler for DegradedServer {
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
-        Ok(ListToolsResult {
-            tools: vec![Self::status_tool()],
-            meta: None,
-            next_cursor: None,
-        })
+        Ok(ListToolsResult::with_all_items(vec![Self::status_tool()]).with_cache_hints(&context))
+    }
+
+    /// # The three empty lists below are overridden for their caching hints
+    ///
+    /// This server advertises the tools capability alone (see `get_info`), so
+    /// it is tempting to leave `resources/list`, `resources/templates/list` and
+    /// `prompts/list` to rmcp's defaults. Those defaults answer with an empty
+    /// **complete** result and no hints (rmcp 3.1.2
+    /// `handler/server.rs:373-395`), and an un-advertised capability is not a
+    /// defence: `Service::handle_request` (`:50-245`) dispatches every method
+    /// unconditionally, the only capability check in the whole match being
+    /// `validate_tasks_capability`. A client replaying a stale method list from
+    /// a healthy session - the same case [`DegradedServer::call_tool`] already
+    /// handles for tool names - therefore reaches them. Three of the six
+    /// operations SEP-2549 names would then answer without the hints it makes a
+    /// MUST, so each is overridden here to return rmcp's own empty answer plus
+    /// the hints. `resources/read` and `prompts/get` need nothing: their
+    /// defaults are `method_not_found` (`:366-372`, `:396-404`), and a method
+    /// that returns no result carries no obligation.
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, ErrorData> {
+        Ok(ListResourcesResult::with_all_items(Vec::new()).with_cache_hints(&context))
+    }
+
+    /// Empty, with hints; see [`DegradedServer::list_resources`].
+    async fn list_resource_templates(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListResourceTemplatesResult, ErrorData> {
+        Ok(ListResourceTemplatesResult::with_all_items(Vec::new()).with_cache_hints(&context))
+    }
+
+    /// Empty, with hints; see [`DegradedServer::list_resources`]. The healthy
+    /// server's two onboarding prompts are deliberately absent here (see the
+    /// module doc).
+    async fn list_prompts(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListPromptsResult, ErrorData> {
+        Ok(ListPromptsResult::with_all_items(Vec::new()).with_cache_hints(&context))
     }
 
     /// Resolve `status` by name; every other name is unknown here.
@@ -261,14 +331,14 @@ impl ServerHandler for DegradedServer {
         &self,
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, ErrorData> {
+    ) -> Result<CallToolResponse, ErrorData> {
         if request.name == "status" {
             let text = serde_json::to_string(&self.status.tool_payload())
                 .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-            Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+            Ok(CallToolResult::success(vec![ContentBlock::text(text)]).into())
         } else {
             let text = format!("{}\n\n{}", self.status.instructions(), self.status.fix());
-            Ok(CallToolResult::error(vec![ContentBlock::text(text)]))
+            Ok(CallToolResult::error(vec![ContentBlock::text(text)]).into())
         }
     }
 }

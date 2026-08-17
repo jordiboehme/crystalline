@@ -7,6 +7,17 @@
  * and engrams by title, which the server answers because only the index knows
  * what is in the other domains.
  *
+ * Above both sits what the screen behind the palette can do right now, which
+ * the screen itself registers (`commands.tsx`). It leads because it is the one
+ * group that does not leave: every row under it is a jump somewhere else, and
+ * the thing a reader most often opens the palette for is the thing in front of
+ * them.
+ *
+ * What the frame registers is the exception, and it goes last. A row that is
+ * identical on every screen is chrome rather than "what you are looking at",
+ * and putting it first would have made the app's least specific action the
+ * default Enter on the screens that offer nothing of their own.
+ *
  * Titles only, on purpose. A palette is for reaching something whose name you
  * half remember, and a body-text match dressed as a title would send a reader
  * somewhere they did not ask for. What that leaves out is the last row: a query
@@ -20,6 +31,14 @@
 
 import { useQuery } from "@tanstack/react-query";
 import { Command } from "cmdk";
+import {
+  Compass,
+  FileText,
+  Library,
+  Search,
+  Command as Shortcut,
+} from "lucide-react";
+import type { LucideIcon } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router";
 
@@ -32,6 +51,7 @@ import {
   fetchSearch,
   titleMatchesKey,
 } from "../api/search";
+import { usePaletteCommands } from "../commands";
 import { RETIRED_CLASS, isRetired } from "../lifecycle";
 import { domainRoute, engramRoute, searchRoute } from "../paths";
 
@@ -61,6 +81,27 @@ function Heading({ children }: { children: string }) {
   return <span className={HEADING_CLASSES}>{children}</span>;
 }
 
+/**
+ * The glyph on a row, which says what kind of thing the row is.
+ *
+ * Decorative, and deliberately so: the group heading above already names the
+ * kind in words, so this is the same fact for the eye scanning a mixed list
+ * rather than a fact only the eye gets. The row's accessible name is its text,
+ * unchanged. `self-center` opts the icon out of the row's baseline, which is
+ * set for text of two sizes and would hang a square glyph off the bottom of
+ * it.
+ */
+function Glyph({ icon: Icon }: { icon: LucideIcon }) {
+  return (
+    <Icon
+      aria-hidden="true"
+      size={16}
+      strokeWidth={1.75}
+      className="shrink-0 self-center text-slate-500 dark:text-slate-400"
+    />
+  );
+}
+
 /** What one row is called, which is how the highlight keeps track of it. */
 function domainValue(name: string): string {
   return `domain:${name}`;
@@ -74,8 +115,16 @@ function searchValue(term: string): string {
   return `search:${term}`;
 }
 
+function actionValue(id: string): string {
+  return `action:${id}`;
+}
+
 export function CommandPalette() {
   const navigate = useNavigate();
+  // What the screen behind the palette can do, which is why the palette is
+  // more than a way around: a write is reachable from the keyboard without
+  // ever finding the button that also runs it.
+  const actions = usePaletteCommands();
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   // What the last pause settled on, which is what the server was asked for.
@@ -193,20 +242,36 @@ export function CommandPalette() {
   // question nobody is asking any more.
   const hits =
     term === typed ? (titles.data?.hits ?? []).slice(0, PALETTE_HITS) : [];
+  // The actions, matched here for the same reason the domain names are: they
+  // are already in hand, and a reader holding shift is asking the same
+  // question. Nothing typed matches everything, so an empty palette opens on
+  // what this screen can do.
+  const matching = actions.filter((command) =>
+    command.title.toLowerCase().includes(typed.toLowerCase()),
+  );
+  // Split by who offered them: the screen's own lead the list, the frame's
+  // trail it. Only the first group can take the highlight below.
+  const matchingActions = matching.filter(
+    (command) => command.scope === "screen",
+  );
+  const frameActions = matching.filter((command) => command.scope === "frame");
 
   // The top row, in the order they are drawn in. Enter follows the highlight,
   // and the highlight is the top row until somebody moves it off: an answer
   // landing above a highlighted row takes the highlight with it.
+  const firstAction = matchingActions[0];
   const firstDomain = domains[0];
   const firstHit = hits[0];
   const top =
-    firstDomain !== undefined
-      ? domainValue(firstDomain.name)
-      : firstHit !== undefined
-        ? engramValue(firstHit)
-        : typed === ""
-          ? ""
-          : searchValue(typed);
+    firstAction !== undefined
+      ? actionValue(firstAction.id)
+      : firstDomain !== undefined
+        ? domainValue(firstDomain.name)
+        : firstHit !== undefined
+          ? engramValue(firstHit)
+          : typed === ""
+            ? ""
+            : searchValue(typed);
   const highlighted = choice.top === top ? choice.value : top;
 
   /** Go, and get out of the way. */
@@ -235,7 +300,9 @@ export function CommandPalette() {
       onValueChange={(value) => {
         setChoice({ top, value });
       }}
-      overlayClassName="fixed inset-0 z-50 bg-slate-900/40"
+      // Behind the panel rather than level with it, and darker in dark: a
+      // palette that floats over the screen has to look like it does.
+      overlayClassName="fixed inset-0 z-40 bg-slate-950/25 dark:bg-slate-950/50"
       contentClassName="fixed top-24 left-1/2 z-50 w-[min(36rem,calc(100vw-2rem))] -translate-x-1/2 overflow-hidden rounded border border-slate-200 bg-white shadow-xl dark:border-slate-700 dark:bg-slate-900"
     >
       <Command.Input
@@ -248,6 +315,32 @@ export function CommandPalette() {
         label="Jump to"
         className="max-h-80 overflow-y-auto p-1.5 text-slate-900 dark:text-slate-100"
       >
+        {/*
+          First, above the jumps: what the reader is already looking at is
+          what they most likely opened the palette to act on, and everything
+          below this leaves the screen the actions belong to.
+        */}
+        {matchingActions.length > 0 && (
+          <Command.Group heading={<Heading>Actions</Heading>}>
+            {matchingActions.map((command) => (
+              <Command.Item
+                key={command.id}
+                value={actionValue(command.id)}
+                onSelect={() => {
+                  // Shut first, then act: an action that opens a dialog of its
+                  // own would otherwise open it behind this one.
+                  close();
+                  command.run();
+                }}
+                className={ROW_CLASSES}
+              >
+                <Glyph icon={Shortcut} />
+                <span className="truncate">{command.title}</span>
+              </Command.Item>
+            ))}
+          </Command.Group>
+        )}
+
         {domains.length > 0 && (
           <Command.Group heading={<Heading>Domains</Heading>}>
             {domains.map((domain) => (
@@ -259,6 +352,7 @@ export function CommandPalette() {
                 }}
                 className={ROW_CLASSES}
               >
+                <Glyph icon={Library} />
                 <span className="truncate">{domain.name}</span>
                 {domain.engrams !== null && (
                   <span className="text-xs text-slate-500 tabular-nums dark:text-slate-400">
@@ -287,6 +381,7 @@ export function CommandPalette() {
                   isRetired(hit.status) ? RETIRED_CLASS : ""
                 }`}
               >
+                <Glyph icon={FileText} />
                 <span className="truncate">{hit.title}</span>
                 {/*
                   And the word itself, only where it changes what the row
@@ -316,11 +411,36 @@ export function CommandPalette() {
               }}
               className={ROW_CLASSES}
             >
+              <Glyph icon={Search} />
               <span className="truncate">Search for {`"${typed}"`}</span>
               <span className="text-xs text-slate-500 dark:text-slate-400">
                 titles and text
               </span>
             </Command.Item>
+          </Command.Group>
+        )}
+
+        {/*
+          Last, and never the highlight on an opening palette: these rows are
+          the same wherever a reader is, so they are the app rather than the
+          place, and the row Enter lands on should be about the place.
+        */}
+        {frameActions.length > 0 && (
+          <Command.Group heading={<Heading>App</Heading>}>
+            {frameActions.map((command) => (
+              <Command.Item
+                key={command.id}
+                value={actionValue(command.id)}
+                onSelect={() => {
+                  close();
+                  command.run();
+                }}
+                className={ROW_CLASSES}
+              >
+                <Glyph icon={Compass} />
+                <span className="truncate">{command.title}</span>
+              </Command.Item>
+            ))}
           </Command.Group>
         )}
 

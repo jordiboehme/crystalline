@@ -8,6 +8,40 @@
  */
 @custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
 
+/*
+ * The app's own design tokens. One accent (a crystalline teal, not the
+ * framework's stock blue), and one five-step typographic scale; every screen
+ * draws from these rather than inventing sizes. The caption step is the
+ * floor: nothing in the app renders text below 12px.
+ */
+@theme {
+  --color-accent-50: #f0fdfa;
+  --color-accent-100: #ccfbf1;
+  --color-accent-200: #99f6e4;
+  --color-accent-300: #5eead4;
+  --color-accent-400: #2dd4bf;
+  --color-accent-500: #14b8a6;
+  --color-accent-600: #0d9488;
+  --color-accent-700: #0f766e;
+  --color-accent-800: #115e59;
+  --color-accent-900: #134e4a;
+  --color-accent-950: #042f2e;
+
+  --text-display: 1.5rem;
+  --text-display--line-height: 2rem;
+  --text-display--font-weight: 600;
+  --text-title: 1.25rem;
+  --text-title--line-height: 1.75rem;
+  --text-title--font-weight: 600;
+  --text-section: 1.0625rem;
+  --text-section--line-height: 1.5rem;
+  --text-section--font-weight: 600;
+  --text-body: 0.9375rem;
+  --text-body--line-height: 1.65;
+  --text-caption: 0.75rem;
+  --text-caption--line-height: 1rem;
+}
+
 @layer base {
   /*
    * Tell the browser which way the document leans, so form controls,
@@ -140,5 +174,26 @@
   [data-theme="dark"] .hljs-selector-class,
   [data-theme="dark"] .hljs-selector-id {
     color: #fcd34d;
+  }
+
+  /*
+   * The reading measure: prose is capped at about 70 characters, while
+   * anything marked .breakout (tables, diagrams, the graph) keeps the full
+   * column. Applied to the container of a rendered document.
+   */
+  .measured > :not(.breakout) {
+    max-width: 70ch;
+  }
+}
+
+@media print {
+  /* The engram page prints as a document: title, metadata line, content. */
+  main {
+    max-width: none;
+    padding: 0;
+  }
+  a {
+    color: inherit;
+    text-decoration: none;
   }
 }

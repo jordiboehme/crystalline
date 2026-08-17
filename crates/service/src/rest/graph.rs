@@ -71,9 +71,10 @@ const DEFAULT_MAX_NODES: usize = 100;
             status = 200,
             description = "The engine's own graph payload, unchanged: the flat \
                            node and edge lists a renderer draws from, with \
-                           `truncated` saying whether the node cap cut anything. \
-                           `id` is opaque and stable only within one response; \
-                           the address is `crystalline://domain/permalink`.",
+                           `truncated` saying whether the node cap cut anything \
+                           and `hidden` counting the nodes the cap cut, retired \
+                           ones first. `id` is opaque and stable only within one \
+                           response; the address is `crystalline://domain/permalink`.",
             body = Object,
             example = json!({
                 "nodes": [
@@ -95,7 +96,8 @@ const DEFAULT_MAX_NODES: usize = 100;
                     }
                 ],
                 "edges": [{ "from": 1, "to": 2, "rel_type": "relates_to" }],
-                "truncated": false
+                "truncated": false,
+                "hidden": 0
             }),
         ),
         (

@@ -20,7 +20,10 @@ use crate::store::{
     salience_prior,
 };
 
-use super::{cell_i64, cell_real, cell_text, query_all, query_first, scalar_i64};
+use super::{
+    cell_i64, cell_real, cell_text, like_escape, path_prefix_like, query_all, query_first,
+    scalar_i64,
+};
 
 const SNIPPET_MARGIN: usize = 70;
 const SNIPPET_LEAD: usize = 200;
@@ -218,10 +221,16 @@ async fn scored_lexical(
     } else {
         format!("WHERE {}", clauses.join(" AND "))
     };
-    // `ORDER BY e.id` is satisfied from the table's own rowid order, so this
-    // wide projection never reaches a sorter (verified by `EXPLAIN QUERY PLAN`:
-    // no `USE SORTER` line). Keep it that way: any other ordering here would
-    // spill every matched body to disk.
+    // `ORDER BY e.id` is the cheapest order this wide projection can be given:
+    // unscoped, or scoped by path alone, it is satisfied from the table's own
+    // rowid order and no sorter opens at all. Scoped to a domain it does sort -
+    // `d.name IN (...)` drives the join from `domain` and reaches `engram`
+    // through `idx_engram_domain`, whose order is not rowid order - and what
+    // holds that sorter down is the `LIMIT` in this same statement, which lets
+    // turso keep `candidate_cap` records rather than the match set. Both
+    // properties are pinned by `EXPLAIN QUERY PLAN` and a source scan in
+    // `tests/turso_only.rs`. Keep the bound and keep the order: any other
+    // ordering here, or a `GROUP BY`, would spill every matched body to disk.
     let sql = format!(
         "SELECT {CANDIDATE_COLUMNS} FROM engram e JOIN domain d ON d.id=e.domain_id {where_sql} \
          ORDER BY e.id LIMIT {candidate_cap}"
@@ -677,6 +686,18 @@ fn build_scalar_filters(
             })
             .collect();
         clauses.push(format!("d.name IN ({})", ph.join(",")));
+    }
+
+    // A folder filter, matched as a literal prefix: the caller hands the folder
+    // with its trailing slash, so `notes/` selects `notes/deep/y.md` and never
+    // the sibling `notes-misc/z.md`, and `like_escape` keeps a folder named
+    // `50%` or `a_b` a name rather than a pattern. It folds case on both sides,
+    // in SQL - see `path_prefix_like` for why that shape and not the other one
+    // in this crate.
+    if let Some(prefix) = query.path_prefix.as_deref().filter(|p| !p.is_empty()) {
+        clauses.push(path_prefix_like(*n, false));
+        params.push(Value::Text(format!("{}%", like_escape(prefix))));
+        *n += 1;
     }
 
     if let Some(t) = &query.engram_type {

@@ -10,36 +10,9 @@
 
 use std::collections::BTreeSet;
 
-/// Every operation the `/api/v1` router mounts, as `METHOD path`, spelled the
-/// way the OpenAPI document spells it (the engram wildcard becomes an ordinary
-/// `{permalink}` template, which is the only notation OpenAPI has for it).
-///
-/// This list is the contract rather than a convenience: it is hand-maintained
-/// against `rest::router`, and `the_document_covers_every_mounted_path` compares
-/// it against the document in *both* directions, so a new route that nobody
-/// annotated and an annotation for a route nobody mounted each fail here. The
-/// method is part of it because a documented method the router does not serve
-/// would generate a client function that compiles and then answers 405.
-const MOUNTED_OPERATIONS: &[&str] = &[
-    "GET /api/v1/openapi.json",
-    "POST /api/v1/auth/login",
-    "POST /api/v1/auth/logout",
-    "GET /api/v1/auth/me",
-    "GET /api/v1/domains",
-    "GET /api/v1/domains/{domain}/tree",
-    "GET /api/v1/domains/{domain}/manifest",
-    "GET /api/v1/domains/{domain}/engrams",
-    "GET /api/v1/domains/{domain}/engrams/{permalink}",
-    "GET /api/v1/search",
-    "GET /api/v1/vocabulary",
-    "GET /api/v1/context",
-    "GET /api/v1/activity",
-    "GET /api/v1/graph",
-    "GET /api/v1/users",
-    "POST /api/v1/users",
-    "PATCH /api/v1/users/{name}",
-    "DELETE /api/v1/users/{name}",
-];
+mod support;
+
+use support::MOUNTED_OPERATIONS;
 
 /// Where the committed snapshot lives, as an absolute path, for the writer.
 const SNAPSHOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/openapi/fluid-v1.json");

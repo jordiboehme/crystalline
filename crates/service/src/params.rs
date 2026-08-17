@@ -130,12 +130,52 @@ pub struct EditParams {
     /// Replace deeper subsections too when replacing a section.
     #[serde(default)]
     pub include_subsections: bool,
-    /// The checksum from a prior `read_engram`, guarding a virtual-domain edit
-    /// against a change since it was read: the edit is refused as a conflict if
-    /// the stored checksum no longer matches. Omit for last-write-wins. Ignored
-    /// by file domains, whose single-writer host owns the file on disk.
+    /// The checksum from a prior `read_engram`, guarding the edit against a
+    /// change since it was read: the edit is refused as a conflict if the
+    /// content changed, whichever storage kind holds it. Omit for
+    /// last-write-wins.
     #[serde(default)]
     pub expected_checksum: Option<String>,
+}
+
+/// Parameters for `save_engram`, the full-document save behind the HTTP PUT.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct SaveParams {
+    /// The engram's domain.
+    pub domain: String,
+    /// A bare permalink, title or `crystalline://` URL. Without the scheme
+    /// the identifier is domain-relative: never prefix it with a domain name.
+    pub identifier: String,
+    /// The complete markdown text, frontmatter included, written verbatim.
+    pub content: String,
+    /// The checksum from the read this save is based on. The save is refused
+    /// as a conflict when the stored version no longer matches, on file and
+    /// virtual domains alike.
+    pub expected_checksum: String,
+}
+
+/// Parameters for `retire_engram`, the guided retirement behind the HTTP
+/// retire action.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct RetireParams {
+    /// The engram's domain.
+    pub domain: String,
+    /// A bare permalink, title or `crystalline://` URL, domain-relative.
+    pub identifier: String,
+    /// The retirement status: deprecated, superseded or archived. This guided
+    /// flow accepts exactly these three; any other status goes through the
+    /// ordinary save path.
+    pub status: String,
+    /// The successor's permalink or title in the same domain. Wires the
+    /// superseded_by / supersedes relation pair. Required when status is
+    /// superseded (T005 would flag the result otherwise), refused for the
+    /// other two.
+    #[serde(default)]
+    pub successor: Option<String>,
+    /// The date validity ends, plain ISO (YYYY-MM-DD). Omitted means the end
+    /// date is unknown, never a sentinel.
+    #[serde(default)]
+    pub valid_to: Option<String>,
 }
 
 /// Parameters for `move_engram`.
@@ -165,6 +205,11 @@ pub struct DeleteParams {
     pub identifier: String,
     /// The engram's domain.
     pub domain: String,
+    /// The checksum from a prior read. When supplied, the delete is refused as
+    /// a conflict if the engram changed since that read. Omit for an
+    /// unconditional delete (the MCP tool's existing behavior).
+    #[serde(default)]
+    pub expected_checksum: Option<String>,
 }
 
 /// Parameters for `search_engrams`.
@@ -346,10 +391,12 @@ pub struct EvolveParams {
     pub today: Option<String>,
 }
 
-/// Parameters for `configure`. Omit everything to see the current settings
-/// and GitHub connection. `token` or `connect` handle a GitHub connect
-/// action on their own and ignore `set`/`unset` in the same call; give them
-/// on a separate call from a settings change.
+/// Parameters for `configure`. Omit everything to see the current settings,
+/// and with `github.enabled` on the GitHub connection too; with it off the
+/// snapshot reports that the feature is off and how to turn it on, leaving
+/// the stored credential unread. `token` or `connect` handle a GitHub
+/// connect action on their own and ignore `set`/`unset` in the same call;
+/// give them on a separate call from a settings change.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 pub struct ConfigureParams {
     /// Settings to change, key to value, for example { "github.enabled":

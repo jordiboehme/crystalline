@@ -9,7 +9,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.12.0"
+version = "0.13.0"
 authors = ["Jordi Boehme <jordi@boehme-lopez.de>"]
 edition = "2024"
 license = "AGPL-3.0-or-later"
@@ -25,9 +25,9 @@ crystalline-index = { path = "crates/index", default-features = false }
 crystalline-remote = { path = "crates/remote" }
 crystalline-service = { path = "crates/service" }
 
-clap = { version = "4.6.5", features = ["derive"] }
+clap = { version = "4.6.6", features = ["derive"] }
 tokio = { version = "1.53.1", features = ["full"] }
-rmcp = "2.2.0"
+rmcp = "3.1.2"
 turso = "0.7.2"
 candle-core = "0.11.0"
 candle-nn = "0.11.0"
@@ -61,7 +61,20 @@ serde_json = "1.0.151"
 indexmap = "2.14.0"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json"] }
 fs4 = "1.1.0"
-axum = "0.8.9"
+axum = { version = "0.8.9", features = ["ws"] }
+# The yrs `sync` feature makes observer callbacks Send + Sync for the
+# multi-threaded server; the `yrs::sync` protocol module itself is
+# unconditional. Wire format pinned in crates/service/tests/collab_wire.rs.
+yrs = { version = "0.27.3", features = ["sync"] }
+# Text diffing for collaborative merge conflict surfacing (crates/service).
+similar = "3.1.2"
+# Cheaply cloned byte buffers for the collab broadcast fan-out; also the shape
+# axum's WebSocket binary frames take, so a frame crosses the seam without a
+# copy. Already in the graph through axum and tokio.
+bytes = "1.12.1"
+# Dev-only: a WebSocket client to drive the collab session tests against the
+# real server socket.
+tokio-tungstenite = "0.30.0"
 # Only the cookie extractor is used (session and CSRF handling in the REST
 # auth layer); default features pull in tracing for unrelated extractors.
 axum-extra = { version = "0.12.6", default-features = false, features = ["cookie"] }
@@ -72,15 +85,15 @@ time = { version = "0.3.55", default-features = false }
 libc = "0.2.189"
 serde_yaml_ng = "0.10.0"
 toml = "1.1.4"
-async-trait = "0.1.91"
+async-trait = "0.1.92"
 uuid = { version = "1.24.0", features = ["v4"] }
-thiserror = "2.0.19"
+thiserror = "2.0.20"
 anyhow = "1.0.104"
 etcetera = "0.11.0"
 walkdir = "2.5.0"
-globset = "0.4.19"
+globset = "0.4.20"
 schemars = "1.2.2"
-futures = "0.3.33"
+futures = "0.3.34"
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Threading"] }
@@ -95,12 +108,33 @@ diffy = "0.5.1"
 keyring = { version = "4.1.6", default-features = false, features = ["v1"] }
 tar = "0.4.46"
 flate2 = "1.1.9"
-base64 = "0.22.1"
+base64 = "0.23.1"
 # Password hashing for the REST auth store (crates/service). Default features
 # already pull `password-hash` and its `rand_core`, so the salt and the session
 # token both draw from `password_hash::rand_core::OsRng` and no separate `rand`
 # dependency is needed; `std` is on so hashing errors carry `std::error::Error`.
 argon2 = { version = "0.5.3", features = ["std"] }
+
+# Zip archives for the domain archive download and import (crates/service).
+# Default features drag aes, bzip2, lzma, ppmd, zstd and xz in; the archives
+# this reads and writes are deflate only, and flate2 is already in the graph
+# through crates/remote, so the lean deflate backend is the whole need.
+zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+
+# The Fluid web bundle, compiled into the binary (crates/service, behind the
+# `fluid-ui` feature). This crate has no default features, and all three named
+# here are load bearing rather than nice to have:
+# `interpolate-folder-path` is what lets the derive read `$OUT_DIR/fluid-dist`
+# (without it the path is taken literally and the build fails), `mime-guess` is
+# what gives `Metadata::mimetype()`, the Content-Type of every served file, and
+# `include-exclude` is what makes the `#[exclude = "*.map"]` attribute compile
+# at all (the derive rejects it otherwise, by name). `sha256_hash()`, the ETag
+# source, needs no feature.
+rust-embed = { version = "8.12", features = [
+    "interpolate-folder-path",
+    "mime-guess",
+    "include-exclude",
+] }
 
 # The OpenAPI document for the REST surface (crates/service). Default features
 # are exactly the `macros` one the `#[utoipa::path]`, `ToSchema` and

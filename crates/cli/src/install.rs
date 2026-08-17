@@ -50,7 +50,7 @@ use serde::Serialize;
 use serde_json::{Map, Value, json};
 
 use crystalline_core::{HarnessKind, HarnessPaths, config, harness_paths};
-use crystalline_service::{CliRun, run_harness_cli};
+use crystalline_service::{CliCapture, CliRun, run_harness_cli, run_harness_cli_capture};
 
 use crate::receipt;
 
@@ -94,7 +94,7 @@ const HOOK_TIMEOUT_SECS: u64 = 10;
 /// in [`crystalline_core::SKILL_ASSETS`] by their `install_managed` flag. The
 /// assets are embedded with `include_str!` so the binary is self-contained and
 /// an install from a downloaded release carries the same skills a clone would.
-/// `crystalline-memory` is deliberately not managed: it is the single
+/// `crystalline-intelligence` is deliberately not managed: it is the single
 /// consolidated skill for Claude Desktop, which has no hooks and installs one
 /// skill at a time. The MCP server serves all five regardless (see
 /// [`crystalline_core::skills`]); only installation is filtered here.
@@ -110,7 +110,10 @@ pub(crate) fn managed_skills() -> Vec<(&'static str, &'static str)> {
 /// release drops or renames a managed skill, its old folder name is appended
 /// here in the same change and never leaves the list, so install and the
 /// session-start auto-reconcile can retire a leftover even when no receipt
-/// records it (a zip-unpacked install, a lost state directory).
+/// records it (a zip-unpacked install, a lost state directory). The 0.13.0
+/// rename of the consolidated Desktop skill to `crystalline-intelligence`
+/// deliberately adds nothing here: that skill was never install-managed, so no
+/// harness folder ever held its old name and there is nothing to retire.
 pub(crate) const RETIRED_SKILLS: &[&str] = &[];
 
 /// How a reconcile treats a managed skill whose file is missing: an explicit
@@ -486,29 +489,53 @@ fn write_settings(path: &Path, root: &Map<String, Value>) -> anyhow::Result<()> 
 
 // --- MCP registration (shell-outs, never fatal) ------------------------------
 
+/// The command and arguments the registered MCP server runs: this binary's
+/// own `mcp` verb, told which harness it is serving.
+///
+/// The `--harness` flag is what makes the skill-surface decision per harness
+/// rather than per machine. The spawned process reads it, asks this machine's
+/// install receipt whether that harness has session hooks wired, and withholds
+/// the skill surface and the second copy of the routing block when it does.
+/// The receipt alone could only answer "is anything onboarded here".
+fn mcp_server_command(harness: HarnessKind) -> Vec<String> {
+    ["crystalline", "mcp", "--harness", harness.id()]
+        .into_iter()
+        .map(String::from)
+        .collect()
+}
+
 /// The `mcp add` argument vector for a harness. Claude Code takes an explicit
 /// `--scope`; Codex and Copilot register MCP servers per user only, so
 /// `--project` still lands globally (called out in the printed notice).
+///
+/// **Every arm emits `--` before the command.** Codex and Copilot always did.
+/// The Claude Code arm did not, and passed `crystalline mcp` as bare trailing
+/// positionals, which worked only because the command carried no flags of its
+/// own: the Claude Code documentation is explicit that "without `--`, Claude
+/// Code would try to parse the server's flags [...] as its own options", so
+/// `--harness` appended there would have been eaten by `claude mcp add`.
+/// Verified against `claude` 2.1.228 before this was written: adding a probe
+/// entry with `--scope user -- crystalline mcp --harness claude-code` and
+/// reading it back gives `Command: crystalline`, `Args: mcp --harness
+/// claude-code`.
 fn mcp_add_args(harness: HarnessKind, project: bool) -> Vec<String> {
-    let args: Vec<&str> = match harness {
+    let mut args: Vec<String> = match harness {
         HarnessKind::ClaudeCode => {
             let scope = if project { "project" } else { "user" };
-            vec![
-                "mcp",
-                "add",
-                "crystalline",
-                "--scope",
-                scope,
-                "crystalline",
-                "mcp",
-            ]
+            ["mcp", "add", "crystalline", "--scope", scope, "--"]
+                .into_iter()
+                .map(String::from)
+                .collect()
         }
-        HarnessKind::Codex => vec!["mcp", "add", "crystalline", "--", "crystalline", "mcp"],
-        // The same stdio form as Codex, kept as its own arm so the two can
-        // diverge without surprises.
-        HarnessKind::Copilot => vec!["mcp", "add", "crystalline", "--", "crystalline", "mcp"],
+        // The same stdio form for both, matched together but kept apart from
+        // the Claude Code arm above, which is the one that takes a scope.
+        HarnessKind::Codex | HarnessKind::Copilot => ["mcp", "add", "crystalline", "--"]
+            .into_iter()
+            .map(String::from)
+            .collect(),
     };
-    args.into_iter().map(String::from).collect()
+    args.extend(mcp_server_command(harness));
+    args
 }
 
 /// The version-skew guard for the hooks: they run whatever `crystalline` the
@@ -547,17 +574,311 @@ fn path_binary_notice() -> Option<String> {
     }
 }
 
+/// One MCP registration as a harness CLI reports it back.
+#[derive(Debug, PartialEq, Eq)]
+struct StoredMcpEntry {
+    /// The scope the CLI says the entry lives in, lowercased.
+    scope: String,
+    /// The transport the entry declares (`stdio`, `http`, ...).
+    transport: String,
+    /// The executable the entry launches.
+    command: String,
+    /// Its arguments, whitespace split (which is all the CLI gives back).
+    args: Vec<String>,
+    /// The lines of its environment block, one `KEY=value` per entry.
+    ///
+    /// Carried purely so a non-empty block can refuse the repair. It must
+    /// never be *reproduced*: `mcp add` would need each pair back as `-e
+    /// KEY=value`, and a value containing whitespace has already been mangled
+    /// by the same space joining that flattens `Args:`.
+    env: Vec<String>,
+}
+
+/// The field labels `claude mcp get` prints, so a line that is not one of them
+/// can be recognized as the *content* of the block it follows rather than
+/// mistaken for a field.
+///
+/// Read off live output rather than imagined: a stdio entry prints `Scope`,
+/// `Status` (plus `Issue` when it failed to connect), `Type`, `Command`,
+/// `Args` and `Environment`; an http entry prints `Scope`, `Status`, `Type`,
+/// `URL` and `Headers`.
+const CLAUDE_MCP_GET_LABELS: [&str; 9] = [
+    "Scope",
+    "Status",
+    "Issue",
+    "Type",
+    "Command",
+    "Args",
+    "Environment",
+    "URL",
+    "Headers",
+];
+
+/// Parse `claude mcp get crystalline` output into the stored entry.
+///
+/// The format is prose and undocumented, so this is deliberately strict: any
+/// shape it does not recognize returns `None`, and [`mcp_repair`] then leaves
+/// the entry alone. Measured against `claude` 2.1.228:
+///
+/// ```text
+/// crystalline:
+///   Scope: User config (available in all your projects)
+///   Status: ✔ Connected
+///   Type: stdio
+///   Command: crystalline
+///   Args: mcp --harness claude-code
+///   Environment:
+///     CRYSTALLINE_SKILLS_SERVE=true
+///     FOO=bar
+///
+/// To remove this server, run: claude mcp remove crystalline -s user
+/// ```
+///
+/// **Every field the command prints is parsed, and that is a rule rather than
+/// tidiness.** A parser narrower than its input reads a customised entry as a
+/// plain one: the environment block above was originally skipped, so an entry
+/// carrying it matched the flagless command exactly and the repair would have
+/// removed and re-added it, destroying the user's environment with no message.
+/// So whenever this format grows a field, it is parsed here first and turned
+/// into a refusal, never ignored.
+///
+/// Three properties worth stating because they decide the rest of the repair.
+/// `Args:` is **space joined**, so any quoting a user applied is already lost
+/// and an argument containing a space cannot be recovered - which is one more
+/// reason a command that does not match exactly is left alone rather than
+/// rewritten. The command **exits 0 even for an entry it could not connect
+/// to**, so nothing about content may be read from the exit status. And an
+/// http entry prints `URL:`/`Headers:` and no `Command:`/`Args:` at all, so it
+/// leaves this function as `None` rather than as a half-read stdio entry.
+fn parse_claude_mcp_get(stdout: &str) -> Option<StoredMcpEntry> {
+    let mut scope = None;
+    let mut transport = None;
+    let mut command = None;
+    let mut args = None;
+    let mut env: Vec<String> = Vec::new();
+    // The environment block is the indented content that follows the
+    // `Environment:` label, ending at the first blank line or the next known
+    // field label. Anything unrecognized inside it counts as content, so an
+    // unfamiliar shape refuses the repair instead of being skipped.
+    let mut in_env = false;
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            in_env = false;
+            continue;
+        }
+        let is_field = line
+            .split_once(':')
+            .is_some_and(|(label, _)| CLAUDE_MCP_GET_LABELS.contains(&label));
+        if in_env && !is_field {
+            env.push(line.to_string());
+            continue;
+        }
+        in_env = false;
+        if let Some(rest) = line.strip_prefix("Scope:") {
+            scope = Some(rest.trim().to_ascii_lowercase());
+        } else if let Some(rest) = line.strip_prefix("Type:") {
+            transport = Some(rest.trim().to_ascii_lowercase());
+        } else if let Some(rest) = line.strip_prefix("Command:") {
+            command = Some(rest.trim().to_string());
+        } else if let Some(rest) = line.strip_prefix("Args:") {
+            args = Some(
+                rest.split_whitespace()
+                    .map(String::from)
+                    .collect::<Vec<String>>(),
+            );
+        } else if let Some(rest) = line.strip_prefix("Environment:") {
+            in_env = true;
+            if !rest.trim().is_empty() {
+                env.push(rest.trim().to_string());
+            }
+        }
+    }
+    Some(StoredMcpEntry {
+        scope: scope?,
+        transport: transport?,
+        command: command?,
+        args: args?,
+        env,
+    })
+}
+
+/// What `install` should do about a registration that is already there.
+#[derive(Debug, PartialEq, Eq)]
+enum McpRepair {
+    /// It already runs what we would register: nothing to do.
+    UpToDate,
+    /// It is ours and runs the old flagless command: remove and re-add.
+    Repair,
+    /// Not ours to touch. The entry stays exactly as it is and the user is
+    /// shown the command that would change it.
+    LeaveAlone,
+}
+
+/// Decide from a read-back entry, without touching anything.
+///
+/// **The rules are refusals, and the default branch is one of them.**
+///
+/// - A command or argument vector that is neither what we write today nor the
+///   flagless one we used to write is somebody's customisation: a different
+///   binary path, a wrapper, an extra flag. Overwriting it to deliver a
+///   context optimisation would be its own defect, and the cost of leaving it
+///   is that the surface stays served, which is the safe direction.
+/// - **A scope other than the one we would write is never repaired**, because
+///   the repair is remove-then-add and `mcp add` writes the scope we pass:
+///   repairing a user-placed local entry would silently migrate it. `mcp get`
+///   does print the scope (verified on `claude` 2.1.228, `Scope: User config
+///   (available in all your projects)`), so this is decidable rather than
+///   guessed - and when the scope line is a shape we do not recognize, that is
+///   again a refusal.
+/// - **A non-empty environment block is never repaired.** The repair is
+///   remove-then-add and the add carries no `-e` pairs, so it would delete
+///   whatever the user had set with no message at all. Reproducing the block
+///   is not the answer either: `mcp get` prints it after the same space
+///   joining that flattens `Args:`, so a value containing whitespace cannot be
+///   handed back faithfully.
+/// - **A transport other than stdio is never repaired.** An http entry names
+///   the same server by url; it is not the command this install writes and has
+///   no `--harness` to gain.
+fn mcp_repair(stored: &StoredMcpEntry, harness: HarnessKind, project: bool) -> McpRepair {
+    let want = mcp_server_command(harness);
+    let (want_command, want_args) = want.split_first().expect("the command is never empty");
+    // The flagless form every registration written before `--harness` existed
+    // carries: the same command with the two flag tokens removed.
+    let legacy_args: Vec<String> = want_args
+        .iter()
+        .take_while(|a| a.as_str() != "--harness")
+        .cloned()
+        .collect();
+
+    let scope_ok = match harness {
+        // Only Claude Code takes a scope at all; the other two register per
+        // user with no scope concept, so there is nothing to migrate.
+        HarnessKind::ClaudeCode => {
+            let wanted = if project {
+                "project config"
+            } else {
+                "user config"
+            };
+            stored.scope.starts_with(wanted)
+        }
+        HarnessKind::Codex | HarnessKind::Copilot => true,
+    };
+    if !scope_ok
+        || stored.transport != "stdio"
+        || !stored.env.is_empty()
+        || stored.command != *want_command
+    {
+        return McpRepair::LeaveAlone;
+    }
+    if stored.args == want_args {
+        McpRepair::UpToDate
+    } else if stored.args == legacy_args {
+        McpRepair::Repair
+    } else {
+        McpRepair::LeaveAlone
+    }
+}
+
+/// Read an existing registration back, for the harnesses whose `mcp get`
+/// format has actually been verified. `None` means "we cannot see what is
+/// there", which is a refusal to repair rather than a licence to overwrite.
+///
+/// Only Claude Code is verified: neither `codex` nor `copilot` was installed
+/// on any machine this was built against, so their output shape is unknown and
+/// an existing entry of theirs is left exactly as it is.
+fn read_back_mcp(harness: HarnessKind) -> Option<StoredMcpEntry> {
+    if harness != HarnessKind::ClaudeCode {
+        return None;
+    }
+    match run_harness_cli_capture(harness, &["mcp", "get", "crystalline"]) {
+        CliCapture::Ok { stdout } => parse_claude_mcp_get(&stdout),
+        CliCapture::Failed | CliCapture::NotFound => None,
+    }
+}
+
 /// Register the MCP server: check presence with `mcp get` first, then `mcp
 /// add`. A missing CLI or a failing add never aborts the install; it records
 /// the command to run by hand instead. The manual command always shows the
 /// harness's own plain CLI form, whatever candidate actually ran.
+///
+/// # Repairing an entry that predates `--harness`
+///
+/// A rerun used to stop at "already registered" and never look inside, which
+/// would have left every machine installed before this change running a
+/// flagless `crystalline mcp` for ever: the server could not identify its
+/// harness, so it would serve the skill surface and a second copy of the
+/// routing block to a session whose own hook already delivered one. So an
+/// existing entry is now read back and re-registered when it runs the command
+/// we used to write.
+///
+/// **Repair in place or not at all**, which is why the read-back matters more
+/// than the write: remove-then-add is the only order these CLIs support, so
+/// anything we cannot positively identify as our own, in the scope we would
+/// write, is reported and left alone. An unreadable or unparseable read-back
+/// **never removes**.
+///
+/// The window between the remove and the add is unavoidable and self-heals: a
+/// process that dies inside it leaves no entry, and the next run finds nothing
+/// and adds cleanly. The state where the remove succeeded and the add failed
+/// is reported as its own status, because at that moment the user has no
+/// registration at all and a generic "registration failed" would not say so.
 fn install_mcp(harness: HarnessKind, project: bool) -> McpReport {
     let add_args = mcp_add_args(harness, project);
     let manual = format!("{} {}", harness.cli(), add_args.join(" "));
+    // What a user must run when an entry is already there. A bare `mcp add`
+    // would not do: these CLIs refuse a same-name add outright (`claude mcp
+    // add crystalline` on an existing name exits 1 with "already exists"), so
+    // a printed command has to remove first or it cannot succeed as printed.
+    let manual_replace = format!(
+        "{} {} && {manual}",
+        harness.cli(),
+        mcp_remove_args(harness, project).join(" ")
+    );
 
     match run_harness_cli(harness, &["mcp", "get", "crystalline"]) {
         CliRun::NotFound => return McpReport::new("cli-missing", Some(manual)),
-        CliRun::Ok => return McpReport::new("already-present", None),
+        CliRun::Ok => {
+            let repair = read_back_mcp(harness)
+                .map(|stored| mcp_repair(&stored, harness, project))
+                // Unread or unparseable: report what is there and touch
+                // nothing.
+                .unwrap_or(McpRepair::LeaveAlone);
+            match repair {
+                McpRepair::UpToDate => return McpReport::new("already-present", None),
+                McpRepair::LeaveAlone => {
+                    return McpReport::new("already-present-customised", Some(manual_replace));
+                }
+                McpRepair::Repair => {
+                    let remove_args = mcp_remove_args(harness, project);
+                    let remove_ref: Vec<&str> = remove_args.iter().map(String::as_str).collect();
+                    match run_harness_cli(harness, &remove_ref) {
+                        CliRun::Ok => {}
+                        // The remove itself failed, so the working entry is
+                        // still in place: report it as present rather than
+                        // alarming the user about a state that did not happen.
+                        CliRun::Failed | CliRun::NotFound => {
+                            return McpReport::new(
+                                "already-present-customised",
+                                Some(manual_replace),
+                            );
+                        }
+                    }
+                    let add_ref: Vec<&str> = add_args.iter().map(String::as_str).collect();
+                    return match run_harness_cli(harness, &add_ref) {
+                        CliRun::Ok => McpReport::new("repaired", None),
+                        // The loud arm: the old entry is gone and the new one
+                        // did not land, so right now there is no registration.
+                        // The plain add, deliberately: the remove above
+                        // succeeded, so there is no entry left to collide with
+                        // and a remove-first command would fail on nothing.
+                        CliRun::Failed | CliRun::NotFound => {
+                            McpReport::new("repair-failed", Some(manual))
+                        }
+                    };
+                }
+            }
+        }
         CliRun::Failed => {}
     }
 
@@ -567,6 +888,20 @@ fn install_mcp(harness: HarnessKind, project: bool) -> McpReport {
         CliRun::Ok => McpReport::new("registered", None),
         CliRun::Failed => McpReport::new("failed", Some(manual)),
     }
+}
+
+/// The `mcp remove` argument vector, scoped the same way the add is: the
+/// removal half of a repair must name the scope it is removing from, or the
+/// CLI takes whichever scope happens to hold the name.
+fn mcp_remove_args(harness: HarnessKind, project: bool) -> Vec<String> {
+    let args: Vec<&str> = match harness {
+        HarnessKind::ClaudeCode => {
+            let scope = if project { "project" } else { "user" };
+            vec!["mcp", "remove", "crystalline", "--scope", scope]
+        }
+        HarnessKind::Codex | HarnessKind::Copilot => vec!["mcp", "remove", "crystalline"],
+    };
+    args.into_iter().map(String::from).collect()
 }
 
 /// Deregister the MCP server, tolerantly: a missing CLI records the manual
@@ -1097,6 +1432,13 @@ fn mcp_line(m: &McpReport) -> String {
     let manual = m.manual_command.as_deref().unwrap_or("");
     match m.status {
         "already-present" => "already registered".to_string(),
+        "already-present-customised" => format!(
+            "already registered, and left as it is because it is not the entry this install writes. To register Crystalline's own, run: {manual}"
+        ),
+        "repaired" => "re-registered (it predated the --harness argument)".to_string(),
+        "repair-failed" => format!(
+            "the old registration was removed and the new one could not be added, so there is no registration right now. Add it with: {manual}"
+        ),
         "registered" => "registered".to_string(),
         "removed" => "removed".to_string(),
         "not-present" => "not registered (nothing to remove)".to_string(),
@@ -1603,6 +1945,239 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+
+    // --- MCP registration ----------------------------------------------------
+
+    /// Every arm registers the server with `--harness <id>`, and every arm
+    /// puts the command after a `--` separator.
+    ///
+    /// The separator is the whole finding behind this change. Codex and
+    /// Copilot always emitted one. The Claude Code arm did not, and its own
+    /// documentation says that without `--` it parses the server's flags as
+    /// its own options, so `--harness` appended to the old form would have
+    /// been eaten by `claude mcp add` rather than reaching the server.
+    /// Verified against `claude` 2.1.228 before this was written: the stored
+    /// entry reads back `Command: crystalline`, `Args: mcp --harness
+    /// claude-code`.
+    #[test]
+    fn every_mcp_add_form_separates_the_command_and_names_the_harness() {
+        assert_eq!(
+            mcp_add_args(HarnessKind::ClaudeCode, false),
+            vec![
+                "mcp",
+                "add",
+                "crystalline",
+                "--scope",
+                "user",
+                "--",
+                "crystalline",
+                "mcp",
+                "--harness",
+                "claude-code",
+            ]
+        );
+        assert_eq!(
+            mcp_add_args(HarnessKind::ClaudeCode, true)[4],
+            "project",
+            "the scope still follows --project"
+        );
+        for harness in [HarnessKind::Codex, HarnessKind::Copilot] {
+            assert_eq!(
+                mcp_add_args(harness, false),
+                vec![
+                    "mcp",
+                    "add",
+                    "crystalline",
+                    "--",
+                    "crystalline",
+                    "mcp",
+                    "--harness",
+                    harness.id(),
+                ]
+            );
+        }
+    }
+
+    /// The removal half of a repair names the same scope the add writes, or
+    /// the CLI removes from whichever scope happens to hold the name.
+    #[test]
+    fn the_remove_form_is_scoped_the_same_way_the_add_is() {
+        assert_eq!(
+            mcp_remove_args(HarnessKind::ClaudeCode, false),
+            vec!["mcp", "remove", "crystalline", "--scope", "user"]
+        );
+        assert_eq!(
+            mcp_remove_args(HarnessKind::ClaudeCode, true),
+            vec!["mcp", "remove", "crystalline", "--scope", "project"]
+        );
+        assert_eq!(
+            mcp_remove_args(HarnessKind::Codex, false),
+            vec!["mcp", "remove", "crystalline"]
+        );
+    }
+
+    /// The read-back format, captured verbatim from `claude` 2.1.228 rather
+    /// than imagined. Args come back space joined, which is why an entry that
+    /// is not exactly one of our two known shapes is left alone rather than
+    /// rewritten: the original quoting is already gone.
+    #[test]
+    fn the_claude_read_back_parses_every_field_the_command_prints() {
+        let stdout = "crystalline:\n  Scope: User config (available in all your projects)\n  Status: \u{2718} Failed to connect\n  Issue: CONNECTION_CLOSED: Connection closed\n  Type: stdio\n  Command: crystalline\n  Args: mcp --harness claude-code\n  Environment:\n\nTo remove this server, run: claude mcp remove crystalline -s user\n";
+        let entry = parse_claude_mcp_get(stdout).expect("the verified format parses");
+        assert_eq!(entry.scope, "user config (available in all your projects)");
+        assert_eq!(entry.transport, "stdio");
+        assert_eq!(entry.command, "crystalline");
+        assert_eq!(entry.args, vec!["mcp", "--harness", "claude-code"]);
+        assert!(
+            entry.env.is_empty(),
+            "an empty Environment: block reads as empty, and the trailing \
+             sentence after the blank line is not mistaken for its content: {:?}",
+            entry.env
+        );
+
+        // The block's contents, including a value carrying a colon of its own.
+        let with_env = stdout.replace(
+            "  Environment:\n",
+            "  Environment:\n    CRYSTALLINE_SKILLS_SERVE=true\n    FOO=a:b\n",
+        );
+        assert_eq!(
+            parse_claude_mcp_get(&with_env).unwrap().env,
+            vec!["CRYSTALLINE_SKILLS_SERVE=true", "FOO=a:b"]
+        );
+
+        // An http entry prints URL and Headers and no command at all, so it
+        // never reads as a half-parsed stdio entry.
+        let http = "crystalline:\n  Scope: User config (available in all your projects)\n  Status: \u{2718} Failed to connect\n  Type: http\n  URL: https://example.test/mcp\n  Headers:\n    Authorization: Bearer x\n";
+        assert!(parse_claude_mcp_get(http).is_none());
+
+        // Anything missing a field it needs is unreadable, which is a refusal
+        // to repair rather than a licence to overwrite.
+        assert!(parse_claude_mcp_get("").is_none());
+        assert!(parse_claude_mcp_get("crystalline:\n  Command: crystalline\n").is_none());
+        assert!(parse_claude_mcp_get("No MCP server named \"crystalline\".").is_none());
+        assert!(
+            parse_claude_mcp_get(&stdout.replace("  Type: stdio\n", "")).is_none(),
+            "a format without the transport is a format we have not verified"
+        );
+    }
+
+    /// **F-5.1 red.** An entry carrying an environment block parses to exactly
+    /// the flagless command we would repair, so remove-then-add destroys the
+    /// user's environment with no message at all. Constructed from live
+    /// `claude mcp get` output.
+    #[test]
+    fn an_entry_with_an_environment_block_is_never_repaired() {
+        let stdout = "crystalline:\n  Scope: User config (available in all your projects)\n  Status: \u{2714} Connected\n  Type: stdio\n  Command: crystalline\n  Args: mcp\n  Environment:\n    CRYSTALLINE_SKILLS_SERVE=true\n    FOO=bar\n\nTo remove this server, run: claude mcp remove crystalline -s user\n";
+        let entry = parse_claude_mcp_get(stdout).expect("the format parses");
+        assert_eq!(
+            mcp_repair(&entry, HarnessKind::ClaudeCode, false),
+            McpRepair::LeaveAlone,
+            "an environment block is a customisation, and remove-then-add would \
+             destroy it silently"
+        );
+    }
+
+    /// The repair decision table. Only one row acts.
+    #[test]
+    fn only_our_own_flagless_entry_in_our_own_scope_is_repaired() {
+        let entry = |scope: &str, command: &str, args: &[&str]| StoredMcpEntry {
+            scope: scope.to_string(),
+            transport: "stdio".to_string(),
+            command: command.to_string(),
+            args: args.iter().map(|a| a.to_string()).collect(),
+            env: Vec::new(),
+        };
+        let user = "user config (available in all your projects)";
+
+        // The row this whole repair exists for: an install predating the flag.
+        assert_eq!(
+            mcp_repair(
+                &entry(user, "crystalline", &["mcp"]),
+                HarnessKind::ClaudeCode,
+                false
+            ),
+            McpRepair::Repair
+        );
+        // Already correct: rerunning `crystalline install` leaves it alone,
+        // which is the idempotence the README promises.
+        assert_eq!(
+            mcp_repair(
+                &entry(user, "crystalline", &["mcp", "--harness", "claude-code"]),
+                HarnessKind::ClaudeCode,
+                false
+            ),
+            McpRepair::UpToDate
+        );
+        // A scope we would not write. Repairing is remove-then-add, so this
+        // would silently migrate somebody's own local entry into user scope.
+        assert_eq!(
+            mcp_repair(
+                &entry("local config", "crystalline", &["mcp"]),
+                HarnessKind::ClaudeCode,
+                false
+            ),
+            McpRepair::LeaveAlone
+        );
+        assert_eq!(
+            mcp_repair(
+                &entry(user, "crystalline", &["mcp"]),
+                HarnessKind::ClaudeCode,
+                true
+            ),
+            McpRepair::LeaveAlone,
+            "a --project install must not adopt the user-scope entry"
+        );
+        // Customisations: a wrapper, an absolute path, an extra flag, a
+        // different harness id. All left exactly as they are.
+        for stored in [
+            entry(user, "/opt/bin/crystalline", &["mcp"]),
+            entry(user, "uvx", &["crystalline", "mcp"]),
+            entry(user, "crystalline", &["mcp", "--read-only"]),
+            entry(user, "crystalline", &["mcp", "--harness", "codex"]),
+            entry(user, "crystalline", &[]),
+            StoredMcpEntry {
+                env: vec!["FOO=bar".to_string()],
+                ..entry(user, "crystalline", &["mcp"])
+            },
+            StoredMcpEntry {
+                transport: "http".to_string(),
+                ..entry(user, "crystalline", &["mcp"])
+            },
+        ] {
+            assert_eq!(
+                mcp_repair(&stored, HarnessKind::ClaudeCode, false),
+                McpRepair::LeaveAlone,
+                "{stored:?}"
+            );
+        }
+    }
+
+    /// Both new statuses say what actually happened, and the loud one says
+    /// that there is no registration right now.
+    #[test]
+    fn the_new_mcp_statuses_render_for_a_human() {
+        let customised = McpReport::new(
+            "already-present-customised",
+            Some("claude mcp remove crystalline --scope user && claude mcp add ...".into()),
+        );
+        let line = mcp_line(&customised);
+        assert!(line.contains("left as it is"), "{line}");
+        assert!(
+            line.contains("mcp remove crystalline --scope user && claude mcp add"),
+            "the printed command has to remove first, because these CLIs refuse \
+             a same-name add: {line}"
+        );
+
+        let failed = McpReport::new("repair-failed", Some("claude ...".into()));
+        let line = mcp_line(&failed);
+        assert!(
+            line.contains("no registration right now"),
+            "the user has to learn their working entry is gone: {line}"
+        );
+        assert!(line.contains("claude ..."), "{line}");
+
+        assert!(mcp_line(&McpReport::new("repaired", None)).contains("re-registered"));
+    }
 
     /// Build a settings object from a JSON literal, panicking if it is not an
     /// object (a test-only convenience).

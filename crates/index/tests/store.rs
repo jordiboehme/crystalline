@@ -13,8 +13,9 @@ use std::path::Path;
 
 use crystalline_index::{
     DomainId, DomainKind, EMBED_PAGE_SIZE, EdgeKind, EmbeddingCoverage, EmbeddingRow, EngramId,
-    EngramRecord, FileStamp, FilterOp, HostClaim, IndexError, MetadataFilter, NamedCount, NewChunk,
-    RecentFilter, SearchMode, SearchQuery, Store, TursoStore, Vocabulary, sync_domain,
+    EngramRecord, FileStamp, FilterOp, HostClaim, InboundPage, InboundQuery, IndexError,
+    MetadataFilter, NamedCount, NewChunk, RecentFilter, SearchMode, SearchQuery, Store, TursoStore,
+    Vocabulary, sync_domain,
 };
 
 fn write(dir: &Path, rel: &str, content: &str) {
@@ -734,6 +735,417 @@ async fn inbound_refs_kinds(store: &dyn Store) {
     );
 }
 parity!(inbound_refs_report_ref_kinds, inbound_refs_kinds);
+
+/// A hub with seven references pointing at it from two domains, for the
+/// `inbound_page` tests: four `cites`, two `part_of` and one prose wikilink.
+///
+/// The titles are chosen so byte order and locale order disagree twice over -
+/// `beta small` sorts last byte-wise and third under a locale collation, and
+/// `Alpha 100%` sorts before `Alpha 1005` byte-wise and after it wherever
+/// punctuation is weighted last - so an ordering that lost `COLLATE "C"` on
+/// either backend is visible rather than merely different. Returns the hub's
+/// ids.
+async fn hub_fixture(store: &dyn Store) -> (EngramId, DomainId) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "hub.md",
+        &engram("Hub", "hub", "engram", "", "the hub body\n"),
+    );
+    for (path, title, permalink, body) in [
+        ("alpha.md", "Alpha 100%", "alpha", "- cites [[Hub]]\n"),
+        ("alpha2.md", "Alpha 1005", "alpha2", "- cites [[Hub]]\n"),
+        ("beta.md", "Beta", "beta", "- part_of [[Hub]]\n"),
+        ("Capital.md", "Capital", "capital", "- cites [[Hub]]\n"),
+        (
+            "notes/gamma.md",
+            "Gamma",
+            "notes/gamma",
+            "See [[Hub]] for the details.\n",
+        ),
+        ("small.md", "beta small", "small", "- part_of [[Hub]]\n"),
+    ] {
+        write(root, path, &engram(title, permalink, "engram", "", body));
+    }
+    sync_domain(store, "d", root).await.unwrap();
+
+    // A second domain pointing across, so a hit carries the domain it came
+    // from rather than assuming one.
+    let other_dir = tempfile::tempdir().unwrap();
+    let other = other_dir.path();
+    write(
+        other,
+        "cross.md",
+        &engram("Cross", "cross", "engram", "", "- cites [[d:Hub]]\n"),
+    );
+    sync_domain(store, "Zed", other).await.unwrap();
+
+    let hub = store.lookup_id("d", "hub").await.unwrap().unwrap();
+    let domain = store
+        .upsert_domain("d", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+    // The temp directories are dropped here on purpose: every assertion runs
+    // against indexed rows, and nothing below reads a file.
+    (hub, domain)
+}
+
+/// The query naming the fixture hub, with no filters and a page of ten.
+fn hub_query(hub: EngramId, domain: DomainId) -> InboundQuery<'static> {
+    InboundQuery {
+        engram_id: hub,
+        domain_id: domain,
+        permalink: "hub",
+        title: "Hub",
+        q: None,
+        rel: None,
+        page: 1,
+        limit: 10,
+    }
+}
+
+/// The titles of a page, in the order it returned them.
+fn hit_titles(page: &InboundPage) -> Vec<&str> {
+    page.hits.iter().map(|h| h.title.as_str()).collect()
+}
+
+/// `inbound_page` answers one page of the references pointing at an engram,
+/// ordered byte-wise by title, with an exact total and a per-relation summary
+/// that counts every reference rather than the page.
+async fn inbound_page_orders_and_summarizes(store: &dyn Store) {
+    let (hub, domain) = hub_fixture(store).await;
+
+    let page = store.inbound_page(&hub_query(hub, domain)).await.unwrap();
+
+    assert_eq!(page.total, 7, "seven references point at the hub: {page:?}");
+    assert_eq!(
+        hit_titles(&page),
+        vec![
+            "Alpha 100%",
+            "Alpha 1005",
+            "Beta",
+            "Capital",
+            "Cross",
+            "Gamma",
+            "beta small",
+        ],
+        "hits are ordered by title in byte order: {page:?}"
+    );
+    assert_eq!(
+        page.types
+            .iter()
+            .map(|t| (t.name.as_str(), t.count))
+            .collect::<Vec<_>>(),
+        vec![("cites", 4), ("part_of", 2), ("links_to", 1)],
+        "the summary counts every relation type, most-used first: {page:?}"
+    );
+    // A prose wikilink is `links_to`, the word the graph edges and the sweep
+    // already use for one.
+    let gamma = page
+        .hits
+        .iter()
+        .find(|h| h.title == "Gamma")
+        .expect("the prose linker is on the page");
+    assert_eq!(gamma.rel, "links_to", "{page:?}");
+    assert_eq!(gamma.permalink, "notes/gamma", "{page:?}");
+    assert_eq!(gamma.path, "notes/gamma.md", "{page:?}");
+    assert_eq!(gamma.domain, "d", "{page:?}");
+    let cross = page
+        .hits
+        .iter()
+        .find(|h| h.title == "Cross")
+        .expect("the cross-domain linker is on the page");
+    assert_eq!(cross.domain, "Zed", "{page:?}");
+    assert_eq!(cross.rel, "cites", "{page:?}");
+}
+parity!(
+    inbound_page_orders_by_title_and_summarizes_types,
+    inbound_page_orders_and_summarizes
+);
+
+/// Paging slices that one order without changing what it is a page of: the
+/// total and the summary describe the whole set on every page.
+async fn inbound_page_pages(store: &dyn Store) {
+    let (hub, domain) = hub_fixture(store).await;
+
+    let first = store
+        .inbound_page(&InboundQuery {
+            limit: 3,
+            ..hub_query(hub, domain)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        hit_titles(&first),
+        vec!["Alpha 100%", "Alpha 1005", "Beta"],
+        "{first:?}"
+    );
+    assert_eq!(first.total, 7, "{first:?}");
+
+    let second = store
+        .inbound_page(&InboundQuery {
+            page: 2,
+            limit: 3,
+            ..hub_query(hub, domain)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        hit_titles(&second),
+        vec!["Capital", "Cross", "Gamma"],
+        "the second page continues the first: {second:?}"
+    );
+    assert_eq!(second.total, 7, "the total is of the set, not the page");
+    assert_eq!(
+        second.types.len(),
+        3,
+        "the summary rides every page: {second:?}"
+    );
+
+    let last = store
+        .inbound_page(&InboundQuery {
+            page: 3,
+            limit: 3,
+            ..hub_query(hub, domain)
+        })
+        .await
+        .unwrap();
+    assert_eq!(hit_titles(&last), vec!["beta small"], "{last:?}");
+
+    let past_the_end = store
+        .inbound_page(&InboundQuery {
+            page: 9,
+            limit: 3,
+            ..hub_query(hub, domain)
+        })
+        .await
+        .unwrap();
+    assert!(
+        past_the_end.hits.is_empty(),
+        "a page past the end is empty rather than an error: {past_the_end:?}"
+    );
+    assert_eq!(past_the_end.total, 7, "{past_the_end:?}");
+}
+parity!(inbound_page_pages_the_same_order, inbound_page_pages);
+
+/// `rel` narrows to one relation type and `q` matches the referencing engram's
+/// title or path, case-insensitively. Both keep the total exact and neither
+/// touches the summary.
+async fn inbound_page_filters(store: &dyn Store) {
+    let (hub, domain) = hub_fixture(store).await;
+
+    let cites = store
+        .inbound_page(&InboundQuery {
+            rel: Some("cites"),
+            ..hub_query(hub, domain)
+        })
+        .await
+        .unwrap();
+    assert_eq!(cites.total, 4, "{cites:?}");
+    assert_eq!(
+        hit_titles(&cites),
+        vec!["Alpha 100%", "Alpha 1005", "Capital", "Cross"],
+        "{cites:?}"
+    );
+    assert_eq!(
+        cites.types.len(),
+        3,
+        "the summary is of every reference, not of the filtered ones: {cites:?}"
+    );
+
+    let prose = store
+        .inbound_page(&InboundQuery {
+            rel: Some("links_to"),
+            ..hub_query(hub, domain)
+        })
+        .await
+        .unwrap();
+    assert_eq!(hit_titles(&prose), vec!["Gamma"], "{prose:?}");
+
+    let by_title = store
+        .inbound_page(&InboundQuery {
+            q: Some("BETA"),
+            ..hub_query(hub, domain)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        hit_titles(&by_title),
+        vec!["Beta", "beta small"],
+        "q matches the title case-insensitively: {by_title:?}"
+    );
+    assert_eq!(by_title.total, 2, "{by_title:?}");
+
+    let by_path = store
+        .inbound_page(&InboundQuery {
+            q: Some("notes/"),
+            ..hub_query(hub, domain)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        hit_titles(&by_path),
+        vec!["Gamma"],
+        "q matches the path too: {by_path:?}"
+    );
+
+    let both = store
+        .inbound_page(&InboundQuery {
+            q: Some("alpha"),
+            rel: Some("cites"),
+            ..hub_query(hub, domain)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        hit_titles(&both),
+        vec!["Alpha 100%", "Alpha 1005"],
+        "the two filters compose: {both:?}"
+    );
+
+    let nothing = store
+        .inbound_page(&InboundQuery {
+            q: Some("nobody"),
+            ..hub_query(hub, domain)
+        })
+        .await
+        .unwrap();
+    assert_eq!(nothing.total, 0, "{nothing:?}");
+    assert!(nothing.hits.is_empty(), "{nothing:?}");
+    assert_eq!(
+        nothing.types.len(),
+        3,
+        "a filter that matches nothing still reports what is there: {nothing:?}"
+    );
+}
+parity!(inbound_page_filters_by_rel_and_text, inbound_page_filters);
+
+/// A page size or page number no `i64` can hold is arithmetic, not a licence.
+///
+/// `usize::MAX as i64` is `-1`, and a negative bound means three different wrong
+/// answers depending on the backend: SQLite reads a negative `LIMIT` as no limit
+/// and returns the whole set, Postgres refuses a negative `LIMIT` or `OFFSET`
+/// outright, and a wrapped offset silently serves page one under any page
+/// number. All three are pinned here, on both backends, because the numbers come
+/// from a query string.
+async fn inbound_page_absurd_bounds(store: &dyn Store) {
+    let (hub, domain) = hub_fixture(store).await;
+
+    // A page size past `i64`: bounded, and bounded by the set rather than
+    // unbounded by a wrapped negative.
+    let huge_limit = store
+        .inbound_page(&InboundQuery {
+            limit: usize::MAX,
+            ..hub_query(hub, domain)
+        })
+        .await
+        .expect("an absurd page size is arithmetic, not an error");
+    assert_eq!(huge_limit.total, 7, "{huge_limit:?}");
+    assert_eq!(
+        huge_limit.hits.len(),
+        7,
+        "the whole set is seven rows, so a page bigger than it holds seven: {huge_limit:?}"
+    );
+
+    // A page number past `i64`, whose offset would wrap: an empty page carrying
+    // the true total, never the first page's rows.
+    let huge_page = store
+        .inbound_page(&InboundQuery {
+            page: usize::MAX,
+            ..hub_query(hub, domain)
+        })
+        .await
+        .expect("an absurd page number is arithmetic, not an error");
+    assert!(
+        huge_page.hits.is_empty(),
+        "a page past the end is empty rather than page one: {huge_page:?}"
+    );
+    assert_eq!(huge_page.total, 7, "{huge_page:?}");
+
+    // Both at once, which is where the multiplication overflows.
+    let both = store
+        .inbound_page(&InboundQuery {
+            page: usize::MAX,
+            limit: usize::MAX,
+            ..hub_query(hub, domain)
+        })
+        .await
+        .expect("both at once is arithmetic too");
+    assert!(both.hits.is_empty(), "{both:?}");
+    assert_eq!(both.total, 7, "{both:?}");
+}
+parity!(
+    inbound_page_clamps_absurd_bounds,
+    inbound_page_absurd_bounds
+);
+
+/// A `%` in `q` is a percent sign, not a wildcard: the fixture holds both
+/// `Alpha 100%` and `Alpha 1005`, and an unescaped pattern would return both.
+async fn inbound_page_escapes(store: &dyn Store) {
+    let (hub, domain) = hub_fixture(store).await;
+
+    let literal = store
+        .inbound_page(&InboundQuery {
+            q: Some("100%"),
+            ..hub_query(hub, domain)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        hit_titles(&literal),
+        vec!["Alpha 100%"],
+        "the wildcard is escaped: {literal:?}"
+    );
+
+    let underscore = store
+        .inbound_page(&InboundQuery {
+            q: Some("alpha_"),
+            ..hub_query(hub, domain)
+        })
+        .await
+        .unwrap();
+    assert!(
+        underscore.hits.is_empty(),
+        "`_` is a literal underscore, which no title carries: {underscore:?}"
+    );
+}
+parity!(inbound_page_escapes_like_wildcards, inbound_page_escapes);
+
+/// An engram nothing points at reports an empty page rather than an error, and
+/// says so in the summary too.
+async fn inbound_page_empty(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "lonely.md",
+        &engram("Lonely", "lonely", "engram", "", "nobody points here\n"),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+    let lonely = store.lookup_id("d", "lonely").await.unwrap().unwrap();
+    let domain = store
+        .upsert_domain("d", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+
+    let page = store
+        .inbound_page(&InboundQuery {
+            permalink: "lonely",
+            title: "Lonely",
+            ..hub_query(lonely, domain)
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(page.total, 0, "{page:?}");
+    assert!(page.hits.is_empty(), "{page:?}");
+    assert!(page.types.is_empty(), "{page:?}");
+}
+parity!(
+    inbound_page_reports_nothing_pointing_here,
+    inbound_page_empty
+);
 
 /// `unresolved_refs` reports every dangling relation and prose link in a domain,
 /// and nothing else: a relation that resolves never appears, a reference in
@@ -3592,4 +4004,385 @@ async fn lexical_candidate_cap(store: &dyn Store) {
 parity!(
     lexical_candidate_cap_bounds_and_ranks,
     lexical_candidate_cap
+);
+
+/// A folder filter on a search is a folder filter, not a string prefix.
+///
+/// `notes/` selects `notes/beta.md` and `notes/deep/gamma.md` and refuses
+/// `notes-misc/delta.md`, which is the whole reason the prefix carries its
+/// trailing slash. The `%` and `_` folders are the second half of the contract:
+/// a folder name is a literal, so `50%/` must not reach `50x/` and `a_b/` must
+/// not reach `axb/`. Each decoy exists precisely so an unescaped LIKE pattern
+/// fails this test rather than passing it quietly.
+async fn folder_prefix_filter(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    for (path, permalink) in [
+        ("alpha.md", "alpha"),
+        ("notes/beta.md", "notes/beta"),
+        ("notes/deep/gamma.md", "notes/deep/gamma"),
+        ("notes-misc/delta.md", "notes-misc/delta"),
+        ("50%/pct.md", "50pct/pct"),
+        ("50x/other.md", "50x/other"),
+        ("a_b/under.md", "a_b/under"),
+        ("axb/other.md", "axb/other"),
+    ] {
+        write(
+            root,
+            path,
+            &engram(permalink, permalink, "engram", "", "sharedbodyterm\n"),
+        );
+    }
+    sync_domain(store, "eng", root).await.unwrap();
+
+    // The filter-only path: every engram under `notes/`, and nothing whose
+    // path merely starts with those five letters.
+    let under = |prefix: Option<&str>| SearchQuery {
+        domains: Some(vec!["eng".to_string()]),
+        path_prefix: prefix.map(str::to_string),
+        limit: 50,
+        page: 1,
+        ..SearchQuery::default()
+    };
+    let notes = store.search(&under(Some("notes/"))).await.unwrap();
+    assert_eq!(
+        notes
+            .items
+            .iter()
+            .map(|h| h.permalink.as_str())
+            .collect::<Vec<_>>(),
+        vec!["notes/beta", "notes/deep/gamma"],
+        "a folder filter takes the folder and its descendants, never a sibling \
+         whose name merely starts the same way"
+    );
+    assert_eq!(notes.total, 2, "the total counts the filtered set exactly");
+
+    // No prefix is the whole domain, which is what an absent `path` means.
+    let all = store.search(&under(None)).await.unwrap();
+    assert_eq!(all.total, 8, "an absent folder filter selects everything");
+    let empty = store.search(&under(Some(""))).await.unwrap();
+    assert_eq!(empty.total, 8, "an empty folder filter selects everything");
+
+    // The wildcard characters are literals: each of these has a decoy sibling
+    // that an unescaped pattern would sweep in.
+    let pct = store.search(&under(Some("50%/"))).await.unwrap();
+    assert_eq!(
+        pct.items
+            .iter()
+            .map(|h| h.permalink.as_str())
+            .collect::<Vec<_>>(),
+        vec!["50pct/pct"],
+        "a folder named 50% is a folder, not a wildcard"
+    );
+    let under_score = store.search(&under(Some("a_b/"))).await.unwrap();
+    assert_eq!(
+        under_score
+            .items
+            .iter()
+            .map(|h| h.permalink.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a_b/under"],
+        "a folder named a_b is a folder, not a single-character wildcard"
+    );
+
+    // Paging under the filter: the total stays the filtered total rather than
+    // the domain's, which is what a client pages against.
+    let page_two = store
+        .search(&SearchQuery {
+            limit: 1,
+            page: 2,
+            ..under(Some("notes/"))
+        })
+        .await
+        .unwrap();
+    assert_eq!(page_two.total, 2, "the count query carries the same filter");
+    assert_eq!(page_two.items.len(), 1, "and the page is one row of it");
+
+    // The filter is a scalar filter, so it narrows a text search too rather
+    // than only the filter-only listing.
+    let text = store
+        .search(&SearchQuery {
+            text: Some("sharedbodyterm".to_string()),
+            ..under(Some("notes/"))
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        text.items
+            .iter()
+            .map(|h| h.permalink.as_str())
+            .collect::<Vec<_>>(),
+        vec!["notes/beta", "notes/deep/gamma"],
+        "a text search under a folder stays under it"
+    );
+}
+parity!(
+    search_filters_by_folder_segment_not_string_prefix,
+    folder_prefix_filter
+);
+
+/// `browse_level` bounds a tree level without hiding the tree.
+///
+/// The row page is capped and says so through `total`, while the folder list
+/// is derived separately and stays complete: a reader whose level was
+/// truncated can still descend into every folder under it. The count runs
+/// under the same depth filter as the page, so the two never disagree.
+async fn browse_level_bounds(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    for path in [
+        "a.md",
+        "b.md",
+        "c.md",
+        "notes/n1.md",
+        "notes/n2.md",
+        "notes-misc/m.md",
+        "deep/inner/x.md",
+        "50%/p.md",
+        "50x/q.md",
+    ] {
+        let permalink = path.trim_end_matches(".md");
+        write(
+            root,
+            path,
+            &engram(permalink, permalink, "engram", "", "b\n"),
+        );
+    }
+    sync_domain(store, "eng", root).await.unwrap();
+
+    // A capped root level: two of the three root engrams, the count of all
+    // three, and every folder regardless of the cap.
+    let capped = store.browse_level("eng", None, 1, 2).await.unwrap();
+    assert_eq!(
+        capped
+            .engrams
+            .iter()
+            .map(|d| d.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a.md", "b.md"],
+        "the level is capped at the limit, ordered by path in byte order"
+    );
+    assert_eq!(
+        capped.total, 3,
+        "the count is the level's own, under the same depth filter as the page"
+    );
+    assert_eq!(
+        capped.folders,
+        vec!["50%", "50x", "deep", "notes", "notes-misc"],
+        "every folder is listed even though the rows were cut"
+    );
+
+    // Depth counts segments below the prefix: 2 reaches one folder further
+    // down but not two.
+    let deeper = store.browse_level("eng", None, 2, 50).await.unwrap();
+    assert_eq!(
+        deeper.total, 8,
+        "depth 2 counts everything but the two-folder-deep engram: {:?}",
+        deeper.engrams
+    );
+    assert!(
+        !deeper.engrams.iter().any(|d| d.path == "deep/inner/x.md"),
+        "depth 2 does not reach a third level"
+    );
+
+    // Descending: the prefix is segment-safe here too, and a level with no
+    // subfolders says so with an empty list rather than by omission.
+    let notes = store
+        .browse_level("eng", Some("notes/"), 1, 50)
+        .await
+        .unwrap();
+    assert_eq!(
+        notes
+            .engrams
+            .iter()
+            .map(|d| d.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["notes/n1.md", "notes/n2.md"],
+        "notes-misc is a sibling of notes, not a child"
+    );
+    assert_eq!(notes.total, 2);
+    assert!(notes.folders.is_empty(), "a leaf folder has no children");
+
+    // A caller that leaves the trailing slash off gets the same folder rather
+    // than a string prefix, and never a folder with no name.
+    let slashless = store
+        .browse_level("eng", Some("notes"), 1, 50)
+        .await
+        .unwrap();
+    assert_eq!(slashless, notes, "the trailing slash is added, not trusted");
+
+    // A folder whose name carries a LIKE wildcard is a folder: `50x/` is a
+    // sibling an unescaped pattern would have swept in.
+    let pct = store
+        .browse_level("eng", Some("50%/"), 1, 50)
+        .await
+        .unwrap();
+    assert_eq!(
+        pct.engrams
+            .iter()
+            .map(|d| d.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["50%/p.md"],
+        "a folder named 50% is browsed literally"
+    );
+
+    // A prefix nothing lives under is an empty level, not an error.
+    let nothing = store
+        .browse_level("eng", Some("nothing/"), 1, 50)
+        .await
+        .unwrap();
+    assert_eq!(nothing.total, 0);
+    assert!(nothing.engrams.is_empty() && nothing.folders.is_empty());
+
+    // A flat domain: every engram at the root and no folders at all.
+    let flat_dir = tempfile::tempdir().unwrap();
+    write(
+        flat_dir.path(),
+        "one.md",
+        &engram("One", "one", "engram", "", "b\n"),
+    );
+    sync_domain(store, "flat", flat_dir.path()).await.unwrap();
+    let flat = store.browse_level("flat", None, 1, 50).await.unwrap();
+    assert_eq!(flat.total, 1);
+    assert!(flat.folders.is_empty(), "a flat domain has no folders");
+
+    // An empty domain answers an empty level rather than nothing at all.
+    let empty_dir = tempfile::tempdir().unwrap();
+    sync_domain(store, "empty", empty_dir.path()).await.unwrap();
+    let empty = store.browse_level("empty", None, 1, 50).await.unwrap();
+    assert_eq!(empty.total, 0);
+    assert!(empty.engrams.is_empty() && empty.folders.is_empty());
+}
+parity!(browse_level_caps_rows_but_not_folders, browse_level_bounds);
+
+/// Every path filter folds case, and both backends fold it the same way.
+///
+/// SQLite-family `LIKE` is ASCII-case-insensitive while Postgres `LIKE` is
+/// case-sensitive, so a folder filter of `notes` used to take `Notes/b.md` on
+/// turso and miss it on postgres. The three surfaces that carry such a filter -
+/// `list_engrams`, `browse_level` and the search planner - now lower both sides
+/// in SQL, so the two backends answer alike.
+///
+/// **The fold is ASCII-exact and Unicode-approximate.** SQLite's `lower()` is
+/// ASCII-only while Postgres follows the database collation, so `Notes/` and
+/// `notes/` fold identically on both while a non-ASCII case pair may fold on
+/// one and not the other. Every case pair here is ASCII on purpose; this is not
+/// a promise about `Ünter/` versus `ünter/`.
+///
+/// **The rows are upserted into a virtual domain rather than synced from
+/// disk**, because macOS's default filesystem is case-insensitive: writing
+/// `notes/a.md` and `Notes/b.md` under one temp dir produces a single folder
+/// and the case variant this test is about would never reach the store.
+///
+/// `Notes/deep/e.md` is not decoration. It is the row that catches a PARTIAL
+/// fold: with only the under-prefix clause folded, it passes
+/// `lower(e.path) LIKE 'notes/%'` and also passes the unfolded
+/// `e.path NOT LIKE 'notes/%/%'` (which no case variant matches), so a
+/// two-level-deep engram would surface in a one-level listing - a leak that
+/// does not exist while neither side is folded.
+async fn path_filters_fold_case(store: &dyn Store) {
+    let did = store
+        .upsert_domain("eng", None, DomainKind::Virtual)
+        .await
+        .unwrap();
+    for (path, permalink) in [
+        ("notes/a.md", "a"),
+        ("Notes/b.md", "b"),
+        ("notes/deep/c.md", "c"),
+        ("Notes/deep/e.md", "e"),
+        ("other/d.md", "d"),
+    ] {
+        store
+            .upsert_engram(
+                did,
+                &record(
+                    path,
+                    permalink,
+                    "shared body term",
+                    &format!("sha-{permalink}"),
+                ),
+            )
+            .await
+            .unwrap();
+    }
+
+    // `list_engrams` takes both spellings of the folder and still refuses a
+    // path that is merely a different folder.
+    let listed = store
+        .list_engrams("eng", Some("notes"), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        listed.iter().map(|d| d.path.as_str()).collect::<Vec<_>>(),
+        vec![
+            "Notes/b.md",
+            "Notes/deep/e.md",
+            "notes/a.md",
+            "notes/deep/c.md"
+        ],
+        "a prefix filter takes every case spelling of the folder, in byte order, \
+         and nothing outside it"
+    );
+
+    // The one-level listing under `notes/`: the shallow engrams from both
+    // spellings, the folder derived from both, and neither two-level engram.
+    let level = store
+        .browse_level("eng", Some("notes"), 1, 50)
+        .await
+        .unwrap();
+    assert_eq!(
+        level
+            .engrams
+            .iter()
+            .map(|d| d.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Notes/b.md", "notes/a.md"],
+        "one level under the folder, both spellings"
+    );
+    assert_eq!(level.total, 2, "the count runs under the same depth filter");
+    assert!(
+        !level.engrams.iter().any(|d| d.path.contains("/deep/")),
+        "the depth cut folds too, so no case variant slips two levels deep into \
+         a one-level listing: {:?}",
+        level.engrams
+    );
+    assert_eq!(
+        level.folders,
+        vec!["deep"],
+        "the subfolder is derived from both spellings and collapses to one name"
+    );
+
+    // Folding merges case-variant folders in the FILTER, never in the derived
+    // folder names: browsing the root still reports each folder's own spelling.
+    let root = store.browse_level("eng", None, 1, 50).await.unwrap();
+    assert_eq!(
+        root.folders,
+        vec!["Notes", "notes", "other"],
+        "two case-variant folders stay two folder rows"
+    );
+
+    // The search planner's folder filter, filter-only and lexical alike.
+    let under = |text: Option<&str>| SearchQuery {
+        text: text.map(str::to_string),
+        domains: Some(vec!["eng".to_string()]),
+        path_prefix: Some("notes/".to_string()),
+        limit: 50,
+        page: 1,
+        ..SearchQuery::default()
+    };
+    for text in [None, Some("term")] {
+        let hits = store.search(&under(text)).await.unwrap();
+        let mut found: Vec<&str> = hits.items.iter().map(|h| h.permalink.as_str()).collect();
+        found.sort();
+        assert_eq!(
+            found,
+            vec!["a", "b", "c", "e"],
+            "a folder-scoped search takes both spellings and stops at the folder \
+             (text: {text:?})"
+        );
+    }
+}
+parity!(
+    path_filters_fold_case_on_both_backends,
+    path_filters_fold_case
 );

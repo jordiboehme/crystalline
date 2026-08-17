@@ -2,7 +2,7 @@
 //! machine: the advisory lock and socket that guarantee exactly one process
 //! holds the derived index, the daemon that watches Domains and runs the
 //! embedding queue, the ctl control protocol, the rmcp tool router and the
-//! JSON API `serve --http` mounts at `/api/v1`.
+//! JSON API the HTTP endpoint mounts at `/api/v1`.
 //!
 //! The CLI is a thin dispatcher over this crate. Data operations run through one
 //! shared [`engine::Engine`], reached either over the socket (when a daemon owns
@@ -10,6 +10,7 @@
 //! commands and the CLI data commands all funnel through that one engine.
 
 pub mod client;
+pub mod collab;
 pub mod control;
 pub mod daemon;
 pub mod engine;
@@ -27,6 +28,8 @@ pub mod stub;
 pub mod temp_store;
 mod tool_schema;
 mod toon;
+#[cfg(feature = "fluid-ui")]
+pub mod ui;
 
 /// The name the consolidation sweep is advertised and dispatched under.
 ///
@@ -44,7 +47,9 @@ pub use client::{
 };
 pub use daemon::run_serve;
 pub use engine::{Engine, EngineError};
-pub use harness_cli::{CliRun, SystemMcpRunner, run_harness_cli};
+pub use harness_cli::{
+    CliCapture, CliRun, SystemMcpRunner, run_harness_cli, run_harness_cli_capture,
+};
 pub use mcp::McpServer;
 pub use origin::{default_domain_folder, parse_origin_spec};
 pub use overlay::{EnvDomain, EnvOverlay, LoadedConfig};

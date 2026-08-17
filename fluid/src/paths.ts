@@ -17,6 +17,20 @@ export function domainRoute(domain: string): string {
 }
 
 /**
+ * One folder of a domain, browsed on the domain's own screen.
+ *
+ * A query parameter rather than a segment of the path, because the browse view
+ * is one of the states that screen holds in its URL beside the frontmatter
+ * filters, and the root folder is the domain itself rather than a folder named
+ * nothing.
+ */
+export function folderRoute(domain: string, folder: string): string {
+  return folder === ""
+    ? domainRoute(domain)
+    : `${domainRoute(domain)}?path=${encodeURIComponent(folder)}`;
+}
+
+/**
  * The address of one engram.
  *
  * Built from the client's own encoders rather than from its `engramPath`,
@@ -29,6 +43,29 @@ export function domainRoute(domain: string): string {
  */
 export function engramRoute(domain: string, permalink: string): string {
   return `${domainRoute(domain)}/e/${encodePermalink(permalink)}`;
+}
+
+/**
+ * The editor over one engram. Not under `/e/`: that pattern ends in a splat,
+ * and a splat swallows everything after it, so `edit` gets its own segment
+ * ahead of the permalink - the same shape the API gave its action routes.
+ */
+export function editRoute(domain: string, permalink: string): string {
+  return `${domainRoute(domain)}/edit/${encodePermalink(permalink)}`;
+}
+
+/**
+ * The MANIFEST page of one domain. Its own segment rather than a permalink
+ * under `/e/`: a MANIFEST is not an engram and carries no permalink of its
+ * own to encode.
+ */
+export function manifestRoute(domain: string): string {
+  return `${domainRoute(domain)}/manifest`;
+}
+
+/** The editor over one domain's MANIFEST. */
+export function manifestEditRoute(domain: string): string {
+  return `${manifestRoute(domain)}/edit`;
 }
 
 /**
@@ -49,6 +86,28 @@ export function graphRoute(
   return depth === NEIGHBORHOOD_DEPTH
     ? `/graph?anchor=${anchor}`
     : `/graph?anchor=${anchor}&depth=${String(depth)}`;
+}
+
+/**
+ * The account administration screen.
+ *
+ * A constant rather than a literal at each call site for the reason every
+ * builder here exists: the pattern in `routes.tsx` and the links pointing at
+ * it are one fact, kept in one place.
+ */
+export function usersRoute(): string {
+  return "/users";
+}
+
+/**
+ * The GitHub settings screen.
+ *
+ * Under `/settings/` even though it is the only section there: the address
+ * says what kind of screen it is, and the next section will not need every
+ * link that points here rewritten.
+ */
+export function githubSettingsRoute(): string {
+  return "/settings/github";
 }
 
 /** Where the topbar's search box sends a query. */

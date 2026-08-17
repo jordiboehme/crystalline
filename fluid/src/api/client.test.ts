@@ -233,6 +233,38 @@ describe("api", () => {
   });
 });
 
+describe("problem extensions", () => {
+  it("carries a problem body's extension members on the error", async () => {
+    stubFetch(
+      new Response(
+        JSON.stringify({
+          type: "about:blank",
+          status: 412,
+          title: "precondition failed",
+          detail: "stale edit: engram changed since it was read",
+          current_etag: '"abc123"',
+          current_content: "---\ntitle: Alpha\n---\n\nTheirs.\n",
+        }),
+        {
+          status: 412,
+          headers: { "Content-Type": "application/problem+json" },
+        },
+      ),
+    );
+    const failure = await api("/domains/eng/engrams/alpha", {
+      method: "PUT",
+      body: "{}",
+    }).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(ApiProblem);
+    const problem = failure as ApiProblem;
+    expect(problem.status).toBe(412);
+    expect(problem.extensions.current_etag).toBe('"abc123"');
+    expect(problem.extensions.current_content).toContain("Theirs.");
+    // The four standard members are fields, not extensions.
+    expect(problem.extensions.title).toBeUndefined();
+  });
+});
+
 describe("csrf", () => {
   it("attaches the token on an unsafe method but not on a safe one", async () => {
     setCsrfToken("9f2c1d7e4b6a8035");

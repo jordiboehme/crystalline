@@ -31,9 +31,16 @@
 //!    `BEGIN IMMEDIATE` so they serialize against each other rather than
 //!    interleaving. Covering test:
 //!    `users_add_works_while_another_process_holds_the_auth_db` in the CLI's
-//!    `tests/users.rs`, which is the only one that spawns a second process.
-//!    `two_stores_on_one_file_interleave_writes` below covers the ordering
-//!    within one process and nothing about the locking.
+//!    `tests/users.rs`, which is the only one that spawns a second process, and
+//!    which is `#[cfg(unix)]` because turso 0.7.2 has no shared WAL
+//!    coordination on the default Windows IO backend (that file says the whole
+//!    of it). `two_stores_on_one_file_interleave_writes` below covers the
+//!    ordering within one process and nothing about the locking.
+//!
+//!    Where layer 1 cannot be had, the fallback open is what runs, and a
+//!    second process is then refused at open time: [`legacy_open_error`] turns
+//!    that refusal into a message that names the daemon holding the file and
+//!    the ways out, instead of turso's byte-range wording.
 //! 2. *Within one process*, every method serializes on `AuthStore::guard`,
 //!    because turso's [`Connection`] refuses concurrent use outright rather
 //!    than queueing. The daemon shares one `AuthStore` across axum handlers, so
@@ -117,7 +124,9 @@ fn role_from_db(s: &str) -> Role {
 }
 
 /// Fold a supplied user name to the one form this store keys on: trimmed of
-/// surrounding whitespace and lowercased. Empty is rejected.
+/// surrounding whitespace and lowercased. Empty is rejected, and so is any
+/// name with whitespace left after trimming - a login name is space-free, the
+/// readable form belongs in the display name instead.
 ///
 /// This is enforced here rather than left to callers because the store is the
 /// only place every path meets. `name TEXT PRIMARY KEY` byte-compares, so
@@ -133,6 +142,12 @@ fn normalize_name(name: &str) -> Result<String> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
         bail!("a user name cannot be empty");
+    }
+    if trimmed.chars().any(char::is_whitespace) {
+        bail!(
+            "a login name cannot contain whitespace: pick a space-free name \
+             and put the readable form in the display name"
+        );
     }
     Ok(trimmed.to_lowercase())
 }
@@ -156,6 +171,10 @@ pub struct User {
     /// A disabled account keeps its rows but can neither log in nor use an
     /// already-issued session.
     pub disabled: bool,
+    /// When this account last resolved a session or arrived through the
+    /// trusted header, RFC 3339. Null for an account never seen.
+    #[schema(example = "2026-08-08T09:14:22Z")]
+    pub last_seen: Option<String>,
 }
 
 /// What checking a password found, kept apart by how much work each one costs.
@@ -186,6 +205,32 @@ pub struct Session {
     pub csrf: String,
     /// Unix seconds at which the session stops being accepted.
     pub expires_at: i64,
+}
+
+/// What [`AuthStore::ensure_session`] found or did.
+///
+/// The two are answered differently on the wire: a created session has a token
+/// to put in a cookie, a reused one does not, because the stored copy is hashed
+/// and the original was handed out once and never kept.
+#[derive(Clone, Debug)]
+pub enum SessionMint {
+    /// The account already held a live session; this is its CSRF token.
+    Reused {
+        /// The CSRF token that session's requests must echo.
+        csrf: String,
+    },
+    /// The account held none, so one was issued.
+    Created(Session),
+}
+
+impl SessionMint {
+    /// The CSRF token either way, which is what the caller always needs.
+    pub fn csrf(&self) -> &str {
+        match self {
+            SessionMint::Reused { csrf } => csrf,
+            SessionMint::Created(session) => &session.csrf,
+        }
+    }
 }
 
 /// The users and sessions database. Open one per process that needs it: the
@@ -236,6 +281,7 @@ CREATE TABLE IF NOT EXISTS users (
     role TEXT NOT NULL,
     pass_hash TEXT,
     disabled INTEGER NOT NULL DEFAULT 0,
+    last_seen_at TEXT,
     created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS sessions (
@@ -249,11 +295,11 @@ CREATE INDEX IF NOT EXISTS sessions_expires_at ON sessions (expires_at);
 ";
 
 /// The columns every user read selects, in the order [`user_from_row`] decodes.
-const USER_COLUMNS: &str = "name, display, email, role, disabled";
+const USER_COLUMNS: &str = "name, display, email, role, disabled, last_seen_at";
 
 /// [`USER_COLUMNS`] qualified for the session join, where `users` is aliased
 /// `u`. Same columns in the same order, so [`user_from_row`] decodes both.
-const USER_COLUMNS_JOINED: &str = "u.name, u.display, u.email, u.role, u.disabled";
+const USER_COLUMNS_JOINED: &str = "u.name, u.display, u.email, u.role, u.disabled, u.last_seen_at";
 
 /// A `WHERE` fragment that is true unless the row it matches is the last
 /// *enabled* admin: either this account is not an enabled admin, or another
@@ -347,13 +393,56 @@ async fn open_database(path: &Path) -> Result<Database> {
     tracing::warn!(
         error = %err,
         path = %path.display(),
-        "this filesystem does not support cross-process access to the auth database; \
+        "this platform does not support cross-process access to the auth database; \
          `crystalline users` will fail while the daemon is running"
     );
     Builder::new_local(&name)
         .build()
         .await
-        .with_context(|| format!("opening auth database {}", path.display()))
+        .map_err(|err| legacy_open_error(err, path))
+}
+
+/// Word a failed *fallback* open, the one that runs after multiprocess WAL
+/// turned out to be unavailable here.
+///
+/// One of its failures is not a defect but the predicted consequence of that
+/// fallback: with no shared WAL coordination the open takes an exclusive,
+/// process-scoped lock on the file, so whichever of the daemon and the CLI
+/// opens second is refused at open time. That is today's situation on Windows,
+/// where turso 0.7.2's default IO backend reports no shared WAL coordination
+/// (only the off-by-default `experimental_win_iocp` backend does), and it is
+/// also what a state directory on a network filesystem gets. Turso words it as
+/// a byte-range lock failure, which is true and useless: what the person at the
+/// terminal needs is what holds the file and which two ways out exist. Every
+/// other failure keeps the plain context, so a corrupt file is never reported
+/// as a running daemon.
+///
+/// Kept as a pure function of the error so it is testable on any OS, not only
+/// on the one platform that can produce the lock failure. Covering tests:
+/// `a_locked_fallback_open_says_what_holds_the_database` and
+/// `a_fallback_open_that_fails_for_another_reason_keeps_the_plain_context`.
+fn legacy_open_error(err: turso::Error, path: &Path) -> anyhow::Error {
+    if is_locked_by_another_process(&err) {
+        anyhow::Error::new(err).context(format!(
+            "the auth database {} is held by a running daemon and this platform cannot share it: \
+             manage accounts in the web UI, or stop the daemon (`crystalline ctl shutdown`) and \
+             try again",
+            path.display()
+        ))
+    } else {
+        anyhow::Error::new(err).context(format!("opening auth database {}", path.display()))
+    }
+}
+
+/// Whether an open failed because another process already holds the file.
+///
+/// Matched on the message for the same reason as
+/// [`is_multiprocess_unsupported`]: turso flattens `LimboError` into the
+/// catch-all `turso::Error::Error(String)`, so the `Locking error:` prefix that
+/// `LimboError::LockingError`'s `Display` writes is the only thing left to
+/// match on.
+fn is_locked_by_another_process(err: &turso::Error) -> bool {
+    err.to_string().contains("Locking error")
 }
 
 /// Whether this open failed because multiprocess WAL cannot be had here at
@@ -393,6 +482,7 @@ impl AuthStore {
         conn.execute_batch(SCHEMA)
             .await
             .context("creating the auth database schema")?;
+        ensure_column(&conn, "users", "last_seen_at TEXT").await?;
         Ok(AuthStore {
             _db: db,
             conn,
@@ -435,6 +525,62 @@ impl AuthStore {
             .await
             .with_context(|| format!("adding user '{name}'"))?;
         Ok(())
+    }
+
+    /// How many accounts exist. Zero is what opens the first-run setup path,
+    /// and it is what `GET /auth/me` reports as `needs_setup`.
+    pub async fn user_count(&self) -> Result<usize> {
+        let _guard = self.guard.lock().await;
+        Ok(
+            match self
+                .query_first("SELECT COUNT(*) FROM users", vec![])
+                .await?
+                .map(|row| row.get_value(0))
+            {
+                Some(Ok(Value::Integer(n))) => n as usize,
+                _ => 0,
+            },
+        )
+    }
+
+    /// Create the first admin, and only into an empty table. Returns whether
+    /// this call is the one that created it.
+    ///
+    /// The zero-check and the insert are ONE statement, which is the whole
+    /// point: this is the only claim on the first-account slot that holds
+    /// across processes. `crystalline users add` opens this same file from
+    /// another process while the daemon serves, so no mutex in the daemon can
+    /// serialize against it - and a read-then-write here would let a setup
+    /// request and a CLI add both see an empty table and both go through, the
+    /// second of them silently creating an admin nobody asked for. As part of
+    /// the statement, the `WHERE NOT EXISTS` is decided by whichever writer
+    /// holds the write lock, exactly like [`NOT_LAST_ADMIN`].
+    ///
+    /// The name is folded by [`normalize_name`] like every other path, and a
+    /// name that will not fold is refused before anything is written, so a typo
+    /// does not consume the one slot there is. The password is hashed outside
+    /// the lock, as in [`AuthStore::add_user`]: argon2 is CPU, not database.
+    pub async fn add_first_admin(&self, name: &str, display: &str, password: &str) -> Result<bool> {
+        let name = normalize_name(name)?;
+        // Hash before taking the lock: argon2 is CPU, not database.
+        let hash = hash_password(password).await?;
+        let _guard = self.guard.lock().await;
+        let written = self
+            .conn
+            .execute(
+                "INSERT INTO users (name, display, email, role, pass_hash, disabled, created_at)
+                 SELECT ?1, ?2, NULL, 'admin', ?3, 0, ?4
+                 WHERE NOT EXISTS (SELECT 1 FROM users)",
+                vec![
+                    Value::Text(name.clone()),
+                    Value::Text(display.to_string()),
+                    Value::Text(hash),
+                    Value::Text(chrono::Utc::now().to_rfc3339()),
+                ],
+            )
+            .await
+            .with_context(|| format!("creating the first admin '{name}'"))?;
+        Ok(written > 0)
     }
 
     /// Check a password. `None` covers every way this can fail to produce a
@@ -484,7 +630,7 @@ impl AuthStore {
         if user.disabled {
             return Ok(PasswordCheck::NoHash);
         }
-        let Some(hash) = cell_text(&row, 5) else {
+        let Some(hash) = cell_text(&row, 6) else {
             return Ok(PasswordCheck::NoHash);
         };
         if verify_hash(hash, password.to_string()).await? {
@@ -545,6 +691,57 @@ impl AuthStore {
             "demote",
         )
         .await
+    }
+
+    /// [`AuthStore::set_role`] without the last-admin guard. The CLI's
+    /// `users demote --force` recovery path; HTTP never calls it, so the
+    /// installation cannot be locked out over the network - only deliberately,
+    /// on the machine that holds this file.
+    pub async fn set_role_force(&self, name: &str, role: Role) -> Result<()> {
+        let name = normalize_name(name)?;
+        let _guard = self.guard.lock().await;
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE users SET role = ?2 WHERE name = ?1",
+                vec![
+                    Value::Text(name.clone()),
+                    Value::Text(role.as_str().to_string()),
+                ],
+            )
+            .await
+            .with_context(|| format!("updating user '{name}'"))?;
+        if changed == 0 {
+            bail!("no such user: '{name}'");
+        }
+        Ok(())
+    }
+
+    /// Set or clear an account's display name. Clearing (None, or a value that
+    /// trims to nothing) resets it to the folded login name, so a row is never
+    /// nameless: the column is NOT NULL and the UI always has something to
+    /// print. No last-admin guard applies - a display name changes nothing
+    /// about what the account may do.
+    pub async fn set_display(&self, name: &str, display: Option<&str>) -> Result<()> {
+        let name = normalize_name(name)?;
+        let display = display
+            .map(str::trim)
+            .filter(|d| !d.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| name.clone());
+        let _guard = self.guard.lock().await;
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE users SET display = ?2 WHERE name = ?1",
+                vec![Value::Text(name.clone()), Value::Text(display)],
+            )
+            .await
+            .with_context(|| format!("updating user '{name}'"))?;
+        if changed == 0 {
+            bail!("no such user: '{name}'");
+        }
+        Ok(())
     }
 
     /// Disable or re-enable an account. Disabling deletes every session it
@@ -664,6 +861,33 @@ impl AuthStore {
         self.finish(result).await
     }
 
+    /// [`AuthStore::remove_user`] without the last-admin guard, for
+    /// `users remove --force`. Sessions still go first, in the same
+    /// `BEGIN IMMEDIATE` transaction, for the resurrection reasons the guarded
+    /// remove documents.
+    pub async fn remove_user_force(&self, name: &str) -> Result<()> {
+        let name = normalize_name(name)?;
+        let key = vec![Value::Text(name.clone())];
+        let _guard = self.guard.lock().await;
+        self.begin_immediate()
+            .await
+            .with_context(|| format!("removing user '{name}'"))?;
+        let result = async {
+            self.delete_sessions_of(&name).await?;
+            let changed = self
+                .conn
+                .execute("DELETE FROM users WHERE name = ?1", key)
+                .await
+                .with_context(|| format!("removing user '{name}'"))?;
+            if changed == 0 {
+                bail!("no such user: '{name}'");
+            }
+            Ok(())
+        }
+        .await;
+        self.finish(result).await
+    }
+
     /// Every account, by name. Names sort byte-wise, which is the ordering
     /// contract the rest of the workspace's text columns use.
     pub async fn list_users(&self) -> Result<Vec<User>> {
@@ -695,10 +919,45 @@ impl AuthStore {
     /// header value of `Ada` must resolve to the existing `ada` rather than
     /// mint a second account at the default role, which would silently undo a
     /// disable or a demotion. The display name keeps the casing as sent.
-    pub async fn ensure_user(&self, name: &str, role: Role) -> Result<User> {
+    ///
+    /// `cap` bounds how many accounts this call may *mint*: an account that
+    /// already exists always resolves, whatever the current count is relative
+    /// to `cap`, and only bringing a new one into existence is refused once
+    /// the count has reached it. This is the trusted-header mitigation - a
+    /// proxy misconfiguration (a header carrying a session id, say) must not
+    /// mint one account per request forever. The check-then-insert runs under
+    /// this process's `guard`, so two calls in this process cannot both slip
+    /// past it; the cross-process window (a `crystalline users add` racing it
+    /// in another process) can overshoot the cap by at most the number of
+    /// racing writers, which is acceptable for a mitigation whose job is
+    /// stopping *unbounded* minting, not enforcing an exact ceiling.
+    pub async fn ensure_user(&self, name: &str, role: Role, cap: usize) -> Result<User> {
         let display = name.trim().to_string();
         let name = normalize_name(name)?;
         let _guard = self.guard.lock().await;
+        let exists = self
+            .query_first(
+                "SELECT 1 FROM users WHERE name = ?1",
+                vec![Value::Text(name.clone())],
+            )
+            .await?
+            .is_some();
+        if !exists {
+            let count = match self
+                .query_first("SELECT COUNT(*) FROM users", vec![])
+                .await?
+                .map(|row| row.get_value(0))
+            {
+                Some(Ok(Value::Integer(n))) => n as usize,
+                _ => 0,
+            };
+            if count >= cap {
+                bail!(
+                    "refusing to provision '{name}': the account cap is reached \
+                     (auth.max_users = {cap}). Remove unused accounts or raise the cap"
+                );
+            }
+        }
         self.conn
             .execute(
                 "INSERT OR IGNORE INTO users
@@ -713,6 +972,16 @@ impl AuthStore {
             )
             .await
             .with_context(|| format!("provisioning user '{name}'"))?;
+        self.conn
+            .execute(
+                "UPDATE users SET last_seen_at = ?2 WHERE name = ?1",
+                vec![
+                    Value::Text(name.clone()),
+                    Value::Text(chrono::Utc::now().to_rfc3339()),
+                ],
+            )
+            .await
+            .context("stamping last_seen_at")?;
         self.query_first(
             &format!("SELECT {USER_COLUMNS} FROM users WHERE name = ?1"),
             vec![Value::Text(name.clone())],
@@ -774,6 +1043,163 @@ impl AuthStore {
         })
     }
 
+    /// Reuse the account's newest live session, or issue one when it holds
+    /// none.
+    ///
+    /// What `GET /auth/me` calls for a trusted-header identity, which arrives
+    /// with an account and no session of its own. Minting unconditionally would
+    /// add a row per probe - unbounded for a client that keeps no cookie - and
+    /// would hand two tabs opening at once two different CSRF tokens, of which
+    /// only the one whose `Set-Cookie` landed last would work.
+    ///
+    /// The check and the insert are one `BEGIN IMMEDIATE` transaction, which is
+    /// the whole point: two concurrent probes serialize here, so the second sees
+    /// the first's session rather than racing it to a duplicate.
+    ///
+    /// A reused session yields only its CSRF token. The session token itself is
+    /// stored hashed and no unhashed copy is kept, so there is nothing to put in
+    /// a cookie - which is why [`AuthStore::newest_session_csrf`] exists: the
+    /// trusted-header path resolves the token by identity, not by cookie.
+    pub async fn ensure_session(&self, name: &str, ttl_secs: i64) -> Result<SessionMint> {
+        let name = normalize_name(name)?;
+        let now = chrono::Utc::now().timestamp();
+        let token = random_hex();
+        let csrf = random_hex();
+        let expires_at = now.saturating_add(ttl_secs);
+        let _guard = self.guard.lock().await;
+        self.begin_immediate()
+            .await
+            .with_context(|| format!("ensuring a session for user '{name}'"))?;
+        let mut reused = None;
+        let result = async {
+            let exists = self
+                .query_first(
+                    "SELECT 1 FROM users WHERE name = ?1",
+                    vec![Value::Text(name.clone())],
+                )
+                .await?;
+            if exists.is_none() {
+                bail!("no such user: '{name}'");
+            }
+            // Drop this account's expired rows while the transaction is open.
+            // `session_user` is the only other pruner, and a probe that never
+            // presents a cookie never reaches it: without this, an SSO identity
+            // whose session lapsed would leave a dead row behind on every
+            // expiry, forever. Scoped to one account rather than sweeping the
+            // table, so the cost stays proportional to the caller.
+            self.conn
+                .execute(
+                    "DELETE FROM sessions WHERE user_name = ?1 AND expires_at <= ?2",
+                    vec![Value::Text(name.clone()), Value::Integer(now)],
+                )
+                .await
+                .with_context(|| format!("pruning expired sessions for user '{name}'"))?;
+            if let Some(live) = self.live_csrf(&name, now).await? {
+                reused = Some(live);
+                return Ok(());
+            }
+            self.conn
+                .execute(
+                    "INSERT INTO sessions (token_hash, user_name, csrf, expires_at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    vec![
+                        Value::Text(token_hash(&token)),
+                        Value::Text(name.clone()),
+                        Value::Text(csrf.clone()),
+                        Value::Integer(expires_at),
+                    ],
+                )
+                .await
+                .with_context(|| format!("ensuring a session for user '{name}'"))?;
+            Ok(())
+        }
+        .await;
+        self.finish(result).await?;
+        Ok(match reused {
+            Some(csrf) => SessionMint::Reused { csrf },
+            None => SessionMint::Created(Session {
+                token,
+                csrf,
+                expires_at,
+            }),
+        })
+    }
+
+    /// The CSRF token of the newest live session `name` holds, or `None`.
+    ///
+    /// The trusted-header path resolves its token this way rather than through
+    /// the session cookie: the proxy is what names the identity there, the
+    /// cookie carries nothing the header does not already say, and a device
+    /// whose cookie was never set or has gone stale would otherwise hold a token
+    /// the server refuses to recognize. Not used by the cookie-session path,
+    /// where the cookie is the identity and its own session's token is the one
+    /// that must match.
+    pub async fn newest_session_csrf(&self, name: &str) -> Result<Option<String>> {
+        let name = normalize_name(name)?;
+        let now = chrono::Utc::now().timestamp();
+        let _guard = self.guard.lock().await;
+        self.live_csrf(&name, now).await
+    }
+
+    /// Which account a live session belongs to, or `None` when the token names
+    /// no live session.
+    ///
+    /// A pure read, unlike [`AuthStore::session_user`], which stamps
+    /// `last_seen_at` for whoever it resolves. `GET /auth/me` asks this about a
+    /// cookie it is deciding whether to retire, and the answer must not record
+    /// the cookie's owner as having just been seen: they are not the one making
+    /// the request.
+    pub async fn session_owner(&self, token: &str) -> Result<Option<String>> {
+        let now = chrono::Utc::now().timestamp();
+        let _guard = self.guard.lock().await;
+        Ok(self
+            .query_first(
+                "SELECT user_name FROM sessions
+                 WHERE token_hash = ?1 AND expires_at > ?2",
+                vec![Value::Text(token_hash(token)), Value::Integer(now)],
+            )
+            .await?
+            .and_then(|row| cell_text(&row, 0)))
+    }
+
+    /// How many session rows exist, live and expired alike. A diagnostic, and
+    /// what pins the reuse invariant in tests: a probe that minted per call
+    /// would show here as a growing count.
+    pub async fn session_count(&self) -> Result<usize> {
+        let _guard = self.guard.lock().await;
+        Ok(
+            match self
+                .query_first("SELECT COUNT(*) FROM sessions", vec![])
+                .await?
+                .map(|row| row.get_value(0))
+            {
+                Some(Ok(Value::Integer(n))) => n as usize,
+                _ => 0,
+            },
+        )
+    }
+
+    /// The newest unexpired session's CSRF token for an already-normalized
+    /// `name`. Callers hold the guard; `ensure_session` also holds an open
+    /// transaction, so this must not take either.
+    ///
+    /// Ordered by `expires_at` because the table records no creation time and
+    /// the TTL is a constant, which makes the two orders the same. The tie-break
+    /// on `token_hash` only keeps the answer stable when two sessions were
+    /// issued in the same second.
+    async fn live_csrf(&self, name: &str, now: i64) -> Result<Option<String>> {
+        Ok(self
+            .query_first(
+                "SELECT csrf FROM sessions
+                 WHERE user_name = ?1 AND expires_at > ?2
+                 ORDER BY expires_at DESC, token_hash DESC
+                 LIMIT 1",
+                vec![Value::Text(name.to_string()), Value::Integer(now)],
+            )
+            .await?
+            .and_then(|row| cell_text(&row, 0)))
+    }
+
     /// Resolve a session token to its account and CSRF token. `None` for an
     /// unknown, expired or disabled-account session.
     ///
@@ -816,7 +1242,17 @@ impl AuthStore {
         if user.disabled {
             return Ok(None);
         }
-        let csrf = cell_text(&row, 5).unwrap_or_default();
+        let csrf = cell_text(&row, 6).unwrap_or_default();
+        self.conn
+            .execute(
+                "UPDATE users SET last_seen_at = ?2 WHERE name = ?1",
+                vec![
+                    Value::Text(user.name.clone()),
+                    Value::Text(chrono::Utc::now().to_rfc3339()),
+                ],
+            )
+            .await
+            .context("stamping last_seen_at")?;
         Ok(Some((user, csrf)))
     }
 
@@ -935,6 +1371,27 @@ impl AuthStore {
     }
 }
 
+/// Add a column to an existing table when it is missing. The auth database has
+/// no schema-version counter - its `SCHEMA` is idempotent DDL - so a new column
+/// follows the same contract: run the ALTER, and treat "the column is already
+/// there" as success. Any other failure is real and propagates.
+async fn ensure_column(conn: &Connection, table: &str, column_def: &str) -> Result<()> {
+    match conn
+        .execute(&format!("ALTER TABLE {table} ADD COLUMN {column_def}"), ())
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(e)
+            if e.to_string()
+                .to_ascii_lowercase()
+                .contains("duplicate column") =>
+        {
+            Ok(())
+        }
+        Err(e) => Err(e).with_context(|| format!("adding {table}.{column_def}")),
+    }
+}
+
 /// Decode the [`USER_COLUMNS`] prefix of a row.
 fn user_from_row(row: &Row) -> User {
     User {
@@ -943,6 +1400,7 @@ fn user_from_row(row: &Row) -> User {
         email: cell_text(row, 2),
         role: role_from_db(&cell_text(row, 3).unwrap_or_default()),
         disabled: matches!(row.get_value(4), Ok(Value::Integer(i)) if i != 0),
+        last_seen: cell_text(row, 5),
     }
 }
 
@@ -1038,6 +1496,29 @@ async fn verify_hash(hash: String, password: String) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whether [`open_database`] is expected to reach multiprocess WAL on the
+    /// platform these tests are running on, rather than falling back to a
+    /// legacy open. Observable as the `web-auth.db-tshm` coordination file
+    /// beside the database, which only the multiprocess open creates.
+    ///
+    /// Stated once here, with its two upstream conditions, so no assertion has
+    /// to carry a `cfg` of its own:
+    ///
+    /// * turso_core's `host_shared_wal` cfg, which its `build.rs` sets to
+    ///   `all(any(unix, target_os = "windows"), target_pointer_width = "64")`.
+    ///   Where it is off the flag is a documented no-op and legacy behavior
+    ///   stays, so a 32-bit target never gets the coordination file.
+    /// * an IO backend whose `supports_shared_wal_coordination` is true
+    ///   (turso_core 0.7.2 `io/mod.rs`, where the trait default is `false`).
+    ///   The unix and io_uring backends override it to `true`; the default
+    ///   Windows backend, `WindowsIO`, does not, and only `WindowsIOCP`,
+    ///   compiled only under the off-by-default `experimental_win_iocp` cargo
+    ///   feature, does. So a Windows open takes the fallback.
+    ///
+    /// The day either changes upstream, whatever reads this goes red rather
+    /// than quietly stale, which is the point of asserting the mode at all.
+    const MULTIPROCESS_WAL_EXPECTED: bool = cfg!(unix) && cfg!(target_pointer_width = "64");
 
     async fn store() -> (tempfile::TempDir, AuthStore) {
         let dir = tempfile::tempdir().unwrap();
@@ -1157,6 +1638,120 @@ mod tests {
         assert!(store.session_user("not-a-token").await.unwrap().is_none());
         // The live session survived the expired one's prune.
         assert!(store.session_user(&live.token).await.unwrap().is_some());
+    }
+
+    /// `ensure_session` issues at most one session per account: the first call
+    /// creates, every later one reuses, and only an account with nothing live
+    /// gets a second row. This is what keeps `/auth/me` from adding a session
+    /// per probe for a trusted-header client that keeps no cookie.
+    #[tokio::test]
+    async fn ensure_session_reuses_a_live_session_rather_than_adding_one() {
+        let (_dir, store) = store().await;
+        store
+            .add_user("ada", "Ada", None, Role::Editor, "pw")
+            .await
+            .unwrap();
+        assert_eq!(store.session_count().await.unwrap(), 0);
+        assert!(store.newest_session_csrf("ada").await.unwrap().is_none());
+
+        let SessionMint::Created(first) = store.ensure_session("ada", 3600).await.unwrap() else {
+            panic!("the first call has nothing to reuse, so it creates");
+        };
+        assert_eq!(store.session_count().await.unwrap(), 1);
+
+        // Ten more probes, all reusing: the row count does not move and the
+        // token does not change, which is what keeps a second tab working.
+        for _ in 0..10 {
+            let mint = store.ensure_session("AdA", 3600).await.unwrap();
+            assert!(
+                matches!(mint, SessionMint::Reused { .. }),
+                "a live session must be reused, not duplicated"
+            );
+            assert_eq!(mint.csrf(), first.csrf);
+        }
+        assert_eq!(store.session_count().await.unwrap(), 1);
+        assert_eq!(
+            store.newest_session_csrf("ada").await.unwrap().as_deref(),
+            Some(first.csrf.as_str())
+        );
+        // The created session is still the one the cookie resolves to.
+        let (_, csrf) = store.session_user(&first.token).await.unwrap().unwrap();
+        assert_eq!(csrf, first.csrf);
+
+        // An expired session is not live, so the next probe issues a fresh one
+        // and takes the dead row with it. `session_user` is the only other
+        // pruner and a cookieless probe never reaches it, so without this an
+        // account whose session lapsed would leave a row behind every time.
+        store.delete_session(&first.token).await.unwrap();
+        store.create_session("ada", -1).await.unwrap();
+        assert_eq!(store.session_count().await.unwrap(), 1, "the expired row");
+        assert!(store.newest_session_csrf("ada").await.unwrap().is_none());
+        let SessionMint::Created(second) = store.ensure_session("ada", 3600).await.unwrap() else {
+            panic!("nothing live is left to reuse, so this creates");
+        };
+        assert_ne!(second.csrf, first.csrf);
+        assert_eq!(
+            store.session_count().await.unwrap(),
+            1,
+            "the expired row was pruned rather than left beside the new one"
+        );
+
+        // Another account's live session is never handed over.
+        store
+            .add_user("bob", "Bob", None, Role::Editor, "pw")
+            .await
+            .unwrap();
+        assert!(store.newest_session_csrf("bob").await.unwrap().is_none());
+        let SessionMint::Created(bobs) = store.ensure_session("bob", 3600).await.unwrap() else {
+            panic!("bob holds nothing, so this creates");
+        };
+        assert_ne!(bobs.csrf, second.csrf);
+
+        // An account nobody created has no session to ensure.
+        assert!(store.ensure_session("ghost", 3600).await.is_err());
+    }
+
+    /// Concurrent probes, which is the two-tabs-at-once case: the check and the
+    /// insert are one transaction, so exactly one session is created however
+    /// many arrive together, and every caller is handed the same token. Without
+    /// the transaction each tab would get its own token and only the one whose
+    /// `Set-Cookie` landed last would be able to write.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_probes_settle_on_one_session() {
+        let (_dir, store) = store().await;
+        store
+            .add_user("ada", "Ada", None, Role::Editor, "pw")
+            .await
+            .unwrap();
+        let store = std::sync::Arc::new(store);
+
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let store = store.clone();
+            tasks.push(tokio::spawn(async move {
+                store.ensure_session("ada", 3600).await.unwrap()
+            }));
+        }
+        let mints: Vec<SessionMint> = futures::future::join_all(tasks)
+            .await
+            .into_iter()
+            .map(|t| t.unwrap())
+            .collect();
+
+        assert_eq!(
+            store.session_count().await.unwrap(),
+            1,
+            "one session however many probes raced for it"
+        );
+        let created = mints
+            .iter()
+            .filter(|m| matches!(m, SessionMint::Created(_)))
+            .count();
+        assert_eq!(created, 1, "exactly one caller created it");
+        let token = mints[0].csrf();
+        for mint in &mints {
+            assert_eq!(mint.csrf(), token, "every tab was handed the same token");
+        }
     }
 
     #[tokio::test]
@@ -1365,6 +1960,36 @@ mod tests {
         assert_eq!(store.list_users().await.unwrap().len(), 1);
     }
 
+    /// The display name is editable, and clearing it falls back to the login
+    /// name: "optional" means a client may always unset it, never that a row
+    /// goes nameless.
+    #[tokio::test]
+    async fn display_names_are_editable_and_clearing_resets_to_the_login_name() {
+        let (_dir, store) = store().await;
+        store
+            .add_user("ada", "Ada", None, Role::Viewer, "pw")
+            .await
+            .unwrap();
+
+        store
+            .set_display("ada", Some("Ada Lovelace"))
+            .await
+            .unwrap();
+        assert_eq!(store.list_users().await.unwrap()[0].display, "Ada Lovelace");
+
+        store.set_display("ADA", None).await.unwrap();
+        assert_eq!(store.list_users().await.unwrap()[0].display, "ada");
+
+        store.set_display("ada", Some("   ")).await.unwrap();
+        assert_eq!(
+            store.list_users().await.unwrap()[0].display,
+            "ada",
+            "blank is a clear, not a display name of spaces"
+        );
+
+        assert!(store.set_display("ghost", Some("Ghost")).await.is_err());
+    }
+
     /// Two `AuthStore` handles on one file see each other's writes as they
     /// happen, in the order the `crystalline users` CLI and the daemon do it.
     ///
@@ -1429,6 +2054,12 @@ mod tests {
     /// `-tshm` sibling created on demand, so an existing state directory needs
     /// no migration. This writes the file exactly as the previous build did,
     /// closes it and reopens it the way [`open_database`] now does.
+    ///
+    /// The title's promise - that it still opens, with its accounts, and stays
+    /// writable - is asserted everywhere. Which mode did the opening is
+    /// asserted against [`MULTIPROCESS_WAL_EXPECTED`], because on Windows
+    /// multiprocess WAL is refused and the fallback is the correct outcome
+    /// there, not a defect.
     #[tokio::test]
     async fn a_database_written_without_the_multiprocess_flag_still_opens() {
         let dir = tempfile::tempdir().unwrap();
@@ -1451,16 +2082,19 @@ mod tests {
 
         let store = AuthStore::open(&path)
             .await
-            .expect("an existing legacy-mode database must open in multiprocess mode");
+            .expect("an existing legacy-mode database must open");
         let users = store.list_users().await.unwrap();
         assert_eq!(users.len(), 1, "the accounts survived the mode change");
         assert_eq!(users[0].name, "ada");
         // The account is still editable, so the reopen is a real read-write
         // open and not a degraded one.
         store.set_role("ada", Role::Admin).await.unwrap();
-        assert!(
+        assert_eq!(
             path.with_file_name("web-auth.db-tshm").exists(),
-            "multiprocess mode is what actually opened the file"
+            MULTIPROCESS_WAL_EXPECTED,
+            "the mode that opened the file must be the one this platform can \
+             have (see MULTIPROCESS_WAL_EXPECTED): multiprocess leaves the \
+             coordination file beside the database, the fallback leaves none"
         );
     }
 
@@ -1480,6 +2114,54 @@ mod tests {
         assert!(
             is_multiprocess_unsupported(&err),
             "the fallback no longer recognizes turso's message: {err}"
+        );
+    }
+
+    /// A locked fallback open is the one failure a user can do something
+    /// about, so it must say what to do rather than hand back turso's byte
+    /// range wording. The error is synthesized here because the platform that
+    /// produces it (Windows, whose default IO backend has no shared WAL
+    /// coordination) is not the platform this test usually runs on: the
+    /// mapping is a pure function of the message, so it is testable
+    /// everywhere.
+    #[test]
+    fn a_locked_fallback_open_says_what_holds_the_database() {
+        let locked = turso::Error::Error(
+            "Locking error: Failed locking file, The process cannot access the file because \
+             another process has locked a portion of the file. (os error 33)"
+                .to_string(),
+        );
+        let err = legacy_open_error(locked, Path::new("/state/web-auth.db"));
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("held by a running daemon"),
+            "the message must name what holds the file: {text}"
+        );
+        assert!(
+            text.contains("crystalline ctl shutdown"),
+            "the message must name the way out: {text}"
+        );
+        assert!(
+            text.contains("web-auth.db"),
+            "the message must name the file: {text}"
+        );
+    }
+
+    /// Any other reason a fallback open fails is not the locked case and must
+    /// keep the plain context, so a corrupt file or a missing directory is not
+    /// reported as a running daemon.
+    #[test]
+    fn a_fallback_open_that_fails_for_another_reason_keeps_the_plain_context() {
+        let other = turso::Error::Error("file is not a database".to_string());
+        let err = legacy_open_error(other, Path::new("/state/web-auth.db"));
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("opening auth database"),
+            "an unrelated failure keeps the plain wording: {text}"
+        );
+        assert!(
+            !text.contains("running daemon"),
+            "an unrelated failure must not blame a daemon: {text}"
         );
     }
 
@@ -1591,26 +2273,77 @@ mod tests {
     #[tokio::test]
     async fn ensure_user_is_idempotent() {
         let (_dir, store) = store().await;
-        let first = store.ensure_user("ada", Role::Viewer).await.unwrap();
-        let second = store.ensure_user("ada", Role::Viewer).await.unwrap();
+        let first = store
+            .ensure_user("ada", Role::Viewer, usize::MAX)
+            .await
+            .unwrap();
+        let second = store
+            .ensure_user("ada", Role::Viewer, usize::MAX)
+            .await
+            .unwrap();
         assert_eq!(first.name, second.name);
         assert_eq!(first.role, second.role);
         assert_eq!(store.list_users().await.unwrap().len(), 1);
     }
 
+    /// The provisioning cap: ensure_user refuses to mint an account past the cap,
+    /// while an existing account keeps resolving whatever the count is. This is
+    /// the trusted-header mitigation - a proxy misconfiguration (a header carrying
+    /// a session id, say) must not mint one account per request forever.
+    #[tokio::test]
+    async fn ensure_user_refuses_to_mint_past_the_cap() {
+        let (_dir, store) = store().await;
+        store.ensure_user("ada", Role::Viewer, 2).await.unwrap();
+        store.ensure_user("bob", Role::Viewer, 2).await.unwrap();
+
+        let err = store.ensure_user("cyd", Role::Viewer, 2).await.unwrap_err();
+        assert!(
+            err.to_string().contains("auth.max_users"),
+            "the refusal names the setting: {err}"
+        );
+        assert_eq!(store.list_users().await.unwrap().len(), 2);
+
+        // Existing accounts resolve regardless of the count-vs-cap state.
+        assert_eq!(
+            store
+                .ensure_user("ada", Role::Viewer, 2)
+                .await
+                .unwrap()
+                .name,
+            "ada"
+        );
+        assert_eq!(
+            store
+                .ensure_user("ADA", Role::Viewer, 1)
+                .await
+                .unwrap()
+                .name,
+            "ada"
+        );
+    }
+
     #[tokio::test]
     async fn ensure_user_keeps_an_admin_assigned_role() {
         let (_dir, store) = store().await;
-        store.ensure_user("ada", Role::Viewer).await.unwrap();
+        store
+            .ensure_user("ada", Role::Viewer, usize::MAX)
+            .await
+            .unwrap();
         store.set_role("ada", Role::Admin).await.unwrap();
-        let again = store.ensure_user("ada", Role::Viewer).await.unwrap();
+        let again = store
+            .ensure_user("ada", Role::Viewer, usize::MAX)
+            .await
+            .unwrap();
         assert_eq!(again.role, Role::Admin);
     }
 
     #[tokio::test]
     async fn a_provisioned_user_has_no_password_to_log_in_with() {
         let (_dir, store) = store().await;
-        store.ensure_user("ada", Role::Editor).await.unwrap();
+        store
+            .ensure_user("ada", Role::Editor, usize::MAX)
+            .await
+            .unwrap();
         assert!(store.verify_password("ada", "").await.unwrap().is_none());
         store.set_password("ada", "pw").await.unwrap();
         assert!(store.verify_password("ada", "pw").await.unwrap().is_some());
@@ -1631,7 +2364,10 @@ mod tests {
             .unwrap();
         store.set_disabled("ada", true).await.unwrap();
 
-        let same = store.ensure_user("Ada", Role::Viewer).await.unwrap();
+        let same = store
+            .ensure_user("Ada", Role::Viewer, usize::MAX)
+            .await
+            .unwrap();
         assert_eq!(same.name, "ada");
         assert!(same.disabled, "the disable must not have been undone");
         assert_eq!(same.role, Role::Editor, "the role must not have been reset");
@@ -1693,12 +2429,50 @@ mod tests {
                     .is_err(),
                 "add_user must reject {blank:?}"
             );
-            assert!(store.ensure_user(blank, Role::Viewer).await.is_err());
+            assert!(
+                store
+                    .ensure_user(blank, Role::Viewer, usize::MAX)
+                    .await
+                    .is_err()
+            );
             // A login attempt is a `None`, not an error, like every other bad
             // credential.
             assert!(store.verify_password(blank, "pw").await.unwrap().is_none());
         }
         assert!(store.list_users().await.unwrap().is_empty());
+    }
+
+    /// Login names are space-free: the readable form belongs in the display name.
+    /// Enforced in normalize_name so every path - add, ensure, verify, edit -
+    /// refuses the same way.
+    #[tokio::test]
+    async fn a_name_with_internal_whitespace_is_rejected_on_every_path() {
+        let (_dir, store) = store().await;
+        for name in ["ada lovelace", "ada\tlovelace", "a b c"] {
+            assert!(
+                store
+                    .add_user(name, "Ada", None, Role::Viewer, "pw")
+                    .await
+                    .is_err(),
+                "add_user must reject {name:?}"
+            );
+            assert!(
+                store
+                    .ensure_user(name, Role::Viewer, usize::MAX)
+                    .await
+                    .is_err()
+            );
+            assert!(store.set_role(name, Role::Admin).await.is_err());
+            // A login attempt is a NoHash, not an error, like other bad names.
+            assert!(store.verify_password(name, "pw").await.unwrap().is_none());
+        }
+        assert!(store.list_users().await.unwrap().is_empty());
+        // Surrounding whitespace is still merely trimmed.
+        store
+            .add_user("  ada  ", "Ada Lovelace", None, Role::Viewer, "pw")
+            .await
+            .unwrap();
+        assert_eq!(store.list_users().await.unwrap()[0].name, "ada");
     }
 
     #[test]
@@ -1707,6 +2481,7 @@ mod tests {
         assert_eq!(normalize_name("Ada").unwrap(), "ada");
         assert!(normalize_name("").is_err());
         assert!(normalize_name("   ").is_err());
+        assert!(normalize_name("ada lovelace").is_err());
     }
 
     #[tokio::test]
@@ -1722,6 +2497,227 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    /// The count the first-run probe reads: zero on a fresh file, and one more
+    /// for every account however it was created.
+    #[tokio::test]
+    async fn user_count_is_zero_until_an_account_exists() {
+        let (_dir, store) = store().await;
+        assert_eq!(store.user_count().await.unwrap(), 0);
+        store
+            .add_user("ada", "Ada", None, Role::Admin, "pw")
+            .await
+            .unwrap();
+        assert_eq!(store.user_count().await.unwrap(), 1);
+        // The trusted-header path mints accounts too, and they count the same.
+        store
+            .ensure_user("bob", Role::Viewer, usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(store.user_count().await.unwrap(), 2);
+        store.remove_user("bob").await.unwrap();
+        assert_eq!(store.user_count().await.unwrap(), 1);
+    }
+
+    /// The first admin is created only into an empty table, and the account it
+    /// creates is a real one: admin, enabled, folded name, display as typed,
+    /// and a password that verifies.
+    #[tokio::test]
+    async fn add_first_admin_creates_one_admin_and_only_on_an_empty_table() {
+        let (_dir, store) = store().await;
+        assert!(
+            store.add_first_admin("Ada", "Ada", "s3cret").await.unwrap(),
+            "an empty table is what the first-run path is for"
+        );
+        let users = store.list_users().await.unwrap();
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].name, "ada", "the name is folded like every other");
+        assert_eq!(users[0].display, "Ada");
+        assert_eq!(users[0].role, Role::Admin);
+        assert!(!users[0].disabled);
+        assert!(matches!(
+            store.check_password("ada", "s3cret").await.unwrap(),
+            PasswordCheck::Verified(_)
+        ));
+
+        assert!(
+            !store.add_first_admin("bob", "Bob", "pw").await.unwrap(),
+            "the slot is gone once any account exists"
+        );
+        assert_eq!(
+            store.user_count().await.unwrap(),
+            1,
+            "and nothing was written"
+        );
+    }
+
+    /// The account that closes the slot need not be an admin, and need not have
+    /// been created here: `crystalline users add` in another process is the
+    /// case that matters, and it lands an ordinary row.
+    #[tokio::test]
+    async fn add_first_admin_refuses_once_any_account_exists() {
+        let (_dir, added) = store().await;
+        added
+            .add_user("vera", "Vera", None, Role::Viewer, "pw")
+            .await
+            .unwrap();
+        assert!(
+            !added
+                .add_first_admin("root", "Root", "rootpw")
+                .await
+                .unwrap()
+        );
+        assert_eq!(added.list_users().await.unwrap().len(), 1);
+
+        let (_dir2, provisioned) = store().await;
+        provisioned
+            .ensure_user("proxied", Role::Viewer, usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            !provisioned
+                .add_first_admin("root", "Root", "rootpw")
+                .await
+                .unwrap()
+        );
+    }
+
+    /// An unusable name is refused before anything is written, so a typo does
+    /// not consume the one slot there is.
+    #[tokio::test]
+    async fn add_first_admin_refuses_a_name_the_store_cannot_key_on() {
+        let (_dir, store) = store().await;
+        assert!(store.add_first_admin("  ", "Blank", "pw").await.is_err());
+        assert!(
+            store
+                .add_first_admin("ada lovelace", "Ada", "pw")
+                .await
+                .is_err()
+        );
+        assert_eq!(store.user_count().await.unwrap(), 0);
+        assert!(store.add_first_admin("ada", "Ada", "pw").await.unwrap());
+    }
+
+    /// Invariant 1's real pin: the claim holds across PROCESSES, which is what
+    /// the REST layer's own guard mutex can never show.
+    ///
+    /// Two [`AuthStore`]s are opened on one `web-auth.db` - the exact shape
+    /// `crystalline users add` takes while the daemon serves - and the first
+    /// admin is raced against a second first-admin call and against a plain
+    /// `add_user`. Two assertions carry the invariant, and neither is "exactly
+    /// one row lands": in the `add_user` leg two rows legitimately can, since
+    /// an ordinary add of a different name is not competing for the slot at
+    /// all. What must hold is that `add_first_admin` reports success at most
+    /// once, and never once any row already exists.
+    ///
+    /// **The two racing calls are `tokio::spawn`ed behind a barrier, and the
+    /// race is repeated ten times.** All three details are load bearing and
+    /// none is style. A `tokio::join!` polls both futures on ONE task, so they
+    /// can only interleave where one of them returns `Pending` - and the
+    /// check-then-insert window this test exists to catch is store work that
+    /// never yields, so a `join!` version of this test passes against exactly
+    /// the naive implementation the plan rejects (measured against a
+    /// deliberately naive store: 12 runs, 12 misses). Spawned onto different
+    /// worker threads and released together, the same race caught that store in
+    /// roughly four rounds out of five, and ten rounds is what turns "roughly
+    /// four out of five" into a pin. Anyone tempted to tidy this back into a
+    /// `join!` is removing the only test that can see the bug.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_second_store_open_cannot_also_win_first_admin() {
+        use std::sync::Arc;
+
+        // Leg one: first admin against first admin, on two opens of one file.
+        for round in 0..10 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("web-auth.db");
+            let daemon = Arc::new(AuthStore::open(&path).await.unwrap());
+            let cli = Arc::new(AuthStore::open(&path).await.unwrap());
+            // Released together, so what separates the two calls is the work
+            // itself rather than however long each task waited to be scheduled.
+            let gate = Arc::new(tokio::sync::Barrier::new(2));
+            let one = tokio::spawn({
+                let store = daemon.clone();
+                let gate = gate.clone();
+                async move {
+                    gate.wait().await;
+                    store.add_first_admin("root", "Root", "rootpw").await
+                }
+            });
+            let two = tokio::spawn({
+                let store = cli.clone();
+                let gate = gate.clone();
+                async move {
+                    gate.wait().await;
+                    store.add_first_admin("boss", "Boss", "bosspw").await
+                }
+            });
+            let won = [one.await.unwrap().unwrap(), two.await.unwrap().unwrap()];
+            assert_eq!(
+                won.iter().filter(|w| **w).count(),
+                1,
+                "round {round}: exactly one of two racing first-admin calls may win"
+            );
+            assert_eq!(
+                daemon.user_count().await.unwrap(),
+                1,
+                "round {round}: and exactly one row is what they left behind"
+            );
+        }
+
+        // Leg two: first admin against an ordinary add from the other open.
+        // Both may land - the names differ and `users add` is not competing for
+        // the slot - but a first admin created after a row exists would be a
+        // check-then-insert that read stale, and a first admin that reported
+        // failure while writing a row would be worse still.
+        for round in 0..10 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("web-auth.db");
+            let daemon = Arc::new(AuthStore::open(&path).await.unwrap());
+            let cli = Arc::new(AuthStore::open(&path).await.unwrap());
+            let gate = Arc::new(tokio::sync::Barrier::new(2));
+            let first = tokio::spawn({
+                let store = daemon.clone();
+                let gate = gate.clone();
+                async move {
+                    gate.wait().await;
+                    store.add_first_admin("root", "Root", "rootpw").await
+                }
+            });
+            let added = tokio::spawn({
+                let store = cli.clone();
+                let gate = gate.clone();
+                async move {
+                    gate.wait().await;
+                    store.add_user("ada", "Ada", None, Role::Viewer, "pw").await
+                }
+            });
+            added.await.unwrap().unwrap();
+            // Both racers have finished before the table is read, or the read
+            // could miss a row that was still on its way in.
+            let first = first.await.unwrap().unwrap();
+            let names: Vec<String> = daemon
+                .list_users()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|u| u.name)
+                .collect();
+            if first {
+                assert!(names.contains(&"root".to_string()), "round {round}");
+            } else {
+                assert_eq!(
+                    names,
+                    vec!["ada".to_string()],
+                    "round {round}: a first admin that reported failure must not \
+                     have written a row"
+                );
+            }
+            assert!(
+                !daemon.add_first_admin("late", "Late", "pw").await.unwrap(),
+                "round {round}: and the slot stays shut for every later caller"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1941,5 +2937,102 @@ mod tests {
         assert!("root".parse::<Role>().is_err());
         // A hand-edited or corrupt row resolves to the least privileged role.
         assert_eq!(role_from_db("root"), Role::Viewer);
+    }
+
+    /// The column migration: a database created by the slice-1 schema (no
+    /// last_seen_at) opens cleanly and gains the column, and opening twice is
+    /// harmless - the idempotent-open contract, extended to columns.
+    #[tokio::test]
+    async fn an_old_database_gains_the_last_seen_column_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("web-auth.db");
+        // Hand-create the pre-migration shape.
+        {
+            let db = Builder::new_local(&path.to_string_lossy())
+                .build()
+                .await
+                .unwrap();
+            let conn = db.connect().unwrap();
+            conn.execute_batch(
+                "CREATE TABLE users (
+                    name TEXT PRIMARY KEY,
+                    display TEXT NOT NULL,
+                    email TEXT,
+                    role TEXT NOT NULL,
+                    pass_hash TEXT,
+                    disabled INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL
+                );
+                INSERT INTO users (name, display, email, role, pass_hash, disabled, created_at)
+                VALUES ('ada', 'Ada', NULL, 'admin', NULL, 0, '2026-01-01T00:00:00Z');",
+            )
+            .await
+            .unwrap();
+        }
+        let store = AuthStore::open(&path).await.unwrap();
+        let users = store.list_users().await.unwrap();
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].name, "ada");
+        assert!(users[0].last_seen.is_none(), "never seen yet");
+        drop(store);
+        // Re-opening (the migrated shape) must not fail on the duplicate column.
+        let again = AuthStore::open(&path).await.unwrap();
+        assert_eq!(again.list_users().await.unwrap().len(), 1);
+    }
+
+    /// Resolving a session stamps the account as seen; a trusted-header contact
+    /// (ensure_user) stamps it too.
+    #[tokio::test]
+    async fn resolving_a_session_updates_last_seen() {
+        let (_dir, store) = store().await;
+        store
+            .add_user("ada", "Ada", None, Role::Editor, "pw")
+            .await
+            .unwrap();
+        assert!(store.list_users().await.unwrap()[0].last_seen.is_none());
+
+        let s = store.create_session("ada", 3600).await.unwrap();
+        store.session_user(&s.token).await.unwrap().unwrap();
+        let seen = store.list_users().await.unwrap()[0].last_seen.clone();
+        assert!(seen.is_some(), "a resolved session is a sighting");
+
+        let provisioned = store
+            .ensure_user("bob", Role::Viewer, usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            provisioned.last_seen.is_some(),
+            "provisioning is a sighting too"
+        );
+    }
+
+    /// The operator escape hatch: --force bypasses the last-admin guard. It still
+    /// reports a missing account, and a forced removal still takes the sessions
+    /// with it in the same transaction.
+    #[tokio::test]
+    async fn forced_edits_bypass_the_last_admin_guard() {
+        let (_dir, store) = store().await;
+        store
+            .add_user("ada", "Ada", None, Role::Admin, "pw")
+            .await
+            .unwrap();
+        let live = store.create_session("ada", 3600).await.unwrap();
+
+        // The guarded paths refuse; the forced ones do not.
+        assert!(store.set_role("ada", Role::Viewer).await.is_err());
+        store.set_role_force("ada", Role::Viewer).await.unwrap();
+        assert_eq!(store.list_users().await.unwrap()[0].role, Role::Viewer);
+
+        store.set_role_force("ada", Role::Admin).await.unwrap();
+        assert!(store.remove_user("ada").await.is_err());
+        store.remove_user_force("ada").await.unwrap();
+        assert!(store.list_users().await.unwrap().is_empty());
+        assert!(
+            store.session_user(&live.token).await.unwrap().is_none(),
+            "a forced removal still revokes the sessions"
+        );
+
+        assert!(store.set_role_force("ghost", Role::Viewer).await.is_err());
+        assert!(store.remove_user_force("ghost").await.is_err());
     }
 }

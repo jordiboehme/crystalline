@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Crystalline Fluid API",
-    "description": "The JSON API `crystalline serve --http` mounts at `/api/v1`, the surface the Fluid UI talks to. Read-only in this version apart from the session and account routes.\n\nEvery path but `/auth/login`, `/auth/logout` and `/auth/me` is closed by default: a request that carries no identity is answered 401 ahead of routing, so an unauthenticated caller never learns which paths exist. Every failure is an RFC 9457 problem detail sent as `application/problem+json`.\n\nThe payloads marked as generic objects are the engine's own JSON, passed through unchanged so this API and the MCP tools stay one source of truth; each carries an example of the shape it answers with.",
+    "description": "The JSON API the Crystalline daemon mounts at `/api/v1` on its HTTP endpoint (127.0.0.1:7411 by default), the surface the Fluid UI talks to. Reading is open to any signed-in viewer; writing content needs an editor account and the `If-Match` token of the version being replaced, and account management needs an admin.\n\nEvery path but `/auth/login`, `/auth/logout`, `/auth/me` and `/auth/setup` is closed by default: a request that carries no identity is answered 401 ahead of routing, so an unauthenticated caller never learns which paths exist. Every failure is an RFC 9457 problem detail sent as `application/problem+json`.\n\nThe payloads marked as generic objects are the engine's own JSON, passed through unchanged so this API and the MCP tools stay one source of truth; each carries an example of the shape it answers with.",
     "license": {
       "name": "AGPL-3.0-or-later"
     },
@@ -132,6 +132,12 @@
           "200": {
             "description": "Signed in. The session cookie is set and the CSRF token is in the body.",
             "headers": {
+              "cache-control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "`no-store`: this answer carries a session cookie and a CSRF token, so no cache between the server and the browser may keep it."
+              },
               "set-cookie": {
                 "schema": {
                   "type": "string"
@@ -211,6 +217,12 @@
           "200": {
             "description": "Signed out, whether or not there was a session to revoke.",
             "headers": {
+              "cache-control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "`no-store`: this answer clears the session cookie, so no cache between the server and the browser may keep it."
+              },
               "set-cookie": {
                 "schema": {
                   "type": "string"
@@ -227,7 +239,7 @@
             }
           },
           "403": {
-            "description": "A cookie session did not echo its CSRF token, or the trusted-header identity names a disabled account.",
+            "description": "The identity did not echo its CSRF token, or carries none yet and must call `/auth/me` first, or the trusted-header identity names a disabled account.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -244,12 +256,26 @@
         "tags": [
           "auth"
         ],
-        "summary": "The capability probe a client calls before anything else: who it is, whether\nit is being served anonymously, whether this instance refuses content\nmutations, and which server version it is talking to, so a mismatched UI can\nsay so instead of failing later.",
-        "description": "Answers without an identity on purpose. `user: null, anonymous: false` is\nwhat tells a browser to show a login form; `anonymous: true` tells it to\nbrowse instead.\n\nIt also reissues the session's CSRF token, which is the only way a reloaded\nbrowser gets it back: see `MeResponse::csrf`.",
+        "summary": "The capability probe a client calls before anything else: who it is, whether\nit is being served anonymously, whether this instance refuses content\nmutations, whether it has any accounts at all, and which server version it\nis talking to, so a mismatched UI can say so instead of failing later.",
+        "description": "Who the caller is, whether it is being served anonymously, whether this instance refuses content mutations, whether it has no accounts yet and so still needs its first admin (`needs_setup`, which is what opens `POST /auth/setup`), and which server version it is talking to. Also issues the CSRF token every later mutating request must echo in `x-csrf-token`: a cookie session has its token reissued here, and a trusted-header identity is minted a session on the first call, which is the only way that mode obtains a token.",
         "operationId": "get_me",
         "responses": {
           "200": {
             "description": "Who the caller is and what this instance allows. Answered without an identity too, which is how a client learns it has to log in.",
+            "headers": {
+              "cache-control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "`no-store`. Always set: this answer names the caller and carries their CSRF token, and a shared cache is allowed to store a GET 200 heuristically, which behind an SSO proxy would hand the next user the previous one's identity."
+              },
+              "set-cookie": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "The `fluid_session` session cookie, HttpOnly and SameSite=Lax. Set only when this call issues a session, which is the first call from a trusted-header identity whose account holds none; a later probe reuses that session and sets no cookie."
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -260,6 +286,187 @@
           },
           "403": {
             "description": "The trusted-header identity names a disabled account. The guard resolves identity ahead of routing, so this answer reaches even the paths that are served without one.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/auth/setup": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Create the first admin account and sign in.",
+        "description": "Valid only while this instance has no accounts at all, and only for a caller on the machine that serves it or one carrying the one-time setup token `serve` prints for a non-loopback bind. Succeeds exactly once: the account is created by a single conditional insert, so a concurrent caller - another browser, or `crystalline users add` in another process - cannot also win. Success sets the `fluid_session` cookie and answers in the login shape.",
+        "operationId": "setup",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetupBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The first admin was created and signed in. The session cookie is set and the CSRF token is in the body, exactly as `POST /auth/login` answers.",
+            "headers": {
+              "cache-control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "`no-store`: this answer carries a session cookie and a CSRF token, so no cache between the server and the browser may keep it."
+              },
+              "set-cookie": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "The `fluid_session` session cookie, HttpOnly and SameSite=Lax."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LoginResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The body is not JSON.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The request did not come from the machine that serves this instance and carried no setup token, or the wrong one; one message covers both, so nothing says whether a token was close. When this instance holds a token, the problem document carries the extension member `token_required: true`, which is what a client keys a token field on - an instance that has no token to enter refuses without the member, so no dead-end input is ever offered.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "An account already exists, so the first-run slot is permanently gone. Checked before locality and before the token, and answered for a lost race too. 410 rather than 403 because a credential cannot change the answer, and rather than 409 because the conflict never resolves.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body is not `application/json`. Load bearing rather than pedantic: with no CORS layer on this surface, it is what stops another origin from driving this pre-session POST with a form.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The body is JSON but not a setup, the password is empty, or the name is not one this store can key on.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/collab/{domain}/{permalink}": {
+      "get": {
+        "tags": [
+          "engrams"
+        ],
+        "summary": "Upgrade to a real-time co-editing session on one engram.",
+        "description": "WebSocket upgrade for the y-sync + awareness protocol over the engram's shared text. Editor role, a live session cookie and a same-host Origin header are all required and checked before the upgrade; a read-only instance refuses like every write. CSRF headers do not apply to the upgrade GET. Refusals are problem+json.",
+        "operationId": "collab_join",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The domain.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "permalink",
+            "in": "path",
+            "description": "The engram's permalink; may contain slashes.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "101": {
+            "description": "Switching protocols: the session is joined."
+          },
+          "401": {
+            "description": "No identity.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Viewer role, read-only instance, or a missing/foreign Origin.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such engram.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Mixed line endings: this file cannot hold a shared session; edit solo.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Session or participant capacity reached.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -479,6 +686,434 @@
             }
           }
         }
+      },
+      "post": {
+        "tags": [
+          "domains"
+        ],
+        "summary": "Register a domain: local, virtual or a GitHub team domain.",
+        "description": "Admin only. A local domain is name-only and always lands at `<domains_root>/<name>` on the server, so no request can place a folder anywhere else; a virtual domain lives in the database; a team domain needs a GitHub connection and downloads the repository inside this request, which can take a while for a large one.",
+        "operationId": "create_domain",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateDomainBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "The engine's own registration report, unchanged. Its shape follows the mode: a local domain reports where it landed, a virtual one reports that it was registered, a team domain reports what was fetched.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                },
+                "example": {
+                  "adopted": false,
+                  "domain": "notes",
+                  "kind": "file",
+                  "manifest_created": true,
+                  "root": "/Users/ada/Documents/Crystalline/notes"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or an anonymous one.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an admin, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The name is taken by another domain, or mode `github` was asked for on an instance with no GitHub connection - the detail says where to make one.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body is not `application/json`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "An unknown mode, a name that could escape the domains root, or a field that does not belong to the mode asked for.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/domains/{domain}": {
+      "delete": {
+        "tags": [
+          "domains"
+        ],
+        "summary": "Unregister a domain. Files on disk are never touched.",
+        "description": "Admin only. The registration and the domain's index rows go; a file domain's files stay exactly where they are (re-adding the folder adopts them again), which is what `files_kept` reports. A virtual domain has no files, so `files_kept` is false and its knowledge is gone - a client must confirm that difference in words. Any open co-editing rooms in the domain are saved and closed first; `rooms_closed` counts them.",
+        "operationId": "unregister_domain",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The registered domain.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The engine's own unregistration report, plus the number of co-editing rooms this call closed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                },
+                "example": {
+                  "domain": "eng",
+                  "files_kept": true,
+                  "index_cleared": true,
+                  "rooms_closed": 0,
+                  "unregistered": true
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or an anonymous one.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an admin, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The domain is defined by an environment variable, which owns it: unset the variable instead.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/domains/{domain}/archive": {
+      "get": {
+        "tags": [
+          "domains"
+        ],
+        "summary": "Download a whole domain as a zip.",
+        "description": "Admin only. Every file of the domain - MANIFEST included - as one zip, read from whichever source of truth the domain has: markdown on disk for a file domain, the database for a virtual one. A pure read, so it is served even on a read-only instance, which is exactly where an operator wants a backup to take.",
+        "operationId": "download_domain_archive",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The registered domain to archive.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The archive, as an attachment named after the domain.",
+            "content": {
+              "application/zip": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or an anonymous one.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an admin, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/domains/{domain}/archive/import": {
+      "post": {
+        "tags": [
+          "domains"
+        ],
+        "summary": "Import an uploaded archive into a domain.",
+        "description": "Admin only. Runs the engine verb the preview dry-ran, so the outcome matches the report that was approved: entries land as `created` or `overwritten`, and `skipped`, `invalid` and `ignored` name everything that did not.\n\n`policy=skip` (the default) leaves an existing path alone; `policy=overwrite` replaces it. Overwrite is a same-path decision only - an entry whose permalink is held at another path is refused under either policy, since writing it would leave two files claiming one permalink.\n\nThe same hygiene the preview enforces applies here: a hostile archive is refused whole rather than partially imported.",
+        "operationId": "import_domain_archive",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The registered domain to import into.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "policy",
+            "in": "query",
+            "description": "How a path that already exists is treated: `skip` (the default) leaves\nit alone, `overwrite` replaces it. Anything else is refused.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "skip"
+          }
+        ],
+        "requestBody": {
+          "description": "The raw bytes of a zip archive.",
+          "content": {
+            "application/zip": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The per-entry report of what landed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ArchiveReport"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or an anonymous one.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an admin, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The upload is past the surface's request-body limit.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The bytes are not a readable zip, the archive fails hygiene, or `policy` is neither `skip` nor `overwrite`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/domains/{domain}/archive/preview": {
+      "post": {
+        "tags": [
+          "domains"
+        ],
+        "summary": "Dry-run an archive upload: what each entry would become.",
+        "description": "Admin only. Takes the raw bytes of a zip and reports, per entry, what an import would do with it - `new`, `collides`, `invalid` or `ignored` - with the verify findings `POST /validate` would raise over that entry's markdown.\n\nNothing is written. A hostile archive is refused whole with 422 rather than partially imported: more than 1000 entries, an entry over 1 MiB or a whole archive over 32 MiB once decompressed, an entry name that is not UTF-8, or any path that could escape the domain root.",
+        "operationId": "preview_domain_archive_import",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The registered domain the archive is aimed at.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "The raw bytes of a zip archive.",
+          "content": {
+            "application/zip": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The per-entry report, and the counters under it.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ArchiveReport"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or an anonymous one.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an admin, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The upload is past the surface's request-body limit.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The bytes are not a readable zip, or the archive fails hygiene - the detail names which rule.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
       }
     },
     "/api/v1/domains/{domain}/engrams": {
@@ -487,7 +1122,7 @@
           "engrams"
         ],
         "summary": "One domain's engrams, filtered by frontmatter and paged.",
-        "description": "A filter-only search, so the answer carries the same page envelope a search does and a client pages it the same way. Listing by folder is not here: the tree endpoint owns the navigation view and this one owns the frontmatter view.\n\nA domain nobody registered is a 404, while filters that match nothing are an empty page: two states a client can tell apart.",
+        "description": "A filter-only search, so the answer carries the same page envelope a search does and a client pages it the same way.\n\n`path` scopes the listing to one folder, the folder and everything below it, and it is a folder rather than a string prefix: `notes` takes `notes/deep/y.md` and never `notes-misc/z.md`. The total stays exact under it, so a folder holding thousands of engrams costs one page rather than the folder.\n\nUnder `path`, `total` counts the folder recursively - every engram below it at any depth - which is the number to show when promising a folder's size. The tree endpoint's `total` counts a single level and is deliberately smaller, because it states a fact about the level it drew rather than a promise about the folder. The tree still owns the navigation view and this one owns the listing.\n\nA domain nobody registered is a 404, while filters that match nothing are an empty page: two states a client can tell apart.",
         "operationId": "list_engrams",
         "parameters": [
           {
@@ -540,6 +1175,16 @@
             "example": "2026-01-31"
           },
           {
+            "name": "path",
+            "in": "query",
+            "description": "Only engrams filed under this domain-relative folder, the folder and\neverything below it. A folder rather than a string prefix: `notes`\ntakes `notes/deep/y.md` and never `notes-misc/z.md`. Absent or empty\nis the whole domain.\n\nThe `total` beside the hits counts this folder recursively, at any\ndepth, which is the number to show when promising a folder's size. The\ntree endpoint counts one level and reports a smaller one.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "notes"
+          },
+          {
             "name": "page",
             "in": "query",
             "description": "One-based page number. Defaults to 1.",
@@ -564,7 +1209,7 @@
         ],
         "responses": {
           "200": {
-            "description": "The engine's page envelope, unchanged.",
+            "description": "The engine's page envelope, unchanged. Under `path`, its `total` is the folder's recursive count, not the tree's per-level one.",
             "content": {
               "application/json": {
                 "schema": {
@@ -627,6 +1272,135 @@
           },
           "404": {
             "description": "No such domain.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "engrams"
+        ],
+        "summary": "Create an engram from a title and a markdown body.",
+        "description": "The engine builds the frontmatter and slugifies the title into the filename and permalink, and the account behind the request is named in the engram's `generated.by`.\n\nThe answer is the detail read of what landed, `ETag` included, so a client can go straight to editing it. This route never overwrites: a permalink already taken is a 409, and replacing an engram is what the PUT is for.",
+        "operationId": "create_engram",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The registered domain.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateEngramBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "The engine's own read payload for the new engram.",
+            "headers": {
+              "etag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "The quoted checksum of the engram as written, the token a later save carries in `If-Match`."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The body is not JSON.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or an anonymous one: an identity with no account behind it never writes.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an editor, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "That permalink is already taken in this domain.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The body is over the 10 MiB limit this API accepts.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body is not `application/json`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The body is JSON but not an engram, the title does not slugify to a permalink, the metadata breaks the frontmatter contract, or the target is one of the reserved OKF names (`index.md`, `log.md`).",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -735,6 +1509,428 @@
             }
           }
         }
+      },
+      "put": {
+        "tags": [
+          "engrams"
+        ],
+        "summary": "Save an engram's complete markdown text.",
+        "description": "The text lands verbatim, frontmatter included: nothing rebuilds it and nothing stamps provenance, so a client that saves what it read writes back byte-identical bytes.\n\nThe write is guarded by `If-Match`, whose token is the `ETag` of the detail read it is based on: a save that arrives without one is answered 428, and one whose token is stale is answered 412 carrying the version the server holds now, so a client can merge rather than lose the edit.\n\nEditing the `permalink` in the frontmatter moves the engram's address, since the index takes the permalink from the file. Such a save is answered 200 with the engram read at its new address, so a client can follow the move rather than lose track of what it just wrote.",
+        "operationId": "save_engram",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The registered domain.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "permalink",
+            "in": "path",
+            "description": "The engram permalink. A permalink is a path, so this segment may contain slashes: `notes/deep/gamma`.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "notes/deep/gamma"
+          },
+          {
+            "name": "If-Match",
+            "in": "header",
+            "description": "The quoted `ETag` of the version being replaced, from the detail read.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "\"3f8a1c05e2\""
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SaveEngramBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The engine's own read payload for the saved engram.",
+            "headers": {
+              "etag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "The quoted checksum of the engram as saved, the token the next save carries."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The body is not JSON, or `If-Match` carries more than one entity tag: this surface expects exactly one strong checksum, not a comma-separated list.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or an anonymous one: an identity with no account behind it never writes.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an editor, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. A read-only instance answers this ahead of the precondition check, so it is never 428.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain or engram, or the engram is indexed but its file is not on this machine.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "The `If-Match` token is stale. The body carries the version the server holds now, so a client can merge.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConflictDetail"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The document is over the 10 MiB limit this API accepts.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body is not `application/json`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The document is not an engram (unparseable, or no frontmatter block), the `If-Match` is a wildcard or a weak validator, or the target is one of the reserved OKF names (`index.md`, `log.md`).",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "428": {
+            "description": "No `If-Match` arrived. The token comes from the detail read.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "engrams"
+        ],
+        "summary": "Hard delete an engram, guarded by If-Match.",
+        "description": "A file domain removes the file from disk; a virtual domain drops the database rows. Guarded the same way `save` is: 428 with no `If-Match`, 412 when the token is stale (carrying the version the server holds now), 204 once it lands. A read-only instance answers 403 ahead of the precondition check, so it is never 428.",
+        "operationId": "delete_engram",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The registered domain.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "permalink",
+            "in": "path",
+            "description": "The engram permalink. A permalink is a path, so this segment may contain slashes: `notes/deep/gamma`.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "notes/deep/gamma"
+          },
+          {
+            "name": "If-Match",
+            "in": "header",
+            "description": "The quoted `ETag` of the version being deleted, from the detail read.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "\"3f8a1c05e2\""
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted. No body."
+          },
+          "400": {
+            "description": "`If-Match` carries more than one entity tag: this surface expects exactly one strong checksum, not a comma-separated list.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or an anonymous one: an identity with no account behind it never writes.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an editor, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. A read-only instance answers this ahead of the precondition check, so it is never 428.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain or engram.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "The `If-Match` token is stale. The body carries the version the server holds now, so a client can decide whether losing it is really what it meant.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConflictDetail"
+                }
+              }
+            }
+          },
+          "428": {
+            "description": "No `If-Match` arrived. The token comes from the detail read.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/domains/{domain}/inbound/{permalink}": {
+      "get": {
+        "tags": [
+          "engrams"
+        ],
+        "summary": "What points at one engram, paged and searchable.",
+        "description": "The browsing view of the detail payload's inbound block: the same references, counted by relation type and answered a page at a time.\n\n`types` is the summary of every reference pointing here, most-used first, and it deliberately ignores `q` and `rel` - it is the map a client filters *with*, so it does not change shape as the filters are used. `total` is exact under both filters. `rel` names a relation type, with `links_to` for prose wikilinks. Hits are ordered by title, then permalink, so paging is stable.",
+        "operationId": "get_inbound_references",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The registered domain.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "permalink",
+            "in": "path",
+            "description": "The engram permalink. A permalink is a path, so this segment may contain slashes: `notes/deep/gamma`.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "notes/deep/gamma"
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "description": "Case-insensitive substring the referencing engram's title or path must\ncontain. Absent or empty selects every reference.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "beta"
+          },
+          {
+            "name": "rel",
+            "in": "query",
+            "description": "Keep only references carrying this relation type. `links_to` selects\nprose wikilinks.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "relates_to"
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "description": "One-based page number. Defaults to 1.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "example": 1
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size. Defaults to 10.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "example": 10
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "One page of references, with the unfiltered per-relation summary.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                },
+                "example": {
+                  "count": 2,
+                  "hits": [
+                    {
+                      "domain": "eng",
+                      "path": "notes/beta.md",
+                      "permalink": "notes/beta",
+                      "rel": "relates_to",
+                      "status": "stable",
+                      "title": "Beta"
+                    },
+                    {
+                      "domain": "eng",
+                      "path": "notes/deep/gamma.md",
+                      "permalink": "notes/deep/gamma",
+                      "rel": "links_to",
+                      "status": "stable",
+                      "title": "Gamma"
+                    }
+                  ],
+                  "limit": 10,
+                  "page": 1,
+                  "total": 2,
+                  "types": [
+                    {
+                      "count": 1,
+                      "rel": "relates_to"
+                    },
+                    {
+                      "count": 1,
+                      "rel": "links_to"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The query string will not parse.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain or engram.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
       }
     },
     "/api/v1/domains/{domain}/manifest": {
@@ -742,7 +1938,8 @@
         "tags": [
           "domains"
         ],
-        "summary": "`GET /domains/{domain}/manifest` - the domain's MANIFEST markdown as\nwritten, so a client can render or edit the source rather than a reduction\nof it.",
+        "summary": "The domain's MANIFEST markdown as written.",
+        "description": "The source, not a reduction of it, so a client can render or edit it directly.\n\nThe response carries an `ETag` over the markdown, the same strong validator a later `PUT` compares an `If-Match` against.",
         "operationId": "get_domain_manifest",
         "parameters": [
           {
@@ -758,12 +1955,21 @@
         "responses": {
           "200": {
             "description": "The manifest source beside the domain it belongs to.",
+            "headers": {
+              "etag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "The quoted checksum of the manifest as read, the token a later `PUT` carries in `If-Match`."
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
                   "type": "object"
                 },
                 "example": {
+                  "checksum": "3f8a1c05e2",
                   "domain": "eng",
                   "markdown": "---\ntitle: eng\n---\n\n## When to Use\n\n- Route here for eng questions.\n"
                 }
@@ -801,6 +2007,555 @@
             }
           }
         }
+      },
+      "put": {
+        "tags": [
+          "domains"
+        ],
+        "summary": "Save a domain's MANIFEST markdown, guarded by If-Match.",
+        "description": "The text lands verbatim, frontmatter included, guarded the same way an engram save is: 428 with no `If-Match`, 412 when the token is stale (carrying the version the server holds now), 200 once it lands. A read-only instance answers 403 ahead of the precondition check, so it is never 428.",
+        "operationId": "save_domain_manifest",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The registered domain.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "If-Match",
+            "in": "header",
+            "description": "The quoted `ETag` of the version being replaced, from the manifest read.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "\"3f8a1c05e2\""
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SaveManifestBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The manifest as saved, mirroring the GET shape.",
+            "headers": {
+              "etag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "The quoted checksum of the manifest as saved, the token the next save carries."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                },
+                "example": {
+                  "checksum": "3f8a1c05e2",
+                  "domain": "eng",
+                  "markdown": "---\ntitle: eng\n---\n\n## When to Use\n\n- Route here for eng questions.\n"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`If-Match` carries more than one entity tag: this surface expects exactly one strong checksum, not a comma-separated list.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or an anonymous one: an identity with no account behind it never writes.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an admin, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. A read-only instance answers this ahead of the precondition check, so it is never 428.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain, or the domain carries no MANIFEST yet.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "The `If-Match` token is stale. The body carries the version the server holds now, so a client can merge.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConflictDetail"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The document is over the 10 MiB limit this API accepts.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body is not `application/json`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The document carries no frontmatter block, so it is not a MANIFEST.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "428": {
+            "description": "No `If-Match` arrived. The token comes from the manifest read.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/domains/{domain}/move": {
+      "post": {
+        "tags": [
+          "engrams"
+        ],
+        "summary": "Move an engram to a new path, or into another domain.",
+        "description": "A same-domain move is a rename; a cross-domain move reads the source content and re-indexes it into the destination's source, rewriting inbound bare links from other domains to the domain-prefixed form.\n\nThe permalink rides in the body for the same reason `RetireBody`'s does: the engram route's wildcard cannot be followed by an action segment.",
+        "operationId": "move_engram",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The engram's current domain.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MoveBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The move receipt: where the engram came from, where it landed, whether the move crossed domains and how many inbound links were rewritten.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                },
+                "example": {
+                  "cross_domain": false,
+                  "from": {
+                    "domain": "eng",
+                    "path": "beta.md",
+                    "permalink": "beta"
+                  },
+                  "links_rewritten": 0,
+                  "to": {
+                    "domain": "eng",
+                    "path": "guides/beta.md"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or an anonymous one: an identity with no account behind it never writes.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an editor, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain or engram.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The destination already exists in the target domain.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body is not `application/json`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The destination path is empty, or resolves to one of the reserved OKF names (`index.md`, `log.md`).",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/domains/{domain}/retire": {
+      "post": {
+        "tags": [
+          "engrams"
+        ],
+        "summary": "Guided retirement of one engram.",
+        "description": "Sets a retirement `status` (deprecated, superseded or archived), optionally closes out `valid_to`, and for `superseded` wires the reciprocal `superseded_by` / `supersedes` relation pair so verify's T005 and the evolve sweep see a live pair rather than a dangling one.\n\nThe permalink rides in the body rather than the path: a permalink is a path of its own and the engram route's wildcard cannot be followed by an action segment.",
+        "operationId": "retire_engram",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The registered domain.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RetireBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The retirement receipt: domain, permalink, the status now set and the resolved successor permalink, if any.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                },
+                "example": {
+                  "domain": "eng",
+                  "permalink": "alpha",
+                  "status": "superseded",
+                  "successor": "beta"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or an anonymous one: an identity with no account behind it never writes.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an editor, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain, engram, or - when status is superseded - successor.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A conflict the engine's retirement rule raises, answered 409 like the collision this API's other writes raise. Reserved for classification parity with create and move; guided retirement raises no conflict from any input this route accepts today.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body is not `application/json`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The status is not deprecated, superseded or archived; a successor is missing for superseded or given for another status; the successor resolves to the same engram being retired; or valid_to is not a plain ISO date.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/domains/{domain}/sync": {
+      "get": {
+        "tags": [
+          "domains"
+        ],
+        "summary": "Where a team domain stands relative to its GitHub origin.",
+        "description": "Admin only. A pure read, served even on a read-only instance. Answers 404 for a domain with no origin - only a GitHub team domain has sync status - so a client can treat any 404 as `no sync card`.",
+        "operationId": "get_domain_sync_status",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The registered team domain.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The engine's own status report for this one domain, plus the mode it is synced in. `local_changes` is the unshared-work count a client shows as pending; `probe_error` is set when the live check could not reach GitHub and the rest of the report came from local state alone.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                },
+                "example": {
+                  "base_commit": "9f3c1a2",
+                  "behind": false,
+                  "branch": "main",
+                  "conflicts": [],
+                  "declined_proposals": [],
+                  "domain": "eng",
+                  "last_checked": "2026-08-10T08:00:00Z",
+                  "local_changes": 2,
+                  "mode": "github",
+                  "open_proposals": [],
+                  "probe_error": null,
+                  "repo": "acme/knowledge"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or an anonymous one.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an admin, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain, or a domain with no team origin.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "GitHub is switched off on this instance, so no origin can be reached - the detail says where to turn it on.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "domains"
+        ],
+        "summary": "Pull a team domain's origin now.",
+        "description": "Admin only. Brings this instance's copy up to date with the domain's GitHub origin immediately, instead of waiting for the daemon's next poll: the same pull the poller runs, under the same per-domain lock. Refused on a read-only instance, and a conflict on a domain that has no origin to pull from.",
+        "operationId": "sync_domain",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The registered team domain.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The engine's own pull report for this one domain: whether it was already up to date, which files were applied or merged, which conflicts are waiting and which proposals changed state.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                },
+                "example": {
+                  "applied": [
+                    "notes/a.md"
+                  ],
+                  "conflicts": [],
+                  "domain": "eng",
+                  "merged": [],
+                  "proposals": [],
+                  "re_baselined": false,
+                  "skipped_large": [],
+                  "up_to_date": false
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or an anonymous one.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an admin, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The domain has no team origin to pull from, or GitHub is switched off on this instance - the detail says which, and where to fix it.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
       }
     },
     "/api/v1/domains/{domain}/tree": {
@@ -808,7 +2563,8 @@
         "tags": [
           "domains"
         ],
-        "summary": "`GET /domains/{domain}/tree` - one domain's engrams and subfolders under a\npath, the navigation a file tree in the UI is built from.",
+        "summary": "One level of a domain's folders and engrams.",
+        "description": "The navigation a file tree is built from, one level at a time and bounded: a level holding more engrams than the tree shows is cut, `total` says how many it really holds and `truncated` says the rows were cut, so a client can send its reader to the paged listing instead.\n\n`total` counts this level, not the folder: it moves with `depth` and leaves out everything nested deeper, so a folder of ten engrams holding a subfolder of a thousand reports ten here. `GET /domains/{domain}/engrams?path=...` counts the same folder recursively and reports the larger number. Neither is the other's approximation - a level states a fact about the rows it drew, a folder listing promises the folder - so a client that means to say \"N engrams in this folder\" takes that number from the listing.\n\n`folders` is never cut, so a truncated level still names every folder a reader can descend into. A `glob` narrows the engrams this level returned, so on a truncated level it selects within the cut rather than across the whole folder, and it does not filter `folders` at all.",
         "operationId": "get_domain_tree",
         "parameters": [
           {
@@ -833,7 +2589,7 @@
           {
             "name": "depth",
             "in": "query",
-            "description": "How many folder levels deep to list. Defaults to 1.",
+            "description": "How many folder levels deep to list. Defaults to 1. The `total` in the\nanswer counts this depth, so it moves with this parameter and is not\nthe folder's recursive size.",
             "required": false,
             "schema": {
               "type": "integer",
@@ -874,7 +2630,9 @@
                   "folders": [
                     "notes"
                   ],
-                  "path": "/"
+                  "path": "/",
+                  "total": 1,
+                  "truncated": false
                 }
               }
             }
@@ -977,7 +2735,7 @@
         ],
         "responses": {
           "200": {
-            "description": "The engine's own graph payload, unchanged: the flat node and edge lists a renderer draws from, with `truncated` saying whether the node cap cut anything. `id` is opaque and stable only within one response; the address is `crystalline://domain/permalink`.",
+            "description": "The engine's own graph payload, unchanged: the flat node and edge lists a renderer draws from, with `truncated` saying whether the node cap cut anything and `hidden` counting the nodes the cap cut, retired ones first. `id` is opaque and stable only within one response; the address is `crystalline://domain/permalink`.",
             "content": {
               "application/json": {
                 "schema": {
@@ -991,6 +2749,7 @@
                       "to": 2
                     }
                   ],
+                  "hidden": 0,
                   "nodes": [
                     {
                       "domain": "eng",
@@ -1299,6 +3058,232 @@
         }
       }
     },
+    "/api/v1/settings/github": {
+      "get": {
+        "tags": [
+          "settings"
+        ],
+        "summary": "The GitHub connection, and the device flow's poll.",
+        "description": "Admin only. A pure read, served even on a read-only instance. Also the device flow's poll: while one runs, `pending` carries the short code and its URL; once it ends, `pending` goes null and a failed flow's reason is reported in `error` on exactly one read, then cleared.",
+        "operationId": "get_github_settings",
+        "responses": {
+          "200": {
+            "description": "The connection. No token material.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GithubStatusResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an admin, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "settings"
+        ],
+        "summary": "Forget the stored credential.",
+        "description": "Admin only, and refused on a read-only instance. Idempotent: disconnecting an instance that holds no credential succeeds and answers `connected: false` rather than 404. `github.enabled` is left alone - turning the feature off is a separate intent.",
+        "operationId": "disconnect_github",
+        "responses": {
+          "200": {
+            "description": "The connection as it now stands.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GithubStatusResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an admin, a cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The credential comes from `CRYSTALLINE_GITHUB_TOKEN`: only the environment that set it can retire it.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/settings/github/connect": {
+      "post": {
+        "tags": [
+          "settings"
+        ],
+        "summary": "Start a device-code sign-in.",
+        "description": "Admin only, and refused on a read-only instance. Answers 202 with the short code to confirm in a browser; the flow itself runs in the background and its outcome is read from `GET /settings/github`. A second call while one flow runs reports that same flow rather than starting another. Connecting is the intent to use the feature, so this turns `github.enabled` on.",
+        "operationId": "connect_github_device",
+        "responses": {
+          "202": {
+            "description": "The flow started (or one was already running): `pending` carries the code to confirm. Poll `GET /settings/github` for the outcome.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GithubStatusResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an admin, a cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "This machine's identity is fixed by `CRYSTALLINE_GITHUB_TOKEN`, so no sign-in can be started here, or GitHub refused to start the flow.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/settings/github/token": {
+      "post": {
+        "tags": [
+          "settings"
+        ],
+        "summary": "Connect with a personal access token.",
+        "description": "Admin only, and refused on a read-only instance. The token is validated against GitHub before it is stored, and is never echoed: the answer is the same token-material-free status the GET returns. Connecting is the intent to use the feature, so this turns `github.enabled` on.",
+        "operationId": "connect_github_token",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TokenBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The connection as it now stands.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GithubStatusResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The body is not JSON.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an admin, a cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body is not `application/json`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The body is JSON but not a token, the token is empty, GitHub refused it, or this machine's identity is fixed by `CRYSTALLINE_GITHUB_TOKEN` and no token may be stored here.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/users": {
       "get": {
         "tags": [
@@ -1389,7 +3374,7 @@
             }
           },
           "403": {
-            "description": "The caller is not an admin, a cookie session did not echo its CSRF token, or the trusted-header identity names a disabled account.",
+            "description": "The caller is not an admin, a cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -1465,7 +3450,7 @@
             }
           },
           "403": {
-            "description": "The caller is not an admin, a cookie session did not echo its CSRF token, or the trusted-header identity names a disabled account.",
+            "description": "The caller is not an admin, a cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -1500,8 +3485,8 @@
         "tags": [
           "users"
         ],
-        "summary": "`PATCH /users/{name}` - change a role, a disabled flag, a password, or any\ncombination, answering with the account as it now stands.",
-        "description": "Two of the three fields are revocations as well as edits: setting a password\nand disabling an account each delete every session that account holds, in\nthe store and in the same transaction as the change. That is what makes this\nroute useful against a compromised account - a reset that left the intruder's\ncookie alive for the rest of its 30-day life would be theatre - and it means\nan admin resetting their own password signs their own other sessions out too,\nthis one included.\n\nEvery check runs before the first write, so a request that will be refused\nchanges nothing. The writes themselves are one store call each rather than\none transaction: the store's guarded statements each own their own\ninvariant, and a failure part-way leaves the earlier fields applied and says\nwhich operation was refused. That is visible to a client only in the\npathological case of a concurrent edit racing this one, since the refusals a\ncaller can provoke on purpose - the last-admin guard and an unknown account\n- are decided identically by all three statements.",
+        "summary": "`PATCH /users/{name}` - change a role, a disabled flag, a display name, or\nany combination, answering with the account as it now stands. A password\nreset is a separate route, [`reset_password`].",
+        "description": "Disabling an account is a revocation as well as an edit: it deletes every\nsession that account holds, in the store and in the same transaction as the\nflag. Setting a role or a display name never touches a session.\n\nEvery check runs before the first write, so a request that will be refused\nchanges nothing. The writes themselves are one store call each rather than\none transaction: the store's guarded statements each own their own\ninvariant, and a failure part-way leaves the earlier fields applied and says\nwhich operation was refused. That is visible to a client only in the\npathological case of a concurrent edit racing this one, since the refusals a\ncaller can provoke on purpose - the last-admin guard and an unknown account\n- are decided identically by all three statements.",
         "operationId": "update_user",
         "parameters": [
           {
@@ -1556,7 +3541,7 @@
             }
           },
           "403": {
-            "description": "The caller is not an admin, a cookie session did not echo its CSRF token, or the trusted-header identity names a disabled account.",
+            "description": "The caller is not an admin, a cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -1596,7 +3581,184 @@
             }
           },
           "422": {
-            "description": "The body changes nothing, or the new password is empty.",
+            "description": "The body changes nothing: send role, disabled or display.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/users/{name}/password": {
+      "post": {
+        "tags": [
+          "users"
+        ],
+        "summary": "`POST /users/{name}/password` - replace an account's password, answering\nwith the account as it now stands.",
+        "description": "A distinct route rather than a `PATCH` field: setting a password revokes\nevery session the account holds, in the same transaction as the change -\nthe reset is useless against a compromised account otherwise, since a\ncookie minted before it would keep working for the rest of its life. An\nadmin resetting their own password signs their own other sessions out too,\nthis one included.",
+        "operationId": "reset_user_password",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "The account, in any casing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PasswordBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The account as it now stands.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The body is not JSON.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an admin, a cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body is not `application/json`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The new password is empty.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/validate": {
+      "post": {
+        "tags": [
+          "engrams"
+        ],
+        "summary": "Pre-save validation: the findings a save would raise, without writing.",
+        "description": "Runs verify's format (`E`) and temporal (`T`) rule families over the document text, the same families `crystalline verify` runs for a single document. Link, manifest, schema and quality rules need a whole domain for context and are not run here.\n\n`T006` (missing write provenance) is dropped, so a fresh unsaved document is not nagged about a field the save is about to stamp.\n\nRefused like every other write on this surface - editor role, read-only answered first - even though nothing is ever written.",
+        "operationId": "validate_document",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ValidateBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Every finding, and how many are hard errors.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ValidateResponse"
+                },
+                "example": {
+                  "errors": 0,
+                  "findings": [
+                    {
+                      "fix": "add `- superseded_by [[Target]]`",
+                      "line": null,
+                      "message": "status is `superseded` but no `superseded_by` relation is present",
+                      "rule": "T005",
+                      "severity": "warning"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or an anonymous one: an identity with no account behind it never writes.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an editor, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body is not `application/json`.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -1703,6 +3865,148 @@
   },
   "components": {
     "schemas": {
+      "ArchiveEntryReport": {
+        "type": "object",
+        "description": "One entry of an uploaded archive and what became of it. A preview reports `new`, `collides`, `invalid` or `ignored`; an import reports `created`, `overwritten`, `skipped`, `invalid` or `ignored`.",
+        "required": [
+          "path",
+          "status",
+          "findings"
+        ],
+        "properties": {
+          "findings": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ValidateFinding"
+            },
+            "description": "The verify findings over this entry's markdown, the same families\n`POST /validate` runs. Empty for an entry that was never read."
+          },
+          "path": {
+            "type": "string",
+            "description": "The entry's path inside the archive, domain-relative.",
+            "example": "alpha.md"
+          },
+          "permalink": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The permalink the entry claims, once it parsed far enough to have one.",
+            "example": "alpha"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the entry was not written, in the words of whatever refused it."
+          },
+          "status": {
+            "type": "string",
+            "description": "preview: new | collides | invalid | ignored.\nimport: created | overwritten | skipped | invalid | ignored.",
+            "example": "new"
+          }
+        }
+      },
+      "ArchiveReport": {
+        "type": "object",
+        "description": "The per-entry report of a preview or an import, with the counters a confirmation dialog summarizes. The counters are tallied from the entries above them, so the two can never disagree.",
+        "required": [
+          "domain",
+          "dry_run",
+          "entries",
+          "new",
+          "collides",
+          "written",
+          "skipped",
+          "invalid",
+          "ignored"
+        ],
+        "properties": {
+          "collides": {
+            "type": "integer",
+            "description": "Preview only: entries whose path or permalink is already taken.",
+            "minimum": 0
+          },
+          "domain": {
+            "type": "string",
+            "description": "The domain the archive was aimed at.",
+            "example": "eng"
+          },
+          "dry_run": {
+            "type": "boolean",
+            "description": "True for a preview, false for an import that really wrote."
+          },
+          "entries": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ArchiveEntryReport"
+            },
+            "description": "Every entry of the archive, in the order the archive holds them."
+          },
+          "ignored": {
+            "type": "integer",
+            "description": "Entries an archive may carry but a domain never imports: a MANIFEST, a\ngenerated OKF index or log, anything that is not markdown.",
+            "minimum": 0
+          },
+          "invalid": {
+            "type": "integer",
+            "description": "Entries refused as not importable: unparseable, not UTF-8 text, or\ncarrying a hard verify error. Never written under either policy.",
+            "minimum": 0
+          },
+          "new": {
+            "type": "integer",
+            "description": "Preview only: entries that would be created.",
+            "minimum": 0
+          },
+          "skipped": {
+            "type": "integer",
+            "description": "Import only: entries an existing path or permalink held back.",
+            "minimum": 0
+          },
+          "written": {
+            "type": "integer",
+            "description": "Import only: entries written, created and overwritten together.",
+            "minimum": 0
+          }
+        }
+      },
+      "ConflictDetail": {
+        "type": "object",
+        "description": "The wire form of a 412: a problem detail carrying the version the server\nholds now, so a client can show a merge view instead of just failing.",
+        "required": [
+          "type",
+          "status",
+          "title",
+          "detail",
+          "current_etag",
+          "current_content"
+        ],
+        "properties": {
+          "current_content": {
+            "type": "string",
+            "description": "The full markdown the server holds now, so a client can merge."
+          },
+          "current_etag": {
+            "type": "string",
+            "description": "The ETag of the version the server holds now, quoted."
+          },
+          "detail": {
+            "type": "string"
+          },
+          "status": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "title": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string"
+          }
+        }
+      },
       "CreateBody": {
         "type": "object",
         "description": "A new account. `display` defaults to `name` as typed, and `email` is optional and never used for login.",
@@ -1741,6 +4045,187 @@
           "role": {
             "$ref": "#/components/schemas/Role",
             "description": "What the new account may do."
+          }
+        }
+      },
+      "CreateDomainBody": {
+        "type": "object",
+        "description": "A domain to register. `mode` picks which of the three kinds is meant, and every other field belongs to one of them: a field that does not apply to the mode asked for is refused rather than ignored.",
+        "required": [
+          "mode"
+        ],
+        "properties": {
+          "branch": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Branch to track; github mode only, defaults to the repo default.",
+            "example": "main"
+          },
+          "mode": {
+            "type": "string",
+            "description": "local | virtual | github",
+            "example": "local"
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The domain name. Required for local and virtual; optional for github\n(defaults to the repository name). A local domain always lands at\n<domains_root>/<name>; there is no folder parameter on this surface.",
+            "example": "notes"
+          },
+          "path": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Subfolder within the repository; github mode only.",
+            "example": "domains/eng"
+          },
+          "repo": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "owner/name; github mode only.",
+            "example": "acme/knowledge"
+          }
+        }
+      },
+      "CreateEngramBody": {
+        "type": "object",
+        "description": "A new engram. The engine builds the frontmatter from these fields and slugifies the title into the filename and permalink, so the body carries markdown only.",
+        "required": [
+          "title",
+          "content"
+        ],
+        "properties": {
+          "content": {
+            "type": "string",
+            "description": "The markdown body (no frontmatter: creation builds it).",
+            "example": "# Alpha\n\nA rule about alpha.\n"
+          },
+          "folder": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A domain-relative subfolder. Defaults to the root.",
+            "example": "notes"
+          },
+          "metadata": {
+            "description": "Extra frontmatter keys (valid_from, valid_to, salience, ...), passed to\nthe engine's metadata contract unchanged."
+          },
+          "status": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Lifecycle `status`. Defaults to `stable`. Free form."
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Tags, lowercase-with-hyphens."
+          },
+          "title": {
+            "type": "string",
+            "description": "The engram title. Slugified into the filename and permalink.",
+            "example": "Alpha"
+          },
+          "type": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The engram `type`. Defaults to `engram`. Free form; recommended values\nare guidance.",
+            "example": "decision"
+          }
+        }
+      },
+      "GithubPendingView": {
+        "type": "object",
+        "description": "The half of a running device flow a browser has to show: the short code the user types in, where they type it, and how long the code stays valid.",
+        "required": [
+          "user_code",
+          "verification_url",
+          "expires_in_secs"
+        ],
+        "properties": {
+          "expires_in_secs": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many seconds from the flow's start the code stays valid.",
+            "example": 900,
+            "minimum": 0
+          },
+          "user_code": {
+            "type": "string",
+            "description": "The short code the user confirms at `verification_url`.",
+            "example": "ABCD-1234"
+          },
+          "verification_url": {
+            "type": "string",
+            "description": "Where the user confirms the code.",
+            "example": "https://github.com/login/device"
+          }
+        }
+      },
+      "GithubStatusResponse": {
+        "type": "object",
+        "description": "The GitHub connection as the settings screen renders and polls it. No token material, ever: only whether the feature is on, whether a credential is on file, whose it is and where it lives.",
+        "required": [
+          "enabled",
+          "connected"
+        ],
+        "properties": {
+          "connected": {
+            "type": "boolean",
+            "description": "Whether a credential is on file for this instance.",
+            "example": true
+          },
+          "enabled": {
+            "type": "boolean",
+            "description": "Whether `github.enabled` is on: team tools and origin polling.",
+            "example": true
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A device flow's failure (expired, denied), reported on exactly one\nstatus read after the flow ends, then cleared."
+          },
+          "pending": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/GithubPendingView",
+                "description": "A device flow waiting for the browser side. Poll this route until it\ngoes null; the flow either connected or set `error`."
+              }
+            ]
+          },
+          "token_store": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "keyring | file | environment; null when disconnected.",
+            "example": "keyring"
+          },
+          "user": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The account login, when connected.",
+            "example": "octo"
           }
         }
       },
@@ -1802,6 +4287,7 @@
         "required": [
           "anonymous",
           "read_only",
+          "needs_setup",
           "version"
         ],
         "properties": {
@@ -1814,8 +4300,12 @@
               "string",
               "null"
             ],
-            "description": "The CSRF token of the session this request arrived on, or null when it\narrived on no session.\n\nReissued here, not only by login, because the session cookie is\n`HttpOnly` and the token is not stored anywhere a reload survives: a\nbrowser that refreshes holds a live session whose token it can no longer\nproduce, and would be unable to log out or to write until it logged in\nagain. This probe is what a client opens on, so it is where the token\nbelongs.\n\nNull for the anonymous viewer, which has no session, and null for a\ntrusted-header identity, which has none either: what protects those\nrequests is the shape they are allowed to have, not a token. See the\n`check_csrf` invariant.\n\nHanding the token back on a `GET` is safe for the same reason handing it\nback from login is: no CORS layer exists on this surface, so another\norigin can send the request but cannot read the answer. **That is load\nbearing - a CORS layer must not be added without revisiting this.**",
+            "description": "The CSRF token of the session this request arrived on, or null when it\narrived on no session.\n\nReissued here, not only by login, because the session cookie is\n`HttpOnly` and the token is not stored anywhere a reload survives: a\nbrowser that refreshes holds a live session whose token it can no longer\nproduce, and would be unable to log out or to write until it logged in\nagain. This probe is what a client opens on, so it is where the token\nbelongs.\n\nNull only for the anonymous viewer, which has no account and can never\nwrite; a trusted-header identity is given a session here on the first\ncall and handed that same session's token on every later one, so every\nidentity that can mutate anything carries a token. See the `check_csrf`\nrule.\n\nHanding the token back on a `GET` is safe for the same reason handing it\nback from login is: no CORS layer exists on this surface, so another\norigin can send the request but cannot read the answer. **That is load\nbearing - a CORS layer must not be added without revisiting this.**",
             "example": "9f2c1d7e4b6a8035"
+          },
+          "needs_setup": {
+            "type": "boolean",
+            "description": "Whether no account exists yet, so the first-run setup path is open.\n\nRead fresh on every probe rather than cached: it is one indexed count\nover a table with a handful of rows, and a stale `true` would draw a\nwizard whose POST then answers 410 - correct, but baffling. That it\ntells an unauthenticated caller \"this instance has no accounts yet\" is\ndeliberate: the login page needs to know before any identity exists, and\nthe state itself is what makes `POST /auth/setup` answer at all."
           },
           "read_only": {
             "type": "boolean",
@@ -1839,9 +4329,50 @@
           }
         }
       },
+      "MoveBody": {
+        "type": "object",
+        "description": "Move an engram to a new path, or into another registered domain. Inbound bare links are rewritten to the domain-prefixed form on a cross-domain move.",
+        "required": [
+          "permalink",
+          "destination"
+        ],
+        "properties": {
+          "destination": {
+            "type": "string",
+            "description": "The new domain-relative path, with or without `.md`.",
+            "example": "guides/beta"
+          },
+          "destination_domain": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Move into another registered domain. Inbound bare links are rewritten\nto the domain-prefixed form."
+          },
+          "permalink": {
+            "type": "string",
+            "description": "The engram to move, by permalink.",
+            "example": "notes/beta"
+          }
+        }
+      },
+      "PasswordBody": {
+        "type": "object",
+        "description": "The replacement password. Setting it revokes every session the account holds, this admin's own included when they reset themselves.",
+        "required": [
+          "password"
+        ],
+        "properties": {
+          "password": {
+            "type": "string",
+            "description": "The replacement password. Setting it revokes every session the account\nholds, this admin's own included when they reset themselves.",
+            "example": "correct horse battery staple"
+          }
+        }
+      },
       "PatchBody": {
         "type": "object",
-        "description": "Whichever of the three an admin wants to change. All absent is refused with a 422 rather than served as a no-op, so a client sending the wrong field names hears about it.",
+        "description": "Whichever of the three an admin wants to change. All absent is refused with a 422 rather than served as a no-op, so a client sending the wrong field names hears about it. `display` clears to the login name when sent empty or blank; the password lives on its own route, `POST /users/{name}/password`.",
         "properties": {
           "disabled": {
             "type": [
@@ -1850,12 +4381,12 @@
             ],
             "description": "Whether the account is disabled. Disabling deletes every session the\naccount holds, so it is a revocation rather than a flag a later\nre-enabling hands back; it also stops any new login."
           },
-          "password": {
+          "display": {
             "type": [
               "string",
               "null"
             ],
-            "description": "A replacement password. Setting it revokes every session the account\nholds, so whoever was signed in under the old one is signed out."
+            "description": "The new display name. Empty or blank clears it, resetting the account\nto its folded login name - a row is never nameless. Never normalized\nlike a login name: spaces and casing are kept as sent."
           },
           "role": {
             "oneOf": [
@@ -1897,10 +4428,52 @@
             "description": "A short, stable, human-readable summary of the problem type.",
             "example": "not found"
           },
+          "token_required": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "An RFC 9457 extension member, present only on the `403` of\n`POST /auth/setup` and only when this instance holds a setup token: the\nfirst-run wizard renders its token field on this member rather than on\nthe detail prose, so an instance that has no token to enter (the\nloopback bind generates none) never causes a dead-end input to be\ndrawn. Absent from every other problem document on this surface.",
+            "example": true
+          },
           "type": {
             "type": "string",
             "description": "The problem type URI. Always `about:blank`: `status` and `title` carry\nthe classification, and this surface publishes no per-problem pages to\npoint at.",
             "example": "about:blank"
+          }
+        }
+      },
+      "RetireBody": {
+        "type": "object",
+        "description": "Guided retirement of one engram: a `status` from a fixed set, an optional close-out date, and, for `superseded`, the successor that wires the reciprocal relation pair.",
+        "required": [
+          "permalink",
+          "status"
+        ],
+        "properties": {
+          "permalink": {
+            "type": "string",
+            "description": "The engram to retire, by permalink.",
+            "example": "notes/beta"
+          },
+          "status": {
+            "type": "string",
+            "description": "The retirement status: deprecated, superseded or archived.",
+            "example": "superseded"
+          },
+          "successor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The successor's permalink, wiring superseded_by / supersedes. Required\nfor superseded, refused otherwise."
+          },
+          "valid_to": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The date validity ends, plain ISO (YYYY-MM-DD). Absent means unknown."
           }
         }
       },
@@ -1912,6 +4485,77 @@
           "editor",
           "admin"
         ]
+      },
+      "SaveEngramBody": {
+        "type": "object",
+        "description": "The complete file text, frontmatter included. It is written verbatim: nothing here rebuilds the frontmatter or stamps provenance, so what a client reads back is what its author typed.",
+        "required": [
+          "content"
+        ],
+        "properties": {
+          "content": {
+            "type": "string",
+            "description": "The full markdown text as the editor holds it.",
+            "example": "---\ntitle: Alpha\npermalink: alpha\n---\n\nA sharper rule.\n"
+          }
+        }
+      },
+      "SaveManifestBody": {
+        "type": "object",
+        "description": "The full MANIFEST markdown as the editor holds it, written verbatim: nothing here rebuilds the frontmatter or stamps provenance.",
+        "required": [
+          "markdown"
+        ],
+        "properties": {
+          "markdown": {
+            "type": "string",
+            "description": "The full MANIFEST markdown as the editor holds it.",
+            "example": "---\ntitle: eng\n---\n\n## When to Use\n\n- Route here for eng questions.\n"
+          }
+        }
+      },
+      "SetupBody": {
+        "type": "object",
+        "description": "The first admin. `display` is the name as typed; no email is asked for, since that is a users-screen concern. `token` is the one-time setup token `serve` prints for a non-loopback bind, and is not needed when the request comes from the machine that serves this instance.",
+        "required": [
+          "name",
+          "password"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The login name of the first admin, in any casing: the store folds it,\nand the name as typed becomes the display name.",
+            "example": "ada"
+          },
+          "password": {
+            "type": "string",
+            "description": "The password for the new account. Never stored in the clear; the store\nhashes it with argon2id.",
+            "example": "correct horse battery staple"
+          },
+          "token": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The one-time setup token, when this instance printed one. In the body\nrather than a header on purpose: it is a one-shot secret rather than a\nsession credential, and a body keeps it out of the header dumps an\naccess log or a proxy trace collects.",
+            "example": "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+          }
+        }
+      },
+      "TokenBody": {
+        "type": "object",
+        "description": "A GitHub personal access token to connect with. Write-only: no response on this surface ever echoes it, and the status shape carries only where the credential lives and whose it is.",
+        "required": [
+          "token"
+        ],
+        "properties": {
+          "token": {
+            "type": "string",
+            "description": "A GitHub personal access token. Write-only: no response ever echoes it.",
+            "example": "ghp_xxxxxxxxxxxxxxxxxxxx",
+            "writeOnly": true
+          }
+        }
       },
       "User": {
         "type": "object",
@@ -1940,6 +4584,14 @@
             "description": "Optional contact address; never used for login.",
             "example": "ada@example.com"
           },
+          "last_seen": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "When this account last resolved a session or arrived through the\ntrusted header, RFC 3339. Null for an account never seen.",
+            "example": "2026-08-08T09:14:22Z"
+          },
           "name": {
             "type": "string",
             "description": "The login name and primary key. Also the identity the trusted-header\nmode provisions against.",
@@ -1953,7 +4605,7 @@
       },
       "UserResponse": {
         "type": "object",
-        "description": "What the two writing routes answer with: the account as stored, read back\nafter the write rather than echoed from the request.",
+        "description": "What every writing route but `DELETE` answers with: the account as stored,\nread back after the write rather than echoed from the request.",
         "required": [
           "user"
         ],
@@ -1979,6 +4631,98 @@
             "description": "Every account, by name."
           }
         }
+      },
+      "ValidateBody": {
+        "type": "object",
+        "description": "The document a save would write, checked without writing. Lives beside the engram routes because what it validates is engram markdown, not because it is scoped to a domain the way the other write routes are.",
+        "required": [
+          "content"
+        ],
+        "properties": {
+          "content": {
+            "type": "string",
+            "description": "The full markdown text, frontmatter included.",
+            "example": "---\ntitle: Alpha\n---\n\nA rule about alpha.\n"
+          },
+          "domain": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The domain the document belongs (or will belong) to. Names the scan\nroot in findings; defaults to \"draft\".",
+            "example": "eng"
+          },
+          "path": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The domain-relative path the document sits (or will sit) at. Defaults\nto \"draft.md\".",
+            "example": "alpha.md"
+          }
+        }
+      },
+      "ValidateFinding": {
+        "type": "object",
+        "description": "One finding, and the envelope: the same fields the verify report carries.\n\nShared rather than validation-local: the archive preview reports the same\nfindings per entry, and a second shape for the same facts would drift.",
+        "required": [
+          "rule",
+          "severity",
+          "message"
+        ],
+        "properties": {
+          "fix": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A suggested fix, when the rule has one."
+          },
+          "line": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "The one-based source line, when the finding points at one.",
+            "minimum": 0
+          },
+          "message": {
+            "type": "string",
+            "description": "What is wrong, in the rule's own words."
+          },
+          "rule": {
+            "type": "string",
+            "description": "The rule id, for example E002 or T005.",
+            "example": "T005"
+          },
+          "severity": {
+            "type": "string",
+            "description": "error, warning or info. Hard errors are what a client blocks a save on.",
+            "example": "warning"
+          }
+        }
+      },
+      "ValidateResponse": {
+        "type": "object",
+        "description": "What `POST /validate` answers: every finding the format and temporal rule\nfamilies raise over the document, and how many of them are hard errors.",
+        "required": [
+          "findings",
+          "errors"
+        ],
+        "properties": {
+          "errors": {
+            "type": "integer",
+            "description": "How many findings are hard errors.",
+            "minimum": 0
+          },
+          "findings": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ValidateFinding"
+            },
+            "description": "Every finding, format and temporal families, default severities."
+          }
+        }
       }
     }
   },
@@ -1997,7 +4741,7 @@
     },
     {
       "name": "engrams",
-      "description": "Listing and reading engrams."
+      "description": "Listing, reading and writing engrams."
     },
     {
       "name": "discovery",
@@ -2010,6 +4754,10 @@
     {
       "name": "users",
       "description": "Account management. Admin only."
+    },
+    {
+      "name": "settings",
+      "description": "Instance settings. Admin only."
     }
   ]
 }

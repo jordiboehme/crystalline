@@ -4,36 +4,46 @@
  * Two requests make it. The detail payload is the engram itself - its markdown,
  * its frontmatter, and every reference the server parsed out of the body with a
  * flag saying whether the index resolved it. The neighborhood graph is where
- * those references landed and what points back, because the detail payload
- * names a target as it was written (a title, usually) and never as an address,
- * and its inbound block is a sample capped at five rather than the set.
+ * those references landed, because the detail payload names a target as it was
+ * written (a title, usually) and never as an address.
  *
  * So the two are read together rather than shown side by side: the resolver
  * that linkifies the body needs a fact from each, and until the graph lands a
  * wikilink the index resolved is prose rather than a link that guesses.
+ *
+ * What points back is no longer among them. The graph is capped at a hundred
+ * and fifty nodes, which is a cap on the backlinks drawn from it; the panel
+ * counts and pages the whole index instead, and asks for nothing when the
+ * detail payload's `inboundCount` is already zero. The graph's inbound edges
+ * are still read here for the two things they are exact about: the supersedes
+ * chain, whose other half only the linker wrote down, and the retire dialog's
+ * warning about what would be left dangling.
  *
  * The detail response is cached under `(domain, permalink)` with the checksum
  * it carries, which is the same token its `ETag` carries and the one a later
  * conditional write presents back as `expected_checksum`. Keeping it is what
  * makes editing from this screen possible without a re-read.
  *
- * The observation and relation bullets appear twice on purpose: once in the
- * body, because they are lines of the markdown somebody wrote and cutting them
- * out would show a document nobody has, and once as lists, which is where the
- * category, the tags, the context and whether the target resolved are legible.
- * The two are the same lines read two ways rather than a duplicate.
+ * The observation and relation bullets render once, in the body, in chip
+ * form: the written line and its indexed reading are the same line drawn
+ * one way, and the details panel deliberately repeats none of it.
  */
 
 import { useQuery } from "@tanstack/react-query";
-import { useEffect, useMemo, useState } from "react";
-import { Link, useParams } from "react-router";
+import {
+  ChevronRight,
+  Download,
+  Link2,
+  MoreHorizontal,
+  Printer,
+} from "lucide-react";
+import { DropdownMenu } from "radix-ui";
+import { useMemo, useRef, useState } from "react";
+import { Link, useNavigate, useParams } from "react-router";
 
 import { ApiProblem, problemDetail } from "../api/client";
-import type {
-  EngramDetail,
-  EngramObservation,
-  EngramReference,
-} from "../api/engram";
+import { DOMAINS_QUERY_KEY, fetchDomains } from "../api/domains";
+import type { EngramDetail } from "../api/engram";
 import { engramDetailKey, fetchEngramDetail } from "../api/engram";
 import type { Backlink } from "../api/graph";
 import {
@@ -42,26 +52,52 @@ import {
   fetchGraph,
   graphKey,
 } from "../api/graph";
+import { useAuth } from "../auth/AuthContext";
+import { NO_COMMANDS, useRegisterCommands } from "../commands";
+import type { PaletteCommand } from "../commands";
 import { AgentsEye } from "../components/AgentsEye";
 import { BacklinksPanel } from "../components/BacklinksPanel";
-import { FrontmatterPanel } from "../components/FrontmatterPanel";
+import { Breadcrumbs, crumbsOf } from "../components/Breadcrumbs";
+import { DetailsPanel } from "../components/DetailsPanel";
+import { EngramActions } from "../components/EngramActions";
+import type { EngramActionHandlers } from "../components/EngramActions";
 import { LifecycleBanner } from "../components/LifecycleBanner";
 import type { LifecycleLink } from "../components/LifecycleBanner";
 import { Markdown } from "../components/Markdown";
+import { ITEM_CLASSES, MENU_CLASSES } from "../components/menu";
+import { MoveDialog } from "../components/MoveDialog";
 import { NeighborhoodGraph } from "../components/NeighborhoodGraph";
-import { ReferenceLink } from "../components/ReferenceLink";
-import { domainRoute, engramRoute, graphRoute } from "../paths";
+import { BUTTON, IconButton } from "../components/primitives";
+import { RetireDialog } from "../components/RetireDialog";
+import { Skeleton } from "../components/Skeleton";
+import { useRememberedDisclosure } from "../disclosure";
+import { domainRoute, editRoute, engramRoute, graphRoute } from "../paths";
+import { prefetchEngramEditor } from "../prefetch";
 import type { WikilinkResolver } from "../wikilinks";
 import { buildWikilinkResolver, innerOf, referenceState } from "../wikilinks";
 
-/** How long the copy button keeps saying it worked. */
-const COPIED_FOR_MS = 2000;
+/** Where the neighborhood section writes down whether it was left open. */
+const GRAPH_SECTION_KEY = "fluid.section.graph";
 
 export default function EngramPage() {
   const params = useParams();
   const domain = params.domain ?? "";
   // A permalink is a path of its own, so it arrives through the splat.
   const permalink = params["*"] ?? "";
+  const { capabilities } = useAuth();
+  const navigate = useNavigate();
+  const [retiring, setRetiring] = useState(false);
+  const [moving, setMoving] = useState(false);
+  // The utility three, as `EngramActions` runs them: the palette rows below
+  // reach through this rather than repeating the clipboard and blob calls.
+  const utilities = useRef<EngramActionHandlers | null>(null);
+
+  // The listing the sidebar already read, under the same key: opening the
+  // move dialog's domain picker costs nothing on the wire.
+  const domains = useQuery({
+    queryKey: DOMAINS_QUERY_KEY,
+    queryFn: fetchDomains,
+  });
 
   const detail = useQuery({
     queryKey: engramDetailKey(domain, permalink),
@@ -81,6 +117,71 @@ export default function EngramPage() {
     [detail.data, graph.data],
   );
 
+  /*
+   * What this screen offers the palette: the same things its own buttons do,
+   * gated the same way. Built here rather than below the guards because a
+   * hook may not sit behind a return, and nothing is registered until there
+   * is an engram for the actions to act on.
+   */
+  const loaded = detail.data;
+  const commands = useMemo<readonly PaletteCommand[]>(() => {
+    if (!loaded) {
+      return NO_COMMANDS;
+    }
+    // The writes lead, because they are what somebody opens a palette to do
+    // that a link would not already have done for them.
+    const writes: PaletteCommand[] = capabilities.canWrite
+      ? [
+          {
+            id: "edit",
+            title: "Edit engram",
+            run: () => {
+              void navigate(editRoute(loaded.domain, loaded.permalink));
+            },
+          },
+          {
+            id: "retire",
+            title: "Retire engram",
+            run: () => {
+              setRetiring(true);
+            },
+          },
+          {
+            id: "move",
+            title: "Move engram",
+            run: () => {
+              setMoving(true);
+            },
+          },
+        ]
+      : [];
+    return [
+      ...writes,
+      {
+        id: "download",
+        title: "Download this engram as Markdown",
+        run: () => {
+          utilities.current?.download();
+        },
+      },
+      {
+        id: "share",
+        title: "Share link to this engram",
+        run: () => {
+          utilities.current?.share();
+        },
+      },
+      {
+        id: "print",
+        title: "Print this engram",
+        run: () => {
+          utilities.current?.print();
+        },
+      },
+    ];
+  }, [capabilities.canWrite, loaded, navigate]);
+  useRegisterCommands(commands);
+
   if (isMissing(detail.error)) {
     return <EngramNotFound domain={domain} permalink={permalink} />;
   }
@@ -95,11 +196,7 @@ export default function EngramPage() {
     );
   }
   if (!detail.data || !wikilinks) {
-    return (
-      <p className="text-sm text-slate-500 dark:text-slate-400">
-        Loading the engram
-      </p>
-    );
+    return <Skeleton label="Loading the engram" rows={6} />;
   }
 
   const engram = detail.data;
@@ -107,19 +204,110 @@ export default function EngramPage() {
   return (
     <div className="flex flex-col gap-6">
       <header className="flex flex-col gap-2">
-        <h1 id="engram-title" className="text-xl font-semibold">
+        {/*
+          Where this engram lives, and what can be done with it: the address on
+          the left, the controls on the right, the title alone on the line
+          below with nothing competing for it.
+
+          The trail prints: the details panel and the controls beside it are
+          chrome and stay off the page, so this line is what says on paper
+          which domain and which folders this document came out of.
+        */}
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <Breadcrumbs
+            crumbs={crumbsOf(engram.domain, engram.permalink, engram.title)}
+          />
+          {/*
+            A quiet strip, then the one labelled thing. The three utilities are
+            what a reader reaches for often and thinks about rarely, so they are
+            icons: no words to read past on the way to Edit, which is what
+            somebody came to this header for and which keeps its name and its
+            tier. Move and Retire stay behind the fold - one is rare, the other
+            is destructive and destructive belongs where it cannot be brushed.
+
+            Each icon carries EXACTLY the name its menu row carried. A control
+            with no text in it has nothing else to be known by, and the palette
+            still runs the same three through the same ref, so a name that
+            drifted here would be a name that disagreed with itself.
+
+            `EngramActions` builds the three and hands them over through that
+            ref; it draws nothing here but the region that announces a copy.
+          */}
+          <div className="flex flex-wrap items-center gap-2 print:hidden">
+            <IconButton
+              label="Share link"
+              icon={Link2}
+              onClick={() => {
+                utilities.current?.share();
+              }}
+            />
+            <IconButton
+              label="Download as Markdown"
+              icon={Download}
+              onClick={() => {
+                utilities.current?.download();
+              }}
+            />
+            <IconButton
+              label="Print view"
+              icon={Printer}
+              onClick={() => {
+                utilities.current?.print();
+              }}
+            />
+            {/*
+              Both halves of the write surface hang off one gate: a reader who
+              may not write has nothing left for the menu to hold, and an
+              ellipsis that opens onto an empty panel is worse than no ellipsis.
+            */}
+            {capabilities.canWrite && (
+              <>
+                <Link
+                  to={editRoute(engram.domain, engram.permalink)}
+                  onPointerEnter={prefetchEngramEditor}
+                  onFocus={prefetchEngramEditor}
+                  className={BUTTON.primary}
+                >
+                  Edit
+                </Link>
+                <DropdownMenu.Root>
+                  <DropdownMenu.Trigger asChild>
+                    <IconButton label="More actions" icon={MoreHorizontal} />
+                  </DropdownMenu.Trigger>
+                  <DropdownMenu.Portal>
+                    <DropdownMenu.Content
+                      align="end"
+                      sideOffset={6}
+                      className={MENU_CLASSES}
+                    >
+                      <DropdownMenu.Item
+                        className={ITEM_CLASSES}
+                        onSelect={() => {
+                          setMoving(true);
+                        }}
+                      >
+                        Move
+                      </DropdownMenu.Item>
+                      <DropdownMenu.Separator className="my-1 h-px bg-slate-200 dark:bg-slate-700" />
+                      <DropdownMenu.Item
+                        className={`${ITEM_CLASSES} text-red-700 dark:text-red-300`}
+                        onSelect={() => {
+                          setRetiring(true);
+                        }}
+                      >
+                        Retire
+                      </DropdownMenu.Item>
+                    </DropdownMenu.Content>
+                  </DropdownMenu.Portal>
+                </DropdownMenu.Root>
+              </>
+            )}
+            <EngramActions engram={engram} handlers={utilities} />
+          </div>
+        </div>
+        <h1 id="engram-title" className="text-display">
           {engram.title}
         </h1>
-        <p className="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm text-slate-500 dark:text-slate-400">
-          <Link
-            to={domainRoute(engram.domain)}
-            className="underline underline-offset-2 hover:no-underline"
-          >
-            {engram.domain}
-          </Link>
-          <span className="font-mono text-xs">{engram.permalink}</span>
-          <CopyAddressButton address={engram.url} />
-        </p>
       </header>
 
       <LifecycleBanner
@@ -149,27 +337,55 @@ export default function EngramPage() {
       <div className="grid gap-8 lg:grid-cols-[minmax(0,1fr)_18rem]">
         <div className="flex min-w-0 flex-col gap-8">
           <article aria-labelledby="engram-title">
-            <Markdown source={engram.content} wikilinks={wikilinks} />
+            {/*
+              The heading above is the page's rendering of the title, so the
+              body's own opening `# Title` folds away rather than repeating
+              it.
+            */}
+            <Markdown
+              source={engram.content}
+              wikilinks={wikilinks}
+              foldTitle={engram.title}
+            />
           </article>
-          <Observations observations={engram.observations} />
-          <Relations relations={engram.relations} resolve={wikilinks} />
-          <GraphSection domain={engram.domain} permalink={engram.permalink} />
-          <AgentsEye
-            domain={engram.domain}
-            salience={engram.frontmatter.salience}
-            content={engram.content}
-          />
+          <div className="print:hidden">
+            <GraphSection domain={engram.domain} permalink={engram.permalink} />
+          </div>
+          <div className="print:hidden">
+            <AgentsEye
+              domain={engram.domain}
+              salience={engram.frontmatter.salience}
+              content={engram.content}
+            />
+          </div>
         </div>
-        <aside className="flex flex-col gap-4">
-          <FrontmatterPanel frontmatter={engram.frontmatter} />
+        <aside className="flex flex-col gap-6 print:hidden">
+          <DetailsPanel frontmatter={engram.frontmatter} address={engram.url} />
           <BacklinksPanel
-            backlinks={backlinks}
-            pending={graph.isPending}
-            error={graph.error}
-            truncated={graph.data?.truncated ?? false}
+            domain={engram.domain}
+            permalink={engram.permalink}
+            inboundCount={engram.inboundCount}
           />
         </aside>
       </div>
+      {retiring && (
+        <RetireDialog
+          engram={engram}
+          backlinks={backlinks}
+          onClose={() => {
+            setRetiring(false);
+          }}
+        />
+      )}
+      {moving && (
+        <MoveDialog
+          engram={engram}
+          domains={(domains.data?.domains ?? []).map((entry) => entry.name)}
+          onClose={() => {
+            setMoving(false);
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -229,94 +445,6 @@ function chain(
   return [...merged.values()];
 }
 
-/** The observation bullets, as the structure they are rather than as prose. */
-function Observations({ observations }: { observations: EngramObservation[] }) {
-  if (observations.length === 0) {
-    return null;
-  }
-  return (
-    <section aria-labelledby="engram-observations">
-      <h2 id="engram-observations" className="mb-2 text-lg font-semibold">
-        Observations
-      </h2>
-      <ul className="flex flex-col gap-2 text-sm">
-        {observations.map((observation) => (
-          <li
-            key={`${String(observation.line)}-${observation.content}`}
-            className="flex flex-wrap items-baseline gap-2"
-          >
-            {observation.category !== null && (
-              // In the brackets it was written in, which is what tells it
-              // apart from the same word used as a type or a tag.
-              <span className="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-xs text-slate-600 dark:bg-slate-800 dark:text-slate-300">
-                [{observation.category}]
-              </span>
-            )}
-            <span>{observation.content}</span>
-            {observation.tags.map((tag) => (
-              <span
-                key={tag}
-                className="text-xs text-slate-500 dark:text-slate-400"
-              >
-                #{tag}
-              </span>
-            ))}
-            {observation.context !== null && (
-              <span className="text-xs text-slate-500 dark:text-slate-400">
-                ({observation.context})
-              </span>
-            )}
-          </li>
-        ))}
-      </ul>
-    </section>
-  );
-}
-
-/**
- * The relation bullets. A target the index resolved and the graph placed is a
- * link; one it did not is named and marked, never linked somewhere invented.
- */
-function Relations({
-  relations,
-  resolve,
-}: {
-  relations: EngramReference[];
-  resolve: WikilinkResolver;
-}) {
-  if (relations.length === 0) {
-    return null;
-  }
-  return (
-    <section aria-labelledby="engram-relations">
-      <h2 id="engram-relations" className="mb-2 text-lg font-semibold">
-        Relations
-      </h2>
-      <ul className="flex flex-col gap-2 text-sm">
-        {relations.map((relation) => {
-          const inner = innerOf(relation.target);
-          const resolution = resolve(inner);
-          return (
-            <li
-              key={`${String(relation.line)}-${relation.relType ?? ""}-${inner}`}
-              className="flex flex-wrap items-baseline gap-2"
-            >
-              <span className="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-xs text-slate-600 dark:bg-slate-800 dark:text-slate-300">
-                {relation.relType ?? "relates to"}
-              </span>
-              <ReferenceLink
-                label={relation.target.target}
-                href={resolution?.kind === "resolved" ? resolution.href : null}
-                state={referenceState(resolution, relation.resolved)}
-              />
-            </li>
-          );
-        })}
-      </ul>
-    </section>
-  );
-}
-
 /**
  * The neighborhood, one hop out, folded away until it is asked for.
  *
@@ -326,6 +454,10 @@ function Relations({
  * detour from the engram, which is what this page is for. Opened, it costs
  * nothing on the wire either: it reads the same neighborhood under the same
  * cache key the backlinks panel already read.
+ *
+ * A reader who does open it is a reader who reads this way, so the section
+ * remembers: the default is closed, and the choice against it survives the
+ * visit.
  */
 function GraphSection({
   domain,
@@ -334,18 +466,18 @@ function GraphSection({
   domain: string;
   permalink: string;
 }) {
-  const [open, setOpen] = useState(false);
+  const [open, toggle] = useRememberedDisclosure(GRAPH_SECTION_KEY);
 
   return (
     <section aria-labelledby="engram-graph">
       <div className="mb-2 flex flex-wrap items-baseline justify-between gap-3">
-        <h2 id="engram-graph" className="text-lg font-semibold">
+        <h2 id="engram-graph" className="text-section">
           Graph
         </h2>
         {open && (
           <Link
             to={graphRoute(domain, permalink)}
-            className="text-sm text-sky-700 underline underline-offset-2 hover:no-underline dark:text-sky-400"
+            className="text-sm text-accent-700 underline underline-offset-2 hover:no-underline dark:text-accent-300"
           >
             Open the full view
           </Link>
@@ -355,11 +487,17 @@ function GraphSection({
         type="button"
         aria-expanded={open}
         aria-controls="engram-graph-panel"
-        onClick={() => {
-          setOpen((was) => !was);
-        }}
-        className="rounded border border-slate-300 px-2 py-1 text-sm hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800"
+        onClick={toggle}
+        className={`${BUTTON.ghost} inline-flex items-center gap-1.5`}
       >
+        <ChevronRight
+          aria-hidden="true"
+          size={14}
+          strokeWidth={1.75}
+          className={
+            open ? "rotate-90 transition-transform" : "transition-transform"
+          }
+        />
         {open ? "Hide the neighborhood" : "Show the neighborhood"}
       </button>
       <div id="engram-graph-panel" className="mt-3">
@@ -372,72 +510,6 @@ function GraphSection({
         )}
       </div>
     </section>
-  );
-}
-
-/**
- * Hand the engram's address to the clipboard.
- *
- * `crystalline://domain/permalink` rather than the browser's URL: it is what
- * this engram is called everywhere else, so it is what an agent, a MANIFEST or
- * another engram can be given.
- *
- * The outcome is announced in a live region beside the button rather than
- * written into the button's own label. A control that renames itself is a
- * control a reader navigating by name loses track of, and a label that changes
- * silently is no announcement at all: the region is in the document from the
- * start and empty, so the text arriving in it is what gets read out.
- */
-function CopyAddressButton({ address }: { address: string }) {
-  const [state, setState] = useState<"idle" | "copied" | "failed">("idle");
-
-  useEffect(() => {
-    if (state !== "copied") {
-      return;
-    }
-    const timer = setTimeout(() => {
-      setState("idle");
-    }, COPIED_FOR_MS);
-    return () => {
-      clearTimeout(timer);
-    };
-  }, [state]);
-
-  return (
-    <span className="inline-flex items-center gap-2">
-      <button
-        type="button"
-        title={address}
-        className="rounded border border-slate-300 px-2 py-0.5 text-xs hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800"
-        onClick={() => {
-          void (async () => {
-            try {
-              await navigator.clipboard.writeText(address);
-              setState("copied");
-            } catch {
-              // A browser that refuses the clipboard is not a failure of the
-              // page: the address is in the button's tooltip either way, and
-              // saying so beats a button that silently does nothing.
-              setState("failed");
-            }
-          })();
-        }}
-      >
-        Copy address
-      </button>
-      <span
-        role="status"
-        aria-live="polite"
-        aria-label="Copy address result"
-        className="text-xs text-slate-500 dark:text-slate-400"
-      >
-        {state === "copied"
-          ? "Copied"
-          : state === "failed"
-            ? "Copy refused"
-            : ""}
-      </span>
-    </span>
   );
 }
 

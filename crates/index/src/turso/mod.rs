@@ -31,11 +31,12 @@ use turso::{Builder, Connection, Database, Row, Value};
 use crate::alias::{AliasMap, query_uses_tags};
 use crate::error::{IndexError, Result};
 use crate::store::{
-    ChunkJob, ChunkModelCount, DomainHost, DomainId, DomainKind, DomainStats, EdgeKind,
-    EmbeddingCoverage, EmbeddingRow, EngramDescriptor, EngramId, EngramRecord, EngramSummary,
-    FileStamp, FtsMode, GraphSlice, HostClaim, InboundRef, NewChunk, OutboundRef, Page,
-    RecentFilter, SearchHit, SearchMode, SearchQuery, Store, StoreInfo, StoredEngram, Vocabulary,
-    build_vocabulary,
+    BrowseLevel, ChunkJob, ChunkModelCount, DomainHost, DomainId, DomainKind, DomainStats,
+    EdgeKind, EmbeddingCoverage, EmbeddingRow, EngramDescriptor, EngramId, EngramRecord,
+    EngramSummary, FileStamp, FtsMode, GraphSlice, HostClaim, InboundHit, InboundPage,
+    InboundQuery, InboundRef, LINKS_TO, NamedCount, NewChunk, OutboundRef, Page, RecentFilter,
+    SearchHit, SearchMode, SearchQuery, Store, StoreInfo, StoredEngram, Vocabulary,
+    build_vocabulary, folder_slash, page_window,
 };
 use crate::sweep::UnresolvedRef;
 
@@ -350,6 +351,38 @@ fn like_escape(s: &str) -> String {
         out.push(c);
     }
     out
+}
+
+/// The folder-prefix comparison every path filter uses, with BOTH sides lowered
+/// in SQL: `lower(e.path) LIKE lower(?n) ESCAPE '\'`, negated for a depth cut.
+///
+/// Three things about this shape, because they are the reasons and not the
+/// spelling:
+///
+/// 1. **Both sides are lowered by the same expression, in SQL.** The database
+///    decides what "lowered" means for the column and for the pattern in one
+///    place, so the comparison cannot disagree with itself. The parameter
+///    arrives escaped but unfolded; `lower()` in the statement folds it.
+/// 2. **The other folding shape in this crate was deliberately not copied.**
+///    The inbound-links `q` filter lowercases its parameter in Rust and wraps
+///    only the column. That loses rows on a C or POSIX collated Postgres:
+///    `lower()` there follows the argument's collation and returns `Ünter/a.md`
+///    unchanged, while Rust's `to_lowercase()` has already folded the pattern to
+///    `ünter/`, so a row that matches today stops matching. Measured on a
+///    `--lc-collate=C` database, not assumed.
+/// 3. **That `q` filter's own instance of the Rust-side shape is a known
+///    follow-up, not the house convention.** Do not harmonize these sites toward
+///    it; harmonize it toward these.
+///
+/// The fold is ASCII-exact and Unicode-approximate: Turso's `lower()` is
+/// `to_ascii_lowercase` while Postgres follows the database collation, so
+/// `Notes/` and `notes/` fold alike on both backends while a non-ASCII case pair
+/// may fold on one and not the other. Being ASCII-only, this side can only ever
+/// widen the match set and always preserves length; the Postgres twin of this
+/// helper carries the collation caveats that do not apply here.
+fn path_prefix_like(n: usize, negated: bool) -> String {
+    let not = if negated { " NOT" } else { "" };
+    format!("lower(e.path){not} LIKE lower(?{n}) ESCAPE '\\'")
 }
 
 fn cell_text(row: &Row, idx: usize) -> Option<String> {
@@ -915,7 +948,7 @@ impl Store for TursoStore {
         let mut params = vec![Value::Text(domain.to_string())];
         let mut n = 2;
         if let Some(prefix) = path_prefix.filter(|p| !p.is_empty()) {
-            clauses.push(format!("e.path LIKE ?{n} ESCAPE '\\'"));
+            clauses.push(path_prefix_like(n, false));
             params.push(Value::Text(format!("{}%", like_escape(prefix))));
             n += 1;
         }
@@ -930,6 +963,113 @@ impl Store for TursoStore {
         );
         let rows = query_all(&self.conn, &sql, params).await?;
         Ok(rows.iter().map(descriptor_from_row).collect())
+    }
+
+    async fn browse_level(
+        &self,
+        domain: &str,
+        path_prefix: Option<&str>,
+        depth: usize,
+        limit: usize,
+    ) -> Result<BrowseLevel> {
+        // The trailing slash is what makes the prefix a folder, so it is added
+        // here when a caller left it off rather than trusted: without it the
+        // folder derivation would cut its first segment out of a `rel` that
+        // starts with a slash and report a folder with no name.
+        let prefix = folder_slash(path_prefix.unwrap_or_default());
+        let depth = depth.max(1);
+        let escaped = like_escape(&prefix);
+
+        // Under the prefix. The pattern is escaped, so a folder named `50%` is
+        // a folder rather than a wildcard, and both sides are lowered so the
+        // filter folds case (see `path_prefix_like`).
+        let mut clauses = vec!["d.name=?1".to_string()];
+        let mut params = vec![Value::Text(domain.to_string())];
+        let mut n = 2;
+        if !prefix.is_empty() {
+            clauses.push(path_prefix_like(n, false));
+            params.push(Value::Text(format!("{escaped}%")));
+            n += 1;
+        }
+        let under = clauses.join(" AND ");
+
+        // The level itself: no more than `depth` segments below the prefix. A
+        // path with at least `depth` slashes under the prefix matches
+        // `<prefix>%/%` with one `/%` per level, so excluding that pattern is
+        // the depth cut - pushed into SQL rather than applied after the fact,
+        // because a cap over unfiltered rows could otherwise spend the whole
+        // page on engrams too deep to show. It folds case exactly as the
+        // under-prefix clause does, and that is not optional: folding one and
+        // not the other would let a case-variant path pass the folded
+        // under-prefix test AND pass the unfolded depth cut, landing an engram
+        // two levels down in a one-level listing - a leak that does not exist
+        // while neither side folds.
+        let mut level = clauses.clone();
+        let mut level_params = params.clone();
+        level.push(path_prefix_like(n, true));
+        level_params.push(Value::Text(format!("{escaped}%{}", "/%".repeat(depth))));
+        let level = level.join(" AND ");
+
+        // The count runs under exactly the filter the page runs under, so a
+        // truncated level can say how much it is not showing without the two
+        // queries ever disagreeing.
+        let total = scalar_i64(
+            &self.conn,
+            &format!(
+                "SELECT count(*) FROM engram e JOIN domain d ON d.id=e.domain_id WHERE {level}"
+            ),
+            level_params.clone(),
+        )
+        .await?
+        .max(0) as usize;
+
+        let rows = query_all(
+            &self.conn,
+            &format!(
+                "SELECT e.id, e.domain_id, d.name, e.path, e.permalink, e.title, e.engram_type, e.status \
+                 FROM engram e JOIN domain d ON d.id=e.domain_id WHERE {level} \
+                 ORDER BY e.path LIMIT {limit}"
+            ),
+            level_params,
+        )
+        .await?;
+        let engrams: Vec<EngramDescriptor> = rows.iter().map(descriptor_from_row).collect();
+
+        // The folder names come from the path column alone - the distinct first
+        // segment below the prefix - so no body is read to learn that a folder
+        // exists and the row cap above can never hide one. `substr` and `instr`
+        // count characters, so the offset is a character count.
+        //
+        // The offset is the caller's prefix length, and the folded filter above
+        // admits rows whose own leading characters are a case VARIANT of that
+        // prefix rather than the prefix itself. It still cuts in the right place
+        // for one reason only: every fold in play is LENGTH-PRESERVING (Turso's
+        // `lower()` is ASCII-only, and the per-character mappings of the locales
+        // in use map one code point to one). A provider whose `lower()` is not -
+        // an ICU Postgres folding U+0130 to two code points - would cut here in
+        // the wrong place and derive a wrong or empty folder name. That is what
+        // a future reader has to re-check, not where the number came from.
+        let rel = format!("substr(e.path, {})", prefix.chars().count() + 1);
+        let folder_rows = query_all(
+            &self.conn,
+            &format!(
+                "SELECT DISTINCT substr({rel}, 1, instr({rel}, '/') - 1) \
+                 FROM engram e JOIN domain d ON d.id=e.domain_id \
+                 WHERE {under} AND instr({rel}, '/') > 0"
+            ),
+            params,
+        )
+        .await?;
+        let mut folders: Vec<String> = folder_rows.iter().filter_map(|r| cell_text(r, 0)).collect();
+        // Sorted here rather than in SQL, so both backends order folder names
+        // by bytes without either dialect's collation having a say.
+        folders.sort();
+
+        Ok(BrowseLevel {
+            engrams,
+            folders,
+            total,
+        })
     }
 
     async fn engrams_with_tag(
@@ -1079,6 +1219,128 @@ impl Store for TursoStore {
                 },
             })
             .collect())
+    }
+
+    async fn inbound_page(&self, query: &InboundQuery<'_>) -> Result<InboundPage> {
+        // Every reference pointing at the target, as one narrow projection: the
+        // referencing engram's address, its status and the relation it points
+        // with. The predicate is `inbound_refs`'s, unchanged, so a total here
+        // and the count `read_engram` reports are the same number - resolved
+        // references by id, plus the unresolved same-domain ones whose text
+        // names this engram. A prose wikilink carries `links_to`, the word the
+        // graph edges and the sweep already use for one.
+        //
+        // Narrow on purpose: nothing here selects a body, so the sort below
+        // never carries one. Sorting wide rows is what made a search spill
+        // gigabytes on this project once, and a reference list is exactly the
+        // shape that tempts a `SELECT *`.
+        let source = format!(
+            "SELECT d.name AS domain, e.permalink AS permalink, e.title AS title, \
+                    e.path AS path, e.status AS status, r.rel_type AS rel \
+             FROM relation r JOIN engram e ON e.id=r.engram_id JOIN domain d ON d.id=e.domain_id \
+             WHERE r.to_id=?1 \
+                OR (r.to_id IS NULL AND r.domain_id=?2 AND r.to_domain IS NULL \
+                    AND (r.to_target=?3 OR lower(r.to_target)=lower(?4))) \
+             UNION ALL \
+             SELECT d.name, e.permalink, e.title, e.path, e.status, '{LINKS_TO}' \
+             FROM link l JOIN engram e ON e.id=l.engram_id JOIN domain d ON d.id=e.domain_id \
+             WHERE l.to_id=?1 \
+                OR (l.to_id IS NULL AND l.domain_id=?2 AND l.to_domain IS NULL \
+                    AND (l.to_target=?3 OR lower(l.to_target)=lower(?4)))"
+        );
+        let target = || {
+            vec![
+                Value::Integer(query.engram_id.0),
+                Value::Integer(query.domain_id.0),
+                Value::Text(query.permalink.to_string()),
+                Value::Text(query.title.to_string()),
+            ]
+        };
+
+        // The filters, appended after the four the target always binds.
+        let mut params = target();
+        let mut clauses: Vec<String> = Vec::new();
+        let mut n = 5;
+        if let Some(rel) = query.rel.filter(|r| !r.is_empty()) {
+            clauses.push(format!("i.rel=?{n}"));
+            params.push(Value::Text(rel.to_string()));
+            n += 1;
+        }
+        if let Some(text) = query.q.map(str::trim).filter(|t| !t.is_empty()) {
+            // Lowercased on both sides and escaped, the established
+            // case-insensitive LIKE of this backend: a `%` a reader typed is a
+            // percent sign, not a wildcard over the whole index.
+            let pattern = format!("%{}%", like_escape(&text.to_lowercase()));
+            clauses.push(format!(
+                "(lower(i.title) LIKE ?{n} ESCAPE '\\' OR lower(i.path) LIKE ?{} ESCAPE '\\')",
+                n + 1
+            ));
+            params.push(Value::Text(pattern.clone()));
+            params.push(Value::Text(pattern));
+            n += 2;
+        }
+        let where_sql = if clauses.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", clauses.join(" AND "))
+        };
+
+        let total = scalar_i64(
+            &self.conn,
+            &format!("SELECT COUNT(*) FROM ({source}) i{where_sql}"),
+            params.clone(),
+        )
+        .await?
+        .max(0) as usize;
+
+        // Ordered by title, then permalink, then domain, then relation, so a
+        // page boundary is stable across calls even where two engrams share a
+        // title. TEXT sorts byte-wise here, which is the ordering the Postgres
+        // twin pins itself to with an explicit `COLLATE "C"`.
+        let (limit, offset) = page_window(query.page, query.limit);
+        let mut paged = params;
+        paged.push(Value::Integer(limit));
+        paged.push(Value::Integer(offset));
+        let rows = query_all(
+            &self.conn,
+            &format!(
+                "SELECT i.domain, i.permalink, i.title, i.path, i.status, i.rel \
+                 FROM ({source}) i{where_sql} \
+                 ORDER BY i.title, i.permalink, i.domain, i.rel LIMIT ?{n} OFFSET ?{}",
+                n + 1
+            ),
+            paged,
+        )
+        .await?;
+        let hits = rows
+            .iter()
+            .map(|r| InboundHit {
+                domain: cell_text(r, 0).unwrap_or_default(),
+                permalink: cell_text(r, 1).unwrap_or_default(),
+                title: cell_text(r, 2).unwrap_or_default(),
+                path: cell_text(r, 3).unwrap_or_default(),
+                status: cell_text(r, 4).unwrap_or_default(),
+                rel: cell_text(r, 5).unwrap_or_default(),
+            })
+            .collect();
+
+        // The summary, deliberately over the unfiltered set: the caller filters
+        // *with* it. One grouped pass, no page.
+        let summary = query_all(
+            &self.conn,
+            &format!("SELECT i.rel, COUNT(*) FROM ({source}) i GROUP BY i.rel ORDER BY 2 DESC, 1"),
+            target(),
+        )
+        .await?;
+        let types = summary
+            .iter()
+            .map(|r| NamedCount {
+                name: cell_text(r, 0).unwrap_or_default(),
+                count: cell_i64(r, 1).unwrap_or(0),
+            })
+            .collect();
+
+        Ok(InboundPage { total, types, hits })
     }
 
     async fn outbound_refs(&self, engram_id: EngramId) -> Result<Vec<OutboundRef>> {

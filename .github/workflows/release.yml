@@ -13,8 +13,59 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # The Fluid bundle, built once for the whole release. It is JavaScript, so it
+  # is the same bytes on every platform and there is no reason for six build
+  # legs to each stand up a Node toolchain and produce it again. Every leg
+  # downloads this artifact into fluid/dist before cargo runs, because
+  # crates/service/build.rs stages whatever is in that folder at compile time
+  # and the binary carries the copy.
+  fluid-dist:
+    name: build the fluid bundle
+    runs-on: ubuntu-latest
+    env:
+      # Corepack fetches the pinned pnpm on first use, and the confirmation it
+      # would otherwise ask for has nobody to answer it here. Set the way
+      # fluid/Dockerfile and the CI fluid job set it, and for the same reason.
+      COREPACK_ENABLE_DOWNLOAD_PROMPT: '0'
+    defaults:
+      run:
+        working-directory: fluid
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      # Corepack rather than a pnpm setup action, and for one reason: corepack
+      # reads the "packageManager" pin in fluid/package.json, so the pnpm
+      # version used here, in CI, in the Fluid image and on a laptop is one fact
+      # in one place. It is no longer bundled with Node, hence the install,
+      # pinned to the same corepack release fluid/Dockerfile pins.
+      - name: Enable corepack
+        run: |
+          npm install --global corepack@0.35.0
+          corepack enable pnpm
+          pnpm --version
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build the bundle
+        run: pnpm build
+
+      # Repository-relative: working-directory applies to run steps, not to an
+      # action's inputs.
+      - name: Upload the bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fluid-dist
+          path: fluid/dist
+          if-no-files-found: error
+          # The action skips dotfiles by default and the index.html guard in
+          # the build legs would never notice one missing; a future vite
+          # emitting .vite/manifest.json must ride along, not silently drop.
+          include-hidden-files: true
+
   build:
     name: build (${{ matrix.target }})
+    needs: fluid-dist
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -98,6 +149,29 @@ jobs:
           else
             echo "version=v0.0.0-dev" >> "$GITHUB_OUTPUT"
           fi
+
+      # The web UI, downloaded before cargo runs on purpose: the service crate's
+      # build script copies fluid/dist into its OUT_DIR and the derive embeds
+      # that copy, so a bundle arriving after the compile is a bundle nobody
+      # ships. download-artifact is cross-platform, so the Windows legs take
+      # this path too.
+      - name: Download the fluid bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: fluid-dist
+          path: fluid/dist
+
+      # Cheap, and it is the difference between a release that ships the UI and
+      # one that quietly answers 503 on every navigation.
+      - name: The bundle is there to embed
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f fluid/dist/index.html ]; then
+            echo "::error::fluid/dist/index.html is missing, so this binary would ship with no web UI. The fluid-dist job builds the bundle and uploads it as the fluid-dist artifact; this leg downloads it into fluid/dist."
+            exit 1
+          fi
+          echo "bundle: $(find fluid/dist -type f | wc -l) files staged for the embed"
 
       - name: Build crystalline
         run: cargo build --release --target ${{ matrix.target }} -p crystalline
@@ -499,7 +573,7 @@ jobs:
           if-no-files-found: error
 
       # Skill zips: crystalline-claude-desktop-skill carries the consolidated
-      # crystalline-memory skill Claude Desktop users upload as-is (the skill
+      # crystalline-intelligence skill Claude Desktop users upload as-is (the skill
       # FOLDER must sit at the zip root, hence zipping from inside skills/);
       # crystalline-agent-skills carries the four topical skills for harnesses
       # that install skill folders directly.
@@ -509,13 +583,13 @@ jobs:
           set -euo pipefail
           version="${{ steps.version.outputs.version }}"
           mkdir -p skill-out
-          (cd skills && zip -qr "../skill-out/crystalline-claude-desktop-skill-v${version}.zip" crystalline-memory)
+          (cd skills && zip -qr "../skill-out/crystalline-claude-desktop-skill-v${version}.zip" crystalline-intelligence)
           (cd skills && zip -qr "../skill-out/crystalline-agent-skills-v${version}.zip" \
             crystalline-routing crystalline-capture crystalline-schema crystalline-collaboration)
           # Exact-path assertions: each skill folder must sit at the zip ROOT
           # (an unanchored grep would also match a wrong skills/<name> layout)
           # and every topical skill must be present in the bundle zip.
-          unzip -Z1 "skill-out/crystalline-claude-desktop-skill-v${version}.zip" | grep -qx 'crystalline-memory/SKILL.md'
+          unzip -Z1 "skill-out/crystalline-claude-desktop-skill-v${version}.zip" | grep -qx 'crystalline-intelligence/SKILL.md'
           for s in crystalline-routing crystalline-capture crystalline-schema crystalline-collaboration; do
             unzip -Z1 "skill-out/crystalline-agent-skills-v${version}.zip" | grep -qx "$s/SKILL.md"
           done
@@ -548,7 +622,12 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p release
-          find downloads -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.deb' -o -name '*.mcpb' -o -name '*.msi' \) -exec cp {} release/ \;
+          # The step above downloads every artifact the run produced, and one of
+          # them is the fluid-dist bundle the build legs embed rather than
+          # anything a reader downloads. Its files carry none of the extensions
+          # below today, so the filter alone would do; the path exclusion is
+          # what keeps that true when the bundler starts emitting something new.
+          find downloads -type f -not -path 'downloads/fluid-dist/*' \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.deb' -o -name '*.mcpb' -o -name '*.msi' \) -exec cp {} release/ \;
           cd release
           sha256sum * > SHA256SUMS
           ls -la

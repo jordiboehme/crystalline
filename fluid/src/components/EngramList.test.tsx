@@ -210,6 +210,70 @@ describe("the engram list", () => {
     }
   });
 
+  it("wears the one chip primitive: status filled by meaning, type neutral", async () => {
+    mount(
+      <EngramList
+        queryKey={["test", "chips"]}
+        loadPage={() => Promise.resolve(pageOf(1, [row(0)], 1))}
+        label="Engrams"
+        emptyMessage="Nothing here."
+      />,
+    );
+
+    // The same mapping the details panel uses: a recognized lifecycle value
+    // gets its semantic fill, and `type` is a fact rather than a judgement.
+    expect((await screen.findByText("stable")).className).toContain("emerald");
+    expect(screen.getByText("engram").className).toContain("slate");
+  });
+
+  it("reads a snippet as the sentence it is, not as its markdown source", async () => {
+    mount(
+      <EngramList
+        queryKey={["test", "snippet"]}
+        loadPage={() =>
+          Promise.resolve(
+            pageOf(
+              1,
+              [
+                row(0, {
+                  snippet: "## Relations - relates_to [[Lantern Protocol]]",
+                }),
+              ],
+              1,
+            ),
+          )
+        }
+        label="Engrams"
+        emptyMessage="Nothing here."
+      />,
+    );
+
+    const link = await screen.findByRole("link", { name: /Alpha 0/ });
+    expect(link).toHaveTextContent("Relations - relates_to Lantern Protocol");
+    expect(link.textContent).not.toContain("[[");
+    expect(link.textContent).not.toContain("##");
+  });
+
+  it("lets a caller's summary own the line that counts the rows", async () => {
+    mount(
+      <EngramList
+        queryKey={["test", "summary"]}
+        loadPage={() => Promise.resolve(numberedPage(1, PAGE_SIZE))}
+        label="Engrams"
+        emptyMessage="Nothing here."
+        summary={(page, shown) => (
+          <p>{`${String(shown)} of ${String(page.total)} results, ranked by text`}</p>
+        )}
+      />,
+    );
+
+    expect(
+      await screen.findByText("20 of 20 results, ranked by text"),
+    ).toBeVisible();
+    // One line rather than two saying near enough the same thing.
+    expect(screen.queryByText(/shown/)).toBeNull();
+  });
+
   it("says so when there is nothing to list", async () => {
     mount(
       <EngramList
@@ -223,5 +287,20 @@ describe("the engram list", () => {
     expect(
       await screen.findByText("No engram matches these filters."),
     ).toBeVisible();
+  });
+
+  it("offers the way out a caller hands it, beside the empty message", async () => {
+    mount(
+      <EngramList
+        queryKey={["test", "empty-actions"]}
+        loadPage={() => Promise.resolve(pageOf(1, [], 0))}
+        label="Engrams"
+        emptyMessage="No engram matches these filters."
+        emptyActions={<button type="button">Clear filters</button>}
+      />,
+    );
+
+    await screen.findByText("No engram matches these filters.");
+    expect(screen.getByRole("button", { name: "Clear filters" })).toBeVisible();
   });
 });

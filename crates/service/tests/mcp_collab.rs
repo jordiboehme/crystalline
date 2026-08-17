@@ -1,15 +1,15 @@
 //! MCP-layer tests for the five GitHub collaboration tools: the runtime
-//! gating matrix over `list_tools`/`get_tool`, the clean refusal a direct
-//! call to a hidden tool still gets, the `configure` tool's snapshot, set
+//! gating matrix over `list_tools`/`get_tool`, the call-time refusal the four
+//! GitHub-gated ones give while collaboration is off, the `configure` tool's snapshot, set
 //! flow and GitHub connect state machine, and wiring smoke tests for the
 //! origin tools against the engine with an injected `MockProvider`. Also the
 //! non-GitHub `add_domain` modes (local and virtual), which are not
 //! collaboration-gated and work on a fresh instance with GitHub off.
 //!
 //! Every test that touches a GitHub connection injects either
-//! `support::MockProvider` (via `Engine::with_origin_provider`) or a local
-//! `FakeConnectAuth` (via `Engine::with_connect_auth`), and points token and
-//! origin state at a tempdir (`Engine::with_token_store_dir`,
+//! `support::MockProvider` (via `Engine::with_origin_provider`) or
+//! `support::StubConnectAuth` (via `Engine::with_connect_auth`), and points
+//! token and origin state at a tempdir (`Engine::with_token_store_dir`,
 //! `Engine::with_origins_dir`), so nothing here reaches a network, a real
 //! GitHub repository, or the developer's actual OS keychain.
 
@@ -21,16 +21,16 @@ use std::sync::Arc;
 
 use crystalline_core::config::{GitHubConfig, GlobalConfig, ResponseFormat, ServiceConfig};
 use crystalline_index::TursoStore;
-use crystalline_remote::{DeviceFlowStart, RemoteError, StoredToken, TokenStore};
+use crystalline_remote::{RemoteError, StoredToken, TokenStore};
 use crystalline_service::Engine;
 use crystalline_service::EnvOverlay;
-use crystalline_service::engine::{ConnectAuth, EngineError};
+use crystalline_service::engine::EngineError;
 use crystalline_service::mcp::McpServer;
 use rmcp::model::{CallToolRequestParams, ProgressNotificationParam};
 use rmcp::service::{NotificationContext, Peer, RunningService};
 use rmcp::{ClientHandler, RoleClient, RoleServer};
 use serde_json::{Value, json};
-use support::MockProvider;
+use support::{MockProvider, StubConnectAuth, device_flow_start, fake_auth};
 use tokio::sync::Mutex;
 
 // --- shared fixtures ---------------------------------------------------------
@@ -56,7 +56,10 @@ fn config(github_enabled: bool) -> GlobalConfig {
 /// A bare engine (no origin provider, no connect auth) for gating and
 /// refusal tests that never reach `resolve_origin_provider` or a real
 /// connect action. `config_path` points `configure`'s `set`/`unset` at a
-/// tempdir file instead of the real machine global config.
+/// tempdir file instead of the real machine global config, and the token
+/// store is pointed at the same tempdir: a test that turns github.enabled on
+/// mid-call gets an ungated snapshot afterwards, and without the override
+/// that snapshot would read the developer's real OS keychain.
 async fn engine(config_path: &std::path::Path, github_enabled: bool, read_only: bool) -> Engine {
     let store = TursoStore::open_in_memory().await.unwrap();
     Engine::new(
@@ -65,6 +68,7 @@ async fn engine(config_path: &std::path::Path, github_enabled: bool, read_only: 
         None,
         Some(config_path.to_path_buf()),
     )
+    .with_token_store_dir(config_path.parent().unwrap().to_path_buf())
     .with_read_only(read_only)
 }
 
@@ -160,11 +164,15 @@ const ALL_FIVE: [&str; 5] = [
 
 // --- gating matrix -----------------------------------------------------------
 
+/// The locked matrix, now on `read_only` alone. `github.enabled` left the
+/// listing in the SEP-2567 work: it is settable by `configure` on the same
+/// connection, so a list that varied with it varied as a side effect of
+/// another request. Both rows for a given `read_only` are therefore identical.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gating_matrix_over_list_tools() {
     let cases: [(bool, bool, &[&str]); 4] = [
-        (false, false, &["configure"]),
-        (false, true, &[]),
+        (false, false, &ALL_FIVE),
+        (false, true, &["update_domain", "origin_status"]),
         (true, false, &ALL_FIVE),
         (true, true, &["update_domain", "origin_status"]),
     ];
@@ -186,13 +194,14 @@ async fn gating_matrix_over_list_tools() {
     }
 }
 
+/// `get_tool` agrees with `list_tools`, on the same narrowed matrix.
 #[tokio::test]
 async fn gating_matrix_over_get_tool() {
     use rmcp::ServerHandler;
 
     let cases: [(bool, bool, &[&str]); 4] = [
-        (false, false, &["configure"]),
-        (false, true, &[]),
+        (false, false, &ALL_FIVE),
+        (false, true, &["update_domain", "origin_status"]),
         (true, false, &ALL_FIVE),
         (true, true, &["update_domain", "origin_status"]),
     ];
@@ -235,16 +244,46 @@ async fn add_domain_is_visible_unless_read_only_regardless_of_github() {
     }
 }
 
+/// Flipping `github.enabled` mid-session moves the refusal, never the
+/// listing. This test used to assert the opposite, which is SEP-2567's second
+/// prohibition word for word: results "MUST NOT vary per-connection or as a
+/// side effect of other requests on the connection".
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn flipping_github_enabled_mid_session_changes_the_next_list_tools_result() {
+async fn flipping_github_enabled_mid_session_moves_the_refusal_not_the_list() {
     let tmp = tempfile::tempdir().unwrap();
     let eng = Arc::new(engine(&tmp.path().join("config.yaml"), false, false).await);
     let (client, _server) = connect(eng.clone()).await;
     let peer = client.peer();
 
-    // share_changes is a collaboration tool, so it is hidden while github is off.
-    let tools = peer.list_tools(Default::default()).await.unwrap();
-    assert!(!tools.tools.iter().any(|t| t.name == "share_changes"));
+    let before: Vec<String> = peer
+        .list_tools(Default::default())
+        .await
+        .unwrap()
+        .tools
+        .iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    assert!(before.contains(&"share_changes".to_string()));
+
+    // It refuses while the setting is off, and the refusal is what the caller
+    // reads.
+    let refused = peer
+        .call_tool(CallToolRequestParams::new("origin_status".to_string()))
+        .await
+        .expect("a listed tool answers");
+    assert_eq!(refused.is_error, Some(true));
+    // The text as well as the flag: in rmcp 3.1.2 a parameter-deserialization
+    // failure is itself a tool-level error, so `is_error` alone can be
+    // satisfied by a call that never reached the gate under test.
+    let text = serde_json::to_value(&refused).unwrap();
+    let text = text
+        .pointer("/content/0/text")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    assert!(
+        text.contains("github.enabled"),
+        "the refusal names the setting to change: {text}"
+    );
 
     call(
         peer,
@@ -254,17 +293,40 @@ async fn flipping_github_enabled_mid_session_changes_the_next_list_tools_result(
     .await
     .unwrap();
 
-    let tools = peer.list_tools(Default::default()).await.unwrap();
-    assert!(
-        tools.tools.iter().any(|t| t.name == "share_changes"),
-        "share_changes must appear once github.enabled flips to true"
+    let after: Vec<String> = peer
+        .list_tools(Default::default())
+        .await
+        .unwrap()
+        .tools
+        .iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    assert_eq!(
+        before, after,
+        "the listing is the same on both sides of the flip"
+    );
+
+    // And now the same call reaches the engine instead of the gate.
+    let served = peer
+        .call_tool(CallToolRequestParams::new("origin_status".to_string()))
+        .await
+        .expect("a listed tool answers");
+    assert_ne!(
+        served.is_error,
+        Some(true),
+        "origin_status runs once collaboration is on"
     );
 }
 
-// --- hidden tools still route to the clean engine refusal -------------------
+// --- listed tools refuse at call time ---------------------------------------
 
+/// The four GitHub-gated tools are listed whatever `github.enabled` says
+/// (SEP-2567: the setting is `configure`-settable on this very connection, so
+/// it cannot gate a listing) and refuse when it is off. The refusal is a
+/// tool-level error rather than a JSON-RPC one, because a listed tool's
+/// failure has to be readable by the model that called it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn hidden_collab_tools_route_to_not_enabled_when_github_is_disabled() {
+async fn listed_collab_tools_refuse_at_call_time_when_github_is_disabled() {
     let tmp = tempfile::tempdir().unwrap();
     let eng = Arc::new(engine(&tmp.path().join("config.yaml"), false, false).await);
     let (client, _server) = connect(eng).await;
@@ -280,10 +342,22 @@ async fn hidden_collab_tools_route_to_not_enabled_when_github_is_disabled() {
         ),
     ];
     for (tool, args) in cases {
-        let err = call(peer, tool, args).await.unwrap_err();
+        let mut params = rmcp::model::CallToolRequestParams::new(tool.to_string());
+        if let Value::Object(map) = args {
+            params = params.with_arguments(map);
+        }
+        let result = peer
+            .call_tool(params)
+            .await
+            .unwrap_or_else(|e| panic!("{tool} must answer rather than fail at the protocol: {e}"));
+        assert_eq!(result.is_error, Some(true), "{tool} should refuse");
+        let text = serde_json::to_value(&result).unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
         assert!(
-            err.contains("not enabled"),
-            "{tool} should refuse with the not-enabled message, got: {err}"
+            text.contains("not enabled") && text.contains("github.enabled"),
+            "{tool} should refuse with the not-enabled message, got: {text}"
         );
     }
 }
@@ -359,11 +433,68 @@ async fn configure_with_no_args_reports_the_settings_snapshot_and_github_block()
 
     let out = call(peer, "configure", json!({})).await.unwrap();
     let settings = out["settings"].as_array().unwrap();
-    assert_eq!(settings.len(), 18, "{settings:?}");
+    assert_eq!(settings.len(), 21, "{settings:?}");
     assert!(settings.iter().any(|s| s["key"] == "github.enabled"));
     assert!(settings.iter().any(|s| s["key"] == "domains_root"));
-    assert_eq!(out["github"]["connected"], json!(false));
-    assert!(out["github"]["pending_connect"].is_null());
+    // github.enabled is off here, so the github block states enablement and
+    // says nothing about a credential the call deliberately never read.
+    assert_eq!(out["github"]["github_enabled"], json!(false));
+    assert!(
+        out["github"]["note"]
+            .as_str()
+            .unwrap()
+            .contains("configure")
+    );
+    let github = out["github"].as_object().unwrap();
+    for absent in ["connected", "user", "token_store", "pending_connect"] {
+        assert!(
+            !github.contains_key(absent),
+            "a disabled instance reports no connection facts, not false ones: {github:?}"
+        );
+    }
+}
+
+/// The gate is about the credential store, not only about the JSON: a token
+/// sitting in the engine's token directory would make an ungated snapshot
+/// report `connected: true`, so the disabled shape here is proof the block
+/// never reached the store. On a real machine that store is the OS keychain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configure_snapshot_never_reads_the_credential_while_github_is_off() {
+    let tmp = tempfile::tempdir().unwrap();
+    seed_token_file(tmp.path(), "octocat");
+    let eng = engine(&tmp.path().join("config.yaml"), false, false).await;
+
+    let snap = eng.configure_snapshot().await.unwrap();
+    assert_eq!(snap["github"]["github_enabled"], json!(false));
+    assert_eq!(
+        snap["github"]["note"],
+        json!(
+            "GitHub is switched off on this instance; set github.enabled true with configure to connect or read the connection."
+        )
+    );
+    let github = snap["github"].as_object().unwrap();
+    for absent in ["connected", "user", "token_store", "pending_connect"] {
+        assert!(
+            !github.contains_key(absent),
+            "the seeded token must not surface in any shape: {github:?}"
+        );
+    }
+}
+
+/// The counterweight: with github.enabled on, the same seeded token is read
+/// and reported exactly as before, so the gate cannot be over-applied into a
+/// snapshot that never reports a connection at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configure_snapshot_still_reports_the_connection_while_github_is_on() {
+    let tmp = tempfile::tempdir().unwrap();
+    seed_token_file(tmp.path(), "octocat");
+    let eng = engine(&tmp.path().join("config.yaml"), true, false).await;
+
+    let snap = eng.configure_snapshot().await.unwrap();
+    assert_eq!(snap["github"]["connected"], json!(true));
+    assert_eq!(snap["github"]["user"], json!("octocat"));
+    assert_eq!(snap["github"]["token_store"], json!("file"));
+    assert!(snap["github"]["pending_connect"].is_null());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -427,7 +558,7 @@ async fn configure_set_stops_at_the_first_bad_key_and_reports_what_applied() {
     assert!(eng.config().github_enabled());
 }
 
-// --- configure: tools/list_changed -------------------------------------------
+// --- configure: the flip announces nothing ------------------------------------
 
 /// A client handler that records whether it ever received
 /// `notifications/tools/list_changed`.
@@ -448,8 +579,16 @@ impl ClientHandler for NotifyClient {
     }
 }
 
+/// Flipping `github.enabled` announces **nothing**, which is the inversion of
+/// `configure_flipping_github_enabled_pushes_a_tool_list_changed_notification`.
+///
+/// The four collaboration tools are listed whatever the setting says and refuse
+/// at call time instead, so the flip moves no list and the push described a
+/// change that had not happened. MCP 2026-07-28 removes the unsolicited channel
+/// as well: `tests/mcp_subscriptions.rs` carries the subscription stream that
+/// replaces it, and the same silence asserted for a subscriber.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn configure_flipping_github_enabled_pushes_a_tool_list_changed_notification() {
+async fn configure_flipping_github_enabled_announces_nothing() {
     let tmp = tempfile::tempdir().unwrap();
     let eng = Arc::new(engine(&tmp.path().join("config.yaml"), false, false).await);
     let (client_io, server_io) = tokio::io::duplex(1 << 16);
@@ -462,100 +601,40 @@ async fn configure_flipping_github_enabled_pushes_a_tool_list_changed_notificati
     let _server = server_task.await.unwrap().unwrap();
     let peer = client.peer();
 
-    call(
+    let snapshot = call(
         peer,
         "configure",
         json!({"set": {"github.enabled": "true"}}),
     )
     .await
     .unwrap();
+    // Prove the write landed: a malformed `configure` comes back as a
+    // tool-level error in rmcp 3.1.2, so a silence test could otherwise pass
+    // because nothing happened at all.
+    assert_ne!(
+        snapshot["github"]["github_enabled"],
+        json!(false),
+        "the setting must actually be on: {snapshot}"
+    );
 
-    tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        handler.got_list_changed.notified(),
-    )
-    .await
-    .expect("expected a tools/list_changed notification after configure flipped github.enabled");
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            handler.got_list_changed.notified(),
+        )
+        .await
+        .is_err(),
+        "the flip moves no list, so nothing may be pushed to a client that asked for nothing"
+    );
 }
 
 // --- configure: GitHub connect state machine (engine-level) -----------------
+//
+// The `ConnectAuth` fake (`StubConnectAuth`, `fake_auth`, `device_flow_start`)
+// lives in `support` now, shared with `tests/domain_admin.rs`'s GitHub
+// status/ready/disconnect tests.
 
-/// A fake [`ConnectAuth`] whose three outcomes are set once at construction
-/// and consumed once each, with `run_device_flow` blockable on a `Notify` so
-/// a test can observe the "still waiting on the user" state before letting
-/// the flow land.
-struct FakeConnectAuth {
-    start_result: std::sync::Mutex<Option<Result<DeviceFlowStart, RemoteError>>>,
-    run_gate: tokio::sync::Notify,
-    run_result: std::sync::Mutex<Option<Result<String, RemoteError>>>,
-    validate_result: std::sync::Mutex<Option<Result<String, RemoteError>>>,
-}
-
-fn fake_auth(
-    start: Result<DeviceFlowStart, RemoteError>,
-    run: Result<String, RemoteError>,
-    validate: Result<String, RemoteError>,
-) -> Arc<FakeConnectAuth> {
-    Arc::new(FakeConnectAuth {
-        start_result: std::sync::Mutex::new(Some(start)),
-        run_gate: tokio::sync::Notify::new(),
-        run_result: std::sync::Mutex::new(Some(run)),
-        validate_result: std::sync::Mutex::new(Some(validate)),
-    })
-}
-
-fn device_flow_start() -> DeviceFlowStart {
-    DeviceFlowStart {
-        device_code: "devcode".to_string(),
-        user_code: "ABCD-1234".to_string(),
-        verification_url: "https://github.com/login/device".to_string(),
-        interval_secs: 0,
-        expires_in_secs: 900,
-    }
-}
-
-#[async_trait::async_trait]
-impl ConnectAuth for FakeConnectAuth {
-    async fn start_device_flow(
-        &self,
-        _auth_base: &str,
-        _client_id: &str,
-    ) -> Result<DeviceFlowStart, RemoteError> {
-        self.start_result
-            .lock()
-            .unwrap()
-            .take()
-            .expect("start_device_flow result not set")
-    }
-
-    async fn run_device_flow(
-        &self,
-        _auth_base: &str,
-        _client_id: &str,
-        _start: &DeviceFlowStart,
-    ) -> Result<String, RemoteError> {
-        self.run_gate.notified().await;
-        self.run_result
-            .lock()
-            .unwrap()
-            .take()
-            .expect("run_device_flow result not set")
-    }
-
-    async fn validate_token(
-        &self,
-        _api_url: Option<&str>,
-        _token: &str,
-    ) -> Result<String, RemoteError> {
-        self.validate_result
-            .lock()
-            .unwrap()
-            .take()
-            .expect("validate_token result not set")
-    }
-}
-
-async fn engine_for_connect(auth: Arc<FakeConnectAuth>, dir: &std::path::Path) -> Engine {
+async fn engine_for_connect(auth: Arc<StubConnectAuth>, dir: &std::path::Path) -> Engine {
     engine_for_connect_with(false, auth, dir).await
 }
 
@@ -563,9 +642,16 @@ async fn engine_for_connect(auth: Arc<FakeConnectAuth>, dir: &std::path::Path) -
 /// engine's config instead of always off - so a test can prove a connect
 /// response's `github_enabled`/`note` reflect the live config in both
 /// states, not just the disabled default the other connect fixtures use.
+///
+/// Every test below about the credential cache or the device-flow lifecycle
+/// builds its engine with `true` here. Those tests are about the token cache
+/// and the pending slot, not about enablement, and they read their result
+/// out of `configure_snapshot`, which reports connection facts only while
+/// github.enabled is on. The tests that ARE about enablement (the connect
+/// responses' `github_enabled`/`note`) keep the disabled fixture.
 async fn engine_for_connect_with(
     github_enabled: bool,
-    auth: Arc<FakeConnectAuth>,
+    auth: Arc<StubConnectAuth>,
     dir: &std::path::Path,
 ) -> Engine {
     let store = TursoStore::open_in_memory().await.unwrap();
@@ -579,12 +665,16 @@ async fn engine_for_connect_with(
     .with_token_store_dir(dir.to_path_buf())
 }
 
-/// The same wiring as [`engine_for_connect`], plus `CRYSTALLINE_GITHUB_TOKEN`
-/// in the environment overlay: the token store directory stays wired up too,
-/// so a test built this way can prove the environment wins over it rather
-/// than merely being the only option available.
+/// The same wiring as [`engine_for_connect_with`], plus
+/// `CRYSTALLINE_GITHUB_TOKEN` in the environment overlay: the token store
+/// directory stays wired up too, so a test built this way can prove the
+/// environment wins over it rather than merely being the only option
+/// available. `github_enabled` is a parameter for the same reason it is one
+/// on `engine_for_connect_with`: the snapshot test needs it on, the two
+/// refusal tests are about a refusal that happens with it off.
 async fn engine_for_connect_with_env_token(
-    auth: Arc<FakeConnectAuth>,
+    github_enabled: bool,
+    auth: Arc<StubConnectAuth>,
     dir: &std::path::Path,
     token: &str,
 ) -> Engine {
@@ -593,7 +683,7 @@ async fn engine_for_connect_with_env_token(
         token.to_string(),
     )])
     .unwrap();
-    engine_for_connect(auth, dir)
+    engine_for_connect_with(github_enabled, auth, dir)
         .await
         .with_env_overlay(overlay)
 }
@@ -606,7 +696,7 @@ async fn token_connect_validates_saves_and_reports_connected() {
         Err(RemoteError::NotConnected),
         Ok("octocat".to_string()),
     );
-    let eng = engine_for_connect(auth, tmp.path()).await;
+    let eng = engine_for_connect_with(true, auth, tmp.path()).await;
 
     let result = eng.connect_with_token("pat-123", None).await.unwrap();
     assert_eq!(result["github"]["connected"], json!(true));
@@ -691,7 +781,7 @@ async fn token_connect_refuses_when_the_environment_owns_the_token() {
         Err(RemoteError::NotConnected),
         Ok("octocat".to_string()),
     );
-    let eng = engine_for_connect_with_env_token(auth, tmp.path(), "gho_SECRETSECRET").await;
+    let eng = engine_for_connect_with_env_token(false, auth, tmp.path(), "gho_SECRETSECRET").await;
 
     let err = eng.connect_with_token("pat-123", None).await.unwrap_err();
     assert!(matches!(err, EngineError::EnvTokenConnect));
@@ -709,7 +799,7 @@ async fn device_flow_refuses_when_the_environment_owns_the_token() {
         Ok("device-token".to_string()),
         Ok("octocat".to_string()),
     );
-    let eng = engine_for_connect_with_env_token(auth, tmp.path(), "gho_SECRETSECRET").await;
+    let eng = engine_for_connect_with_env_token(false, auth, tmp.path(), "gho_SECRETSECRET").await;
 
     let err = eng.start_device_connect(None).await.unwrap_err();
     assert!(matches!(err, EngineError::EnvTokenConnect));
@@ -722,7 +812,7 @@ async fn device_flow_refuses_when_the_environment_owns_the_token() {
 #[tokio::test]
 async fn env_token_wins_over_the_test_token_dir_override() {
     let tmp = tempfile::tempdir().unwrap();
-    // Every FakeConnectAuth outcome is set to fail: if the engine somehow
+    // Every StubConnectAuth outcome is set to fail: if the engine somehow
     // fell through to the test token directory (which has no saved token
     // either), reading the snapshot would still not need any of these, so a
     // wrong resolution would only be caught by the token_store assertion
@@ -732,7 +822,7 @@ async fn env_token_wins_over_the_test_token_dir_override() {
         Err(RemoteError::NotConnected),
         Err(RemoteError::NotConnected),
     );
-    let eng = engine_for_connect_with_env_token(auth, tmp.path(), "gho_SECRETSECRET").await;
+    let eng = engine_for_connect_with_env_token(true, auth, tmp.path(), "gho_SECRETSECRET").await;
 
     let snap = eng.configure_snapshot().await.unwrap();
     assert_eq!(snap["github"]["connected"], json!(true));
@@ -752,7 +842,7 @@ async fn device_flow_second_connect_reports_the_same_pending_code_then_lands_con
         Ok("device-token".to_string()),
         Ok("octocat".to_string()),
     );
-    let eng = engine_for_connect(auth.clone(), tmp.path()).await;
+    let eng = engine_for_connect_with(true, auth.clone(), tmp.path()).await;
 
     let first = eng.start_device_connect(None).await.unwrap();
     assert_eq!(first["github"]["connected"], json!(false));
@@ -839,7 +929,7 @@ async fn device_flow_failure_is_reported_once_as_an_error_then_the_slot_clears()
         Err(RemoteError::AuthExpired),
         Err(RemoteError::AuthExpired),
     );
-    let eng = engine_for_connect(auth.clone(), tmp.path()).await;
+    let eng = engine_for_connect_with(true, auth.clone(), tmp.path()).await;
 
     eng.start_device_connect(None).await.unwrap();
     auth.run_gate.notify_one();
@@ -855,6 +945,52 @@ async fn device_flow_failure_is_reported_once_as_an_error_then_the_slot_clears()
     let after = eng.configure_snapshot().await.unwrap();
     assert_eq!(after["github"]["connected"], json!(false));
     assert!(after["github"]["pending_connect"].is_null());
+}
+
+/// The gate sits ABOVE the pending drain, so on a disabled instance a bare
+/// `configure` neither reports a landed device-flow outcome nor destroys it:
+/// the outcome stays in the slot for the settings surface, which still
+/// reports it exactly once.
+#[tokio::test]
+async fn a_disabled_snapshot_leaves_a_landed_outcome_for_the_settings_surface() {
+    let tmp = tempfile::tempdir().unwrap();
+    let auth = fake_auth(
+        Ok(device_flow_start()),
+        Err(RemoteError::AuthExpired),
+        Err(RemoteError::AuthExpired),
+    );
+    let eng = engine_for_connect(auth.clone(), tmp.path()).await;
+
+    eng.start_device_connect(None).await.unwrap();
+    auth.run_gate.notify_one();
+
+    // The snapshot call sits INSIDE the poll loop deliberately. Nothing can
+    // observe the background task landing its outcome without draining it
+    // (the pending view is private and github_connection drains), so a
+    // single snapshot before the poll would prove nothing: it would usually
+    // run before the outcome landed and pass with or without the gate. Here
+    // it runs on every iteration, including the one where the outcome is
+    // sitting in the slot. An ungated snapshot would drain the failure and
+    // return it as an error, github_connection would never see it, and this
+    // loop would run out and panic.
+    let reported = wait_until(|| async {
+        let snap = eng.configure_snapshot().await.unwrap();
+        let github = snap["github"].as_object().unwrap();
+        assert_eq!(github["github_enabled"], json!(false));
+        assert!(
+            !github.contains_key("connected") && !github.contains_key("pending_connect"),
+            "a disabled snapshot reports no connection facts, landed outcome or not: {github:?}"
+        );
+        eng.github_connection().await.unwrap().error
+    })
+    .await;
+    assert_eq!(
+        reported,
+        "The GitHub connection has expired or was revoked. Use configure to sign in again."
+    );
+
+    // Still exactly once: the drain that reported it also cleared the slot.
+    assert!(eng.github_connection().await.unwrap().error.is_none());
 }
 
 // --- process-lifetime token cache -------------------------------------------
@@ -883,7 +1019,7 @@ async fn configure_snapshot_serves_the_cached_token_after_the_backing_file_is_de
         Err(RemoteError::NotConnected),
         Ok("octocat".to_string()),
     );
-    let eng = engine_for_connect(auth, tmp.path()).await;
+    let eng = engine_for_connect_with(true, auth, tmp.path()).await;
 
     // Connect writes the token once and refreshes the cache.
     let result = eng.connect_with_token("pat-123", None).await.unwrap();
@@ -912,7 +1048,7 @@ async fn connect_with_token_refreshes_the_cached_credential() {
         Err(RemoteError::NotConnected),
         Ok("octocat".to_string()),
     );
-    let eng = engine_for_connect(auth, tmp.path()).await;
+    let eng = engine_for_connect_with(true, auth, tmp.path()).await;
 
     // Populate the cache with the stale identity.
     let before = eng.configure_snapshot().await.unwrap();
@@ -945,7 +1081,7 @@ async fn a_landed_device_flow_refreshes_the_cached_credential() {
         Ok("device-token".to_string()),
         Ok("octocat".to_string()),
     );
-    let eng = engine_for_connect(auth.clone(), tmp.path()).await;
+    let eng = engine_for_connect_with(true, auth.clone(), tmp.path()).await;
 
     // Populate the cache with the stale identity, then start the flow.
     let before = eng.configure_snapshot().await.unwrap();

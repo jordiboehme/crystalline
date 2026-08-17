@@ -23,7 +23,10 @@ use crate::store::{
     salience_prior,
 };
 
-use super::{Param, cell_i64, cell_real, cell_text, query_all, query_first, scalar_i64};
+use super::{
+    Param, cell_i64, cell_real, cell_text, like_escape, path_prefix_like, query_all, query_first,
+    scalar_i64,
+};
 
 use sqlx::postgres::PgRow;
 
@@ -650,6 +653,18 @@ fn build_scalar_filters(
             })
             .collect();
         clauses.push(format!("d.name IN ({})", ph.join(",")));
+    }
+
+    // A folder filter, matched as a literal prefix: the caller hands the folder
+    // with its trailing slash, so `notes/` selects `notes/deep/y.md` and never
+    // the sibling `notes-misc/z.md`, and `like_escape` keeps a folder named
+    // `50%` or `a_b` a name rather than a pattern. It folds case on both sides,
+    // in SQL - see `path_prefix_like` for why that shape and not the other one
+    // in this crate.
+    if let Some(prefix) = query.path_prefix.as_deref().filter(|p| !p.is_empty()) {
+        clauses.push(path_prefix_like(*n, false));
+        params.push(Param::Text(format!("{}%", like_escape(prefix))));
+        *n += 1;
     }
 
     if let Some(t) = &query.engram_type {

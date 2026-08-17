@@ -125,6 +125,7 @@ async fn a_move_and_a_delete_keep_both_folders_in_step() {
         .delete_engram(&DeleteParams {
             identifier: "archive/restart".to_string(),
             domain: "notes".to_string(),
+            expected_checksum: None,
         })
         .await
         .unwrap();

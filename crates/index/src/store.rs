@@ -411,6 +411,13 @@ pub struct SearchQuery {
     /// The active provider's model id, paired with `query_embedding` for the
     /// staleness check. Required by the semantic and hybrid modes.
     pub active_model: Option<String>,
+    /// Restrict to engrams filed under this domain-relative folder, given with
+    /// its trailing slash (`notes/`). The slash is what makes the match a
+    /// folder rather than a string: `notes/deep/y.md` is under `notes/` and
+    /// `notes-misc/z.md` is not. `None` or an empty value searches the whole
+    /// domain. The value is a literal path, so `%` and `_` in a folder name are
+    /// escaped rather than matched as wildcards.
+    pub path_prefix: Option<String>,
     /// Page size.
     pub limit: usize,
     /// One-based page number.
@@ -671,6 +678,51 @@ pub struct EngramDescriptor {
     pub status: String,
 }
 
+/// One level of a domain's folder tree, as [`Store::browse_level`] reports it:
+/// the engrams a navigation view draws at this level, the child folders under
+/// it, and how many engrams the level really holds.
+///
+/// `engrams` is capped by the caller's limit while `folders` and `total` are
+/// not, which is the whole point of the shape: a tree that truncates its rows
+/// must still name every folder a reader can descend into, and must still be
+/// able to say how much it is not showing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BrowseLevel {
+    /// The engrams at this level, ordered by path in byte order, at most the
+    /// caller's limit of them.
+    pub engrams: Vec<EngramDescriptor>,
+    /// Every child folder directly under the browsed path, ordered by name in
+    /// byte order. Derived from the distinct first path segment below the
+    /// prefix rather than from `engrams`, so the cap never hides a folder.
+    pub folders: Vec<String>,
+    /// How many engrams the level holds, counted under exactly the filter that
+    /// selected `engrams`. Larger than `engrams.len()` means the cap cut the
+    /// listing.
+    ///
+    /// The level, not the folder: the depth cut applies to this count as it
+    /// does to the rows, so it moves with `depth` and never counts an engram
+    /// nested deeper than the level drawn. A search filtered by the same folder
+    /// counts recursively instead and legitimately reports more. See
+    /// [`Store::browse_level`] for why the two differ and what it would take to
+    /// return both.
+    pub total: usize,
+}
+
+/// A folder prefix carrying its trailing slash, whatever the caller passed.
+///
+/// The slash is the whole difference between a folder and a string: without it
+/// `notes` also takes `notes-misc/z.md`, and the first-segment derivation would
+/// cut a folder name out of a `rel` that opens with a slash and report a folder
+/// with no name. An empty prefix stays empty, since the root is the whole domain
+/// rather than a folder.
+pub(crate) fn folder_slash(prefix: &str) -> String {
+    if prefix.is_empty() || prefix.ends_with('/') {
+        prefix.to_string()
+    } else {
+        format!("{prefix}/")
+    }
+}
+
 /// A stored engram's addressing plus its full markdown content and checksum.
 /// Returned by [`Store::all_engram_contents`] to materialize a whole domain for
 /// `domain export`, and shaped so an export writes each engram back to disk
@@ -702,6 +754,105 @@ pub struct InboundRef {
     pub to_target: String,
     /// Whether the reference came from a relation bullet or a prose link.
     pub kind: EdgeKind,
+}
+
+/// The label a prose wikilink carries wherever inbound references are grouped
+/// or filtered by relation type.
+///
+/// The same word the graph edges and the consolidation sweep already use for a
+/// wikilink, rather than a second name for one thing: a reader who has seen
+/// `links_to` on an edge meets it again on the chip that counts those edges.
+pub const LINKS_TO: &str = "links_to";
+
+/// One row of [`Store::inbound_page`]: an engram that points at the target, and
+/// the relation it points with.
+///
+/// Addressed rather than merely located: [`InboundRef`] carries a path because
+/// the cross-domain move rewrites files, while a reader needs a link, so this
+/// one carries the permalink and title a client renders and navigates with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct InboundHit {
+    /// The referencing engram's domain name.
+    pub domain: String,
+    /// The referencing engram's permalink.
+    pub permalink: String,
+    /// Its title, as indexed. Empty when it carries none.
+    pub title: String,
+    /// Its domain-relative file path.
+    pub path: String,
+    /// Its `status` frontmatter, free form. Empty when it carries none. Here so
+    /// a reader is told that what points at this engram is itself retired,
+    /// which is a fact about the reference worth as much as its existence.
+    pub status: String,
+    /// The relation type of this reference, or [`LINKS_TO`] for a prose
+    /// wikilink.
+    pub rel: String,
+}
+
+/// What [`Store::inbound_page`] takes: which engram is being pointed at, and
+/// how the caller wants the references to it narrowed and paged.
+///
+/// The target is spelled the way [`Store::inbound_refs`] spells it - id, domain
+/// and the permalink and title an unresolved reference is text-matched against -
+/// because both walk the same rows and must agree about what points where.
+#[derive(Debug, Clone)]
+pub struct InboundQuery<'a> {
+    /// The engram being pointed at.
+    pub engram_id: EngramId,
+    /// Its domain, for the unresolved same-domain text match.
+    pub domain_id: DomainId,
+    /// Its permalink, for that same match.
+    pub permalink: &'a str,
+    /// Its title, for that same match.
+    pub title: &'a str,
+    /// Case-insensitive substring the referencing engram's title or path must
+    /// contain. `None` or empty selects every reference.
+    pub q: Option<&'a str>,
+    /// Keep only references carrying this relation type ([`LINKS_TO`] for prose
+    /// wikilinks). `None` selects every relation.
+    pub rel: Option<&'a str>,
+    /// One-based page number.
+    pub page: usize,
+    /// Page size.
+    pub limit: usize,
+}
+
+/// The `LIMIT` and `OFFSET` a one-based page asks for, as numbers a database
+/// integer can actually hold.
+///
+/// Every clamp happens before the cast, which is the whole point. A page size
+/// arriving from an HTTP query is a `usize`, and `usize::MAX as i64` is `-1`:
+/// SQLite reads a negative `LIMIT` as no limit at all and hands back the entire
+/// set, while Postgres refuses it outright. One request would then get three
+/// different wrong answers - every row, the first page under any page number,
+/// or a 500 - all from a number a caller typed. Saturating arithmetic and a
+/// ceiling of [`i64::MAX`] turn all three into the honest one: a page past the
+/// end is empty.
+///
+/// No policy ceiling here on purpose. How much of an index one request may
+/// materialize is the calling surface's decision (the HTTP layer clamps its own
+/// page size), and this is only the arithmetic that keeps that decision from
+/// being undone by a cast.
+pub(crate) fn page_window(page: usize, limit: usize) -> (i64, i64) {
+    let ceiling = i64::MAX as usize;
+    let limit = limit.max(1).min(ceiling);
+    let offset = page.saturating_sub(1).saturating_mul(limit).min(ceiling);
+    (limit as i64, offset as i64)
+}
+
+/// One page of [`Store::inbound_page`], with the counts a client draws its
+/// chips from.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct InboundPage {
+    /// How many references match under the active filters, exactly.
+    pub total: usize,
+    /// Every relation type pointing at this engram with its count, most-used
+    /// first, ties broken by name. Deliberately NOT narrowed by the filters:
+    /// this is the map a client filters *with*, so it must not change shape as
+    /// the reader clicks through it.
+    pub types: Vec<NamedCount>,
+    /// This page of matching references.
+    pub hits: Vec<InboundHit>,
 }
 
 /// One outbound reference from an engram: a relation bullet or a prose wikilink,
@@ -1115,6 +1266,49 @@ pub trait Store: Send + Sync {
         engram_type: Option<&str>,
     ) -> Result<Vec<EngramDescriptor>>;
 
+    /// One level of a domain's folder tree: the engrams no more than `depth`
+    /// segments below `path_prefix`, capped at `limit` rows and ordered by path,
+    /// every child folder under the prefix, and the exact number of engrams the
+    /// level holds.
+    ///
+    /// Three bounded queries rather than one unbounded listing, which is what
+    /// keeps a navigation tree affordable on a domain of tens of thousands of
+    /// engrams: the row page is `LIMIT`ed, the count runs under exactly the
+    /// same filter so the two can never disagree, and the folder names come
+    /// from a `DISTINCT` over the path column alone - no bodies are read to
+    /// learn that a folder exists.
+    ///
+    /// `path_prefix` carries its trailing slash (`notes/`) and is matched as a
+    /// literal, so a folder named `50%` or `a_b` is a folder rather than a
+    /// wildcard. `None` or an empty prefix browses the domain root. `depth`
+    /// counts segments below the prefix, so `1` is the direct children and `2`
+    /// reaches one folder further down; it is clamped to at least 1 here, and a
+    /// caller taking it from a request bounds it from above too, since the
+    /// depth cut is a pattern that grows one term per level.
+    ///
+    /// **What `total` counts.** The level, not the folder. The count runs under
+    /// the depth cut with the page, so it moves with `depth` and excludes
+    /// everything nested deeper - a folder of ten engrams holding a subfolder of
+    /// a thousand reports ten at depth 1. A [`SearchQuery`] carrying the same
+    /// folder as its `path_prefix` counts the other way, recursively, over the
+    /// prefix at any depth, and so reports the larger number. Both are right for
+    /// what they answer: a level states a fact about the rows it just drew,
+    /// while a folder listing promises the folder. Whoever renders "N engrams in
+    /// this folder" wants the second one.
+    ///
+    /// If a tree ever needs the recursive number beside the level's, it is one
+    /// more bounded query on a filter this method already builds: the same
+    /// `count(*)` under the prefix clause alone, without the depth cut. It is
+    /// deliberately not returned today, because nothing drawing a tree has asked
+    /// for it and an unused count is a query per request.
+    async fn browse_level(
+        &self,
+        domain: &str,
+        path_prefix: Option<&str>,
+        depth: usize,
+        limit: usize,
+    ) -> Result<BrowseLevel>;
+
     /// Every engram carrying a tag, on its frontmatter or on one of its
     /// observations, optionally scoped to one domain. The bound tag is
     /// case-folded to match the case-folded `tag.name`. Ordered by domain name
@@ -1152,6 +1346,27 @@ pub trait Store: Send + Sync {
         permalink: &str,
         title: &str,
     ) -> Result<Vec<InboundRef>>;
+
+    /// One page of the references that point at an engram, filtered and counted
+    /// in SQL, with the per-relation summary of all of them.
+    ///
+    /// The paged twin of [`Store::inbound_refs`], over exactly the same rows:
+    /// resolved references plus the unresolved same-domain ones whose text names
+    /// this engram, so a total here and the count `read_engram` reports are the
+    /// same number. What differs is what a reader needs - a title and a
+    /// permalink to follow, a page rather than the whole set, and a substring
+    /// filter - none of which the move's rewrite has any use for.
+    ///
+    /// `total` is exact under [`InboundQuery::q`] and [`InboundQuery::rel`], and
+    /// [`InboundPage::types`] ignores both: an engram with thousands of inbound
+    /// references is browsed by picking a relation type and then searching
+    /// inside it, and a summary that shrank as it was used would be a map that
+    /// redraws itself while it is being read.
+    ///
+    /// Ordered by title, then permalink, then domain, then relation, byte-wise
+    /// on both backends, so paging is stable and a page boundary never drops or
+    /// repeats a row.
+    async fn inbound_page(&self, query: &InboundQuery<'_>) -> Result<InboundPage>;
 
     /// Every relation and prose link that points out of the given engram, each
     /// carrying whether it currently resolves to a target in the index. Ordered

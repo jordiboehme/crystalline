@@ -55,6 +55,44 @@ pub struct LockInfo {
     pub version: String,
     /// RFC 3339 start time.
     pub started_at: String,
+    /// Whether this daemon parses an `mcp` handshake line carrying options
+    /// after the mode token.
+    ///
+    /// **A declared capability rather than a version comparison, because the
+    /// version cannot answer this question.** A daemon predating the extended
+    /// line compares the whole trimmed line against `"mcp"` and drops anything
+    /// else, so sending it costs the bridge its socket; and the version that
+    /// first learned to parse it is a version *this very tree* already
+    /// carries, so any threshold spelled here would let a daemon built one
+    /// commit earlier through. An older daemon writes no such field and
+    /// `serde(default)` reads it as `false`, which is exactly right.
+    #[serde(default)]
+    pub mcp_line_options: bool,
+}
+
+/// The option token that tells the daemon this stdio session's harness is
+/// already onboarded, so the skill surface and the second copy of the routing
+/// block are both withheld. Absence means "serve", which is what every older
+/// bridge's bare `mcp` line already meant.
+pub(crate) const SKILLS_OFF_OPTION: &str = "skills=off";
+
+/// Whether the daemon this process is about to hand its handshake to has
+/// declared that it parses handshake options. A record that is missing,
+/// unreadable or written by a daemon that predates the field all read as
+/// `false`, which is the safe direction.
+fn daemon_parses_mcp_line_options() -> bool {
+    read_lock_info().is_some_and(|info| info.mcp_line_options)
+}
+
+/// The `mcp` handshake line for a resolved answer. Bare `mcp` unless there is
+/// something to say **and** the daemon has declared it can hear it. Pure so
+/// the decision is testable without a daemon.
+fn mcp_mode_line(harness_onboarded: bool, daemon_parses_options: bool) -> String {
+    if harness_onboarded && daemon_parses_options {
+        format!("mcp {SKILLS_OFF_OPTION}\n")
+    } else {
+        "mcp\n".to_string()
+    }
 }
 
 /// A connected client stream, before the handshake line is written.
@@ -65,8 +103,26 @@ pub struct Connection {
 impl Connection {
     /// Write the `mcp` handshake and hand back the stream for an rmcp session or
     /// a byte pump.
-    pub async fn into_mcp(self) -> io::Result<IpcStream> {
-        self.handshake(b"mcp\n").await
+    ///
+    /// `harness_onboarded` is the answer the bridge process resolved at
+    /// startup from its `--harness` argument and this machine's install
+    /// receipt; the daemon builds its per-socket `McpServer` with it. It rides
+    /// the handshake line rather than being re-derived daemon-side on purpose:
+    /// the bridge inherits the harness's own environment (and therefore its
+    /// state directory), while a long-lived daemon carries whatever
+    /// environment spawned it first, and a value resolved once per process
+    /// cannot drift across a reconnect.
+    ///
+    /// **The extended line is only sent to a daemon that declared it parses
+    /// one**, through [`LockInfo::mcp_line_options`]. An older daemon compares
+    /// the whole line against `"mcp"` and drops anything else, and a failed
+    /// displacement can leave one running (`try_attach_reporting` attaches to
+    /// a daemon that would not shut down), so the fallback is the bare line,
+    /// which resolves to "serve" - the safe direction, and exactly today's
+    /// behaviour.
+    pub async fn into_mcp(self, harness_onboarded: bool) -> io::Result<IpcStream> {
+        let line = mcp_mode_line(harness_onboarded, daemon_parses_mcp_line_options());
+        self.handshake(line.as_bytes()).await
     }
 
     /// Write the `ctl` handshake and hand back the stream for the NDJSON control
@@ -112,6 +168,9 @@ impl Ownership {
             socket_path: self.socket_display(),
             version: crystalline_core::VERSION.to_string(),
             started_at: chrono::Utc::now().to_rfc3339(),
+            // This daemon's `handle_conn` splits the handshake line into a
+            // mode and its options, so a bridge may send them.
+            mcp_line_options: true,
         };
         let json = serde_json::to_string(&info).unwrap_or_default();
         let tmp = self.info_path.with_extension("json.tmp");
@@ -871,6 +930,16 @@ fn daemon_log_sink() -> Option<std::process::Stdio> {
 
 /// Spawn `current_exe serve --daemon` fully detached, forwarding `--read-only`
 /// when this instance was asked to serve read-only.
+///
+/// No `--http off` is passed and none ever should be: a daemon started this way
+/// (an agent's `crystalline mcp` connection, the Desktop extension) serves the
+/// HTTP endpoint on 127.0.0.1:7411 by exactly the same default a hand-started
+/// `crystalline serve` does. The daemon is a singleton, so an autostarted one
+/// that skipped HTTP would leave the web UI dead for the most common population
+/// of all, with no way to get it back short of shutting the daemon down. The one
+/// coherent opt-out is `service.http=false`, which turns the endpoint off for
+/// every daemon however it started; the spawned process inherits this one's
+/// environment, so `CRYSTALLINE_SERVICE_HTTP` reaches it too.
 fn spawn_daemon(
     db: Option<&Path>,
     config_path: Option<&Path>,
@@ -980,19 +1049,50 @@ pub fn acquire_ownership() -> anyhow::Result<Ownership> {
     })
 }
 
+/// How many bytes of handshake line are read before giving up on finding the
+/// newline. The line is `mcp`, `ctl` or `mcp` plus options; 64 leaves room for
+/// several options without letting a misbehaving client stall the accept loop.
+/// It was 16, which fit `mcp claude-code` with one byte to spare, so the cap
+/// is raised well clear of the shapes this protocol can grow.
+const MODE_LINE_CAP: usize = 64;
+
 /// Read the one-line handshake from an accepted stream without consuming past
 /// the newline. Bounded so a misbehaving client cannot stall the accept loop.
+///
+/// **A line longer than the cap is an error rather than a prefix.** Returning
+/// the truncated head would leave the rest of the line in the stream to be
+/// read as JSON-RPC, which is a wedged session; the caller drops the
+/// connection instead, which the bridge sees as a dead socket and reports.
 pub async fn read_mode_line(stream: &mut IpcStream) -> io::Result<String> {
     let mut buf = Vec::with_capacity(8);
     let mut byte = [0u8; 1];
-    for _ in 0..16 {
+    loop {
         let n = stream.read(&mut byte).await?;
         if n == 0 || byte[0] == b'\n' {
             break;
         }
         buf.push(byte[0]);
+        if buf.len() >= MODE_LINE_CAP {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "handshake line longer than the mode-line cap",
+            ));
+        }
     }
     Ok(String::from_utf8_lossy(&buf).trim().to_string())
+}
+
+/// Split a handshake line into its mode and its options: the first
+/// whitespace-delimited token is the mode, the rest are options.
+///
+/// Deliberately tolerant in both directions of version skew. An older bridge's
+/// bare `mcp` line yields no options, and an option this binary does not know
+/// is ignored rather than fatal, so a newer bridge talking to this daemon
+/// degrades to the default instead of losing its socket.
+pub fn split_mode_line(line: &str) -> (&str, Vec<&str>) {
+    let mut parts = line.split_whitespace();
+    let mode = parts.next().unwrap_or("");
+    (mode, parts.collect())
 }
 
 /// Best-effort process liveness. On unix a signal-0 probe, on Windows an
@@ -1041,6 +1141,115 @@ pub fn process_alive(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- the mcp handshake line ---------------------------------------------
+
+    /// The extended line only goes to a daemon that declared it parses one. An
+    /// older one compares the whole trimmed line against `"mcp"` and drops
+    /// anything else, and a displacement that times out leaves exactly such a
+    /// daemon running and attached to (`try_attach_reporting` says so in as
+    /// many words), so the fallback has to be the bare line rather than a dead
+    /// socket.
+    #[test]
+    fn the_extended_mode_line_is_only_sent_to_a_daemon_that_declared_it() {
+        assert_eq!(mcp_mode_line(true, true), "mcp skills=off\n");
+        assert_eq!(
+            mcp_mode_line(true, false),
+            "mcp\n",
+            "a daemon that did not declare it gets the line it understands, and \
+             serves the surface"
+        );
+        // Nothing to say, nothing added, whatever the daemon can parse.
+        assert_eq!(mcp_mode_line(false, true), "mcp\n");
+        assert_eq!(mcp_mode_line(false, false), "mcp\n");
+    }
+
+    /// The capability is read off the record, and a record written before the
+    /// field existed reads as "cannot parse options" rather than failing to
+    /// deserialize at all. That is the whole reason it is a declared
+    /// capability and not a version threshold: the version that first learned
+    /// to parse options is one this tree already carries, so no threshold
+    /// could tell a daemon built from this commit apart from one built the
+    /// commit before.
+    #[test]
+    fn a_lock_record_without_the_capability_field_reads_as_unable() {
+        let legacy =
+            r#"{"pid":1,"socket_path":"s","version":"0.13.0","started_at":"2026-08-14T00:00:00Z"}"#;
+        let info: LockInfo = serde_json::from_str(legacy).expect("an older record still parses");
+        assert!(!info.mcp_line_options);
+        assert_eq!(mcp_mode_line(true, info.mcp_line_options), "mcp\n");
+
+        let current = serde_json::to_string(&LockInfo {
+            pid: 1,
+            socket_path: "s".to_string(),
+            version: crystalline_core::VERSION.to_string(),
+            started_at: "2026-08-14T00:00:00Z".to_string(),
+            mcp_line_options: true,
+        })
+        .unwrap();
+        let info: LockInfo = serde_json::from_str(&current).unwrap();
+        assert!(info.mcp_line_options);
+    }
+
+    /// The reader used to stop at 16 bytes and return the truncated head,
+    /// leaving the rest of the line in the stream to be read as JSON-RPC.
+    /// `mcp claude-code` was 15 bytes, so the old cap had one byte of
+    /// headroom. Both halves of the fix are pinned here: a longer line arrives
+    /// whole, and a line past the new cap is an error the caller drops the
+    /// connection on rather than a prefix that wedges the session.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_long_handshake_line_arrives_whole_and_an_endless_one_errors() {
+        async fn round_trip(payload: Vec<u8>) -> io::Result<String> {
+            let dir = tempfile::tempdir().unwrap();
+            let sock = dir.path().join("crystalline.sock");
+            let listener = ListenerOptions::new()
+                .name(socket_name(&sock).unwrap())
+                .create_tokio()
+                .unwrap();
+            let server = tokio::spawn(async move {
+                let mut stream = listener.accept().await.unwrap();
+                read_mode_line(&mut stream).await
+            });
+            let mut client = IpcStream::connect(socket_name(&sock).unwrap())
+                .await
+                .unwrap();
+            client.write_all(&payload).await.unwrap();
+            client.flush().await.unwrap();
+            let out = server.await.unwrap();
+            drop(client);
+            out
+        }
+
+        let long = b"mcp skills=off future=1\n".to_vec();
+        assert!(long.len() > 16, "longer than the old cap: {}", long.len());
+        assert_eq!(round_trip(long).await.unwrap(), "mcp skills=off future=1");
+
+        let endless = vec![b'x'; MODE_LINE_CAP + 8];
+        assert!(
+            round_trip(endless).await.is_err(),
+            "a line past the cap must not come back as a prefix"
+        );
+    }
+
+    /// The daemon's half: the first token is the mode and the rest are
+    /// options, so an old bridge's bare `mcp` and a new bridge's extended line
+    /// both serve, and an option this binary does not know is ignored rather
+    /// than fatal.
+    #[test]
+    fn a_mode_line_splits_into_a_mode_and_its_options() {
+        assert_eq!(split_mode_line("mcp"), ("mcp", vec![]));
+        assert_eq!(
+            split_mode_line("mcp skills=off"),
+            ("mcp", vec![SKILLS_OFF_OPTION])
+        );
+        assert_eq!(
+            split_mode_line("mcp skills=off future=1"),
+            ("mcp", vec![SKILLS_OFF_OPTION, "future=1"])
+        );
+        assert_eq!(split_mode_line("ctl"), ("ctl", vec![]));
+        assert_eq!(split_mode_line(""), ("", vec![]));
+    }
 
     #[cfg(windows)]
     #[test]
@@ -1309,6 +1518,7 @@ mod tests {
             socket_path: sock.display().to_string(),
             version: "0.0.1".to_string(),
             started_at: chrono::Utc::now().to_rfc3339(),
+            mcp_line_options: true,
         };
         std::fs::write(&info_path, serde_json::to_string(&info).unwrap()).unwrap();
 
@@ -1356,6 +1566,7 @@ mod tests {
             socket_path: sock.display().to_string(),
             version: crystalline_core::VERSION.to_string(),
             started_at: chrono::Utc::now().to_rfc3339(),
+            mcp_line_options: true,
         };
         std::fs::write(&info_path, serde_json::to_string(&info).unwrap()).unwrap();
 
@@ -1423,6 +1634,7 @@ mod tests {
             socket_path: "legacy".to_string(),
             version: "0.8.2".to_string(),
             started_at: chrono::Utc::now().to_rfc3339(),
+            mcp_line_options: true,
         };
         std::fs::write(
             config::service_lock_path().unwrap(),
@@ -1611,6 +1823,7 @@ mod tests {
             socket_path: config::service_sock_path().unwrap().display().to_string(),
             version: crystalline_core::VERSION.to_string(),
             started_at: chrono::Utc::now().to_rfc3339(),
+            mcp_line_options: true,
         };
         std::fs::write(
             config::service_info_path().unwrap(),

@@ -40,6 +40,8 @@ import { fetchTags, vocabularyKey } from "../api/vocabulary";
 import { EngramList } from "../components/EngramList";
 import { Facets } from "../components/Facets";
 import type { FacetChange } from "../components/Facets";
+import { BUTTON } from "../components/primitives";
+import { plural } from "../format";
 import { searchTerms } from "../snippet";
 
 export default function Search() {
@@ -145,7 +147,7 @@ export default function Search() {
   return (
     <div className="flex flex-col gap-6">
       <header>
-        <h1 className="text-xl font-semibold">Search</h1>
+        <h1 className="text-display">Search</h1>
       </header>
 
       <form
@@ -170,7 +172,7 @@ export default function Search() {
           onChange={(event) => {
             setText(event.target.value);
           }}
-          className="w-full rounded border border-slate-300 bg-white px-3 py-2 text-sm outline-none focus-visible:ring-2 focus-visible:ring-sky-500 dark:border-slate-700 dark:bg-slate-900"
+          className="w-full rounded border border-slate-300 bg-white px-3 py-2 text-sm outline-none focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 dark:border-slate-700 dark:bg-slate-900"
         />
       </form>
 
@@ -192,7 +194,42 @@ export default function Search() {
               : "No engram matches this search."
           }
           highlight={terms}
-          summary={(page) => <ModeNote page={page} asked={request.mode} />}
+          summary={(page, shown) => (
+            <StatusLine page={page} shown={shown} asked={request.mode} />
+          )}
+          emptyActions={
+            filtering ? (
+              <>
+                <button
+                  type="button"
+                  className={BUTTON.secondary}
+                  onClick={() => {
+                    // The query survives: widening a search is not ending it.
+                    apply({
+                      domains: [],
+                      type: null,
+                      status: null,
+                      tags: [],
+                      after: null,
+                    });
+                  }}
+                >
+                  Clear filters
+                </button>
+                {request.domains.length > 0 && (
+                  <button
+                    type="button"
+                    className={BUTTON.secondary}
+                    onClick={() => {
+                      apply({ domains: [] });
+                    }}
+                  >
+                    Search all domains
+                  </button>
+                )}
+              </>
+            ) : undefined
+          }
         />
       ) : (
         <p className="text-sm text-slate-500 dark:text-slate-400">
@@ -205,24 +242,71 @@ export default function Search() {
 }
 
 /**
- * Which mode ran.
+ * How many results there are and what ranked them, on one line.
  *
- * Always on screen rather than only on a fallback, because "this was ranked by
+ * One line rather than the two this used to stack: a tally and a mode note are
+ * both facts about the page, and a reader scanning for "did this find
+ * anything" should not have to read two sentences to learn it. The mode is
+ * always on it rather than only on a fallback, because "this was ranked by
  * text" is what explains the order of the results, and a reader who only ever
  * sees the note when something went wrong learns to read it as an error.
+ *
+ * An empty page counts nothing - the empty message below it already says there
+ * is nothing, and "0 results" ahead of that would be the same sentence twice -
+ * but it still says what ranked the search, as a sentence of its own rather
+ * than as the clause that follows a count. Which mode ran is exactly what
+ * explains an empty answer to a reader whose words were right.
  */
-function ModeNote({ page, asked }: { page: EngramPage; asked: SearchMode }) {
+function StatusLine({
+  page,
+  shown,
+  asked,
+}: {
+  page: EngramPage;
+  shown: number;
+  asked: SearchMode;
+}) {
   const ran = page.mode;
-  if (ran === null) {
+  // The total survives the merge: a page of fifty out of two hundred is a fact
+  // about this search that nothing else on the screen says.
+  const counted =
+    shown < page.total
+      ? `${String(shown)} of ${String(page.total)} results`
+      : plural(page.total, "result", "results");
+  const line = statusText(ran, asked, shown === 0 ? null : counted);
+  if (line === null) {
     return null;
   }
   return (
-    <p className="pb-2 text-xs text-slate-500 dark:text-slate-400">
-      {ran === asked
-        ? `Ranked by ${ran}.`
-        : `Asked for ${asked}, ran as ${ran}: ${asked} needs embeddings and a query to embed them against, so the engine fell back.`}
+    <p className="text-caption pb-2 text-slate-500 tabular-nums dark:text-slate-400">
+      {line}
     </p>
   );
+}
+
+/**
+ * The status line's own words, given what ran, what was asked for, and the
+ * tally when there is one to give. Null when there is nothing to say at all.
+ *
+ * Split out from the component because every branch of it is a sentence
+ * somebody reads: with a count the mode is the clause that finishes it, and
+ * without one the mode has to stand up on its own.
+ */
+function statusText(
+  ran: string | null,
+  asked: SearchMode,
+  counted: string | null,
+): string | null {
+  if (ran === null) {
+    return counted === null ? null : `${counted}.`;
+  }
+  if (ran !== asked) {
+    const explained = `Asked for ${asked}, ran as ${ran}: ${asked} needs embeddings and a query to embed them against, so the engine fell back.`;
+    return counted === null ? explained : `${counted}. ${explained}`;
+  }
+  return counted === null
+    ? `Ranked by ${ran}.`
+    : `${counted}, ranked by ${ran}.`;
 }
 
 /** A comma list from the URL, without the empties. */

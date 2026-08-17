@@ -56,7 +56,7 @@ async fn show_lists_every_registry_key_at_its_default() {
 
     let data = engine.configure(&ConfigureAction::Show).await.unwrap();
     let views = settings_of(&data);
-    assert_eq!(views.len(), 18);
+    assert_eq!(views.len(), 21);
     assert!(
         views
             .iter()
@@ -447,5 +447,75 @@ fn retired_weight_rejects_out_of_range() {
     assert!(
         crystalline_service::settings::apply(&mut config, "search.retired_weight", "notanumber")
             .is_err()
+    );
+}
+
+// --- skills.serve is frozen at engine construction ---------------------------
+//
+// SEP-2567 forbids a list endpoint varying "as a side effect of other requests
+// on the connection", and `skills.serve` gates three of them (the `skills`
+// tool, the `skill://` resources, the two prompts). So the value the MCP
+// server reads is snapshotted while the engine is built and never re-read.
+// `configure` still writes the setting; it applies at the next daemon start,
+// which is what `startup_effective: true` now tells the user.
+
+/// The freeze itself: a mid-session `configure` writes the setting through to
+/// the config, and the engine keeps serving the value it was built with.
+#[tokio::test]
+async fn a_configure_of_skills_serve_does_not_move_the_engines_answer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_path = tmp.path().join("config.yaml");
+    let engine = engine_at(&config_path, false).await;
+    assert_eq!(
+        engine.skills_serve(),
+        crystalline_core::config::SkillsServe::Auto,
+        "the default this engine was built with"
+    );
+
+    engine
+        .configure(&ConfigureAction::Set {
+            key: "skills.serve".to_string(),
+            value: "false".to_string(),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        engine.skills_serve(),
+        crystalline_core::config::SkillsServe::Auto,
+        "the served value is the construction snapshot, not the live setting"
+    );
+    let data = engine.configure(&ConfigureAction::Show).await.unwrap();
+    let view = settings_of(&data)
+        .into_iter()
+        .find(|v| v.key == "skills.serve")
+        .expect("the key is in the registry");
+    assert_eq!(
+        view.value, "false",
+        "the write itself lands, it just applies at the next start"
+    );
+    assert!(
+        crystalline_service::settings::change_note("skills.serve", &EnvOverlay::default())
+            .unwrap_or_default()
+            .contains("next time the daemon starts"),
+        "and the user is told so"
+    );
+}
+
+/// The trap the snapshot has to survive: the environment overlay is applied
+/// *after* `Engine::new` through a builder (`with_env_overlay`), so a snapshot
+/// taken in the constructor alone would miss `CRYSTALLINE_SKILLS_SERVE` and
+/// silently serve the wrong answer to exactly the deployments that set it.
+/// Passes before and after the freeze; it is here to fail if the snapshot is
+/// ever moved into `Engine::new` alone.
+#[tokio::test]
+async fn the_environment_overlay_reaches_the_frozen_skills_serve() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_path = tmp.path().join("config.yaml");
+    let engine = engine_with_overlay(&config_path, &[("CRYSTALLINE_SKILLS_SERVE", "false")]).await;
+    assert_eq!(
+        engine.skills_serve(),
+        crystalline_core::config::SkillsServe::Never,
+        "the overlay is applied by a builder that runs after the constructor"
     );
 }

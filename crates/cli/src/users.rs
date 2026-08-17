@@ -1,5 +1,5 @@
-//! `crystalline users`: the accounts that may sign in to the web API served
-//! by `serve --http`.
+//! `crystalline users`: the accounts that may sign in to the web API and the
+//! web UI the daemon serves at 127.0.0.1:7411 by default.
 //!
 //! The accounts live in their own small database in the state directory
 //! (`web-auth.db`), never in the index: credentials are not knowledge and must
@@ -8,6 +8,12 @@
 //! store serializes its writers across processes - so account management works
 //! whether or not a daemon is running, and a running daemon picks the change
 //! up on its next lookup without a restart.
+//!
+//! Except on Windows, where the database engine has no cross-process
+//! coordination on its default IO backend yet, so a running daemon holds the
+//! file exclusively: a command here then fails at open time with the message
+//! `legacy_open_error` in `crystalline-service`'s `rest::auth_store` writes,
+//! which points at the web UI or at stopping the daemon.
 
 use std::io::{IsTerminal, Read, Write};
 
@@ -92,12 +98,35 @@ pub async fn run(command: UsersCommand, json: bool) -> Result<()> {
             store.set_disabled(&name, false).await?;
             println!("Enabled '{}'.", stored_name(&name));
         }
-        UsersCommand::Remove { name } => {
-            store.remove_user(&name).await?;
-            println!(
-                "Removed '{}' and every session it held.",
-                stored_name(&name)
-            );
+        UsersCommand::Demote { name, role, force } => {
+            let role: Role = role.into();
+            if force {
+                store.set_role_force(&name, role).await?;
+                println!(
+                    "'{}' is now {role} (forced). The installation may now have no \
+                     admin; add one with `crystalline users role <name> admin`.",
+                    stored_name(&name)
+                );
+            } else {
+                store.set_role(&name, role).await?;
+                println!("'{}' is now {role}.", stored_name(&name));
+            }
+        }
+        UsersCommand::Remove { name, force } => {
+            if force {
+                store.remove_user_force(&name).await?;
+                println!(
+                    "Removed '{}' and every session it held (forced). The installation \
+                     may now have no admin; add one with `crystalline users add <name> --role admin`.",
+                    stored_name(&name)
+                );
+            } else {
+                store.remove_user(&name).await?;
+                println!(
+                    "Removed '{}' and every session it held.",
+                    stored_name(&name)
+                );
+            }
         }
     }
     Ok(())
@@ -111,14 +140,14 @@ fn stored_name(name: &str) -> String {
     name.trim().to_lowercase()
 }
 
-/// One line per account: name, role, whether it is disabled, display name and
-/// email, columns aligned to the widest entry.
+/// One line per account: name, role, whether it is disabled, display name,
+/// email and when it was last seen, columns aligned to the widest entry.
 fn print_users(users: &[User]) {
     if users.is_empty() {
         println!("No users yet. Add one with: crystalline users add <name> --role admin");
         return;
     }
-    let rows: Vec<[String; 5]> = users
+    let rows: Vec<[String; 6]> = users
         .iter()
         .map(|u| {
             [
@@ -127,13 +156,14 @@ fn print_users(users: &[User]) {
                 if u.disabled { "disabled" } else { "active" }.to_string(),
                 u.display.clone(),
                 u.email.clone().unwrap_or_default(),
+                u.last_seen.clone().unwrap_or_default(),
             ]
         })
         .collect();
-    let header = ["NAME", "ROLE", "STATUS", "DISPLAY", "EMAIL"];
-    // The last column is never padded, so a trailing empty email leaves no
+    let header = ["NAME", "ROLE", "STATUS", "DISPLAY", "EMAIL", "LAST SEEN"];
+    // The last column is never padded, so a trailing empty last-seen leaves no
     // trailing whitespace behind.
-    let widths: Vec<usize> = (0..4)
+    let widths: Vec<usize> = (0..5)
         .map(|c| {
             rows.iter()
                 .map(|r| r[c].chars().count())
@@ -142,17 +172,17 @@ fn print_users(users: &[User]) {
                 .unwrap_or(0)
         })
         .collect();
-    let line = |cells: [&str; 5]| {
+    let line = |cells: [&str; 6]| {
         let mut out = String::new();
-        for (c, cell) in cells.iter().enumerate().take(4) {
+        for (c, cell) in cells.iter().enumerate().take(5) {
             out.push_str(&format!("{cell:<width$}  ", width = widths[c]));
         }
-        out.push_str(cells[4]);
+        out.push_str(cells[5]);
         println!("{}", out.trim_end());
     };
     line(header);
     for row in &rows {
-        line([&row[0], &row[1], &row[2], &row[3], &row[4]]);
+        line([&row[0], &row[1], &row[2], &row[3], &row[4], &row[5]]);
     }
     println!();
     println!(

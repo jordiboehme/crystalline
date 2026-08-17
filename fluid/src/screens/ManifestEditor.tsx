@@ -1,0 +1,383 @@
+/**
+ * The MANIFEST editor: `EngramEditor`'s shape with the engram-specific panels
+ * left out.
+ *
+ * A MANIFEST has no permalink of its own to rename through, no wikilinks to
+ * resolve and no frontmatter form beside it - it is plain markdown with
+ * frontmatter like any engram, but nothing here parses it into fields. What
+ * survives the trim is exactly what both editors need to agree on, and that
+ * part is not copied any more: `useEditorSession` holds it once for both. The
+ * buffer is the file's own bytes, saved back with the If-Match token of the
+ * version it was read from, gated by the same dry-run findings and landing in
+ * the same 412 conflict view on a stale save.
+ *
+ * The extension set stays static rather than built from a shared options
+ * object: there is no preview layer to toggle and no resolver to reconfigure,
+ * so `[...lineSeparatorFor, ...baseExtensions, saveKeymap, RAW_MONO]` is the
+ * whole of it, spelled once at mount and again wherever a swap rebuilds the
+ * buffer.
+ */
+
+import type { Extension } from "@codemirror/state";
+import type { EditorView } from "@codemirror/view";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useState } from "react";
+import { useNavigate, useParams } from "react-router";
+
+import { problemDetail } from "../api/client";
+import type { ManifestDetail } from "../api/domain";
+import {
+  fetchManifestDetail,
+  manifestDetailKey,
+  manifestKey,
+  saveManifest,
+} from "../api/domain";
+import { useAuth } from "../auth/AuthContext";
+import { Breadcrumbs, crumbsOf } from "../components/Breadcrumbs";
+import { BUTTON, Tooltip } from "../components/primitives";
+import { Skeleton } from "../components/Skeleton";
+import CmEditor from "../editor/CmEditor";
+import { ConfirmLeaveDialog } from "../editor/ConfirmLeaveDialog";
+import { ConflictDialog } from "../editor/ConflictDialog";
+import { EditorToolbar } from "../editor/EditorToolbar";
+import { FindingsPanel, jumpToLine } from "../editor/FindingsPanel";
+import {
+  RAW_MONO,
+  baseExtensions,
+  docText,
+  lineSeparatorFor,
+} from "../editor/setup";
+import { tableContextListener } from "../editor/tableVerbs";
+import { formattingKeymap } from "../editor/toolbar";
+import { useCloseFlow, useExitRequest } from "../editor/useCloseFlow";
+import { saveKeymap, useEditorSession } from "../editor/useEditorSession";
+import { manifestRoute } from "../paths";
+import { useTheme } from "../theme/context";
+import NotFound from "./NotFound";
+
+/**
+ * The MANIFEST's stand-in permalink in the draft store. A domain's MANIFEST
+ * has no permalink of its own - `readDraft`/`writeDraft` key on one anyway,
+ * so this is the fixed second half of that key rather than a value read off
+ * anything: the engine's own name for the file is exactly this word.
+ */
+const MANIFEST_DRAFT_SLOT = "MANIFEST";
+
+/** The file this buffer validates as, in the engine's own vocabulary. */
+const MANIFEST_PATH = "MANIFEST.md";
+
+/** The buffer's accessible name - shared with the state a conflict rebuilds. */
+const ARIA_LABEL = "MANIFEST source";
+
+/**
+ * The whole extension set of this buffer, spelled once.
+ *
+ * `RAW_MONO` is a fixture here rather than a mode: the shared theme sets
+ * editor prose proportional for the surfaces that draw a live preview over
+ * it, and this one draws none. It is the source of a file and nothing else,
+ * so mono is its permanent face - the same face the engram editor's Raw
+ * toggle switches into, carried statically because there is no toggle and no
+ * preview compartment to carry it. One function, so the mount and every
+ * buffer swap agree.
+ */
+function extensionsFor(
+  content: string,
+  dark: boolean,
+  onTableContext: (inTable: boolean) => void,
+): Extension[] {
+  return [
+    ...lineSeparatorFor(content),
+    ...baseExtensions(dark),
+    saveKeymap,
+    // What the format bar's context segment is drawn from: a MANIFEST holds
+    // tables like any other markdown file, so it gets the same verbs.
+    tableContextListener(onTableContext),
+    // The format bar's shortcuts. A MANIFEST is markdown like any engram and
+    // its author forgets the syntax just as readily; the `Prec.high` wrapper
+    // inside `formattingKeymap` is what keeps Mod-i off defaultKeymap.
+    formattingKeymap,
+    RAW_MONO,
+  ];
+}
+
+export default function ManifestEditor() {
+  const { domain = "" } = useParams();
+  const { capabilities } = useAuth();
+
+  const detail = useQuery({
+    queryKey: manifestDetailKey(domain),
+    queryFn: () => fetchManifestDetail(domain),
+    enabled: capabilities.canAdminister,
+  });
+
+  if (!capabilities.canAdminister) {
+    return <NotFound />;
+  }
+  if (detail.error) {
+    return (
+      <p
+        role="alert"
+        className="rounded bg-red-50 px-3 py-2 text-sm text-red-800 dark:bg-red-950 dark:text-red-200"
+      >
+        {problemDetail(detail.error)}
+      </p>
+    );
+  }
+  if (!detail.data) {
+    return <Skeleton label="Loading the editor" rows={4} />;
+  }
+  // Keyed by domain: a different domain's MANIFEST is a different session.
+  return <EditorSurface key={domain} domain={domain} manifest={detail.data} />;
+}
+
+function EditorSurface({
+  domain,
+  manifest,
+}: {
+  domain: string;
+  manifest: ManifestDetail;
+}) {
+  const navigate = useNavigate();
+  const queryClient = useQueryClient();
+  const { resolved } = useTheme();
+  const { user } = useAuth();
+  // Anonymous can never reach this screen (`canAdminister` gates it above);
+  // the fallback only satisfies the types.
+  const account = user?.name ?? "anonymous";
+  const dark = resolved === "dark";
+  /**
+   * The live view as state rather than through the session's ref: the format
+   * bar is rendered beside the buffer, and a ref read during render would hand
+   * it `null` forever - filling the ref schedules no re-render of its own.
+   */
+  const [view, setView] = useState<EditorView | null>(null);
+  /**
+   * Whether the caret is in a table - the format bar's context segment, fed by
+   * the listener inside the buffer, which reports crossings only.
+   */
+  const [tableActive, setTableActive] = useState(false);
+
+  /**
+   * The standing "leave when this save lands" flag, made before the session
+   * because the save below is what answers it, and the leaving itself. The flow
+   * that arms and clears the flag is built after the session, where the dirty
+   * state it asks about is.
+   */
+  const exit = useExitRequest();
+  const leave = () => {
+    void navigate(manifestRoute(domain));
+  };
+
+  // The shared shell: buffer, checksum, dirty state, the dry-run gate,
+  // drafts, the Mod-S save and the 412 flow. What this screen adds is the
+  // transport below and the layout under it.
+  const session = useEditorSession({
+    initialContent: manifest.markdown,
+    initialChecksum: manifest.checksum ?? "",
+    draftUser: account,
+    draftDomain: domain,
+    draftSlot: MANIFEST_DRAFT_SLOT,
+    validateDomain: domain,
+    validatePath: MANIFEST_PATH,
+    save: async (content, token) => {
+      let saved;
+      try {
+        saved = await saveManifest(domain, content, token);
+      } catch (error) {
+        // A refused save is not an exit: the author stays on the buffer that
+        // caused it, and the standing request dies with the save rather than
+        // being left armed for whatever lands next.
+        exit.disarm();
+        throw error;
+      }
+      // The plain read and the detail read are two cache entries over one
+      // file: both are stale the moment this lands.
+      void queryClient.invalidateQueries({ queryKey: manifestKey(domain) });
+      void queryClient.invalidateQueries({
+        queryKey: manifestDetailKey(domain),
+      });
+      // Whether this is the save Save and close asked for, and whether it still
+      // carries what is on screen - the same rule the engram editor applies,
+      // spelled once in `useCloseFlow`.
+      if (exit.consume(view === null || docText(view.state) === content)) {
+        leave();
+      }
+      return { content: saved.markdown, checksum: saved.checksum ?? "" };
+    },
+    extensionsFor: (content) => extensionsFor(content, dark, setTableActive),
+    ariaLabel: ARIA_LABEL,
+  });
+
+  /**
+   * The way out, and the question it asks of a buffer with unsaved text in it -
+   * the engram editor's flow exactly, from the module both screens share, so
+   * the two editors cannot drift apart on what closing means.
+   */
+  const closing = useCloseFlow(
+    exit,
+    {
+      dirty: session.dirty,
+      hardErrors: session.hardErrors,
+      requestSave: session.requestSave,
+      abandon: session.abandon,
+    },
+    leave,
+  );
+
+  return (
+    <div className="flex flex-col gap-4">
+      {/*
+        The same trail the MANIFEST's reading page carries, in the same place:
+        this screen used to draw none, so opening the editor took the address
+        off the screen and moved the row of controls up into the line the trail
+        had been on. The reading page's own row is heading-plus-controls with
+        the trail above it, and this is that row.
+      */}
+      <Breadcrumbs crumbs={crumbsOf(domain, "MANIFEST", "MANIFEST")} />
+      <header className="flex flex-wrap items-baseline justify-between gap-3">
+        <div className="flex flex-wrap items-baseline gap-3">
+          {/* The engram editor's own heading scale: the two editors are one
+              screen with two subjects, and a heading that changed size
+              between them would say they were different places. */}
+          <h1 className="text-title">Editing {domain} MANIFEST</h1>
+        </div>
+        <div className="flex items-center gap-2">
+          {session.notice && (
+            <p
+              role={session.notice.kind === "problem" ? "alert" : "status"}
+              className={
+                session.notice.kind === "problem"
+                  ? "rounded bg-red-50 px-2 py-1 text-sm text-red-800 dark:bg-red-950 dark:text-red-200"
+                  : "text-sm text-slate-500 dark:text-slate-400"
+              }
+            >
+              {session.notice.text}
+            </p>
+          )}
+          {session.dirty && !session.notice && (
+            <p className="text-sm text-slate-500 dark:text-slate-400">
+              Unsaved changes
+            </p>
+          )}
+          {/*
+            The same two tiers the engram editor's header wears, drawn from
+            the shared primitives rather than hand-rolled here: Save keeps the
+            work, Close is the way out. The classes were a copy of
+            `BUTTON.secondary` for both, which made the two editors' headers
+            drift apart.
+
+            A button rather than the link this used to be, for the reason the
+            engram editor's is one: leaving a MANIFEST with unsaved text in the
+            buffer is a question, and a link would have gone regardless of the
+            answer.
+          */}
+          <Tooltip label="Save and keep editing">
+            <button
+              type="button"
+              onClick={session.requestSave}
+              disabled={session.saving || session.hardErrors > 0}
+              className={BUTTON.secondary}
+            >
+              Save
+            </button>
+          </Tooltip>
+          {/*
+            The hint rides the app's own tooltip surface, which is what the
+            engram editor's row wears: the two editors are one screen with two
+            subjects, and a browser-drawn title here would make them disagree
+            about what a hint looks like.
+          */}
+          <Tooltip label="Close the editor">
+            <button
+              type="button"
+              onClick={closing.close}
+              className={BUTTON.primary}
+            >
+              Close
+            </button>
+          </Tooltip>
+        </div>
+      </header>
+      {session.hardErrors > 0 && (
+        <p role="alert" className="text-sm text-red-800 dark:text-red-200">
+          {String(session.hardErrors)} hard{" "}
+          {session.hardErrors === 1 ? "error" : "errors"} block saving; see
+          Findings.
+        </p>
+      )}
+      {session.offeredDraft && (
+        <aside
+          role="note"
+          className="flex flex-wrap items-baseline gap-3 rounded border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-100"
+        >
+          <span>
+            An unsaved draft of this MANIFEST from{" "}
+            {session.offeredDraft.savedAt || "an earlier session"} is on this
+            browser.
+          </span>
+          <button
+            type="button"
+            className="underline underline-offset-2 hover:no-underline"
+            onClick={session.restoreDraft}
+          >
+            Restore draft
+          </button>
+          <button
+            type="button"
+            className="underline underline-offset-2 hover:no-underline"
+            onClick={session.discardDraft}
+          >
+            Discard draft
+          </button>
+        </aside>
+      )}
+      <div className="grid gap-8 lg:grid-cols-[minmax(0,1fr)_18rem]">
+        <div className="rounded border border-slate-200 dark:border-slate-800">
+          {/* The same bar the engram editor carries, over the same kind of
+              text: this buffer is markdown too. */}
+          <EditorToolbar view={view} tableActive={tableActive} />
+          <CmEditor
+            initialDoc={manifest.markdown}
+            extensions={extensionsFor(manifest.markdown, dark, setTableActive)}
+            ariaLabel={ARIA_LABEL}
+            onReady={(ready) => {
+              session.onReady(ready);
+              setView(ready);
+            }}
+            onDocChanged={session.setBuffer}
+          />
+        </div>
+        <aside className="flex flex-col gap-4">
+          <FindingsPanel
+            report={session.report}
+            pending={session.checking}
+            unavailable={session.validationUnavailable}
+            onJump={(line) => {
+              const view = session.viewRef.current;
+              if (view) {
+                jumpToLine(view, line);
+              }
+            }}
+          />
+        </aside>
+      </div>
+      {closing.confirming && (
+        <ConfirmLeaveDialog
+          hardErrors={session.hardErrors}
+          onSaveAndClose={closing.saveAndClose}
+          onDiscard={closing.discard}
+          onKeepEditing={closing.keepEditing}
+        />
+      )}
+      {session.conflict && (
+        <ConflictDialog
+          conflict={session.conflict}
+          mine={session.buffer}
+          onClose={session.onConflictClose}
+          onOverwrite={session.onConflictOverwrite}
+          onTakeServer={session.onConflictTakeServer}
+        />
+      )}
+    </div>
+  );
+}

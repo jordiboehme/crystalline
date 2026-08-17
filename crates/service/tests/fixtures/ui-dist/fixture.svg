@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
+  <!-- A root-level file that is not index.html: what the exact-match half of
+       the fallback exists for (a favicon, a web manifest, robots.txt). -->
+  <circle cx="8" cy="8" r="7" fill="#1a1a1a" />
+</svg>

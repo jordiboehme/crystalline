@@ -14,18 +14,80 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crystalline_index::EmbeddingProvider;
-use crystalline_remote::RemoteError;
 use crystalline_remote::provider::{
     ChangeKind, CompareResult, HeadProbe, OriginSpec, ProposalHandle, ProposalRequest,
     ProposalState, Provider, TreeWrite, UpstreamChange,
 };
+use crystalline_remote::{DeviceFlowStart, RemoteError};
+use crystalline_service::engine::ConnectAuth;
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use sha2::{Digest, Sha256};
 use tar::Header;
+
+/// Every operation the `/api/v1` router mounts, as `METHOD path`, spelled the
+/// way the OpenAPI document spells it (the engram wildcard becomes an ordinary
+/// `{permalink}` template, which is the only notation OpenAPI has for it).
+///
+/// This list is the contract rather than a convenience, and it is shared
+/// rather than duplicated on purpose: `openapi_snapshot.rs`'s
+/// `the_document_covers_every_mounted_path` compares it against the served
+/// OpenAPI document in *both* directions, so a route the router mounts but
+/// nobody annotated, and an annotation for a route nobody mounts, each fail
+/// there; `rest_write_api.rs`'s `write_ops_covers_every_mutating_route_mounted`
+/// filters it down to the unsafe methods and checks that list against the
+/// auth/CSRF matrix's own route set, so a write route mounted without a
+/// matching matrix row fails there too. One list feeding two checks is the
+/// point: a hand-kept second copy is exactly the kind of thing that drifts
+/// unnoticed (Task 13 shipped three routes uncovered by the matrix this way).
+/// The method is part of the string because a documented method the router
+/// does not serve would generate a client function that compiles and then
+/// answers 405.
+pub const MOUNTED_OPERATIONS: &[&str] = &[
+    "GET /api/v1/openapi.json",
+    "POST /api/v1/auth/login",
+    "POST /api/v1/auth/logout",
+    "GET /api/v1/auth/me",
+    "POST /api/v1/auth/setup",
+    "GET /api/v1/domains",
+    "POST /api/v1/domains",
+    "DELETE /api/v1/domains/{domain}",
+    "GET /api/v1/domains/{domain}/sync",
+    "POST /api/v1/domains/{domain}/sync",
+    "GET /api/v1/domains/{domain}/archive",
+    "POST /api/v1/domains/{domain}/archive/preview",
+    "POST /api/v1/domains/{domain}/archive/import",
+    "GET /api/v1/domains/{domain}/tree",
+    "GET /api/v1/domains/{domain}/manifest",
+    "PUT /api/v1/domains/{domain}/manifest",
+    "GET /api/v1/domains/{domain}/engrams",
+    "POST /api/v1/domains/{domain}/engrams",
+    "GET /api/v1/domains/{domain}/engrams/{permalink}",
+    "GET /api/v1/domains/{domain}/inbound/{permalink}",
+    "PUT /api/v1/domains/{domain}/engrams/{permalink}",
+    "DELETE /api/v1/domains/{domain}/engrams/{permalink}",
+    "POST /api/v1/domains/{domain}/retire",
+    "POST /api/v1/domains/{domain}/move",
+    "POST /api/v1/validate",
+    "GET /api/v1/collab/{domain}/{permalink}",
+    "GET /api/v1/search",
+    "GET /api/v1/vocabulary",
+    "GET /api/v1/context",
+    "GET /api/v1/activity",
+    "GET /api/v1/graph",
+    "GET /api/v1/users",
+    "POST /api/v1/users",
+    "PATCH /api/v1/users/{name}",
+    "DELETE /api/v1/users/{name}",
+    "POST /api/v1/users/{name}/password",
+    "GET /api/v1/settings/github",
+    "DELETE /api/v1/settings/github",
+    "POST /api/v1/settings/github/connect",
+    "POST /api/v1/settings/github/token",
+];
 
 /// The lowercase hex SHA-256 digest of `bytes`.
 pub fn sha256_hex(bytes: &[u8]) -> String {
@@ -539,5 +601,158 @@ impl EmbeddingProvider for CountingEmbedder {
 
     fn max_input_tokens(&self) -> usize {
         512
+    }
+}
+
+// --- GitHub connect auth: shared test double --------------------------------
+
+/// A fake [`ConnectAuth`] for the `configure` tool's connect actions and the
+/// engine-level GitHub status/ready/disconnect verbs. Lifted out of
+/// `tests/mcp_collab.rs` (formerly `FakeConnectAuth`) so both that suite and
+/// `tests/domain_admin.rs` share one double instead of keeping two: the
+/// general one-shot constructor [`fake_auth`] sets all three outcomes once,
+/// each consumed exactly once by its matching method, with
+/// `run_device_flow` blockable on `run_gate` so a test can observe the
+/// "still waiting on the user" state before letting the flow land;
+/// [`StubConnectAuth::accepting`] and [`StubConnectAuth::denying`] are
+/// narrower convenience constructors for tests that only need a
+/// token-validate acceptor or a device flow that always fails once released.
+pub struct StubConnectAuth {
+    start_result: Mutex<Option<Result<DeviceFlowStart, RemoteError>>>,
+    /// Gates `run_device_flow`'s completion; a test releases it with
+    /// `auth.run_gate.notify_one()` once it has observed the "still waiting
+    /// on the user" state.
+    pub run_gate: Arc<tokio::sync::Notify>,
+    run_result: Mutex<Option<Result<String, RemoteError>>>,
+    validate_result: Mutex<Option<Result<String, RemoteError>>>,
+    /// When set, every `validate_token` call returns this login instead of
+    /// consuming `validate_result`, so a connect in any test never panics on
+    /// a used-up one-shot outcome. Backs [`StubConnectAuth::accepting`].
+    accept_any: Option<String>,
+}
+
+/// The general one-shot double (the original `FakeConnectAuth` constructor):
+/// each of the three outcomes is set once here and consumed exactly once by
+/// its matching `ConnectAuth` method.
+pub fn fake_auth(
+    start: Result<DeviceFlowStart, RemoteError>,
+    run: Result<String, RemoteError>,
+    validate: Result<String, RemoteError>,
+) -> Arc<StubConnectAuth> {
+    Arc::new(StubConnectAuth {
+        start_result: Mutex::new(Some(start)),
+        run_gate: Arc::new(tokio::sync::Notify::new()),
+        run_result: Mutex::new(Some(run)),
+        validate_result: Mutex::new(Some(validate)),
+        accept_any: None,
+    })
+}
+
+/// A device-flow start payload with fixed, inert field values, for a
+/// `ConnectAuth` fake's `start_device_flow` outcome.
+pub fn device_flow_start() -> DeviceFlowStart {
+    DeviceFlowStart {
+        device_code: "devcode".to_string(),
+        user_code: "ABCD-1234".to_string(),
+        verification_url: "https://github.com/login/device".to_string(),
+        interval_secs: 0,
+        expires_in_secs: 900,
+    }
+}
+
+impl StubConnectAuth {
+    /// Validates any token as `user`, repeatably. Device flow start always
+    /// fails (`RemoteError::NotConnected`): a test built this way needs no
+    /// device path.
+    pub fn accepting(user: &str) -> Self {
+        Self {
+            start_result: Mutex::new(Some(Err(RemoteError::NotConnected))),
+            run_gate: Arc::new(tokio::sync::Notify::new()),
+            run_result: Mutex::new(Some(Err(RemoteError::NotConnected))),
+            validate_result: Mutex::new(None),
+            accept_any: Some(user.to_string()),
+        }
+    }
+
+    /// A device flow that starts with a canned code (`ABCD-1234` at
+    /// `https://github.example/device`), blocks on the returned `Notify`
+    /// until released, then fails, reporting `reason` as GitHub's own
+    /// refusal (a `RemoteError::Api`, the shape a declined or expired flow
+    /// arrives in).
+    ///
+    /// The gate is what makes a device-flow test deterministic: the engine
+    /// *spawns* the task that runs the flow, so a stub that failed instantly
+    /// could land - and, on the next status read, clear - its outcome before
+    /// the caller has even read the body of the response that started it.
+    pub fn denying(reason: &str) -> (Self, Arc<tokio::sync::Notify>) {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let auth = Self {
+            start_result: Mutex::new(Some(Ok(DeviceFlowStart {
+                device_code: "devcode".to_string(),
+                user_code: "ABCD-1234".to_string(),
+                verification_url: "https://github.example/device".to_string(),
+                interval_secs: 0,
+                expires_in_secs: 900,
+            }))),
+            run_gate: gate.clone(),
+            run_result: Mutex::new(Some(Err(RemoteError::Api {
+                status: 403,
+                message: reason.to_string(),
+            }))),
+            validate_result: Mutex::new(None),
+            accept_any: None,
+        };
+        (auth, gate)
+    }
+}
+
+#[async_trait::async_trait]
+impl ConnectAuth for StubConnectAuth {
+    async fn start_device_flow(
+        &self,
+        _auth_base: &str,
+        _client_id: &str,
+    ) -> Result<DeviceFlowStart, RemoteError> {
+        if self.accept_any.is_some() {
+            // The acceptor has no device path, and says so repeatably: a
+            // suite that drives the connect route more than once (the write
+            // matrix does) must get the same refusal every time rather than
+            // panic on a used-up one-shot.
+            return Err(RemoteError::NotConnected);
+        }
+        self.start_result
+            .lock()
+            .unwrap()
+            .take()
+            .expect("start_device_flow result not set")
+    }
+
+    async fn run_device_flow(
+        &self,
+        _auth_base: &str,
+        _client_id: &str,
+        _start: &DeviceFlowStart,
+    ) -> Result<String, RemoteError> {
+        self.run_gate.notified().await;
+        self.run_result
+            .lock()
+            .unwrap()
+            .take()
+            .expect("run_device_flow result not set")
+    }
+
+    async fn validate_token(
+        &self,
+        _api_url: Option<&str>,
+        _token: &str,
+    ) -> Result<String, RemoteError> {
+        if let Some(user) = &self.accept_any {
+            return Ok(user.clone());
+        }
+        self.validate_result
+            .lock()
+            .unwrap()
+            .take()
+            .expect("validate_token result not set")
     }
 }

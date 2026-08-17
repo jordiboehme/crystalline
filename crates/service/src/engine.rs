@@ -32,15 +32,16 @@ use crystalline_core::emit::{
 use crystalline_core::schema::{self, Schema};
 use crystalline_core::{
     CrystallineUrl, Engram, Frontmatter, HarnessKind, LinkTarget, Manifest, YamlValue,
-    is_lower_hyphen, parse_engram, slugify,
+    is_lower_hyphen, parse_engram, parse_engram_lossless, slugify,
 };
 use crystalline_index::{
     ChunkParams, DEFAULT_RETIRED_WEIGHT, DEFAULT_SALIENCE_WEIGHT, DomainHost, DomainId, DomainKind,
     EMBED_PAGE_SIZE, EdgeKind, EmbeddingProvider, EngramDescriptor, EngramFacts, EngramId,
-    EngramRecord, Family, FileStamp, Finding, GraphNode, GraphSlice, HostClaim, RULES,
-    RecentFilter, SearchMode, SearchQuery, Store, SweepInput, SweepOptions, SyncReport, apply_scan,
-    chunk_engram, configured_model_id, detect, order_jobs_for_batching, parse_metadata_filters,
-    provider_from_config, rank, retired_factor, rule_info, salience_prior, scan_domain, scan_paths,
+    EngramRecord, Family, FileStamp, Finding, GraphNode, GraphSlice, HostClaim, InboundQuery,
+    RULES, RecentFilter, SearchMode, SearchQuery, Store, SweepInput, SweepOptions, SyncReport,
+    apply_scan, chunk_engram, configured_model_id, detect, order_jobs_for_batching,
+    parse_metadata_filters, provider_from_config, rank, retired_factor, rule_info, salience_prior,
+    scan_domain, scan_paths,
 };
 use crystalline_remote::ops;
 use crystalline_remote::{
@@ -73,12 +74,66 @@ const NEIGHBOR_CHUNK: usize = 5_000;
 /// `truncated` flag rather than pretending to be whole.
 const MAX_GRAPH_NODES: usize = 150;
 
+/// The most engrams one level of [`Engine::browse_domain`] carries.
+///
+/// The tree is a navigation aid, not the listing: a sidebar exists to get a
+/// reader into a folder, and the folder listing - paged, filterable, and
+/// server-side - is what shows a folder holding thousands of engrams. A level
+/// past this cap is cut rather than loaded, and says so through `truncated`
+/// beside the `total` the level really holds, so a client can send its reader
+/// to the listing instead of drawing a tree nobody can read.
+///
+/// The number is generous on purpose: a folder anyone still navigates by tree
+/// is well under it, so in practice the cap is the ceiling that keeps one
+/// window-focus refetch from loading a whole domain, not a limit a real folder
+/// runs into.
+pub const TREE_LEVEL_CAP: usize = 500;
+
+/// The largest page a search or a listing hands back.
+///
+/// The page size is client-controlled and the filter-only path projects whole
+/// bodies through a sorter that turso bounds by exactly this number, so an
+/// unclamped `limit` lets any reader ask the database to hold a hundred
+/// thousand engram bodies at once (the 2026-08-11 query-spill audit, whose
+/// sharpest finding this closes: the bound on that sorter must not be the
+/// caller's to choose). A hundred rows is more than a page anyone reads and far
+/// less than a page anyone can weaponize; a client that wants more pages
+/// through them, which is what the envelope's `total` is for.
+///
+/// Clamped rather than refused, like every other bound on this surface: a hand
+/// written URL asking for too much gets the largest page there is, not a 4xx.
+///
+/// The same number as [`MAX_INBOUND_LIMIT`] and for the same reason, kept as
+/// its own constant because the two bound different queries and either could
+/// move without the other: this one bounds a sorter holding bodies, that one
+/// bounds how much of the reference index a popover materializes.
+const MAX_PAGE_LIMIT: usize = 100;
+
+/// The deepest level [`Engine::browse_domain`] walks.
+///
+/// The depth cut is pushed into SQL as a pattern that grows one term per level,
+/// and `depth` arrives from a request, so this is where an absurd number stops
+/// before it builds an absurd pattern. No domain nests folders anywhere near
+/// this deep, which is what makes the clamp invisible to a real tree.
+const TREE_MAX_DEPTH: usize = 64;
+
 /// The default `evolve_engrams` page size. Small on purpose: the queue is meant
 /// to be worked top-down and agreed item by item, not read in bulk.
 const EVOLVE_DEFAULT_LIMIT: usize = 10;
 
 /// The largest `evolve_engrams` page size.
 const EVOLVE_MAX_LIMIT: usize = 100;
+
+/// The largest `inbound_references` page size.
+///
+/// A ceiling rather than a suggestion, because the bound on how much of an
+/// index one request may materialize must not be the caller's to choose: an
+/// engram a few thousand engrams point at is exactly the case this endpoint
+/// exists for, and `?limit=<enormous>` would turn the endpoint that makes that
+/// engram cheap into the one way to load all of it at once. A hundred is well
+/// past any popover page and small enough that the widest answer is still one
+/// screenful of rows.
+const MAX_INBOUND_LIMIT: usize = 100;
 
 /// The fixed instruction every `evolve_engrams` response carries. It states the
 /// authority the queue does and does not have, so an agent working it never
@@ -247,6 +302,19 @@ impl From<crystalline_remote::RemoteError> for EngineError {
     }
 }
 
+/// The one sentence a refused compare-and-swap speaks, wherever the comparison
+/// happened. It opens with the store's own `stale edit` wording (see
+/// `IndexError::StaleEdit`) because that phrase is the seam: the database
+/// enforces the swap for virtual domains and [`Engine::save_engram`] enforces
+/// it by hand for file domains, and the HTTP layer classifies both as the same
+/// conflict by looking for it. Keep the prefix stable.
+fn stale_edit_message(expected: &str, found: &str) -> String {
+    format!(
+        "stale edit: engram changed since it was read \
+         (expected {expected}, found {found}); re-read and retry"
+    )
+}
+
 impl From<crystalline_index::IndexError> for EngineError {
     fn from(e: crystalline_index::IndexError) -> Self {
         match e {
@@ -256,9 +324,7 @@ impl From<crystalline_index::IndexError> for EngineError {
             // A stale compare-and-swap surfaces as a conflict, mirroring the
             // expected_replacements ergonomics: re-read and retry.
             crystalline_index::IndexError::StaleEdit { expected, found } => {
-                EngineError::Conflict(format!(
-                    "engram changed since you last read it (expected checksum {expected}, found {found}); re-read and retry"
-                ))
+                EngineError::Conflict(stale_edit_message(&expected, &found))
             }
             other => EngineError::Internal(other.to_string()),
         }
@@ -286,6 +352,22 @@ mod error_tests {
 
 /// The result type used across the engine.
 pub type Result<T> = std::result::Result<T, EngineError>;
+
+/// One engram's exact file text and identity, as [`Engine::engram_text`]
+/// returns it. The `checksum` is the same CAS token a save takes back.
+#[derive(Debug, Clone)]
+pub struct EngramText {
+    /// The owning domain name.
+    pub domain: String,
+    /// The engram permalink.
+    pub permalink: String,
+    /// The domain-relative file path, forward-slashed, with the `.md` suffix.
+    pub path: String,
+    /// The engram's full markdown, byte for byte as stored.
+    pub content: String,
+    /// The content checksum: the CAS token of the next save.
+    pub checksum: String,
+}
 
 /// A stage-boundary progress callback for a long connect:
 /// (step, total steps, message). Sync and cheap by contract; the MCP
@@ -434,6 +516,10 @@ pub struct Engine {
     // `EngineError::ReadOnly`. Set at construction from the effective mode
     // (explicit flag or `service.read_only`). Index maintenance is unaffected.
     read_only: bool,
+    // The effective `skills.serve` value, snapshotted while this engine is
+    // built and never re-read. See `Engine::skills_serve` for why it is frozen
+    // and `Engine::with_env_overlay` for why the snapshot is taken twice.
+    skills_serve: crystalline_core::config::SkillsServe,
     // This instance's stable id for shared-database collaboration, or empty when
     // collaboration is off (standalone commands and the embedded stdio stack).
     // Only a non-empty id claims host locks, scopes embedding and refuses a
@@ -458,6 +544,12 @@ pub struct Engine {
     // whole call rather than reasoning about which sub-step actually needs
     // it, simplest and cheap since these calls are already rare and short.
     origin_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    // Per-file lock serializing the checksum-guarded verbs against each other
+    // for one file on disk, keyed by absolute path. See `Engine::write_lock`
+    // for what it protects and why a compare-then-write without it is a race
+    // two browser tabs can reach. Created lazily, one `tokio::sync::Mutex` per
+    // file ever written through those verbs.
+    write_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     // A fixed provider used by every origin operation instead of the
     // production per-operation `GitHubProvider` build, for tests: an engine
     // built this way never reads config or the token store to decide who to
@@ -632,6 +724,7 @@ impl Engine {
         // No overlay yet: file and effective start identical, so an engine
         // built without `with_env_overlay` behaves exactly as before the split.
         let file_config = config.clone();
+        let skills_serve = config.skills_serve();
         Engine {
             store,
             config: std::sync::RwLock::new(config),
@@ -645,12 +738,14 @@ impl Engine {
             model_id,
             chunk_params,
             read_only: false,
+            skills_serve,
             instance_id: String::new(),
             label: String::new(),
             hosted: std::sync::RwLock::new(HashMap::new()),
             heartbeat_secs: env_secs("CRYSTALLINE_HEARTBEAT_SECS", DEFAULT_HEARTBEAT_SECS),
             stale_secs: env_secs("CRYSTALLINE_STALE_SECS", DEFAULT_STALE_SECS),
             origin_locks: std::sync::Mutex::new(HashMap::new()),
+            write_locks: std::sync::Mutex::new(HashMap::new()),
             origin_provider_override: None,
             origins_dir_override: None,
             connect_auth: Arc::new(RealConnectAuth),
@@ -712,8 +807,19 @@ impl Engine {
     /// call this with the overlay parsed at startup; every existing call site
     /// leaves the default empty overlay in place, so file and effective stay
     /// identical there.
+    ///
+    /// **The `skills.serve` snapshot is retaken here, and that is load
+    /// bearing.** The overlay arrives through this builder *after*
+    /// [`Engine::new`] has run (the daemon and `build_embedded` both spell
+    /// `Engine::new(store, loaded.file, ...).with_env_overlay(loaded.overlay)`,
+    /// passing the **file** config to the constructor), so a snapshot taken
+    /// only in the constructor would miss `CRYSTALLINE_SKILLS_SERVE` and serve
+    /// the wrong answer to exactly the deployments that set it. Both builders
+    /// take `self` by value and the engine is then shared behind an `Arc`, so
+    /// the value is still frozen for the engine's lifetime.
     pub fn with_env_overlay(mut self, overlay: EnvOverlay) -> Engine {
         let effective = overlay.apply(&self.file_config.read().unwrap());
+        self.skills_serve = effective.skills_serve();
         *self.config.write().unwrap() = effective;
         self.overlay = overlay;
         self
@@ -787,12 +893,27 @@ impl Engine {
         self.config.read().unwrap().github_enabled()
     }
 
-    /// How the shipped agent skills are served over MCP, read fresh under
-    /// the config guard the same way [`Engine::github_enabled`] is, so a
-    /// runtime `configure` flip of `skills.serve` applies from the next call
-    /// on rather than at the next daemon start.
+    /// How the shipped agent skills are served over MCP: the value this engine
+    /// was **built** with, not the live setting.
+    ///
+    /// Deliberately unlike [`Engine::github_enabled`] beside it. This one
+    /// shapes three MCP list endpoints (the `skills` tool, the five
+    /// `skill://` resources and the two prompts), and MCP 2026-07-28's
+    /// SEP-2567 says a list "MUST NOT vary per-connection or as a side effect
+    /// of other requests on the connection". Read live, a `configure set
+    /// skills.serve` moved all three lists on the very connection that made
+    /// the call. So the effective value is snapshotted while the engine is
+    /// built and never re-read, which is the only layer where stdio, HTTP,
+    /// embedded and the degraded stub all agree - over HTTP rmcp rebuilds the
+    /// server per request from this same shared engine, so freezing anything
+    /// higher up would have left that transport moving.
+    ///
+    /// `configure` still writes the setting; it applies at the next daemon
+    /// start, which is what `startup_effective: true` (`settings.rs`) tells
+    /// the user through `change_note`. That flag is the label on this
+    /// behaviour, never the mechanism: its only consumer is that note.
     pub fn skills_serve(&self) -> crystalline_core::config::SkillsServe {
-        self.config.read().unwrap().skills_serve()
+        self.skills_serve
     }
 
     /// How the MCP server encodes list-shaped tool results, from the
@@ -965,6 +1086,20 @@ impl Engine {
     pub fn require_domain(&self, name: &str) -> Result<()> {
         self.domain_entry(name)?;
         Ok(())
+    }
+
+    /// Whether `name` is a team domain: a registered domain that carries a
+    /// GitHub origin. [`EngineError::UnknownDomain`] when nobody registered
+    /// it, which is a caller's missing resource rather than a false answer.
+    ///
+    /// The distinction a surface needs before offering anything origin-shaped:
+    /// [`Engine::origin_status`] and [`Engine::origin_update`] both refuse a
+    /// domain with no origin, and their refusal is one message for a request
+    /// that could never have worked. Asking first lets a caller answer in its
+    /// own terms - there is no sync status here, or there is nothing to sync -
+    /// without parsing an error string.
+    pub fn domain_has_origin(&self, name: &str) -> Result<bool> {
+        Ok(self.domain_entry(name)?.origin.is_some())
     }
 
     /// Resolve a registered domain to its content source: a filesystem root for
@@ -1341,6 +1476,21 @@ impl Engine {
         }
         let permalink = slugify(&rel);
 
+        // The whole existence-check-then-write, for a file domain, under that
+        // file's lock: the check and the write it authorizes must be one step,
+        // or two creates of one title both find the permalink free, both write,
+        // and the second answers "created" over the first's body instead of the
+        // conflict that says the name was taken. Taken before the store lock,
+        // like every other holder. See `Engine::write_lock`.
+        let file_lock = match &source {
+            ContentSource::File { root } => Some(self.write_lock(&join_rel(root, &rel))),
+            ContentSource::Virtual => None,
+        };
+        let _guard = match &file_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+
         // Enforce overwrite semantics against the existing permalink.
         {
             let store = self.store.lock().await;
@@ -1410,7 +1560,586 @@ impl Engine {
         }))
     }
 
+    /// Save an engram's complete markdown text verbatim, guarded by the
+    /// checksum of the version the caller read.
+    ///
+    /// The full-document counterpart of [`Engine::edit_engram`], for the HTTP
+    /// PUT: the client edited the whole file, so the whole file is what lands.
+    /// Nothing is rebuilt and `generated` is not touched - a save of what was
+    /// read must be byte-identical, which is the editor's fidelity contract,
+    /// and the text already carries whatever provenance its author put there.
+    ///
+    /// `expected_checksum` is enforced on BOTH storage kinds. File domains get
+    /// the comparison here (read, hash, compare, write), virtual domains get
+    /// it in the store's compare-and-swap (`upsert_engram_checked`); both
+    /// failure paths speak the store's own "stale edit" language so the HTTP
+    /// layer classifies them as one conflict.
+    ///
+    /// The `permalink` in the receipt is the one the engram answers to *after*
+    /// the write, which is not always the one it was addressed by: writing the
+    /// document verbatim means an author may have edited the `permalink` line
+    /// in the frontmatter, and the index takes the permalink from the file. A
+    /// caller that saved a rename is told where its engram went.
+    pub async fn save_engram(&self, p: &SaveParams) -> Result<Value> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        // A document that is not an engram would poison the index on reindex,
+        // so it is refused before anything is written. This is the one hard
+        // gate, and it is deliberately narrow: the text must parse (clean
+        // UTF-8, frontmatter that is a YAML mapping) and must carry frontmatter
+        // that actually says something, because a save that drops it silently
+        // strips the engram's type, title, permalink, tags and status at once,
+        // leaving the index to fall back to the path slug. An empty block is
+        // that same strip wearing delimiters, so it is refused the same way.
+        // Everything a document can get wrong while still being an engram - a
+        // missing tag, a permalink that is not a slug, an inverted validity
+        // window - is the validation endpoint's business to report, not this
+        // path's to refuse: an engram that already carries such a flaw must
+        // stay editable, since fixing it here is what the editor is for.
+        let parsed =
+            parse_engram_lossless(&p.content).map_err(|e| EngineError::Invalid(e.to_string()))?;
+        if !parsed.has_frontmatter || parsed.raw_frontmatter.trim().is_empty() {
+            return Err(EngineError::Invalid(
+                "the document carries no frontmatter, so it is not an engram; \
+                 keep the --- delimited frontmatter block, and the type, title, \
+                 permalink and tags in it, at the top of the file"
+                    .into(),
+            ));
+        }
+        let (desc, source) = self.resolve(&p.identifier, Some(&p.domain)).await?;
+        // A reserved name never resolves to an engram today (sync skips both),
+        // so this is defence in depth rather than a reachable branch: the
+        // generated `index.md` is derived from its folder and would be
+        // overwritten on the next refresh, and `log.md` is reserved beside it.
+        // Checked on the resolved path, which is the authority on what would
+        // actually be written.
+        if crystalline_core::is_reserved_path(&desc.path) {
+            return Err(EngineError::Invalid(reserved_name_error(&desc.path)));
+        }
+
+        match &source {
+            ContentSource::File { root } => {
+                let abs = join_rel(root, &desc.path);
+                // Held across the comparison and the write. See
+                // `Engine::write_lock`.
+                let lock = self.write_lock(&abs);
+                let _guard = lock.lock().await;
+                let current = match std::fs::read_to_string(&abs) {
+                    Ok(text) => text,
+                    // Indexed but absent from this machine's disk: the file was
+                    // removed behind the index, or this instance is not the
+                    // domain's host and only ever saw the database rows. Either
+                    // way the engram the caller asked to save is not here to
+                    // save, which is a miss rather than a server fault - the
+                    // same reading `save_manifest` takes of its own file.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        return Err(EngineError::NotFound(format!(
+                            "engram '{}' in domain '{}' has no file at {}",
+                            desc.permalink,
+                            desc.domain,
+                            abs.display()
+                        )));
+                    }
+                    Err(source) => {
+                        return Err(EngineError::Io {
+                            path: abs.display().to_string(),
+                            source,
+                        });
+                    }
+                };
+                let found = sha256_hex(current.as_bytes());
+                if found != p.expected_checksum {
+                    return Err(EngineError::Conflict(stale_edit_message(
+                        &p.expected_checksum,
+                        &found,
+                    )));
+                }
+                write_file(&abs, &p.content)?;
+                let store = self.store.lock().await;
+                self.reindex_file(&*store, desc.domain_id, root, &desc.path)
+                    .await?;
+            }
+            ContentSource::Virtual => {
+                let stamp = virtual_stamp(&p.content);
+                let store = self.store.lock().await;
+                self.index_markdown(
+                    &*store,
+                    desc.domain_id,
+                    &desc.path,
+                    &p.content,
+                    stamp,
+                    Some(&p.expected_checksum),
+                    true,
+                )
+                .await?;
+            }
+        }
+
+        // Where the engram now answers. Read back after the reindex rather than
+        // echoed from the resolution that preceded it: the index takes an
+        // engram's permalink from its frontmatter, so an author who edited that
+        // line has just moved the address, and a receipt naming the old one
+        // would send its caller to a permalink nothing resolves. The saved
+        // content is the truth here, so the truth is what is asked.
+        let permalink = {
+            let store = self.store.lock().await;
+            store
+                .list_engrams(&desc.domain, Some(&desc.path), None)
+                .await?
+                .into_iter()
+                .find(|found| found.path == desc.path)
+                .map(|found| found.permalink)
+                // Unreachable while the write above succeeded; the resolved
+                // name is the honest fallback rather than a panic.
+                .unwrap_or_else(|| desc.permalink.clone())
+        };
+
+        // A save can rewrite the MANIFEST engram of a virtual domain or the
+        // titles a folder index lists, same as an edit.
+        if matches!(source, ContentSource::Virtual) {
+            self.refresh_routing_cache().await;
+        }
+        self.refresh_index_files(&desc.domain).await;
+
+        Ok(json!({
+            "domain": desc.domain,
+            "permalink": permalink,
+            "path": desc.path,
+            "checksum": sha256_hex(p.content.as_bytes()),
+        }))
+    }
+
+    /// Write an engram file back into existence with this exact content, then
+    /// reindex it: the resolution path for "externally deleted while a collab
+    /// session held unsaved work". [`Engine::save_engram`] refuses a missing
+    /// file by design (a save of something that is not there is a miss, not a
+    /// create), so a room whose author keeps their text needs this verb.
+    ///
+    /// Same parse gate as a save and the same receipt shape, addressed by
+    /// PATH rather than by identifier: the engram is gone from the index, so
+    /// there is nothing left to resolve. No CAS token either, for the same
+    /// reason - there is no stored version to compare against.
+    pub async fn restore_engram(&self, domain: &str, path: &str, content: &str) -> Result<Value> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        let parsed =
+            parse_engram_lossless(content).map_err(|e| EngineError::Invalid(e.to_string()))?;
+        if !parsed.has_frontmatter || parsed.raw_frontmatter.trim().is_empty() {
+            return Err(EngineError::Invalid(
+                "the document carries no frontmatter, so it is not an engram; \
+                 keep the --- delimited frontmatter block, and the type, title, \
+                 permalink and tags in it, at the top of the file"
+                    .into(),
+            ));
+        }
+        if crystalline_core::is_reserved_path(path) {
+            return Err(EngineError::Invalid(reserved_name_error(path)));
+        }
+        let (domain_id, source) = self.domain_source(domain).await?;
+        match &source {
+            ContentSource::File { root } => {
+                let abs = join_rel(root, path);
+                // Held across the write and the reindex, like every other
+                // file write. See `Engine::write_lock`.
+                let lock = self.write_lock(&abs);
+                let _guard = lock.lock().await;
+                write_file(&abs, content)?;
+                let store = self.store.lock().await;
+                self.reindex_file(&*store, domain_id, root, path).await?;
+            }
+            ContentSource::Virtual => {
+                let stamp = virtual_stamp(content);
+                let store = self.store.lock().await;
+                self.index_markdown(&*store, domain_id, path, content, stamp, None, true)
+                    .await?;
+            }
+        }
+        if matches!(source, ContentSource::Virtual) {
+            self.refresh_routing_cache().await;
+        }
+        self.refresh_index_files(domain).await;
+
+        // Read back after the reindex, exactly as a save does: the index takes
+        // the permalink from the restored frontmatter, which need not match
+        // the path slug.
+        let permalink = {
+            let store = self.store.lock().await;
+            store
+                .list_engrams(domain, Some(path), None)
+                .await?
+                .into_iter()
+                .find(|found| found.path == path)
+                .map(|found| found.permalink)
+                .unwrap_or_else(|| path.trim_end_matches(".md").to_string())
+        };
+        Ok(json!({
+            "domain": domain,
+            "permalink": permalink,
+            "path": path,
+            "checksum": sha256_hex(content.as_bytes()),
+        }))
+    }
+
+    /// A registered domain's row id and content source, upserting the row the
+    /// way a create does. The domain-addressed half of what
+    /// [`Engine::resolve`] does for an identifier, for a write path whose
+    /// engram is not in the index to resolve.
+    async fn domain_source(&self, domain: &str) -> Result<(DomainId, ContentSource)> {
+        let source = self.content_source(domain)?;
+        let store = self.store.lock().await;
+        let domain_id = match &source {
+            ContentSource::File { root } => {
+                store
+                    .upsert_domain(domain, Some(&root.to_string_lossy()), DomainKind::File)
+                    .await?
+            }
+            ContentSource::Virtual => {
+                store
+                    .upsert_domain(domain, None, DomainKind::Virtual)
+                    .await?
+            }
+        };
+        Ok((domain_id, source))
+    }
+
+    /// The retirement statuses [`Engine::retire_engram`] accepts. Any other
+    /// status is this verb's business to refuse, not a global rule: the
+    /// ordinary save and edit paths accept any status string.
+    const RETIREMENT_STATUSES: [&str; 3] = ["deprecated", "superseded", "archived"];
+
+    /// Guided retirement: set a retirement `status`, optionally close out
+    /// `valid_to`, and, for `superseded`, wire the supersede pair as body
+    /// relations so verify's T005 and the evolve sweep see a reciprocal link
+    /// rather than a dangling one.
+    pub async fn retire_engram(&self, p: &RetireParams) -> Result<Value> {
+        self.retire_engram_as(p, None).await
+    }
+
+    /// [`Engine::retire_engram`] with the retiring identity, resolved by
+    /// [`Engine::actor`] and stamped into both engrams' `generated` block.
+    ///
+    /// Everything is validated and resolved before anything is written: the
+    /// status is checked against [`Self::RETIREMENT_STATUSES`], the
+    /// successor rule (required for `superseded`, refused otherwise) is
+    /// enforced, `valid_to` is parsed and, when a successor is named, it is
+    /// resolved in the same domain so a missing successor is `NotFound`
+    /// before the target is touched. The target is then written first, and
+    /// only then the successor's reciprocal `- supersedes [[..]]` line
+    /// (appended only when not already present, so a repeat call is
+    /// idempotent). A failure on the successor write leaves the target
+    /// retired with a one-sided pair; nothing here rolls that back, since the
+    /// evolve sweep already flags a `superseded_by` with no matching
+    /// `supersedes` as its own finding.
+    pub async fn retire_engram_as(&self, p: &RetireParams, client: Option<&str>) -> Result<Value> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        if !Self::RETIREMENT_STATUSES.contains(&p.status.as_str()) {
+            return Err(EngineError::Invalid(format!(
+                "retire_engram accepts status deprecated, superseded or archived, got '{}'; \
+                 use edit_engram's set_frontmatter operation for any other status",
+                p.status
+            )));
+        }
+        match (p.status.as_str(), p.successor.is_some()) {
+            ("superseded", false) => {
+                return Err(EngineError::Invalid(
+                    "status superseded needs a successor to wire the supersede pair, \
+                     or verify rule T005 flags the result as a dangling retirement"
+                        .into(),
+                ));
+            }
+            (other, true) if other != "superseded" => {
+                return Err(EngineError::Invalid(format!(
+                    "successor is only accepted when status is superseded, not '{other}'"
+                )));
+            }
+            _ => {}
+        }
+        let valid_to = p
+            .valid_to
+            .as_deref()
+            .map(|raw| {
+                NaiveDate::parse_from_str(raw, "%Y-%m-%d").map_err(|_| {
+                    EngineError::Invalid(format!(
+                        "valid_to must be a plain ISO date (YYYY-MM-DD), got '{raw}'"
+                    ))
+                })
+            })
+            .transpose()?;
+
+        let actor = self.actor(client);
+        let (desc, source) = self.resolve(&p.identifier, Some(&p.domain)).await?;
+
+        // Resolved before the target is touched: a missing successor must
+        // never leave the target half-retired.
+        let successor = match &p.successor {
+            Some(identifier) => Some(self.resolve(identifier, Some(&p.domain)).await?),
+            None => None,
+        };
+        // A successor that resolves to the target itself would append a
+        // supersedes-self relation: no deadlock (the target's lock is
+        // released before the successor's is taken), just a nonsense pair
+        // that verify would then have to make sense of. Refused before
+        // anything is written rather than left to produce that pair.
+        if let Some((succ_desc, _)) = &successor
+            && succ_desc.id == desc.id
+        {
+            return Err(EngineError::Invalid(format!(
+                "successor '{}' resolves to the same engram being retired; \
+                 a retirement needs a different engram to supersede it",
+                p.successor.as_deref().unwrap_or_default()
+            )));
+        }
+        let successor_title = successor.as_ref().map(|(d, _)| d.title.clone());
+
+        // -- target: status, optional valid_to, optional superseded_by line --
+        match &source {
+            ContentSource::File { root } => {
+                let abs = join_rel(root, &desc.path);
+                // Held across the read, the retirement edit and the write, for
+                // the reason `edit_engram_as` gives: this is a read-modify-write
+                // with nothing to refuse a concurrent change on, so serializing
+                // is what stops one from being dropped. See `Engine::write_lock`.
+                let lock = self.write_lock(&abs);
+                let _guard = lock.lock().await;
+                let current = std::fs::read_to_string(&abs).map_err(|source| EngineError::Io {
+                    path: abs.display().to_string(),
+                    source,
+                })?;
+                let edited = Self::build_retirement_edit(
+                    &current,
+                    &p.status,
+                    valid_to,
+                    successor_title.as_deref(),
+                    &actor,
+                );
+                let edited = Self::enforce_temporal(edited)?;
+                write_file(&abs, &edited)?;
+                let store = self.store.lock().await;
+                self.reindex_file(&*store, desc.domain_id, root, &desc.path)
+                    .await?;
+            }
+            ContentSource::Virtual => {
+                let current = {
+                    let store = self.store.lock().await;
+                    store
+                        .engram_content(desc.domain_id, &desc.path)
+                        .await?
+                        .ok_or_else(|| {
+                            EngineError::NotFound(format!(
+                                "no content stored for '{}' in domain '{}'",
+                                desc.permalink, desc.domain
+                            ))
+                        })?
+                };
+                let edited = Self::build_retirement_edit(
+                    &current,
+                    &p.status,
+                    valid_to,
+                    successor_title.as_deref(),
+                    &actor,
+                );
+                let edited = Self::enforce_temporal(edited)?;
+                let stamp = virtual_stamp(&edited);
+                let store = self.store.lock().await;
+                self.index_markdown(
+                    &*store,
+                    desc.domain_id,
+                    &desc.path,
+                    &edited,
+                    stamp,
+                    None,
+                    true,
+                )
+                .await?;
+            }
+        }
+        if matches!(source, ContentSource::Virtual) {
+            self.refresh_routing_cache().await;
+        }
+        self.refresh_index_files(&desc.domain).await;
+
+        // -- successor: reciprocal supersedes line, appended once --
+        if let Some((succ_desc, succ_source)) = &successor {
+            let line = format!("- supersedes [[{}]]", desc.title);
+            match succ_source {
+                ContentSource::File { root } => {
+                    let abs = join_rel(root, &succ_desc.path);
+                    // The successor's own file, under its own lock: appending
+                    // the reciprocal line is another read-modify-write. Taken
+                    // after the target's has been released, never with it, so
+                    // two retirements naming each other cannot deadlock.
+                    let lock = self.write_lock(&abs);
+                    let _guard = lock.lock().await;
+                    let current =
+                        std::fs::read_to_string(&abs).map_err(|source| EngineError::Io {
+                            path: abs.display().to_string(),
+                            source,
+                        })?;
+                    if !current.contains(&line) {
+                        let edited =
+                            touch_generated(&append_body(&current, &line), &actor, now_offset());
+                        write_file(&abs, &edited)?;
+                        let store = self.store.lock().await;
+                        self.reindex_file(&*store, succ_desc.domain_id, root, &succ_desc.path)
+                            .await?;
+                    }
+                }
+                ContentSource::Virtual => {
+                    let current = {
+                        let store = self.store.lock().await;
+                        store
+                            .engram_content(succ_desc.domain_id, &succ_desc.path)
+                            .await?
+                            .ok_or_else(|| {
+                                EngineError::NotFound(format!(
+                                    "no content stored for '{}' in domain '{}'",
+                                    succ_desc.permalink, succ_desc.domain
+                                ))
+                            })?
+                    };
+                    if !current.contains(&line) {
+                        let edited =
+                            touch_generated(&append_body(&current, &line), &actor, now_offset());
+                        let stamp = virtual_stamp(&edited);
+                        let store = self.store.lock().await;
+                        self.index_markdown(
+                            &*store,
+                            succ_desc.domain_id,
+                            &succ_desc.path,
+                            &edited,
+                            stamp,
+                            None,
+                            true,
+                        )
+                        .await?;
+                    }
+                }
+            }
+            if matches!(succ_source, ContentSource::Virtual) {
+                self.refresh_routing_cache().await;
+            }
+            self.refresh_index_files(&succ_desc.domain).await;
+        }
+
+        Ok(json!({
+            "domain": desc.domain,
+            "permalink": desc.permalink,
+            "status": p.status,
+            "successor": successor.map(|(d, _)| d.permalink),
+        }))
+    }
+
+    /// Build the target engram's retirement edit: set `status`, set
+    /// `valid_to` when given, append the `superseded_by` relation when a
+    /// successor title is given and the line is not already there, then
+    /// stamp `generated` provenance. Shared by the file and virtual arms of
+    /// [`Engine::retire_engram_as`]. The `contains` guard, checked against
+    /// `current` rather than the frontmatter-edited text (the two never
+    /// disagree on body content), matches the successor side's guard so a
+    /// retry after a timeout, say, retires idempotently instead of
+    /// duplicating the relation.
+    fn build_retirement_edit(
+        current: &str,
+        status: &str,
+        valid_to: Option<NaiveDate>,
+        successor_title: Option<&str>,
+        actor: &str,
+    ) -> String {
+        let mut edited = set_frontmatter_field(current, "status", status);
+        if let Some(date) = valid_to {
+            edited =
+                set_frontmatter_field(&edited, "valid_to", &date.format("%Y-%m-%d").to_string());
+        }
+        if let Some(title) = successor_title {
+            let line = format!("- superseded_by [[{title}]]");
+            if !current.contains(&line) {
+                edited = append_body(&edited, &line);
+            }
+        }
+        touch_generated(&edited, actor, now_offset())
+    }
+
     // --- read ----------------------------------------------------------------
+
+    /// One engram's exact file text and identity: what the collab session
+    /// layer loads at open and probes with on its idle external-change check.
+    /// Deliberately thin - [`Engine::read_engram`] resolves references and
+    /// builds hints this caller never reads.
+    pub async fn engram_text(&self, domain: &str, identifier: &str) -> Result<EngramText> {
+        let (desc, source) = self.resolve(identifier, Some(domain)).await?;
+        let content = self.load_content(&source, &desc).await?;
+        let checksum = sha256_hex(content.as_bytes());
+        Ok(EngramText {
+            domain: desc.domain,
+            permalink: desc.permalink,
+            path: desc.path,
+            content,
+            checksum,
+        })
+    }
+
+    /// The exact text a domain holds at a domain-relative PATH right now, or
+    /// `None` when nothing is there.
+    ///
+    /// Path-addressed on purpose, and the counterpart of
+    /// [`Engine::restore_engram`]: a collab room whose engram vanished from
+    /// the index has no identifier left to resolve, and before it puts its own
+    /// text back it has to know whether somebody else's bytes are sitting at
+    /// that path (an external rename, or a delete followed by a recreate).
+    /// The `permalink` reported back is what the index answers for this path,
+    /// which an external rename may just have moved; it falls back to the path
+    /// slug when no row holds the path any more.
+    pub async fn engram_text_at_path(
+        &self,
+        domain: &str,
+        path: &str,
+    ) -> Result<Option<EngramText>> {
+        let source = self.content_source(domain)?;
+        let content = match &source {
+            ContentSource::File { root } => {
+                let abs = join_rel(root, path);
+                match std::fs::read_to_string(&abs) {
+                    Ok(text) => text,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                    Err(source) => {
+                        return Err(EngineError::Io {
+                            path: abs.display().to_string(),
+                            source,
+                        });
+                    }
+                }
+            }
+            ContentSource::Virtual => {
+                let (domain_id, _) = self.domain_source(domain).await?;
+                let store = self.store.lock().await;
+                match store.engram_content(domain_id, path).await? {
+                    Some(text) => text,
+                    None => return Ok(None),
+                }
+            }
+        };
+        let permalink = {
+            let store = self.store.lock().await;
+            store
+                .list_engrams(domain, Some(path), None)
+                .await?
+                .into_iter()
+                .find(|found| found.path == path)
+                .map(|found| found.permalink)
+                .unwrap_or_else(|| path.trim_end_matches(".md").to_string())
+        };
+        Ok(Some(EngramText {
+            domain: domain.to_string(),
+            permalink,
+            path: path.to_string(),
+            checksum: sha256_hex(content.as_bytes()),
+            content,
+        }))
+    }
 
     /// Read an engram's full markdown and resolved frontmatter. The content
     /// comes from the local file when a file domain holds it, else from the
@@ -1542,6 +2271,87 @@ impl Engine {
         Ok(value)
     }
 
+    /// One page of what points at an engram, with the per-relation summary of
+    /// all of it: the browsing view of the inbound block [`Engine::read_engram`]
+    /// samples.
+    ///
+    /// The read payload's `inbound` stays what it is - an exact count and five
+    /// references, cheap enough to ride every read. This is for the case that
+    /// count implies but cannot serve: hundreds or thousands of engrams pointing
+    /// at one, where the answer is a map to browse rather than a list to print.
+    /// Both are the same rows, so the counts agree.
+    ///
+    /// `q` matches the referencing engram's title or path, case-insensitively,
+    /// and `rel` narrows to one relation type (`links_to` for prose wikilinks).
+    /// `total` is exact under both; `types` ignores both, because a summary that
+    /// shrank as it was used would be a map redrawing itself while it is read.
+    ///
+    /// `limit` is clamped to [`MAX_INBOUND_LIMIT`] and a page past the end is an
+    /// empty page carrying the true total, never the first page's rows.
+    ///
+    /// An engram nobody wrote is [`EngineError::NotFound`], the same resolution
+    /// every other read of one identifier opens with.
+    pub async fn inbound_references(
+        &self,
+        p: &ReadParams,
+        q: Option<&str>,
+        rel: Option<&str>,
+        page: Option<usize>,
+        limit: Option<usize>,
+    ) -> Result<Value> {
+        let (desc, _) = self.resolve(&p.identifier, p.domain.as_deref()).await?;
+        // Clamped rather than refused, the way the listing clamps its own: a
+        // hand-written page number below one is answered with the first page,
+        // and a page size past [`MAX_INBOUND_LIMIT`] is answered with that
+        // many. The envelope reports the clamped values, so a caller is told
+        // what it was actually given rather than having its own number read
+        // back at it.
+        let page = page.unwrap_or(1).max(1);
+        let limit = limit.unwrap_or(10).clamp(1, MAX_INBOUND_LIMIT);
+        let found = {
+            let store = self.store.lock().await;
+            store
+                .inbound_page(&InboundQuery {
+                    engram_id: desc.id,
+                    domain_id: desc.domain_id,
+                    permalink: &desc.permalink,
+                    title: &desc.title,
+                    q,
+                    rel,
+                    page,
+                    limit,
+                })
+                .await?
+        };
+        let types: Vec<Value> = found
+            .types
+            .iter()
+            .map(|t| json!({ "rel": t.name, "count": t.count }))
+            .collect();
+        let hits: Vec<Value> = found
+            .hits
+            .iter()
+            .map(|h| {
+                json!({
+                    "domain": h.domain,
+                    "permalink": h.permalink,
+                    "title": h.title,
+                    "path": h.path,
+                    "status": h.status,
+                    "rel": h.rel,
+                })
+            })
+            .collect();
+        Ok(json!({
+            "total": found.total,
+            "page": page,
+            "limit": limit,
+            "count": hits.len(),
+            "types": types,
+            "hits": hits,
+        }))
+    }
+
     // --- edit ----------------------------------------------------------------
 
     /// Apply a surgical edit to an engram, then reindex it. A file domain edits
@@ -1567,10 +2377,27 @@ impl Engine {
         match &source {
             ContentSource::File { root } => {
                 let abs = join_rel(root, &desc.path);
+                // Held across the read, the compare, the edit and the write.
+                // With an expected_checksum the compare below refuses a stale
+                // edit; without one, serializing is the whole guarantee: two
+                // unguarded edits each apply to what the other wrote rather
+                // than silently dropping it. See `Engine::write_lock`.
+                let lock = self.write_lock(&abs);
+                let _guard = lock.lock().await;
                 let current = std::fs::read_to_string(&abs).map_err(|source| EngineError::Io {
                     path: abs.display().to_string(),
                     source,
                 })?;
+                // The CAS token, when the caller presents one: compared inside
+                // the lock, against the bytes just read, exactly as save_engram
+                // compares. Absent stays last-write-wins - the serialized
+                // read-modify-write below is then the whole guarantee.
+                if let Some(expected) = &p.expected_checksum {
+                    let found = sha256_hex(current.as_bytes());
+                    if found != *expected {
+                        return Err(EngineError::Conflict(stale_edit_message(expected, &found)));
+                    }
+                }
                 let edited = self.apply_edit(&current, p, &desc.permalink, &actor)?;
                 let edited = touch_generated(&edited, &actor, now_offset());
                 let edited = Self::enforce_temporal(edited)?;
@@ -2304,6 +3131,24 @@ impl Engine {
             return Err(EngineError::ReadOnly);
         }
         let (desc, source) = self.resolve(&p.identifier, Some(&p.domain)).await?;
+        // Held across the comparison and the removal, so a guarded delete
+        // cannot check a file that a concurrent save then rewrites underneath
+        // it. See `Engine::write_lock`.
+        let file_lock = match &source {
+            ContentSource::File { root } => Some(self.write_lock(&join_rel(root, &desc.path))),
+            ContentSource::Virtual => None,
+        };
+        let _guard = match &file_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+        if let Some(expected) = &p.expected_checksum {
+            let current = self.load_content(&source, &desc).await?;
+            let found = sha256_hex(current.as_bytes());
+            if &found != expected {
+                return Err(EngineError::Conflict(stale_edit_message(expected, &found)));
+            }
+        }
         if let ContentSource::File { root } = &source {
             let abs = join_rel(root, &desc.path);
             std::fs::remove_file(&abs).map_err(|source| EngineError::Io {
@@ -2342,6 +3187,30 @@ impl Engine {
 
     /// Search across domains, embedding the query when the mode needs it.
     pub async fn search_engrams(&self, p: &SearchParams) -> Result<Value> {
+        self.search_engrams_under(p, None).await
+    }
+
+    /// [`Engine::search_engrams`] narrowed to one domain-relative folder, which
+    /// is what a folder view pages from: the same filter-only search, with the
+    /// folder pushed into SQL beside the other filters, so `total` stays exact
+    /// and paging is unchanged.
+    ///
+    /// The folder is segment-safe - see [`folder_prefix`] - and `None` or an
+    /// empty value searches the whole scope, which is what every caller that
+    /// never names a folder keeps getting.
+    ///
+    /// The `total` in the envelope counts the folder recursively: every engram
+    /// under it at any depth, since a folder listing promises the folder. The
+    /// tree's own `total` counts one level and is deliberately smaller; see
+    /// [`Engine::browse_domain`]. It is a separate verb rather than a
+    /// field on [`SearchParams`] because that struct is the MCP search tool's
+    /// argument schema, and a folder filter is a browsing affordance of this
+    /// API rather than a knob worth spending an agent's context on.
+    pub async fn search_engrams_under(
+        &self,
+        p: &SearchParams,
+        folder: Option<&str>,
+    ) -> Result<Value> {
         let requested = parse_mode(p.search_type.as_deref())?;
         let text = p.query.clone().filter(|s| !s.trim().is_empty());
         let mut query = SearchQuery {
@@ -2352,7 +3221,8 @@ impl Engine {
             tags: Some(p.tags.clone()).filter(|t| !t.is_empty()),
             after: p.after.clone(),
             min_similarity: p.min_similarity,
-            limit: p.limit.unwrap_or(10).max(1),
+            path_prefix: folder.and_then(folder_prefix),
+            limit: p.limit.unwrap_or(10).clamp(1, MAX_PAGE_LIMIT),
             page: p.page.unwrap_or(1).max(1),
             ..SearchQuery::default()
         };
@@ -2565,13 +3435,13 @@ impl Engine {
     /// Retired engrams come back like any other, with their status, because the
     /// graph is the shape of what is written rather than of what still holds:
     /// hiding a superseded node would break the chain that explains what replaced
-    /// it. A client fades them; this does not drop them, and the cap below does
-    /// not demote them either.
+    /// it. A client fades them; this does not drop them from an uncapped answer.
     ///
-    /// When the cap bites, the anchors are kept first and the rest are kept by
-    /// the same spread mass and salience lift `build_context` ranks with, so what
-    /// survives is the neighborhood nearest the anchor rather than whatever the
-    /// index happened to list first.
+    /// When the cap bites, the anchors are kept first, then the rest are kept by
+    /// the same spread mass and salience lift `build_context` ranks with - except
+    /// that retired non-anchor nodes yield to live ones first, since a fading
+    /// node is the one the budget can least afford to keep over live knowledge.
+    /// `hidden` counts every node the cap cut, retired or not.
     pub async fn graph_neighborhood(
         &self,
         anchor: &str,
@@ -2635,6 +3505,11 @@ impl Engine {
                 .unwrap_or(Ordering::Equal)
                 .then_with(|| a.1.id.0.cmp(&b.1.id.0))
         });
+        // Retired knowledge yields first when the cap bites. A stable partition
+        // after the score sort: under the cap the kept SET is identical (order
+        // within the payload is not part of the contract), over it the live
+        // neighborhood survives and the hidden count below reports the cut.
+        related.sort_by_key(|(_, node)| crystalline_index::is_retired_status(&node.status));
 
         let total = anchors.len() + related.len();
         let mut kept: HashSet<i64> = HashSet::new();
@@ -2679,6 +3554,7 @@ impl Engine {
             "nodes": nodes,
             "edges": edges,
             "truncated": total > nodes.len(),
+            "hidden": total - nodes.len(),
         }))
     }
 
@@ -2803,6 +3679,113 @@ impl Engine {
                 })
             }
         }
+    }
+
+    /// Save a domain's MANIFEST markdown verbatim, guarded by the checksum of
+    /// the version the caller read - the manifest counterpart of
+    /// [`Engine::save_engram`], through the same `expected_checksum` seam and
+    /// the same "stale edit" wording on both domain kinds.
+    ///
+    /// `refresh_routing_cache` runs unconditionally afterwards, on both file
+    /// and virtual domains, even though the cache it fills
+    /// (`Engine::routing_virtual`) only ever holds virtual-domain bullets: a
+    /// file domain's bullets are read straight off `MANIFEST.md` on disk by
+    /// `routing_text` at request time, so a file-domain save has nothing in
+    /// the cache to refresh. Calling it unconditionally keeps this call site
+    /// correct without the caller needing to know which kind answered.
+    pub async fn save_manifest(
+        &self,
+        domain: &str,
+        markdown: &str,
+        expected_checksum: &str,
+    ) -> Result<Value> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        // Same hard gate as `save_engram`: a MANIFEST with no frontmatter (or
+        // an empty block) is not a manifest at all - it carries the domain's
+        // routing bullets and Tag Aliases, so losing the frontmatter here
+        // silently strips those too. `parse_engram` alone would not catch
+        // this, since an empty frontmatter span parses to
+        // `Frontmatter::default()` rather than an error.
+        let parsed =
+            parse_engram_lossless(markdown).map_err(|e| EngineError::Invalid(e.to_string()))?;
+        if !parsed.has_frontmatter || parsed.raw_frontmatter.trim().is_empty() {
+            return Err(EngineError::Invalid(
+                "the document carries no frontmatter, so it is not a MANIFEST; \
+                 keep the --- delimited frontmatter block at the top of the file"
+                    .into(),
+            ));
+        }
+
+        match self.content_source(domain)? {
+            ContentSource::File { root } => {
+                let path = root.join("MANIFEST.md");
+                // The same compare-then-write section `save_engram` holds, for
+                // the same reason: two saves of one MANIFEST must not both find
+                // their token fresh. See `Engine::write_lock`.
+                let lock = self.write_lock(&path);
+                let _guard = lock.lock().await;
+                let current = match std::fs::read_to_string(&path) {
+                    Ok(source) => source,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        return Err(EngineError::NotFound(format!(
+                            "domain '{domain}' has no MANIFEST.md at {}",
+                            path.display()
+                        )));
+                    }
+                    Err(source) => {
+                        return Err(EngineError::Io {
+                            path: path.display().to_string(),
+                            source,
+                        });
+                    }
+                };
+                let found = sha256_hex(current.as_bytes());
+                if found != expected_checksum {
+                    return Err(EngineError::Conflict(stale_edit_message(
+                        expected_checksum,
+                        &found,
+                    )));
+                }
+                write_file(&path, markdown)?;
+                let store = self.store.lock().await;
+                let domain_id = store
+                    .upsert_domain(domain, Some(&root.to_string_lossy()), DomainKind::File)
+                    .await?;
+                self.reindex_file(&*store, domain_id, &root, "MANIFEST.md")
+                    .await?;
+            }
+            ContentSource::Virtual => {
+                let store = self.store.lock().await;
+                let desc = store
+                    .find_engram(domain, "manifest")
+                    .await?
+                    .ok_or_else(|| {
+                        EngineError::NotFound(format!(
+                            "domain '{domain}' has no MANIFEST engram yet"
+                        ))
+                    })?;
+                let stamp = virtual_stamp(markdown);
+                self.index_markdown(
+                    &*store,
+                    desc.domain_id,
+                    &desc.path,
+                    markdown,
+                    stamp,
+                    Some(expected_checksum),
+                    true,
+                )
+                .await?;
+            }
+        }
+
+        self.refresh_routing_cache().await;
+
+        Ok(json!({
+            "domain": domain,
+            "checksum": sha256_hex(markdown.as_bytes()),
+        }))
     }
 
     /// Routing bullets for one virtual domain, read from its `MANIFEST.md`
@@ -2976,13 +3959,34 @@ impl Engine {
     /// Browse a domain's engrams under a folder path. Works for any registered
     /// domain, file or virtual, since it lists rows from the store rather than
     /// walking a filesystem.
+    ///
+    /// One level at a time and bounded: at most [`TREE_LEVEL_CAP`] engrams come
+    /// back, with `total` saying how many the level holds and `truncated`
+    /// saying whether the two differ. `folders` is never cut - it is derived
+    /// from the paths themselves rather than from the rows that survived the
+    /// cap, so a truncated level still names every folder a reader can descend
+    /// into.
+    ///
+    /// `total` counts the level, not the folder: it moves with `depth` and
+    /// leaves out everything nested deeper, so a folder of ten engrams holding a
+    /// subfolder of a thousand reports ten here. The paged listing scoped to the
+    /// same folder ([`Engine::search_engrams_under`]) counts recursively and
+    /// reports the larger number. Neither is the other's approximation: a level
+    /// states a fact about the rows it drew, a folder listing promises the
+    /// folder, and a client that means to say "N engrams in this folder" takes
+    /// the number from the listing.
+    ///
+    /// A `glob` narrows the rows this level returned, so on a truncated level
+    /// it selects within the cap rather than across the whole folder. The tree
+    /// is a navigation aid; a folder too big to draw is what the paged listing
+    /// is for.
     pub async fn browse_domain(&self, p: &BrowseParams) -> Result<Value> {
         // A domain-exists check, not a filesystem-root requirement, so a virtual
         // domain browses.
         self.domain_entry(&p.domain)?;
         let raw = p.path.clone().unwrap_or_else(|| "/".to_string());
-        let prefix = raw.trim_start_matches("./").trim_matches('/').to_string();
-        let depth = p.depth.unwrap_or(1).max(1);
+        let prefix = folder_prefix(&raw);
+        let depth = p.depth.unwrap_or(1).clamp(1, TREE_MAX_DEPTH);
         let matcher = match &p.glob {
             Some(g) => Some(
                 globset::Glob::new(g)
@@ -2992,60 +3996,49 @@ impl Engine {
             None => None,
         };
 
-        let prefix_pat = if prefix.is_empty() {
-            None
-        } else {
-            Some(format!("{prefix}/"))
-        };
+        // Three bounded queries in the store rather than one listing of the
+        // whole domain filtered here: the prefix and the depth cut are pushed
+        // into SQL in every case, the root included, so a client that refetches
+        // its tree can never pull tens of thousands of rows across per request.
         let store = self.store.lock().await;
-        let all = store
-            .list_engrams(&p.domain, prefix_pat.as_deref(), None)
+        let level = store
+            .browse_level(&p.domain, prefix.as_deref(), depth, TREE_LEVEL_CAP)
             .await?;
         drop(store);
 
-        let mut entries = Vec::new();
-        let mut folders: HashSet<String> = HashSet::new();
-        for d in &all {
-            let rel: &str = if prefix.is_empty() {
-                d.path.as_str()
-            } else {
-                d.path
-                    .strip_prefix(&format!("{prefix}/"))
-                    .unwrap_or(&d.path)
-            };
-            if let Some(m) = &matcher
-                && !m.is_match(&d.path)
-            {
-                continue;
-            }
-            let segments: Vec<&str> = rel.split('/').collect();
-            if segments.len() > 1 {
-                folders.insert(segments[0].to_string());
-            }
-            if segments.len() <= depth {
+        // Whether the level was cut is a fact about the rows, decided before the
+        // glob narrows them: a glob that matches two of five hundred rows has
+        // not un-truncated the level, and `total` stays the level's own count so
+        // a client can offer the listing instead.
+        let truncated = level.total > level.engrams.len();
+        let entries: Vec<Value> = level
+            .engrams
+            .iter()
+            .filter(|d| matcher.as_ref().is_none_or(|m| m.is_match(&d.path)))
+            .map(|d| {
                 // `status` rides along with the rest of the descriptor, which
                 // already carries it: a browse row is what a navigation tree is
                 // drawn from, and whether an engram is retired is the one thing
                 // such a tree has to say about a row it is not otherwise
                 // describing. Leaving it out meant every client browsing a
                 // domain had to fetch the listing again to learn it.
-                entries.push(json!({
+                json!({
                     "permalink": d.permalink,
                     "title": d.title,
                     "type": d.engram_type,
                     "status": d.status,
                     "path": d.path,
-                }));
-            }
-        }
-        let mut folders: Vec<String> = folders.into_iter().collect();
-        folders.sort();
+                })
+            })
+            .collect();
 
         Ok(json!({
             "domain": p.domain,
             "path": raw,
-            "folders": folders,
+            "folders": level.folders,
             "engrams": entries,
+            "truncated": truncated,
+            "total": level.total,
         }))
     }
 
@@ -3675,19 +4668,35 @@ impl Engine {
         }))
     }
 
-    /// Export every engram of a domain (file or virtual) from the database to
-    /// `dest` as a normal filesystem engram folder. Refuses to write into a
-    /// non-empty directory unless `force`; `dry_run` reports without writing.
-    pub async fn export_domain(
+    /// Import in-memory engram files - an unpacked archive - into a domain of
+    /// either storage kind, classifying every entry as `create`, `overwrite`,
+    /// `skip`, `invalid` or `ignored`.
+    ///
+    /// One verb backs both the preview and the commit: `dry_run` runs the whole
+    /// classification and writes nothing, so what an operator is shown is what
+    /// the same call would then do. Each kind is written through its own normal
+    /// road rather than a shortcut: a file domain gets the exact incoming bytes
+    /// on disk and is indexed by one targeted [`Engine::sync_paths`] after the
+    /// loop, the same pass the watcher runs for an external edit, and a virtual
+    /// domain is indexed directly because the row is its only source of truth.
+    /// Two files must never claim one permalink, so a permalink already held at
+    /// a different path is refused under both policies - `overwrite` decides
+    /// what happens at the SAME path, nothing more.
+    pub async fn import_domain_files(
         &self,
         domain: &str,
-        dest: &Path,
-        force: bool,
+        files: &[(String, String)],
+        overwrite: bool,
         dry_run: bool,
     ) -> Result<Value> {
-        let entry = self.domain_entry(domain)?;
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        // Delta 2 vs `import_domain`: a file domain is served too, so the source
+        // decides how a write lands rather than being refused outright.
+        let source = self.content_source(domain)?;
         let store = self.store.lock().await;
-        let domain_id = match self.source_of(&entry) {
+        let domain_id = match &source {
             ContentSource::File { root } => {
                 store
                     .upsert_domain(domain, Some(&root.to_string_lossy()), DomainKind::File)
@@ -3699,8 +4708,324 @@ impl Engine {
                     .await?
             }
         };
-        let all = store.all_engram_contents(domain_id).await?;
+        let existing = store.all_engram_contents(domain_id).await?;
         drop(store);
+
+        // The snapshot is taken once, before the loop, and then kept live as the
+        // batch is classified: an entry accepted here claims its path and its
+        // permalink for the rest of the batch, so two files of one archive
+        // claiming one permalink are resolved deterministically in input order
+        // (first wins, second skips) instead of both passing a stale snapshot.
+        let mut path_perms: HashMap<String, String> = HashMap::new();
+        let mut perm_paths: HashMap<String, String> = HashMap::new();
+        for e in &existing {
+            path_perms.insert(e.path.clone(), e.permalink.clone());
+            perm_paths.insert(e.permalink.clone(), e.path.clone());
+        }
+
+        let mut created = 0usize;
+        let mut overwritten = 0usize;
+        let mut skipped = 0usize;
+        let mut invalid = 0usize;
+        let mut ignored = 0usize;
+        // Delta 6: every entry gets a row, whatever became of it.
+        let mut entries: Vec<Value> = Vec::new();
+        let mut changed_paths: Vec<String> = Vec::new();
+
+        // Delta 1: the files arrive in memory, already unpacked by the caller,
+        // so there is no folder to walk and no source directory to validate.
+        for (path, text) in files {
+            // Delta 4: a MANIFEST at any depth is ignored - defense in depth,
+            // the REST layer screens these before the engine ever sees them.
+            // Matched case-insensitively because the filesystem underneath is:
+            // on APFS or NTFS a `manifest.md` entry lands on the domain's real
+            // MANIFEST.md, so an exact-string screen would let a third-party
+            // archive replace the one file a domain cannot regenerate.
+            if Path::new(path)
+                .file_name()
+                .is_some_and(|n| n.eq_ignore_ascii_case("MANIFEST.md"))
+            {
+                entries.push(json!({
+                    "path": path,
+                    "permalink": Value::Null,
+                    "action": "ignored",
+                    "reason": "a MANIFEST belongs to the domain, which keeps its own",
+                }));
+                ignored += 1;
+                continue;
+            }
+            // Only markdown is an engram. Anything else would land in the folder
+            // as junk a sync never walks, or as a row no reader can parse, so it
+            // is reported rather than written.
+            if !path.to_lowercase().ends_with(".md") {
+                entries.push(json!({
+                    "path": path,
+                    "permalink": Value::Null,
+                    "action": "ignored",
+                    "reason": "not a markdown engram file",
+                }));
+                ignored += 1;
+                continue;
+            }
+            // The OKF reserved names are never imported: `index.md` is rebuilt
+            // from the folder it sits in, and `log.md` is reserved without ever
+            // being generated at all, so an import can only damage it.
+            //
+            // Matched case-insensitively, and deliberately stricter than
+            // `crystalline_core::is_reserved_path` (whose exact match is a
+            // documented rule about what Crystalline generates and exports).
+            // Import faces the filesystem instead, and that filesystem is
+            // case-insensitive on APFS and NTFS: a `Log.md` entry renames onto
+            // the existing `log.md`, replacing its bytes while the on-disk name
+            // stays lowercase. Nothing regenerates a log, so that loss is
+            // permanent - the same argument that makes the MANIFEST screen
+            // above case-insensitive.
+            if Path::new(path).file_name().is_some_and(|name| {
+                name.eq_ignore_ascii_case(crystalline_core::INDEX_FILE)
+                    || name.eq_ignore_ascii_case(crystalline_core::LOG_FILE)
+            }) {
+                entries.push(json!({
+                    "path": path,
+                    "permalink": Value::Null,
+                    "action": "ignored",
+                    "reason": "a reserved OKF index or log is never imported",
+                }));
+                ignored += 1;
+                continue;
+            }
+            // An archive is untrusted input and `join_rel` joins segment by
+            // segment, `..` included, so containment is decided before any path
+            // is built: an entry can never address a byte outside the domain.
+            if !is_contained_rel(path) {
+                entries.push(json!({
+                    "path": path,
+                    "permalink": Value::Null,
+                    "action": "invalid",
+                    "reason": "path escapes the domain root",
+                }));
+                invalid += 1;
+                continue;
+            }
+            // Delta 5: unparseable content is a first-class `invalid` entry
+            // carrying the parse error, not a warning on the side.
+            let engram = match parse_engram(text) {
+                Ok(e) => e,
+                Err(e) => {
+                    entries.push(json!({
+                        "path": path,
+                        "permalink": Value::Null,
+                        "action": "invalid",
+                        "reason": e.to_string(),
+                    }));
+                    invalid += 1;
+                    continue;
+                }
+            };
+            // `parse_engram` is deliberately permissive - a file with no
+            // frontmatter at all parses into an engram with empty fields - so
+            // the required OKF keys are checked here. Without them there is
+            // nothing to import: the permalink would be invented from the file
+            // name and the engram would carry no type.
+            if engram.frontmatter.engram_type.trim().is_empty()
+                || engram.frontmatter.title.trim().is_empty()
+            {
+                entries.push(json!({
+                    "path": path,
+                    "permalink": Value::Null,
+                    "action": "invalid",
+                    "reason": "not an engram: the frontmatter needs a type and a title",
+                }));
+                invalid += 1;
+                continue;
+            }
+            let record = EngramRecord::from_engram(&engram, path, virtual_stamp(text));
+
+            // Delta 3: a permalink held at a different path is refused under
+            // BOTH policies - `overwrite` is a same-path decision only.
+            if let Some(held_at) = perm_paths.get(&record.permalink)
+                && held_at != path
+            {
+                entries.push(json!({
+                    "path": path,
+                    "permalink": record.permalink,
+                    "action": "skip",
+                    "reason": format!(
+                        "permalink '{}' already exists at another path",
+                        record.permalink
+                    ),
+                }));
+                skipped += 1;
+                continue;
+            }
+            // A file domain's truth is the file on disk, so an entry that never
+            // made it into the index still counts as existing there.
+            let exists = path_perms.contains_key(path)
+                || match &source {
+                    ContentSource::File { root } => join_rel(root, path).exists(),
+                    ContentSource::Virtual => false,
+                };
+            if exists && !overwrite {
+                entries.push(json!({
+                    "path": path,
+                    "permalink": record.permalink,
+                    "action": "skip",
+                    "reason": format!("'{path}' already exists"),
+                }));
+                skipped += 1;
+                continue;
+            }
+
+            if !dry_run {
+                let outcome = match &source {
+                    // Delta 2: the exact incoming bytes go to disk and the index
+                    // follows afterwards through the targeted sync, so an import
+                    // takes the same road as any external write.
+                    ContentSource::File { root } => {
+                        write_file(&join_rel(root, path), text).map(|()| {
+                            changed_paths.push(path.clone());
+                        })
+                    }
+                    // A virtual domain has no file: the row is the document, so
+                    // the full markdown is indexed directly.
+                    ContentSource::Virtual => {
+                        let stamp = virtual_stamp(text);
+                        let store = self.store.lock().await;
+                        self.index_markdown(&*store, domain_id, path, text, stamp, None, true)
+                            .await
+                            .map(|_| ())
+                    }
+                };
+                if let Err(e) = outcome {
+                    entries.push(json!({
+                        "path": path,
+                        "permalink": record.permalink,
+                        "action": "skip",
+                        "reason": e.to_string(),
+                    }));
+                    skipped += 1;
+                    continue;
+                }
+            }
+
+            if exists {
+                overwritten += 1;
+            } else {
+                created += 1;
+            }
+            entries.push(json!({
+                "path": path,
+                "permalink": record.permalink,
+                "action": if exists { "overwrite" } else { "create" },
+                "reason": Value::Null,
+            }));
+            // Claim both for the rest of the batch. An overwrite that changes an
+            // engram's permalink releases the one that path used to hold, so a
+            // later entry is judged against what the batch will really leave
+            // behind - in a dry run too, where the preview must match the commit.
+            if let Some(prev) = path_perms.insert(path.clone(), record.permalink.clone())
+                && prev != record.permalink
+            {
+                perm_paths.remove(&prev);
+            }
+            perm_paths.insert(record.permalink, path.clone());
+        }
+
+        // Delta 2, after the loop and only once: one targeted sync for the whole
+        // batch, the pass the watcher runs for a small debounced set of paths,
+        // rather than a full rescan or a per-file reindex. A dry run collected
+        // no path here, so it never reaches the sync either.
+        if !changed_paths.is_empty() {
+            self.sync_paths(domain, changed_paths).await?;
+        }
+
+        Ok(json!({
+            "domain": domain,
+            "dry_run": dry_run,
+            "files": entries,
+            "created": created,
+            "overwritten": overwritten,
+            "skipped": skipped,
+            "invalid": invalid,
+            "ignored": ignored,
+        }))
+    }
+
+    /// Every file of a domain as `(domain-relative path, content)`, MANIFEST
+    /// included: the portable view an archive download is built from, byte for
+    /// byte as the domain holds it.
+    ///
+    /// Each storage kind is read from its own source of truth, which is why
+    /// this is not simply `export_domain`'s read half. A file domain's truth is
+    /// the markdown on disk, walked exactly the way a sync walks it: the index
+    /// keeps only the body there, with the frontmatter shredded into columns,
+    /// so reading the store would hand back headerless engrams and a MANIFEST
+    /// that never indexed would go missing entirely. A virtual domain has no
+    /// disk at all - the row IS the file, and it carries the full text.
+    pub async fn domain_files(&self, domain: &str) -> Result<Vec<(String, String)>> {
+        let entry = self.domain_entry(domain)?;
+        match self.source_of(&entry) {
+            ContentSource::File { root } => {
+                let mut files = Vec::new();
+                for (rel, abs) in walk_markdown(&root) {
+                    // The OKF reserved names are excluded, as everywhere else:
+                    // `index.md` is generated from the folder it sits in and
+                    // regenerates itself wherever this archive is restored,
+                    // and writing either name back is refused by design.
+                    if crystalline_core::is_reserved_path(&rel) {
+                        continue;
+                    }
+                    match std::fs::read_to_string(&abs) {
+                        Ok(text) => files.push((rel, text)),
+                        // One unreadable or non-UTF-8 file must not deny the
+                        // operator the rest of the backup: it is skipped and
+                        // logged rather than failing the whole archive.
+                        Err(e) => {
+                            tracing::warn!("archive of '{domain}' skipped '{rel}': {e}");
+                        }
+                    }
+                }
+                Ok(files)
+            }
+            ContentSource::Virtual => {
+                let store = self.store.lock().await;
+                let domain_id = store
+                    .upsert_domain(domain, None, DomainKind::Virtual)
+                    .await?;
+                let all = store.all_engram_contents(domain_id).await?;
+                drop(store);
+                Ok(all.into_iter().map(|e| (e.path, e.content)).collect())
+            }
+        }
+    }
+
+    /// Export every file of a domain (file or virtual) to `dest` as a normal
+    /// filesystem engram folder. Refuses to write into a non-empty directory
+    /// unless `force`; `dry_run` reports without writing.
+    ///
+    /// The read half is [`Engine::domain_files`], the same one the archive
+    /// download uses, so an export is a copy of the domain rather than a
+    /// re-serialization of the index: a file domain hands over its exact disk
+    /// bytes (frontmatter included, MANIFEST included), a virtual domain the
+    /// full text of every row, and the OKF reserved names are excluded from
+    /// both. Reading the store directly instead - the shape this verb had -
+    /// wrote frontmatter-less markdown for file domains, since their index
+    /// rows keep only the body, and silently dropped MANIFEST.md.
+    ///
+    /// Report shape follows from that source: `domain_files` carries
+    /// `(path, content)` and no permalink column, so each row reports its
+    /// path and byte count instead of the former path/permalink pair. Parsing
+    /// every body back just to re-derive a permalink would re-introduce the
+    /// re-serialization this verb exists to avoid, and no caller reads the
+    /// field: the two callers (`ctl` and the daemonless CLI) print the report
+    /// as-is.
+    pub async fn export_domain(
+        &self,
+        domain: &str,
+        dest: &Path,
+        force: bool,
+        dry_run: bool,
+    ) -> Result<Value> {
+        let all = self.domain_files(domain).await?;
 
         if !dry_run && dir_is_nonempty(dest) && !force {
             return Err(EngineError::Conflict(format!(
@@ -3711,13 +5036,13 @@ impl Engine {
 
         let mut written = 0usize;
         let mut files: Vec<Value> = Vec::new();
-        for e in &all {
-            files.push(json!({ "path": e.path, "permalink": e.permalink }));
+        for (path, content) in &all {
+            files.push(json!({ "path": path, "bytes": content.len() }));
             if dry_run {
                 continue;
             }
-            let abs = join_rel(dest, &e.path);
-            write_file(&abs, &e.content)?;
+            let abs = join_rel(dest, path);
+            write_file(&abs, content)?;
             written += 1;
         }
 
@@ -4319,15 +5644,19 @@ impl Engine {
     // --- provision ---------------------------------------------------------
 
     /// Whether any registered domain currently declares a `## Provisioning`
-    /// section in its MANIFEST, the gate for the `provision` MCP tool's
-    /// visibility: a fresh install with no such domain never sees the tool at
-    /// all, zero context cost. Wraps
+    /// section in its MANIFEST, the gate on the `provision` MCP tool's
+    /// mutating actions: with no such domain, `allow`, `deny` and `apply`
+    /// refuse rather than report a reconcile that touched nothing. It used to
+    /// gate the tool's visibility instead, which MCP 2026-07-28 forbids
+    /// (SEP-2567: a tool list must not vary as a side effect of other requests
+    /// on the connection, and `add_domain` and `update_domain` can create a
+    /// declaration mid-session). Wraps
     /// [`crystalline_core::provision::any_domain_declares`] against the live
     /// effective config, read fresh off the config lock on every call rather
     /// than cached - the same cost class as `routing_text`, since a domain's
     /// MANIFEST can gain or lose a `Provisioning` section between calls (a
     /// freshly added domain, or an `update_domain` pull) and the very next
-    /// `list_tools` must reflect that.
+    /// `provision` call must reflect that.
     pub fn provisioning_declared(&self) -> bool {
         crystalline_core::provision::any_domain_declares(&self.config.read().unwrap())
     }
@@ -4628,6 +5957,102 @@ impl Engine {
             "kind": "virtual",
             "manifest_created": manifest_created,
             "registered": is_new,
+        }))
+    }
+
+    /// Unregister a domain: the config entry goes, the watcher and discovery
+    /// forget it and its index rows are cleared so search stops serving it.
+    /// Files are never touched - for a file domain they stay on disk exactly
+    /// as they are (re-adding the folder re-adopts them); a virtual domain's
+    /// rows ARE its truth, so callers should export first and their
+    /// confirmation copy must say the knowledge is gone. "Index rows cleared"
+    /// means the engram rows only: the store's domain row itself is left in
+    /// place (`Store::clear_domain` keeps it by design), so a later re-add of
+    /// the same name adopts the same row rather than minting a new one.
+    ///
+    /// Known race: the config write (name freed) is persisted and both config
+    /// locks release before the tail runs `forget_domain` and `clear_domain`.
+    /// No lock in this engine currently serializes `domain_remove` against a
+    /// concurrent `domain_add_local`/`domain_add_virtual` for the same name
+    /// (the daemon spawns each connection independently, and the admin verbs
+    /// only hold `file_config`/`config` for their brief mutate-and-persist
+    /// step, not the whole call - `origin_lock` exists but serializes only
+    /// the origin verbs against each other, not these). A same-name add
+    /// racing into that window has its fresh watcher registration dropped and
+    /// its freshly-indexed rows wiped by this call's tail, since both resolve
+    /// the same `DomainId` by name. Closing this needs the add verbs to take
+    /// the same per-name lock this verb would need to hold across its own
+    /// tail, which is a cross-verb change out of scope here; a caller that
+    /// cannot tolerate the window should serialize admin mutations for a
+    /// given name at its own layer - which the REST surface does, in
+    /// `RestState::domain_admin`: one mutex held across the whole of a create
+    /// and the whole of an unregister.
+    pub async fn domain_remove(&self, name: &str) -> Result<Value> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+
+        // Same file-lock persist dance as `domain_add_local`: file_config
+        // write lock, clone, mutate, persist_config, overlay.apply, write
+        // both locks - same order. The miss is classified before persisting
+        // anything. Scoped in a block, mirroring the sibling verbs, so the
+        // guard is released well before the awaits that follow.
+        let removed = {
+            let mut file_guard = self.file_config.write().unwrap();
+            let mut file = file_guard.clone();
+            let removed = match file.domains.shift_remove(name) {
+                Some(entry) => entry,
+                None => {
+                    // A miss in the file config may be an env-defined domain:
+                    // those are immune to `domain_remove` (the variable is
+                    // their source of truth), mirroring `cmd::domain_remove`.
+                    if let Some(env) = self.overlay.env_domain(name) {
+                        return Err(EngineError::Conflict(format!(
+                            "domain '{name}' is defined by the environment variable {}; unset it to manage this domain in the config file",
+                            env.var
+                        )));
+                    }
+                    return Err(EngineError::UnknownDomain {
+                        domain: name.to_string(),
+                        registered: self.known_domain_names(),
+                    });
+                }
+            };
+            self.persist_config(&file)?;
+            let effective = self.overlay.apply(&file);
+            *file_guard = file;
+            *self.config.write().unwrap() = effective;
+            removed
+        };
+        // Record whether the entry was a file domain before removing it.
+        let files_kept = !removed.is_virtual();
+
+        // Tell the runtime: drop it from the discovered overlay and stop
+        // watching its root.
+        self.forget_domain(name);
+
+        // Index rows: resolve the DomainId the way `reindex(full)` does
+        // before it calls `clear_domain` and clear them. The domain row
+        // stays either way (idempotent upsert); only the engram rows matter.
+        let kind = if removed.is_virtual() {
+            DomainKind::Virtual
+        } else {
+            DomainKind::File
+        };
+        let path = removed.file_path();
+        let path_str = path.as_ref().map(|p| p.to_string_lossy());
+        let store = self.store.lock().await;
+        let domain_id = store.upsert_domain(name, path_str.as_deref(), kind).await?;
+        store.clear_domain(domain_id).await?;
+        drop(store);
+
+        self.refresh_routing_cache().await;
+
+        Ok(json!({
+            "domain": name,
+            "unregistered": true,
+            "files_kept": files_kept,
+            "index_cleared": true,
         }))
     }
 
@@ -5635,6 +7060,71 @@ impl Engine {
             .clone()
     }
 
+    /// The per-file lock every content write holds across its whole
+    /// read-decide-write, created lazily on first use and keyed by the file's
+    /// canonical path.
+    ///
+    /// What it closes is a time-of-check-to-time-of-use race, not a partial
+    /// write. Each of the file-domain writes looks at the world and then acts
+    /// on what it saw, and between those two steps another writer fits:
+    ///
+    /// - [`Engine::save_engram`], [`Engine::save_manifest`] and
+    ///   [`Engine::delete_engram`] read the file, hash it and compare that
+    ///   against the caller's `expected_checksum`. Unlocked, two saves of one
+    ///   engram arriving together (two browser tabs, or one tab whose autosave
+    ///   overlaps a manual save) both read the same text, both find their token
+    ///   fresh and both write. One author's version then wins on disk while the
+    ///   other is told the save succeeded, which is precisely the outcome
+    ///   `If-Match` exists to prevent.
+    /// - [`Engine::write_engram_as`] checks that the permalink is free and then
+    ///   creates the file. Two creates of one title would both find it free and
+    ///   both write, and the second would answer 201 over the first's body
+    ///   rather than the 409 that says it was already taken.
+    /// - [`Engine::edit_engram_as`] and [`Engine::retire_engram_as`] serialize
+    ///   their read-modify-write under the lock: each reads the file, applies
+    ///   its operation to that text and writes the result. Two edits, or an
+    ///   agent's edit racing a browser's save, would each compute from a
+    ///   version the other has already replaced, and the last write would
+    ///   silently drop the other's change; under the lock the second one reads
+    ///   the first's result and applies to that instead. `edit_engram_as`
+    ///   additionally compares an `expected_checksum` there when one is
+    ///   supplied (see [`crate::params::EditParams`]), refusing a stale edit
+    ///   rather than merely serializing it. A retirement takes its successor's
+    ///   lock too, for the reciprocal line it appends there, but never at the
+    ///   same time as its target's.
+    ///
+    /// Held across the whole sequence, the second caller sees the first's bytes
+    /// and either refuses or builds on them.
+    ///
+    /// Keyed by the file's own identity rather than by `domain/permalink`, so
+    /// two domains registered over one root, or over two spellings of one path,
+    /// still serialize on the file itself: the key is
+    /// [`canonicalize`](std::fs::canonicalize)d where the filesystem can
+    /// resolve it, which covers symlinks and `..` segments, and falls back to
+    /// the path as given for a file that does not exist yet - a create and a
+    /// save of one engram therefore share a key only once the file is there,
+    /// which is exactly when both are reading it. Taken before the store lock,
+    /// always, so the two never invert; virtual domains take neither, since
+    /// their compare-and-swap happens inside a single database statement.
+    ///
+    /// The map is never pruned, like [`Engine::origin_locks`]: an entry is a
+    /// path string and an `Arc`, and the set of files a process ever writes is
+    /// bounded by the installation.
+    ///
+    /// **In-process only.** Two Crystalline processes over one domain root are
+    /// not held apart by this; the host-lock machinery governs that.
+    fn write_lock(&self, abs: &Path) -> Arc<tokio::sync::Mutex<()>> {
+        // Computed before the map-wide guard is taken: `canonicalize` is a
+        // blocking stat, and every other file's lookup would otherwise queue
+        // behind it while it resolves this one's path.
+        let key = lock_key(abs);
+        let mut locks = self.write_locks.lock().unwrap();
+        locks
+            .entry(key)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
     /// The base directory per-domain origin state lives under: the test
     /// override, or the real state directory.
     fn origins_base_dir(&self) -> Result<PathBuf> {
@@ -5890,6 +7380,88 @@ impl Engine {
         Ok(github)
     }
 
+    /// The token-store host this connect targets: `github.api_url`'s bare
+    /// Enterprise Server host, or `None` for GitHub.com. The same derivation
+    /// [`Engine::origin_connection_json`] uses, so status, readiness and
+    /// disconnect can never look at a different credential slot than
+    /// team-domain operations do - on a GitHub Enterprise instance the GHES
+    /// token is the one read (and deleted), never an empty github.com slot.
+    fn github_token_host(&self) -> Option<String> {
+        let api_url = self
+            .config
+            .read()
+            .unwrap()
+            .github
+            .as_ref()
+            .and_then(|g| g.api_url.clone());
+        origin::token_host(api_url.as_deref())
+    }
+
+    /// The connection as a settings surface polls it. Mirrors
+    /// configure_connection_block's lifecycle handling (the MCP view) so the
+    /// two surfaces can never disagree about a pending or finished flow: a
+    /// finished failure is reported exactly once via the outcome slot, and a
+    /// finished success is simply visible as connected (the token was saved).
+    pub async fn github_connection(&self) -> Result<GithubConnection> {
+        let error = match self.take_finished_pending() {
+            Some(Err(e)) => Some(e.to_string()),
+            _ => None,
+        };
+        let host = self.github_token_host();
+        let (store, token) = self.github_credential(host.as_deref())?;
+        let pending = self.pending_view().map(|v| GithubPending {
+            user_code: v["user_code"].as_str().unwrap_or_default().to_string(),
+            verification_url: v["verification_url"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            expires_in_secs: v["expires_in_secs"].as_u64().unwrap_or_default(),
+        });
+        Ok(GithubConnection {
+            enabled: self.github_enabled(),
+            connected: token.is_some(),
+            user: token
+                .as_ref()
+                .and_then(|t| t.user_display())
+                .map(str::to_string),
+            token_store: token.is_some().then(|| store.kind().to_string()),
+            pending,
+            error,
+        })
+    }
+
+    /// Whether team-domain registration can succeed right now.
+    pub async fn github_ready(&self) -> bool {
+        if !self.github_enabled() {
+            return false;
+        }
+        let host = self.github_token_host();
+        matches!(self.github_credential(host.as_deref()), Ok((_, Some(_))))
+    }
+
+    /// Forget the stored credential: delete it where it lives, drop the
+    /// in-process cache and cancel any pending device flow. Refuses under an
+    /// environment token (only the environment can retire it) and on a
+    /// read-only instance. github.enabled is untouched: turning the feature
+    /// off stays a configure concern.
+    pub async fn github_disconnect(&self) -> Result<Value> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        let host = self.github_token_host();
+        let (store, token) = self.github_credential(host.as_deref())?;
+        if matches!(store, TokenStore::Env { .. }) {
+            return Err(EngineError::EnvTokenConnect);
+        }
+        let kind = store.kind();
+        if token.is_some() {
+            store.delete().map_err(EngineError::Remote)?;
+        }
+        self.github_tokens.lock().unwrap().clear();
+        *self.pending_connect.lock().unwrap() = None;
+        Ok(json!({ "connected": false, "token_store": kind }))
+    }
+
     /// Wraps a `github` block with the settings registry snapshot, the full
     /// shape the `configure` tool always returns.
     fn configure_snapshot_with(&self, github: Value) -> Result<Value> {
@@ -5900,7 +7472,42 @@ impl Engine {
     /// The `configure` tool's plain snapshot: every registry setting plus
     /// the GitHub connection block. Used for a bare call and after applying
     /// `set`/`unset`.
+    ///
+    /// With `github.enabled` off the connection block is `{ github_enabled:
+    /// false, note }` and nothing else: no `connected`, no `user`, no
+    /// `token_store`, no `pending_connect`. Absent rather than false on
+    /// purpose - a `connected: false` would be a claim about a credential
+    /// this call deliberately did not read, and reading it is the thing the
+    /// gate exists to prevent (on a real machine that read is an OS keychain
+    /// touch, for a feature that is switched off). What a disabled instance
+    /// reports is the feature's state and how to turn it on, which is the
+    /// only actionable thing at that moment: `configure` stays visible with
+    /// GitHub off precisely so it can be enabled.
+    ///
+    /// The gate sits ABOVE [`Engine::configure_connection_block`], whose
+    /// first act is draining a landed device-flow outcome. That placement is
+    /// deliberate: gating below the drain would leave only two options, both
+    /// wrong - report the landed outcome (connection facts on a disabled
+    /// instance) or drain and swallow it (destroying the one thing a
+    /// report-once contract cannot survive). Above the drain the outcome
+    /// stays in the slot and is still reported exactly once, by the next
+    /// connect call or by the settings surface through
+    /// [`Engine::github_connection`], which drains for itself. The only
+    /// change is that a bare `configure` stops being one of the surfaces
+    /// that report it while the feature is off.
+    ///
+    /// The connect paths are NOT gated: [`Engine::connect_with_token`] and
+    /// [`Engine::start_device_connect`] build their own block and go through
+    /// [`Engine::configure_snapshot_with`], so connecting with
+    /// `github.enabled` off still reports the connection and says so in its
+    /// note. Connecting and enabling are independent and either order works.
     pub async fn configure_snapshot(&self) -> Result<Value> {
+        if !self.github_enabled() {
+            return self.configure_snapshot_with(json!({
+                "github_enabled": false,
+                "note": "GitHub is switched off on this instance; set github.enabled true with configure to connect or read the connection.",
+            }));
+        }
         let github = self.configure_connection_block().await?;
         self.configure_snapshot_with(github)
     }
@@ -6138,6 +7745,31 @@ fn connect_enablement_note(enabled: bool, pending: bool) -> &'static str {
             "Connected with github.enabled off; set it to true with configure when you want team domains."
         }
     }
+}
+
+/// The GitHub connection as a settings screen needs it: never any token
+/// material, only where the credential lives and who it authenticates.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GithubConnection {
+    /// The github.enabled switch (team tools and polling).
+    pub enabled: bool,
+    pub connected: bool,
+    /// The account login, when connected.
+    pub user: Option<String>,
+    /// "keyring" | "file" | "environment", when connected.
+    pub token_store: Option<String>,
+    /// A device flow waiting for the browser side.
+    pub pending: Option<GithubPending>,
+    /// The once-reported failure of the last device flow (expired, denied);
+    /// present on exactly one status read, then cleared.
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GithubPending {
+    pub user_code: String,
+    pub verification_url: String,
+    pub expires_in_secs: u64,
 }
 
 /// One in-flight GitHub device-flow sign-in, held by
@@ -6678,6 +8310,30 @@ fn read_engram_file(root: &Path, rel: &str) -> Option<Engram> {
 /// (non-canonical) path when it no longer resolves, so a domain whose folder
 /// moved away still compares by its last-known path instead of silently
 /// dropping out of the comparison. A virtual domain has no path, so `None`.
+/// The [`Engine::write_locks`] key for a file: its canonical path wherever the
+/// filesystem can resolve one, so two spellings of one file - a symlinked
+/// domain root, a `..` segment, a case difference the filesystem folds - share
+/// a lock instead of each getting their own.
+///
+/// A file that does not exist yet cannot be canonicalized, and a create is
+/// exactly that case, so the parent folder is resolved instead and the filename
+/// joined back on. When even the parent is missing (a create that will also
+/// make the folder) the path as given is the key: still stable, and still the
+/// same string for two creates racing on one target, since both derive it from
+/// the same registered root. The same fallback ladder
+/// [`canonicalized_file_path`] uses for a domain root, one level deeper.
+fn lock_key(abs: &Path) -> String {
+    if let Ok(canonical) = std::fs::canonicalize(abs) {
+        return canonical.to_string_lossy().into_owned();
+    }
+    if let (Some(parent), Some(name)) = (abs.parent(), abs.file_name())
+        && let Ok(canonical) = std::fs::canonicalize(parent)
+    {
+        return canonical.join(name).to_string_lossy().into_owned();
+    }
+    abs.to_string_lossy().into_owned()
+}
+
 fn canonicalized_file_path(entry: &DomainEntry) -> Option<PathBuf> {
     let path = entry.file_path()?;
     Some(std::fs::canonicalize(&path).unwrap_or(path))
@@ -6800,6 +8456,33 @@ fn join_rel(root: &Path, rel: &str) -> PathBuf {
     p
 }
 
+/// Whether a domain-relative path may be joined onto a domain root at all:
+/// every segment has to be an ordinary name. [`join_rel`] pushes what it is
+/// given segment by segment and would happily push a `..`, so untrusted input -
+/// an archive entry above all - is screened here before any path is built. A
+/// backslash or a colon inside a segment is refused too: both are separators or
+/// drive and stream markers on Windows, where a name that looks contained on
+/// one platform escapes on another.
+fn is_contained_rel(rel: &str) -> bool {
+    !rel.is_empty()
+        && !Path::new(rel).is_absolute()
+        && rel
+            .split('/')
+            .all(|seg| !seg.is_empty() && seg != "." && seg != ".." && !seg.contains(['\\', ':']))
+}
+
+/// A domain-relative folder as the store's path prefix: the trailing slash is
+/// what makes the match a folder rather than a string, so `notes` selects
+/// `notes/deep/y.md` and never the sibling `notes-misc/z.md`.
+///
+/// The root - an empty value, `/` or `./` - is `None`, meaning the whole
+/// domain. Written once and shared by the tree and the folder-scoped listing,
+/// so the two can never disagree about what a folder is.
+fn folder_prefix(raw: &str) -> Option<String> {
+    let trimmed = raw.trim_start_matches("./").trim_matches('/');
+    (!trimmed.is_empty()).then(|| format!("{trimmed}/"))
+}
+
 /// Normalize a destination into a forward-slashed `.md` path.
 fn normalize_md(dest: &str) -> String {
     let trimmed = dest.trim_start_matches("./").trim_matches('/');
@@ -6821,6 +8504,10 @@ fn write_file(abs: &Path, contents: &str) -> Result<()> {
     write_bytes(abs, contents.as_bytes())
 }
 
+/// Distinguishes one write's temp file from another's within this process. See
+/// [`write_bytes`].
+static TEMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn write_bytes(abs: &Path, contents: &[u8]) -> Result<()> {
     if let Some(parent) = abs.parent() {
         std::fs::create_dir_all(parent).map_err(|source| EngineError::Io {
@@ -6828,8 +8515,15 @@ fn write_bytes(abs: &Path, contents: &[u8]) -> Result<()> {
             source,
         })?;
     }
-    // Write to a sibling temp then rename so the watcher never sees a partial file.
-    let tmp = abs.with_extension(format!("md.tmp.{}", std::process::id()));
+    // Write to a sibling temp then rename so the watcher never sees a partial
+    // file. The name carries a process-lifetime counter as well as the pid:
+    // the pid alone gives every writer in this process the same temp path, so
+    // two writes to one file racing inside one daemon would interleave their
+    // bytes there and rename the blend into place. Per-file locking keeps the
+    // guarded verbs off each other, but the counter is what makes the temp
+    // file private to a single write whichever path produced it.
+    let seq = TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = abs.with_extension(format!("md.tmp.{}.{seq}", std::process::id()));
     std::fs::write(&tmp, contents).map_err(|source| EngineError::Io {
         path: tmp.display().to_string(),
         source,
@@ -7173,7 +8867,7 @@ mod context_rank_tests {
 }
 
 #[cfg(test)]
-mod origin_lock_tests {
+mod lock_tests {
     use super::*;
     use crystalline_core::config::DomainEntry;
     use crystalline_index::TursoStore;
@@ -7213,5 +8907,313 @@ mod origin_lock_tests {
         let second = engine.origin_lock_registered("known").unwrap();
         assert!(Arc::ptr_eq(&first, &second), "the lock is created once");
         assert_eq!(engine.origin_locks.lock().unwrap().len(), 1);
+    }
+
+    /// One lock per file, whoever asks for it.
+    #[tokio::test]
+    async fn one_file_has_one_write_lock() {
+        let engine = engine_with_domains(&["known"]).await;
+        let first = engine.write_lock(Path::new("/roots/known/alpha.md"));
+        let second = engine.write_lock(Path::new("/roots/known/alpha.md"));
+        assert!(Arc::ptr_eq(&first, &second), "the lock is created once");
+        let other = engine.write_lock(Path::new("/roots/known/beta.md"));
+        assert!(!Arc::ptr_eq(&first, &other), "and it is per file");
+        assert_eq!(engine.write_locks.lock().unwrap().len(), 2);
+    }
+
+    /// Two spellings of one file share a lock, which is the point of keying on
+    /// the canonical path: a domain registered through a symlink and the same
+    /// domain registered at its real path are two strings for one file, and two
+    /// locks over one file are no lock at all.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn one_file_reached_two_ways_still_has_one_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("eng");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("alpha.md"), "x").unwrap();
+        let linked = tmp.path().join("linked");
+        std::os::unix::fs::symlink(&root, &linked).unwrap();
+
+        let engine = engine_with_domains(&["known"]).await;
+        let direct = engine.write_lock(&root.join("alpha.md"));
+        let through_link = engine.write_lock(&linked.join("alpha.md"));
+        assert!(
+            Arc::ptr_eq(&direct, &through_link),
+            "the symlinked spelling resolves to the same file, so to the same lock"
+        );
+        // And a file that does not exist yet - a create - still resolves
+        // through its folder, so the create and the first save of one engram
+        // agree on the key.
+        let unborn = engine.write_lock(&root.join("beta.md"));
+        let unborn_linked = engine.write_lock(&linked.join("beta.md"));
+        assert!(Arc::ptr_eq(&unborn, &unborn_linked));
+        assert_eq!(engine.write_locks.lock().unwrap().len(), 2);
+    }
+
+    /// A file-domain engine over `root`, with whatever files were written into
+    /// it already indexed.
+    async fn file_engine(root: &Path) -> Arc<Engine> {
+        let store = TursoStore::open_in_memory().await.unwrap();
+        let mut config = GlobalConfig::default();
+        config
+            .domains
+            .insert("eng".to_string(), DomainEntry::file(root));
+        let engine = Arc::new(Engine::new(Arc::new(Mutex::new(store)), config, None, None));
+        engine.sync(None).await.unwrap();
+        engine
+    }
+
+    /// The markdown of a minimal engram, for the tests below.
+    fn engram(title: &str, permalink: &str, body: &str) -> String {
+        format!(
+            "---\ntype: engram\ntitle: {title}\npermalink: {permalink}\ntags:\n  - eng\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n{body}\n"
+        )
+    }
+
+    /// A create checks that the permalink is free *inside* the file's lock, so
+    /// two creates of one title cannot both find it free.
+    ///
+    /// Unlocked, the second create writes over the first's body and answers
+    /// "created" rather than the conflict that says the name was taken - the
+    /// worse half of the pair, because the caller is told it succeeded. Driven
+    /// the same way as the save test: the lock is held from outside while the
+    /// create is in flight, the engram it is about to claim is landed and
+    /// indexed underneath it, and the create must then refuse.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_create_checks_the_permalink_is_free_inside_the_file_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("eng");
+        std::fs::create_dir_all(&root).unwrap();
+        let engine = file_engine(&root).await;
+
+        let abs = root.join("beta.md");
+        let lock = engine.write_lock(&abs);
+        let held = lock.lock().await;
+
+        let creator = engine.clone();
+        let task = tokio::spawn(async move {
+            creator
+                .write_engram(&WriteParams {
+                    domain: "eng".to_string(),
+                    title: "Beta".to_string(),
+                    content: "Mine.".to_string(),
+                    folder: None,
+                    engram_type: None,
+                    tags: Vec::new(),
+                    status: None,
+                    metadata: None,
+                    overwrite: false,
+                })
+                .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !task.is_finished(),
+            "the create must be waiting on the file lock, not already past its existence check"
+        );
+
+        // The other writer got there first: the file lands and is indexed while
+        // this create is blocked.
+        let theirs = engram("Beta", "beta", "Theirs.");
+        std::fs::write(&abs, &theirs).unwrap();
+        engine.sync(None).await.unwrap();
+        drop(held);
+
+        match task.await.unwrap() {
+            Err(EngineError::Conflict(message)) => assert!(
+                message.contains("already exists"),
+                "the conflict says the name was taken: {message}"
+            ),
+            other => panic!("the create claimed a permalink that was already gone: {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(&abs).unwrap(),
+            theirs,
+            "and the other writer's engram is untouched"
+        );
+    }
+
+    /// An edit reads, applies and writes inside the file's lock, so a
+    /// concurrent write is built on rather than dropped.
+    ///
+    /// This edit carries no `expected_checksum`, which is still legal - last
+    /// write wins, and serializing is the entire guarantee: what must not
+    /// happen is the edit computing from text that has already been replaced
+    /// and then writing that computation over the replacement. Here the other
+    /// writer's line lands while the edit is blocked, and both lines have to
+    /// survive.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_edit_reads_and_writes_inside_the_file_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("eng");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("alpha.md"), engram("Alpha", "alpha", "The body.")).unwrap();
+        let engine = file_engine(&root).await;
+
+        let abs = root.join("alpha.md");
+        let lock = engine.write_lock(&abs);
+        let held = lock.lock().await;
+
+        let editor = engine.clone();
+        let task = tokio::spawn(async move {
+            let params: EditParams = serde_json::from_value(json!({
+                "identifier": "alpha",
+                "domain": "eng",
+                "operation": "append",
+                "content": "From the agent.\n",
+            }))
+            .unwrap();
+            editor.edit_engram(&params).await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !task.is_finished(),
+            "the edit must be waiting on the file lock, not already holding stale text"
+        );
+
+        // The other writer's change lands while the edit is blocked.
+        std::fs::write(
+            &abs,
+            engram("Alpha", "alpha", "The body.\n\nFrom the browser."),
+        )
+        .unwrap();
+        drop(held);
+
+        task.await.unwrap().expect("the edit applies");
+        let final_text = std::fs::read_to_string(&abs).unwrap();
+        assert!(
+            final_text.contains("From the browser."),
+            "the concurrent write must not be silently dropped: {final_text}"
+        );
+        assert!(
+            final_text.contains("From the agent."),
+            "and the edit still applied, on top of it: {final_text}"
+        );
+    }
+
+    /// A save reports where the engram answers *after* it landed, which is not
+    /// always where it was addressed: the document is written verbatim, so an
+    /// author may have edited the `permalink` line in it, and the index takes
+    /// the permalink from the file. A receipt naming the old address would send
+    /// the caller to a permalink nothing resolves.
+    #[tokio::test]
+    async fn a_save_that_renames_reports_the_new_permalink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("eng");
+        std::fs::create_dir_all(&root).unwrap();
+        let original = engram("Alpha", "alpha", "The body.");
+        std::fs::write(root.join("alpha.md"), &original).unwrap();
+        let engine = file_engine(&root).await;
+
+        let renamed = original.replace("permalink: alpha", "permalink: renamed");
+        let receipt = engine
+            .save_engram(&SaveParams {
+                domain: "eng".to_string(),
+                identifier: "alpha".to_string(),
+                content: renamed.clone(),
+                expected_checksum: sha256_hex(original.as_bytes()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            receipt["permalink"], "renamed",
+            "the receipt names where the engram now answers"
+        );
+        assert_eq!(receipt["path"], "alpha.md", "the file did not move");
+        assert_eq!(
+            std::fs::read_to_string(root.join("alpha.md")).unwrap(),
+            renamed,
+            "and the bytes are the author's own"
+        );
+
+        // An ordinary save still reports the address it was given.
+        let plain = renamed.replace("The body.", "A sharper body.");
+        let receipt = engine
+            .save_engram(&SaveParams {
+                domain: "eng".to_string(),
+                identifier: "renamed".to_string(),
+                content: plain.clone(),
+                expected_checksum: sha256_hex(renamed.as_bytes()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(receipt["permalink"], "renamed");
+    }
+
+    /// A save reads the file it is comparing against *inside* the per-file
+    /// lock, which is what makes `If-Match` mean anything when two saves of one
+    /// engram arrive together.
+    ///
+    /// Asserted by holding the lock from outside and rewriting the file while
+    /// the save is blocked on it, which is exactly what a first writer does.
+    /// A save that read and hashed before taking the lock would have compared
+    /// against the original bytes, found its token fresh and overwritten the
+    /// other author's work; a save that reads inside sees the new bytes and
+    /// refuses. Two properties are checked, and the pair is what pins the
+    /// order: that the save cannot finish while the lock is held, and that it
+    /// then fails against the text that landed in the meantime. Driving it
+    /// through two concurrent HTTP saves instead would prove nothing - the
+    /// request round trip is long enough that they serialize by themselves,
+    /// whether or not anything holds them apart.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_save_compares_inside_the_file_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("eng");
+        std::fs::create_dir_all(&root).unwrap();
+        let original = "---\ntype: engram\ntitle: Alpha\npermalink: alpha\ntags:\n  - eng\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\nThe original.\n";
+        std::fs::write(root.join("alpha.md"), original).unwrap();
+        let store = TursoStore::open_in_memory().await.unwrap();
+        let mut config = GlobalConfig::default();
+        config
+            .domains
+            .insert("eng".to_string(), DomainEntry::file(&root));
+        let engine = Arc::new(Engine::new(Arc::new(Mutex::new(store)), config, None, None));
+        engine.sync(None).await.unwrap();
+
+        let abs = root.join("alpha.md");
+        let lock = engine.write_lock(&abs);
+        let held = lock.lock().await;
+
+        let saver = engine.clone();
+        let mine = original.replace("The original.", "Mine.");
+        let expected = sha256_hex(original.as_bytes());
+        let task = tokio::spawn(async move {
+            saver
+                .save_engram(&SaveParams {
+                    domain: "eng".to_string(),
+                    identifier: "alpha".to_string(),
+                    content: mine,
+                    expected_checksum: expected,
+                })
+                .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !task.is_finished(),
+            "the save must be waiting on the file lock, not already past its comparison"
+        );
+
+        // What the other writer did while this save was blocked.
+        let theirs = original.replace("The original.", "Theirs.");
+        std::fs::write(&abs, &theirs).unwrap();
+        drop(held);
+
+        let outcome = task.await.unwrap();
+        match outcome {
+            Err(EngineError::Conflict(message)) => assert!(
+                message.starts_with("stale edit"),
+                "the conflict speaks the shared wording: {message}"
+            ),
+            other => panic!("the save compared against bytes that were already gone: {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(&abs).unwrap(),
+            theirs,
+            "and the other writer's version is still the one on disk"
+        );
     }
 }

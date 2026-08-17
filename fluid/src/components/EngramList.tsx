@@ -26,7 +26,9 @@ import type { EngramPage, EngramRow } from "../api/engrams";
 import { hasNextPage as envelopeHasNext } from "../api/engrams";
 import { RETIRED_CLASS, isRetired } from "../lifecycle";
 import { engramRoute } from "../paths";
-import { snippetParts } from "../snippet";
+import { ENGRAM_PREFETCH } from "../prefetch";
+import { snippetParts, stripSnippetMarkup } from "../snippet";
+import { Chip, statusVariant } from "./primitives";
 
 /** How tall one row is, in pixels. The tests scroll by it, so it is exported. */
 export const ENGRAM_ROW_HEIGHT = 76;
@@ -49,11 +51,22 @@ export interface EngramListProps {
    */
   highlight?: string[];
   /**
-   * What the envelope itself says, drawn above the rows. Search uses it for the
-   * mode that actually ran, which is a fact about the page rather than about
+   * What the envelope itself says, drawn above the rows, given the envelope and
+   * how many rows are in hand across the pages loaded so far. Search uses it for
+   * the mode that actually ran, which is a fact about the page rather than about
    * any row, and which matters just as much when the page is empty.
+   *
+   * A caller that gives one owns the whole status line: the count this list
+   * would otherwise draw is its to say, because two lines stacked above the
+   * rows saying near enough the same thing is what that replaced.
    */
-  summary?: (page: EngramPage) => ReactNode;
+  summary?: (page: EngramPage, shown: number) => ReactNode;
+  /**
+   * The way out of an empty answer, drawn under the empty message. Only a
+   * caller knows whether there is one: an empty search under a filter can be
+   * widened, and an empty folder cannot.
+   */
+  emptyActions?: ReactNode;
 }
 
 export function EngramList({
@@ -63,6 +76,7 @@ export function EngramList({
   emptyMessage,
   highlight = [],
   summary,
+  emptyActions,
 }: EngramListProps) {
   const scroller = useRef<HTMLDivElement>(null);
 
@@ -124,23 +138,34 @@ export function EngramList({
   if (rows.length === 0) {
     return (
       <div>
-        {envelope && summary?.(envelope)}
+        {envelope && summary?.(envelope, 0)}
         <p className="py-6 text-sm text-slate-500 dark:text-slate-400">
           {emptyMessage}
         </p>
+        {emptyActions && (
+          <div className="flex flex-wrap gap-2">{emptyActions}</div>
+        )}
       </div>
     );
   }
 
   return (
     <div>
-      {envelope && summary?.(envelope)}
-      <p className="pb-2 text-xs text-slate-500 tabular-nums dark:text-slate-400">
-        {rows.length} of {total} shown
-      </p>
+      {envelope && summary?.(envelope, rows.length)}
+      {summary === undefined && (
+        <p className="text-caption pb-2 text-slate-500 tabular-nums dark:text-slate-400">
+          {rows.length} of {total} shown
+        </p>
+      )}
+      {/*
+        The box hugs what is in it and only starts scrolling once there is
+        more than a screenful: a fixed 60vh left three results sitting in a
+        tall empty frame. The inner list carries its own measured height, so
+        capping rather than fixing is all the virtualizer needs.
+      */}
       <div
         ref={scroller}
-        className="h-[60vh] min-h-64 overflow-y-auto rounded border border-slate-200 dark:border-slate-800"
+        className="max-h-[60vh] overflow-y-auto rounded border border-slate-200 dark:border-slate-800"
       >
         <ul
           aria-label={label}
@@ -202,11 +227,12 @@ function Row({
     >
       <Link
         to={engramRoute(row.domain, row.permalink)}
+        {...ENGRAM_PREFETCH}
         // Named by what it points at. Without this the name is every badge on
         // the row run together, which is what a screen reader would read out
         // for each of a hundred rows.
         aria-label={`${row.title}, ${row.permalink}`}
-        className="flex h-full flex-col justify-center gap-1 rounded px-3 py-2 hover:bg-slate-50 focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:outline-none dark:hover:bg-slate-900"
+        className="flex h-full flex-col justify-center gap-1 rounded px-3 py-2 hover:bg-slate-50 focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:hover:bg-slate-900"
       >
         <span className="flex items-baseline gap-2">
           <span className="truncate font-medium">{row.title}</span>
@@ -215,11 +241,11 @@ function Row({
           </span>
         </span>
         <span className="flex items-center gap-1.5 overflow-hidden text-xs whitespace-nowrap">
-          {row.type !== null && <Badge>{row.type}</Badge>}
+          {row.type !== null && <Chip>{row.type}</Chip>}
           {row.status !== null && (
-            <Badge {...(retired ? { title: "A retired status" } : {})}>
-              {row.status}
-            </Badge>
+            <span {...(retired ? { title: "A retired status" } : {})}>
+              <Chip variant={statusVariant(row.status)}>{row.status}</Chip>
+            </span>
           )}
           {row.line !== null && (
             <span className="text-slate-500 tabular-nums dark:text-slate-400">
@@ -248,12 +274,17 @@ function Row({
  * The snippet is text the engine cut out of an engram and it is rendered as
  * text: the pieces become elements here, and nothing turns a server string into
  * markup. An engram that talks about `<script>` reads the way it was written.
+ *
+ * The window was cut out of the file, though, so it arrives wearing whatever
+ * markdown syntax it crossed. That comes back out first, and the terms are
+ * matched against what is left, so the mark lands on the word the reader sees.
  */
 function Snippet({ text, highlight }: { text: string; highlight: string[] }) {
+  const plain = stripSnippetMarkup(text);
   if (highlight.length === 0) {
-    return text;
+    return plain;
   }
-  return snippetParts(text, highlight).map((part, index) =>
+  return snippetParts(plain, highlight).map((part, index) =>
     part.match ? (
       // Keyed by position: the pieces are a cut of one string, so a piece is
       // only ever itself and the list never reorders.
@@ -266,17 +297,6 @@ function Snippet({ text, highlight }: { text: string; highlight: string[] }) {
     ) : (
       <span key={index}>{part.text}</span>
     ),
-  );
-}
-
-function Badge({ children, title }: { children: ReactNode; title?: string }) {
-  return (
-    <span
-      title={title}
-      className="rounded bg-slate-100 px-1.5 py-0.5 text-slate-600 dark:bg-slate-800 dark:text-slate-300"
-    >
-      {children}
-    </span>
   );
 }
 

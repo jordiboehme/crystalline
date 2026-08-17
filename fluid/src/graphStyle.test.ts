@@ -12,11 +12,23 @@
  */
 
 import cytoscape from "cytoscape";
+import type { StylesheetJson } from "cytoscape";
 import { describe, expect, it, vi } from "vitest";
 
 import { readGraph } from "./api/graph";
-import { graphElements } from "./graphElements";
-import { GRAPH_LAYOUT, graphStylesheet } from "./graphStyle";
+import { ANCHOR_CLASS, graphElements } from "./graphElements";
+import { GRAPH_LAYOUT, HOVERED_CLASS, graphStylesheet } from "./graphStyle";
+
+/** What one selector in the sheet declares, read back by name. */
+function styleFor(sheet: StylesheetJson, selector: string) {
+  const block = sheet.find(
+    (entry) => "selector" in entry && entry.selector === selector,
+  );
+  if (!block || !("style" in block)) {
+    throw new Error(`no block for '${selector}' in the stylesheet`);
+  }
+  return block.style as Record<string, unknown>;
+}
 
 /** Alpha is the anchor and Beta, which it points at, is retired. */
 function elements() {
@@ -69,10 +81,45 @@ describe("the graph stylesheet", () => {
     // which is the join between the two halves of this feature.
     expect(cy.nodes(".anchor")).toHaveLength(1);
     expect(cy.nodes(".retired").style("opacity")).toBe("0.5");
-    // And the arrow says the relation it is, read off the element's own data.
+    // An arrow says nothing until it is pointed at, and then it says the
+    // relation it is, read off the element's own data.
+    expect(cy.edges().style("label")).toBe("");
+    cy.edges().addClass(HOVERED_CLASS);
     expect(cy.edges().style("label")).toBe("links_to");
     cy.destroy();
     warn.mockRestore();
+  });
+
+  it("keeps node labels UI-sized and haloed, and edges silent until hovered", () => {
+    // The picture is a small map, not a poster: the labels are the size of the
+    // app's own small text and are cut out of the canvas behind them, so a name
+    // crossing an arrow stays readable without the arrow shouting back.
+    const sheet = graphStylesheet(false);
+    const node = styleFor(sheet, "node");
+    expect(node["font-size"]).toBeLessThanOrEqual(11);
+    expect(node["text-outline-width"]).toBeGreaterThanOrEqual(2);
+
+    const edge = styleFor(sheet, "edge");
+    expect(edge.label).toBe("");
+    const hovered = styleFor(sheet, `edge.${HOVERED_CLASS}`);
+    expect(hovered.label).toBe("data(label)");
+    expect(hovered["text-rotation"]).toBe("none");
+  });
+
+  it("gives the anchor the app's own accent in both themes", () => {
+    // The one thing on the picture that is not neutral geometry is the engram
+    // the reader is standing on, and it wears the accent every other screen
+    // uses for the same job.
+    expect(
+      styleFor(graphStylesheet(false), `node.${ANCHOR_CLASS}`)[
+        "background-color"
+      ],
+    ).toBe("#0f766e");
+    expect(
+      styleFor(graphStylesheet(true), `node.${ANCHOR_CLASS}`)[
+        "background-color"
+      ],
+    ).toBe("#2dd4bf");
   });
 
   it("repaints an instance that is already drawn, without moving it", () => {

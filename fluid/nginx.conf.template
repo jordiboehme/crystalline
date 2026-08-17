@@ -21,6 +21,20 @@ server {
     gzip_min_length 1024;
     gzip_types text/css application/javascript application/json image/svg+xml;
 
+    # nginx's own default here is 1 MiB, an order of magnitude below what the
+    # daemon behind this proxy accepts: MAX_BODY_BYTES in
+    # crates/service/src/rest/mod.rs is 10 MiB. Left at the default, this
+    # proxy would silently cap every browser save and every archive import to
+    # 1 MiB, after the editing was already done. Set at server level so both
+    # proxied locations inherit it rather than repeating it. `10m` is binary
+    # in nginx, so this is exactly MAX_BODY_BYTES rather than approximately -
+    # a literal rather than a substituted variable, because envsubst in this
+    # image only fills in CRYSTALLINE_-prefixed names and has no default
+    # syntax, so an unset one would render an empty directive and nginx would
+    # refuse to start. crates/service/tests/nginx_body_cap.rs is what notices
+    # if the two numbers ever drift apart.
+    client_max_body_size 10m;
+
     # A build emits about a hundred content-hashed chunks under /assets, so a
     # name never survives a change to what is behind it: these can be held for
     # as long as a browser is willing to hold anything.
@@ -38,13 +52,41 @@ server {
         add_header Cache-Control "no-store";
     }
 
+    # The collab WebSocket. Its own block, above /api/, because the Upgrade
+    # and Connection headers must be sent here and must NOT be sent on plain
+    # API requests. proxy_read_timeout is generous: the daemon pings every
+    # 30s, so a healthy socket is never idle longer than that.
+    location /api/v1/collab/ {
+        # $http_host, the Host header verbatim, and NOT $host: nginx strips the
+        # port from $host, while the browser's Origin on this upgrade always
+        # carries it. The daemon refuses a collab upgrade whose Origin
+        # authority does not equal the Host it was asked on, so a deployment
+        # published on any port but 80 (a plain `-p 8080:80`) would answer
+        # every join with 403 and every editor would quietly go solo.
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+        # Same no-URI proxy_pass rule as /api/ below: nginx must forward the
+        # request URI exactly as sent, because a permalink is a path and its
+        # percent-escapes are deliberate. Do not "clean this up".
+        proxy_pass http://${CRYSTALLINE_UPSTREAM};
+    }
+
     # The API, forwarded to the Crystalline daemon.
     location /api/ {
-        # The Host the browser asked for, not the upstream's name. The daemon
-        # reads it to decide whether the session cookie needs the Secure flag,
-        # and nginx's default here ($proxy_host, literally the upstream
-        # host:port) would make every session look remote.
-        proxy_set_header Host $host;
+        # The Host the browser asked for, verbatim, not the upstream's name.
+        # The daemon reads it to decide whether the session cookie needs the
+        # Secure flag, and nginx's default here ($proxy_host, literally the
+        # upstream host:port) would make every session look remote. $http_host
+        # rather than $host for the same reason as the collab block above:
+        # the header as sent, port included, is what every reader of it here
+        # is written against.
+        proxy_set_header Host $http_host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         # X-Forwarded-Proto is deliberately not set. Whatever a TLS terminator

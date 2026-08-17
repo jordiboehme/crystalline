@@ -4,11 +4,12 @@
  * What is pinned here is what the screen is allowed to claim. A wikilink is a
  * link only where the server resolved it and the graph says where it landed;
  * one the index looked for and did not find is marked and left unlinked; the
- * frontmatter panel shows the fields the engram carries and invents nothing for
+ * details panel shows the fields the engram carries and invents nothing for
  * the ones it does not, which for the temporal fields is the difference between
- * "valid forever" and a date nobody wrote. Backlinks come from the graph rather
- * than from the detail payload's capped sample, and the empty case says so
- * plainly instead of pretending the panel is still loading.
+ * "valid forever" and a date nobody wrote. Backlinks are counted by relation
+ * across the whole index rather than drawn from the capped neighborhood, they
+ * cost no request at all when the detail payload already counted none, and the
+ * empty case says so plainly instead of pretending the panel is still loading.
  */
 
 import { screen, waitFor, within } from "@testing-library/react";
@@ -36,10 +37,18 @@ vi.mock("../components/GraphCanvas", () => ({
 
 const apiMock = vi.mocked(api);
 
+/**
+ * An engram as one is written: the frontmatter, the title as an opening
+ * heading, prose, and the two structured bullet kinds. The heading and the
+ * bullets are here because what this screen must not do is draw any of them
+ * twice.
+ */
 const BODY = [
   "---",
   "title: Alpha",
   "---",
+  "",
+  "# Alpha",
   "",
   "Body prose linking [[Beta]] and [[Nowhere]] inline.",
   "",
@@ -80,7 +89,7 @@ function detailResponse(overrides: Record<string, unknown> = {}) {
     },
     observations: [
       {
-        line: 7,
+        line: 9,
         category: "decision",
         content: "we chose X",
         tags: ["tag"],
@@ -89,7 +98,7 @@ function detailResponse(overrides: Record<string, unknown> = {}) {
     ],
     relations: [
       {
-        line: 8,
+        line: 10,
         rel_type: "superseded_by",
         resolved: true,
         target: { domain: null, target: "Beta" },
@@ -138,6 +147,37 @@ function graphResponse(overrides: Record<string, unknown> = {}) {
   };
 }
 
+/**
+ * What points at Alpha, as the inbound endpoint answers it: Beta's prose
+ * wikilink, which is the same reference the neighborhood above carries as an
+ * inbound `links_to` edge. The summary and the page come out of one function
+ * because the endpoint answers both, differing only in whether a relation was
+ * named.
+ */
+function inboundResponse(path: string) {
+  const rel = new URLSearchParams(path.split("?")[1] ?? "").get("rel");
+  return {
+    total: 1,
+    page: 1,
+    limit: rel === null ? 1 : 20,
+    count: rel === null ? 0 : 1,
+    types: [{ rel: "links_to", count: 1 }],
+    hits:
+      rel === null
+        ? []
+        : [
+            {
+              domain: "eng",
+              permalink: "notes/beta",
+              title: "Beta",
+              path: "notes/beta.md",
+              rel: "links_to",
+              status: "stable",
+            },
+          ],
+  };
+}
+
 function serve(routes: Record<string, (path: string) => unknown> = {}) {
   apiMock.mockImplementation(
     answersFor({
@@ -161,6 +201,9 @@ function serve(routes: Record<string, (path: string) => unknown> = {}) {
       }),
       "/domains/eng/engrams/alpha": () => detailResponse(),
       "/graph": () => graphResponse(),
+      // What points here, which the backlinks panel reads on its own: the
+      // summary on first paint, one relation's page when a chip is opened.
+      "/domains/eng/inbound/alpha": (path: string) => inboundResponse(path),
       ...routes,
     }),
   );
@@ -168,6 +211,9 @@ function serve(routes: Record<string, (path: string) => unknown> = {}) {
 
 beforeEach(() => {
   apiMock.mockReset();
+  // The folded sections remember whether they were left open, so each test
+  // starts from a browser that has never opened one.
+  localStorage.clear();
 });
 
 describe("the engram page", () => {
@@ -242,7 +288,7 @@ describe("the engram page", () => {
 
     renderApp("/d/eng/e/alpha");
 
-    expect(await screen.findByText("Frontmatter")).toBeVisible();
+    expect(await screen.findByText("Details")).toBeVisible();
     // Absent means always valid and valid forever, so the row is absent too.
     // A placeholder here would be a date nobody wrote.
     expect(screen.queryByText("Valid")).toBeNull();
@@ -325,27 +371,52 @@ describe("the engram page", () => {
     });
   });
 
-  it("lists what points here, from the graph rather than the capped sample", async () => {
+  it("says where the engram lives in a trail above its title", async () => {
+    serve();
+
+    renderApp("/d/eng/e/alpha");
+
+    const trail = await screen.findByRole("navigation", { name: "Breadcrumb" });
+    // The domain is the one crumb that leads somewhere: there is no route for
+    // a folder to point at, and the leaf is the page the reader is on.
+    expect(within(trail).getByRole("link", { name: "eng" })).toHaveAttribute(
+      "href",
+      "/d/eng",
+    );
+    expect(within(trail).getByText("Alpha")).toHaveAttribute(
+      "aria-current",
+      "page",
+    );
+  });
+
+  it("counts what points here by relation, and opens onto them on request", async () => {
     serve();
 
     renderApp("/d/eng/e/alpha");
 
     const panel = await screen.findByRole("region", { name: "Backlinks" });
-    await waitFor(() => {
-      expect(
-        within(panel).getByRole("link", { name: "Beta, notes/beta" }),
-      ).toHaveAttribute("href", "/d/eng/e/notes/beta");
+    // The counts are of the whole index rather than of the capped
+    // neighborhood, so the panel is a chip per relation and no rows at all
+    // until one is opened.
+    const chip = await within(panel).findByRole("button", {
+      name: /links_to/,
     });
-    // How it points, which is what the edge carries beyond the fact of it.
-    expect(panel).toHaveTextContent("links_to");
+    expect(chip).toHaveTextContent("1");
+    expect(within(panel).queryByRole("link")).toBeNull();
+
+    await userEvent.click(chip);
+
+    expect(
+      await screen.findByRole("link", { name: "Beta, eng / notes/beta.md" }),
+    ).toHaveAttribute("href", "/d/eng/e/notes/beta");
   });
 
-  it("says what the server said when the neighborhood could not be read", async () => {
+  it("says what the server said when what points here could not be read", async () => {
     serve({
       // A refusal rather than a server error, so the query layer answers it
       // once instead of retrying: what is pinned here is the message, not the
       // retry policy.
-      "/graph": () => {
+      "/domains/eng/inbound/alpha": () => {
         throw new ApiProblem(403, "forbidden", "this account may not read eng");
       },
     });
@@ -359,40 +430,64 @@ describe("the engram page", () => {
     expect(alert).toHaveTextContent("this account may not read eng");
   });
 
-  it("says plainly when nothing points here yet", async () => {
+  it("says plainly when nothing points here yet, without asking", async () => {
     serve({
-      "/graph": () =>
-        graphResponse({
-          nodes: [
-            {
-              id: 1,
-              domain: "eng",
-              permalink: "alpha",
-              title: "Alpha",
-              status: "stable",
-              type: "decision",
-            },
-          ],
-          edges: [],
-        }),
+      // The detail payload omits the inbound block entirely when nothing
+      // points here, which is exactly the case this panel must answer from
+      // what the page has already read.
+      "/domains/eng/engrams/alpha": () =>
+        detailResponse({ inbound: undefined }),
     });
 
     renderApp("/d/eng/e/alpha");
 
     expect(await screen.findByText(/nothing links here yet/i)).toBeVisible();
+    expect(apiMock.mock.calls.map((call) => String(call[0]))).not.toContain(
+      "/domains/eng/inbound/alpha?page=1&limit=1",
+    );
   });
 
-  it("lists the observations and the relations the body declares", async () => {
+  it("draws an observation once, in the body, as what it is", async () => {
     serve();
 
     renderApp("/d/eng/e/alpha");
 
-    expect(await screen.findByText("we chose X")).toBeVisible();
-    // In brackets, the way it was written, which is what tells the category
-    // apart from the same word used as the engram's type.
+    // Once: the written line and its indexed reading are the same line, so a
+    // second list of them would be the same page saying one thing twice.
+    const hits = await screen.findAllByText(/we chose X/);
+    expect(hits).toHaveLength(1);
+    // And nothing is lost by that: in brackets, the way it was written, which
+    // is what tells the category apart from the engram's type, with the tag
+    // and the context still on the line.
+    const [line] = hits;
     expect(screen.getByText("[decision]")).toBeVisible();
-    expect(screen.getByText("#tag")).toBeVisible();
-    expect(screen.getByText("superseded_by")).toBeVisible();
+    expect(line).toHaveTextContent("#tag");
+    expect(line).toHaveTextContent("(context)");
+  });
+
+  it("draws a relation once, in the body, as what it is", async () => {
+    serve();
+
+    renderApp("/d/eng/e/alpha");
+
+    const body = await screen.findByRole("article");
+    const relType = await within(body).findByText("superseded_by");
+    expect(relType).toBeVisible();
+    // The type is on the bullet the target is on, and the target is the link
+    // the graph placed rather than a second copy of the same fact.
+    expect(within(body).getAllByText("superseded_by")).toHaveLength(1);
+  });
+
+  it("draws the title once", async () => {
+    serve();
+
+    renderApp("/d/eng/e/alpha");
+
+    // The header's h1 is the page's rendering of the title; the body opens
+    // with the same line and it folds away rather than repeating it.
+    const headings = await screen.findAllByRole("heading", { name: "Alpha" });
+    expect(headings).toHaveLength(1);
+    expect(headings[0]).toHaveAttribute("id", "engram-title");
   });
 
   it("copies the engram's crystalline address", async () => {
@@ -443,6 +538,135 @@ describe("the engram page", () => {
     });
   });
 
+  it("puts the utilities on the row as icons and the writes behind one menu", async () => {
+    serve();
+
+    renderApp("/d/eng/e/alpha");
+
+    // A quiet strip of icons, then the one labelled thing somebody came to
+    // this header for. Each icon carries EXACTLY the name its menu row carried,
+    // because the name is the whole contract a keyboard or a screen reader
+    // holds over a control with no text in it.
+    for (const name of ["Share link", "Download as Markdown", "Print view"]) {
+      expect(await screen.findByRole("button", { name })).toBeVisible();
+    }
+    expect(screen.getByRole("link", { name: "Edit" })).toHaveAttribute(
+      "href",
+      "/d/eng/edit/alpha",
+    );
+    expect(screen.queryByRole("button", { name: "Retire" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Move" })).toBeNull();
+
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "More actions" }));
+
+    // What is left behind the fold is what belongs there: the move, and the
+    // destructive one alone under a rule.
+    for (const name of ["Move", "Retire"]) {
+      expect(await screen.findByRole("menuitem", { name })).toBeVisible();
+    }
+    // And nothing is offered twice.
+    for (const name of ["Share link", "Download as Markdown", "Print view"]) {
+      expect(screen.queryByRole("menuitem", { name })).toBeNull();
+    }
+  });
+
+  it("names each icon on hover without renaming it", async () => {
+    serve();
+
+    renderApp("/d/eng/e/alpha");
+
+    const share = await screen.findByRole("button", { name: "Share link" });
+    // Nothing hangs over the row until it is asked for, and when it is, the
+    // words are the ones the control is already called. The browser's own
+    // tooltip is gone: two labels for one button, drawn a beat apart, is
+    // worse than either alone.
+    expect(share).not.toHaveAttribute("title");
+    expect(screen.queryByRole("tooltip")).toBeNull();
+
+    const user = userEvent.setup();
+    await user.hover(share);
+    expect(
+      await screen.findByRole("tooltip", {}, { timeout: 2000 }),
+    ).toHaveTextContent("Share link");
+    // The accessible name is still the label alone: a tooltip describes.
+    expect(screen.getByRole("button", { name: "Share link" })).toBe(share);
+  });
+
+  it("carries the actions in the trail's own row, leaving the title alone", async () => {
+    serve();
+
+    renderApp("/d/eng/e/alpha");
+
+    const trail = await screen.findByRole("navigation", { name: "Breadcrumb" });
+    const row = trail.parentElement;
+    expect(row).not.toBeNull();
+    // Where this engram is and what can be done with it are one line: the
+    // address reads from the left, the controls sit at its right end.
+    expect(
+      within(row as HTMLElement).getByRole("link", { name: "Edit" }),
+    ).toBeInTheDocument();
+    expect(
+      within(row as HTMLElement).getByRole("button", { name: "More actions" }),
+    ).toBeInTheDocument();
+    expect(row).toHaveClass("justify-between");
+
+    // And the title stands by itself, with nothing in its block to compete
+    // with it - which is the whole point of the row above.
+    const title = screen.getByRole("heading", { name: "Alpha", level: 1 });
+    expect(row).not.toContainElement(title);
+    // The trail's row, then the title, and that is the whole header: no
+    // control row underneath the name any more.
+    expect(title.previousElementSibling).toBe(row);
+    expect(title.parentElement?.lastElementChild).toBe(title);
+  });
+
+  it("runs a utility from its icon rather than from a second copy of it", async () => {
+    const print = vi.spyOn(window, "print").mockImplementation(() => undefined);
+    serve();
+
+    renderApp("/d/eng/e/alpha");
+
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "Print view" }));
+
+    expect(print).toHaveBeenCalled();
+    print.mockRestore();
+  });
+
+  it("opens the guided retirement from the menu", async () => {
+    serve();
+
+    renderApp("/d/eng/e/alpha");
+
+    const user = userEvent.setup();
+    await user.click(
+      await screen.findByRole("button", { name: "More actions" }),
+    );
+    await user.click(await screen.findByRole("menuitem", { name: "Retire" }));
+
+    expect(
+      await screen.findByRole("button", { name: "Retire engram" }),
+    ).toBeVisible();
+  });
+
+  it("offers a reader who may not write the utilities and nothing else", async () => {
+    serve({ "/auth/me": () => meResponse({ anonymous: true }) });
+
+    renderApp("/d/eng/e/alpha");
+
+    await screen.findByRole("heading", { name: "Alpha" });
+    expect(screen.queryByRole("link", { name: "Edit" })).toBeNull();
+
+    // The three utilities are everybody's, and they are the whole row now.
+    for (const name of ["Share link", "Download as Markdown", "Print view"]) {
+      expect(screen.getByRole("button", { name })).toBeVisible();
+    }
+    // The writes are absent, which leaves the menu with nothing to hold: an
+    // ellipsis that opens onto an empty panel is worse than no ellipsis.
+    expect(screen.queryByRole("button", { name: "More actions" })).toBeNull();
+  });
+
   it("keeps the graph folded away until somebody asks for it", async () => {
     serve();
 
@@ -459,10 +683,10 @@ describe("the engram page", () => {
     serve();
 
     renderApp("/d/eng/e/alpha");
-    // The backlinks panel is drawn from the same neighborhood, so once it has
-    // one the graph section has one too.
-    const panel = await screen.findByRole("region", { name: "Backlinks" });
-    await within(panel).findByRole("link", { name: /Beta/ });
+    // The body's wikilinks are resolved from the same neighborhood, so once
+    // they are links the graph section has one too.
+    const body = await screen.findByRole("article");
+    await within(body).findAllByRole("link", { name: "Beta" });
 
     await userEvent.click(
       screen.getByRole("button", { name: /neighborhood/i }),
@@ -477,6 +701,23 @@ describe("the engram page", () => {
       "href",
       "/graph?anchor=crystalline%3A%2F%2Feng%2Falpha",
     );
+  });
+
+  it("opens the sections a reader left open last time", async () => {
+    // The choice to read this way outlives the visit it was made on, under a
+    // key of each section's own.
+    localStorage.setItem("fluid.section.graph", "open");
+    localStorage.setItem("fluid.section.agents-eye", "open");
+    serve();
+
+    renderApp("/d/eng/e/alpha");
+
+    expect(
+      await screen.findByRole("button", { name: "Hide the neighborhood" }),
+    ).toHaveAttribute("aria-expanded", "true");
+    expect(
+      screen.getByRole("button", { name: /what an agent is taught/i }),
+    ).toHaveAttribute("aria-expanded", "true");
   });
 
   it("keeps the agent's-eye view folded away until somebody asks for it", async () => {
