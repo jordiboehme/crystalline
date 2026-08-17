@@ -249,7 +249,7 @@ Claude Code does this for you: it turns tool search on automatically once a sess
 
 ## The learning loop
 
-Memory only compounds when capture actually happens. The loop has three beats: the agent recalls what is known at session start, works with it and captures what it learned before the session ends. The last beat is the one agents skip when nothing reminds them - so `crystalline install` wires the reminder.
+Experience only compounds when capture actually happens. The loop has three beats: the agent recalls what is known at session start, works with it and captures what it learned before the session ends. The last beat is the one agents skip when nothing reminds them - so `crystalline install` wires the reminder.
 
 It is a `Stop` hook running `crystalline hook stop`: a once-per-session, late nudge that fires on the first stop after a session gains real substance and stays silent otherwise - below the substance threshold, once it has already fired, in read-only mode or with no domain registered. When it fires, it asks the agent to review the conversation for durable learnings, propose capturing each one into the fitting domain (the same propose-first, wait-for-a-yes shape the capture skill follows) and raise the salience of any recalled engram that proved key to the task.
 
@@ -477,7 +477,7 @@ It is one - that is the point. Your knowledge stays plain markdown you can read,
 
 **Why not a vector database or a RAG framework?**
 
-Retrieval is the easy half of memory. A vector index finds similar text, but it does not know which domain owns a task, that a fact was superseded in March, who verified a claim or when something new is worth capturing. Crystalline treats embeddings as one ranking signal inside a memory system - routing, temporal semantics, provenance and a capture workflow on top of files you own, with no pipeline to operate.
+Retrieval is the easy half. A vector index finds similar text, but it does not know which domain owns a task, that a fact was superseded in March, who verified a claim or when something new is worth capturing. Crystalline treats embeddings as one ranking signal inside a knowledge system - routing, temporal semantics, provenance and a capture workflow on top of files you own, with no pipeline to operate.
 
 **Where does the name come from?**
 

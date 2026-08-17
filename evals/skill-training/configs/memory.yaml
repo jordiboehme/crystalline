@@ -1,4 +1,4 @@
-# Crystalline memory skill, training config. The memory benchmark
+# The crystalline-intelligence skill's training config. The memory benchmark
 # blends routing and capture items (see data/memory_split/build.py);
 # turns and timeout follow the capture side, the more demanding of the
 # two. Scoring dispatches per item on its bench field (see
