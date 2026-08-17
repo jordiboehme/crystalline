@@ -368,6 +368,32 @@ describe("the table segment", () => {
     expect(docText(v.state)).toContain("| name   | n   |");
   });
 
+  test("the align menu says which alignment each row is", async () => {
+    // Taste again, and the reason the trigger changed glyph: a bar of icons
+    // has to say what it does before it is pressed, so the trigger wears the
+    // conventional alignment mark - the same one its own centre row wears -
+    // and each row carries its own, all three different from one another.
+    const user = userEvent.setup();
+    mount(TABLE_DOC, IN_TABLE, IN_TABLE, true);
+    const glyphOf = (element: HTMLElement) =>
+      element.querySelector("svg")?.getAttribute("class");
+    // Read before opening: an open Radix menu hides the rest of the page from
+    // the accessibility tree, trigger included, so afterwards there is no
+    // button by that name to ask.
+    const trigger = glyphOf(
+      screen.getByRole("button", { name: "Align column" }),
+    );
+    await user.click(screen.getByRole("button", { name: "Align column" }));
+    const rows = ["Align left", "Align center", "Align right"].map((name) =>
+      glyphOf(screen.getByRole("menuitem", { name })),
+    );
+    for (const row of rows) {
+      expect(row).toBeTruthy();
+    }
+    expect(new Set(rows).size).toBe(3);
+    expect(trigger).toBe(rows[1]);
+  });
+
   /*
    * The align menu is the one place a user-visible label is bound to a typed
    * enum value, so all three mappings are pinned separately: an array that was

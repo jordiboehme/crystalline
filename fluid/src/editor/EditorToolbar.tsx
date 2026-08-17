@@ -19,7 +19,9 @@
 
 import type { EditorView } from "@codemirror/view";
 import {
-  AlignJustify,
+  AlignCenter,
+  AlignLeft,
+  AlignRight,
   Bold,
   Brackets,
   Code,
@@ -38,6 +40,7 @@ import {
   WandSparkles,
   Workflow,
 } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
 import { DropdownMenu } from "radix-ui";
 import type { MouseEvent, ReactElement } from "react";
 import { useId } from "react";
@@ -69,11 +72,17 @@ import {
 /** The heading levels the menu offers - deeper marks stay a typed thing. */
 const HEADING_LEVELS = [1, 2, 3];
 
-/** The alignments a column can be given, in the order they read. */
-const ALIGNMENTS: { align: Align; label: string }[] = [
-  { align: "left", label: "Align left" },
-  { align: "center", label: "Align center" },
-  { align: "right", label: "Align right" },
+/**
+ * The alignments a column can be given, in the order they read, each with the
+ * mark that says it without being read: the rows of a menu are icons in every
+ * other editor an author has used, and the trigger above them wears the middle
+ * one - the conventional glyph for "alignment", where a justify mark reads as
+ * one particular alignment this menu does not even offer.
+ */
+const ALIGNMENTS: { align: Align; label: string; icon: LucideIcon }[] = [
+  { align: "left", label: "Align left", icon: AlignLeft },
+  { align: "center", label: "Align center", icon: AlignCenter },
+  { align: "right", label: "Align right", icon: AlignRight },
 ];
 
 /**
@@ -356,7 +365,7 @@ export function EditorToolbar({
             <DropdownMenu.Trigger asChild>
               <IconButton
                 label="Align column"
-                icon={AlignJustify}
+                icon={AlignCenter}
                 disabled={off}
               />
             </DropdownMenu.Trigger>
@@ -374,12 +383,19 @@ export function EditorToolbar({
                   view?.focus();
                 }}
               >
-                {ALIGNMENTS.map(({ align, label }) => (
+                {ALIGNMENTS.map(({ align, label, icon: Icon }) => (
                   <DropdownMenu.Item
                     key={align}
                     className={ITEM_CLASSES}
                     onSelect={act((v) => tableAlignColumn(v, align))}
                   >
+                    {/*
+                      Decoration beside the label rather than a second name:
+                      the row is called what it was always called, and the
+                      glyph is the app's own icon idiom at the size every
+                      other one is drawn at.
+                    */}
+                    <Icon aria-hidden="true" size={16} strokeWidth={1.75} />
                     {label}
                   </DropdownMenu.Item>
                 ))}
