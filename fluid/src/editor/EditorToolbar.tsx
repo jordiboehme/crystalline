@@ -36,7 +36,6 @@ import {
   SquareCode,
   Strikethrough,
   TextQuote,
-  Trash2,
   WandSparkles,
   Workflow,
 } from "lucide-react";
@@ -49,6 +48,7 @@ import { ITEM_CLASSES, MENU_CLASSES } from "../components/menu";
 import { IconButton } from "../components/primitives";
 import { TableSizePicker } from "./TableSizePicker";
 import { MERMAID_STARTER_GROUPS, mermaidFence } from "./mermaidStarters";
+import { DeleteColumnIcon, DeleteRowIcon } from "./tableIcons";
 import type { Align } from "./tableModel";
 import {
   CODE_SKELETON,
@@ -326,16 +326,12 @@ export function EditorToolbar({
             of these is a tooltip as well as an accessible name, because a row
             of small squares is not self-explanatory whatever is drawn in it.
 
-            Two idioms, used consistently: the add verbs draw the axis they act
-            on (Rows3, Columns3) and both delete verbs draw the same trash can.
-            The axis is the thing these two glyphs are worst at saying - the
-            set has no row-flavored sibling of the grid-with-an-X this one used
-            to wear - while "this destroys something" is the thing they must
-            not be coy about, and it is the half a glyph can carry. Reaching
-            for the axis instead (Rows2 beside Rows3) would put the mistake in
-            the worse place: delete looking like add rather than delete row
-            looking like delete column, with the label and the order that
-            mirrors the two buttons above them to tell those apart.
+            All four say both halves now: what happens, and to which axis. The
+            add verbs draw the axis from the shared set (Rows3, Columns3); the
+            deletes draw the same three slots with the middle one crossed out,
+            because the set has no such pair and the two used to share a trash
+            can that could only say "something is destroyed". The axis was the
+            half that went missing, and it was the half only the label carried.
           */}
           <IconButton
             label="Add row below"
@@ -351,13 +347,13 @@ export function EditorToolbar({
           />
           <IconButton
             label="Delete row"
-            icon={Trash2}
+            icon={DeleteRowIcon}
             disabled={off}
             onClick={act(tableDeleteRow)}
           />
           <IconButton
             label="Delete column"
-            icon={Trash2}
+            icon={DeleteColumnIcon}
             disabled={off}
             onClick={act(tableDeleteColumn)}
           />

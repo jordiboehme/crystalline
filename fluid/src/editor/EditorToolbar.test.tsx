@@ -307,21 +307,34 @@ describe("the table segment", () => {
     expect(screen.getByRole("button", { name: "Bold" })).not.toBeNull();
   });
 
-  test("the two delete verbs wear one glyph and the two add verbs two", () => {
+  test("all four table-shape verbs wear a glyph of their own", () => {
     // Taste, pinned because it is invisible to every other assertion here:
-    // the labels are the contract, so a glyph that drifts back to a second
-    // idiom - a trash can beside a grid-with-an-X for two verbs that differ
-    // only in axis - breaks nothing and reads as an accident.
+    // these four differ in two dimensions at once - what they do and which
+    // axis they do it to - and the bar now says both. The shared trash can
+    // that used to stand in for both deletes said only the first, so a glyph
+    // that drifts back to it would break nothing and lose the axis.
     render(<EditorToolbar view={null} tableActive />, { wrapper: Tooltips });
     const glyph = (name: string) =>
       screen
         .getByRole("button", { name })
         .querySelector("svg")
         ?.getAttribute("class");
-    expect(glyph("Delete row")).toBe(glyph("Delete column"));
-    expect(glyph("Add row below")).not.toBe(glyph("Add column after"));
-    // And the two idioms stay apart: deleting must not look like adding.
-    expect(glyph("Delete row")).not.toBe(glyph("Add row below"));
+    const names = [
+      "Add row below",
+      "Add column after",
+      "Delete row",
+      "Delete column",
+    ];
+    const glyphs = names.map(glyph);
+    for (const drawn of glyphs) {
+      expect(drawn).toBeTruthy();
+    }
+    expect(new Set(glyphs).size).toBe(4);
+    // And no trash can anywhere in the segment: the axis is the half that
+    // used to go missing, and it is the half these two now carry.
+    for (const drawn of glyphs) {
+      expect(drawn).not.toContain("trash");
+    }
   });
 
   /*
