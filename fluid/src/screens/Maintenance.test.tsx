@@ -106,6 +106,26 @@ function evolvePayload(overrides: Record<string, unknown> = {}) {
   };
 }
 
+/**
+ * A sweep whose result did not fit the page it was asked for.
+ *
+ * The engine ranks the whole result and answers a page of it, and its family
+ * counts are over the whole result rather than over the page - which is the one
+ * arrangement where a heading's count and the tally's count for the same word
+ * are both right and different.
+ */
+function cappedPayload() {
+  return evolvePayload({
+    total: 250,
+    limit: 100,
+    families: [
+      { family: "temporal", findings: 120 },
+      { family: "structure", findings: 80 },
+      { family: "redundancy", findings: 50 },
+    ],
+  });
+}
+
 /** A sweep that found nothing at all. */
 function cleanPayload() {
   return evolvePayload({
@@ -253,6 +273,67 @@ describe("the maintenance screen", () => {
     // still on offer after one of them narrows it.
     expect(within(domainFilter()).getAllByRole("option")).toHaveLength(3);
     // Narrowing is a lens over what already arrived, not a second sweep.
+    expect(sweeps()).toHaveLength(before);
+  });
+
+  it("counts what is drawn, and names the whole queue as the whole queue", async () => {
+    await open();
+
+    // Nothing capped and nothing filtered: the page IS the queue, so the
+    // family counts need no qualifier - they are the counts above the rows.
+    expect(
+      await screen.findByText(
+        "42 engrams swept, 3 findings. Temporal 1, Structure 1, Redundancy 1.",
+      ),
+    ).toBeVisible();
+  });
+
+  it("says a capped page is a page, and what the whole of it holds", async () => {
+    await open({ "/evolve": cappedPayload });
+
+    // The heading over the temporal rows counts one finding; the breakdown
+    // counts 120. Both are right, and the prefix is what keeps the same word
+    // carrying two numbers from reading as a contradiction.
+    expect(
+      await screen.findByText(
+        "42 engrams swept, 3 of 250 findings. Everything waiting: Temporal 120, Structure 80, Redundancy 50.",
+      ),
+    ).toBeVisible();
+    expect(
+      (await screen.findByRole("heading", { name: /^Temporal/ })).textContent,
+    ).toMatch(/1 finding/);
+  });
+
+  it("names the base a filtered count is counted against", async () => {
+    await open();
+    await section(/^Temporal/);
+
+    await userEvent.selectOptions(domainFilter(), "ops");
+
+    // "1 finding in ops" alone would lose the only not-all-of-it signal on
+    // the screen, so the page it was filtered out of is named beside it.
+    expect(
+      await screen.findByText(
+        "42 engrams swept, 3 findings, 1 of them in ops. Everything waiting: Temporal 1, Structure 1, Redundancy 1.",
+      ),
+    ).toBeVisible();
+  });
+
+  it("does not sweep again when the window comes back", async () => {
+    await open();
+    await section(/^Temporal/);
+    const before = sweeps().length;
+
+    // The sweep is the heaviest read this API has, and this screen is a
+    // snapshot with a Refresh button on it: alt-tabbing back to a page left
+    // open is not somebody asking for it again.
+    window.dispatchEvent(new Event("visibilitychange"));
+    document.dispatchEvent(new Event("visibilitychange"));
+    window.dispatchEvent(new Event("focus"));
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Refresh" })).toBeEnabled();
+    });
+
     expect(sweeps()).toHaveLength(before);
   });
 

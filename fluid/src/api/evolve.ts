@@ -58,6 +58,20 @@ export const DEFAULT_EVOLVE_CLASS: EvolveClass = "judgment";
 /** How many findings one sweep asks for. The engine clamps anything above it. */
 export const EVOLVE_LIMIT = 100;
 
+/**
+ * How long a sweep stays fresh, in ms.
+ *
+ * Detection is the heaviest read this API has - it reads every engram of every
+ * registered domain - and what it answers is a backlog, which moves at the
+ * speed of somebody editing the knowledge rather than at the speed of a screen.
+ * A minute is what the tree already uses for the same kind of value
+ * (`TREE_STALE_TIME` in `api/domain.ts`), and it is what makes the core loop of
+ * the maintenance screen cheap: following a finding to its engram and coming
+ * back is a remount, and a remount inside the window reads the cache instead of
+ * sweeping again.
+ */
+export const EVOLVE_STALE_MS = 60_000;
+
 /** One finding, ranked across the whole result. */
 export interface EvolveFinding {
   /** Its rank across the whole result, not within the page. */

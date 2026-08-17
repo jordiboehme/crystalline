@@ -36,6 +36,7 @@ import {
   EVOLVE_FAMILIES,
   EVOLVE_FAMILY_BLURBS,
   EVOLVE_FAMILY_TITLES,
+  EVOLVE_STALE_MS,
   evolveFamily,
   evolveKey,
   fetchEvolveQueue,
@@ -65,9 +66,19 @@ interface FindingGroup {
 
 export default function Maintenance() {
   const [domain, setDomain] = useState(EVERY_DOMAIN);
+  // Fetched on arrival and on the Refresh button, and on nothing else. The
+  // app's default is to refetch a stale query whenever the window comes back,
+  // which is right for a listing and wrong for this: the sweep reads every
+  // engram of every domain, and alt-tabbing to a page somebody left open is not
+  // somebody asking for it again. Both doors are shut rather than one, because
+  // they are different doors - the flag stops a focus from re-sweeping a page
+  // that is already open, and the freshness window stops the remount that
+  // following a finding to its engram and coming back would otherwise cost.
   const sweep = useQuery({
     queryKey: evolveKey(),
     queryFn: () => fetchEvolveQueue(),
+    staleTime: EVOLVE_STALE_MS,
+    refetchOnWindowFocus: false,
   });
 
   const queue = sweep.data;
@@ -181,9 +192,17 @@ export default function Maintenance() {
  * What the sweep read and what it found, on one line.
  *
  * The family counts are the engine's own, over the whole result rather than
- * over the page, so they say the shape of the backlog even when a cap kept some
- * of it off screen. They are dropped once a domain filter narrows the view,
- * because they would then be counting something other than what is drawn.
+ * over the page, and the section headings count the rows actually drawn. Those
+ * two numbers wear the same word and are both right, so whenever they can
+ * differ - a cap that kept part of the result off the page, a domain filter
+ * that narrowed what is drawn - the breakdown is named as the whole queue
+ * rather than left to be read as a second count of the page. It is kept rather
+ * than dropped in exactly those cases, because the shape of everything waiting
+ * is most worth saying when the page is not all of it.
+ *
+ * The count of what is drawn names the base it counts against for the same
+ * reason: "1 finding in ops" on its own is a true sentence that has lost the
+ * only not-all-of-it signal on the screen.
  */
 function Tally({
   queue,
@@ -194,19 +213,33 @@ function Tally({
   shown: number;
   scoped: string;
 }) {
+  // What arrived, which is the page rather than the result. A domain filter
+  // counts out of this, and it is said out loud whenever it is less than the
+  // whole: a count with no base is what makes "1 finding in ops" sound like
+  // the end of the matter.
+  const fetched = queue.queue.length;
   const breakdown = queue.families
     .map((count) => `${familyTitle(count.family)} ${String(count.findings)}`)
     .join(", ");
-  const counted =
-    scoped === EVERY_DOMAIN
-      ? shown < queue.total
-        ? `${String(shown)} of ${plural(queue.total, "finding", "findings")}`
-        : plural(queue.total, "finding", "findings")
-      : `${plural(shown, "finding", "findings")} in ${scoped}`;
+  const page =
+    fetched < queue.total
+      ? `${String(fetched)} of ${plural(queue.total, "finding", "findings")}`
+      : plural(queue.total, "finding", "findings");
+  const narrowed =
+    scoped === EVERY_DOMAIN ? "" : `, ${String(shown)} of them in ${scoped}`;
+  // Whether what is drawn is less than the whole result, by a cap or a filter
+  // or both. That is exactly when the engine's counts and the headings above
+  // the rows can differ, and exactly when the breakdown has to say which it is.
+  const partial = shown < queue.total;
   return (
     <p className="text-caption text-slate-500 tabular-nums dark:text-slate-400">
-      {counted} over {plural(queue.engramsScanned, "engram", "engrams")}
-      {scoped === EVERY_DOMAIN && breakdown !== "" ? `. ${breakdown}.` : "."}
+      {plural(queue.engramsScanned, "engram", "engrams")} swept, {page}
+      {narrowed}
+      {breakdown === ""
+        ? "."
+        : partial
+          ? `. Everything waiting: ${breakdown}.`
+          : `. ${breakdown}.`}
     </p>
   );
 }
