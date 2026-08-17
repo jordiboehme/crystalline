@@ -18,12 +18,12 @@ use assert_cmd::Command;
 /// The exact reminder text `hook.rs` prints, duplicated here because the
 /// `crystalline` binary has no library target for a test to import it from;
 /// this is a black-box check on what the subprocess actually printed.
+const NUDGE_REASON: &str = "Review this conversation for durable learnings before finishing: new facts, decisions, patterns and antipatterns, gotchas, corrections from the user or researched answers worth keeping. Corrections include ones that make an existing engram wrong - for those propose the reconciling edit or supersession, not a new capture beside the old. If any are not yet captured, propose capturing each one as an engram into the fitting crystalline domain: name the insight, the domain and the folder when one fits and wait for a yes. If a recalled engram proved to be the key to the task, raise its salience. If nothing qualifies or everything is already captured, finish normally without mentioning this check.";
+
 /// The ride-along maintenance paragraph, duplicated here for the same reason
 /// [`NUDGE_REASON`] is: this is a black-box check on what the subprocess
 /// printed.
 const EVOLVE_NUDGE_REASON: &str = "Also due now: knowledge maintenance. Call the crystalline evolve_engrams tool and work the queue it returns: apply mechanical findings directly and summarize once at the end; propose judgment findings one at a time and wait for a yes. Engrams captured by a person are judgment class - never rewrite a human's words without asking.";
-
-const NUDGE_REASON: &str = "Review this conversation for durable learnings before finishing: new facts, decisions, patterns and antipatterns, gotchas, corrections from the user or researched answers worth keeping. Corrections include ones that make an existing engram wrong - for those propose the reconciling edit or supersession, not a new capture beside the old. If any are not yet captured, propose capturing each one as an engram into the fitting crystalline domain: name the insight, the domain and the folder when one fits and wait for a yes. If a recalled engram proved to be the key to the task, raise its salience. If nothing qualifies or everything is already captured, finish normally without mentioning this check.";
 
 fn bin() -> Command {
     Command::cargo_bin("crystalline").unwrap()
@@ -133,9 +133,57 @@ fn the_first_silent_call_seeds_the_maintenance_clock() {
         state["first_seen"].is_string(),
         "a silent call still starts the clock: {state}"
     );
+    // Whether a silent call can stamp an ask is pinned by the test below, on
+    // a state that is actually due; a fresh state is not due at all, so
+    // asserting it here would hold with or without the ride-along gate.
+}
+
+/// The ride-along contract: an overdue backlog is never a reason of its own to
+/// speak. With the ask clearly due but the capture nudge not firing, the hook
+/// must stay silent and must not burn the 24 hour cooldown on a session that
+/// said nothing - otherwise the next session that does earn a nudge carries no
+/// maintenance paragraph.
+#[test]
+fn a_due_ask_stays_silent_when_the_capture_nudge_does_not_fire() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let config = work.path().join("config.yaml");
+    write_domain_config(&config);
+    write_maintenance(
+        &home,
+        serde_json::json!({
+            "v": 1,
+            // Due twice over: a pending domain and a sweep far past the week.
+            "pending_domains": ["playground"],
+            "pending_since": "2026-06-01T09:00:00Z",
+            "last_run_at": "2026-06-01T09:00:00Z",
+            "last_nudge_at": null,
+            "first_seen": "2026-05-01T09:00:00Z",
+        }),
+    );
+    // No transcript: the fallback counter keeps this first call silent, so the
+    // capture nudge never fires and the ask must not ride along.
+    let payload = stop_payload("session-gate", None);
+
+    let mut cmd = bin();
+    isolate(&mut cmd, &home);
+    let out = cmd
+        .env("CRYSTALLINE_CONFIG", &config)
+        .args(["hook", "stop"])
+        .write_stdin(payload)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(
+        out.stdout.is_empty(),
+        "a due backlog must never speak on its own: {:?}",
+        out.stdout
+    );
+
+    let state = read_maintenance(&home);
     assert!(
         state["last_nudge_at"].is_null(),
-        "a silent call never stamps an ask: {state}"
+        "a silent call never stamps an ask it did not make: {state}"
     );
 }
 
