@@ -24,6 +24,7 @@ const FRONTMATTER: EngramFrontmatter = {
   validTo: null,
   staleAfter: null,
   verified: [],
+  generatedBy: null,
 };
 
 function draw(overrides: Partial<EngramFrontmatter> = {}) {
@@ -72,6 +73,17 @@ describe("DetailsPanel", () => {
       ],
     });
     expect(screen.getByText("human:jordi on 2026-02-01")).toBeInTheDocument();
+  });
+
+  test("who captured the engram is stated in a reader's words", () => {
+    draw({ generatedBy: "human:jordi" });
+    expect(screen.getByText("Captured by")).toBeInTheDocument();
+    expect(screen.getByText("jordi (human)")).toBeInTheDocument();
+  });
+
+  test("an engram that records no writer is attributed to nobody", () => {
+    draw();
+    expect(screen.queryByText("Captured by")).toBeNull();
   });
 
   test("a field the engram leaves out has no row", () => {

@@ -84,6 +84,12 @@ export interface EngramFrontmatter {
   staleAfter: string | null;
   /** The verification trail, oldest first. Empty when nothing verified it. */
   verified: VerifiedEntry[];
+  /**
+   * The actor out of `generated.by`, verbatim, or null when the engram records
+   * no writer. An engram written before that key existed carries none, and
+   * absence is absence rather than an unknown writer.
+   */
+  generatedBy: string | null;
 }
 
 /** One of the capped inbound references the detail payload samples. */
@@ -242,6 +248,9 @@ function readFrontmatter(
     validTo: asString(record?.valid_to),
     staleAfter: asString(record?.stale_after) ?? asString(record?.review_after),
     verified: readVerified(record),
+    // Write provenance is a `{ by, at }` mapping, so the actor is a field
+    // inside it rather than a key of its own.
+    generatedBy: asString(asObject(record?.generated)?.by),
   };
 }
 
