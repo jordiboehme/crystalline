@@ -687,6 +687,7 @@ async fn data_routes_401_without_identity_when_not_anonymous() {
         "/api/v1/context",
         "/api/v1/activity",
         "/api/v1/graph",
+        "/api/v1/evolve",
         "/api/v1/users",
         "/api/v1/users/ada",
     ] {

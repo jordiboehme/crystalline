@@ -11,6 +11,7 @@ mod domains;
 mod domains_admin;
 mod engrams;
 mod error;
+mod evolve;
 mod github_settings;
 mod graph;
 mod users_api;
@@ -73,6 +74,7 @@ use crate::engine::Engine;
         (name = "engrams", description = "Listing, reading and writing engrams."),
         (name = "discovery", description = "Search, vocabulary, context and recent activity."),
         (name = "graph", description = "The neighborhood graph around an anchor."),
+        (name = "maintenance", description = "The consolidation queue: what the knowledge needs next. Read-only."),
         (name = "users", description = "Account management. Admin only."),
         (name = "settings", description = "Instance settings. Admin only."),
     ),
@@ -108,6 +110,7 @@ use crate::engine::Engine;
         discovery::context,
         discovery::activity,
         graph::graph,
+        evolve::queue,
         users_api::list,
         users_api::create,
         users_api::update,
@@ -429,6 +432,10 @@ pub fn router(state: RestState) -> Router {
         .route("/context", get(discovery::context))
         .route("/activity", get(discovery::activity))
         .route("/graph", get(graph::graph))
+        // The consolidation queue, read-only: detection runs, nothing is
+        // recorded, so opening the maintenance page never counts as the sweep
+        // it is asking about. See [`evolve::queue`].
+        .route("/evolve", get(evolve::queue))
         // Admin only, enforced inside the handlers: the guard below stops at
         // viewer. See [`users_api`] for the three rules these first mutating
         // routes are held to.

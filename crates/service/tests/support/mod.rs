@@ -78,6 +78,7 @@ pub const MOUNTED_OPERATIONS: &[&str] = &[
     "GET /api/v1/context",
     "GET /api/v1/activity",
     "GET /api/v1/graph",
+    "GET /api/v1/evolve",
     "GET /api/v1/users",
     "POST /api/v1/users",
     "PATCH /api/v1/users/{name}",
