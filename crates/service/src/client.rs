@@ -81,9 +81,14 @@ const META_KEY_CLIENT_CAPABILITIES: &str = "io.modelcontextprotocol/clientCapabi
 /// solely because of upstream rust-sdk issue **#1157** ("stdio server:
 /// malformed-`_meta` 2026 request as first message gets no error response
 /// (connection wedges silently)", `bug`/`P1`, filed against 3.1.2). When that
-/// ships fixed, rmcp answers the bare probe itself and everything here goes:
-/// [`DiscoverProbe`], [`discover_probe`], [`normalize_discover_probe`], the
-/// hook in [`relay_loop`] and the rewrite in [`read_session_opener`].
+/// ships fixed, rmcp answers the bare probe itself and everything here goes.
+/// The whole list, kept complete because this is the copy a future deleter
+/// reads first and it must agree with the one in `CLAUDE.md` and
+/// `plans/backlog.md`: [`DiscoverProbe`], [`discover_probe`], [`probe_meta`],
+/// [`normalize_discover_probe`], [`observe_discover_probe`], the two
+/// `META_KEY_*` constants above, the rewrite in [`read_session_opener`], and
+/// the hook in [`relay_loop`] together with `RelayState`'s
+/// `opener_already_classified` field and the `Default` impl that sets it.
 /// `a_normalized_probe_reaches_our_discover_handler_and_a_bare_one_is_dropped`
 /// pins the bug, so the fix arriving shows up as a red test here.
 ///
@@ -553,7 +558,6 @@ enum SessionEnd {
 /// What the relay remembers across daemon restarts: the client's handshake
 /// lines to replay verbatim and the ids of requests still waiting for a
 /// response, which get an error answer after a restart instead of silence.
-#[derive(Default)]
 struct RelayState {
     init_request: Option<String>,
     init_id: Option<Value>,
@@ -561,16 +565,46 @@ struct RelayState {
     outstanding: std::collections::HashMap<String, Value>,
     /// The next client line is the session opener [`read_session_opener`]
     /// already classified, rewrote if it was a bare probe and logged, so
-    /// [`relay_loop`] must forward it without classifying it again. Set by
-    /// [`pump_stdio`], which only ever runs after that read; cleared on the
-    /// first client line, so a probe that arrives later - the one shape that
-    /// can still meet a fresh daemon's init loop, after a restart resynced a
-    /// session no `initialize` opened - is normalized as usual.
+    /// [`relay_loop`] must forward it without classifying it again. Cleared on
+    /// the first client line, so a probe that arrives later - the one shape
+    /// that can still meet a fresh daemon's init loop, after a restart
+    /// resynced a session no `initialize` opened - is normalized as usual.
     ///
     /// Without this one bare probe produced two WARN lines, the second
     /// ("arrived with the required _meta; forwarding it unchanged", read off
     /// the already-rewritten line) contradicting the first.
+    ///
+    /// **True by default on purpose**, see [`RelayState::default`]: the flag is
+    /// a fact about how every production relay is reached, not an option a
+    /// call site chooses, so no call site can drop it.
     opener_already_classified: bool,
+}
+
+impl Default for RelayState {
+    /// The state every relay in this binary starts from. Written by hand
+    /// rather than derived for one field: `opener_already_classified` is
+    /// **true**, because [`pump_stdio`] is reachable only from [`run_mcp`],
+    /// which has already read and classified the session opener through
+    /// [`read_session_opener`] and re-fronted it onto stdin. Deriving `Default`
+    /// and setting the flag at the call site instead put the invariant in a
+    /// line nothing tested, where reverting it silently brought back the
+    /// double WARN; here it is the one place the value is decided, both
+    /// production and `a_bare_probe_on_the_relay_path_is_classified_once` go
+    /// through it, and flipping it turns that test red.
+    ///
+    /// A test that wants the other shape - a probe the relay itself must
+    /// classify, which is what a fresh daemon sees after a restart resynced a
+    /// session no `initialize` opened - clears the flag explicitly. That is
+    /// the only place in the tree that does.
+    fn default() -> Self {
+        RelayState {
+            init_request: None,
+            init_id: None,
+            initialized_note: None,
+            outstanding: std::collections::HashMap::new(),
+            opener_already_classified: true,
+        }
+    }
 }
 
 impl RelayState {
@@ -783,11 +817,9 @@ where
     R: AsyncRead + Unpin,
 {
     // `run_mcp` read and classified the session opener before priming it back
-    // onto this reader, so the first line below is already described in the log.
-    let mut relay = RelayState {
-        opener_already_classified: true,
-        ..RelayState::default()
-    };
+    // onto this reader, so the first line below is already described in the
+    // log. That is what `RelayState::default()` encodes; nothing is set here.
+    let mut relay = RelayState::default();
     let mut stdin = BufReader::new(reader).lines();
     let mut stdout = tokio::io::stdout();
     let mut session = Session::new(stream);
@@ -2263,12 +2295,12 @@ mod tests {
         assert_eq!(out, "hello world");
     }
 
-    /// A probe the relay has to classify itself: `opener_already_classified`
-    /// is clear, which is the state after a restart resynced a session no
-    /// `initialize` opened, so this line meets a fresh daemon's init loop as
-    /// its first message and has to arrive normalized.
-    /// `a_bare_probe_on_the_relay_path_is_classified_once` covers the other
-    /// side, the opener the bridge already handled.
+    /// A probe the relay has to classify itself: this is the one place in the
+    /// tree that clears `opener_already_classified`, which is the state after
+    /// a restart resynced a session no `initialize` opened, so this line meets
+    /// a fresh daemon's init loop as its first message and has to arrive
+    /// normalized. `a_bare_probe_on_the_relay_path_is_classified_once` covers
+    /// the other side, the opener the bridge already handled.
     #[tokio::test]
     async fn relay_loop_forwards_a_normalized_discover_probe_to_the_daemon() {
         let (bridge_side, daemon_side) = tokio::io::duplex(4096);
@@ -2296,7 +2328,12 @@ mod tests {
             seen
         });
 
-        let mut relay = RelayState::default();
+        // The one place in the tree that clears the flag: this probe is not a
+        // session opener anybody has classified, so the relay owns it.
+        let mut relay = RelayState {
+            opener_already_classified: false,
+            ..RelayState::default()
+        };
         let mut stdin = BufReader::new(stdin_read).lines();
         let mut stdout = Vec::new();
         let mut session = Session::new(bridge_side);
@@ -2430,10 +2467,10 @@ mod tests {
             lines.next_line().await.unwrap()
         });
 
-        let mut relay = RelayState {
-            opener_already_classified: true,
-            ..RelayState::default()
-        };
+        // The construction `pump_stdio` performs, not a hand-built copy of it:
+        // the invariant lives in `RelayState::default` and both go through it,
+        // so a change there fails here instead of shipping.
+        let mut relay = RelayState::default();
         let mut stdout = Vec::new();
         let mut session = Session::new(bridge_side);
         let (end, _) = relay_loop(&mut relay, &mut stdin, &mut stdout, &mut session)
@@ -2509,9 +2546,12 @@ mod tests {
     async fn primed_reader_hands_relay_loop_the_initialize_then_follow_up() {
         // The primed reader carries the drained `initialize` line as its prefix
         // and whatever the client sent next in its inner reader. Fed through
-        // `BufReader::new(reader).lines()` exactly as `pump_stdio` does, the
-        // relay must forward `initialize` first and the follow-up next, proving
-        // the handoff preserves ordering with no special replay.
+        // `BufReader::new(reader).lines()` and relayed from a plain
+        // `RelayState::default()`, both exactly as `pump_stdio` does, the relay
+        // must forward `initialize` first and the follow-up next, proving the
+        // handoff preserves ordering with no special replay. The opener being
+        // exempt from classification changes nothing here: an `initialize` is
+        // not a probe, so nothing would have been logged for it either way.
         let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
         let follow: &[u8] = b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n";
         let mut prefix = Vec::with_capacity(init.len() + 1);
