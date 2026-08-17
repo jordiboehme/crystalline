@@ -60,7 +60,20 @@ Once knowledge grows into the thousands or tens of thousands of units, reading a
 - **Built on an open format.** The engram format extends [Google's Open Knowledge Format (OKF) v0.2](https://github.com/GoogleCloudPlatform/knowledge-catalog/tree/main/okf): plain markdown with YAML frontmatter, readable by any OKF tooling, with no lock-in. Unknown keys are always preserved, every engram records who wrote it and when and Crystalline layers its routing, temporal and knowledge-graph conventions on top - so OKF documents drop straight into a domain and your knowledge stays portable, diffable files whatever tools come next.
 - **Knowledge retires, it does not disappear.** When a fact stops holding, the old engram is superseded rather than overwritten: its `status` marks it as no longer current, `valid_from`/`valid_to` keep the past addressable by date ("what applied last June") and the lessons it taught carry forward as unbounded knowledge - the way a person still draws on a past job without mistaking it for the present. A retired engram stays in every search; it is only softly faded in ranking, so current knowledge surfaces first without the past ever going missing.
 - **MANIFEST routing** lets an agent (or a person) figure out which domain owns a task without reading every file: `crystalline prompt system` turns each domain's `## When to Use` bullets into a compact session-start briefing.
-- **Fluid** is the browser UI for an instance, and it is the half of this that is for people. Everything an agent captured is a page you can read: domains down the side, an engram with its frontmatter, observations, relations and backlinks, faceted search across the whole instance, an interactive graph of a neighborhood, and Cmd+K to jump anywhere by name. Crystalline stores what was learned; Fluid is where you think with it. It is built into the binary and on by default at `http://localhost:7411`, so the daemon your agents already talk to serves the UI and the agents on one port, see [Web UI from the daemon](docs/deployment.md#web-ui-from-the-daemon); the compose variant puts nginx in front of it when a deployment wants to scale out.
+- **Fluid** is the browser UI for an instance, and it is the half of this that is for people: Crystalline stores what was learned, [Fluid](#fluid-the-web-ui) is where you read, edit and think with it.
+
+## Fluid, the web UI
+
+Everything an agent captures is a page you can read. Fluid is built into the binary and on by default at `http://localhost:7411`, so the daemon your agents already talk to serves people and agents on one port: nothing to deploy, and the first visit creates your admin account right in the browser.
+
+![An engram in Fluid: frontmatter details, observations, typed relations and the agent's-eye view](assets/fluid-engram.jpg)
+
+- **Read what was learned.** An engram is a page: frontmatter as a details rail, observations and relations as labelled chips, backlinks, and the `crystalline://` address one click from the clipboard. Domains down the side, Cmd+K to jump anywhere by name.
+- **Edit in place.** A live-preview markdown editor with table editing, a frontmatter form, mermaid previews and wikilink completion across every domain. The file on disk stays the source of truth.
+- **Collaborate in real time.** Everyone in the same engram sees everyone else's cursors and edits live; changes merge conflict-free and land as one save.
+- **Search it all.** Faceted search across the whole instance, backed by the same hybrid text-plus-semantic ranking the agents use.
+- **See the shape of it.** An interactive graph of any engram's neighborhood, and an agent's-eye view showing exactly what the tools serve an agent for that page.
+- **Accounts when you need them, none when you don't.** Admin, editor and viewer roles managed in the UI or with `crystalline users`; an anonymous read-only mode for a published archive; a trusted-header mode behind an SSO proxy. See [deployment](docs/deployment.md) for the container and team-server variants.
 
 ## Get started
 
