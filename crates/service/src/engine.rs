@@ -35,13 +35,13 @@ use crystalline_core::{
     is_lower_hyphen, parse_engram, parse_engram_lossless, slugify,
 };
 use crystalline_index::{
-    ChunkParams, DEFAULT_RETIRED_WEIGHT, DEFAULT_SALIENCE_WEIGHT, DomainHost, DomainId, DomainKind,
-    EMBED_PAGE_SIZE, EdgeKind, EmbeddingProvider, EngramDescriptor, EngramFacts, EngramId,
-    EngramRecord, Family, FileStamp, Finding, GraphNode, GraphSlice, HostClaim, InboundQuery,
-    RULES, RecentFilter, SearchMode, SearchQuery, Store, SweepInput, SweepOptions, SyncReport,
-    apply_scan, chunk_engram, configured_model_id, detect, order_jobs_for_batching,
-    parse_metadata_filters, provider_from_config, rank, retired_factor, rule_info, salience_prior,
-    scan_domain, scan_paths,
+    AttachmentRow, ChunkParams, DEFAULT_RETIRED_WEIGHT, DEFAULT_SALIENCE_WEIGHT, DomainHost,
+    DomainId, DomainKind, EMBED_PAGE_SIZE, EdgeKind, EmbeddingProvider, EngramDescriptor,
+    EngramFacts, EngramId, EngramRecord, Family, FileStamp, Finding, GraphNode, GraphSlice,
+    HostClaim, InboundQuery, RULES, RecentFilter, SearchMode, SearchQuery, Store, SweepInput,
+    SweepOptions, SyncReport, apply_scan, chunk_engram, configured_model_id, detect,
+    order_jobs_for_batching, parse_metadata_filters, provider_from_config, rank, retired_factor,
+    rule_info, salience_prior, scan_domain, scan_paths,
 };
 use crystalline_remote::ops;
 use crystalline_remote::{
@@ -1474,6 +1474,12 @@ impl Engine {
         if crystalline_core::is_reserved_path(&rel) {
             return Err(EngineError::Invalid(reserved_name_error(&rel)));
         }
+        // The other reserved shape: the folder attachments live in. Checked on
+        // the joined path, so a `folder` of `assets`, `/assets/` or
+        // `assets/deep` is refused whichever spelling arrived.
+        if is_assets_reserved(&rel) {
+            return Err(EngineError::Invalid(assets_reserved_error(&rel)));
+        }
         let permalink = slugify(&rel);
 
         // The whole existence-check-then-write, for a file domain, under that
@@ -1617,6 +1623,13 @@ impl Engine {
         if crystalline_core::is_reserved_path(&desc.path) {
             return Err(EngineError::Invalid(reserved_name_error(&desc.path)));
         }
+        // Defence in depth for the same reason: the walk never indexes
+        // anything under `assets/`, so a resolved engram cannot sit there
+        // today, and a row left over from before the prefix was reserved must
+        // not become a way to write into the attachment folder.
+        if is_assets_reserved(&desc.path) {
+            return Err(EngineError::Invalid(assets_reserved_error(&desc.path)));
+        }
 
         match &source {
             ContentSource::File { root } => {
@@ -1737,6 +1750,9 @@ impl Engine {
         if crystalline_core::is_reserved_path(path) {
             return Err(EngineError::Invalid(reserved_name_error(path)));
         }
+        if is_assets_reserved(path) {
+            return Err(EngineError::Invalid(assets_reserved_error(path)));
+        }
         let (domain_id, source) = self.domain_source(domain).await?;
         match &source {
             ContentSource::File { root } => {
@@ -1802,6 +1818,192 @@ impl Engine {
             }
         };
         Ok((domain_id, source))
+    }
+
+    // --- attachments ---------------------------------------------------------
+    //
+    // The byte seam every attachment surface goes through: the REST file
+    // routes, the archive and the MCP resource reads. Above it nothing knows
+    // which kind of domain it is addressing; below it a file domain keeps plain
+    // files under its root (so a git team domain carries them like any other
+    // tracked file) and a virtual domain keeps the bytes in the index beside
+    // the row. The metadata row is identical either way, and it is written
+    // here rather than left to the next walker pass, so a surface that just
+    // uploaded a file can list it immediately.
+
+    /// Every attachment a domain carries, metadata only, ordered by path.
+    ///
+    /// Bytes are never loaded: a listing of a domain full of slide decks costs
+    /// one query.
+    pub async fn attachment_list(&self, domain: &str) -> Result<Vec<AttachmentRow>> {
+        let (domain_id, _) = self.domain_source(domain).await?;
+        let store = self.store.lock().await;
+        Ok(store.list_attachments(domain_id).await?)
+    }
+
+    /// One attachment's bytes and its metadata row.
+    ///
+    /// A file domain reads the file under its root; a virtual domain reads the
+    /// stored blob. Either way an absent attachment is
+    /// [`EngineError::NotFound`], the same miss an absent engram reports.
+    ///
+    /// The file arm heals the row it serves. A file can arrive behind the index
+    /// (a `git pull`, an editor, a domain whose first sync has not run) and can
+    /// change behind it the same way, so when the recorded row does not match
+    /// the file's own size and modification instant the bytes just read are
+    /// hashed and the row is refreshed through the same upsert the walker uses.
+    /// That keeps the sha a caller caches on describing exactly what it
+    /// received. The match itself is the walker's stat prefilter, so the common
+    /// case costs no hashing at all.
+    pub async fn attachment_read(
+        &self,
+        domain: &str,
+        path: &str,
+    ) -> Result<(Vec<u8>, AttachmentRow)> {
+        validate_attachment_path(path)?;
+        let (domain_id, source) = self.domain_source(domain).await?;
+        match &source {
+            ContentSource::File { root } => {
+                let abs = contained_asset_path(root, path)?;
+                let bytes = match std::fs::read(&abs) {
+                    Ok(bytes) => bytes,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        return Err(EngineError::NotFound(missing_attachment(domain, path)));
+                    }
+                    Err(source) => {
+                        return Err(EngineError::Io {
+                            path: abs.display().to_string(),
+                            source,
+                        });
+                    }
+                };
+                let modified = asset_modified(&abs);
+                let store = self.store.lock().await;
+                if let Some(row) = store.get_attachment(domain_id, path).await?
+                    && row.size == bytes.len() as u64
+                    && row.modified == modified
+                {
+                    return Ok((bytes, row));
+                }
+                let row = attachment_row(path, &bytes, modified)?;
+                store.upsert_attachment(domain_id, &row).await?;
+                Ok((bytes, row))
+            }
+            ContentSource::Virtual => {
+                let store = self.store.lock().await;
+                let row = store
+                    .get_attachment(domain_id, path)
+                    .await?
+                    .ok_or_else(|| EngineError::NotFound(missing_attachment(domain, path)))?;
+                let bytes = store
+                    .read_attachment_blob(domain_id, path)
+                    .await?
+                    .ok_or_else(|| EngineError::NotFound(missing_attachment(domain, path)))?;
+                Ok((bytes, row))
+            }
+        }
+    }
+
+    /// Create or replace one attachment, returning the row that now describes
+    /// it.
+    ///
+    /// Every gate runs before a byte is stored: the path rules and the
+    /// extension allowlist ([`crystalline_core::validate_asset_path`]) and the
+    /// size ceiling. A file domain then writes the bytes atomically under its
+    /// root, with the joined path proven to stay inside it, and takes the same
+    /// per-file lock every other file write takes so a concurrent replace
+    /// cannot leave the row describing the loser's bytes. A virtual domain
+    /// writes the row and then the blob, in that order, since the store keeps a
+    /// blob without a row an error rather than an orphan.
+    ///
+    /// Both kinds mark the domain pending in the maintenance state afterwards:
+    /// a human just added something the agent has not read yet, which is
+    /// exactly what a consolidation sweep is for.
+    pub async fn attachment_write(
+        &self,
+        domain: &str,
+        path: &str,
+        bytes: Vec<u8>,
+    ) -> Result<AttachmentRow> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        validate_attachment_path(path)?;
+        if bytes.len() as u64 > crystalline_core::MAX_ATTACHMENT_BYTES {
+            return Err(EngineError::Invalid(format!(
+                "attachment '{path}' is {} bytes, over the {} byte ceiling",
+                bytes.len(),
+                crystalline_core::MAX_ATTACHMENT_BYTES
+            )));
+        }
+        let (domain_id, source) = self.domain_source(domain).await?;
+        let row = match &source {
+            ContentSource::File { root } => {
+                let abs = contained_asset_path(root, path)?;
+                // Held across the write and the row upsert, the file lock
+                // before the store lock like every other writer here. See
+                // `Engine::write_lock`.
+                let lock = self.write_lock(&abs);
+                let _guard = lock.lock().await;
+                write_bytes(&abs, &bytes)?;
+                // The modification instant is read back off the file rather
+                // than taken from the clock, so it is the same value the sync
+                // walker's stat prefilter compares against and an upload costs
+                // no re-hash on the next scan.
+                let row = attachment_row(path, &bytes, asset_modified(&abs))?;
+                let store = self.store.lock().await;
+                store.upsert_attachment(domain_id, &row).await?;
+                row
+            }
+            ContentSource::Virtual => {
+                let row = attachment_row(path, &bytes, Utc::now().to_rfc3339())?;
+                let store = self.store.lock().await;
+                store.upsert_attachment(domain_id, &row).await?;
+                store.write_attachment_blob(domain_id, path, &bytes).await?;
+                row
+            }
+        };
+        crate::maintenance::record_pending(domain);
+        Ok(row)
+    }
+
+    /// Remove one attachment: the file or the blob, and the row.
+    ///
+    /// [`EngineError::NotFound`] when neither was there, so a caller can answer
+    /// a miss. A file that is gone while its row stands (or the reverse, after
+    /// a hand-edited domain) still counts as a delete: whichever half existed
+    /// is removed and the pair ends up consistent.
+    pub async fn attachment_delete(&self, domain: &str, path: &str) -> Result<()> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        validate_attachment_path(path)?;
+        let (domain_id, source) = self.domain_source(domain).await?;
+        let mut file_removed = false;
+        if let ContentSource::File { root } = &source {
+            let abs = contained_asset_path(root, path)?;
+            let lock = self.write_lock(&abs);
+            let _guard = lock.lock().await;
+            match std::fs::remove_file(&abs) {
+                Ok(()) => file_removed = true,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(source) => {
+                    return Err(EngineError::Io {
+                        path: abs.display().to_string(),
+                        source,
+                    });
+                }
+            }
+        }
+        let row_removed = {
+            let store = self.store.lock().await;
+            store.delete_attachment(domain_id, path).await?
+        };
+        if !file_removed && !row_removed {
+            return Err(EngineError::NotFound(missing_attachment(domain, path)));
+        }
+        crate::maintenance::record_pending(domain);
+        Ok(())
     }
 
     /// The retirement statuses [`Engine::retire_engram`] accepts. Any other
@@ -2702,6 +2904,9 @@ impl Engine {
         }
         if crystalline_core::is_reserved_path(&dest_rel) {
             return Err(EngineError::Invalid(reserved_name_error(&dest_rel)));
+        }
+        if is_assets_reserved(&dest_rel) {
+            return Err(EngineError::Invalid(assets_reserved_error(&dest_rel)));
         }
         let cross = dest_domain != p.domain;
 
@@ -8568,7 +8773,15 @@ fn write_bytes(abs: &Path, contents: &[u8]) -> Result<()> {
     // guarded verbs off each other, but the counter is what makes the temp
     // file private to a single write whichever path produced it.
     let seq = TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp = abs.with_extension(format!("md.tmp.{}.{seq}", std::process::id()));
+    // The suffix is appended to the whole filename rather than replacing its
+    // extension, so an attachment's temp file keeps naming the file it belongs
+    // to (`shot.png.tmp.<pid>.<seq>`) instead of claiming an extension it never
+    // had. For a `.md` engram the two spellings produce the same name.
+    let name = abs
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let tmp = abs.with_file_name(format!("{name}.tmp.{}.{seq}", std::process::id()));
     std::fs::write(&tmp, contents).map_err(|source| EngineError::Io {
         path: tmp.display().to_string(),
         source,
@@ -8578,6 +8791,112 @@ fn write_bytes(abs: &Path, contents: &[u8]) -> Result<()> {
         source,
     })?;
     Ok(())
+}
+
+/// Screen an attachment path before it reaches a filesystem or the store:
+/// [`crystalline_core::validate_asset_path`]'s rules - the reserved prefix, the
+/// segment rules, the character rules, the length ceiling and the extension
+/// allowlist - reported as a malformed request.
+fn validate_attachment_path(path: &str) -> Result<()> {
+    crystalline_core::validate_asset_path(path)
+        .map_err(|e| EngineError::Invalid(format!("attachment path '{path}': {e}")))
+}
+
+/// The absolute path an attachment occupies under a file domain's root, proven
+/// to stay inside it.
+///
+/// Two proofs, because they catch different things.
+/// [`is_contained_rel`] refuses a relative path that could climb out
+/// (`..`, an absolute path, a Windows separator or drive marker) before any
+/// path is built, which is the one that matters for untrusted input.
+/// Canonicalization then catches what a string check cannot see: an `assets`
+/// folder, or a folder inside it, that is a symlink pointing somewhere else
+/// entirely. It is taken on the deepest ancestor that actually exists, since
+/// the file itself usually does not yet.
+fn contained_asset_path(root: &Path, rel: &str) -> Result<PathBuf> {
+    if !is_contained_rel(rel) {
+        return Err(EngineError::Invalid(format!(
+            "attachment path '{rel}' escapes the domain root"
+        )));
+    }
+    let abs = join_rel(root, rel);
+    // A root that cannot be resolved does not exist yet, so there is no
+    // symlink in place to escape through and the segment-by-segment join
+    // stands on its own.
+    let Ok(canonical_root) = std::fs::canonicalize(root) else {
+        return Ok(abs);
+    };
+    let mut probe = abs.clone();
+    while probe != *root {
+        if let Ok(resolved) = std::fs::canonicalize(&probe) {
+            if !resolved.starts_with(&canonical_root) {
+                return Err(EngineError::Invalid(format!(
+                    "attachment path '{rel}' resolves outside the domain root"
+                )));
+            }
+            break;
+        }
+        match probe.parent() {
+            Some(parent) => probe = parent.to_path_buf(),
+            None => break,
+        }
+    }
+    Ok(abs)
+}
+
+/// The metadata row describing these bytes at this path. The mime comes from
+/// the extension and never from a caller, which is why this cannot be built
+/// before [`validate_attachment_path`] has accepted the path.
+fn attachment_row(path: &str, bytes: &[u8], modified: String) -> Result<AttachmentRow> {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let mime = crystalline_core::attachment_mime(name).ok_or_else(|| {
+        EngineError::Invalid(format!(
+            "attachment path '{path}': an attachment must carry an allowlisted file extension"
+        ))
+    })?;
+    Ok(AttachmentRow {
+        path: path.to_string(),
+        sha256: sha256_hex(bytes),
+        mime: mime.to_string(),
+        size: bytes.len() as u64,
+        modified,
+    })
+}
+
+/// A file's modification instant in the spelling the sync walker records, so a
+/// row written here and a row written by a scan compare equal.
+fn asset_modified(abs: &Path) -> String {
+    let mtime = std::fs::metadata(abs)
+        .map(|meta| mtime_secs(&meta))
+        .unwrap_or_else(|_| Utc::now().timestamp());
+    chrono::DateTime::from_timestamp(mtime, 0)
+        .unwrap_or(chrono::DateTime::UNIX_EPOCH)
+        .to_rfc3339()
+}
+
+/// The miss message every attachment verb reports, one spelling.
+fn missing_attachment(domain: &str, path: &str) -> String {
+    format!("no attachment '{path}' in domain '{domain}'")
+}
+
+/// Whether a forward-slashed domain-relative path lands under the reserved
+/// `assets/` prefix, where attachments live and no engram is ever written.
+///
+/// A folder called `assets-notes` is an ordinary folder, and so is an engram
+/// file called `assets.md`: only the folder itself and what sits inside it is
+/// reserved.
+fn is_assets_reserved(rel: &str) -> bool {
+    let trimmed = rel.trim_start_matches("./").trim_matches('/');
+    trimmed == "assets" || trimmed.starts_with(crystalline_core::ASSETS_PREFIX)
+}
+
+/// The refusal an engram write earns by aiming at the reserved `assets/`
+/// prefix.
+fn assets_reserved_error(rel: &str) -> String {
+    format!(
+        "'{rel}' sits under the reserved {} folder: assets is reserved for attachments, so nothing under it is an engram. Choose another folder or destination.",
+        crystalline_core::ASSETS_PREFIX
+    )
 }
 
 /// A synthesized file stamp for a virtual write: the current epoch seconds, the
