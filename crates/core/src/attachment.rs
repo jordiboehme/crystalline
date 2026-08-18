@@ -87,8 +87,8 @@ pub enum AssetPathError {
     /// A segment starts with `.`, which would hide the file from sync.
     #[error("an attachment path must not hold a segment starting with `.`")]
     HiddenSegment,
-    /// The path holds a backslash, a colon or a control character.
-    #[error("an attachment path must not hold a backslash, a colon or a control character")]
+    /// The path holds a backslash, a colon, a `#` or a control character.
+    #[error("an attachment path must not hold a backslash, a colon, a `#` or a control character")]
     BadCharacter,
     /// The path is longer than 256 bytes.
     #[error("an attachment path must be at most 256 bytes")]
@@ -103,12 +103,16 @@ pub enum AssetPathError {
 /// Asset paths are never slugified - a filename a human recognizes is the
 /// point - so validation carries the whole burden: the path starts with
 /// `assets/`, uses forward slashes only, holds no empty, `.`, `..` or
-/// dot-leading segment, holds no backslash, colon or control character, is at
-/// most 256 bytes, and its final segment carries an allowlisted extension.
+/// dot-leading segment, holds no backslash, colon, `#` or control character,
+/// is at most 256 bytes, and its final segment carries an allowlisted
+/// extension.
 ///
 /// A colon is refused because it is a path separator on some platforms and a
 /// drive designator on Windows, so a segment shaped like `C:` would reach the
-/// filesystem as something other than the plain relative name it looks like.
+/// filesystem as something other than the plain relative name it looks like. A
+/// `#` is refused because it opens the image formatting fragment a body target
+/// may carry; keeping it out of stored paths is what makes that fragment
+/// unambiguous.
 pub fn validate_asset_path(path: &str) -> Result<(), AssetPathError> {
     let Some(rest) = path.strip_prefix(ASSETS_PREFIX) else {
         return Err(AssetPathError::NotUnderAssets);
@@ -116,7 +120,11 @@ pub fn validate_asset_path(path: &str) -> Result<(), AssetPathError> {
     if path.len() > MAX_ASSET_PATH_BYTES {
         return Err(AssetPathError::TooLong);
     }
-    if path.contains('\\') || path.contains(':') || path.chars().any(char::is_control) {
+    if path.contains('\\')
+        || path.contains(':')
+        || path.contains('#')
+        || path.chars().any(char::is_control)
+    {
         return Err(AssetPathError::BadCharacter);
     }
 
@@ -148,6 +156,13 @@ pub fn validate_asset_path(path: &str) -> Result<(), AssetPathError> {
 /// are skipped so an example in a snippet never counts as a reference. A target
 /// carrying a scheme or a leading `/` addresses something outside the domain
 /// and is ignored, which the `assets/` prefix test already decides.
+///
+/// A trailing `#fragment` is stripped: an image formatting directive
+/// (`assets/pic.png#right,w=50%`) is a rendering instruction, not part of the
+/// path, so it resolves and dedupes as `assets/pic.png`. Since a stored asset
+/// path can never hold a `#`, the first one always opens the fragment. A target
+/// that is nothing but the prefix once the fragment is gone (`assets/#left`)
+/// names no file and is dropped.
 pub fn find_asset_refs(body: &str) -> Vec<String> {
     let mut refs: Vec<String> = Vec::new();
     // A fence opens on a marker of at least three backticks or tildes and
@@ -214,7 +229,16 @@ fn line_targets(line: &str) -> Vec<String> {
         let inside = line[open..end].trim();
         let target = inside.split_whitespace().next().unwrap_or("");
         let target = target.strip_prefix("./").unwrap_or(target);
-        if target.starts_with(ASSETS_PREFIX) {
+        // An image formatting fragment is a rendering directive, not part of
+        // the path, so it never reaches a reference. `#` cannot occur inside a
+        // stored asset path, so the first one always opens the fragment.
+        let target = match target.split_once('#') {
+            Some((path, _)) => path,
+            None => target,
+        };
+        if let Some(rest) = target.strip_prefix(ASSETS_PREFIX)
+            && !rest.is_empty()
+        {
             targets.push(target.to_string());
         }
     }
@@ -387,6 +411,26 @@ Again: ![d](assets/flow.png)\n\
     }
 
     #[test]
+    fn an_image_format_fragment_is_stripped_and_dedupes_with_the_bare_path() {
+        let body = "\
+![x](assets/a.png#right,w=50%)\n\
+\n\
+![x again](assets/a.png)\n\
+\n\
+[deck](assets/deck.pdf#center)\n";
+        assert_eq!(
+            find_asset_refs(body),
+            vec!["assets/a.png".to_string(), "assets/deck.pdf".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_target_that_is_only_a_fragment_is_not_a_reference() {
+        assert_eq!(find_asset_refs("![x](assets/#left)"), Vec::<String>::new());
+        assert_eq!(find_asset_refs("![x](assets/#)"), Vec::<String>::new());
+    }
+
+    #[test]
     fn a_colon_in_a_segment_is_refused() {
         assert_eq!(
             validate_asset_path("assets/C:/Users/x.png"),
@@ -394,6 +438,14 @@ Again: ![d](assets/flow.png)\n\
         );
         assert_eq!(
             validate_asset_path("assets/a:b.png"),
+            Err(AssetPathError::BadCharacter)
+        );
+    }
+
+    #[test]
+    fn a_hash_in_a_path_is_refused() {
+        assert_eq!(
+            validate_asset_path("assets/a#b.png"),
             Err(AssetPathError::BadCharacter)
         );
     }
