@@ -58,18 +58,34 @@ async fn engine_fixture() -> (
     std::path::PathBuf,
     support::ScratchStateDir,
 ) {
+    named_fixture("eng", "scratch").await
+}
+
+/// [`engine_fixture`] with the two domain names chosen by the caller, for a
+/// test whose assertions are about process-wide state (the maintenance file)
+/// and so must not collide with a sibling running in the same process under
+/// plain `cargo test`.
+async fn named_fixture(
+    file_domain: &str,
+    virtual_domain: &str,
+) -> (
+    tempfile::TempDir,
+    Arc<Engine>,
+    std::path::PathBuf,
+    support::ScratchStateDir,
+) {
     let scratch = support::ScratchStateDir::acquire();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
     let mut cfg = GlobalConfig::default();
-    let dir = root.join("eng");
+    let dir = root.join(file_domain);
     std::fs::create_dir_all(&dir).unwrap();
-    write_manifest(&dir, "eng");
+    write_manifest(&dir, file_domain);
     std::fs::write(dir.join("alpha.md"), ALPHA).unwrap();
     cfg.domains
-        .insert("eng".to_string(), DomainEntry::file(dir.clone()));
+        .insert(file_domain.to_string(), DomainEntry::file(dir.clone()));
     cfg.domains
-        .insert("scratch".to_string(), DomainEntry::virtual_domain());
+        .insert(virtual_domain.to_string(), DomainEntry::virtual_domain());
     cfg.service = Some(ServiceConfig {
         response_format: Some(ResponseFormat::Json),
         ..ServiceConfig::default()
@@ -211,38 +227,53 @@ async fn a_write_refuses_a_traversal_path_a_bad_extension_and_an_oversized_body(
     assert!(engine.attachment_list("eng").await.unwrap().is_empty());
 }
 
+/// The maintenance state file is process-wide (`ScratchStateDir` redirects one
+/// `HOME` per process, refcounted), and under plain `cargo test` the siblings
+/// in this binary run as threads beside this test and write to the same file.
+/// So the assertions are `contains` over domain names private to this test,
+/// plus a before/after snapshot where an exact claim is wanted: the brief asks
+/// that the pending set *gains* the domain, which is exactly what that proves.
 #[tokio::test]
 async fn a_write_marks_its_domain_pending_and_so_does_a_delete() {
-    let (_tmp, engine, _root, scratch) = engine_fixture().await;
-    assert!(
-        crystalline_service::maintenance::load()
-            .pending_domains
-            .is_empty()
-    );
+    let (_tmp, engine, _root, scratch) = named_fixture("pending-eng", "pending-scratch").await;
+    let before = crystalline_service::maintenance::load().pending_domains;
+    assert!(!before.contains(&"pending-eng".to_string()));
+    assert!(!before.contains(&"pending-scratch".to_string()));
 
     engine
-        .attachment_write("eng", "assets/shot.png", PNG.to_vec())
+        .attachment_write("pending-eng", "assets/shot.png", PNG.to_vec())
         .await
         .unwrap();
-    assert_eq!(
-        crystalline_service::maintenance::load().pending_domains,
-        vec!["eng".to_string()],
-        "an upload owes the human a sweep"
+    let after_write = crystalline_service::maintenance::load().pending_domains;
+    assert!(
+        after_write.contains(&"pending-eng".to_string()),
+        "an upload owes the human a sweep: {after_write:?}"
+    );
+    assert!(
+        !after_write.contains(&"pending-scratch".to_string()),
+        "only the written domain goes pending: {after_write:?}"
     );
     assert!(scratch.maintenance_path().exists());
 
-    // A delete is a change to what the domain carries too.
+    // A delete is a change to what the domain carries too, so the domain whose
+    // attachment is removed goes pending on the delete alone.
     engine
-        .attachment_write("scratch", "assets/x.txt", b"hi".to_vec())
+        .attachment_write("pending-scratch", "assets/x.txt", b"hi".to_vec())
         .await
         .unwrap();
+    crystalline_service::maintenance::record_run(&["pending-scratch".to_string()]);
+    let after_sweep = crystalline_service::maintenance::load().pending_domains;
+    assert!(!after_sweep.contains(&"pending-scratch".to_string()));
+
     engine
-        .attachment_delete("scratch", "assets/x.txt")
+        .attachment_delete("pending-scratch", "assets/x.txt")
         .await
         .unwrap();
-    assert_eq!(
-        crystalline_service::maintenance::load().pending_domains,
-        vec!["eng".to_string(), "scratch".to_string()]
+    assert!(
+        crystalline_service::maintenance::load()
+            .pending_domains
+            .contains(&"pending-scratch".to_string()),
+        "a delete owes the human a sweep too"
     );
 }
 
@@ -328,7 +359,16 @@ async fn a_rewritten_attachment_refreshes_its_row_and_a_stale_row_heals_on_read(
 async fn an_engram_write_refuses_the_reserved_assets_prefix() {
     let (_tmp, engine, _root, _scratch) = engine_fixture().await;
 
-    for folder in ["assets", "assets/deep", "/assets/"] {
+    for folder in [
+        "assets",
+        "assets/deep",
+        "/assets/",
+        "./assets",
+        // Case-insensitive: APFS and NTFS resolve `Assets` to the same
+        // directory, so the lowercase spelling cannot be the only one refused.
+        "Assets",
+        "ASSETS/deep",
+    ] {
         let err = engine
             .write_engram(&write_params("Notes", Some(folder)))
             .await
@@ -339,6 +379,26 @@ async fn an_engram_write_refuses_the_reserved_assets_prefix() {
             "folder '{folder}' must be refused with the reserved message, got: {message}"
         );
     }
+
+    // A folder that climbs out and back in is refused before any path is
+    // built: unscreened it would land the file in `assets/` on disk while
+    // reading as an ordinary destination.
+    for folder in ["a/../assets", "a/b/../../assets/deep"] {
+        let err = engine
+            .write_engram(&write_params("Notes", Some(folder)))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, EngineError::Invalid(_)),
+            "folder '{folder}' must be refused, got {err:?}"
+        );
+    }
+    // And so is a plain climb out of the domain, which is the same screen.
+    let err = engine
+        .write_engram(&write_params("Notes", Some("../outside")))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EngineError::Invalid(_)), "got {err:?}");
 
     // The neighbouring folder name is an ordinary one.
     engine
@@ -373,6 +433,24 @@ async fn a_move_and_a_restore_refuse_the_reserved_assets_prefix() {
         "a move into assets/ must be refused, got: {err}"
     );
 
+    // Same for the spellings that only look like something else.
+    for destination in ["Assets/alpha.md", "a/../assets/alpha.md"] {
+        let err = engine
+            .move_engram(&crystalline_service::params::MoveParams {
+                domain: "eng".to_string(),
+                identifier: "alpha".to_string(),
+                destination: destination.to_string(),
+                destination_domain: None,
+                update_links: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, EngineError::Invalid(_)),
+            "a move to '{destination}' must be refused, got {err:?}"
+        );
+    }
+
     let err = engine
         .restore_engram("eng", "assets/alpha.md", ALPHA)
         .await
@@ -381,5 +459,118 @@ async fn a_move_and_a_restore_refuse_the_reserved_assets_prefix() {
         err.to_string()
             .contains("assets is reserved for attachments"),
         "a restore into assets/ must be refused, got: {err}"
+    );
+    let err = engine
+        .restore_engram("eng", "a/../assets/alpha.md", ALPHA)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, EngineError::Invalid(_)),
+        "a restore that climbs out and back in must be refused, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_over_cap_file_is_refused_by_the_read_and_never_gains_a_row() {
+    let (_tmp, engine, root, _scratch) = engine_fixture().await;
+
+    // A file over the ceiling can only arrive behind the index (the write path
+    // refuses one and the walker skips it), and the read must agree with both:
+    // no bytes loaded, no row minted, so a full scan and a read never disagree
+    // about whether the attachment exists.
+    let dir = root.join("assets");
+    std::fs::create_dir_all(&dir).unwrap();
+    let over = vec![0u8; (crystalline_core::attachment::MAX_ATTACHMENT_BYTES + 1) as usize];
+    std::fs::write(dir.join("huge.pdf"), &over).unwrap();
+
+    let err = engine
+        .attachment_read("eng", "assets/huge.pdf")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, EngineError::Invalid(_)),
+        "an over-cap file must be refused by the read, got {err:?}"
+    );
+    assert!(
+        engine.attachment_list("eng").await.unwrap().is_empty(),
+        "the refused read must not mint a row"
+    );
+}
+
+/// The containment proof, which no path-string test can reach:
+/// `validate_asset_path` refuses every textual escape before
+/// `contained_asset_path` is called, so a symlink is the only way to exercise
+/// the canonicalization half - the half that stops an `assets/` folder (or a
+/// folder or file inside it) from pointing at somebody else's disk.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_symlink_out_of_the_domain_is_refused_by_every_attachment_verb() {
+    use std::os::unix::fs::symlink;
+
+    let (tmp, engine, root, _scratch) = engine_fixture().await;
+    let outside = tmp.path().join("outside");
+    std::fs::create_dir_all(outside.join("nested")).unwrap();
+    std::fs::write(outside.join("nested").join("secret.png"), PNG).unwrap();
+    std::fs::write(outside.join("target.png"), PNG).unwrap();
+
+    // 1. The `assets` folder itself is a symlink out of the domain.
+    symlink(&outside, root.join("assets")).unwrap();
+    for path in ["assets/target.png", "assets/nested/secret.png"] {
+        assert_refused_everywhere(&engine, path).await;
+    }
+    std::fs::remove_file(root.join("assets")).unwrap();
+
+    // 2. An inner segment is the symlink; the folder above it is real.
+    std::fs::create_dir_all(root.join("assets")).unwrap();
+    symlink(&outside, root.join("assets").join("link")).unwrap();
+    assert_refused_everywhere(&engine, "assets/link/target.png").await;
+
+    // 3. The target file itself is a symlink pointing outside.
+    symlink(
+        outside.join("target.png"),
+        root.join("assets").join("file.png"),
+    )
+    .unwrap();
+    assert_refused_everywhere(&engine, "assets/file.png").await;
+
+    // Nothing about this is a blanket refusal of the folder: a real file
+    // beside the symlinks still round-trips.
+    engine
+        .attachment_write("eng", "assets/real.png", PNG.to_vec())
+        .await
+        .unwrap();
+    assert_eq!(
+        engine
+            .attachment_read("eng", "assets/real.png")
+            .await
+            .unwrap()
+            .0,
+        PNG
+    );
+    // And the bytes outside the domain were never touched.
+    assert_eq!(std::fs::read(outside.join("target.png")).unwrap(), PNG);
+}
+
+/// Read, write and delete must all refuse `path`, and the file the path
+/// resolves to must still be there afterwards.
+#[cfg(unix)]
+async fn assert_refused_everywhere(engine: &Engine, path: &str) {
+    let read = engine.attachment_read("eng", path).await.unwrap_err();
+    assert!(
+        matches!(read, EngineError::Invalid(_)),
+        "read of '{path}' must be refused, got {read:?}"
+    );
+    let write = engine
+        .attachment_write("eng", path, b"overwritten".to_vec())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(write, EngineError::Invalid(_)),
+        "write of '{path}' must be refused, got {write:?}"
+    );
+    let delete = engine.attachment_delete("eng", path).await.unwrap_err();
+    assert!(
+        matches!(delete, EngineError::Invalid(_)),
+        "delete of '{path}' must be refused, got {delete:?}"
     );
 }

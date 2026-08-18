@@ -1444,16 +1444,27 @@ async fn hash_password(password: &str) -> Result<String> {
     .context("the password hashing task failed")?
 }
 
-/// Counts every argon2 verification this process has run, real or dummy.
-///
-/// The point of the dummy verification is that a login attempt costs the same
-/// wherever it lands, and a code path that merely looks balanced is not
-/// evidence of that. This lets a test assert the cost itself: exactly one
-/// verification per attempt, on every path. Test-only; nothing in a served
-/// binary touches it.
 #[cfg(test)]
-pub(crate) static VERIFICATIONS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+tokio::task_local! {
+    /// Counts the argon2 verifications run inside one test's task, real or
+    /// dummy.
+    ///
+    /// The point of the dummy verification is that a login attempt costs the
+    /// same wherever it lands, and a code path that merely looks balanced is
+    /// not evidence of that. This lets a test assert the cost itself: exactly
+    /// one verification per attempt, on every path. Test-only; nothing in a
+    /// served binary touches it.
+    ///
+    /// Task-local rather than a process-wide atomic, because `cargo test` runs
+    /// the tests of one binary as threads in a single process: a global counter
+    /// would also count whatever a sibling test was verifying at that instant,
+    /// and the "exactly one" assertion would be a race rather than a property.
+    /// Every verification a login runs happens on the task that asked for it,
+    /// so a scope around a test body counts exactly that test's own work. A
+    /// verification outside any scope (every other test, and the served binary)
+    /// simply counts nowhere.
+    pub(crate) static VERIFICATIONS: std::cell::Cell<u64>;
+}
 
 /// Verify `password` against a hash no account has, and throw the answer away.
 ///
@@ -1482,7 +1493,7 @@ pub(crate) async fn dummy_verify(password: &str) -> Result<bool> {
 /// false rather than erroring: a corrupt row must fail closed.
 async fn verify_hash(hash: String, password: String) -> Result<bool> {
     #[cfg(test)]
-    VERIFICATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let _ = VERIFICATIONS.try_with(|count| count.set(count.get() + 1));
     tokio::task::spawn_blocking(move || match PasswordHash::new(&hash) {
         Ok(parsed) => Argon2::default()
             .verify_password(password.as_bytes(), &parsed)

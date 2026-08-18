@@ -1466,16 +1466,26 @@ impl Engine {
                     .into(),
             ));
         }
-        let rel = if folder.trim_matches('/').is_empty() {
+        let folder = normalize_rel(&folder);
+        let rel = if folder.is_empty() {
             format!("{title_slug}.md")
         } else {
-            format!("{}/{title_slug}.md", folder.trim_matches('/'))
+            format!("{folder}/{title_slug}.md")
         };
+        // Screened before either reserved check, and before `join_rel` ever
+        // sees it: `join_rel` pushes segment by segment, `..` included, so an
+        // unscreened folder both places the file outside the domain root and
+        // hides the destination from a textual reserved check - `a/../assets`
+        // is neither `assets` nor `assets/...` as a string, yet it lands
+        // exactly there on disk.
+        if !is_contained_rel(&rel) {
+            return Err(EngineError::Invalid(escapes_root_error(&rel)));
+        }
         if crystalline_core::is_reserved_path(&rel) {
             return Err(EngineError::Invalid(reserved_name_error(&rel)));
         }
         // The other reserved shape: the folder attachments live in. Checked on
-        // the joined path, so a `folder` of `assets`, `/assets/` or
+        // the joined path, so a `folder` of `assets`, `/assets/`, `Assets` or
         // `assets/deep` is refused whichever spelling arrived.
         if is_assets_reserved(&rel) {
             return Err(EngineError::Invalid(assets_reserved_error(&rel)));
@@ -1747,6 +1757,14 @@ impl Engine {
                     .into(),
             ));
         }
+        // Normalized and screened before the two reserved checks read it, the
+        // same order the create and move paths use. A stored path is already in
+        // this shape, so nothing a caller sends today changes.
+        let normalized = normalize_rel(path);
+        let path = normalized.as_str();
+        if !is_contained_rel(path) {
+            return Err(EngineError::Invalid(escapes_root_error(path)));
+        }
         if crystalline_core::is_reserved_path(path) {
             return Err(EngineError::Invalid(reserved_name_error(path)));
         }
@@ -1865,6 +1883,26 @@ impl Engine {
         match &source {
             ContentSource::File { root } => {
                 let abs = contained_asset_path(root, path)?;
+                // The stat comes first so an over-cap file is refused without
+                // ever being read: the ceiling is enforced by the walker (which
+                // skips such a file, so it has no row) and by the write, and a
+                // read that hashed one anyway would both spend the memory and
+                // mint a row the next full scan deletes again.
+                let meta = match std::fs::metadata(&abs) {
+                    Ok(meta) => meta,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        return Err(EngineError::NotFound(missing_attachment(domain, path)));
+                    }
+                    Err(source) => {
+                        return Err(EngineError::Io {
+                            path: abs.display().to_string(),
+                            source,
+                        });
+                    }
+                };
+                if meta.len() > crystalline_core::MAX_ATTACHMENT_BYTES {
+                    return Err(EngineError::Invalid(over_cap_error(path, meta.len())));
+                }
                 let bytes = match std::fs::read(&abs) {
                     Ok(bytes) => bytes,
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -1877,6 +1915,15 @@ impl Engine {
                         });
                     }
                 };
+                // The bytes that were actually read decide, like the walker's
+                // post-read check: a file that grew past the ceiling between
+                // the stat and the read is caught here rather than served.
+                if bytes.len() as u64 > crystalline_core::MAX_ATTACHMENT_BYTES {
+                    return Err(EngineError::Invalid(over_cap_error(
+                        path,
+                        bytes.len() as u64,
+                    )));
+                }
                 let modified = asset_modified(&abs);
                 let store = self.store.lock().await;
                 if let Some(row) = store.get_attachment(domain_id, path).await?
@@ -1914,7 +1961,9 @@ impl Engine {
     /// per-file lock every other file write takes so a concurrent replace
     /// cannot leave the row describing the loser's bytes. A virtual domain
     /// writes the row and then the blob, in that order, since the store keeps a
-    /// blob without a row an error rather than an orphan.
+    /// blob without a row an error rather than an orphan; a blob write that
+    /// fails takes the row back out with it, so a failure leaves the domain
+    /// exactly as it found it rather than listing a path with no bytes.
     ///
     /// Both kinds mark the domain pending in the maintenance state afterwards:
     /// a human just added something the agent has not read yet, which is
@@ -1930,10 +1979,9 @@ impl Engine {
         }
         validate_attachment_path(path)?;
         if bytes.len() as u64 > crystalline_core::MAX_ATTACHMENT_BYTES {
-            return Err(EngineError::Invalid(format!(
-                "attachment '{path}' is {} bytes, over the {} byte ceiling",
-                bytes.len(),
-                crystalline_core::MAX_ATTACHMENT_BYTES
+            return Err(EngineError::Invalid(over_cap_error(
+                path,
+                bytes.len() as u64,
             )));
         }
         let (domain_id, source) = self.domain_source(domain).await?;
@@ -1959,7 +2007,19 @@ impl Engine {
                 let row = attachment_row(path, &bytes, Utc::now().to_rfc3339())?;
                 let store = self.store.lock().await;
                 store.upsert_attachment(domain_id, &row).await?;
-                store.write_attachment_blob(domain_id, path, &bytes).await?;
+                // The row cannot outlive a failed blob write: it is the only
+                // thing a listing reads, so leaving it behind would advertise
+                // an attachment whose bytes were never stored. The rollback is
+                // best effort - if it fails too the next write or the walker
+                // reconciles - and the original error is what the caller sees.
+                if let Err(e) = store.write_attachment_blob(domain_id, path, &bytes).await {
+                    if let Err(rollback) = store.delete_attachment(domain_id, path).await {
+                        tracing::warn!(
+                            "attachment '{path}' in '{domain}' kept a row after a failed blob write: {rollback}"
+                        );
+                    }
+                    return Err(e.into());
+                }
                 row
             }
         };
@@ -2901,6 +2961,13 @@ impl Engine {
         let dest_rel = normalize_md(&p.destination);
         if dest_rel.is_empty() {
             return Err(EngineError::Invalid("destination path is empty".into()));
+        }
+        // As on the create path: `normalize_md` drops empty segments but keeps
+        // `..`, so containment is decided here, before either reserved check
+        // reads the destination as text and before `join_rel` builds a path
+        // from it.
+        if !is_contained_rel(&dest_rel) {
+            return Err(EngineError::Invalid(escapes_root_error(&dest_rel)));
         }
         if crystalline_core::is_reserved_path(&dest_rel) {
             return Err(EngineError::Invalid(reserved_name_error(&dest_rel)));
@@ -8733,12 +8800,15 @@ fn folder_prefix(raw: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| format!("{trimmed}/"))
 }
 
-/// Normalize a destination into a forward-slashed `.md` path.
+/// Normalize a destination into a forward-slashed `.md` path. A `.` segment is
+/// dropped with the empty ones (it resolves to nothing); a `..` segment
+/// survives, so the containment screen at the call site refuses it rather than
+/// this quietly resolving a destination nobody asked for.
 fn normalize_md(dest: &str) -> String {
     let trimmed = dest.trim_start_matches("./").trim_matches('/');
     let joined = trimmed
         .split('/')
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.is_empty() && *s != ".")
         .collect::<Vec<_>>()
         .join("/");
     if joined.is_empty() {
@@ -8879,15 +8949,65 @@ fn missing_attachment(domain: &str, path: &str) -> String {
     format!("no attachment '{path}' in domain '{domain}'")
 }
 
+/// The refusal an over-cap attachment earns, one spelling for the write path
+/// and the read path so a file and an upload of the same size are refused in
+/// the same words.
+fn over_cap_error(path: &str, size: u64) -> String {
+    format!(
+        "attachment '{path}' is {size} bytes, over the {} byte ceiling",
+        crystalline_core::MAX_ATTACHMENT_BYTES
+    )
+}
+
 /// Whether a forward-slashed domain-relative path lands under the reserved
 /// `assets/` prefix, where attachments live and no engram is ever written.
 ///
 /// A folder called `assets-notes` is an ordinary folder, and so is an engram
 /// file called `assets.md`: only the folder itself and what sits inside it is
 /// reserved.
+///
+/// The first segment is matched case-insensitively, for the same reason the
+/// archive import matches the OKF reserved names that way: APFS and NTFS are
+/// case-insensitive, so a folder called `Assets` *is* `assets/` on the two
+/// filesystems most people run. Refusing only the lowercase spelling would let
+/// an engram land inside the attachment folder on those machines - or, with no
+/// folder there yet, create one the walker then indexes as an ordinary folder
+/// while every attachment written afterwards joins into it and is classified
+/// outside the reserved prefix. Callers pass an already normalized path (see
+/// [`normalize_rel`]), so a `..` segment can no longer walk in behind this
+/// check.
 fn is_assets_reserved(rel: &str) -> bool {
-    let trimmed = rel.trim_start_matches("./").trim_matches('/');
-    trimmed == "assets" || trimmed.starts_with(crystalline_core::ASSETS_PREFIX)
+    rel.trim_start_matches("./")
+        .trim_matches('/')
+        .split('/')
+        .next()
+        .is_some_and(|first| {
+            first.eq_ignore_ascii_case(crystalline_core::ASSETS_PREFIX.trim_end_matches('/'))
+        })
+}
+
+/// A caller-supplied domain-relative path as one normalized, forward-slashed
+/// string: a leading `./` stripped, surrounding slashes trimmed, empty and `.`
+/// segments dropped.
+///
+/// `..` segments deliberately survive, because normalizing them away would
+/// resolve a path the caller never asked for. They are refused instead, by the
+/// [`is_contained_rel`] screen every call site runs straight afterwards, which
+/// is what makes the reserved-name and reserved-prefix checks that follow
+/// decidable on the text alone.
+fn normalize_rel(raw: &str) -> String {
+    raw.trim_start_matches("./")
+        .split('/')
+        .filter(|segment| !segment.is_empty() && *segment != ".")
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// The refusal a write earns by aiming outside the domain root.
+fn escapes_root_error(rel: &str) -> String {
+    format!(
+        "'{rel}' is not a domain-relative destination: a path may not climb out of the domain root with a `..` segment, name an absolute path or hold a `\\` or `:` in a segment."
+    )
 }
 
 /// The refusal an engram write earns by aiming at the reserved `assets/`

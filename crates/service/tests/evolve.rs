@@ -696,6 +696,10 @@ async fn the_queue_rows_stay_tabular_for_toon() {
 /// the run never touches the developer's own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_run_recorder_stamps_a_sweep_and_leaves_detection_pure() {
+    // Both assertions here are about the whole file - its exact bytes, and the
+    // exact backlog left after a scoped sweep - so this test needs the state
+    // to itself while it runs. See `support::maintenance_guard`.
+    let _serialized = support::maintenance_guard().await;
     let scratch = support::ScratchStateDir::acquire();
     let (_tmp, engine) = fixture().await;
 
@@ -759,6 +763,9 @@ async fn the_run_recorder_stamps_a_sweep_and_leaves_detection_pure() {
 /// is left over is by definition unreachable and the run settles it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unscoped_run_settles_the_whole_backlog_including_a_ghost() {
+    // "A full sweep leaves no ghost behind" is a claim about the whole file, so
+    // it takes the same exclusivity as the test above.
+    let _serialized = support::maintenance_guard().await;
     let _scratch = support::ScratchStateDir::acquire();
     let (_tmp, engine) = fixture().await;
 
