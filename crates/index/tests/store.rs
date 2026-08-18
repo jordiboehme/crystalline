@@ -12,10 +12,10 @@
 use std::path::Path;
 
 use crystalline_index::{
-    DomainId, DomainKind, EMBED_PAGE_SIZE, EdgeKind, EmbeddingCoverage, EmbeddingRow, EngramId,
-    EngramRecord, FileStamp, FilterOp, HostClaim, InboundPage, InboundQuery, IndexError,
-    MetadataFilter, NamedCount, NewChunk, RecentFilter, SearchMode, SearchQuery, Store, TursoStore,
-    Vocabulary, sync_domain,
+    AttachmentRow, DomainId, DomainKind, EMBED_PAGE_SIZE, EdgeKind, EmbeddingCoverage,
+    EmbeddingRow, EngramId, EngramRecord, FileStamp, FilterOp, HostClaim, InboundPage,
+    InboundQuery, IndexError, MetadataFilter, NamedCount, NewChunk, RecentFilter, SearchMode,
+    SearchQuery, Store, TursoStore, Vocabulary, sync_domain,
 };
 
 fn write(dir: &Path, rel: &str, content: &str) {
@@ -4386,3 +4386,220 @@ parity!(
     path_filters_fold_case_on_both_backends,
     path_filters_fold_case
 );
+
+// --- attachments -------------------------------------------------------------
+
+/// A metadata row for a binary asset under the domain's `assets/` folder.
+fn attachment(path: &str, sha: &str, mime: &str, size: u64) -> AttachmentRow {
+    AttachmentRow {
+        path: path.to_string(),
+        sha256: sha.to_string(),
+        mime: mime.to_string(),
+        size,
+        modified: "2026-08-18T09:00:00+00:00".to_string(),
+    }
+}
+
+async fn attachment_metadata_roundtrip(store: &dyn Store) {
+    let did = store
+        .upsert_domain("eng", Some("/k/eng"), DomainKind::File)
+        .await
+        .unwrap();
+
+    // Every field survives the round trip verbatim.
+    let row = attachment("assets/shot.png", "aa11", "image/png", 4096);
+    store.upsert_attachment(did, &row).await.unwrap();
+    assert_eq!(
+        store
+            .get_attachment(did, "assets/shot.png")
+            .await
+            .unwrap()
+            .unwrap(),
+        row
+    );
+    assert!(
+        store
+            .get_attachment(did, "assets/missing.png")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // A second upsert on the same path replaces the row rather than adding one:
+    // this is the shape the sync walker relies on to refresh a rewritten file.
+    let refreshed = attachment("assets/shot.png", "bb22", "image/png", 8192);
+    store.upsert_attachment(did, &refreshed).await.unwrap();
+    let got = store
+        .get_attachment(did, "assets/shot.png")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(got, refreshed);
+    assert_eq!(
+        store.list_attachments(did).await.unwrap().len(),
+        1,
+        "an upsert on an existing path keeps a single row"
+    );
+
+    // A second domain's rows never leak into the first's listing.
+    let other = store
+        .upsert_domain("ops", Some("/k/ops"), DomainKind::File)
+        .await
+        .unwrap();
+    store
+        .upsert_attachment(other, &attachment("assets/a.png", "cc33", "image/png", 1))
+        .await
+        .unwrap();
+
+    // Bytewise ordering: `B` (0x42) sorts before `a` (0x61) before `b` (0x62).
+    // A locale-collated Postgres would return a.png, b.png, B.png instead, so
+    // this is the assertion that pins both backends to one order.
+    for path in ["assets/b.png", "assets/B.png", "assets/a.png"] {
+        store
+            .upsert_attachment(did, &attachment(path, "dd44", "image/png", 2))
+            .await
+            .unwrap();
+    }
+    let paths: Vec<String> = store
+        .list_attachments(did)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.path)
+        .collect();
+    assert_eq!(
+        paths,
+        vec![
+            "assets/B.png".to_string(),
+            "assets/a.png".to_string(),
+            "assets/b.png".to_string(),
+            "assets/shot.png".to_string(),
+        ]
+    );
+
+    // Delete reports whether a row was there, and takes the blob with it.
+    store
+        .write_attachment_blob(did, "assets/shot.png", b"bytes")
+        .await
+        .unwrap();
+    assert!(
+        store
+            .delete_attachment(did, "assets/shot.png")
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .get_attachment(did, "assets/shot.png")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .read_attachment_blob(did, "assets/shot.png")
+            .await
+            .unwrap()
+            .is_none(),
+        "deleting the row takes its blob with it"
+    );
+    assert!(
+        !store
+            .delete_attachment(did, "assets/shot.png")
+            .await
+            .unwrap(),
+        "a second delete reports no row"
+    );
+
+    // The other domain is untouched by all of it.
+    assert_eq!(store.list_attachments(other).await.unwrap().len(), 1);
+}
+parity!(
+    attachment_metadata_roundtrips_and_sorts_bytewise,
+    attachment_metadata_roundtrip
+);
+
+async fn attachment_blob_roundtrip(store: &dyn Store) {
+    let did = store
+        .upsert_domain("eng", Some("/k/eng"), DomainKind::File)
+        .await
+        .unwrap();
+
+    // A row with no blob written yet reads back as None rather than as empty
+    // bytes: a file domain keeps its bytes on disk and never writes one.
+    store
+        .upsert_attachment(
+            did,
+            &attachment("assets/on-disk.png", "aa11", "image/png", 3),
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .read_attachment_blob(did, "assets/on-disk.png")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .read_attachment_blob(did, "assets/nothing.png")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // 1 MiB of non-UTF-8 bytes: the byte column must be a blob, not text.
+    let bytes: Vec<u8> = (0..1024 * 1024).map(|i| (i % 256) as u8).collect();
+    assert!(String::from_utf8(bytes.clone()).is_err());
+    store
+        .upsert_attachment(
+            did,
+            &attachment(
+                "assets/big.pdf",
+                "bb22",
+                "application/pdf",
+                bytes.len() as u64,
+            ),
+        )
+        .await
+        .unwrap();
+    store
+        .write_attachment_blob(did, "assets/big.pdf", &bytes)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .read_attachment_blob(did, "assets/big.pdf")
+            .await
+            .unwrap()
+            .unwrap(),
+        bytes
+    );
+
+    // A second write replaces the content in place.
+    store
+        .write_attachment_blob(did, "assets/big.pdf", b"short")
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .read_attachment_blob(did, "assets/big.pdf")
+            .await
+            .unwrap()
+            .unwrap(),
+        b"short".to_vec()
+    );
+
+    // Writing a blob for a path with no metadata row is a constraint error, not
+    // an orphan blob: the row is what names the mime type and the size.
+    let err = store
+        .write_attachment_blob(did, "assets/orphan.pdf", b"x")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, IndexError::Constraint(_)),
+        "an orphan blob write is a constraint error, got {err:?}"
+    );
+}
+parity!(attachment_blobs_roundtrip, attachment_blob_roundtrip);

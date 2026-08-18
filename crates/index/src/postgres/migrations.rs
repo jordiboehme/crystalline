@@ -61,6 +61,11 @@ pub const MIGRATIONS: &[Migration] = &[
         label: "tag alias map",
         sql: SCHEMA_V7,
     },
+    Migration {
+        version: 8,
+        label: "engram attachments",
+        sql: SCHEMA_V8,
+    },
 ];
 
 // The whole current schema in one step. The temporal columns stay TEXT ISO
@@ -276,9 +281,37 @@ CREATE TABLE tag_alias (
 CREATE INDEX idx_tag_alias_canonical ON tag_alias(domain_id, canonical);
 "#;
 
+// The Postgres twin of Turso's v9: binary attachments. One metadata row per
+// asset under a domain's `assets/` folder, keyed by domain-relative path. A file
+// domain keeps the bytes on disk and holds metadata only; a virtual domain has
+// no filesystem, so its bytes live in `attachment_blob` as BYTEA, split off into
+// its own table so the metadata listing never drags a blob through the row
+// cache. `size` is the byte length and `modified` an RFC 3339 instant, matching
+// the temporal columns' text form.
+const SCHEMA_V8: &str = r#"
+CREATE TABLE attachment (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    domain_id BIGINT NOT NULL REFERENCES domain(id) ON DELETE CASCADE,
+    path TEXT NOT NULL,
+    sha256 TEXT NOT NULL,
+    mime TEXT NOT NULL,
+    size BIGINT NOT NULL,
+    modified TEXT NOT NULL,
+    UNIQUE(domain_id, path)
+);
+CREATE INDEX idx_attachment_domain ON attachment(domain_id);
+
+CREATE TABLE attachment_blob (
+    attachment_id BIGINT PRIMARY KEY REFERENCES attachment(id) ON DELETE CASCADE,
+    content BYTEA NOT NULL
+);
+"#;
+
 /// The tables cleared by `wipe()`, child rows first so the enforced foreign
-/// keys are satisfied at every step. `tag_alias` and `domain_lock` both
-/// reference `domain(id)`, so they are cleared before `domain`.
+/// keys are satisfied at every step. `tag_alias`, `attachment` and
+/// `domain_lock` all reference `domain(id)`, so they are cleared before
+/// `domain`; `attachment_blob` references `attachment`, so it goes first of the
+/// three.
 pub const WIPE_TABLES: &[&str] = &[
     "observation_tag",
     "engram_tag",
@@ -289,6 +322,8 @@ pub const WIPE_TABLES: &[&str] = &[
     "tag",
     "engram",
     "tag_alias",
+    "attachment_blob",
+    "attachment",
     "domain_lock",
     "domain",
 ];

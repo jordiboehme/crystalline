@@ -90,11 +90,11 @@ use tokio::sync::{Mutex as TokioMutex, MutexGuard};
 use crate::alias::{AliasMap, query_uses_tags};
 use crate::error::{IndexError, Result};
 use crate::store::{
-    BrowseLevel, ChunkJob, ChunkModelCount, DomainHost, DomainId, DomainKind, DomainStats,
-    EdgeKind, EmbeddingCoverage, EmbeddingRow, EngramDescriptor, EngramId, EngramRecord,
-    EngramSummary, FileStamp, FtsMode, GraphSlice, HostClaim, InboundHit, InboundPage,
-    InboundQuery, InboundRef, LINKS_TO, NamedCount, NewChunk, OutboundRef, Page, RecentFilter,
-    SearchHit, SearchMode, SearchQuery, Store, StoreInfo, StoredEngram, Vocabulary,
+    AttachmentRow, BrowseLevel, ChunkJob, ChunkModelCount, DomainHost, DomainId, DomainKind,
+    DomainStats, EdgeKind, EmbeddingCoverage, EmbeddingRow, EngramDescriptor, EngramId,
+    EngramRecord, EngramSummary, FileStamp, FtsMode, GraphSlice, HostClaim, InboundHit,
+    InboundPage, InboundQuery, InboundRef, LINKS_TO, NamedCount, NewChunk, OutboundRef, Page,
+    RecentFilter, SearchHit, SearchMode, SearchQuery, Store, StoreInfo, StoredEngram, Vocabulary,
     build_vocabulary, folder_slash, page_window,
 };
 use crate::sweep::UnresolvedRef;
@@ -520,6 +520,18 @@ pub(super) fn cell_text(row: &PgRow, idx: usize) -> Option<String> {
 
 pub(super) fn cell_real(row: &PgRow, idx: usize) -> Option<f64> {
     row.try_get::<Option<f64>, _>(idx).ok().flatten()
+}
+
+/// Decode one attachment row: path, sha256, mime, size, modified. The column
+/// layout is identical across both backends.
+fn attachment_from_row(r: &PgRow) -> AttachmentRow {
+    AttachmentRow {
+        path: cell_text(r, 0).unwrap_or_default(),
+        sha256: cell_text(r, 1).unwrap_or_default(),
+        mime: cell_text(r, 2).unwrap_or_default(),
+        size: cell_i64(r, 3).unwrap_or(0).max(0) as u64,
+        modified: cell_text(r, 4).unwrap_or_default(),
+    }
 }
 
 fn descriptor_from_row(r: &PgRow) -> EngramDescriptor {
@@ -2275,6 +2287,119 @@ impl Store for PostgresStore {
         }))
     }
 
+    async fn upsert_attachment(&self, domain: DomainId, row: &AttachmentRow) -> Result<()> {
+        let mut conn = self.acquire().await?;
+        sqlx::query(
+            "INSERT INTO attachment(domain_id, path, sha256, mime, size, modified) \
+             VALUES($1, $2, $3, $4, $5, $6) \
+             ON CONFLICT(domain_id, path) DO UPDATE SET \
+                 sha256=excluded.sha256, mime=excluded.mime, \
+                 size=excluded.size, modified=excluded.modified",
+        )
+        .bind(domain.0)
+        .bind(&row.path)
+        .bind(&row.sha256)
+        .bind(&row.mime)
+        .bind(row.size as i64)
+        .bind(&row.modified)
+        .execute(conn.as_mut())
+        .await
+        .map_err(IndexError::from)?;
+        Ok(())
+    }
+
+    async fn delete_attachment(&self, domain: DomainId, path: &str) -> Result<bool> {
+        // The declared `ON DELETE CASCADE` would take the blob here, but it is
+        // deleted explicitly so both backends behave alike: Turso's connection
+        // does not enable foreign keys, so its cascade never fires.
+        let mut conn = self.acquire().await?;
+        let c = conn.as_mut();
+        sqlx::query(
+            "DELETE FROM attachment_blob WHERE attachment_id IN \
+             (SELECT id FROM attachment WHERE domain_id=$1 AND path=$2)",
+        )
+        .bind(domain.0)
+        .bind(path)
+        .execute(&mut *c)
+        .await
+        .map_err(IndexError::from)?;
+        let n = sqlx::query("DELETE FROM attachment WHERE domain_id=$1 AND path=$2")
+            .bind(domain.0)
+            .bind(path)
+            .execute(&mut *c)
+            .await
+            .map_err(IndexError::from)?
+            .rows_affected();
+        Ok(n > 0)
+    }
+
+    async fn get_attachment(&self, domain: DomainId, path: &str) -> Result<Option<AttachmentRow>> {
+        let mut conn = self.acquire().await?;
+        let row = query_first(
+            conn.as_mut(),
+            "SELECT path, sha256, mime, size, modified FROM attachment \
+             WHERE domain_id=$1 AND path=$2",
+            vec![Param::Int(domain.0), Param::Text(path.to_string())],
+        )
+        .await?;
+        Ok(row.as_ref().map(attachment_from_row))
+    }
+
+    async fn list_attachments(&self, domain: DomainId) -> Result<Vec<AttachmentRow>> {
+        // The path is a text sort key, so it is pinned to `COLLATE "C"` to match
+        // Turso's byte order: a locale-collated database would otherwise return
+        // the same rows in a different order.
+        let mut conn = self.acquire().await?;
+        let rows = query_all(
+            conn.as_mut(),
+            "SELECT path, sha256, mime, size, modified FROM attachment \
+             WHERE domain_id=$1 ORDER BY path COLLATE \"C\"",
+            vec![Param::Int(domain.0)],
+        )
+        .await?;
+        Ok(rows.iter().map(attachment_from_row).collect())
+    }
+
+    async fn write_attachment_blob(
+        &self,
+        domain: DomainId,
+        path: &str,
+        bytes: &[u8],
+    ) -> Result<()> {
+        let mut conn = self.acquire().await?;
+        let c = conn.as_mut();
+        let id = query_first(
+            &mut *c,
+            "SELECT id FROM attachment WHERE domain_id=$1 AND path=$2",
+            vec![Param::Int(domain.0), Param::Text(path.to_string())],
+        )
+        .await?
+        .and_then(|r| cell_i64(&r, 0))
+        .ok_or_else(|| IndexError::Constraint(format!("no attachment row at `{path}`")))?;
+        sqlx::query(
+            "INSERT INTO attachment_blob(attachment_id, content) VALUES($1, $2) \
+             ON CONFLICT(attachment_id) DO UPDATE SET content=excluded.content",
+        )
+        .bind(id)
+        .bind(bytes)
+        .execute(&mut *c)
+        .await
+        .map_err(IndexError::from)?;
+        Ok(())
+    }
+
+    async fn read_attachment_blob(&self, domain: DomainId, path: &str) -> Result<Option<Vec<u8>>> {
+        let mut conn = self.acquire().await?;
+        let row = query_first(
+            conn.as_mut(),
+            "SELECT b.content FROM attachment_blob b JOIN attachment a ON a.id=b.attachment_id \
+             WHERE a.domain_id=$1 AND a.path=$2",
+            vec![Param::Int(domain.0), Param::Text(path.to_string())],
+        )
+        .await?;
+        Ok(row.and_then(|r| r.try_get::<Option<Vec<u8>>, _>(0).ok().flatten()))
+    }
+
     async fn begin(&self) -> Result<()> {
         let mut guard = self.tx.lock().await;
         if guard.is_some() {
@@ -2334,7 +2459,9 @@ mod tests {
         "holder_instance_id",
         "holder_label",
         "last_sync",
+        "mime",
         "model",
+        "modified",
         "name",
         "path",
         "permalink",
