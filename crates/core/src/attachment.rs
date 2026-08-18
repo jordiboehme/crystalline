@@ -87,8 +87,8 @@ pub enum AssetPathError {
     /// A segment starts with `.`, which would hide the file from sync.
     #[error("an attachment path must not hold a segment starting with `.`")]
     HiddenSegment,
-    /// The path holds a backslash or a control character.
-    #[error("an attachment path must not hold a backslash or a control character")]
+    /// The path holds a backslash, a colon or a control character.
+    #[error("an attachment path must not hold a backslash, a colon or a control character")]
     BadCharacter,
     /// The path is longer than 256 bytes.
     #[error("an attachment path must be at most 256 bytes")]
@@ -103,8 +103,12 @@ pub enum AssetPathError {
 /// Asset paths are never slugified - a filename a human recognizes is the
 /// point - so validation carries the whole burden: the path starts with
 /// `assets/`, uses forward slashes only, holds no empty, `.`, `..` or
-/// dot-leading segment, holds no backslash or control character, is at most
-/// 256 bytes, and its final segment carries an allowlisted extension.
+/// dot-leading segment, holds no backslash, colon or control character, is at
+/// most 256 bytes, and its final segment carries an allowlisted extension.
+///
+/// A colon is refused because it is a path separator on some platforms and a
+/// drive designator on Windows, so a segment shaped like `C:` would reach the
+/// filesystem as something other than the plain relative name it looks like.
 pub fn validate_asset_path(path: &str) -> Result<(), AssetPathError> {
     let Some(rest) = path.strip_prefix(ASSETS_PREFIX) else {
         return Err(AssetPathError::NotUnderAssets);
@@ -112,7 +116,7 @@ pub fn validate_asset_path(path: &str) -> Result<(), AssetPathError> {
     if path.len() > MAX_ASSET_PATH_BYTES {
         return Err(AssetPathError::TooLong);
     }
-    if path.contains('\\') || path.chars().any(char::is_control) {
+    if path.contains('\\') || path.contains(':') || path.chars().any(char::is_control) {
         return Err(AssetPathError::BadCharacter);
     }
 
@@ -146,15 +150,31 @@ pub fn validate_asset_path(path: &str) -> Result<(), AssetPathError> {
 /// and is ignored, which the `assets/` prefix test already decides.
 pub fn find_asset_refs(body: &str) -> Vec<String> {
     let mut refs: Vec<String> = Vec::new();
-    let mut fenced = false;
+    // A fence opens on a marker of at least three backticks or tildes and
+    // closes only on the same character repeated at least as many times, the
+    // rule the rest of the crate reads fences by. A plain toggle would treat a
+    // shorter marker inside a longer fence as a close, which both leaks a
+    // fenced reference and drops the genuine ones after the true close.
+    let mut fence: Option<(char, usize)> = None;
     for line in body.lines() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            fenced = !fenced;
-            continue;
-        }
-        if fenced {
-            continue;
+        let text = line.trim_end_matches('\r');
+        match fence {
+            None => {
+                if let Some((c, n, _)) = crate::parse::fence_marker(text) {
+                    fence = Some((c, n));
+                    continue;
+                }
+            }
+            Some((fc, fcount)) => {
+                if let Some((c, n, _)) = crate::parse::fence_marker(text)
+                    && c == fc
+                    && n >= fcount
+                    && text.trim_start()[n..].trim().is_empty()
+                {
+                    fence = None;
+                }
+                continue;
+            }
         }
         for target in line_targets(line) {
             if !refs.contains(&target) {
@@ -348,6 +368,33 @@ Again: ![d](assets/flow.png)\n\
         assert_eq!(
             find_asset_refs(body),
             vec!["assets/flow.png".to_string(), "assets/deck.pdf".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_longer_fence_closes_only_on_a_marker_at_least_as_long() {
+        // The inner three-backtick line is content, not a close, so the
+        // reference beside it stays fenced; the reference after the true
+        // four-backtick close is a genuine one and must be found.
+        let body = "\
+````\n\
+```\n\
+![y](assets/fenced.png)\n\
+````\n\
+\n\
+![x](assets/real.png)\n";
+        assert_eq!(find_asset_refs(body), vec!["assets/real.png".to_string()]);
+    }
+
+    #[test]
+    fn a_colon_in_a_segment_is_refused() {
+        assert_eq!(
+            validate_asset_path("assets/C:/Users/x.png"),
+            Err(AssetPathError::BadCharacter)
+        );
+        assert_eq!(
+            validate_asset_path("assets/a:b.png"),
+            Err(AssetPathError::BadCharacter)
         );
     }
 
