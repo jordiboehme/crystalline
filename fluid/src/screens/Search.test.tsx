@@ -229,6 +229,20 @@ describe("the search screen", () => {
     expect(url()).toContain("domains=eng");
   });
 
+  it("says where a hit lives, until the search is scoped to one domain", async () => {
+    serve();
+
+    const { unmount } = mount("/search?q=rule");
+    // A sweep of every domain: the row has to say which one answered.
+    expect(await screen.findByText("eng/alpha")).toBeVisible();
+    unmount();
+
+    mount("/search?q=rule&domains=eng");
+    // Scoped: the domain is the search, so repeating it on every row is noise.
+    expect(await screen.findByText("alpha")).toBeVisible();
+    expect(screen.queryByText("eng/alpha")).toBeNull();
+  });
+
   it("arrives with a tag from a link already applied", async () => {
     serve();
 

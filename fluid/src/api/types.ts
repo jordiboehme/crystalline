@@ -478,6 +478,48 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/evolve": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * `GET /evolve` - the consolidation queue: the ranked list of what the
+         *     registered domains need next, with the evidence behind each finding and the
+         *     instruction that says how to work it.
+         * @description A read and only a read. Detection runs over the scope and nothing at all is
+         *     written, the maintenance state included: viewing the queue never counts as a
+         *     consolidation run, so opening this page does not stop a Stop hook from asking
+         *     for the sweep that is actually owed. The `evolve` MCP tool is the surface that
+         *     records a run, because an agent calling it is about to do the work.
+         *
+         *     Each row carries its rank across the whole result (`n`), its priority, the
+         *     rule that fired, the engram it fired on, and a `class`: `mechanical` for work
+         *     that completes intent the knowledge already records, `judgment` for work that
+         *     changes what it claims. A client renders the two differently - a judgment
+         *     finding is a question for a person, never a change to apply.
+         *
+         *     The per-rule instruction rides `actions` rather than a column, so a page of
+         *     findings from one rule carries it once; only the rules on this page appear.
+         *     `families` counts the whole filtered result rather than the page, which is
+         *     what section headings are drawn from, and `truncations` names any per-domain
+         *     cap that fired so a short queue is never mistaken for a finished one.
+         *
+         *     `today` is not exposed. The temporal rules are evaluated as of now, which is
+         *     the only question a page asks; the tool takes a pinned date for a run that
+         *     has to be reproducible.
+         */
+        get: operations["get_evolve_queue"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/graph": {
         parameters: {
             query?: never;
@@ -3496,6 +3538,152 @@ export interface operations {
                 };
             };
             /** @description The glob is not a valid pattern. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    get_evolve_queue: {
+        parameters: {
+            query?: {
+                /**
+                 * @description Restrict the sweep to these domains, comma separated. Defaults to every
+                 *     registered domain.
+                 * @example eng,ops
+                 */
+                domains?: string;
+                /**
+                 * @description Restrict to these detector families, comma separated: `temporal`,
+                 *     `structure` or `redundancy`. Defaults to all three.
+                 * @example temporal,structure
+                 */
+                families?: string;
+                /**
+                 * @description Restrict to these rule ids, comma separated, for example `V006,V201`.
+                 * @example V006
+                 */
+                rules?: string;
+                /**
+                 * @description Drop findings scoring under this priority, 0 to 100.
+                 * @example 50
+                 */
+                min_priority?: number;
+                /**
+                 * @description Page size. Defaults to 10, clamped by the engine to 100.
+                 * @example 25
+                 */
+                limit?: number;
+                /**
+                 * @description One-based page number. Defaults to 1.
+                 * @example 1
+                 */
+                page?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The engine's own evolve payload, unchanged: the swept scope, the ranked queue page, the per-family counts over the whole result, the per-rule instructions for the rules on this page, the shared guidance and any truncation that fired. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "actions": [
+                     *         {
+                     *           "instruction": "A person captured this directly and nobody has reviewed it since. ...",
+                     *           "rule": "V006"
+                     *         }
+                     *       ],
+                     *       "count": 2,
+                     *       "engrams_scanned": 42,
+                     *       "families": [
+                     *         {
+                     *           "family": "temporal",
+                     *           "findings": 2
+                     *         }
+                     *       ],
+                     *       "guidance": "This queue changes nothing by itself. ...",
+                     *       "limit": 10,
+                     *       "page": 1,
+                     *       "queue": [
+                     *         {
+                     *           "class": "judgment",
+                     *           "domain": "eng",
+                     *           "evidence": "generated.by human:jordi; recorded 2026-08-16; no verified entry",
+                     *           "finding": "captured by a person and never reviewed",
+                     *           "fix": "review, then record a verified entry (edit_engram set_frontmatter verified)",
+                     *           "line": null,
+                     *           "n": 1,
+                     *           "permalink": "human-capture",
+                     *           "priority": 58,
+                     *           "rule": "V006",
+                     *           "title": "Incident capture"
+                     *         }
+                     *       ],
+                     *       "scope": {
+                     *         "domains": [
+                     *           "eng"
+                     *         ],
+                     *         "families": [],
+                     *         "min_priority": null,
+                     *         "rules": [],
+                     *         "today": "2026-08-17"
+                     *       },
+                     *       "total": 2,
+                     *       "truncations": [],
+                     *       "unparsed": 0
+                     *     }
+                     */
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description The query string will not parse. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No identity. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The trusted-header identity names a disabled account. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description `domains` names a domain nobody registered. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description `families` or `rules` names something the catalog does not have. */
             422: {
                 headers: {
                     [name: string]: unknown;

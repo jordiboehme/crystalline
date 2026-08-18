@@ -19,9 +19,7 @@ use rmcp::service::{Peer, RunningService};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
-#[cfg(unix)]
 use std::ffi::OsString;
-#[cfg(unix)]
 use std::path::Path;
 
 struct Harness {
@@ -3349,57 +3347,78 @@ async fn provision_tool_hidden_in_read_only() {
     );
 }
 
-// --- provision: HOME/XDG_STATE_HOME redirection (unix only) -----------------
+// --- base-directory redirection ---------------------------------------------
 //
-// `Engine::provision` always resolves `install_receipt_path`/`receipt_path`
-// (and a harness's artifact base) from `HOME`/`XDG_STATE_HOME`, even for a
-// bare `status` call - see `crates/service/tests/provision.rs`'s own note,
-// the engine-level sibling of the tests below. Every test that calls the
-// `provision` tool redirects them to a scratch directory first, restoring
-// the surrounding environment on drop.
+// Two families of test here resolve real per-machine paths and must not touch
+// the developer's own:
+//
+// - `Engine::provision` always resolves `install_receipt_path`/`receipt_path`
+//   (and a harness's artifact base) from `HOME`/`XDG_STATE_HOME`, even for a
+//   bare `status` call - see `crates/service/tests/provision.rs`'s own note,
+//   the engine-level sibling of the provision tests below (unix only);
+// - the `evolve_engrams` tool records the sweep it just ran into the
+//   maintenance state file under the state directory, on every platform.
+//
+// Both take the same guard, so the redirection one test installs is never
+// observed by the other.
 
-/// Serializes every HOME/XDG_STATE_HOME-mutating test in this binary. A
-/// tokio mutex, not `std::sync::Mutex`: the guard below is held across
-/// `.await` points in the async tests, which clippy's `await_holding_lock`
-/// flags for a std lock (the same reason `tests/provision.rs` uses one).
-#[cfg(unix)]
-static PROVISION_ENV_LOCK: Mutex<()> = Mutex::const_new(());
+/// Serializes every base-directory-mutating test in this binary. A tokio
+/// mutex, not `std::sync::Mutex`: the guard below is held across `.await`
+/// points in the async tests, which clippy's `await_holding_lock` flags for a
+/// std lock (the same reason `tests/provision.rs` uses one).
+static SCRATCH_ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
-/// Points `HOME`/`XDG_STATE_HOME` at scratch directories for the duration of
-/// one test, restoring whatever the surrounding environment had on drop.
-#[cfg(unix)]
-struct ProvisionScratchEnv {
-    previous: (Option<OsString>, Option<OsString>),
+/// The variables both platform base-directory strategies read: the XDG pair on
+/// unix and macOS, the Windows trio elsewhere (where there is no state
+/// directory of its own, so `state_dir` falls back to `APPDATA`). Setting the
+/// Windows names on unix is harmless, so one list covers both.
+const SCRATCH_ENV_VARS: [&str; 5] = [
+    "HOME",
+    "XDG_STATE_HOME",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+];
+
+/// Points the base directories at scratch directories for the duration of one
+/// test, restoring whatever the surrounding environment had on drop.
+struct ScratchEnv {
+    previous: Vec<(&'static str, Option<OsString>)>,
     _guard: tokio::sync::MutexGuard<'static, ()>,
 }
 
-#[cfg(unix)]
-impl ProvisionScratchEnv {
-    async fn new(home: &Path, xdg_state_home: &Path) -> ProvisionScratchEnv {
-        let guard = PROVISION_ENV_LOCK.lock().await;
-        let previous = (std::env::var_os("HOME"), std::env::var_os("XDG_STATE_HOME"));
-        // SAFETY: guarded by PROVISION_ENV_LOCK, restored on drop.
+impl ScratchEnv {
+    async fn new(home: &Path, state_home: &Path) -> ScratchEnv {
+        let guard = SCRATCH_ENV_LOCK.lock().await;
+        let previous = SCRATCH_ENV_VARS
+            .iter()
+            .map(|v| (*v, std::env::var_os(v)))
+            .collect();
+        // SAFETY: guarded by SCRATCH_ENV_LOCK, restored on drop.
         unsafe {
             std::env::set_var("HOME", home);
-            std::env::set_var("XDG_STATE_HOME", xdg_state_home);
+            std::env::set_var("XDG_STATE_HOME", state_home);
+            std::env::set_var("USERPROFILE", home);
+            std::env::set_var("APPDATA", state_home);
+            std::env::set_var("LOCALAPPDATA", state_home);
         }
-        ProvisionScratchEnv {
+        ScratchEnv {
             previous,
             _guard: guard,
         }
     }
 }
 
-#[cfg(unix)]
-impl Drop for ProvisionScratchEnv {
+impl Drop for ScratchEnv {
     fn drop(&mut self) {
-        match &self.previous.0 {
-            Some(v) => unsafe { std::env::set_var("HOME", v) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
-        match &self.previous.1 {
-            Some(v) => unsafe { std::env::set_var("XDG_STATE_HOME", v) },
-            None => unsafe { std::env::remove_var("XDG_STATE_HOME") },
+        for (var, value) in &self.previous {
+            // SAFETY: guarded by SCRATCH_ENV_LOCK, still held by this value.
+            unsafe {
+                match value {
+                    Some(v) => std::env::set_var(var, v),
+                    None => std::env::remove_var(var),
+                }
+            }
         }
     }
 }
@@ -3465,7 +3484,7 @@ async fn provision_allow_then_status_flow() {
     let xdg_state_home = work.path().join("state");
     std::fs::create_dir_all(&home).unwrap();
     std::fs::create_dir_all(&xdg_state_home).unwrap();
-    let _env = ProvisionScratchEnv::new(&home, &xdg_state_home).await;
+    let _env = ScratchEnv::new(&home, &xdg_state_home).await;
 
     let harbor_dir = work.path().join("kb-harbor");
     write_provision_harbor(&harbor_dir);
@@ -3554,7 +3573,7 @@ async fn provision_call_by_name_while_hidden_reaches_engine() {
     let xdg_state_home = work.path().join("state");
     std::fs::create_dir_all(&home).unwrap();
     std::fs::create_dir_all(&xdg_state_home).unwrap();
-    let _env = ProvisionScratchEnv::new(&home, &xdg_state_home).await;
+    let _env = ScratchEnv::new(&home, &xdg_state_home).await;
 
     // No declaring domain at all: the tool is listed all the same, and
     // `status` reaches the engine.
@@ -4053,6 +4072,11 @@ async fn the_router_advertises_exactly_the_evolve_tool_name_constant() {
 async fn read_only_hides_evolve_but_still_routes_it_by_name() {
     use rmcp::ServerHandler;
 
+    // The call below reaches the run recorder, which stamps the maintenance
+    // state file under the state directory: scratch, never the developer's.
+    let work = tempfile::tempdir().unwrap();
+    let _env = ScratchEnv::new(work.path(), &work.path().join("state")).await;
+
     let ro = annotation_server(true).await;
     assert!(
         ro.get_tool(crystalline_service::EVOLVE_TOOL_NAME).is_none(),
@@ -4104,6 +4128,10 @@ async fn read_only_hides_evolve_but_still_routes_it_by_name() {
 /// contract every TOON table in the surface follows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn evolve_engrams_renders_the_queue_as_one_toon_table() {
+    // As above: the sweep records itself, so the state directory is scratch.
+    let work = tempfile::tempdir().unwrap();
+    let _env = ScratchEnv::new(work.path(), &work.path().join("state")).await;
+
     let h = Harness::new_toon(&["eng"]).await;
     let (client, _server) = h.connect().await;
     let peer = client.peer();

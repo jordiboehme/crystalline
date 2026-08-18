@@ -4155,7 +4155,51 @@ impl Engine {
     // --- evolve --------------------------------------------------------------
 
     /// Run the consolidation sweep over a scope and return one page of its
-    /// ranked queue.
+    /// ranked queue, recording that the sweep ran.
+    ///
+    /// The thin half of the seam: [`Engine::evolve_detect`] does the work and
+    /// this adds the one side effect, stamping the sweep into the maintenance
+    /// state so the Stop hook stops nudging about domains this sweep just
+    /// looked at - the swept scope for a scoped call, the whole backlog for an
+    /// unscoped one. Detection is shared and pure, so a surface that
+    /// only wants to show the queue (the REST queue view) calls `evolve_detect`
+    /// and never counts as a run; an agent that actually works the queue comes
+    /// through here.
+    ///
+    /// The recording is best effort by design - see [`crate::maintenance`] -
+    /// and the response is returned exactly as detection built it.
+    pub async fn evolve_engrams(&self, p: &EvolveParams) -> Result<Value> {
+        let value = self.evolve_detect(p).await?;
+        // The swept scope is read back out of the response rather than
+        // re-derived from the parameters: an unscoped call defaults to every
+        // registered domain, and only the response knows which those were.
+        let swept: Vec<String> = value["scope"]["domains"]
+            .as_array()
+            .map(|domains| {
+                domains
+                    .iter()
+                    .filter_map(|d| d.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // A sweep with no scope of its own looked at every registered domain,
+        // so it settles the whole backlog rather than subtracting the names it
+        // saw. That is what heals the state file: a domain a human wrote to and
+        // then unregistered can never appear in a swept scope again, and
+        // subtracting would leave it pending for ever with the Stop hook naming
+        // a ghost nothing can act on. A scoped call keeps the exact opposite
+        // property, settling its own domains and leaving the rest of the
+        // backlog standing at its original age.
+        if p.domains.is_empty() {
+            crate::maintenance::record_run_unscoped();
+        } else {
+            crate::maintenance::record_run(&swept);
+        }
+        Ok(value)
+    }
+
+    /// The detection half of the consolidation sweep: one page of the ranked
+    /// queue over a scope, with no side effect of any kind.
     ///
     /// Read-only end to end: it resolves the scope, assembles the facts every
     /// detector reads, runs [`crystalline_index::detect`] once per domain and
@@ -4182,7 +4226,7 @@ impl Engine {
     ///   unregistered target domain apart from a target that does not exist,
     ///   and the graph is taken at depth 1 so cross-domain targets carry a
     ///   status for `V101` to read.
-    pub async fn evolve_engrams(&self, p: &EvolveParams) -> Result<Value> {
+    pub async fn evolve_detect(&self, p: &EvolveParams) -> Result<Value> {
         let today = match p.today.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
             Some(s) => NaiveDate::parse_from_str(s, "%Y-%m-%d").map_err(|_| {
                 EngineError::Invalid(format!("today '{s}' is not an ISO date (YYYY-MM-DD)"))
@@ -4291,6 +4335,7 @@ impl Engine {
                     token_budget: resolve_token_budget(verify_config.as_ref(), &d.path),
                     inbound: inbound.get(&d.id.0).copied().unwrap_or(0),
                     outbound: outbound.get(&d.id.0).copied().unwrap_or(0),
+                    generated_by: fm.generated.as_ref().map(|g| g.by.clone()),
                     body: engram.body,
                 });
             }

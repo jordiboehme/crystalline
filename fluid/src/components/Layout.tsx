@@ -27,6 +27,7 @@ import {
   PanelLeftClose,
   PanelLeftOpen,
   Plus,
+  Stethoscope,
   Sun,
 } from "lucide-react";
 import {
@@ -56,6 +57,7 @@ import type { PaletteCommand } from "../commands";
 import {
   domainRoute,
   githubSettingsRoute,
+  maintenanceRoute,
   searchRoute,
   usersRoute,
 } from "../paths";
@@ -355,6 +357,8 @@ function TopBar({
 
         <SearchBox />
 
+        <MaintenanceLink />
+
         {capabilities.readOnly && (
           <span className="hidden sm:inline">
             <Chip variant="caution">Read only</Chip>
@@ -365,6 +369,45 @@ function TopBar({
         <UserMenu />
       </div>
     </header>
+  );
+}
+
+/**
+ * The way to the maintenance report.
+ *
+ * In the top bar rather than in the sidebar, because it is a question about the
+ * whole instance rather than about one domain, and the sidebar hands itself
+ * over to a domain's own navigation as soon as somebody opens one. It stands
+ * beside the search box for the same reason search stands there: those are the
+ * two screens that are about everything at once.
+ *
+ * Offered to every role, including a read-only session and an anonymous one:
+ * the screen behind it reads and writes nothing, so there is no door here that
+ * will not open - which is the rule the settings and accounts links follow from
+ * the other side.
+ *
+ * The name is drawn where there is room for it and spoken either way: below the
+ * small breakpoint the top bar is a hamburger, a wordmark and a search field
+ * already, so the word folds away and the glyph carries it, with the
+ * `aria-label` making the two widths the same control to anything that reads
+ * the page.
+ */
+function MaintenanceLink() {
+  return (
+    <NavLink
+      to={maintenanceRoute()}
+      aria-label="Maintenance"
+      className={({ isActive }) =>
+        `inline-flex h-8 shrink-0 items-center gap-1.5 rounded px-2 text-sm hover:bg-slate-100 dark:hover:bg-slate-800 ${FOCUS_RING} ${
+          isActive
+            ? "bg-slate-100 font-medium dark:bg-slate-800"
+            : "text-slate-600 dark:text-slate-300"
+        }`
+      }
+    >
+      <Stethoscope aria-hidden="true" size={16} strokeWidth={1.75} />
+      <span className="hidden sm:inline">Maintenance</span>
+    </NavLink>
   );
 }
 

@@ -307,21 +307,34 @@ describe("the table segment", () => {
     expect(screen.getByRole("button", { name: "Bold" })).not.toBeNull();
   });
 
-  test("the two delete verbs wear one glyph and the two add verbs two", () => {
+  test("all four table-shape verbs wear a glyph of their own", () => {
     // Taste, pinned because it is invisible to every other assertion here:
-    // the labels are the contract, so a glyph that drifts back to a second
-    // idiom - a trash can beside a grid-with-an-X for two verbs that differ
-    // only in axis - breaks nothing and reads as an accident.
+    // these four differ in two dimensions at once - what they do and which
+    // axis they do it to - and the bar now says both. The shared trash can
+    // that used to stand in for both deletes said only the first, so a glyph
+    // that drifts back to it would break nothing and lose the axis.
     render(<EditorToolbar view={null} tableActive />, { wrapper: Tooltips });
     const glyph = (name: string) =>
       screen
         .getByRole("button", { name })
         .querySelector("svg")
         ?.getAttribute("class");
-    expect(glyph("Delete row")).toBe(glyph("Delete column"));
-    expect(glyph("Add row below")).not.toBe(glyph("Add column after"));
-    // And the two idioms stay apart: deleting must not look like adding.
-    expect(glyph("Delete row")).not.toBe(glyph("Add row below"));
+    const names = [
+      "Add row below",
+      "Add column after",
+      "Delete row",
+      "Delete column",
+    ];
+    const glyphs = names.map(glyph);
+    for (const drawn of glyphs) {
+      expect(drawn).toBeTruthy();
+    }
+    expect(new Set(glyphs).size).toBe(4);
+    // And no trash can anywhere in the segment: the axis is the half that
+    // used to go missing, and it is the half these two now carry.
+    for (const drawn of glyphs) {
+      expect(drawn).not.toContain("trash");
+    }
   });
 
   /*
@@ -369,10 +382,11 @@ describe("the table segment", () => {
   });
 
   test("the align menu says which alignment each row is", async () => {
-    // Taste again, and the reason the trigger changed glyph: a bar of icons
-    // has to say what it does before it is pressed, so the trigger wears the
-    // conventional alignment mark - the same one its own centre row wears -
-    // and each row carries its own, all three different from one another.
+    // Taste again, and the reason all four glyphs are hand drawn: the verb
+    // acts on a COLUMN, so every mark in this menu is framed as one, and the
+    // trigger no longer impersonates its own centre row. Four drawings, four
+    // different things said, none of them borrowed from the icon set - a row
+    // that drifted back to a bare text-alignment mark would lose the column.
     const user = userEvent.setup();
     mount(TABLE_DOC, IN_TABLE, IN_TABLE, true);
     const glyphOf = (element: HTMLElement) =>
@@ -387,11 +401,15 @@ describe("the table segment", () => {
     const rows = ["Align left", "Align center", "Align right"].map((name) =>
       glyphOf(screen.getByRole("menuitem", { name })),
     );
-    for (const row of rows) {
-      expect(row).toBeTruthy();
+    const glyphs = [trigger, ...rows];
+    for (const drawn of glyphs) {
+      expect(drawn).toBeTruthy();
+      // The set's own marks carry its stem; these carry ours, so a swap back
+      // to a borrowed glyph reads here rather than in a screenshot.
+      expect(drawn).not.toContain("lucide");
+      expect(drawn).toContain("crystalline-icon-align-column");
     }
-    expect(new Set(rows).size).toBe(3);
-    expect(trigger).toBe(rows[1]);
+    expect(new Set(glyphs).size).toBe(4);
   });
 
   /*

@@ -19,9 +19,6 @@
 
 import type { EditorView } from "@codemirror/view";
 import {
-  AlignCenter,
-  AlignLeft,
-  AlignRight,
   Bold,
   Brackets,
   Code,
@@ -36,19 +33,26 @@ import {
   SquareCode,
   Strikethrough,
   TextQuote,
-  Trash2,
   WandSparkles,
   Workflow,
 } from "lucide-react";
-import type { LucideIcon } from "lucide-react";
 import { DropdownMenu } from "radix-ui";
 import type { MouseEvent, ReactElement } from "react";
 import { useId } from "react";
 
 import { ITEM_CLASSES, MENU_CLASSES } from "../components/menu";
 import { IconButton } from "../components/primitives";
+import type { IconComponent } from "../components/primitives";
 import { TableSizePicker } from "./TableSizePicker";
 import { MERMAID_STARTER_GROUPS, mermaidFence } from "./mermaidStarters";
+import {
+  AlignColumnCenterIcon,
+  AlignColumnIcon,
+  AlignColumnLeftIcon,
+  AlignColumnRightIcon,
+  DeleteColumnIcon,
+  DeleteRowIcon,
+} from "./tableIcons";
 import type { Align } from "./tableModel";
 import {
   CODE_SKELETON,
@@ -75,14 +79,18 @@ const HEADING_LEVELS = [1, 2, 3];
 /**
  * The alignments a column can be given, in the order they read, each with the
  * mark that says it without being read: the rows of a menu are icons in every
- * other editor an author has used, and the trigger above them wears the middle
- * one - the conventional glyph for "alignment", where a justify mark reads as
- * one particular alignment this menu does not even offer.
+ * other editor an author has used.
+ *
+ * Hand drawn rather than borrowed, because what these set is a table column
+ * and the set's own alignment marks are lines of a paragraph: the same three
+ * lines here stand inside the column frame the delete glyphs are built on. The
+ * trigger above them is framed the same way and points both ways at once,
+ * where it used to wear the centre mark and so read as one of its own answers.
  */
-const ALIGNMENTS: { align: Align; label: string; icon: LucideIcon }[] = [
-  { align: "left", label: "Align left", icon: AlignLeft },
-  { align: "center", label: "Align center", icon: AlignCenter },
-  { align: "right", label: "Align right", icon: AlignRight },
+const ALIGNMENTS: { align: Align; label: string; icon: IconComponent }[] = [
+  { align: "left", label: "Align left", icon: AlignColumnLeftIcon },
+  { align: "center", label: "Align center", icon: AlignColumnCenterIcon },
+  { align: "right", label: "Align right", icon: AlignColumnRightIcon },
 ];
 
 /**
@@ -326,16 +334,12 @@ export function EditorToolbar({
             of these is a tooltip as well as an accessible name, because a row
             of small squares is not self-explanatory whatever is drawn in it.
 
-            Two idioms, used consistently: the add verbs draw the axis they act
-            on (Rows3, Columns3) and both delete verbs draw the same trash can.
-            The axis is the thing these two glyphs are worst at saying - the
-            set has no row-flavored sibling of the grid-with-an-X this one used
-            to wear - while "this destroys something" is the thing they must
-            not be coy about, and it is the half a glyph can carry. Reaching
-            for the axis instead (Rows2 beside Rows3) would put the mistake in
-            the worse place: delete looking like add rather than delete row
-            looking like delete column, with the label and the order that
-            mirrors the two buttons above them to tell those apart.
+            All four say both halves now: what happens, and to which axis. The
+            add verbs draw the axis from the shared set (Rows3, Columns3); the
+            deletes draw the same three slots with the middle one crossed out,
+            because the set has no such pair and the two used to share a trash
+            can that could only say "something is destroyed". The axis was the
+            half that went missing, and it was the half only the label carried.
           */}
           <IconButton
             label="Add row below"
@@ -351,13 +355,13 @@ export function EditorToolbar({
           />
           <IconButton
             label="Delete row"
-            icon={Trash2}
+            icon={DeleteRowIcon}
             disabled={off}
             onClick={act(tableDeleteRow)}
           />
           <IconButton
             label="Delete column"
-            icon={Trash2}
+            icon={DeleteColumnIcon}
             disabled={off}
             onClick={act(tableDeleteColumn)}
           />
@@ -365,7 +369,7 @@ export function EditorToolbar({
             <DropdownMenu.Trigger asChild>
               <IconButton
                 label="Align column"
-                icon={AlignCenter}
+                icon={AlignColumnIcon}
                 disabled={off}
               />
             </DropdownMenu.Trigger>

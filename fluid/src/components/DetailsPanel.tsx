@@ -24,7 +24,7 @@ import { useEffect, useState } from "react";
 import { Link } from "react-router";
 
 import type { EngramFrontmatter, VerifiedEntry } from "../api/engram";
-import { formatDay } from "../format";
+import { formatActor, formatDay } from "../format";
 import { tagRoute } from "../paths";
 import { Chip, FOCUS_RING, IconButton, statusVariant } from "./primitives";
 
@@ -38,7 +38,7 @@ export interface DetailsPanelProps {
 }
 
 export function DetailsPanel({ frontmatter, address }: DetailsPanelProps) {
-  const { type, status, tags, salience, verified } = frontmatter;
+  const { type, status, tags, salience, verified, generatedBy } = frontmatter;
   const validity = validityOf(frontmatter);
   const stamp = latestVerification(verified);
 
@@ -81,6 +81,11 @@ export function DetailsPanel({ frontmatter, address }: DetailsPanelProps) {
         {validity !== null && (
           <Row label="Valid">
             <span className="tabular-nums">{validity}</span>
+          </Row>
+        )}
+        {generatedBy !== null && (
+          <Row label="Captured by">
+            <span>{formatActor(generatedBy)}</span>
           </Row>
         )}
         {stamp !== null && (

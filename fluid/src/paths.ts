@@ -100,6 +100,18 @@ export function usersRoute(): string {
 }
 
 /**
+ * The maintenance report: what the knowledge needs next, across every domain.
+ *
+ * Named for the question it answers rather than for the sweep behind it. The
+ * endpoint is `/evolve` and the MCP tool an agent works the queue with is
+ * called `evolve` too, but a person arriving at this address came to find out
+ * what is owed, and the word for that is maintenance.
+ */
+export function maintenanceRoute(): string {
+  return "/maintenance";
+}
+
+/**
  * The GitHub settings screen.
  *
  * Under `/settings/` even though it is the only section there: the address

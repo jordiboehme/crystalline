@@ -33,6 +33,16 @@ import { Chip, statusVariant } from "./primitives";
 /** How tall one row is, in pixels. The tests scroll by it, so it is exported. */
 export const ENGRAM_ROW_HEIGHT = 76;
 
+/**
+ * How many of a row's tags are drawn before the rest become a count.
+ *
+ * The row has one line for everything under the title, and the snippet is the
+ * reason the row is there at all: on a well-tagged engram an uncapped tag list
+ * ate that line and left the reader a row that never said what matched. Two
+ * tags are a hint at what this is; the rest are a hover away.
+ */
+const MAX_ROW_TAGS = 2;
+
 /** How many rows beyond the viewport are drawn, so a flick does not flash. */
 const OVERSCAN = 4;
 
@@ -67,6 +77,12 @@ export interface EngramListProps {
    * widened, and an empty folder cannot.
    */
   emptyActions?: ReactNode;
+  /**
+   * Whether a row says which domain it lives in, on the front of its
+   * permalink. Off by default, because a list of one domain's engrams would
+   * repeat that domain on every row; a search that swept several has to say it.
+   */
+  showDomain?: boolean;
 }
 
 export function EngramList({
@@ -77,6 +93,7 @@ export function EngramList({
   highlight = [],
   summary,
   emptyActions,
+  showDomain = false,
 }: EngramListProps) {
   const scroller = useRef<HTMLDivElement>(null);
 
@@ -185,6 +202,7 @@ export function EngramList({
                 row={row}
                 offset={item.start}
                 highlight={highlight}
+                showDomain={showDomain}
               />
             );
           })}
@@ -206,17 +224,27 @@ export function EngramList({
  * kind of thing it is, what state it is in and what it is tagged with. A
  * retired one is faded and still readable, which is the whole point of fading
  * rather than filtering.
+ *
+ * The second line is ordered by what earns the width. The snippet is the reason
+ * a searched row is on screen, so it takes what is left of the line and
+ * truncates last; the tags are a hint rather than the answer, so they are
+ * capped and sit after it. Reading order is chips, line number, match, tags.
  */
 function Row({
   row,
   offset,
   highlight,
+  showDomain,
 }: {
   row: EngramRow;
   offset: number;
   highlight: string[];
+  showDomain: boolean;
 }) {
   const retired = isRetired(row.status);
+  const path = showDomain ? `${row.domain}/${row.permalink}` : row.permalink;
+  const tags = row.tags.slice(0, MAX_ROW_TAGS);
+  const overflow = row.tags.length - tags.length;
   return (
     <li
       className={`absolute top-0 left-0 w-full px-1 ${retired ? RETIRED_CLASS : ""}`}
@@ -231,13 +259,15 @@ function Row({
         // Named by what it points at. Without this the name is every badge on
         // the row run together, which is what a screen reader would read out
         // for each of a hundred rows.
-        aria-label={`${row.title}, ${row.permalink}`}
+        aria-label={`${row.title}, ${path}`}
         className="flex h-full flex-col justify-center gap-1 rounded px-3 py-2 hover:bg-slate-50 focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:hover:bg-slate-900"
       >
         <span className="flex items-baseline gap-2">
-          <span className="truncate font-medium">{row.title}</span>
+          <span className="truncate font-medium">
+            <Marked text={row.title} highlight={highlight} />
+          </span>
           <span className="truncate font-mono text-xs text-slate-500 dark:text-slate-400">
-            {row.permalink}
+            {path}
           </span>
         </span>
         <span className="flex items-center gap-1.5 overflow-hidden text-xs whitespace-nowrap">
@@ -252,14 +282,29 @@ function Row({
               line {row.line}
             </span>
           )}
-          {row.tags.map((tag) => (
-            <span key={tag} className="text-slate-500 dark:text-slate-400">
+          {row.snippet !== null && (
+            // The one thing on the line that is allowed to take what is left
+            // of it: everything beside it is sized by its own content.
+            <span className="min-w-0 flex-1 truncate text-slate-500 dark:text-slate-400">
+              <Snippet text={row.snippet} highlight={highlight} />
+            </span>
+          )}
+          {tags.map((tag) => (
+            <span
+              key={tag}
+              className="shrink-0 text-slate-500 dark:text-slate-400"
+            >
               #{tag}
             </span>
           ))}
-          {row.snippet !== null && (
-            <span className="truncate text-slate-500 dark:text-slate-400">
-              <Snippet text={row.snippet} highlight={highlight} />
+          {overflow > 0 && (
+            // The whole list is in the tooltip: a native title is the entire
+            // overflow affordance, and a row does not open a popover.
+            <span
+              title={row.tags.join(" ")}
+              className="shrink-0 text-slate-500 dark:text-slate-400"
+            >
+              +{overflow}
             </span>
           )}
         </span>
@@ -280,11 +325,23 @@ function Row({
  * matched against what is left, so the mark lands on the word the reader sees.
  */
 function Snippet({ text, highlight }: { text: string; highlight: string[] }) {
-  const plain = stripSnippetMarkup(text);
+  return <Marked text={stripSnippetMarkup(text)} highlight={highlight} />;
+}
+
+/**
+ * Plain text with the searched-for words marked.
+ *
+ * The title is marked the same way the snippet is, and by the same code: a
+ * reader scanning a page of results is looking for their own words, and a
+ * result whose title is the match had been the one row that never said so.
+ * Titles arrive as text rather than as a cut of a file, so nothing is stripped
+ * out of them first.
+ */
+function Marked({ text, highlight }: { text: string; highlight: string[] }) {
   if (highlight.length === 0) {
-    return plain;
+    return text;
   }
-  return snippetParts(plain, highlight).map((part, index) =>
+  return snippetParts(text, highlight).map((part, index) =>
     part.match ? (
       // Keyed by position: the pieces are a cut of one string, so a piece is
       // only ever itself and the list never reorders.

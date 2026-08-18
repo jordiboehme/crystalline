@@ -17,6 +17,7 @@ pub mod engine;
 pub mod harness_cli;
 mod index_files;
 pub mod instance;
+pub mod maintenance;
 pub mod mcp;
 mod origin;
 pub mod overlay;

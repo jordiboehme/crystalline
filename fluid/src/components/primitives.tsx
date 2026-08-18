@@ -7,9 +7,13 @@
  * error.
  */
 
-import type { LucideIcon } from "lucide-react";
 import { Tooltip as TooltipPrimitive } from "radix-ui";
-import type { ComponentPropsWithRef, ReactElement, ReactNode } from "react";
+import type {
+  ComponentPropsWithRef,
+  ComponentType,
+  ReactElement,
+  ReactNode,
+} from "react";
 
 import { isRetired } from "../lifecycle";
 
@@ -224,6 +228,24 @@ export function Tooltip({
 }
 
 /**
+ * What an icon slot takes: the set the app draws from, plus the few glyphs
+ * the app draws itself where that set has nothing for the verb.
+ *
+ * The four attributes below are every one an icon is ever handed here, so
+ * this is the whole contract rather than a narrowed view of one. Written as
+ * the props instead of as the icon set's own component type on purpose: that
+ * type is a forwarding component, which carries a marker no plain function
+ * component has, and a hand-drawn glyph that renders identically would be
+ * refused for its provenance rather than for its shape.
+ */
+export type IconComponent = ComponentType<{
+  size?: number | string;
+  strokeWidth?: number | string;
+  className?: string;
+  "aria-hidden"?: boolean | "true" | "false";
+}>;
+
+/**
  * Every button attribute, `ref` included: a caller that has to move the
  * keyboard onto one of these - a control that replaces the control that was
  * pressed - needs the element itself, and React hands a function component's
@@ -241,7 +263,7 @@ export interface IconButtonProps extends Omit<
 > {
   /** The accessible name; also the tooltip. Mandatory by construction. */
   label: string;
-  icon: LucideIcon;
+  icon: IconComponent;
 }
 
 /**

@@ -78,6 +78,7 @@ pub const MOUNTED_OPERATIONS: &[&str] = &[
     "GET /api/v1/context",
     "GET /api/v1/activity",
     "GET /api/v1/graph",
+    "GET /api/v1/evolve",
     "GET /api/v1/users",
     "POST /api/v1/users",
     "PATCH /api/v1/users/{name}",
@@ -754,5 +755,119 @@ impl ConnectAuth for StubConnectAuth {
             .unwrap()
             .take()
             .expect("validate_token result not set")
+    }
+}
+
+// --- scratch state directory -------------------------------------------------
+
+/// The process-wide scratch redirection, reference counted. `None` until the
+/// first handle is taken and again once the last one drops.
+static SCRATCH: std::sync::Mutex<Option<Scratch>> = std::sync::Mutex::new(None);
+
+struct Scratch {
+    dir: tempfile::TempDir,
+    previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    handles: usize,
+}
+
+/// The base-directory variables both platform strategies read, the same seven
+/// `crates/cli/tests/common` sets for the child processes it spawns. Setting
+/// the Windows names on unix is harmless, so one list covers both.
+const BASE_DIR_VARS: [&str; 7] = [
+    "HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_STATE_HOME",
+    "XDG_CACHE_HOME",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+];
+
+/// Points the base directories at a scratch home for as long as any handle is
+/// alive, restoring the surrounding environment when the last one drops.
+///
+/// Needed by any in-process test that reaches code writing under
+/// `crystalline_core::config::state_dir()` - the maintenance state file the
+/// REST write handlers and the evolve run recorder stamp - so a test run never
+/// leaves anything in the developer's real state directory.
+///
+/// Reference counted rather than a mutex held for the test's duration,
+/// because a single test may build several servers (the write matrix builds
+/// three) and a second acquisition would otherwise wait on the first for ever.
+/// One redirection per process is exactly one per test under `cargo nextest`,
+/// which runs each test in its own process and is what CI runs; a plain
+/// `cargo test` run shares one scratch home across the tests of a binary,
+/// which still keeps every write out of the developer's state directory.
+pub struct ScratchStateDir {
+    home: std::path::PathBuf,
+}
+
+impl ScratchStateDir {
+    /// Take a handle, redirecting the base directories if this is the first.
+    pub fn acquire() -> ScratchStateDir {
+        let mut slot = SCRATCH.lock().unwrap();
+        if let Some(scratch) = slot.as_mut() {
+            scratch.handles += 1;
+            return ScratchStateDir {
+                home: scratch.dir.path().to_path_buf(),
+            };
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_path_buf();
+        let previous = BASE_DIR_VARS
+            .iter()
+            .map(|v| (*v, std::env::var_os(v)))
+            .collect();
+        // SAFETY: the environment is restored when the last handle drops, and
+        // every mutation happens under the SCRATCH lock.
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::set_var("XDG_CONFIG_HOME", home.join("config"));
+            std::env::set_var("XDG_STATE_HOME", home.join("state"));
+            std::env::set_var("XDG_CACHE_HOME", home.join("cache"));
+            std::env::set_var("USERPROFILE", &home);
+            std::env::set_var("APPDATA", home.join("state"));
+            std::env::set_var("LOCALAPPDATA", home.join("local"));
+        }
+        *slot = Some(Scratch {
+            dir,
+            previous,
+            handles: 1,
+        });
+        ScratchStateDir { home }
+    }
+
+    /// The scratch home itself, for a test asserting that what it wrote landed
+    /// under it.
+    pub fn home(&self) -> &std::path::Path {
+        &self.home
+    }
+
+    /// The maintenance state file this redirection resolves.
+    pub fn maintenance_path(&self) -> std::path::PathBuf {
+        crystalline_service::maintenance::path().unwrap()
+    }
+}
+
+impl Drop for ScratchStateDir {
+    fn drop(&mut self) {
+        let mut slot = SCRATCH.lock().unwrap();
+        let Some(scratch) = slot.as_mut() else {
+            return;
+        };
+        scratch.handles -= 1;
+        if scratch.handles > 0 {
+            return;
+        }
+        for (var, value) in &scratch.previous {
+            // SAFETY: as above, under the SCRATCH lock.
+            unsafe {
+                match value {
+                    Some(v) => std::env::set_var(var, v),
+                    None => std::env::remove_var(var),
+                }
+            }
+        }
+        *slot = None;
     }
 }

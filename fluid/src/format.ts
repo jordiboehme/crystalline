@@ -1,5 +1,5 @@
 /**
- * Showing a date the API wrote.
+ * Showing a value the API wrote, in the words a reader reads.
  *
  * Dates arrive as the engine wrote them: `recorded_at` is a plain day and
  * `last_sync` is an RFC 3339 instant. Both are shown as the day they name,
@@ -12,6 +12,30 @@
 /** The leading `YYYY-MM-DD` of a value, or the value itself when it has none. */
 export function formatDay(value: string): string {
   return /^\d{4}-\d{2}-\d{2}/.test(value) ? value.slice(0, 10) : value;
+}
+
+/**
+ * An OKF actor, in the words a reader reads.
+ *
+ * The conventions are written for sorting rather than for reading: a person is
+ * `human:name`, an automated job is `process:name` and an agent is
+ * `name/version`. Each is turned around so the name comes first and the kind
+ * follows it. An actor in none of those conventions is somebody else's
+ * convention rather than a malformed one, so it is shown exactly as written.
+ */
+export function formatActor(by: string): string {
+  const lower = by.toLowerCase();
+  if (lower.startsWith("human:")) {
+    return `${by.slice(6)} (human)`;
+  }
+  if (lower.startsWith("process:")) {
+    return `${by.slice(8)} (process)`;
+  }
+  const slash = by.indexOf("/");
+  if (slash > 0) {
+    return `${by.slice(0, slash)} (agent, ${by.slice(slash + 1)})`;
+  }
+  return by;
 }
 
 /** `n thing` or `n things`, for the counts that appear all over the screens. */

@@ -17,12 +17,15 @@
  *
  * Which axes are a real set and which are suggestions is the server's answer
  * rather than a design choice: tags are enumerable through `/vocabulary`, so
- * they are chips and the set on screen is the whole truth, while `type` and
+ * they are chips and the set in hand is the whole truth, while `type` and
  * `status` are free form with nothing listing the values in use, so they are
- * typed with a datalist beside them.
+ * typed with a datalist beside them. In hand rather than on screen, because a
+ * well-taught domain is written in more tags than any rail can draw: the whole
+ * vocabulary is here, and {@link TagChips} caps what it draws and reaches the
+ * rest by narrowing.
  */
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import type { ReactNode } from "react";
 
 import type { TagCount } from "../api/vocabulary";
@@ -177,9 +180,15 @@ function Field({ label, children }: { label: string; children: ReactNode }) {
 /** A labelled row of chips. */
 export function ChipRow({
   label,
+  control,
+  listClassName = "",
   children,
 }: {
   label: string;
+  /** A control that belongs to the row itself, drawn beside its label. */
+  control?: ReactNode;
+  /** What to add to the chip list, for a row that has to bound its height. */
+  listClassName?: string;
   children: ReactNode;
 }) {
   return (
@@ -187,9 +196,13 @@ export function ChipRow({
       <span className="text-xs text-slate-500 dark:text-slate-400">
         {label}
       </span>
+      {control}
       {/* pb-2 so a wrapped row's chips keep their focus ring: the row sits
           in a column whose next line would otherwise clip it. */}
-      <ul aria-label={label} className="flex flex-wrap gap-1 pb-2">
+      <ul
+        aria-label={label}
+        className={`flex flex-wrap gap-1 pb-2 ${listClassName}`}
+      >
         {children}
       </ul>
     </div>
@@ -221,11 +234,36 @@ export function Chip({
 }
 
 /**
+ * How many chips the rail draws before it starts hiding the rest.
+ *
+ * A cap rather than the whole vocabulary, because a domain that has been taught
+ * for a year is written in a few hundred tags and a chip for each of them is a
+ * wall that pushes the results below the fold. Twelve is what fits on two lines
+ * at a usual width, which is the most a facet rail can cost before it stops
+ * being a rail.
+ */
+export const MAX_VISIBLE_TAGS = 12;
+
+/**
  * The tags in use, with how many engrams carry each.
  *
  * The count is on the chip because it is what makes the row usable: it says
  * which tags are the vocabulary of this knowledge base and which were used once
  * and forgotten.
+ *
+ * What is past the cap is reached by narrowing rather than by expanding. An
+ * expander would put the wall back one click away; the filter answers the
+ * question a reader with three hundred tags actually has, which is "is there a
+ * tag for this", and it costs no request because the whole vocabulary is
+ * already in hand. Three rules keep the cap honest. The cap applies to the
+ * unselected fill alone, so every chosen tag is drawn whatever the count - a
+ * reader who turned a filter on is owed the control that turns it off, and a
+ * rail that hid one would strand its own filter. While the filter is
+ * narrowing, the matches live in a box that scrolls rather than in a page that
+ * grows. And the filter outlives the vocabulary that justified it: the input
+ * stays while it holds anything, so a reader who narrows a three-hundred-tag
+ * domain and then moves to an eight-tag one still has the box that is hiding
+ * their chips.
  */
 export function TagChips({
   tags,
@@ -236,12 +274,77 @@ export function TagChips({
   chosen: string[];
   onChange: (tags: string[]) => void;
 }) {
+  const [filter, setFilter] = useState("");
+  const box = useRef<HTMLInputElement>(null);
+
+  const needle = filter.trim().toLowerCase();
+  const narrowing = needle !== "";
+  // Selected first, in the order they were turned on, then the vocabulary as
+  // it arrived - which is commonest first, so this is a slice and not a sort.
+  const byName = new Map(tags.map((tag) => [tag.name, tag]));
+  const selected = chosen
+    .map((name) => byName.get(name))
+    .filter((tag) => tag !== undefined);
+  const rest = tags.filter((tag) => !chosen.includes(tag.name));
+  // The cap bounds the fill, not the selection: a reader with thirteen tags on
+  // sees thirteen chips, because the thirteenth is a filter they can only turn
+  // off from the chip that says it is on.
+  const shown = narrowing
+    ? [...selected, ...rest].filter((tag) =>
+        tag.name.toLowerCase().includes(needle),
+      )
+    : [
+        ...selected,
+        ...rest.slice(0, Math.max(0, MAX_VISIBLE_TAGS - selected.length)),
+      ];
+  // The controls appear for the vocabulary that needs them and stay for as
+  // long as the filter holds anything, so the escape hatch outlives the
+  // condition that opened it.
+  const overflowing = tags.length > MAX_VISIBLE_TAGS;
+  const hidden = tags.length - shown.length;
+
   if (tags.length === 0) {
     return null;
   }
+
   return (
-    <ChipRow label="Tags">
-      {tags.map((tag) => {
+    <ChipRow
+      label="Tags"
+      listClassName={narrowing ? "max-h-32 overflow-y-auto" : ""}
+      {...(overflowing || narrowing
+        ? {
+            control: (
+              <span className="flex items-baseline gap-2">
+                <input
+                  ref={box}
+                  type="search"
+                  value={filter}
+                  aria-label="Filter tags"
+                  placeholder="Filter tags"
+                  onChange={(event) => {
+                    setFilter(event.target.value);
+                  }}
+                  className="h-6 w-36 rounded border border-slate-300 bg-white px-2 text-xs text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                />
+                {!narrowing && hidden > 0 && (
+                  <button
+                    type="button"
+                    // The count is the affordance: it says what is missing and
+                    // hands the reader the one control that reaches it.
+                    onClick={() => {
+                      box.current?.focus();
+                    }}
+                    className={`rounded text-xs text-slate-500 underline underline-offset-2 hover:no-underline dark:text-slate-400 ${FOCUS_RING}`}
+                  >
+                    +{hidden} more
+                  </button>
+                )}
+              </span>
+            ),
+          }
+        : {})}
+    >
+      {shown.map((tag) => {
         const on = chosen.includes(tag.name);
         return (
           <Chip
@@ -262,6 +365,11 @@ export function TagChips({
           </Chip>
         );
       })}
+      {shown.length === 0 && (
+        <li className="text-xs text-slate-500 dark:text-slate-400">
+          no tag matches
+        </li>
+      )}
     </ChipRow>
   );
 }

@@ -194,6 +194,9 @@ export default function Search() {
               : "No engram matches this search."
           }
           highlight={terms}
+          // A sweep of more than one domain has to say which one answered; a
+          // search already scoped to one would repeat its name on every row.
+          showDomain={scope === null}
           summary={(page, shown) => (
             <StatusLine page={page} shown={shown} asked={request.mode} />
           )}

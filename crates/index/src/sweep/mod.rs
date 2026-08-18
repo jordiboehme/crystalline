@@ -140,6 +140,14 @@ pub const HUB_INBOUND_DEGREE: usize = 3;
 /// The priority a hub's finding gains.
 pub const HUB_BOOST: i64 = 5;
 
+/// The priority a finding gains when a person wrote the engram themselves.
+/// Somebody bothering to sit down and capture it is a salience-like signal the
+/// frontmatter rarely carries explicitly, so the queue treats human-authored
+/// knowledge as worth more attention. Sized between the salience cap of
+/// [`MAX_SALIENCE_BOOST`] and the [`HUB_BOOST`]: stronger than being widely
+/// cited, weaker than a top salience score somebody set on purpose.
+pub const HUMAN_AUTHORED_BOOST: i64 = 8;
+
 /// The most salience alone can add to a finding's priority, reached at the top
 /// of the 0 to 10 frontmatter salience scale.
 pub const MAX_SALIENCE_BOOST: i64 = 10;
@@ -254,7 +262,7 @@ pub struct RuleInfo {
 
 /// The full rule catalog, in id order. The single place a base priority or a
 /// prescribed action is written down.
-pub const RULES: [RuleInfo; 14] = [
+pub const RULES: [RuleInfo; 15] = [
     RuleInfo {
         id: "V001",
         family: Family::Temporal,
@@ -289,6 +297,13 @@ pub const RULES: [RuleInfo; 14] = [
         base: 90,
         summary: "supersedes target still current",
         instruction: "The replacement landed but the retirement was never finished. Complete it: set the old engram's status, append a superseded_by relation pointing at the replacement and set valid_to when the end date is known.",
+    },
+    RuleInfo {
+        id: "V006",
+        family: Family::Temporal,
+        base: 50,
+        summary: "human capture never reviewed",
+        instruction: "A person captured this directly and nobody has reviewed it since. Read it and verify the claim, align its tags with the vocabulary and its aliases, wire relations both ways into the neighbourhood it belongs to, then record a verified entry. Propose any wording change and wait for a yes - the words are the human's.",
     },
     RuleInfo {
         id: "V101",
@@ -424,6 +439,11 @@ pub struct EngramFacts {
     pub inbound: usize,
     /// Resolved outbound edge count across the whole index.
     pub outbound: usize,
+    /// The verbatim `generated.by` frontmatter actor, `None` for an engram
+    /// captured before write provenance was recorded or imported from
+    /// somewhere that never wrote it. Absence fails quiet everywhere: no rule
+    /// treats an unknown author as a finding.
+    pub generated_by: Option<String>,
 }
 
 impl EngramFacts {
@@ -456,7 +476,19 @@ impl EngramFacts {
             token_budget: DEFAULT_TOKEN_BUDGET,
             inbound: 0,
             outbound: 0,
+            generated_by: None,
         }
+    }
+
+    /// Whether `generated.by` names a person (`human:<name>`, the OKF actor
+    /// convention). Absence is never itself a finding. The prefix is taken with
+    /// `get`, so an actor whose sixth byte lands inside a multi-byte character
+    /// simply does not match instead of panicking.
+    pub fn is_human_authored(&self) -> bool {
+        self.generated_by
+            .as_deref()
+            .and_then(|by| by.get(..6))
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("human:"))
     }
 
     /// Whether the status says this is what holds now.
@@ -654,7 +686,12 @@ impl Finding {
         Finding {
             rule: info.id,
             family: info.family,
-            priority: priority(info.base, fact.salience, fact.inbound),
+            priority: priority(
+                info.base,
+                fact.salience,
+                fact.inbound,
+                fact.is_human_authored(),
+            ),
             class: Class::Judgment,
             domain: fact.domain.clone(),
             permalink: fact.permalink.clone(),
@@ -673,7 +710,7 @@ impl Finding {
         Finding {
             rule: info.id,
             family: info.family,
-            priority: priority(info.base, None, 0),
+            priority: priority(info.base, None, 0, false),
             class: Class::Judgment,
             domain: domain.to_string(),
             permalink: String::new(),
@@ -718,14 +755,16 @@ pub struct SweepReport {
 // Ranking
 // ---------------------------------------------------------------------------
 
-/// A finding's priority: `clamp(base + salience_boost + hub_boost, 0, 100)`.
+/// A finding's priority:
+/// `clamp(base + salience_boost + hub_boost + human_boost, 0, 100)`.
 ///
 /// `salience_boost` is `clamp(round(salience), 0, 10)`, so a highly salient
 /// engram's problems rise without a low-base rule ever outranking a high-base
 /// one by more than the boost. `hub_boost` adds [`HUB_BOOST`] once the resolved
-/// inbound degree reaches [`HUB_INBOUND_DEGREE`]. A non-finite or negative
-/// salience contributes nothing.
-pub fn priority(base: u8, salience: Option<f64>, inbound: usize) -> u8 {
+/// inbound degree reaches [`HUB_INBOUND_DEGREE`]. `human_boost` adds
+/// [`HUMAN_AUTHORED_BOOST`] when a person wrote the engram, whatever the rule
+/// that fired. A non-finite or negative salience contributes nothing.
+pub fn priority(base: u8, salience: Option<f64>, inbound: usize, human_authored: bool) -> u8 {
     let raw = salience.unwrap_or(0.0);
     let boost = if raw.is_finite() {
         raw.round().clamp(0.0, MAX_SALIENCE_BOOST as f64) as i64
@@ -737,7 +776,12 @@ pub fn priority(base: u8, salience: Option<f64>, inbound: usize) -> u8 {
     } else {
         0
     };
-    (i64::from(base) + boost + hub).clamp(0, i64::from(MAX_PRIORITY)) as u8
+    let human = if human_authored {
+        HUMAN_AUTHORED_BOOST
+    } else {
+        0
+    };
+    (i64::from(base) + boost + hub + human).clamp(0, i64::from(MAX_PRIORITY)) as u8
 }
 
 /// Sort findings into queue order: priority descending, then rule, domain and
@@ -983,6 +1027,32 @@ fn detect_lifecycle(input: &SweepInput, graph: &Graph<'_>, report: &mut SweepRep
                 format!("stale_after={stale_on}; today={today}; {seen}"),
                 "set_frontmatter verified=<actor> or stale_after=<later date>".to_string(),
             ));
+        }
+
+        // V006: a person captured it and nobody has looked at it since. An
+        // engram written today is left alone because it is still being worked
+        // on. Once it passes the age floor V003 may speak about the same
+        // engram: that overlap is accepted rather than suppressed, because the
+        // two prescribe different work and V006 outranks V003 in the queue.
+        if fact.is_human_authored()
+            && fact.is_current()
+            && fact.verified_on.is_none()
+            && fact.recorded_at.is_some_and(|d| d < today)
+        {
+            let evidence = format!(
+                "generated.by {}; recorded {}; no verified entry",
+                fact.generated_by.as_deref().unwrap_or(""),
+                fact.recorded_at.map(|d| d.to_string()).unwrap_or_default(),
+            );
+            report.findings.push(
+                Finding::about("V006", fact).with(
+                    Class::Judgment,
+                    "captured by a person and never reviewed".to_string(),
+                    evidence,
+                    "review, then record a verified entry (edit_engram set_frontmatter verified)"
+                        .to_string(),
+                ),
+            );
         }
     }
 

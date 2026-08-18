@@ -6,6 +6,8 @@
 //! than a close code: a client that is not allowed to edit never sees a
 //! WebSocket at all.
 
+mod support;
+
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
@@ -42,6 +44,9 @@ struct Fixture {
     addr: std::net::SocketAddr,
     /// The domain folder on disk, so a test can read what a save landed.
     domain_dir: std::path::PathBuf,
+    /// A save through this surface marks its domain pending under the state
+    /// directory, so the whole fixture runs against a scratch one.
+    _scratch: support::ScratchStateDir,
     _tmp: tempfile::TempDir,
 }
 
@@ -50,6 +55,7 @@ struct Fixture {
 /// `rest_write_api.rs` and the domain of `collab_session.rs`; integration test
 /// crates share no helpers, so both are copied rather than imported.
 async fn serve(opts: Options_) -> Fixture {
+    let scratch = support::ScratchStateDir::acquire();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
     let mut cfg = GlobalConfig {
@@ -136,6 +142,7 @@ async fn serve(opts: Options_) -> Fixture {
     Fixture {
         addr,
         domain_dir: dir,
+        _scratch: scratch,
         _tmp: tmp,
     }
 }

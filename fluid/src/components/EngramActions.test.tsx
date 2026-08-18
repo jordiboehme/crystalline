@@ -30,6 +30,7 @@ const ENGRAM = {
     validTo: null,
     staleAfter: null,
     verified: [],
+    generatedBy: null,
   },
   observations: [],
   relations: [],

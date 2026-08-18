@@ -694,6 +694,12 @@ pub async fn create(
             EngineError::Conflict(message) => ApiError::conflict(message),
             other => other.into(),
         })?;
+    // A human just taught this domain something, so the domain owes a
+    // consolidation sweep. The three authoring routes (this one, the PUT save
+    // and retire) mark it; the archive import route deliberately does not, as
+    // restoring a backup is administration rather than authoring and would put
+    // a whole domain on the queue for work nobody did.
+    crate::maintenance::record_pending(&domain);
     let permalink = written["permalink"]
         .as_str()
         .ok_or_else(|| ApiError::internal("the write did not report a permalink to read back"))?
@@ -887,6 +893,7 @@ pub async fn save(
         // line has moved the address, and the detail read has to follow it or
         // answer 404 for a write that succeeded.
         Ok(receipt) => {
+            crate::maintenance::record_pending(&domain);
             let moved = receipt["permalink"]
                 .as_str()
                 .ok_or_else(|| {
@@ -1017,7 +1024,7 @@ pub async fn retire(
         .engine
         .retire_engram_as(
             &RetireParams {
-                domain,
+                domain: domain.clone(),
                 identifier: body.permalink,
                 status: body.status,
                 successor: body.successor,
@@ -1033,6 +1040,7 @@ pub async fn retire(
             EngineError::Conflict(message) => ApiError::conflict(message),
             other => other.into(),
         })?;
+    crate::maintenance::record_pending(&domain);
     Ok(Json(value))
 }
 

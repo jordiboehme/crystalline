@@ -7,6 +7,8 @@
 //! what makes a run reproducible: the detectors never read the clock, the
 //! engine supplies the date.
 
+mod support;
+
 use std::sync::Arc;
 
 use crystalline_core::config::{DomainEntry, GlobalConfig};
@@ -112,6 +114,14 @@ fn files() -> Vec<(String, String)> {
         "---\ntype: engram\ntitle: Retired thing\npermalink: retired-thing\ntags:\n  - legacy-notes\nstatus: superseded\nrecorded_at: 2026-07-25\n---\n\nThis approach was replaced during the migration.\n\n- superseded_by [[Nothing At All]]\n- [context] the successor was never captured\n".to_string(),
     );
 
+    // V006: a person captured it in their own words and nobody has reviewed it
+    // since. Linked and three body lines long so the orphan and stub rules stay
+    // out of it, and recent enough that the aging rule does too.
+    add(
+        "human-capture.md",
+        "---\ntype: engram\ntitle: Incident capture\npermalink: human-capture\ntags:\n  - reference\nstatus: stable\nrecorded_at: 2026-07-25\ngenerated:\n  by: \"human:jordi\"\n  at: 2026-07-25T09:12:00+02:00\n---\n\nWritten straight after the incident call, in the words the responder used.\n\n- relates_to [[Live doc]]\n- [context] nobody has read it back since the call\n".to_string(),
+    );
+
     // V101: a current engram pointing at retired knowledge.
     add(
         "live-doc.md",
@@ -200,9 +210,14 @@ fn files() -> Vec<(String, String)> {
 }
 
 /// A sweep over the fixture as of `today`, with the given extra parameters.
+///
+/// The detection half rather than [`Engine::evolve_engrams`]: the response is
+/// identical, and detection records no maintenance run, so the rule assertions
+/// below neither depend on the state directory nor write to it. The recording
+/// wrapper has its own tests at the end of this file.
 async fn sweep(engine: &Engine, today: &str, p: EvolveParams) -> Value {
     engine
-        .evolve_engrams(&EvolveParams {
+        .evolve_detect(&EvolveParams {
             today: Some(today.to_string()),
             ..p
         })
@@ -246,6 +261,7 @@ async fn every_rule_fires_once_and_the_queue_ranks_by_priority() {
             "V002", // 70
             "V004", // 65
             "V105", // 60
+            "V006", // 58, base 50 plus the human-authored boost
             "V101", // 55
             "V202", // 55
             "V102", // 50
@@ -256,9 +272,9 @@ async fn every_rule_fires_once_and_the_queue_ranks_by_priority() {
             "V003", // 25
         ]
     );
-    assert_eq!(v["total"], 14);
-    assert_eq!(v["count"], 14);
-    assert_eq!(v["engrams_scanned"], 18);
+    assert_eq!(v["total"], 15);
+    assert_eq!(v["count"], 15);
+    assert_eq!(v["engrams_scanned"], 19);
     assert_eq!(v["unparsed"], 0);
     assert_eq!(v["scope"]["today"], TODAY);
     assert_eq!(v["scope"]["domains"], serde_json::json!(["eng"]));
@@ -274,7 +290,7 @@ async fn every_rule_fires_once_and_the_queue_ranks_by_priority() {
     assert_eq!(
         v["families"],
         serde_json::json!([
-            { "family": "temporal", "findings": 5 },
+            { "family": "temporal", "findings": 6 },
             { "family": "structure", "findings": 6 },
             { "family": "redundancy", "findings": 3 },
         ])
@@ -282,7 +298,7 @@ async fn every_rule_fires_once_and_the_queue_ranks_by_priority() {
 
     // The prose instruction rides the legend once per rule, never a row.
     let actions = v["actions"].as_array().unwrap();
-    assert_eq!(actions.len(), 14);
+    assert_eq!(actions.len(), 15);
     assert_eq!(actions[0]["rule"], "V001");
     assert!(
         actions
@@ -312,6 +328,16 @@ async fn every_rule_fires_once_and_the_queue_ranks_by_priority() {
     assert_eq!(by_rule("V201")["permalink"], "dup-a");
     assert_eq!(by_rule("V202")["permalink"], "deploy-checklist");
     assert_eq!(by_rule("V105")["permalink"], "huge-doc");
+
+    // V006 reads the `generated.by` actor the engine put on the facts, so this
+    // is what catches the fact assembly dropping write provenance: the rule
+    // itself has unit coverage, the wiring only has this.
+    assert_eq!(by_rule("V006")["permalink"], "human-capture");
+    assert_eq!(
+        by_rule("V006")["evidence"],
+        "generated.by human:jordi; recorded 2026-07-25; no verified entry"
+    );
+    assert_eq!(by_rule("V006")["class"], "judgment");
 
     // V102 quotes the bracket text verbatim and points at the near match, and
     // it is the typo rather than the retired engram's dangling successor: a
@@ -352,11 +378,10 @@ async fn paging_walks_the_same_ranked_queue() {
             },
         )
         .await;
-        assert_eq!(v["total"], 14);
+        assert_eq!(v["total"], 15);
         assert_eq!(v["limit"], 5);
         assert_eq!(v["page"], page);
-        let expected = if page == 3 { 4 } else { 5 };
-        assert_eq!(v["count"], expected);
+        assert_eq!(v["count"], 5, "fifteen findings fill three whole pages");
         for (i, row) in v["queue"].as_array().unwrap().iter().enumerate() {
             assert_eq!(row["n"].as_u64().unwrap() as usize, (page - 1) * 5 + i + 1);
         }
@@ -386,15 +411,15 @@ async fn paging_walks_the_same_ranked_queue() {
         },
     )
     .await;
-    assert_eq!(past["total"], 14);
+    assert_eq!(past["total"], 15);
     assert_eq!(past["count"], 0);
     assert!(past["queue"].as_array().unwrap().is_empty());
 }
 
 /// The `today` override moves the temporal comparisons and nothing else, which
 /// is what makes a run reproducible. Evaluated before every planted date, the
-/// four age and window rules go silent while the structural and redundancy
-/// rules are unchanged.
+/// age and window rules go silent while the structural and redundancy rules are
+/// unchanged.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_today_override_moves_only_the_temporal_rules() {
     let (_tmp, engine) = fixture().await;
@@ -417,7 +442,7 @@ async fn the_today_override_moves_only_the_temporal_rules() {
         ]
     );
     assert_eq!(v["scope"]["today"], BEFORE_EVERYTHING);
-    assert_eq!(v["engrams_scanned"], 18);
+    assert_eq!(v["engrams_scanned"], 19);
 
     // Two runs over the same scope and the same date are identical, findings
     // and order alike.
@@ -451,9 +476,9 @@ async fn family_and_rule_filters_narrow_the_queue() {
     .await;
     assert_eq!(
         rules(&temporal),
-        vec!["V005", "V001", "V002", "V004", "V003"]
+        vec!["V005", "V001", "V002", "V004", "V006", "V003"]
     );
-    assert_eq!(temporal["total"], 5);
+    assert_eq!(temporal["total"], 6);
     assert_eq!(
         temporal["scope"]["families"],
         serde_json::json!(["temporal"])
@@ -486,7 +511,7 @@ async fn family_and_rule_filters_narrow_the_queue() {
     // The legend follows the filter: one rule shown, one instruction.
     assert_eq!(one_rule["actions"].as_array().unwrap().len(), 1);
     // Scanning is unaffected by a filter; only the queue narrows.
-    assert_eq!(one_rule["engrams_scanned"], 18);
+    assert_eq!(one_rule["engrams_scanned"], 19);
 }
 
 /// `min_priority` drops the low-scoring tail without touching the ranking.
@@ -594,8 +619,8 @@ async fn an_unreadable_engram_is_counted_rather_than_aborting_the_sweep() {
     )
     .await;
     assert_eq!(v["unparsed"], 1);
-    assert_eq!(v["engrams_scanned"], 17);
-    assert_eq!(v["total"], 13);
+    assert_eq!(v["engrams_scanned"], 18);
+    assert_eq!(v["total"], 14);
     assert!(!rules(&v).contains(&"V106".to_string()));
 }
 
@@ -657,4 +682,112 @@ async fn the_queue_rows_stay_tabular_for_toon() {
             assert!(row.as_object().unwrap().values().all(|c| !c.is_array()));
         }
     }
+}
+
+// --- the run recorder --------------------------------------------------------
+
+/// `evolve_engrams` is `evolve_detect` plus exactly one side effect: it stamps
+/// the maintenance state file so the Stop hook stops nudging about the domains
+/// this sweep just looked at. Both halves are asserted in one test because
+/// they share one state file, and a sweep that recorded nothing would pass a
+/// detection-only assertion made anywhere else.
+///
+/// The state directory is redirected into a scratch home for the duration, so
+/// the run never touches the developer's own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_run_recorder_stamps_a_sweep_and_leaves_detection_pure() {
+    let scratch = support::ScratchStateDir::acquire();
+    let (_tmp, engine) = fixture().await;
+
+    // Two domains owe a sweep; the run below is scoped to one of them.
+    crystalline_service::maintenance::record_pending("eng");
+    crystalline_service::maintenance::record_pending("ops");
+    let started = crystalline_service::maintenance::load().pending_since;
+    assert!(started.is_some(), "the backlog carries its start");
+    let before = std::fs::read(scratch.maintenance_path()).unwrap();
+
+    // Detection changes nothing at all, which is what lets a queue view show
+    // this page without claiming anybody worked it.
+    engine
+        .evolve_detect(&EvolveParams {
+            domains: vec!["eng".to_string()],
+            today: Some(TODAY.to_string()),
+            ..EvolveParams::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read(scratch.maintenance_path()).unwrap(),
+        before,
+        "detection must not write the maintenance state"
+    );
+
+    let v = engine
+        .evolve_engrams(&EvolveParams {
+            domains: vec!["eng".to_string()],
+            today: Some(TODAY.to_string()),
+            ..EvolveParams::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(v["scope"]["domains"], serde_json::json!(["eng"]));
+
+    let state = crystalline_service::maintenance::load();
+    assert!(state.last_run_at.is_some(), "the run was stamped");
+    assert_eq!(
+        state.pending_domains,
+        vec!["ops".to_string()],
+        "only the swept domain leaves the backlog"
+    );
+    assert_eq!(
+        state.pending_since, started,
+        "what is left keeps the age it had"
+    );
+    assert!(
+        scratch.maintenance_path().starts_with(scratch.home()),
+        "the state file must land in the scratch home, never the developer's"
+    );
+}
+
+/// An unscoped sweep empties the whole backlog, including a name no scope can
+/// ever cover again.
+///
+/// That name is the ghost this heals: a domain a human wrote to through Fluid
+/// and then unregistered stays on the pending list for ever if the recorder
+/// only ever subtracts the domains it swept, and the Stop hook would keep
+/// naming it. A sweep with no scope looked at every registered domain, so what
+/// is left over is by definition unreachable and the run settles it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unscoped_run_settles_the_whole_backlog_including_a_ghost() {
+    let _scratch = support::ScratchStateDir::acquire();
+    let (_tmp, engine) = fixture().await;
+
+    // `eng` is the only registered domain, so `ghost` can never be swept.
+    crystalline_service::maintenance::record_pending("eng");
+    crystalline_service::maintenance::record_pending("ghost");
+
+    let v = engine
+        .evolve_engrams(&EvolveParams {
+            today: Some(TODAY.to_string()),
+            ..EvolveParams::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        v["scope"]["domains"],
+        serde_json::json!(["eng"]),
+        "the unscoped sweep covered every registered domain"
+    );
+
+    let state = crystalline_service::maintenance::load();
+    assert!(state.last_run_at.is_some(), "the run was stamped");
+    assert!(
+        state.pending_domains.is_empty(),
+        "a full sweep leaves no ghost behind: {:?}",
+        state.pending_domains
+    );
+    assert_eq!(
+        state.pending_since, None,
+        "an empty backlog carries no age to nudge about"
+    );
 }

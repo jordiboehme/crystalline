@@ -916,6 +916,12 @@ impl CollabSession {
             .await;
         match receipt {
             Ok(receipt) => {
+                // A human just taught this domain something through the editor,
+                // which reaches the engine directly rather than through the
+                // REST write handler: the domain owes a consolidation sweep
+                // exactly as it would from a PUT, and this is the surface most
+                // human authoring actually comes through.
+                crate::maintenance::record_pending(&self.domain);
                 let checksum = receipt["checksum"].as_str().unwrap_or_default().to_string();
                 // The permalink the engram answers to AFTER the write: an
                 // author who edited the frontmatter line just moved the

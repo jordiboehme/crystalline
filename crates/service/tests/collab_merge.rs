@@ -4,6 +4,8 @@
 //! own conflict kind. Driven without sockets and without sleeping, like
 //! collab_saves.rs.
 
+mod support;
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -23,7 +25,8 @@ const ALPHA: &str = "---\ntype: engram\ntitle: Alpha\npermalink: alpha\ntags:\n 
 /// A file domain `eng` holding MANIFEST and alpha, synced into an in-memory
 /// store. Mirrors `collab_saves.rs::engine_fixture`; integration test crates
 /// share no helpers, so it is copied rather than imported.
-async fn engine_fixture() -> (tempfile::TempDir, Arc<Engine>) {
+async fn engine_fixture() -> (tempfile::TempDir, Arc<Engine>, support::ScratchStateDir) {
+    let scratch = support::ScratchStateDir::acquire();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
     let mut cfg = GlobalConfig::default();
@@ -51,7 +54,7 @@ async fn engine_fixture() -> (tempfile::TempDir, Arc<Engine>) {
         Some(config_path),
     ));
     engine.sync(None).await.unwrap();
-    (tmp, engine)
+    (tmp, engine, scratch)
 }
 
 /// Frame one client update the way the provider sends it.
@@ -174,7 +177,7 @@ async fn next_control_syncing(
 
 #[tokio::test]
 async fn a_clean_external_edit_merges_into_the_room_and_the_file() {
-    let (tmp, engine) = engine_fixture().await;
+    let (tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
     let mut joined = sessions.join("eng", "alpha").await.unwrap();
     let doc = sync_client(&joined).await;
@@ -216,7 +219,7 @@ async fn a_clean_external_edit_merges_into_the_room_and_the_file() {
 
 #[tokio::test]
 async fn an_idle_session_pulls_external_edits_in_without_writing() {
-    let (tmp, engine) = engine_fixture().await;
+    let (tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
     let mut joined = sessions.join("eng", "alpha").await.unwrap();
     let _doc = sync_client(&joined).await;
@@ -248,7 +251,7 @@ async fn an_idle_session_pulls_external_edits_in_without_writing() {
 
 #[tokio::test]
 async fn colliding_edits_suspend_saving_until_the_room_resolves_mine() {
-    let (tmp, engine) = engine_fixture().await;
+    let (tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
     let mut joined = sessions.join("eng", "alpha").await.unwrap();
     let doc = sync_client(&joined).await;
@@ -299,7 +302,7 @@ async fn colliding_edits_suspend_saving_until_the_room_resolves_mine() {
 
 #[tokio::test]
 async fn resolving_theirs_replaces_the_live_text_and_touches_nothing() {
-    let (tmp, engine) = engine_fixture().await;
+    let (tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
     let mut joined = sessions.join("eng", "alpha").await.unwrap();
     let doc = sync_client(&joined).await;
@@ -366,7 +369,7 @@ async fn resolving_theirs_replaces_the_live_text_and_touches_nothing() {
 
 #[tokio::test]
 async fn an_external_delete_is_its_own_conflict_and_mine_restores_the_file() {
-    let (tmp, engine) = engine_fixture().await;
+    let (tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
     let mut joined = sessions.join("eng", "alpha").await.unwrap();
     let doc = sync_client(&joined).await;
@@ -416,7 +419,7 @@ async fn a_deleted_conflict_never_restores_over_a_file_that_came_back() {
     // rename produces while the file itself sits on disk holding the other
     // author's work. A restore has no CAS to stop it, so the resolve reads the
     // path first: their bytes survive and the room is asked again.
-    let (tmp, engine) = engine_fixture().await;
+    let (tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine.clone());
     let mut joined = sessions.join("eng", "alpha").await.unwrap();
     let doc = sync_client(&joined).await;
@@ -481,7 +484,7 @@ async fn resolving_mine_adopts_their_text_as_the_base_so_the_choice_lands() {
     // only their CHECKSUM would leave the save comparing my text against the
     // stale base, finding nothing to write, and telling the room its choice
     // landed when the file still held theirs.
-    let (tmp, engine) = engine_fixture().await;
+    let (tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
     let mut joined = sessions.join("eng", "alpha").await.unwrap();
     let _doc = sync_client(&joined).await;
@@ -524,7 +527,7 @@ async fn resolving_mine_adopts_their_text_as_the_base_so_the_choice_lands() {
 
 #[tokio::test]
 async fn accepting_an_external_delete_closes_the_session() {
-    let (tmp, engine) = engine_fixture().await;
+    let (tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
     let mut joined = sessions.join("eng", "alpha").await.unwrap();
     let doc = sync_client(&joined).await;
