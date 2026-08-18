@@ -503,6 +503,140 @@ async fn a_human_save_marks_its_domain_pending_for_the_sweep() {
     );
 }
 
+/// A human create marks its domain pending, the same seam the save marks at.
+///
+/// It writes into `scrap` rather than `eng` so the three marker tests here
+/// never depend on each other's backlog: under a plain `cargo test` run the
+/// tests of one binary share a scratch state directory, and a test that
+/// asserted "nothing is pending yet" for a domain another test had just marked
+/// would fail on the order they happened to run in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_human_create_marks_its_domain_pending_for_the_sweep() {
+    let fx = serve(Options::default()).await;
+    let editor = login(fx.addr, "eddy", "eddypw").await;
+
+    let resp = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/scrap/engrams",
+        &editor,
+    )
+    .json(&serde_json::json!({
+        "title": "Fresh",
+        "content": "# Fresh\n\nSomething a person just wrote down.\n"
+    }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 201);
+
+    let state = crystalline_service::maintenance::load();
+    assert!(
+        state.pending_domains.contains(&"scrap".to_string()),
+        "the created-into domain owes a sweep: {:?}",
+        state.pending_domains
+    );
+    assert!(
+        state.pending_since.is_some(),
+        "the backlog carries the moment it started"
+    );
+    assert!(
+        fx.state.maintenance_path().starts_with(fx.state.home()),
+        "the state file must land in the scratch home, never the developer's"
+    );
+}
+
+/// A human retirement marks its domain pending too: closing an engram out is
+/// authoring, and the sweep wants to see what the retirement left dangling.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_human_retire_marks_its_domain_pending_for_the_sweep() {
+    let fx = serve(Options::default()).await;
+    let editor = login(fx.addr, "eddy", "eddypw").await;
+
+    // Authored into `scrap` first, for the isolation the create test explains,
+    // then retired: the create's own mark and this one land on the same domain,
+    // so what this test pins is that the retirement route reaches the recorder
+    // at all rather than which write put the name there.
+    let created = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/scrap/engrams",
+        &editor,
+    )
+    .json(&serde_json::json!({
+        "title": "Retiree",
+        "content": "# Retiree\n\nOn its way out.\n"
+    }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(created.status(), 201);
+
+    let resp = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/scrap/retire",
+        &editor,
+    )
+    .json(&serde_json::json!({"permalink": "retiree", "status": "deprecated"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 200, "{:?}", resp.text().await);
+
+    let state = crystalline_service::maintenance::load();
+    assert!(
+        state.pending_domains.contains(&"scrap".to_string()),
+        "the retired-from domain owes a sweep: {:?}",
+        state.pending_domains
+    );
+}
+
+/// Restoring an archive is administration rather than authoring, so it marks
+/// nothing: an import that put a whole domain on the queue would ask an agent
+/// to consolidate work nobody did, and the one write that most looks like a
+/// flood of human edits is exactly the one that is not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_archive_import_does_not_mark_its_domain_pending() {
+    let fx = serve(Options::default()).await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    let before = crystalline_service::maintenance::load();
+
+    let mut zipped = std::io::Cursor::new(Vec::new());
+    {
+        use std::io::Write as _;
+        let mut writer = zip::ZipWriter::new(&mut zipped);
+        writer
+            .start_file("imported.md", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer
+            .write_all(ALPHA.replace("Alpha", "Imported").as_bytes())
+            .unwrap();
+        writer.finish().unwrap();
+    }
+    let resp = client()
+        .post(format!(
+            "http://{}/api/v1/domains/scrap/archive/import",
+            fx.addr
+        ))
+        .header("cookie", format!("fluid_session={}", admin.0))
+        .header("x-csrf-token", &admin.1)
+        .header("content-type", "application/zip")
+        .body(zipped.into_inner())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let report: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(report["written"], 1, "the import really landed: {report}");
+
+    assert_eq!(
+        crystalline_service::maintenance::load(),
+        before,
+        "a restore owes the sweep nothing at all"
+    );
+}
+
 /// A body past the API's limit is refused with 413 rather than truncated or
 /// hung on, and the refusal is a problem detail like every other one.
 ///

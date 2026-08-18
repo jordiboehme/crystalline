@@ -12,7 +12,9 @@
 //! - the REST write handlers (`crate::rest::engrams`), which mark a domain
 //!   pending when a human creates, saves or retires an engram in it;
 //! - the evolve run recorder (`Engine::evolve_engrams`), which stamps
-//!   `last_run_at` and drops the swept domains from the pending list;
+//!   `last_run_at` and drops the swept domains from the pending list - or,
+//!   when the sweep named no scope at all and so covered every registered
+//!   domain, empties that list outright;
 //! - the Stop hook, which reads the file to decide whether to nudge and
 //!   stamps `last_nudge_at` when it does.
 //!
@@ -154,6 +156,22 @@ pub fn record_run(swept_domains: &[String]) {
     }
 }
 
+/// Record that a consolidation sweep just ran over the whole install.
+///
+/// The unscoped counterpart of [`record_run`]: it stamps `last_run_at` and
+/// empties the pending list outright rather than subtracting a scope from it.
+/// That difference is what heals the file. A sweep with no scope looked at
+/// every registered domain, so any name still standing afterwards is one no
+/// scope can ever cover again (a domain a human wrote to and then
+/// unregistered), and subtracting the swept set would leave it pending for
+/// ever, with the Stop hook naming a ghost once a day. Failures are logged at
+/// debug and swallowed, like every writer here.
+pub fn record_run_unscoped() {
+    if let Err(e) = path().and_then(|p| record_run_unscoped_at(&p)) {
+        tracing::debug!("maintenance state not stamped with the full sweep: {e}");
+    }
+}
+
 // --- path-taking internals ---------------------------------------------------
 //
 // The four functions above resolve `path()` and swallow; these do the work
@@ -245,6 +263,17 @@ fn record_run_at(path: &Path, swept_domains: &[String]) -> Result<(), ConfigErro
     if state.pending_domains.is_empty() {
         state.pending_since = None;
     }
+    write_locked(path, &state)
+}
+
+/// [`record_run_unscoped`] against an explicit file, one critical section like
+/// the two recorders above.
+fn record_run_unscoped_at(path: &Path) -> Result<(), ConfigError> {
+    let _write = write_lock();
+    let mut state = load_from(path);
+    state.last_run_at = Some(Utc::now());
+    state.pending_domains.clear();
+    state.pending_since = None;
     write_locked(path, &state)
 }
 
@@ -354,6 +383,29 @@ mod tests {
 
         record_run_at(&path, &[]).unwrap();
         assert_eq!(load_from(&path).pending_domains, vec!["eng".to_string()]);
+    }
+
+    /// An unscoped sweep looked at everything this install can reach, so it
+    /// empties the backlog rather than subtracting a scope from it. The name
+    /// outside the swept scope is the case that matters: a domain a human
+    /// wrote to and then unregistered can never appear in any scope again, so
+    /// subtracting would leave it pending for ever.
+    #[test]
+    fn record_run_unscoped_clears_the_whole_backlog_ghosts_included() {
+        let (_dir, path) = scratch();
+        record_pending_at(&path, "eng").unwrap();
+        record_pending_at(&path, "ghost").unwrap();
+
+        record_run_unscoped_at(&path).unwrap();
+
+        let after = load_from(&path);
+        assert!(
+            after.pending_domains.is_empty(),
+            "a full sweep settles the whole backlog: {:?}",
+            after.pending_domains
+        );
+        assert_eq!(after.pending_since, None, "an empty backlog has no age");
+        assert!(after.last_run_at.is_some(), "the run was stamped");
     }
 
     /// Concurrent writers in one process never splice their bytes together and

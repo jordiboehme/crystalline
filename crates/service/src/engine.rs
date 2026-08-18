@@ -4158,9 +4158,10 @@ impl Engine {
     /// ranked queue, recording that the sweep ran.
     ///
     /// The thin half of the seam: [`Engine::evolve_detect`] does the work and
-    /// this adds the one side effect, stamping the swept scope into the
-    /// maintenance state so the Stop hook stops nudging about domains this
-    /// sweep just looked at. Detection is shared and pure, so a surface that
+    /// this adds the one side effect, stamping the sweep into the maintenance
+    /// state so the Stop hook stops nudging about domains this sweep just
+    /// looked at - the swept scope for a scoped call, the whole backlog for an
+    /// unscoped one. Detection is shared and pure, so a surface that
     /// only wants to show the queue (the REST queue view) calls `evolve_detect`
     /// and never counts as a run; an agent that actually works the queue comes
     /// through here.
@@ -4181,7 +4182,19 @@ impl Engine {
                     .collect()
             })
             .unwrap_or_default();
-        crate::maintenance::record_run(&swept);
+        // A sweep with no scope of its own looked at every registered domain,
+        // so it settles the whole backlog rather than subtracting the names it
+        // saw. That is what heals the state file: a domain a human wrote to and
+        // then unregistered can never appear in a swept scope again, and
+        // subtracting would leave it pending for ever with the Stop hook naming
+        // a ghost nothing can act on. A scoped call keeps the exact opposite
+        // property, settling its own domains and leaving the rest of the
+        // backlog standing at its original age.
+        if p.domains.is_empty() {
+            crate::maintenance::record_run_unscoped();
+        } else {
+            crate::maintenance::record_run(&swept);
+        }
         Ok(value)
     }
 

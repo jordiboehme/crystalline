@@ -42,8 +42,11 @@
 //! as far as a decision, seeds its `first_seen` stamp the first time it ever
 //! runs, and on the sessions where the capture nudge already fired it may
 //! append a second paragraph asking for a sweep - a ride-along, never a
-//! reason of its own to speak. Being long-lived by design, that file is the
-//! one thing the stale sweep above spares.
+//! reason of its own to speak. What that paragraph asks about is narrowed to
+//! the domains this install still registers, so a domain that went pending and
+//! was later unregistered is never named and never arms the ask. Being
+//! long-lived by design, that file is the one thing the stale sweep above
+//! spares.
 
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -198,12 +201,28 @@ pub enum StopDecision {
 /// for [`state_path`] - no `/`, no `.`, no `..`, no empty string, nothing
 /// outside plain ASCII - so a malformed or hostile session id can never walk
 /// the state file outside `<state_dir>/hooks/`.
+///
+/// One name is refused beyond that shape: the stem of [`MAINTENANCE_FILE`],
+/// because the per-machine throttle record shares this folder and a session by
+/// that name would resolve to exactly its path and write its own state over it.
+/// Compared case-insensitively, since the folder sits on a case-insensitive
+/// filesystem on macOS and Windows.
 pub fn valid_session_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 128
         && id
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        && !id.eq_ignore_ascii_case(maintenance_file_stem())
+}
+
+/// The name a session id must not take: `maintenance.json` without its
+/// extension, derived from the constant rather than spelled again so a rename
+/// upstream carries here.
+fn maintenance_file_stem() -> &'static str {
+    MAINTENANCE_FILE
+        .strip_suffix(".json")
+        .unwrap_or(MAINTENANCE_FILE)
 }
 
 /// The pure decision core: given the parsed payload, whether any domain is
@@ -261,6 +280,10 @@ pub fn decide(
 /// carries the pending domains, which is empty for an ask raised by the
 /// weekly arm alone.
 ///
+/// Pure in the strict sense: what counts as pending is whatever the caller put
+/// in `m`, and [`run_stop`] hands it a state already narrowed by
+/// [`registered_pending`] so an unregistered domain arms nothing here.
+///
 /// Due when the cooldown is clear and either arm is up:
 ///
 /// - the weekly arm, [`EVOLVE_RUN_INTERVAL_DAYS`] since the last sweep, or
@@ -293,6 +316,29 @@ pub fn evolve_ask(m: &MaintenanceState, now: DateTime<Utc>) -> Option<Vec<String
     } else {
         None
     }
+}
+
+/// The pending backlog narrowed to the domains this install still registers,
+/// in the backlog's own order.
+///
+/// A domain can go pending and then be unregistered - a human writes to it
+/// through Fluid, someone removes it from the config later - and the recorder
+/// only subtracts what a sweep actually swept, which a name outside every scope
+/// never is. Left alone, that ghost would arm the pending arm once a day for
+/// ever and name a domain the agent cannot sweep. So the hook asks and speaks
+/// only about domains it can point at; the state file itself heals on the next
+/// full sweep, which is the recorder's half of this
+/// ([`crystalline_service::maintenance::record_run_unscoped`]).
+fn registered_pending<'a>(
+    pending: &[String],
+    registered: impl IntoIterator<Item = &'a str>,
+) -> Vec<String> {
+    let registered: std::collections::HashSet<&str> = registered.into_iter().collect();
+    pending
+        .iter()
+        .filter(|d| registered.contains(d.as_str()))
+        .cloned()
+        .collect()
 }
 
 /// The full reason string this handler prints, composed from the capture
@@ -391,9 +437,20 @@ pub fn run_stop() {
     }
     // The ride-along: only a call that already earned the capture nudge ever
     // asks, so the maintenance throttle can never be the reason this handler
-    // breaks its silence.
+    // breaks its silence. The state it asks about is narrowed to the domains
+    // this install registers first, so a ghost neither arms the pending arm nor
+    // gets named as a focus domain - see [`registered_pending`]. Narrowed for
+    // the question only: the file itself is round-tripped untouched, because
+    // the hook never edits a backlog it is not the recorder for.
     let evolve = if decision == StopDecision::Nudge {
-        evolve_ask(&maintenance_state, now)
+        let visible = MaintenanceState {
+            pending_domains: registered_pending(
+                &maintenance_state.pending_domains,
+                loaded.effective.domains.keys().map(String::as_str),
+            ),
+            ..maintenance_state.clone()
+        };
+        evolve_ask(&visible, now)
     } else {
         None
     };
@@ -548,6 +605,14 @@ mod tests {
             ("../traversal", false),
             ("dot.dot", false),
             ("emoji-🙂", false),
+            // The per-machine throttle record shares the hooks folder, so a
+            // session by that name would write its own state straight over it.
+            ("maintenance", false),
+            // Case folded too: the folder sits on a case-insensitive
+            // filesystem on macOS and Windows, where this resolves to the same
+            // file.
+            ("Maintenance", false),
+            ("maintenance-1", true),
         ];
         for (id, expected) in cases {
             assert_eq!(
@@ -774,6 +839,63 @@ mod tests {
             evolve_ask(&state, now()),
             None,
             "a nudge two hours ago silences the weekly and the pending arm alike"
+        );
+    }
+
+    // --- registered_pending ----------------------------------------------------
+
+    /// The backlog is narrowed to what this install can actually sweep, in the
+    /// order the backlog recorded, and a ghost is dropped rather than renamed
+    /// or reported.
+    #[test]
+    fn registered_pending_keeps_the_backlogs_order_and_drops_the_ghosts() {
+        let pending = [
+            "ops".to_string(),
+            "ghost".to_string(),
+            "eng".to_string(),
+            "gone".to_string(),
+        ];
+        assert_eq!(
+            registered_pending(&pending, ["eng", "ops", "quiet"]),
+            vec!["ops".to_string(), "eng".to_string()],
+            "only registered domains survive, in the backlog's own order"
+        );
+        assert!(
+            registered_pending(&pending, []).is_empty(),
+            "an install with nothing registered has nothing to sweep"
+        );
+        assert!(
+            registered_pending(&[], ["eng"]).is_empty(),
+            "an empty backlog stays empty"
+        );
+    }
+
+    /// A backlog made entirely of ghosts never arms the pending arm: the ask
+    /// would name a domain no sweep can reach, once a day, for ever. The
+    /// weekly arm is untouched by the narrowing - it fires on the calendar and
+    /// simply has nothing to focus on.
+    #[test]
+    fn a_ghost_only_backlog_does_not_arm_the_pending_arm() {
+        let ghosts = MaintenanceState {
+            pending_domains: vec!["ghost".to_string()],
+            pending_since: Some(hours_ago(30)),
+            last_run_at: Some(days_ago(2)),
+            first_seen: Some(days_ago(30)),
+            ..MaintenanceState::default()
+        };
+        let narrowed = MaintenanceState {
+            pending_domains: registered_pending(&ghosts.pending_domains, ["eng"]),
+            ..ghosts.clone()
+        };
+        assert_eq!(
+            evolve_ask(&ghosts, now()),
+            Some(vec!["ghost".to_string()]),
+            "the raw backlog would ask about a domain nothing can sweep"
+        );
+        assert_eq!(
+            evolve_ask(&narrowed, now()),
+            None,
+            "narrowed to what this install registers, nothing is due"
         );
     }
 

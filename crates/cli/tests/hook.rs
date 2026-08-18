@@ -42,11 +42,21 @@ fn isolate(cmd: &mut Command, home: &Path) {
 /// `has_domains` check true. The domain's path is never read by the hook, so
 /// it does not need to exist on disk.
 fn write_domain_config(path: &Path) {
-    std::fs::write(
-        path,
-        "domains:\n  test:\n    path: /nonexistent/test-domain\n",
-    )
-    .unwrap();
+    write_domains_config(path, &["test"]);
+}
+
+/// The same, for a test that needs the registered names to be particular ones:
+/// the maintenance ask names only domains this install still registers, so a
+/// test about a pending domain has to register the domain it puts on the
+/// backlog.
+fn write_domains_config(path: &Path, names: &[&str]) {
+    let mut yaml = String::from("domains:\n");
+    for name in names {
+        yaml.push_str(&format!(
+            "  {name}:\n    path: /nonexistent/{name}-domain\n"
+        ));
+    }
+    std::fs::write(path, yaml).unwrap();
 }
 
 /// A transcript with 25 short lines: well under the byte threshold but over
@@ -95,6 +105,13 @@ fn write_maintenance(home: &Path, state: serde_json::Value) {
 fn read_maintenance(home: &Path) -> serde_json::Value {
     let bytes = std::fs::read(maintenance_path(home)).expect("the maintenance state exists");
     serde_json::from_slice(&bytes).unwrap()
+}
+
+/// An RFC 3339 stamp `days` ago, for a maintenance state whose arms must mean
+/// the same thing whenever the suite runs: a literal date would drift past the
+/// weekly interval and silently change which arm a test exercises.
+fn stamp(days: i64) -> String {
+    (chrono::Utc::now() - chrono::TimeDelta::days(days)).to_rfc3339()
 }
 
 /// Backdate a file's modification time past the sweep's one-week cutoff.
@@ -148,7 +165,10 @@ fn a_due_ask_stays_silent_when_the_capture_nudge_does_not_fire() {
     let work = tempfile::tempdir().unwrap();
     let home = work.path().join("home");
     let config = work.path().join("config.yaml");
-    write_domain_config(&config);
+    // Registered, so the pending arm below is genuinely armed and the silence
+    // this asserts comes from the ride-along gate rather than from the domain
+    // being unreachable.
+    write_domains_config(&config, &["playground"]);
     write_maintenance(
         &home,
         serde_json::json!({
@@ -196,7 +216,10 @@ fn the_ride_along_ask_names_the_pending_domains_and_stamps_the_nudge() {
     let work = tempfile::tempdir().unwrap();
     let home = work.path().join("home");
     let config = work.path().join("config.yaml");
-    write_domain_config(&config);
+    // The pending domain below has to be one this install registers: a name it
+    // does not is a ghost the ask never speaks about, which the test after this
+    // one pins.
+    write_domains_config(&config, &["playground"]);
     let transcript = substantial_transcript(work.path());
     write_maintenance(
         &home,
@@ -239,6 +262,63 @@ fn the_ride_along_ask_names_the_pending_domains_and_stamps_the_nudge() {
         state["pending_domains"],
         serde_json::json!(["playground"]),
         "the hook never clears the backlog - only a sweep does"
+    );
+}
+
+/// A domain that went pending and was later unregistered is a ghost: no sweep
+/// can reach it, so the ask must neither arm on it nor name it. The session
+/// still earns its capture nudge, the maintenance paragraph stays away, and the
+/// 24 hour cooldown is never burnt on an ask nobody could act on.
+#[test]
+fn a_pending_ghost_domain_neither_arms_the_ask_nor_is_named() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let config = work.path().join("config.yaml");
+    // Registers exactly one domain, `test`; the backlog below names another.
+    write_domain_config(&config);
+    let transcript = substantial_transcript(work.path());
+    write_maintenance(
+        &home,
+        serde_json::json!({
+            "v": 1,
+            "pending_domains": ["ghost"],
+            "pending_since": stamp(2),
+            // Recent, so the weekly arm is not what could fire here: the
+            // pending arm is the one under test. Relative to the clock rather
+            // than a literal date, so the week never quietly expires on this
+            // test.
+            "last_run_at": stamp(1),
+            "last_nudge_at": null,
+            "first_seen": stamp(60),
+        }),
+    );
+
+    let mut cmd = bin();
+    isolate(&mut cmd, &home);
+    let out = cmd
+        .env("CRYSTALLINE_CONFIG", &config)
+        .args(["hook", "stop"])
+        .write_stdin(stop_payload("session-ghost", Some(&transcript)))
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let decision: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(
+        decision["reason"],
+        serde_json::Value::String(NUDGE_REASON.to_string()),
+        "an unregistered domain must never pull the maintenance paragraph in"
+    );
+
+    let state = read_maintenance(&home);
+    assert!(
+        state["last_nudge_at"].is_null(),
+        "no ask was made, so no cooldown was burnt: {state}"
+    );
+    assert_eq!(
+        state["pending_domains"],
+        serde_json::json!(["ghost"]),
+        "the hook never edits the backlog - a full sweep is what clears a ghost"
     );
 }
 

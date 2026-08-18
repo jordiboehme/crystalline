@@ -748,3 +748,46 @@ async fn the_run_recorder_stamps_a_sweep_and_leaves_detection_pure() {
         "the state file must land in the scratch home, never the developer's"
     );
 }
+
+/// An unscoped sweep empties the whole backlog, including a name no scope can
+/// ever cover again.
+///
+/// That name is the ghost this heals: a domain a human wrote to through Fluid
+/// and then unregistered stays on the pending list for ever if the recorder
+/// only ever subtracts the domains it swept, and the Stop hook would keep
+/// naming it. A sweep with no scope looked at every registered domain, so what
+/// is left over is by definition unreachable and the run settles it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unscoped_run_settles_the_whole_backlog_including_a_ghost() {
+    let _scratch = support::ScratchStateDir::acquire();
+    let (_tmp, engine) = fixture().await;
+
+    // `eng` is the only registered domain, so `ghost` can never be swept.
+    crystalline_service::maintenance::record_pending("eng");
+    crystalline_service::maintenance::record_pending("ghost");
+
+    let v = engine
+        .evolve_engrams(&EvolveParams {
+            today: Some(TODAY.to_string()),
+            ..EvolveParams::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        v["scope"]["domains"],
+        serde_json::json!(["eng"]),
+        "the unscoped sweep covered every registered domain"
+    );
+
+    let state = crystalline_service::maintenance::load();
+    assert!(state.last_run_at.is_some(), "the run was stamped");
+    assert!(
+        state.pending_domains.is_empty(),
+        "a full sweep leaves no ghost behind: {:?}",
+        state.pending_domains
+    );
+    assert_eq!(
+        state.pending_since, None,
+        "an empty backlog carries no age to nudge about"
+    );
+}
