@@ -4603,3 +4603,86 @@ async fn attachment_blob_roundtrip(store: &dyn Store) {
     );
 }
 parity!(attachment_blobs_roundtrip, attachment_blob_roundtrip);
+
+async fn clear_domain_clears_attachments(store: &dyn Store) {
+    // The live unregister path (`Engine::unregister_domain`) resolves the id
+    // with `upsert_domain` and then calls `clear_domain`, reporting
+    // `index_cleared`. Attachments have to go with everything else, or a
+    // virtual domain's blob bytes outlive the domain with no walker left to
+    // reap them, and a same-named re-registration reuses the id and reads the
+    // previous domain's rows as its own.
+    let did = store
+        .upsert_domain("eng", Some("/k/eng"), DomainKind::File)
+        .await
+        .unwrap();
+    let keep = store
+        .upsert_domain("ops", Some("/k/ops"), DomainKind::File)
+        .await
+        .unwrap();
+
+    for path in ["assets/shot.png", "assets/deck.pdf"] {
+        store
+            .upsert_attachment(did, &attachment(path, "aa11", "image/png", 4))
+            .await
+            .unwrap();
+    }
+    store
+        .write_attachment_blob(did, "assets/deck.pdf", b"pdf bytes")
+        .await
+        .unwrap();
+    store
+        .upsert_attachment(
+            keep,
+            &attachment("assets/other.png", "bb22", "image/png", 5),
+        )
+        .await
+        .unwrap();
+
+    store.clear_domain(did).await.unwrap();
+
+    assert!(
+        store.list_attachments(did).await.unwrap().is_empty(),
+        "clear_domain leaves no attachment metadata behind"
+    );
+    assert!(
+        store
+            .read_attachment_blob(did, "assets/deck.pdf")
+            .await
+            .unwrap()
+            .is_none(),
+        "clear_domain takes the blob bytes with the row"
+    );
+    assert_eq!(
+        store.list_attachments(keep).await.unwrap().len(),
+        1,
+        "another domain's attachments survive"
+    );
+
+    // Re-registering the same name reuses the id, so a cleared domain must come
+    // back empty rather than inheriting what the previous registration held.
+    let again = store
+        .upsert_domain("eng", Some("/k/eng"), DomainKind::File)
+        .await
+        .unwrap();
+    assert_eq!(again, did, "the same name resolves to the same domain id");
+    assert!(store.list_attachments(again).await.unwrap().is_empty());
+    store
+        .upsert_attachment(
+            again,
+            &attachment("assets/fresh.png", "cc33", "image/png", 6),
+        )
+        .await
+        .unwrap();
+    let paths: Vec<String> = store
+        .list_attachments(again)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.path)
+        .collect();
+    assert_eq!(paths, vec!["assets/fresh.png".to_string()]);
+}
+parity!(
+    clear_domain_takes_attachments_with_it,
+    clear_domain_clears_attachments
+);

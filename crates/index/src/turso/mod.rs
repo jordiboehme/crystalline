@@ -814,8 +814,11 @@ impl Store for TursoStore {
     async fn clear_domain(&self, domain: DomainId) -> Result<()> {
         // Deletes this domain's chunks, so the coverage snapshot is now stale.
         self.invalidate_coverage();
-        // Delete a single domain's engram and child rows, keeping the domain
-        // row. Child rows first, then chunks, then the engram rows themselves.
+        // Delete a single domain's engram, attachment and child rows, keeping
+        // the domain row. Child rows first, then chunks, then the engram rows
+        // themselves; attachment blobs before the attachment rows that own
+        // them. `upsert_domain` reuses the id for a name it has seen, so
+        // anything left here would resurface as the next registration's own.
         let did = vec![Value::Integer(domain.0)];
         for sql in [
             "DELETE FROM observation_tag WHERE observation_id IN \
@@ -827,6 +830,9 @@ impl Store for TursoStore {
             "DELETE FROM link WHERE domain_id=?1",
             "DELETE FROM engram WHERE domain_id=?1",
             "DELETE FROM tag_alias WHERE domain_id=?1",
+            "DELETE FROM attachment_blob WHERE attachment_id IN \
+             (SELECT id FROM attachment WHERE domain_id=?1)",
+            "DELETE FROM attachment WHERE domain_id=?1",
         ] {
             self.conn.execute(sql, did.clone()).await?;
         }

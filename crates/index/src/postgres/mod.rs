@@ -1001,8 +1001,11 @@ impl Store for PostgresStore {
     async fn clear_domain(&self, domain: DomainId) -> Result<()> {
         // Deletes this domain's chunks, so the coverage snapshot is now stale.
         self.invalidate_coverage();
-        // Delete a single domain's engram and child rows, keeping the domain
-        // row. Child rows first so the enforced foreign keys are satisfied.
+        // Delete a single domain's engram, attachment and child rows, keeping
+        // the domain row. Child rows first so the enforced foreign keys are
+        // satisfied, attachment blobs before the attachment rows that own them.
+        // `upsert_domain` reuses the id for a name it has seen, so anything left
+        // here would resurface as the next registration's own.
         let mut conn = self.acquire().await?;
         let c = conn.as_mut();
         for sql in [
@@ -1015,6 +1018,9 @@ impl Store for PostgresStore {
             "DELETE FROM link WHERE domain_id=$1",
             "DELETE FROM engram WHERE domain_id=$1",
             "DELETE FROM tag_alias WHERE domain_id=$1",
+            "DELETE FROM attachment_blob WHERE attachment_id IN \
+             (SELECT id FROM attachment WHERE domain_id=$1)",
+            "DELETE FROM attachment WHERE domain_id=$1",
         ] {
             sqlx::query(sql)
                 .bind(domain.0)
