@@ -46,6 +46,18 @@ import { IconButton } from "../components/primitives";
 import type { IconComponent } from "../components/primitives";
 import { AttachIcon } from "./attachIcon";
 import { TableSizePicker } from "./TableSizePicker";
+import type { ImageAlign } from "./imageFormat";
+import {
+  ImageCenterIcon,
+  ImageFloatLeftIcon,
+  ImageFloatRightIcon,
+  ImageFormatMenuIcon,
+  ImageFullIcon,
+  ImageWidth25Icon,
+  ImageWidth50Icon,
+  ImageWidth75Icon,
+} from "./imageIcons";
+import { clearImageFormat, setImageAlign, setImageWidth } from "./imageVerbs";
 import { MERMAID_STARTER_GROUPS, mermaidFence } from "./mermaidStarters";
 import {
   AlignColumnCenterIcon,
@@ -96,6 +108,38 @@ const ALIGNMENTS: { align: Align; label: string; icon: IconComponent }[] = [
 ];
 
 /**
+ * Where an image may stand, in the order they read, each with the mark that
+ * says it without being read.
+ *
+ * Centered leads because it is the default an upload writes and the answer
+ * that clears the fragment again: an author who tried a float and changed
+ * their mind finds the way back at the top of the menu rather than having to
+ * know that "no fragment" is a state.
+ */
+const PLACEMENTS: { align: ImageAlign; label: string; icon: IconComponent }[] =
+  [
+    { align: "center", label: "Centered", icon: ImageCenterIcon },
+    { align: "full", label: "Full width", icon: ImageFullIcon },
+    { align: "left", label: "Float left", icon: ImageFloatLeftIcon },
+    { align: "right", label: "Float right", icon: ImageFloatRightIcon },
+  ];
+
+/**
+ * The widths the menu offers, as shares of the column.
+ *
+ * Presets rather than a number field: the point of the menu is to place a
+ * screenshot in two clicks, and a picture whose size actually matters is
+ * better served by the fragment written by hand. Each composes with whatever
+ * placement the image already has, so the two halves of the menu never undo
+ * each other.
+ */
+const WIDTHS: { width: string; label: string; icon: IconComponent }[] = [
+  { width: "25%", label: "Width 25%", icon: ImageWidth25Icon },
+  { width: "50%", label: "Width 50%", icon: ImageWidth50Icon },
+  { width: "75%", label: "Width 75%", icon: ImageWidth75Icon },
+];
+
+/**
  * The diagram menu's surface: the shared one, with a ceiling on it.
  *
  * Nineteen rows - sixteen starters and the three labels over them - stand 594
@@ -134,11 +178,18 @@ function Divider(): ReactElement {
 export function EditorToolbar({
   view,
   tableActive = false,
+  imageActive = false,
   onAttach,
 }: {
   view: EditorView | null;
   /** Whether the caret is in a table right now; the screen watches for it. */
   tableActive?: boolean;
+  /**
+   * Whether the caret is on an attachment image right now. Drawn rather than
+   * disabled, like the table segment beside it: a menu that has nothing to act
+   * on is one more thing to read past on the way to the verbs that do.
+   */
+  imageActive?: boolean;
   /**
    * What to do with the files a person picks, on a surface that can hold
    * attachments. Absent on one that cannot - the MANIFEST - where the button
@@ -374,6 +425,66 @@ export function EditorToolbar({
             className="hidden"
             onChange={picked}
           />
+        </>
+      )}
+      {imageActive && (
+        <>
+          {/*
+            The same hairline, in front of the one menu that acts on the image
+            the caret is on rather than on the document at large.
+          */}
+          <Divider />
+          <DropdownMenu.Root>
+            <DropdownMenu.Trigger asChild>
+              <IconButton
+                label="Image format"
+                icon={ImageFormatMenuIcon}
+                disabled={off}
+              />
+            </DropdownMenu.Trigger>
+            <DropdownMenu.Portal>
+              <DropdownMenu.Content
+                align="start"
+                sideOffset={6}
+                className={MENU_CLASSES}
+                // The heading menu's discipline, for the same reason: Radix
+                // hands focus back to the trigger on close, and this bar
+                // always returns an author to the buffer instead.
+                onCloseAutoFocus={(event) => {
+                  event.preventDefault();
+                  view?.focus();
+                }}
+              >
+                {PLACEMENTS.map(({ align, label, icon: Icon }) => (
+                  <DropdownMenu.Item
+                    key={align}
+                    className={ITEM_CLASSES}
+                    onSelect={act((v) =>
+                      // Centered is the default, and picking it means "as it
+                      // was": the whole fragment goes, width included.
+                      align === "center"
+                        ? clearImageFormat(v)
+                        : setImageAlign(v, align),
+                    )}
+                  >
+                    <Icon aria-hidden="true" size={16} strokeWidth={1.75} />
+                    {label}
+                  </DropdownMenu.Item>
+                ))}
+                <DropdownMenu.Separator className="my-1 h-px bg-slate-200 dark:bg-slate-700" />
+                {WIDTHS.map(({ width, label, icon: Icon }) => (
+                  <DropdownMenu.Item
+                    key={width}
+                    className={ITEM_CLASSES}
+                    onSelect={act((v) => setImageWidth(v, width))}
+                  >
+                    <Icon aria-hidden="true" size={16} strokeWidth={1.75} />
+                    {label}
+                  </DropdownMenu.Item>
+                ))}
+              </DropdownMenu.Content>
+            </DropdownMenu.Portal>
+          </DropdownMenu.Root>
         </>
       )}
       {tableActive && (

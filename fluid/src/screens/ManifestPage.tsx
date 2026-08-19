@@ -121,7 +121,11 @@ export default function ManifestPage() {
         </p>
       ) : (
         <article>
-          <Markdown source={detail.data.markdown} />
+          {/*
+            The domain's own attachments live at its root, so a MANIFEST that
+            references one resolves it exactly the way an engram does.
+          */}
+          <Markdown source={detail.data.markdown} domain={domain} />
         </article>
       )}
     </div>

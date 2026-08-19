@@ -50,6 +50,8 @@ import {
 import { EditorToolbar } from "../editor/EditorToolbar";
 import { fenceMono } from "../editor/fenceMono";
 import { fencePreviews } from "../editor/fencePreviews";
+import { imagePreviews } from "../editor/imagePreviews";
+import { imageContextListener } from "../editor/imageVerbs";
 import { FindingsPanel, jumpToLine } from "../editor/FindingsPanel";
 import { frontmatterFold } from "../editor/frontmatterFold";
 import { FrontmatterForm } from "../editor/FrontmatterForm";
@@ -88,7 +90,12 @@ const ARIA_LABEL = "Engram source";
  * layer added to only one of them would vanish on whichever path was missed.
  * Later layers are appended to this array and reach both at once.
  */
-function previewConfig(off: boolean, dark: boolean): Extension {
+function previewConfig(
+  off: boolean,
+  dark: boolean,
+  /** The domain the inline image previews load their files from. */
+  domain: string,
+): Extension {
   return off
     ? // Raw is deliberately the source view, so the whole buffer goes back to
       // mono: the shared theme sets prose proportional, and this is the one
@@ -99,6 +106,10 @@ function previewConfig(off: boolean, dark: boolean): Extension {
         wikilinkChips(),
         crystallineLines(),
         fencePreviews(dark),
+        // A pasted screenshot is a path in the buffer and a picture on the
+        // page, so the picture is drawn here too: an author placing an image
+        // sees what a reader will see rather than the reference to it.
+        imagePreviews(domain),
         // The frontmatter form beside the buffer is the metadata surface, so
         // the block itself folds to one chip here rather than being shown
         // twice. The MANIFEST editor deliberately does not get this: it has
@@ -267,6 +278,12 @@ interface SurfaceOptions {
    * time a session rebuilt the buffer.
    */
   onTableContext: (inTable: boolean) => void;
+  /**
+   * Told when the caret enters or leaves an attachment image, so the format
+   * bar can draw its image menu. It travels with the table listener above and
+   * for the same reason.
+   */
+  onImageContext: (onImage: boolean) => void;
 }
 
 /**
@@ -302,6 +319,10 @@ function surfaceExtensions(options: SurfaceOptions): Extension[] {
     // What the format bar's context segment watches. Outside the preview
     // compartment: a table is a table in Raw mode too.
     tableContextListener(options.onTableContext),
+    // The same watch for the image menu. Outside the preview compartment
+    // beside it: the menu edits the target's text, which is as much text in
+    // Raw mode as it is under the previews.
+    imageContextListener(options.onImageContext),
     // A pasted screenshot and a dropped deck are attachments in Raw mode too,
     // so these sit outside the compartment beside it.
     options.uploads,
@@ -322,7 +343,9 @@ function surfaceExtensions(options: SurfaceOptions): Extension[] {
     options.resolverBox.of(wikilinkResolverFacet.of(options.resolver)),
     // Every later flip goes through the compartment rather than through this
     // array, which is read once per state.
-    options.preview.of(previewConfig(options.raw, options.dark)),
+    options.preview.of(
+      previewConfig(options.raw, options.dark, options.domain),
+    ),
   ];
 }
 
@@ -507,6 +530,8 @@ function Surface({
    * per crossing rather than one per keystroke.
    */
   const [tableActive, setTableActive] = useState(false);
+  /** The same, for the caret sitting on an attachment image. */
+  const [imageActive, setImageActive] = useState(false);
   /**
    * WHICH conflict this tab has the resolution view open on, rather than a
    * bare open flag. The conflict itself is the server's - it stands until
@@ -588,6 +613,7 @@ function Surface({
       room,
       uploads: uploads.extension,
       onTableContext: setTableActive,
+      onImageContext: setImageActive,
     });
 
   /**
@@ -848,6 +874,7 @@ function Surface({
         room,
         uploads: uploads.extension,
         onTableContext: setTableActive,
+        onImageContext: setImageActive,
       }),
     // Read once: `CmEditor` snapshots the extensions at mount, so a later
     // theme change reaches the buffer through a remount rather than through
@@ -947,7 +974,7 @@ function Surface({
                   setRaw(next);
                   session.viewRef.current?.dispatch({
                     effects: preview.reconfigure(
-                      previewConfig(next, resolved === "dark"),
+                      previewConfig(next, resolved === "dark", engram.domain),
                     ),
                   });
                 }}
@@ -1153,6 +1180,7 @@ function Surface({
           <EditorToolbar
             view={view}
             tableActive={tableActive}
+            imageActive={imageActive}
             onAttach={uploads.attach}
           />
           <CmEditor

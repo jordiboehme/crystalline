@@ -38,6 +38,30 @@ export function formatActor(by: string): string {
   return by;
 }
 
+/** The units a stored file is measured in, which is how its ceiling is stated. */
+const SIZE_UNITS = ["B", "KiB", "MiB"] as const;
+
+/**
+ * A byte count in the words a reader reads: `812 B`, `45 KiB`, `1.2 MiB`.
+ *
+ * Binary units rather than decimal ones, because the ceiling an author is told
+ * about is 10 MiB and a size shown in MB beside it would be a second unit for
+ * the same quantity. A round-numbered fraction keeps one decimal only while it
+ * says something: `1.2 MiB` is worth the digit, `45.0 KiB` is not, so anything
+ * from ten up is stated whole.
+ */
+export function formatBytes(bytes: number): string {
+  let value = Math.max(bytes, 0);
+  let unit = 0;
+  while (value >= 1024 && unit < SIZE_UNITS.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  const shown =
+    unit === 0 || value >= 10 ? Math.round(value).toString() : value.toFixed(1);
+  return `${shown} ${SIZE_UNITS[unit] ?? "B"}`;
+}
+
 /** `n thing` or `n things`, for the counts that appear all over the screens. */
 export function plural(count: number, one: string, many: string): string {
   return `${String(count)} ${count === 1 ? one : many}`;

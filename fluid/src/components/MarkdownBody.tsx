@@ -36,6 +36,12 @@ import rehypeHighlight from "rehype-highlight";
 import { Link } from "react-router";
 import remarkGfm from "remark-gfm";
 
+import { attachmentUrl } from "../api/files";
+import {
+  imageStyle,
+  isAssetTarget,
+  parseImageFragment,
+} from "../editor/imageFormat";
 import { WIKILINK, referenceState } from "../wikilinks";
 import type { WikilinkResolution, WikilinkResolver } from "../wikilinks";
 import { Chip } from "./primitives";
@@ -346,35 +352,6 @@ const components: Components = {
     <ol className="my-3 list-decimal pl-6 leading-relaxed">{children}</ol>
   ),
   li: ({ children }) => <li className="my-1">{structuredBullet(children)}</li>,
-  a: ({ children, href, node }) => {
-    // A resolved wikilink points at a screen of this app, so it navigates
-    // in place rather than reloading it. The route was built by the resolver
-    // from the graph's own addresses, so there is nothing left to validate.
-    if (wikilinkKind(node) === "resolved" && typeof href === "string") {
-      return (
-        <Link
-          to={href}
-          className="text-sky-700 underline underline-offset-2 hover:no-underline dark:text-sky-400"
-        >
-          {children}
-        </Link>
-      );
-    }
-    // react-markdown's own URL transform has already dropped the protocols a
-    // link may not carry (`javascript:` among them). What is left to decide is
-    // where it opens: a link out of the app leaves this tab alone and gets no
-    // handle on it, while an anchor or an in-app path navigates in place.
-    const outward = typeof href === "string" && /^https?:\/\//i.test(href);
-    return (
-      <a
-        href={href}
-        className="text-sky-700 underline underline-offset-2 hover:no-underline dark:text-sky-400"
-        {...(outward ? { target: "_blank", rel: "noreferrer" } : {})}
-      >
-        {children}
-      </a>
-    );
-  },
   span: ({ children, node }) =>
     // The only spans in this tree are the wikilink rewrite's own: raw HTML
     // stays text here, so nothing in an engram can write one.
@@ -463,6 +440,164 @@ const components: Components = {
   },
 };
 
+/**
+ * The target as the author wrote it, out of the URL the renderer hands over.
+ *
+ * micromark percent-encodes every link and image target on its way through -
+ * a stray `%` becomes `%25`, a name written in Japanese becomes a row of UTF-8
+ * escapes - so what arrives here is a URL rather than the stored path it was
+ * written as. Encoding it again would produce `%2525` and a 404 on a file that
+ * is sitting right there, and the fragment would arrive as `w=50%25`, which is
+ * no width at all.
+ *
+ * A target that will not decode is handed back exactly as it came: it is then
+ * not a path this app can resolve either way, and a thrown `URIError` inside a
+ * render would take the whole document down over one malformed link.
+ */
+function storedTarget(target: string): string {
+  try {
+    return decodeURIComponent(target);
+  } catch {
+    return target;
+  }
+}
+
+/** The classes every link in a document wears, wherever it points. */
+const LINK_CLASSES =
+  "text-sky-700 underline underline-offset-2 hover:no-underline dark:text-sky-400";
+
+/**
+ * One link, drawn by where it points.
+ *
+ * Three destinations, in the order they are decided. A resolved wikilink is a
+ * screen of this app and navigates in place; the route was built by the
+ * resolver from the graph's own addresses, so there is nothing left to
+ * validate. An `assets/` target is an attachment of this engram's own domain
+ * and points at the files route, in a new tab because what comes back is a pdf
+ * or a spreadsheet rather than a page of this app - and whether that opens or
+ * downloads is the server's disposition to decide, not this anchor's.
+ * Everything else is what it was written as.
+ *
+ * react-markdown's own URL transform has already dropped the protocols a link
+ * may not carry (`javascript:` among them). What is left to decide is where it
+ * opens: a link out of the app leaves this tab alone and gets no handle on it,
+ * while an anchor or an in-app path navigates in place.
+ */
+function MarkdownAnchor({
+  children,
+  href,
+  node,
+  domain,
+}: {
+  children?: ReactNode;
+  /** Undefined is spelled out: react-markdown hands a link with no target on. */
+  href?: string | undefined;
+  node?: unknown;
+  /** The domain a relative `assets/` target resolves against, when known. */
+  domain?: string;
+}) {
+  if (wikilinkKind(node) === "resolved" && typeof href === "string") {
+    return (
+      <Link to={href} className={LINK_CLASSES}>
+        {children}
+      </Link>
+    );
+  }
+  const target = typeof href === "string" ? storedTarget(href) : "";
+  if (domain !== undefined && isAssetTarget(target)) {
+    // The fragment is a view concern the file route never sees, so it is
+    // stripped here as well: a link carrying `#right` would be asking for a
+    // file by a name nobody stored.
+    const { path } = parseImageFragment(target);
+    return (
+      <a
+        href={attachmentUrl(domain, path)}
+        target="_blank"
+        rel="noreferrer"
+        className={LINK_CLASSES}
+      >
+        {children}
+      </a>
+    );
+  }
+  const outward = typeof href === "string" && /^https?:\/\//i.test(href);
+  return (
+    <a
+      href={href}
+      className={LINK_CLASSES}
+      {...(outward ? { target: "_blank", rel: "noreferrer" } : {})}
+    >
+      {children}
+    </a>
+  );
+}
+
+/**
+ * One image: an attachment of this domain drawn from the files route, or
+ * whatever it was written as.
+ *
+ * Only a relative `assets/` target is rewritten. An absolute path and an
+ * external URL are somebody else's address and are handed to the browser
+ * exactly as the author wrote them - including any fragment, which means
+ * nothing to this app out there.
+ *
+ * The placement fragment is read on the way through, and the style it means is
+ * the same one the editor's preview widget applies, so a floated image looks
+ * the same in both places.
+ */
+function MarkdownImage({
+  src,
+  alt,
+  domain,
+}: {
+  src?: string;
+  alt?: string;
+  domain?: string;
+}) {
+  const written = typeof src === "string" ? src : "";
+  const target = storedTarget(written);
+  const ours = domain !== undefined && isAssetTarget(target);
+  const { path, format } = parseImageFragment(target);
+  return (
+    <img
+      // Ours is rebuilt from the decoded path, which re-encodes exactly once;
+      // anything else keeps the URL the renderer produced, escapes and all.
+      src={ours ? attachmentUrl(domain, path) : written}
+      // Never null: react-markdown hands the alt text through as written, and
+      // an image with no alt at all is one a screen reader cannot skip.
+      alt={alt ?? ""}
+      loading="lazy"
+      style={imageStyle(ours ? format : { align: "center" })}
+    />
+  );
+}
+
+/**
+ * The component map for one domain: everything above, plus the two elements
+ * that need to know which domain a relative `assets/` target belongs to.
+ */
+function componentsFor(domain: string | undefined): Components {
+  return {
+    ...components,
+    a: ({ children, href, node }) => (
+      <MarkdownAnchor
+        href={href}
+        node={node}
+        {...(domain === undefined ? {} : { domain })}
+      >
+        {children}
+      </MarkdownAnchor>
+    ),
+    img: ({ src, alt }) => (
+      <MarkdownImage
+        {...(typeof src === "string" ? { src } : {})}
+        {...(typeof alt === "string" ? { alt } : {})}
+        {...(domain === undefined ? {} : { domain })}
+      />
+    ),
+  };
+}
+
 /** A diagram's source, which is what shows while the renderer is on its way. */
 function DiagramSource({ source }: { source: string }) {
   return (
@@ -476,11 +611,19 @@ export default function MarkdownBody({
   source,
   wikilinks,
   foldTitle,
+  domain,
 }: {
   source: string;
   wikilinks?: WikilinkResolver;
   foldTitle?: string;
+  /**
+   * The domain this document lives in, which is what a relative `assets/`
+   * target is relative to. Absent, such a target is left as written: an
+   * attachment path means nothing without the domain holding it.
+   */
+  domain?: string;
 }) {
+  const componentMap = useMemo(() => componentsFor(domain), [domain]);
   const rehypePlugins = useMemo<RehypePlugins>(
     () => [
       // `plainText` keeps the highlighter's hands off a mermaid fence, whose
@@ -503,7 +646,7 @@ export default function MarkdownBody({
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         rehypePlugins={rehypePlugins}
-        components={components}
+        components={componentMap}
       >
         {foldLeadingTitle(source.replace(FRONTMATTER, ""), foldTitle)}
       </ReactMarkdown>

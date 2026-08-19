@@ -35,9 +35,21 @@ export interface MarkdownProps {
    * the screen says it once; absent, every heading in the document is drawn.
    */
   foldTitle?: string;
+  /**
+   * The domain this document lives in. It is what a relative `assets/` target
+   * resolves against - an attachment path is domain-relative and means nothing
+   * without one - so a caller that knows says so, and one that does not leaves
+   * such targets as the text they were written as.
+   */
+  domain?: string;
 }
 
-export function Markdown({ source, wikilinks, foldTitle }: MarkdownProps) {
+export function Markdown({
+  source,
+  wikilinks,
+  foldTitle,
+  domain,
+}: MarkdownProps) {
   return (
     <Suspense
       fallback={
@@ -72,6 +84,7 @@ export function Markdown({ source, wikilinks, foldTitle }: MarkdownProps) {
         source={source}
         {...(wikilinks ? { wikilinks } : {})}
         {...(foldTitle === undefined ? {} : { foldTitle })}
+        {...(domain === undefined ? {} : { domain })}
       />
     </Suspense>
   );

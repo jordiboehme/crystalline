@@ -521,3 +521,117 @@ describe("the attach verb", () => {
     expect(opened).toEqual(["picker"]);
   });
 });
+
+/**
+ * The image-format menu is context too: it is drawn only where the caret is
+ * actually on an attachment image, and every row of it edits the target of
+ * that one reference. What the verbs do is `imageVerbs.test.ts`'s job; what is
+ * under test here is that each label reaches the verb it promises.
+ */
+describe("the image-format menu", () => {
+  const IMAGE_DOC = "Before\n\n![Shot](assets/2026/08/shot.png)\n";
+  const ON_IMAGE = IMAGE_DOC.indexOf("![Shot]") + 2;
+
+  /** A buffer with the caret on that image, and the bar above it. */
+  function mountOnImage(doc = IMAGE_DOC, at = ON_IMAGE): EditorView {
+    view = new EditorView({
+      state: parsedState(
+        EditorState.create({
+          doc,
+          selection: EditorSelection.single(at),
+          extensions: [...lineSeparatorFor(doc), ...baseExtensions(false)],
+        }),
+      ),
+      parent: document.body,
+    });
+    bar = render(<EditorToolbar view={view} imageActive />, {
+      wrapper: Tooltips,
+    });
+    return view;
+  }
+
+  /** Open the menu and pick one of its rows. */
+  async function pickFormat(label: string): Promise<void> {
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Image format" }));
+    await user.click(await screen.findByRole("menuitem", { name: label }));
+  }
+
+  test("is there only while the caret is on an image", () => {
+    const { rerender } = render(<EditorToolbar view={null} />, {
+      wrapper: Tooltips,
+    });
+    expect(screen.queryByRole("button", { name: "Image format" })).toBeNull();
+    rerender(<EditorToolbar view={null} imageActive />);
+    expect(screen.getByRole("button", { name: "Image format" })).not.toBeNull();
+  });
+
+  test("every row wears a glyph of its own, none of them borrowed", async () => {
+    const user = userEvent.setup();
+    mountOnImage();
+    const glyphOf = (element: HTMLElement) =>
+      element.querySelector("svg")?.getAttribute("class");
+    // Read before opening: an open Radix menu hides the rest of the page from
+    // the accessibility tree, trigger included.
+    const trigger = glyphOf(
+      screen.getByRole("button", { name: "Image format" }),
+    );
+    await user.click(screen.getByRole("button", { name: "Image format" }));
+    const rows = [
+      "Centered",
+      "Full width",
+      "Float left",
+      "Float right",
+      "Width 25%",
+      "Width 50%",
+      "Width 75%",
+    ].map((name) => glyphOf(screen.getByRole("menuitem", { name })));
+    const glyphs = [trigger, ...rows];
+    for (const drawn of glyphs) {
+      expect(drawn).toBeTruthy();
+      expect(drawn).not.toContain("lucide");
+      expect(drawn).toContain("crystalline-icon-image");
+    }
+    expect(new Set(glyphs).size).toBe(8);
+  });
+
+  const ROWS: [string, string][] = [
+    ["Full width", "![Shot](assets/2026/08/shot.png#full)"],
+    ["Float left", "![Shot](assets/2026/08/shot.png#left)"],
+    ["Float right", "![Shot](assets/2026/08/shot.png#right)"],
+    ["Width 25%", "![Shot](assets/2026/08/shot.png#w=25%)"],
+    ["Width 50%", "![Shot](assets/2026/08/shot.png#w=50%)"],
+    ["Width 75%", "![Shot](assets/2026/08/shot.png#w=75%)"],
+  ];
+  for (const [label, written] of ROWS) {
+    test(`${label} rewrites the target under the caret`, async () => {
+      const v = mountOnImage();
+      await pickFormat(label);
+      expect(docText(v.state)).toContain(written);
+    });
+  }
+
+  test("Centered puts the reference back to the bare path an upload wrote", async () => {
+    const doc = "![Shot](assets/2026/08/shot.png#left,w=25%)\n";
+    const v = mountOnImage(doc, 2);
+    await pickFormat("Centered");
+    expect(docText(v.state)).toBe("![Shot](assets/2026/08/shot.png)\n");
+  });
+
+  test("a width composes with the placement rather than replacing it", async () => {
+    const v = mountOnImage();
+    await pickFormat("Float right");
+    await pickFormat("Width 50%");
+    expect(docText(v.state)).toContain(
+      "![Shot](assets/2026/08/shot.png#right,w=50%)",
+    );
+  });
+
+  test("the caret goes back to the buffer when the menu closes", async () => {
+    const v = mountOnImage();
+    await pickFormat("Float left");
+    await waitFor(() => {
+      expect(v.hasFocus).toBe(true);
+    });
+  });
+});
