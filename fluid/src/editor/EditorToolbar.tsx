@@ -37,12 +37,14 @@ import {
   Workflow,
 } from "lucide-react";
 import { DropdownMenu } from "radix-ui";
-import type { MouseEvent, ReactElement } from "react";
-import { useId } from "react";
+import type { ChangeEvent, MouseEvent, ReactElement } from "react";
+import { useId, useRef } from "react";
 
+import { ATTACHMENT_ACCEPT } from "../api/files";
 import { ITEM_CLASSES, MENU_CLASSES } from "../components/menu";
 import { IconButton } from "../components/primitives";
 import type { IconComponent } from "../components/primitives";
+import { AttachIcon } from "./attachIcon";
 import { TableSizePicker } from "./TableSizePicker";
 import { MERMAID_STARTER_GROUPS, mermaidFence } from "./mermaidStarters";
 import {
@@ -132,14 +134,36 @@ function Divider(): ReactElement {
 export function EditorToolbar({
   view,
   tableActive = false,
+  onAttach,
 }: {
   view: EditorView | null;
   /** Whether the caret is in a table right now; the screen watches for it. */
   tableActive?: boolean;
+  /**
+   * What to do with the files a person picks, on a surface that can hold
+   * attachments. Absent on one that cannot - the MANIFEST - where the button
+   * is simply not drawn rather than drawn and refusing.
+   */
+  onAttach?: (files: File[]) => void;
 }): ReactElement {
   const off = view === null;
   /** The stem the diagram menu's group headings hang their ids off. */
   const groupId = useId();
+  /**
+   * The picker itself. A native file input is the only way to open the
+   * dialog, and it is kept hidden rather than styled: the button beside it is
+   * this bar's own, so the row reads as one kind of thing.
+   */
+  const picker = useRef<HTMLInputElement | null>(null);
+  const picked = (event: ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.target.files ?? []);
+    // Cleared before the callback runs, so picking the same file twice in a
+    // row still fires a change the second time.
+    event.target.value = "";
+    if (files.length > 0) {
+      onAttach?.(files);
+    }
+  };
   const act = (run: (view: EditorView) => boolean) => () => {
     if (view) {
       run(view);
@@ -322,6 +346,36 @@ export function EditorToolbar({
         disabled={off}
         onClick={act((v) => insertBlock(v, CODE_SKELETON))}
       />
+      {/*
+        The third insert verb that asks first, and the only one whose question
+        the browser asks: which file. Paste and drop reach the same flow with
+        no button at all, so this is the way in for a file that is neither on
+        the clipboard nor draggable onto the buffer.
+      */}
+      {onAttach && (
+        <>
+          <IconButton
+            label="Attach a file"
+            icon={AttachIcon}
+            disabled={off}
+            onClick={() => {
+              picker.current?.click();
+            }}
+          />
+          <input
+            ref={picker}
+            type="file"
+            multiple
+            // The allowlist as the dialog's own filter, so a file the server
+            // would refuse is hard to pick in the first place. It is a hint
+            // rather than a gate - every picker offers a way past it - which
+            // is why the upload checks the extension again.
+            accept={ATTACHMENT_ACCEPT}
+            className="hidden"
+            onChange={picked}
+          />
+        </>
+      )}
       {tableActive && (
         <>
           {/*

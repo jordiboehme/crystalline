@@ -62,6 +62,7 @@ import {
 } from "../editor/setup";
 import { tableContextListener } from "../editor/tableVerbs";
 import { formattingKeymap } from "../editor/toolbar";
+import { useAttachmentUploads } from "../editor/useAttachmentUploads";
 import { useCloseFlow, useExitRequest } from "../editor/useCloseFlow";
 import { saveKeymap, useEditorSession } from "../editor/useEditorSession";
 import {
@@ -252,6 +253,13 @@ interface SurfaceOptions {
   /** The session this buffer is bound to, or null on the solo surface. */
   room: Room | null;
   /**
+   * Paste and drop uploads. Inside the options for the same reason the table
+   * listener is: every state this screen builds goes through this function,
+   * and handlers added beside it at one site would go silent the first time a
+   * session rebuilt the buffer.
+   */
+  uploads: Extension;
+  /**
    * Told when the caret enters or leaves a table, so the format bar can draw
    * its table verbs. It travels inside the options rather than being added
    * beside them, because every state this screen builds goes through this
@@ -294,6 +302,9 @@ function surfaceExtensions(options: SurfaceOptions): Extension[] {
     // What the format bar's context segment watches. Outside the preview
     // compartment: a table is a table in Raw mode too.
     tableContextListener(options.onTableContext),
+    // A pasted screenshot and a dropped deck are attachments in Raw mode too,
+    // so these sit outside the compartment beside it.
+    options.uploads,
     // The toolbar's own shortcuts. Beside `saveKeymap` rather than inside the
     // preview compartment: Mod-b and Mod-i are typing help like the
     // completions below, and raw mode is still markdown being written. Its
@@ -506,6 +517,25 @@ function Surface({
    * conflict raised later never pops a dialog nobody asked for.
    */
   const [resolving, setResolving] = useState<CollabConflict | null>(null);
+  /**
+   * Why the last attachment did not land, in the words of whoever refused it -
+   * this tab for a file type or a size the server would bounce, the server for
+   * everything else. It stands until the next batch starts rather than fading:
+   * an author who dropped five files and had one refused needs to be able to
+   * read which one.
+   */
+  const [attachError, setAttachError] = useState<string | null>(null);
+  /**
+   * The live buffer, for the upload flow. A ref rather than the `view` state
+   * above, because the extensions are read once at mount and the handlers
+   * inside them have to reach whatever view exists when a file is dropped.
+   */
+  const uploadView = useRef<EditorView | null>(null);
+  const uploads = useAttachmentUploads({
+    domain: engram.domain,
+    view: () => uploadView.current,
+    onError: setAttachError,
+  });
 
   // The same pair the engram page reads, under the same cache keys: an author
   // who arrived from that page pays nothing on the wire for the chips.
@@ -556,6 +586,7 @@ function Surface({
       resolver,
       vocab: readVocab,
       room,
+      uploads: uploads.extension,
       onTableContext: setTableActive,
     });
 
@@ -815,6 +846,7 @@ function Surface({
         resolver: NO_RESOLUTION,
         vocab: readVocab,
         room,
+        uploads: uploads.extension,
         onTableContext: setTableActive,
       }),
     // Read once: `CmEditor` snapshots the extensions at mount, so a later
@@ -829,6 +861,7 @@ function Surface({
       resolverBox,
       readVocab,
       room,
+      uploads.extension,
     ],
   );
 
@@ -1024,6 +1057,18 @@ function Surface({
             : "block saving; see Findings."}
         </p>
       )}
+      {attachError !== null && (
+        // The same face a refused save wears on this screen, because it is the
+        // same kind of news: the server, or this tab on the server's rules,
+        // would not take what was just handed to it. Nothing was inserted, so
+        // the buffer still says what it said.
+        <p
+          role="alert"
+          className="rounded bg-red-50 px-2 py-1 text-sm text-red-800 dark:bg-red-950 dark:text-red-200"
+        >
+          {attachError}
+        </p>
+      )}
       {/*
         No room to join, and the attempt is over rather than still running:
         one quiet line, because editing solo is the ordinary older behavior
@@ -1105,13 +1150,18 @@ function Surface({
             transactions on the buffer, which in a room is the shared document
             and everywhere is the file.
           */}
-          <EditorToolbar view={view} tableActive={tableActive} />
+          <EditorToolbar
+            view={view}
+            tableActive={tableActive}
+            onAttach={uploads.attach}
+          />
           <CmEditor
             initialDoc={mountText}
             extensions={extensions}
             ariaLabel={ARIA_LABEL}
             onReady={(ready) => {
               session.onReady(ready);
+              uploadView.current = ready;
               setView(ready);
             }}
             onDocChanged={session.setBuffer}

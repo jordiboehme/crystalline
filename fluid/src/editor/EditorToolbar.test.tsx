@@ -19,6 +19,7 @@ import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, test } from "vitest";
 
+import { ATTACHMENT_ACCEPT } from "../api/files";
 import { Tooltips } from "../components/primitives";
 import { parsedState } from "../test/parse";
 import { EditorToolbar } from "./EditorToolbar";
@@ -445,5 +446,78 @@ describe("the table segment", () => {
       screen.getByRole("button", { name: "Add column after" }),
     ).not.toBeNull();
     expect(document.activeElement).toBe(focused);
+  });
+});
+
+/**
+ * The attach verb is drawn only where files can actually go: a surface that
+ * hands the bar no handler - the MANIFEST editor - gets no button rather than
+ * a button that refuses.
+ */
+describe("the attach verb", () => {
+  /** A live buffer, the way every other test here builds one. */
+  function buffer(): EditorView {
+    view = new EditorView({
+      state: EditorState.create({
+        doc: "prose\n",
+        selection: EditorSelection.single(5),
+        extensions: [...lineSeparatorFor("prose\n"), ...baseExtensions(false)],
+      }),
+      parent: document.body,
+    });
+    return view;
+  }
+
+  /** The bar over that buffer, with an upload handler on it. */
+  function mountWithAttach(onAttach: (files: File[]) => void): RenderResult {
+    return render(<EditorToolbar view={buffer()} onAttach={onAttach} />, {
+      wrapper: Tooltips,
+    });
+  }
+
+  test("is absent on a surface that takes no attachments", () => {
+    render(<EditorToolbar view={buffer()} />, { wrapper: Tooltips });
+    expect(screen.queryByRole("button", { name: "Attach a file" })).toBeNull();
+  });
+
+  test("opens a picker filtered to the allowlist and hands the files over", async () => {
+    const picked: File[][] = [];
+    const { container } = mountWithAttach((files) => {
+      picked.push(files);
+    });
+
+    const input =
+      container.querySelector<HTMLInputElement>('input[type="file"]');
+    expect(input).not.toBeNull();
+    expect(input?.accept).toBe(ATTACHMENT_ACCEPT);
+    expect(input?.accept).toContain(".png");
+    expect(input?.accept).not.toContain(".md");
+    expect(input?.multiple).toBe(true);
+
+    const file = new File(["x"], "shot.png", { type: "image/png" });
+    await userEvent.upload(input as HTMLInputElement, file);
+
+    expect(picked).toEqual([[file]]);
+    // Cleared, so picking the same file again still fires a change.
+    expect(input?.value).toBe("");
+  });
+
+  test("the button reaches the picker", async () => {
+    const opened: string[] = [];
+    const { container } = mountWithAttach(() => undefined);
+    const input =
+      container.querySelector<HTMLInputElement>('input[type="file"]');
+    input?.addEventListener("click", (event) => {
+      // Nothing opens a real dialog in jsdom; what is under test is that the
+      // button's press reaches this element at all.
+      event.preventDefault();
+      opened.push("picker");
+    });
+
+    await userEvent.click(
+      screen.getByRole("button", { name: "Attach a file" }),
+    );
+
+    expect(opened).toEqual(["picker"]);
   });
 });
