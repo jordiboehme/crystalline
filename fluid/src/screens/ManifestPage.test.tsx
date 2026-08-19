@@ -186,6 +186,6 @@ describe("the MANIFEST", () => {
         screen.queryByLabelText("MANIFEST source"),
       ).not.toBeInTheDocument();
     });
-    expect(await screen.findByText(/nothing here/i)).toBeInTheDocument();
+    expect(await screen.findByText(/this memory could not be recalled/i)).toBeInTheDocument();
   });
 });

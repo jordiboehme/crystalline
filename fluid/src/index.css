@@ -289,3 +289,76 @@
     animation: none;
   }
 }
+
+/*
+ * The shattered gem: four clip-path shards of the logo fly apart when the
+ * mark is triple-clicked (or long-pressed), and the about screen assembles
+ * behind them. Reduced motion skips the shards and fades the screen in.
+ */
+.gem-shards {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+.gem-shards > span {
+  position: absolute;
+  inset: 0;
+  animation: gem-shard 0.55s ease-out forwards;
+}
+.gem-shards > span:nth-child(1) {
+  clip-path: polygon(50% 0, 100% 0, 100% 50%, 50% 50%);
+  --shard-fly: translate(7px, -8px) rotate(20deg);
+}
+.gem-shards > span:nth-child(2) {
+  clip-path: polygon(0 0, 50% 0, 50% 50%, 0 50%);
+  --shard-fly: translate(-8px, -6px) rotate(-16deg);
+}
+.gem-shards > span:nth-child(3) {
+  clip-path: polygon(0 50%, 50% 50%, 50% 100%, 0 100%);
+  --shard-fly: translate(-6px, 8px) rotate(13deg);
+}
+.gem-shards > span:nth-child(4) {
+  clip-path: polygon(50% 50%, 100% 50%, 100% 100%, 50% 100%);
+  --shard-fly: translate(8px, 7px) rotate(-21deg);
+}
+@keyframes gem-shard {
+  0% {
+    transform: none;
+    opacity: 1;
+  }
+  100% {
+    transform: var(--shard-fly);
+    opacity: 0;
+  }
+}
+@keyframes plaque-in {
+  0% {
+    transform: scale(0.92);
+    opacity: 0;
+  }
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+.plaque-in {
+  animation: plaque-in 0.25s ease-out both;
+}
+/* The faint CRT scanlines over the C64 screen. */
+.crt-scan {
+  background-image: repeating-linear-gradient(
+    to bottom,
+    rgba(0, 0, 0, 0.16) 0px,
+    rgba(0, 0, 0, 0.16) 1px,
+    transparent 1px,
+    transparent 3px
+  );
+}
+@media (prefers-reduced-motion: reduce) {
+  .gem-shards > span {
+    animation-duration: 0.01s;
+  }
+  .plaque-in {
+    animation: none;
+  }
+}
