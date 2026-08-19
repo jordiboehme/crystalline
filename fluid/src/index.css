@@ -233,3 +233,59 @@
     opacity: 1;
   }
 }
+
+/*
+ * The crystallization front: the fallback sketches the incoming prose as
+ * lines of amorphous shade blocks, and a solid layer sweeps across each
+ * line, hardening it. Two identical monospace layers per line; the solid
+ * one is revealed by an animated clip. Motion off = the amorphous sketch.
+ */
+.crystal-line {
+  display: block;
+  position: relative;
+  overflow: hidden;
+  white-space: nowrap;
+  line-height: 1.6;
+}
+.crystal-line > .solid {
+  position: absolute;
+  inset: 0;
+  clip-path: inset(0 100% 0 0);
+  animation: crystal-front 2.1s ease-in-out infinite;
+}
+.crystal-line:nth-child(2) > .solid {
+  animation-delay: 0.35s;
+}
+.crystal-line:nth-child(3) > .solid {
+  animation-delay: 0.7s;
+}
+@keyframes crystal-front {
+  0% {
+    clip-path: inset(0 100% 0 0);
+  }
+  55%,
+  100% {
+    clip-path: inset(0 0 0 0);
+  }
+}
+@keyframes cursor-blink {
+  0%,
+  49% {
+    opacity: 1;
+  }
+  50%,
+  100% {
+    opacity: 0;
+  }
+}
+.crystal-cursor {
+  animation: cursor-blink 1s steps(1, end) infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .crystal-line > .solid {
+    animation: none;
+  }
+  .crystal-cursor {
+    animation: none;
+  }
+}
