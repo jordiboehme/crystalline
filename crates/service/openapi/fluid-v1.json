@@ -861,7 +861,7 @@
           "domains"
         ],
         "summary": "Download a whole domain as a zip.",
-        "description": "Admin only. Every file of the domain - MANIFEST included - as one zip, read from whichever source of truth the domain has: markdown on disk for a file domain, the database for a virtual one. A pure read, so it is served even on a read-only instance, which is exactly where an operator wants a backup to take.",
+        "description": "Admin only. Every file of the domain - MANIFEST and the `assets/` attachments included - as one zip, read from whichever source of truth the domain has: markdown on disk for a file domain, the database for a virtual one. A pure read, so it is served even on a read-only instance, which is exactly where an operator wants a backup to take.",
         "operationId": "download_domain_archive",
         "parameters": [
           {
@@ -924,7 +924,7 @@
           "domains"
         ],
         "summary": "Import an uploaded archive into a domain.",
-        "description": "Admin only. Runs the engine verb the preview dry-ran, so the outcome matches the report that was approved: entries land as `created` or `overwritten`, and `skipped`, `invalid` and `ignored` name everything that did not.\n\n`policy=skip` (the default) leaves an existing path alone; `policy=overwrite` replaces it. Overwrite is a same-path decision only - an entry whose permalink is held at another path is refused under either policy, since writing it would leave two files claiming one permalink.\n\nThe same hygiene the preview enforces applies here: a hostile archive is refused whole rather than partially imported.",
+        "description": "Admin only. Runs the engine verb the preview dry-ran, so the outcome matches the report that was approved: entries land as `created` or `overwritten`, and `skipped`, `invalid` and `ignored` name everything that did not.\n\n`policy=skip` (the default) leaves an existing path alone; `policy=overwrite` replaces it. Overwrite is a same-path decision only - an entry whose permalink is held at another path is refused under either policy, since writing it would leave two files claiming one permalink.\n\nEntries under `assets/` are stored as attachments, through the same gates an upload to the file route passes, and follow the same same-path policy; a restored attachment marks the domain as owing a consolidation sweep, since it is a file the agent has not read yet.\n\nThe same hygiene the preview enforces applies here: a hostile archive is refused whole rather than partially imported.",
         "operationId": "import_domain_archive",
         "parameters": [
           {
@@ -1028,7 +1028,7 @@
           "domains"
         ],
         "summary": "Dry-run an archive upload: what each entry would become.",
-        "description": "Admin only. Takes the raw bytes of a zip and reports, per entry, what an import would do with it - `new`, `collides`, `invalid` or `ignored` - with the verify findings `POST /validate` would raise over that entry's markdown.\n\nNothing is written. A hostile archive is refused whole with 422 rather than partially imported: more than 1000 entries, an entry over 1 MiB or a whole archive over 32 MiB once decompressed, an entry name that is not UTF-8, or any path that could escape the domain root.",
+        "description": "Admin only. Takes the raw bytes of a zip and reports, per entry, what an import would do with it - `new`, `collides`, `invalid` or `ignored` - with the verify findings `POST /validate` would raise over that entry's markdown.\n\nEntries under `assets/` are attachments rather than engrams: they are reported with their byte count and screened by the attachment path rules, the extension allowlist and the size ceiling, each refusal naming which of the three answered.\n\nNothing is written. A hostile archive is refused whole with 422 rather than partially imported: more than 1000 entries, an entry over 1 MiB or a whole archive over 32 MiB once decompressed, an entry name that is not UTF-8, or any path that could escape the domain root.",
         "operationId": "preview_domain_archive_import",
         "parameters": [
           {
@@ -4415,6 +4415,16 @@
           "findings"
         ],
         "properties": {
+          "bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "How many bytes the entry holds, for an attachment. `null` for a\nmarkdown entry, whose size a preview has no use for, and for an entry\nthat was refused before it was ever decompressed.",
+            "example": 20480,
+            "minimum": 0
+          },
           "findings": {
             "type": "array",
             "items": {
@@ -4487,12 +4497,12 @@
           },
           "ignored": {
             "type": "integer",
-            "description": "Entries an archive may carry but a domain never imports: a MANIFEST, a\ngenerated OKF index or log, anything that is not markdown.",
+            "description": "Entries an archive may carry but a domain never imports: a MANIFEST, a\ngenerated OKF index or log, anything that is neither markdown nor an\nattachment of an allowed type.",
             "minimum": 0
           },
           "invalid": {
             "type": "integer",
-            "description": "Entries refused as not importable: unparseable, not UTF-8 text, or\ncarrying a hard verify error. Never written under either policy.",
+            "description": "Entries refused as not importable: unparseable, not UTF-8 text,\ncarrying a hard verify error, or an attachment whose path or size the\nrules refuse. Never written under either policy.",
             "minimum": 0
           },
           "new": {

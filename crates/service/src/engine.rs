@@ -5658,9 +5658,15 @@ impl Engine {
         }))
     }
 
-    /// Every file of a domain as `(domain-relative path, content)`, MANIFEST
-    /// included: the portable view an archive download is built from, byte for
-    /// byte as the domain holds it.
+    /// Every file of a domain as `(domain-relative path, bytes)`, MANIFEST and
+    /// attachments included: the portable view an archive download is built
+    /// from, byte for byte as the domain holds it.
+    ///
+    /// Bytes rather than text, and that is the whole reason for the type: an
+    /// attachment is a PNG or a slide deck, and a collection of `String` could
+    /// only carry a domain's markdown. Markdown entries are the same bytes they
+    /// always were - UTF-8 is validated where a body is parsed, not here, since
+    /// nothing on this path parses anything.
     ///
     /// Each storage kind is read from its own source of truth, which is why
     /// this is not simply `export_domain`'s read half. A file domain's truth is
@@ -5669,9 +5675,18 @@ impl Engine {
     /// so reading the store would hand back headerless engrams and a MANIFEST
     /// that never indexed would go missing entirely. A virtual domain has no
     /// disk at all - the row IS the file, and it carries the full text.
-    pub async fn domain_files(&self, domain: &str) -> Result<Vec<(String, String)>> {
+    ///
+    /// Attachments come last, and through the seam rather than off either
+    /// source directly ([`Engine::attachment_list`] then
+    /// [`Engine::attachment_read`]), so both kinds hand over the same bytes
+    /// under the same `assets/` paths - which is what lets an export of one
+    /// kind be imported as the other. An attachment whose row stands but whose
+    /// bytes cannot be read (a file deleted behind the index) is logged and
+    /// skipped, like an unreadable markdown file: a backup missing one file
+    /// beats no backup.
+    pub async fn domain_files(&self, domain: &str) -> Result<Vec<(String, Vec<u8>)>> {
         let entry = self.domain_entry(domain)?;
-        match self.source_of(&entry) {
+        let mut files = match self.source_of(&entry) {
             ContentSource::File { root } => {
                 let mut files = Vec::new();
                 for (rel, abs) in walk_markdown(&root) {
@@ -5682,17 +5697,17 @@ impl Engine {
                     if crystalline_core::is_reserved_path(&rel) {
                         continue;
                     }
-                    match std::fs::read_to_string(&abs) {
-                        Ok(text) => files.push((rel, text)),
-                        // One unreadable or non-UTF-8 file must not deny the
-                        // operator the rest of the backup: it is skipped and
-                        // logged rather than failing the whole archive.
+                    match std::fs::read(&abs) {
+                        Ok(bytes) => files.push((rel, bytes)),
+                        // One unreadable file must not deny the operator the
+                        // rest of the backup: it is skipped and logged rather
+                        // than failing the whole archive.
                         Err(e) => {
                             tracing::warn!("archive of '{domain}' skipped '{rel}': {e}");
                         }
                     }
                 }
-                Ok(files)
+                files
             }
             ContentSource::Virtual => {
                 let store = self.store.lock().await;
@@ -5701,9 +5716,20 @@ impl Engine {
                     .await?;
                 let all = store.all_engram_contents(domain_id).await?;
                 drop(store);
-                Ok(all.into_iter().map(|e| (e.path, e.content)).collect())
+                all.into_iter()
+                    .map(|e| (e.path, e.content.into_bytes()))
+                    .collect()
+            }
+        };
+        for row in self.attachment_list(domain).await? {
+            match self.attachment_read(domain, &row.path).await {
+                Ok((bytes, _)) => files.push((row.path, bytes)),
+                Err(e) => {
+                    tracing::warn!("archive of '{domain}' skipped '{}': {e}", row.path);
+                }
             }
         }
+        Ok(files)
     }
 
     /// Export every file of a domain (file or virtual) to `dest` as a normal
@@ -5714,13 +5740,14 @@ impl Engine {
     /// download uses, so an export is a copy of the domain rather than a
     /// re-serialization of the index: a file domain hands over its exact disk
     /// bytes (frontmatter included, MANIFEST included), a virtual domain the
-    /// full text of every row, and the OKF reserved names are excluded from
-    /// both. Reading the store directly instead - the shape this verb had -
-    /// wrote frontmatter-less markdown for file domains, since their index
-    /// rows keep only the body, and silently dropped MANIFEST.md.
+    /// full text of every row, both hand over their attachments under
+    /// `assets/`, and the OKF reserved names are excluded from both. Reading
+    /// the store directly instead - the shape this verb had - wrote
+    /// frontmatter-less markdown for file domains, since their index rows keep
+    /// only the body, and silently dropped MANIFEST.md.
     ///
     /// Report shape follows from that source: `domain_files` carries
-    /// `(path, content)` and no permalink column, so each row reports its
+    /// `(path, bytes)` and no permalink column, so each row reports its
     /// path and byte count instead of the former path/permalink pair. Parsing
     /// every body back just to re-derive a permalink would re-introduce the
     /// re-serialization this verb exists to avoid, and no caller reads the
@@ -5750,7 +5777,7 @@ impl Engine {
                 continue;
             }
             let abs = join_rel(dest, path);
-            write_file(&abs, content)?;
+            write_bytes(&abs, content)?;
             written += 1;
         }
 

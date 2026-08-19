@@ -24,10 +24,34 @@
 //!   name, bytes that are not UTF-8 text, a hard verify error - stays in the
 //!   report as that entry's status and never reaches the engine.
 //!
+//! Attachments travel in both directions. The download carries every
+//! attachment the domain holds under its `assets/` path, whichever storage
+//! kind the domain has, so an export of a file domain restores into a virtual
+//! one and back. The upload takes an `assets/` entry when it passes the same
+//! gates an upload through the file route passes - the path rules, the
+//! extension allowlist and the size ceiling - and stores it through the
+//! engine's attachment seam rather than through the engram import verb, which
+//! is about permalinks and parses a PNG does not have. Each of those gates
+//! answers per entry, with its own reason, and each is the reserved folder's
+//! rule rather than markdown's: an entry under `assets/` is never judged by
+//! the "only .md entries are imported" rule, and an `assets/x.md` is refused
+//! outright instead of landing as an engram inside the reserved folder where
+//! no walk would find it again.
+//!
+//! One consequence worth naming rather than discovering: the seam marks the
+//! domain as owing a consolidation sweep, so an import that carries
+//! attachments does mark it pending where an engram-only restore does not.
+//! That is the right way round - the markdown of a restore is knowledge the
+//! agent already had, while a restored screenshot is a file nobody has read
+//! yet - and it comes from calling the seam rather than from a rule this
+//! layer keeps of its own.
+//!
 //! What this layer screens, and what it leaves to the engine: the screen here
-//! covers zip-slip, the size and count caps, non-`.md` entries, MANIFEST at
-//! any depth and the OKF reserved names (`index.md`, `log.md`). The engine's
-//! `import_domain_files` screens the same MANIFEST, non-markdown and reserved
+//! covers zip-slip, the size and count caps, `assets/` entries, non-`.md`
+//! entries, MANIFEST at any depth and the OKF reserved names (`index.md`,
+//! `log.md`). The engine's `import_domain_files` sees markdown only - the
+//! attachments are settled here, against the seam - and it screens the same
+//! MANIFEST, non-markdown and reserved
 //! names again, plus its own containment check - that duplication is
 //! deliberate defense in depth, and this module does not silently rely on it:
 //! the outer screen exists so a preview's precedence (`ignored` before
@@ -76,8 +100,23 @@ use super::{ApiError, ApiPath, ApiQuery, ProblemDetail, RestState, refuse_read_o
 /// How many entries an uploaded archive may hold.
 const MAX_ARCHIVE_ENTRIES: usize = 1000;
 
-/// The largest a single entry may be once decompressed, in bytes.
+/// The largest a single markdown entry may be once decompressed, in bytes.
 const MAX_ENTRY_BYTES: u64 = 1024 * 1024;
+
+/// The largest an `assets/` entry may be once decompressed: the attachment
+/// ceiling itself, since what this endpoint would do with such an entry is
+/// store it through the attachment seam, which enforces exactly this bound.
+/// Markdown keeps the tighter cap above - an engram that size is a mistake,
+/// a 4 MiB screenshot is not.
+const MAX_ASSET_ENTRY_BYTES: u64 = crystalline_core::MAX_ATTACHMENT_BYTES;
+
+/// Why an `assets/` entry was refused, in the words this surface reports.
+/// Named constants because the same strings are asserted by the tests and read
+/// by a user in the preview dialog.
+const ASSET_PATH_REASON: &str = "path is not a valid assets path";
+const ASSET_EXTENSION_REASON: &str = "extension is not an allowed attachment type";
+const ASSET_SIZE_REASON: &str = "attachment exceeds the size limit";
+const ASSET_MARKDOWN_REASON: &str = "assets entries must be attachments, not markdown";
 
 /// The largest a whole archive may be once decompressed, in bytes.
 const MAX_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
@@ -97,12 +136,12 @@ const MAX_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
     tag = "domains",
     operation_id = "download_domain_archive",
     summary = "Download a whole domain as a zip.",
-    description = "Admin only. Every file of the domain - MANIFEST included - \
-                   as one zip, read from whichever source of truth the domain \
-                   has: markdown on disk for a file domain, the database for \
-                   a virtual one. A pure read, so it is served even on a \
-                   read-only instance, which is exactly where an operator \
-                   wants a backup to take.",
+    description = "Admin only. Every file of the domain - MANIFEST and the \
+                   `assets/` attachments included - as one zip, read from \
+                   whichever source of truth the domain has: markdown on disk \
+                   for a file domain, the database for a virtual one. A pure \
+                   read, so it is served even on a read-only instance, which \
+                   is exactly where an operator wants a backup to take.",
     params(("domain" = String, Path, description = "The registered domain to archive.")),
     responses(
         (
@@ -187,7 +226,7 @@ fn archive_filename(domain: &str) -> String {
 /// which is fine at the sizes a domain reaches here but would balloon the
 /// daemon on a pathological multi-hundred-MiB domain. If one ever appears,
 /// the shape to switch to is a temp file plus a `ReaderStream` body.
-fn build_zip(files: &[(String, String)]) -> Result<Vec<u8>, zip::result::ZipError> {
+fn build_zip(files: &[(String, Vec<u8>)]) -> Result<Vec<u8>, zip::result::ZipError> {
     use std::io::Write;
     let mut cursor = std::io::Cursor::new(Vec::new());
     {
@@ -195,7 +234,7 @@ fn build_zip(files: &[(String, String)]) -> Result<Vec<u8>, zip::result::ZipErro
         let options = zip::write::SimpleFileOptions::default();
         for (path, content) in files {
             writer.start_file(path.as_str(), options)?;
-            writer.write_all(content.as_bytes())?;
+            writer.write_all(content)?;
         }
         writer.finish()?;
     }
@@ -225,6 +264,11 @@ pub struct ArchiveEntryReport {
     pub permalink: Option<String>,
     /// Why the entry was not written, in the words of whatever refused it.
     pub reason: Option<String>,
+    /// How many bytes the entry holds, for an attachment. `null` for a
+    /// markdown entry, whose size a preview has no use for, and for an entry
+    /// that was refused before it was ever decompressed.
+    #[schema(example = 20480)]
+    pub bytes: Option<u64>,
     /// The verify findings over this entry's markdown, the same families
     /// `POST /validate` runs. Empty for an entry that was never read.
     pub findings: Vec<ValidateFinding>,
@@ -253,11 +297,13 @@ pub struct ArchiveReport {
     pub written: usize,
     /// Import only: entries an existing path or permalink held back.
     pub skipped: usize,
-    /// Entries refused as not importable: unparseable, not UTF-8 text, or
-    /// carrying a hard verify error. Never written under either policy.
+    /// Entries refused as not importable: unparseable, not UTF-8 text,
+    /// carrying a hard verify error, or an attachment whose path or size the
+    /// rules refuse. Never written under either policy.
     pub invalid: usize,
     /// Entries an archive may carry but a domain never imports: a MANIFEST, a
-    /// generated OKF index or log, anything that is not markdown.
+    /// generated OKF index or log, anything that is neither markdown nor an
+    /// attachment of an allowed type.
     pub ignored: usize,
 }
 
@@ -290,10 +336,52 @@ fn is_reserved_upload(path: &str) -> bool {
 enum Screened {
     /// Markdown this endpoint will hand to the engine.
     Entry { path: String, content: String },
+    /// An attachment this endpoint will hand to the attachment seam.
+    Asset { path: String, bytes: Vec<u8> },
     /// An entry a domain never imports, whatever it holds.
     Ignored { path: String, reason: String },
     /// An entry that cannot be imported as it stands.
     Invalid { path: String, reason: String },
+}
+
+/// What an `assets/` entry's NAME alone decides, before a byte is read.
+///
+/// `None` means the name passes every upload gate and the bytes are worth
+/// decompressing. The two demotion classes are deliberately different: an
+/// extension that is not on the allowlist (`.exe`, and `.md`, which is an
+/// Engram rather than an attachment) is a KIND of file a domain never imports,
+/// which is what `ignored` means here and is the same verdict a `.txt` at the
+/// root gets; a name that breaks a path rule is this one entry failing, which
+/// is `invalid`.
+///
+/// The markdown case is called out separately because it is the confusing one:
+/// `assets/notes.md` ends in `.md`, so the markdown rule below would have
+/// imported it as an engram whose path lives inside the reserved folder - an
+/// engram no walk would ever find again.
+fn asset_name_verdict(path: &str) -> Option<Screened> {
+    let reason = match crystalline_core::validate_asset_path(path) {
+        Ok(()) => return None,
+        Err(crystalline_core::AssetPathError::DisallowedExtension) => {
+            if path.to_lowercase().ends_with(".md") {
+                ASSET_MARKDOWN_REASON
+            } else {
+                ASSET_EXTENSION_REASON
+            }
+        }
+        Err(_) => ASSET_PATH_REASON,
+    };
+    let path = path.to_string();
+    Some(if reason == ASSET_PATH_REASON {
+        Screened::Invalid {
+            path,
+            reason: reason.to_string(),
+        }
+    } else {
+        Screened::Ignored {
+            path,
+            reason: reason.to_string(),
+        }
+    })
 }
 
 /// Open and screen an uploaded archive.
@@ -346,6 +434,60 @@ fn read_archive(bytes: &[u8]) -> Result<Vec<Screened>, ApiError> {
             return Err(ApiError::unprocessable(format!(
                 "archive entry '{raw}' escapes the extraction root; refusing the archive"
             )));
+        }
+        // The reserved folder is answered first, and before the markdown rule
+        // below, because both directions of that order would be wrong: an
+        // `assets/` entry that is not markdown must not be dismissed as "only
+        // .md entries are imported", and an `assets/x.md` must not be taken
+        // for an engram. The folder is matched case-insensitively, the way the
+        // reservation itself is, so `Assets/x.png` lands here and is then
+        // refused by the path rules rather than imported as knowledge.
+        if crystalline_core::is_under_assets(&raw) {
+            if let Some(decided) = asset_name_verdict(&raw) {
+                out.push(decided);
+                continue;
+            }
+            // Same two-step as the markdown arm below - the declared size is a
+            // claim, the metered bytes are the truth - against the attachment
+            // ceiling rather than the markdown one. Both answers are per-entry:
+            // an attachment somebody exported at 12 MiB is a file this domain
+            // will not take, not an archive worth refusing whole.
+            if entry.size() > MAX_ASSET_ENTRY_BYTES {
+                out.push(Screened::Invalid {
+                    path: raw,
+                    reason: ASSET_SIZE_REASON.to_string(),
+                });
+                continue;
+            }
+            let mut buf = Vec::new();
+            {
+                use std::io::Read;
+                let mut limited = (&mut entry).take(MAX_ASSET_ENTRY_BYTES + 1);
+                limited.read_to_end(&mut buf).map_err(|e| {
+                    ApiError::unprocessable(format!("unreadable archive entry '{raw}': {e}"))
+                })?;
+            }
+            // Metered bytes count toward the archive total whatever becomes of
+            // the entry, so a pile of oversized attachments is still bounded
+            // work rather than an unbounded one.
+            total += buf.len() as u64;
+            if total > MAX_TOTAL_BYTES {
+                return Err(ApiError::unprocessable(format!(
+                    "the archive unpacks past the {MAX_TOTAL_BYTES}-byte total limit"
+                )));
+            }
+            if buf.len() as u64 > MAX_ASSET_ENTRY_BYTES {
+                out.push(Screened::Invalid {
+                    path: raw,
+                    reason: ASSET_SIZE_REASON.to_string(),
+                });
+                continue;
+            }
+            out.push(Screened::Asset {
+                path: raw,
+                bytes: buf,
+            });
+            continue;
         }
         // Entries this endpoint will never decompress are classified before
         // any size handling: no read, no allocation.
@@ -499,6 +641,24 @@ async fn run_archive(
     // unauthorized caller learn which domains exist.
     state.engine.require_domain(domain)?;
     let screened = read_archive(bytes)?;
+    // What the domain already holds under `assets/`, so an attachment entry
+    // gets the same same-path treatment a markdown entry does: reported as a
+    // collision by a preview, left alone by a skip-policy import, replaced
+    // only under overwrite. Fetched once, and only when the archive actually
+    // carries an attachment.
+    let mut held: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if screened
+        .iter()
+        .any(|item| matches!(item, Screened::Asset { .. }))
+    {
+        held = state
+            .engine
+            .attachment_list(domain)
+            .await?
+            .into_iter()
+            .map(|row| row.path)
+            .collect();
+    }
     let mut slots: Vec<Slot> = Vec::new();
     let mut clean: Vec<(String, String)> = Vec::new();
     for item in screened {
@@ -508,6 +668,7 @@ async fn run_archive(
                 status: "ignored".to_string(),
                 permalink: None,
                 reason: Some(reason),
+                bytes: None,
                 findings: Vec::new(),
             })),
             Screened::Invalid { path, reason } => slots.push(Slot::Decided(ArchiveEntryReport {
@@ -515,8 +676,55 @@ async fn run_archive(
                 status: "invalid".to_string(),
                 permalink: None,
                 reason: Some(reason),
+                bytes: None,
                 findings: Vec::new(),
             })),
+            // Attachments go through the engine's own seam - the same one the
+            // upload route uses - so the path rules, the allowlist, the size
+            // ceiling and the metadata row are decided in exactly one place.
+            // They are written here rather than handed to the engine's import
+            // verb because that verb is about engrams: a permalink, a parse and
+            // a verify pass, none of which a PNG has.
+            Screened::Asset { path, bytes } => {
+                let size = bytes.len() as u64;
+                let taken = held.contains(&path);
+                let (status, reason) = if dry_run {
+                    held.insert(path.clone());
+                    (if taken { "collides" } else { "new" }.to_string(), None)
+                } else if taken && !overwrite {
+                    (
+                        "skipped".to_string(),
+                        Some(
+                            "the attachment is already there; import with policy=overwrite to \
+                             replace it"
+                                .to_string(),
+                        ),
+                    )
+                } else {
+                    match state.engine.attachment_write(domain, &path, bytes).await {
+                        Ok(_) => {
+                            held.insert(path.clone());
+                            (
+                                if taken { "overwritten" } else { "created" }.to_string(),
+                                None,
+                            )
+                        }
+                        // Whatever the seam refused it for, in its own words:
+                        // this layer screened the path, the extension and the
+                        // size already, so anything left is the storage
+                        // failing rather than the entry being wrong.
+                        Err(e) => ("invalid".to_string(), Some(e.to_string())),
+                    }
+                };
+                slots.push(Slot::Decided(ArchiveEntryReport {
+                    path,
+                    status,
+                    permalink: None,
+                    reason,
+                    bytes: Some(size),
+                    findings: Vec::new(),
+                }));
+            }
             Screened::Entry { path, content } => {
                 // The exact call `/validate` makes, on the path the entry
                 // would land at, so the findings an editor sees before a save
@@ -537,6 +745,7 @@ async fn run_archive(
                         status: "invalid".to_string(),
                         permalink: None,
                         reason: Some(reason),
+                        bytes: None,
                         findings,
                     }));
                 } else {
@@ -575,6 +784,7 @@ async fn run_archive(
                     status: status_of(row["action"].as_str().unwrap_or("invalid"), dry_run),
                     permalink: row["permalink"].as_str().map(str::to_string),
                     reason: row["reason"].as_str().map(str::to_string),
+                    bytes: None,
                     findings,
                 });
             }
@@ -617,7 +827,12 @@ async fn run_archive(
                    entry, what an import would do with it - `new`, \
                    `collides`, `invalid` or `ignored` - with the verify \
                    findings `POST /validate` would raise over that entry's \
-                   markdown.\n\nNothing is written. A hostile archive is \
+                   markdown.\n\nEntries under `assets/` are attachments rather \
+                   than engrams: they are reported with their byte count and \
+                   screened by the attachment path rules, the extension \
+                   allowlist and the size ceiling, each refusal naming which \
+                   of the three answered.\n\nNothing is written. A hostile \
+                   archive is \
                    refused whole with 422 rather than partially imported: \
                    more than 1000 entries, an entry over 1 MiB or a whole \
                    archive over 32 MiB once decompressed, an entry name that \
@@ -711,7 +926,12 @@ pub async fn preview(
                    same-path decision only - an entry whose permalink is held \
                    at another path is refused under either policy, since \
                    writing it would leave two files claiming one \
-                   permalink.\n\nThe same hygiene the preview enforces applies \
+                   permalink.\n\nEntries under `assets/` are stored as \
+                   attachments, through the same gates an upload to the file \
+                   route passes, and follow the same same-path policy; a \
+                   restored attachment marks the domain as owing a \
+                   consolidation sweep, since it is a file the agent has not \
+                   read yet.\n\nThe same hygiene the preview enforces applies \
                    here: a hostile archive is refused whole rather than \
                    partially imported.",
     params(
@@ -806,18 +1026,145 @@ mod tests {
         assert_eq!(archive_filename("wissen-über"), "wissen--ber-archive.zip");
     }
 
+    /// A PNG stand-in: it never has to decode, only to survive the zip
+    /// unchanged, so it is a short blob carrying the NUL a text-shaped path
+    /// would lose.
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\x00binary\x00bytes";
+
+    fn zip_of(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Write;
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut cursor);
+            for (name, content) in entries {
+                writer
+                    .start_file(*name, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                writer.write_all(content).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        cursor.into_inner()
+    }
+
+    /// The screened verdict for one entry, as `(status word, reason)`.
+    fn verdict(screened: &Screened) -> (&'static str, Option<&str>) {
+        match screened {
+            Screened::Entry { .. } => ("entry", None),
+            Screened::Asset { .. } => ("asset", None),
+            Screened::Ignored { reason, .. } => ("ignored", Some(reason.as_str())),
+            Screened::Invalid { reason, .. } => ("invalid", Some(reason.as_str())),
+        }
+    }
+
     #[test]
     fn the_zip_carries_every_file_verbatim() {
         let files = vec![
-            ("MANIFEST.md".to_string(), "# eng\n".to_string()),
-            ("sub/alpha.md".to_string(), "body\n".to_string()),
+            ("MANIFEST.md".to_string(), b"# eng\n".to_vec()),
+            ("sub/alpha.md".to_string(), b"body\n".to_vec()),
+            ("assets/shot.png".to_string(), PNG.to_vec()),
         ];
         let bytes = build_zip(&files).unwrap();
         let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
-        assert_eq!(archive.len(), 2);
+        assert_eq!(archive.len(), 3);
         let mut text = String::new();
         std::io::Read::read_to_string(&mut archive.by_name("sub/alpha.md").unwrap(), &mut text)
             .unwrap();
         assert_eq!(text, "body\n");
+        let mut png = Vec::new();
+        std::io::Read::read_to_end(&mut archive.by_name("assets/shot.png").unwrap(), &mut png)
+            .unwrap();
+        assert_eq!(png, PNG, "the binary survives the archive byte for byte");
+    }
+
+    /// An `assets/` entry is screened by the upload gates rather than by the
+    /// markdown rule: a good one is kept as an attachment, and every refusal
+    /// names which gate answered.
+    #[test]
+    fn asset_entries_are_screened_by_the_attachment_gates() {
+        let long = format!("assets/{}.png", "n".repeat(300));
+        let bytes = zip_of(&[
+            ("assets/shot.png", PNG),
+            ("assets/tool.exe", b"MZ"),
+            ("assets/notes.md", b"# not an attachment"),
+            ("assets/.hidden.png", PNG),
+            (long.as_str(), PNG),
+            ("readme.txt", b"not markdown"),
+        ]);
+        let screened = read_archive(&bytes).unwrap();
+        let by_path = |path: &str| -> (&'static str, Option<String>) {
+            let found = screened
+                .iter()
+                .find(|s| match s {
+                    Screened::Entry { path: p, .. }
+                    | Screened::Asset { path: p, .. }
+                    | Screened::Ignored { path: p, .. }
+                    | Screened::Invalid { path: p, .. } => p == path,
+                })
+                .unwrap_or_else(|| panic!("no verdict for {path}"));
+            let (status, reason) = verdict(found);
+            (status, reason.map(str::to_string))
+        };
+
+        assert_eq!(by_path("assets/shot.png"), ("asset", None));
+        assert_eq!(
+            by_path("assets/tool.exe"),
+            ("ignored", Some(ASSET_EXTENSION_REASON.to_string()))
+        );
+        assert_eq!(
+            by_path("assets/notes.md"),
+            ("ignored", Some(ASSET_MARKDOWN_REASON.to_string())),
+            "an assets/ markdown entry is neither an engram nor an attachment"
+        );
+        assert_eq!(
+            by_path("assets/.hidden.png"),
+            ("invalid", Some(ASSET_PATH_REASON.to_string()))
+        );
+        assert_eq!(
+            by_path(&long),
+            ("invalid", Some(ASSET_PATH_REASON.to_string()))
+        );
+        // The markdown rule is untouched for everything outside assets/.
+        assert_eq!(
+            by_path("readme.txt"),
+            ("ignored", Some("only .md entries are imported".to_string()))
+        );
+
+        // The bytes of the kept attachment are the bytes the archive held.
+        let kept = screened
+            .iter()
+            .find_map(|s| match s {
+                Screened::Asset { path, bytes } if path == "assets/shot.png" => Some(bytes),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(kept.as_slice(), PNG);
+    }
+
+    /// An attachment past the ceiling is one refused entry, not a refused
+    /// archive: the whole-archive hygiene rules stay for the shapes that are
+    /// hostile rather than merely too big.
+    #[test]
+    fn an_oversized_asset_entry_is_refused_on_its_own() {
+        let big = vec![b'a'; crystalline_core::MAX_ATTACHMENT_BYTES as usize + 1];
+        let bytes = zip_of(&[("assets/huge.png", big.as_slice())]);
+        let screened = read_archive(&bytes).unwrap();
+        assert_eq!(
+            verdict(&screened[0]),
+            ("invalid", Some(ASSET_SIZE_REASON)),
+            "the size gate answers per entry"
+        );
+    }
+
+    /// A markdown entry keeps the 1 MiB per-entry cap it always had: the wider
+    /// attachment ceiling belongs to `assets/` alone.
+    #[test]
+    fn a_markdown_entry_keeps_its_own_cap() {
+        let big = vec![b'a'; MAX_ENTRY_BYTES as usize + 1];
+        let bytes = zip_of(&[("big.md", big.as_slice())]);
+        let Err(refused) = read_archive(&bytes) else {
+            panic!("an oversized markdown entry refuses the archive");
+        };
+        assert_eq!(refused.status, StatusCode::UNPROCESSABLE_ENTITY);
     }
 }

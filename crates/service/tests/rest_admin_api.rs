@@ -56,10 +56,16 @@ struct Options {
 
 struct Fixture {
     addr: std::net::SocketAddr,
+    /// Held for the test's duration: an attachment write (an upload, or an
+    /// archive import carrying one) marks its domain pending in the
+    /// maintenance state file, and this redirects the state directory into a
+    /// scratch home so nothing here reaches the developer's own.
+    _state: support::ScratchStateDir,
     _tmp: tempfile::TempDir,
 }
 
 async fn serve(opts: Options) -> Fixture {
+    let state = support::ScratchStateDir::acquire();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
     let mut cfg = GlobalConfig {
@@ -178,7 +184,11 @@ async fn serve(opts: Options) -> Fixture {
         .await
         .unwrap();
     });
-    Fixture { addr, _tmp: tmp }
+    Fixture {
+        addr,
+        _state: state,
+        _tmp: tmp,
+    }
 }
 
 fn client() -> reqwest::Client {
@@ -1356,6 +1366,288 @@ async fn hostile_and_oversized_archives_are_refused() {
         .find(|e| e["path"] == "readme.txt")
         .unwrap();
     assert_eq!(txt["status"], "ignored");
+}
+
+/// A PNG stand-in: it never has to decode, only to survive the round trip, so
+/// it is a short blob carrying the NUL a text-shaped archive would lose.
+const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\x00binary\x00bytes";
+
+/// [`zip_of`] for entries whose content is bytes rather than text.
+fn zip_of_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    use std::io::Write;
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    {
+        let mut writer = zip::ZipWriter::new(&mut cursor);
+        for (name, content) in entries {
+            writer
+                .start_file(*name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(content).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+    cursor.into_inner()
+}
+
+/// Upload one attachment through the file route, the way Fluid does.
+async fn put_attachment(
+    addr: std::net::SocketAddr,
+    domain: &str,
+    path: &str,
+    session: &(String, String),
+    bytes: &[u8],
+) {
+    let resp = client()
+        .put(format!(
+            "http://{addr}/api/v1/domains/{domain}/files/{path}"
+        ))
+        .header("cookie", format!("fluid_session={}", session.0))
+        .header("x-csrf-token", &session.1)
+        .body(bytes.to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "uploading {path}");
+}
+
+/// Read one attachment back through the file route.
+async fn get_attachment(
+    addr: std::net::SocketAddr,
+    domain: &str,
+    path: &str,
+    session: &(String, String),
+) -> Vec<u8> {
+    let resp = as_session(
+        addr,
+        reqwest::Method::GET,
+        &format!("/api/v1/domains/{domain}/files/{path}"),
+        session,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 200, "reading {domain}/{path}");
+    resp.bytes().await.unwrap().to_vec()
+}
+
+/// Spec section 5's consequence: export then import migrates attachments
+/// between the storage kinds in BOTH directions, byte for byte. The file
+/// domain's `assets/` folder travels into a virtual domain's blob table and
+/// back out onto another domain's disk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_archive_carries_attachments_between_domain_kinds() {
+    let fx = serve(Options::default()).await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    put_attachment(fx.addr, "eng", "assets/shot.png", &admin, PNG).await;
+
+    // Downwards: the export of the file domain carries the bytes.
+    let exported = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/domains/eng/archive",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap()
+    .bytes()
+    .await
+    .unwrap()
+    .to_vec();
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(exported.clone())).unwrap();
+    let mut png = Vec::new();
+    std::io::Read::read_to_end(&mut archive.by_name("assets/shot.png").unwrap(), &mut png).unwrap();
+    assert_eq!(png, PNG, "the attachment is in the zip byte for byte");
+
+    // A virtual domain, which has no folder at all, takes the import.
+    let created = as_session(fx.addr, reqwest::Method::POST, "/api/v1/domains", &admin)
+        .json(&serde_json::json!({"mode": "virtual", "name": "vault"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201, "{:?}", created.text().await);
+
+    // The preview names the attachment and its size before anything is written.
+    let preview = post_zip(
+        fx.addr,
+        "/api/v1/domains/vault/archive/preview",
+        &admin,
+        exported.clone(),
+    )
+    .await;
+    assert_eq!(preview.status(), 200);
+    let preview: serde_json::Value = preview.json().await.unwrap();
+    let shot = preview["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["path"] == "assets/shot.png")
+        .unwrap_or_else(|| panic!("the preview lists the attachment: {preview}"));
+    assert_eq!(shot["status"], "new");
+    assert_eq!(shot["bytes"], PNG.len(), "with its size: {shot}");
+
+    let done = post_zip(
+        fx.addr,
+        "/api/v1/domains/vault/archive/import",
+        &admin,
+        exported,
+    )
+    .await;
+    assert_eq!(done.status(), 200);
+    let done: serde_json::Value = done.json().await.unwrap();
+    let shot = done["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["path"] == "assets/shot.png")
+        .unwrap();
+    assert_eq!(shot["status"], "created", "{done}");
+    assert_eq!(
+        get_attachment(fx.addr, "vault", "assets/shot.png", &admin).await,
+        PNG,
+        "the blob-backed kind serves the same bytes"
+    );
+
+    // Upwards: the virtual domain's own export lands the file on a real disk.
+    let from_vault = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/domains/vault/archive",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap()
+    .bytes()
+    .await
+    .unwrap()
+    .to_vec();
+    let created = as_session(fx.addr, reqwest::Method::POST, "/api/v1/domains", &admin)
+        .json(&serde_json::json!({"mode": "local", "name": "restored"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201);
+    let created: serde_json::Value = created.json().await.unwrap();
+    let restored_root = std::path::PathBuf::from(created["root"].as_str().unwrap());
+    let done = post_zip(
+        fx.addr,
+        "/api/v1/domains/restored/archive/import",
+        &admin,
+        from_vault,
+    )
+    .await;
+    assert_eq!(done.status(), 200);
+    assert_eq!(
+        std::fs::read(restored_root.join("assets/shot.png")).unwrap(),
+        PNG,
+        "a file domain gets a real file back"
+    );
+
+    // A second import of the same archive leaves it alone under the default
+    // policy and replaces it under overwrite - the same same-path rule
+    // markdown entries follow.
+    let again = post_zip(
+        fx.addr,
+        "/api/v1/domains/restored/archive/import",
+        &admin,
+        zip_of_bytes(&[("assets/shot.png", b"other bytes entirely")]),
+    )
+    .await;
+    let again: serde_json::Value = again.json().await.unwrap();
+    assert_eq!(again["entries"][0]["status"], "skipped", "{again}");
+    assert_eq!(
+        std::fs::read(restored_root.join("assets/shot.png")).unwrap(),
+        PNG
+    );
+    let over = post_zip(
+        fx.addr,
+        "/api/v1/domains/restored/archive/import?policy=overwrite",
+        &admin,
+        zip_of_bytes(&[("assets/shot.png", b"other bytes entirely")]),
+    )
+    .await;
+    let over: serde_json::Value = over.json().await.unwrap();
+    assert_eq!(over["entries"][0]["status"], "overwritten", "{over}");
+    assert_eq!(
+        std::fs::read(restored_root.join("assets/shot.png")).unwrap(),
+        b"other bytes entirely"
+    );
+}
+
+/// The upload gates decide an `assets/` entry, one reason per entry, and the
+/// markdown rule is untouched for everything outside the folder.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn asset_entries_are_screened_entry_by_entry() {
+    let fx = serve(Options::default()).await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    let big = vec![b'a'; 10 * 1024 * 1024 + 1];
+    let bytes = zip_of_bytes(&[
+        ("assets/ok.png", PNG),
+        ("assets/tool.exe", b"MZ"),
+        ("assets/notes.md", b"# not an attachment"),
+        ("assets/.hidden.png", PNG),
+        ("assets/huge.png", big.as_slice()),
+        ("random.bin", b"not markdown"),
+    ]);
+    let resp = post_zip(
+        fx.addr,
+        "/api/v1/domains/eng/archive/preview",
+        &admin,
+        bytes,
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    let report: serde_json::Value = resp.json().await.unwrap();
+    let line = |path: &str| -> serde_json::Value {
+        report["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["path"] == path)
+            .unwrap_or_else(|| panic!("no line for {path}: {report}"))
+            .clone()
+    };
+    assert_eq!(line("assets/ok.png")["status"], "new");
+    assert_eq!(line("assets/ok.png")["bytes"], PNG.len());
+    assert_eq!(
+        line("assets/tool.exe")["reason"],
+        "extension is not an allowed attachment type"
+    );
+    assert_eq!(
+        line("assets/notes.md")["reason"],
+        "assets entries must be attachments, not markdown"
+    );
+    assert_eq!(
+        line("assets/.hidden.png")["reason"],
+        "path is not a valid assets path"
+    );
+    assert_eq!(
+        line("assets/huge.png")["reason"],
+        "attachment exceeds the size limit"
+    );
+    assert_eq!(
+        line("random.bin")["reason"],
+        "only .md entries are imported",
+        "the markdown rule is unchanged outside assets/"
+    );
+
+    // A preview writes nothing, attachments included.
+    let listed = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/domains/eng/attachments",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+    let listed: serde_json::Value = listed.json().await.unwrap();
+    assert_eq!(
+        listed["attachments"].as_array().map(Vec::len).unwrap_or(0),
+        0,
+        "the preview stored nothing: {listed}"
+    );
 }
 
 /// The collision policies: a second import skips everything, overwrite

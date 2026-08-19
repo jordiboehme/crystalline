@@ -215,7 +215,7 @@ export interface paths {
         };
         /**
          * Download a whole domain as a zip.
-         * @description Admin only. Every file of the domain - MANIFEST included - as one zip, read from whichever source of truth the domain has: markdown on disk for a file domain, the database for a virtual one. A pure read, so it is served even on a read-only instance, which is exactly where an operator wants a backup to take.
+         * @description Admin only. Every file of the domain - MANIFEST and the `assets/` attachments included - as one zip, read from whichever source of truth the domain has: markdown on disk for a file domain, the database for a virtual one. A pure read, so it is served even on a read-only instance, which is exactly where an operator wants a backup to take.
          */
         get: operations["download_domain_archive"];
         put?: never;
@@ -241,6 +241,8 @@ export interface paths {
          *
          *     `policy=skip` (the default) leaves an existing path alone; `policy=overwrite` replaces it. Overwrite is a same-path decision only - an entry whose permalink is held at another path is refused under either policy, since writing it would leave two files claiming one permalink.
          *
+         *     Entries under `assets/` are stored as attachments, through the same gates an upload to the file route passes, and follow the same same-path policy; a restored attachment marks the domain as owing a consolidation sweep, since it is a file the agent has not read yet.
+         *
          *     The same hygiene the preview enforces applies here: a hostile archive is refused whole rather than partially imported.
          */
         post: operations["import_domain_archive"];
@@ -262,6 +264,8 @@ export interface paths {
         /**
          * Dry-run an archive upload: what each entry would become.
          * @description Admin only. Takes the raw bytes of a zip and reports, per entry, what an import would do with it - `new`, `collides`, `invalid` or `ignored` - with the verify findings `POST /validate` would raise over that entry's markdown.
+         *
+         *     Entries under `assets/` are attachments rather than engrams: they are reported with their byte count and screened by the attachment path rules, the extension allowlist and the size ceiling, each refusal naming which of the three answered.
          *
          *     Nothing is written. A hostile archive is refused whole with 422 rather than partially imported: more than 1000 entries, an entry over 1 MiB or a whole archive over 32 MiB once decompressed, an entry name that is not UTF-8, or any path that could escape the domain root.
          */
@@ -871,6 +875,14 @@ export interface components {
         /** @description One entry of an uploaded archive and what became of it. A preview reports `new`, `collides`, `invalid` or `ignored`; an import reports `created`, `overwritten`, `skipped`, `invalid` or `ignored`. */
         ArchiveEntryReport: {
             /**
+             * Format: int64
+             * @description How many bytes the entry holds, for an attachment. `null` for a
+             *     markdown entry, whose size a preview has no use for, and for an entry
+             *     that was refused before it was ever decompressed.
+             * @example 20480
+             */
+            bytes?: number | null;
+            /**
              * @description The verify findings over this entry's markdown, the same families
              *     `POST /validate` runs. Empty for an entry that was never read.
              */
@@ -909,12 +921,14 @@ export interface components {
             entries: components["schemas"]["ArchiveEntryReport"][];
             /**
              * @description Entries an archive may carry but a domain never imports: a MANIFEST, a
-             *     generated OKF index or log, anything that is not markdown.
+             *     generated OKF index or log, anything that is neither markdown nor an
+             *     attachment of an allowed type.
              */
             ignored: number;
             /**
-             * @description Entries refused as not importable: unparseable, not UTF-8 text, or
-             *     carrying a hard verify error. Never written under either policy.
+             * @description Entries refused as not importable: unparseable, not UTF-8 text,
+             *     carrying a hard verify error, or an attachment whose path or size the
+             *     rules refuse. Never written under either policy.
              */
             invalid: number;
             /** @description Preview only: entries that would be created. */
