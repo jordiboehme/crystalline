@@ -283,6 +283,12 @@ async fn an_upload_round_trips_with_the_security_headers() {
         "default-src 'none'; sandbox"
     );
     assert_eq!(header(&resp, "content-disposition"), "inline");
+    assert_eq!(
+        header(&resp, "cache-control"),
+        "no-cache",
+        "the ETag is this response's whole freshness story, so a cache has to \
+         come back and ask rather than guess a lifetime for it"
+    );
     assert_eq!(resp.bytes().await.unwrap().as_ref(), PNG);
 }
 
@@ -306,6 +312,12 @@ async fn a_matching_if_none_match_is_answered_304_with_no_body() {
     .unwrap();
     assert_eq!(resp.status(), 304);
     assert_eq!(header(&resp, "etag"), etag, "a 304 still names the version");
+    assert_eq!(
+        header(&resp, "cache-control"),
+        "no-cache",
+        "and it repeats the directive, so the stored response keeps having to \
+         revalidate rather than becoming heuristically fresh on this answer"
+    );
     assert!(
         resp.bytes().await.unwrap().is_empty(),
         "a 304 carries no body"
@@ -563,6 +575,38 @@ async fn the_listing_is_complete_and_ordered() {
     // miss.
     let empty = attachments(fx.addr, &editor, "scratch").await;
     assert!(empty.as_array().unwrap().is_empty(), "{empty}");
+}
+
+/// An empty listing and an absent domain are two different answers: a
+/// registered domain holding nothing is `200` with no rows (asserted above),
+/// and a domain nobody registered is a miss.
+///
+/// Asserted on the listing route in its own right rather than inferred from the
+/// bytes route's unknown-domain case: the two reach `domain_source` through
+/// different engine verbs, and a client that branched on the difference would
+/// have nothing pinning it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn listing_an_unregistered_domain_is_a_404() {
+    let fx = serve(Options::default()).await;
+    let editor = login(fx.addr, "eddy", "eddypw").await;
+
+    let resp = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/domains/nosuch/attachments",
+        &editor,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 404);
+    assert_eq!(resp.headers()["content-type"], "application/problem+json");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["status"], 404);
+    assert!(
+        body["detail"].as_str().unwrap().contains("nosuch"),
+        "the refusal names the domain that is not there: {body}"
+    );
 }
 
 /// The listing of one domain, asserting the 200 on the way through.

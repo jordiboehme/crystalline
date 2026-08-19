@@ -369,7 +369,7 @@ export interface paths {
          * One attachment's bytes.
          * @description Serves the stored bytes under the mime the extension allowlist assigns - never one guessed from the content and never one the uploader claimed. Every answer carries `X-Content-Type-Options: nosniff` and a `default-src 'none'; sandbox` content security policy, so an attachment can never script against the instance serving it. Images, PDFs and text are dispositioned `inline`; the office formats arrive as a download.
          *
-         *     The `ETag` is the strong quoted SHA-256 of the bytes, so `If-None-Match` answers 304 without a body. A malformed path is 400 with the rule that refused it; a well-formed path holding nothing is 404.
+         *     The `ETag` is the strong quoted SHA-256 of the bytes, so `If-None-Match` answers 304 without a body, and `Cache-Control: no-cache` keeps a stored copy revalidating instead of going heuristically fresh, so a file replaced at the same path is picked up on its next use. A malformed path is 400 with the rule that refused it; a well-formed path holding nothing is 404.
          */
         get: operations["read_attachment"];
         /**
@@ -2986,6 +2986,8 @@ export interface operations {
             /** @description The bytes, under the mime the allowlist assigns. */
             200: {
                 headers: {
+                    /** @description Always `no-cache`: store it, but revalidate before every use. */
+                    "cache-control"?: string;
                     /** @description `inline` for images, PDFs and text; `attachment; filename="..."` otherwise. */
                     "content-disposition"?: string;
                     /** @description Always `default-src 'none'; sandbox`. */
@@ -3000,7 +3002,7 @@ export interface operations {
                     "application/octet-stream": string;
                 };
             };
-            /** @description The `If-None-Match` token matches the stored bytes; no body is sent. */
+            /** @description The `If-None-Match` token matches the stored bytes; no body is sent. Carries the `ETag` it matched and the same `Cache-Control`, so the stored response it refreshes keeps having to revalidate. */
             304: {
                 headers: {
                     [name: string]: unknown;

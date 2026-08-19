@@ -45,6 +45,22 @@ use crate::engine::EngineError;
 /// from.
 const ATTACHMENT_CSP: &str = "default-src 'none'; sandbox";
 
+/// The `Cache-Control` every attachment read carries: store it, but come back
+/// and ask before using it.
+///
+/// Caching an attachment is worth having - the bytes are immutable for as long
+/// as the path holds them, and the strong `ETag` makes the revalidation one
+/// cheap 304 - but this response carries no freshness information of its own,
+/// no `Expires` and no `Last-Modified`. RFC 9111 section 4.2.2 lets a cache
+/// invent a lifetime for exactly that response and reuse it with **no request
+/// to this server at all**, which would skip `If-None-Match` rather than skip
+/// the body. Since a PUT to the same path is a legitimate replace-in-place,
+/// that is a page rendering last week's diagram with no way to notice. So the
+/// directive is `no-cache`, which despite its name means "store it, revalidate
+/// it every time" rather than "do not store it": the round trip stays, the body
+/// does not.
+const REVALIDATE: &str = "no-cache";
+
 /// One attachment's metadata, the row a file browser draws.
 #[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 #[schema(description = "One attachment a domain carries: where it lives, what \
@@ -139,7 +155,10 @@ pub struct UploadedAttachment {
                    it. Images, PDFs and text are dispositioned `inline`; the \
                    office formats arrive as a download.\n\nThe `ETag` is the \
                    strong quoted SHA-256 of the bytes, so `If-None-Match` \
-                   answers 304 without a body. A malformed path is 400 with the \
+                   answers 304 without a body, and `Cache-Control: no-cache` \
+                   keeps a stored copy revalidating instead of going \
+                   heuristically fresh, so a file replaced at the same path is \
+                   picked up on its next use. A malformed path is 400 with the \
                    rule that refused it; a well-formed path holding nothing is \
                    404.",
     params(
@@ -164,12 +183,19 @@ pub struct UploadedAttachment {
             content_type = "application/octet-stream",
             headers(
                 ("etag" = String, description = "The strong quoted SHA-256 of the bytes served."),
+                ("cache-control" = String, description = "Always `no-cache`: store it, but revalidate before every use."),
                 ("x-content-type-options" = String, description = "Always `nosniff`."),
                 ("content-security-policy" = String, description = "Always `default-src 'none'; sandbox`."),
                 ("content-disposition" = String, description = "`inline` for images, PDFs and text; `attachment; filename=\"...\"` otherwise."),
             ),
         ),
-        (status = 304, description = "The `If-None-Match` token matches the stored bytes; no body is sent."),
+        (
+            status = 304,
+            description = "The `If-None-Match` token matches the stored bytes; \
+                           no body is sent. Carries the `ETag` it matched and \
+                           the same `Cache-Control`, so the stored response it \
+                           refreshes keeps having to revalidate.",
+        ),
         (
             status = 400,
             description = "The path breaks an attachment path rule: not under \
@@ -212,14 +238,25 @@ pub async fn read(
     let etag = format!("\"{}\"", row.sha256);
     if if_none_match_matches(&headers, &row.sha256) {
         // RFC 9110: a 304 carries the validator it matched and no body, so the
-        // client can go on caching under the same token.
-        return Ok((StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response());
+        // client can go on caching under the same token. It repeats
+        // `Cache-Control` too, since a 304 updates the stored response's
+        // headers and dropping the directive here would let the very response
+        // it refreshes turn heuristically fresh.
+        return Ok((
+            StatusCode::NOT_MODIFIED,
+            [
+                (header::ETAG, etag),
+                (header::CACHE_CONTROL, REVALIDATE.to_string()),
+            ],
+        )
+            .into_response());
     }
     Ok((
         StatusCode::OK,
         [
             (header::CONTENT_TYPE, row.mime.clone()),
             (header::ETAG, etag),
+            (header::CACHE_CONTROL, REVALIDATE.to_string()),
             (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
             (header::CONTENT_SECURITY_POLICY, ATTACHMENT_CSP.to_string()),
             (header::CONTENT_DISPOSITION, disposition(&row)),
