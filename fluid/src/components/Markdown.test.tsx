@@ -45,7 +45,7 @@ async function renderMarkdown(
     </MemoryRouter>,
   );
   await waitFor(() => {
-    expect(screen.queryByText("Rendering")).toBeNull();
+    expect(screen.queryByText("crystallizing")).toBeNull();
   });
   return result;
 }

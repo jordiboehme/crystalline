@@ -197,3 +197,39 @@
     text-decoration: none;
   }
 }
+
+/*
+ * The crystallizing gem: the markdown renderer's loading state. Three facet
+ * glyphs share one grid cell and take turns, so the gem appears to fill in
+ * as the chunk loads. Motion collapses to the mid facet when the reader
+ * asked for reduced motion.
+ */
+@keyframes gem-facet {
+  0%,
+  27% {
+    opacity: 1;
+  }
+  33%,
+  100% {
+    opacity: 0;
+  }
+}
+.gem-cycle > span {
+  grid-area: 1 / 1;
+  opacity: 0;
+  animation: gem-facet 1.2s steps(1, end) infinite;
+}
+.gem-cycle > span:nth-child(2) {
+  animation-delay: 0.4s;
+}
+.gem-cycle > span:nth-child(3) {
+  animation-delay: 0.8s;
+}
+@media (prefers-reduced-motion: reduce) {
+  .gem-cycle > span {
+    animation: none;
+  }
+  .gem-cycle > span:nth-child(2) {
+    opacity: 1;
+  }
+}

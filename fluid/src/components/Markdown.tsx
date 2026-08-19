@@ -42,9 +42,15 @@ export function Markdown({ source, wikilinks, foldTitle }: MarkdownProps) {
     <Suspense
       fallback={
         // Deliberately quiet rather than the raw source: the chunk is one
-        // request and showing unrendered markdown first would flash.
-        <p className="py-3 text-sm text-slate-500 dark:text-slate-400">
-          Rendering
+        // request and showing unrendered markdown first would flash. The
+        // gem facet-fills while the renderer chunk loads.
+        <p className="flex items-center gap-2 py-3 font-mono text-sm text-slate-500 dark:text-slate-400">
+          <span aria-hidden className="gem-cycle inline-grid">
+            <span>{"◇"}</span>
+            <span>{"◈"}</span>
+            <span>{"◆"}</span>
+          </span>
+          crystallizing
         </p>
       }
     >
