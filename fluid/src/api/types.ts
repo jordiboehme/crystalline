@@ -272,6 +272,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/domains/{domain}/attachments": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Every attachment a domain carries.
+         * @description Metadata only, ordered by path: no bytes are read, so listing a domain full of slide decks costs one query. Each row carries the path to fetch it by, its mime, its size, when it last changed and its checksum.
+         */
+        get: operations["list_attachments"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/domains/{domain}/engrams": {
         parameters: {
             query?: never;
@@ -333,6 +353,38 @@ export interface paths {
          * @description A file domain removes the file from disk; a virtual domain drops the database rows. Guarded the same way `save` is: 428 with no `If-Match`, 412 when the token is stale (carrying the version the server holds now), 204 once it lands. A read-only instance answers 403 ahead of the precondition check, so it is never 428.
          */
         delete: operations["delete_engram"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/domains/{domain}/files/{path}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * One attachment's bytes.
+         * @description Serves the stored bytes under the mime the extension allowlist assigns - never one guessed from the content and never one the uploader claimed. Every answer carries `X-Content-Type-Options: nosniff` and a `default-src 'none'; sandbox` content security policy, so an attachment can never script against the instance serving it. Images, PDFs and text are dispositioned `inline`; the office formats arrive as a download.
+         *
+         *     The `ETag` is the strong quoted SHA-256 of the bytes, so `If-None-Match` answers 304 without a body. A malformed path is 400 with the rule that refused it; a well-formed path holding nothing is 404.
+         */
+        get: operations["read_attachment"];
+        /**
+         * Upload an attachment, creating or replacing it.
+         * @description Editor only. The request body is the raw file - not multipart - and the declared content type is ignored: the extension allowlist decides the mime, at upload and at every later read.
+         *
+         *     The path must start with `assets/`, hold no `.`, `..` or hidden segment, no backslash, colon or `#`, be at most 256 bytes and end in an allowlisted extension; anything else is 400 naming the rule. The domain is marked as owing a consolidation sweep, because a person just added something the agent has not read yet.
+         */
+        put: operations["write_attachment"];
+        post?: never;
+        /**
+         * Delete an attachment.
+         * @description Editor only. Removes the bytes and the metadata row together. An engram that still references the path keeps its reference - the consolidation sweep is what reports the dangling link, rather than this route rewriting somebody's markdown.
+         */
+        delete: operations["delete_attachment"];
         options?: never;
         head?: never;
         patch?: never;
@@ -872,6 +924,41 @@ export interface components {
             /** @description Import only: entries written, created and overwritten together. */
             written: number;
         };
+        /** @description One attachment a domain carries: where it lives, what it is, how big it is and when it last changed. */
+        AttachmentView: {
+            /**
+             * @description The mime the bytes are served under, derived from the extension.
+             * @example image/png
+             */
+            mime: string;
+            /**
+             * @description Last modification instant, RFC 3339.
+             * @example 2026-08-18T09:12:00+00:00
+             */
+            modified: string;
+            /**
+             * @description The domain-relative path, always under `assets/`.
+             * @example assets/architecture.png
+             */
+            path: string;
+            /**
+             * @description Lowercase hex SHA-256 of the bytes, the same token the read's `ETag`
+             *     carries.
+             * @example 9f2a1c05e2b7
+             */
+            sha256: string;
+            /**
+             * Format: int64
+             * @description Byte length.
+             * @example 20481
+             */
+            size: number;
+        };
+        /** @description Every attachment one domain carries, ordered by path. Metadata only: the bytes are fetched one file at a time. */
+        AttachmentsResponse: {
+            /** @description The rows, ordered by path. */
+            attachments: components["schemas"]["AttachmentView"][];
+        };
         /**
          * @description The wire form of a 412: a problem detail carrying the version the server
          *     holds now, so a client can show a merge view instead of just failing.
@@ -1281,6 +1368,31 @@ export interface components {
              * @example ghp_xxxxxxxxxxxxxxxxxxxx
              */
             token: string;
+        };
+        /** @description The attachment as stored: the path to reference it by, the mime it will be served under, its size and the checksum a read's `ETag` will carry. */
+        UploadedAttachment: {
+            /**
+             * @description The mime the bytes will be served under.
+             * @example image/png
+             */
+            mime: string;
+            /**
+             * @description The domain-relative path it was stored at, the target an engram body
+             *     references.
+             * @example assets/architecture.png
+             */
+            path: string;
+            /**
+             * @description Lowercase hex SHA-256 of the stored bytes.
+             * @example 9f2a1c05e2b7
+             */
+            sha256: string;
+            /**
+             * Format: int64
+             * @description Byte length as stored.
+             * @example 20481
+             */
+            size: number;
         };
         /**
          * @description One account. Carries no password material, so it is safe to hand to a
@@ -2291,6 +2403,56 @@ export interface operations {
             };
         };
     };
+    list_attachments: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The registered domain. */
+                domain: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The rows, ordered by path. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AttachmentsResponse"];
+                };
+            };
+            /** @description No identity. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The trusted-header identity names a disabled account. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No such domain. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
     list_engrams: {
         parameters: {
             query?: {
@@ -2795,6 +2957,225 @@ export interface operations {
             };
             /** @description No `If-Match` arrived. The token comes from the detail read. */
             428: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    read_attachment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The registered domain. */
+                domain: string;
+                /**
+                 * @description The domain-relative attachment path. It always starts with `assets/` and may contain slashes: `assets/diagrams/flow.png`.
+                 * @example assets/diagrams/flow.png
+                 */
+                path: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The bytes, under the mime the allowlist assigns. */
+            200: {
+                headers: {
+                    /** @description `inline` for images, PDFs and text; `attachment; filename="..."` otherwise. */
+                    "content-disposition"?: string;
+                    /** @description Always `default-src 'none'; sandbox`. */
+                    "content-security-policy"?: string;
+                    /** @description The strong quoted SHA-256 of the bytes served. */
+                    etag?: string;
+                    /** @description Always `nosniff`. */
+                    "x-content-type-options"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/octet-stream": string;
+                };
+            };
+            /** @description The `If-None-Match` token matches the stored bytes; no body is sent. */
+            304: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The path breaks an attachment path rule: not under `assets/`, a `.` or `..` segment, a hidden segment, a refused character, too long, or an extension that is not on the allowlist. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No identity. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The trusted-header identity names a disabled account. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No such domain, or no attachment at that path. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    write_attachment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The registered domain. */
+                domain: string;
+                /**
+                 * @description Where to store it, domain-relative and under `assets/`.
+                 * @example assets/diagrams/flow.png
+                 */
+                path: string;
+            };
+            cookie?: never;
+        };
+        /** @description The raw file bytes. */
+        requestBody: {
+            content: {
+                "application/octet-stream": string;
+            };
+        };
+        responses: {
+            /** @description Stored. The path to reference it by, its mime, its size and its checksum. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UploadedAttachment"];
+                };
+            };
+            /** @description The path breaks an attachment path rule or carries an extension that is not on the allowlist. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No identity, or an anonymous one: an anonymous identity never writes. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The caller is not an editor, the CSRF token is missing or wrong, or the instance is read-only. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No such domain. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The body is over the 10 MiB limit this API accepts, which is also the attachment size ceiling. */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    delete_attachment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The registered domain. */
+                domain: string;
+                /**
+                 * @description The attachment path.
+                 * @example assets/diagrams/flow.png
+                 */
+                path: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The path breaks an attachment path rule. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No identity, or an anonymous one. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The caller is not an editor, the CSRF token is missing or wrong, or the instance is read-only. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No such domain, or no attachment at that path. */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };

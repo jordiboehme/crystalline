@@ -1803,6 +1803,22 @@ fn write_ops() -> Vec<WriteOp> {
             body: None,
             admin_only: true,
         },
+        // The attachment bytes, in this order so the delete row has something
+        // to remove. Editor writes rather than admin ones: attaching a file to
+        // an engram is content editing, and the same role that writes the
+        // markdown referencing it writes the file.
+        WriteOp {
+            method: Method::PUT,
+            path: "/api/v1/domains/eng/files/assets/matrix.png",
+            body: Some(serde_json::json!("bytes")),
+            admin_only: false,
+        },
+        WriteOp {
+            method: Method::DELETE,
+            path: "/api/v1/domains/eng/files/assets/matrix.png",
+            body: None,
+            admin_only: false,
+        },
         // Last among the domain rows, and no later row targets `scrap`: this
         // one unregisters it.
         WriteOp {
@@ -2007,6 +2023,12 @@ async fn the_write_matrix_holds_on_every_route() {
 /// two user-admin targets - so a fixed per-segment substitution is enough;
 /// nothing here needs to be a general router.
 fn canonicalize(path: &str) -> String {
+    // The attachment routes take a wildcard rather than a segment: everything
+    // after `files/` is the one `{path}` parameter, however many slashes it
+    // holds, so it collapses before the per-segment pass runs over the head.
+    if let Some((head, _)) = path.split_once("/files/") {
+        return format!("{}/files/{{path}}", canonicalize(head));
+    }
     path.split('/')
         .map(|segment| match segment {
             "eng" | "scrap" => "{domain}",

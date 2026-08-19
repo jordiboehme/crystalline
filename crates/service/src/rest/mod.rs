@@ -12,6 +12,7 @@ mod domains_admin;
 mod engrams;
 mod error;
 mod evolve;
+mod files;
 mod github_settings;
 mod graph;
 mod users_api;
@@ -74,6 +75,7 @@ use crate::engine::Engine;
         (name = "engrams", description = "Listing, reading and writing engrams."),
         (name = "discovery", description = "Search, vocabulary, context and recent activity."),
         (name = "graph", description = "The neighborhood graph around an anchor."),
+        (name = "attachments", description = "The files an engram carries: bytes in, bytes out, and what a domain holds."),
         (name = "maintenance", description = "The consolidation queue: what the knowledge needs next. Read-only."),
         (name = "users", description = "Account management. Admin only."),
         (name = "settings", description = "Instance settings. Admin only."),
@@ -92,6 +94,10 @@ use crate::engine::Engine;
         archive::download,
         archive::preview,
         archive::import,
+        files::list,
+        files::read,
+        files::write,
+        files::remove,
         domains::tree,
         domains::manifest,
         domains::save_manifest,
@@ -130,6 +136,9 @@ use crate::engine::Engine;
         domains_admin::CreateDomainBody,
         archive::ArchiveEntryReport,
         archive::ArchiveReport,
+        files::AttachmentView,
+        files::AttachmentsResponse,
+        files::UploadedAttachment,
         engrams::CreateEngramBody,
         engrams::SaveEngramBody,
         engrams::RetireBody,
@@ -384,6 +393,17 @@ pub fn router(state: RestState) -> Router {
         // AND refused on a read-only instance.
         .route("/domains/{domain}/archive/preview", post(archive::preview))
         .route("/domains/{domain}/archive/import", post(archive::import))
+        // The attachment surface, beside the archive because both move bytes
+        // rather than knowledge. The listing is a plain read; the bytes route
+        // is a wildcard, because an attachment path is a path and carries its
+        // own slashes, and its wildcard is terminal like every other one here.
+        // The PUT and DELETE are editor writes refused on a read-only
+        // instance; the GET is a read and stays served there.
+        .route("/domains/{domain}/attachments", get(files::list))
+        .route(
+            "/domains/{domain}/files/{*path}",
+            get(files::read).put(files::write).delete(files::remove),
+        )
         .route("/domains/{domain}/tree", get(domains::tree))
         .route(
             "/domains/{domain}/manifest",
