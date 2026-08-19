@@ -172,6 +172,8 @@
 
 use std::sync::Arc;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use rmcp::handler::server::prompt::PromptContext;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
@@ -180,13 +182,14 @@ use rmcp::model::{
     ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, ListToolsResult,
     PaginatedRequestParams, ProgressNotificationParam, PromptMessage, ProtocolVersion,
     ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
-    ResourceContents, Role, ServerCapabilities, ServerInfo, SubscriptionFilter, Tool,
+    ResourceContents, ResourceTemplate, Role, ServerCapabilities, ServerInfo, SubscriptionFilter,
+    Tool,
 };
 use rmcp::service::{RequestContext, SubscriptionContext};
 use rmcp::{RoleServer, ServerHandler, prompt, prompt_router, tool, tool_handler, tool_router};
 use serde_json::{Value, json};
 
-use crystalline_core::SKILL_ASSETS;
+use crystalline_core::{CrystallineUrl, SKILL_ASSETS};
 use crystalline_remote::RemoteError;
 
 /// The tools hidden in read-only mode: the four content-mutating engram tools
@@ -482,6 +485,18 @@ fn skill_uris() -> String {
         .join(", ")
 }
 
+/// The RFC 6570 template every attachment is addressed by. `{+path}` is the
+/// reserved expansion, so a nested path keeps its separators: an attachment two
+/// folders deep is one uri, not one segment.
+const ATTACHMENT_URI_TEMPLATE: &str = "crystalline://{domain}/assets/{+path}";
+
+/// The template's programmatic name, and what a client shows beside it.
+const ATTACHMENT_TEMPLATE_NAME: &str = "attachment";
+
+/// What the template is for, in the words a model reads before deciding to
+/// fetch one.
+const ATTACHMENT_TEMPLATE_DESCRIPTION: &str = "A file attachment a human added to a domain: read it here when an engram's resource links or an evolve finding point at it.";
+
 /// Whether the whole skill-serving surface (the `skills` tool, the `skill://`
 /// resources and the two prompts) is hidden.
 ///
@@ -717,18 +732,18 @@ impl McpServer {
     #[tool(
         name = "read_engram",
         title = "Read engram",
-        description = "Read an engram's full markdown and resolved frontmatter to learn what is already known before acting or writing. Identify it by bare permalink, title or a crystalline:// URL; pass domain to disambiguate. An identifier without crystalline:// is domain-relative: 'onboarding/setup', never 'mydomain/onboarding/setup'. The response flags whether each relation and prose link resolves, summarizes what links back and names a build_context anchor for exploring nearby knowledge.",
+        description = "Read an engram's full markdown and resolved frontmatter to learn what is already known before acting or writing. Identify it by bare permalink, title or a crystalline:// URL; pass domain to disambiguate. An identifier without crystalline:// is domain-relative: 'onboarding/setup', never 'mydomain/onboarding/setup'. The response flags whether each relation and prose link resolves, summarizes what links back and names a build_context anchor for exploring nearby knowledge. Attachments the engram references come back as resource links; fetch one with resources/read when the file itself matters.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn read_engram(
         &self,
         Parameters(p): Parameters<ReadParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.engine
-            .read_engram(&p)
-            .await
-            .map_err(to_error)
-            .and_then(ok)
+        let value = self.engine.read_engram(&p).await.map_err(to_error)?;
+        let links = self.attachment_links(&value).await;
+        let mut result = ok(value)?;
+        result.content.extend(links);
+        Ok(result)
     }
 
     #[tool(
@@ -937,7 +952,7 @@ impl McpServer {
     #[tool(
         name = "evolve_engrams",
         title = "Evolve engrams",
-        description = "Sweep one domain or every domain for the maintenance the knowledge needs and return a ranked work queue: a to-do list that walks you through tidying, cleaning up, auditing, reviewing or health-checking what has been taught. Detects temporal and lifecycle debt (an elapsed valid_to still marked stable, stale_after past due, long-unverified knowledge, a superseded engram with no successor relation and the half-finished converse, a retired engram still cited as current by live ones), structural gaps (unresolved [[links]], one-sided supersedes or summarizes pairs, orphans, an engram over the split budget, near-empty stubs) and redundancy (near-duplicate clusters, drifted tags). It detects by dates, links and graph shape only, never by meaning, so it cannot find or confirm a contradiction between what two engrams say. It also surfaces engrams people captured directly (through the Fluid web UI) that nobody reviewed yet, so what a person taught gets verified, tagged against the vocabulary and woven into the graph - those findings are judgment class. Read-only: it changes nothing itself. Each finding names the engram, the evidence and the exact next action with the tool that performs it, and a finding marked mechanical completes intent the archive already records while one marked judgment changes what the archive claims and needs a yes from the user first. Work the queue with the write tools and re-run the same scope to confirm it shrank. Call it when the user asks whether knowledge is still accurate, what needs attention or review, or to tidy, audit, consolidate or spring-clean a domain; after a large ingest lands many engrams at once; and when a search returns hits that disagree, since a half-finished retirement often explains the disagreement. Do not call it at session start, after routine captures or before ordinary recall - it is deliberate maintenance, on demand. limit caps the queue (default 10), families narrows to one detector family, domains narrows the sweep.",
+        description = "Sweep one domain or every domain for the maintenance the knowledge needs and return a ranked work queue: a to-do list that walks you through tidying, cleaning up, auditing, reviewing or health-checking what has been taught. Detects temporal and lifecycle debt (an elapsed valid_to still marked stable, stale_after past due, long-unverified knowledge, a superseded engram with no successor relation and the half-finished converse, a retired engram still cited as current by live ones), structural gaps (unresolved [[links]], one-sided supersedes or summarizes pairs, orphans, an engram over the split budget, near-empty stubs) and redundancy (near-duplicate clusters, drifted tags). It detects by dates, links and graph shape only, never by meaning, so it cannot find or confirm a contradiction between what two engrams say. It also surfaces engrams people captured directly (through the Fluid web UI) that nobody reviewed yet, so what a person taught gets verified, tagged against the vocabulary and woven into the graph - those findings are judgment class. Attachments are swept too: a file a human added that no engram references, and a reference that points at no stored file, both come back as findings naming the attachment path. Read-only: it changes nothing itself. Each finding names the engram, the evidence and the exact next action with the tool that performs it, and a finding marked mechanical completes intent the archive already records while one marked judgment changes what the archive claims and needs a yes from the user first. Work the queue with the write tools and re-run the same scope to confirm it shrank. Call it when the user asks whether knowledge is still accurate, what needs attention or review, or to tidy, audit, consolidate or spring-clean a domain; after a large ingest lands many engrams at once; and when a search returns hits that disagree, since a half-finished retirement often explains the disagreement. Do not call it at session start, after routine captures or before ordinary recall - it is deliberate maintenance, on demand. limit caps the queue (default 10), families narrows to one detector family, domains narrows the sweep.",
         annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
     )]
     async fn evolve_engrams(
@@ -1359,6 +1374,45 @@ impl McpServer {
             info.instructions = Some(instructions);
         }
         info
+    }
+
+    /// The resource links a `read_engram` result carries: one per distinct
+    /// `assets/` reference in the body that resolves to a stored attachment.
+    ///
+    /// Links rather than bytes, deliberately. A screenshot inlined as base64
+    /// would spend a model's whole context on a file it may not need; a link
+    /// names it - uri, filename, mime and size - and `resources/read` fetches
+    /// the bytes when the model decides the file itself matters.
+    ///
+    /// A reference that resolves to nothing produces no link and no complaint:
+    /// a dangling attachment reference is knowledge debt, and `evolve_engrams`
+    /// is where debt is reported. A listing that cannot be read (a domain
+    /// dropped between the read and this call) costs the links, never the read.
+    async fn attachment_links(&self, value: &Value) -> Vec<ContentBlock> {
+        let (Some(domain), Some(content)) = (
+            value.get("domain").and_then(Value::as_str),
+            value.get("content").and_then(Value::as_str),
+        ) else {
+            return Vec::new();
+        };
+        let refs = crystalline_core::find_asset_refs(content);
+        if refs.is_empty() {
+            return Vec::new();
+        }
+        let Ok(rows) = self.engine.attachment_list(domain).await else {
+            return Vec::new();
+        };
+        refs.iter()
+            .filter_map(|target| rows.iter().find(|row| row.path == *target))
+            .map(|row| {
+                let name = row.path.rsplit('/').next().unwrap_or(row.path.as_str());
+                ContentBlock::resource_link(
+                    Resource::new(format!("crystalline://{domain}/{}", row.path), name)
+                        .with_mime_type(row.mime.clone())
+                        .with_size(row.size),
+                )
+            })
+            .collect()
     }
 
     /// Wrap a list-shaped engine value as a successful tool result: TOON
@@ -1856,46 +1910,79 @@ impl ServerHandler for McpServer {
         Ok(ListResourcesResult::with_all_items(resources).with_cache_hints(&context))
     }
 
-    /// This server serves no resource templates, and answering the method is
-    /// still work: rmcp's default returns `ListResourceTemplatesResult::default()`
-    /// (rmcp 3.1.2 `handler/server.rs:387-395`), which is a **complete** result
-    /// with no caching hints on one of the six operations SEP-2549 names. So
-    /// the override exists for the hints alone, and the empty list is rmcp's
-    /// answer unchanged. See [`CacheHinted`] for why an un-advertised or empty
-    /// surface is not a defence against that MUST.
+    /// The one template this server serves: every attachment a domain carries,
+    /// addressed as `crystalline://<domain>/assets/<path>`.
+    ///
+    /// A template rather than a listing because the set is open and per domain:
+    /// enumerating every screenshot of every registered domain would spend a
+    /// client's context on files it will never open, while the template plus the
+    /// resource links `read_engram` returns name exactly the ones an engram
+    /// actually references.
+    ///
+    /// The override also carries the caching hints on its own account: rmcp's
+    /// default returns `ListResourceTemplatesResult::default()` (rmcp 3.1.2
+    /// `handler/server.rs:387-395`), a **complete** result with no hints on one
+    /// of the six operations SEP-2549 names. See [`CacheHinted`].
     async fn list_resource_templates(
         &self,
         _request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<ListResourceTemplatesResult, ErrorData> {
-        Ok(ListResourceTemplatesResult::with_all_items(Vec::new()).with_cache_hints(&context))
+        let template = ResourceTemplate::new(ATTACHMENT_URI_TEMPLATE, ATTACHMENT_TEMPLATE_NAME)
+            .with_description(ATTACHMENT_TEMPLATE_DESCRIPTION);
+        Ok(ListResourceTemplatesResult::with_all_items(vec![template]).with_cache_hints(&context))
     }
 
-    /// Read one shipped skill by its resource uri. Like every hidden tool,
-    /// this answers even while `skills.serve` is off: the gate hides the
-    /// surface from a listing rather than disabling it, and a skill is static
-    /// public copy this binary already carries, so a client holding a uri from
-    /// an earlier listing gets the bytes rather than a puzzle.
+    /// Read one shipped skill, or one attachment, by its resource uri.
+    ///
+    /// A skill answers even while `skills.serve` is off, like every hidden
+    /// tool: the gate hides the surface from a listing rather than disabling
+    /// it, and a skill is static public copy this binary already carries, so a
+    /// client holding a uri from an earlier listing gets the bytes rather than
+    /// a puzzle.
+    ///
+    /// An attachment uri is anything [`CrystallineUrl::asset_path`] recognizes,
+    /// and the bytes come back the way the file is read rather than the way it
+    /// was asked for: a text mime as `TextResourceContents`, everything else
+    /// base64 in `BlobResourceContents`. This is the one place base64 is ever
+    /// emitted - a tool result carries links, never bytes - so a model spends
+    /// the context on an image or a deck only when it decided to open it.
     async fn read_resource(
         &self,
         request: ReadResourceRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResponse, ErrorData> {
-        match skill_for_uri(&request.uri) {
-            Some(asset) => Ok(ReadResourceResult::new(vec![
+        if let Some(asset) = skill_for_uri(&request.uri) {
+            return Ok(ReadResourceResult::new(vec![
                 ResourceContents::text(asset.content, &request.uri).with_mime_type(SKILL_MIME_TYPE),
             ])
             .with_cache_hints(&context)
-            .into()),
-            None => Err(ErrorData::invalid_params(
-                format!(
-                    "unknown resource '{}'; this server serves {}",
-                    request.uri,
-                    skill_uris()
-                ),
-                None,
-            )),
+            .into());
         }
+        if let Some(url) = CrystallineUrl::parse(&request.uri)
+            && let Some(path) = url.asset_path()
+        {
+            let (bytes, row) = self
+                .engine
+                .attachment_read(&url.domain, path)
+                .await
+                .map_err(to_error)?;
+            return Ok(ReadResourceResult::new(vec![attachment_contents(
+                &request.uri,
+                bytes,
+                &row.mime,
+            )])
+            .with_cache_hints(&context)
+            .into());
+        }
+        Err(ErrorData::invalid_params(
+            format!(
+                "unknown resource '{}'; this server serves {} and every attachment addressed as {ATTACHMENT_URI_TEMPLATE}",
+                request.uri,
+                skill_uris()
+            ),
+            None,
+        ))
     }
 
     /// List the two onboarding prompts, empty while `skills.serve` is off.
@@ -1931,6 +2018,28 @@ impl ServerHandler for McpServer {
             ))
             .await
     }
+}
+
+/// One attachment's bytes as resource contents, in the shape its mime asks
+/// for: text for the readable formats
+/// [`crystalline_core::is_text_attachment_mime`] names, base64 for everything
+/// else.
+///
+/// A text mime whose bytes are not valid UTF-8 falls back to the blob shape
+/// rather than losing them to a lossy conversion: a `.txt` in some other
+/// encoding is still the file the caller asked for, and a client that decodes
+/// the base64 gets it byte for byte.
+fn attachment_contents(uri: &str, bytes: Vec<u8>, mime: &str) -> ResourceContents {
+    if crystalline_core::is_text_attachment_mime(mime) {
+        match String::from_utf8(bytes) {
+            Ok(text) => return ResourceContents::text(text, uri).with_mime_type(mime),
+            Err(e) => {
+                return ResourceContents::blob(BASE64.encode(e.into_bytes()), uri)
+                    .with_mime_type(mime);
+            }
+        }
+    }
+    ResourceContents::blob(BASE64.encode(bytes), uri).with_mime_type(mime)
 }
 
 /// Wrap an engine value as a successful tool result. The compact JSON is the

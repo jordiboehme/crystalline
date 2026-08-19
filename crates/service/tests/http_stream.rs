@@ -555,16 +555,21 @@ async fn the_wire_format_baseline_the_conformance_tasks_measure_against() {
         "the five served skills"
     );
     let templates = list(4, "resources/templates/list").await;
+    let listed = templates["result"]["resourceTemplates"].as_array().unwrap();
     assert_eq!(
-        templates["result"]["resourceTemplates"]
-            .as_array()
-            .unwrap()
-            .len(),
-        0,
-        "this server serves no resource templates; the endpoint is overridden \
-         rather than inherited only because rmcp's default answers one of the \
-         six cache-hint operations with no hints (handler/server.rs:387-395)"
+        listed.len(),
+        1,
+        "the one template: every attachment a domain carries. The endpoint also \
+         has to be overridden rather than inherited because rmcp's default \
+         answers one of the six cache-hint operations with no hints \
+         (handler/server.rs:387-395)"
     );
+    assert_eq!(
+        listed[0]["uriTemplate"].as_str(),
+        Some("crystalline://{domain}/assets/{+path}"),
+        "the reserved expansion keeps a nested path's separators: {listed:?}"
+    );
+    assert_eq!(listed[0]["name"].as_str(), Some("attachment"));
     let prompts = list(5, "prompts/list").await;
     assert_eq!(
         prompts["result"]["prompts"].as_array().unwrap().len(),
