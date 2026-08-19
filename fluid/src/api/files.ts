@@ -69,10 +69,19 @@ export const ATTACHMENT_ACCEPT = ALLOWED_ATTACHMENT_EXTENSIONS.map(
   (extension) => `.${extension}`,
 ).join(",");
 
-/** The lowercase extension of a filename, or "" when it carries none. */
+/**
+ * The lowercase extension of a filename, or "" when it carries none.
+ *
+ * The name is trimmed first, because {@link sanitizeAttachmentName} trims too:
+ * the question "will this be refused" and the question "what will this be
+ * called" have to be asked of the same name, or `"shot.png "` is refused for
+ * having no allowlisted extension while the sanitizer would have stored a
+ * perfectly ordinary `shot.png`.
+ */
 function extensionOf(name: string): string {
-  const dot = name.lastIndexOf(".");
-  return dot > 0 ? name.slice(dot + 1).toLowerCase() : "";
+  const trimmed = name.trim();
+  const dot = trimmed.lastIndexOf(".");
+  return dot > 0 ? trimmed.slice(dot + 1).toLowerCase() : "";
 }
 
 /** Whether the allowlist admits this filename, case-insensitively. */
@@ -90,28 +99,62 @@ export function isImageAttachment(name: string): boolean {
 }
 
 /**
- * The longest stem or extension a sanitized name keeps. The core caps the
- * whole path at 256 bytes including the `assets/YYYY/MM/` prefix, and a
- * hundred characters is long enough to stay recognizable while leaving that
- * ceiling out of reach.
+ * The longest stem or extension a sanitized name keeps, in BYTES rather than
+ * characters, because the server's 256-byte path ceiling is counted in bytes
+ * and a name written in a non-Latin script costs two or three bytes a letter.
+ * A hundred each leaves the dated prefix, the separator and a collision suffix
+ * a wide margin under that ceiling.
  */
-const MAX_NAME_PART = 100;
+const MAX_NAME_BYTES = 100;
 
-/** What a name that sanitizes away to nothing is called instead. */
-const FALLBACK_STEM = "file";
+/** What a name with nothing keepable in it is called instead. */
+const FALLBACK_STEM = "attachment";
+
+/** How many bytes this text takes on the wire, which is how the server counts. */
+function utf8Length(value: string): number {
+  return new TextEncoder().encode(value).length;
+}
+
+/** The longest prefix of whole characters that fits in `maxBytes`. */
+function truncateToBytes(value: string, maxBytes: number): string {
+  if (utf8Length(value) <= maxBytes) {
+    return value;
+  }
+  let kept = "";
+  let used = 0;
+  // Iterating the string yields whole code points, so a truncation never
+  // splits a character into an invalid byte sequence.
+  for (const character of value) {
+    const size = utf8Length(character);
+    if (used + size > maxBytes) {
+      break;
+    }
+    kept += character;
+    used += size;
+  }
+  return kept;
+}
 
 /**
- * One part of a filename, made safe: lowercase, everything outside
- * `[a-z0-9._-]` collapsed to a single dash, and no leading or trailing dot or
- * dash - a leading dot would be a hidden segment, which the server refuses,
- * and a trailing dash is only noise.
+ * One part of a filename, made safe: lowercase where lowercasing means
+ * anything, every run of genuinely unsafe characters collapsed to a single
+ * dash, and no leading or trailing dot or dash - a leading dot would be a
+ * hidden segment, which the server refuses, and a trailing dash is only noise.
+ *
+ * Letters and digits of ANY script are kept, because "a filename a human
+ * recognizes is the point" and an author writing in Japanese or Greek should
+ * get their own words back rather than a row of dashes. What is dropped is
+ * what the server refuses or what a path cannot carry: whitespace,
+ * parentheses, `#`, `:`, slashes, backslashes, control and format characters,
+ * and symbols including emoji. A name made only of those sanitizes to nothing
+ * and takes {@link FALLBACK_STEM}.
  */
 function slug(part: string): string {
-  return part
+  const safe = part
     .toLowerCase()
-    .replace(/[^a-z0-9._-]+/g, "-")
-    .replace(/-{2,}/g, "-")
-    .slice(0, MAX_NAME_PART)
+    .replace(/[^\p{L}\p{N}._-]+/gu, "-")
+    .replace(/-{2,}/g, "-");
+  return truncateToBytes(safe, MAX_NAME_BYTES)
     .replace(/^[.-]+/, "")
     .replace(/[.-]+$/, "");
 }
@@ -120,9 +163,10 @@ function slug(part: string): string {
  * A filename an author picked, as a filename the server will accept: lowercase,
  * unsafe characters dashed, extension kept.
  *
- * "Q3 Deck (final).PDF" becomes "q3-deck-final.pdf". A name with nothing safe
- * left in its stem keeps its extension and takes {@link FALLBACK_STEM}, so the
- * result is never a bare extension or an empty string.
+ * "Q3 Deck (final).PDF" becomes "q3-deck-final.pdf" and "設計 メモ.png" becomes
+ * "設計-メモ.png". A name with nothing safe left in its stem keeps its
+ * extension and takes {@link FALLBACK_STEM}, so the result is never a bare
+ * extension or an empty string.
  */
 export function sanitizeAttachmentName(name: string): string {
   const trimmed = name.trim();

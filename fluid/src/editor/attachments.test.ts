@@ -6,7 +6,7 @@
  * maintenance sweep would then have to flag).
  */
 
-import { EditorState } from "@codemirror/state";
+import { EditorSelection, EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -19,6 +19,7 @@ import {
   transferFiles,
   uploadAttachments,
 } from "./attachments";
+import { frontmatterFold } from "./frontmatterFold";
 
 vi.mock("../api/files", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../api/files")>();
@@ -53,6 +54,13 @@ function mount(doc = "Body line\n"): EditorView {
 describe("refuseAttachment", () => {
   it("passes an allowed file under the ceiling", () => {
     expect(refuseAttachment(fileOf("shot.png"))).toBeNull();
+  });
+
+  it("judges the name the sanitizer would store, padding and all", () => {
+    // The pre-check and the path builder have to agree about what the file is
+    // called, or a name a trailing space is refused for is a name that would
+    // have been stored perfectly legally.
+    expect(refuseAttachment(fileOf("shot.png "))).toBeNull();
   });
 
   it("refuses an extension that is not on the allowlist, naming the file", () => {
@@ -105,7 +113,10 @@ describe("attachmentUploads", () => {
    * the editor's own handler, which reads the text payload of anything this
    * module hands back to it.
    */
-  function transferEvent(type: "paste" | "drop", files: File[]): Event {
+  function transferEvent(
+    type: "paste" | "drop" | "dragover",
+    files: File[],
+  ): Event {
     const event = new Event(type, { bubbles: true, cancelable: true });
     Object.defineProperty(
       event,
@@ -177,6 +188,44 @@ describe("attachmentUploads", () => {
 
     expect(seen).toEqual([[file]]);
     expect(event.defaultPrevented).toBe(true);
+  });
+
+  it("leaves a drop with no files to the editor", () => {
+    const seen: File[][] = [];
+    view = new EditorView({
+      state: EditorState.create({
+        doc: "x\n",
+        extensions: [
+          attachmentUploads((files) => {
+            seen.push(files);
+          }),
+        ],
+      }),
+    });
+
+    view.contentDOM.dispatchEvent(transferEvent("drop", []));
+
+    expect(seen).toEqual([]);
+  });
+
+  it("cancels a file dragover and only a file dragover", () => {
+    // The one that is invisible until it breaks: a browser fires no drop at
+    // all unless the dragover before it was cancelled, so a regression here
+    // kills drag and drop with every other test still green.
+    view = new EditorView({
+      state: EditorState.create({
+        doc: "x\n",
+        extensions: [attachmentUploads(() => undefined)],
+      }),
+    });
+
+    const withFiles = transferEvent("dragover", [fileOf("shot.png")]);
+    const withoutFiles = transferEvent("dragover", []);
+    view.contentDOM.dispatchEvent(withFiles);
+    view.contentDOM.dispatchEvent(withoutFiles);
+
+    expect(withFiles.defaultPrevented).toBe(true);
+    expect(withoutFiles.defaultPrevented).toBe(false);
   });
 });
 
@@ -258,6 +307,36 @@ describe("uploadAttachments", () => {
     expect(target.state.doc.toString()).toBe("Body line\n");
   });
 
+  it("reports every refusal in the batch, not only the last one", async () => {
+    // The screen holds one line, so an author who dropped five files and had
+    // two refused has to be able to read which two.
+    const target = mount();
+    listMock.mockResolvedValueOnce([]);
+    uploadMock.mockImplementation((_domain, path) =>
+      Promise.resolve({ path, mime: "image/png", size: 8, sha256: "a" }),
+    );
+    const errors: (string | null)[] = [];
+
+    const inserted = await uploadAttachments({
+      domain: "eng",
+      files: [
+        fileOf("tool.exe"),
+        fileOf("shot.png"),
+        fileOf("huge.png", 10 * 1024 * 1024 + 1),
+      ],
+      view: target,
+      onError: (message) => errors.push(message),
+      now: new Date(2026, 7, 3),
+    });
+
+    expect(inserted).toBe(1);
+    const reported = errors.at(-1) ?? "";
+    expect(reported).toContain("tool.exe");
+    expect(reported).toContain("huge.png");
+    // One report per batch rather than one per failure: the clear, then this.
+    expect(errors).toHaveLength(2);
+  });
+
   it("inserts nothing for a failed upload and surfaces the server's words", async () => {
     const target = mount();
     listMock.mockResolvedValueOnce([]);
@@ -277,6 +356,42 @@ describe("uploadAttachments", () => {
     expect(inserted).toBe(0);
     expect(errors.at(-1)).toBe("the attachment is larger than 10 MiB");
     expect(target.state.doc.toString()).toBe("Body line\n");
+  });
+
+  it("says so when the bytes landed but the reference could not be inserted", async () => {
+    // The buffer's whole text is selected and its frontmatter is folded, which
+    // is the case `insertBlock` refuses: an edit made through a block nobody
+    // can see. The PUT has already happened by then, so silence here would
+    // leave a stored file no engram references - the orphan the maintenance
+    // sweep would raise days later.
+    const doc = "---\ntitle: T\n---\n\nBody line\n";
+    view = new EditorView({
+      state: EditorState.create({
+        doc,
+        selection: EditorSelection.single(0, doc.length),
+        extensions: [frontmatterFold()],
+      }),
+    });
+    const target = view;
+    listMock.mockResolvedValueOnce([]);
+    uploadMock.mockImplementation((_domain, path) =>
+      Promise.resolve({ path, mime: "image/png", size: 8, sha256: "a" }),
+    );
+    const errors: (string | null)[] = [];
+
+    const inserted = await uploadAttachments({
+      domain: "eng",
+      files: [fileOf("shot.png")],
+      view: target,
+      onError: (message) => errors.push(message),
+      now: new Date(2026, 7, 3),
+    });
+
+    expect(uploadMock).toHaveBeenCalledTimes(1);
+    expect(inserted).toBe(0);
+    // Named, so the file can be linked by hand or deleted.
+    expect(errors.at(-1)).toContain("assets/2026/08/shot.png");
+    expect(target.state.doc.toString()).toBe(doc);
   });
 
   it("uploads nothing when the domain's attachments cannot be listed", async () => {

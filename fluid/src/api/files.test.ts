@@ -122,11 +122,32 @@ describe("sanitizeAttachmentName", () => {
   });
 
   it("falls back to a stem rather than producing a bare extension", () => {
-    expect(sanitizeAttachmentName("###.png")).toBe("file.png");
+    expect(sanitizeAttachmentName("###.png")).toBe("attachment.png");
+    expect(sanitizeAttachmentName("....png")).toBe("attachment.png");
   });
 
   it("collapses a run of unsafe characters into one dash", () => {
     expect(sanitizeAttachmentName("a   b___c.png")).toBe("a-b___c.png");
+  });
+
+  it("judges the same trimmed name the pre-check judges", () => {
+    expect(sanitizeAttachmentName("shot.png ")).toBe("shot.png");
+    expect(isAllowedAttachment("shot.png ")).toBe(true);
+  });
+
+  it("keeps the letters of any script, so a name stays recognizable", () => {
+    // The whole point of not slugifying server-side is that an author gets
+    // their own filename back; a row of dashes is not that.
+    expect(sanitizeAttachmentName("設計 メモ.png")).toBe("設計-メモ.png");
+    expect(sanitizeAttachmentName("Übersicht Plan.png")).toBe(
+      "übersicht-plan.png",
+    );
+    expect(sanitizeAttachmentName("Σχέδιο2.png")).toBe("σχέδιο2.png");
+  });
+
+  it("has nothing to keep from a name made only of symbols", () => {
+    // Emoji are symbols rather than letters, so they go the way a space goes.
+    expect(sanitizeAttachmentName("🎉🎉.png")).toBe("attachment.png");
   });
 
   it("produces names the server's path rules accept", () => {
@@ -137,13 +158,33 @@ describe("sanitizeAttachmentName", () => {
       "back\\slash.png",
       " padded .json",
       "Übersicht Plan.png",
+      "設計 メモ.png",
+      "🎉🎉.png",
       "..\\..\\escape.png",
+      "a/b/c.png",
+      "bell\u0007ring.png",
+      `${"設計".repeat(200)}.png`,
     ];
     for (const name of nasty) {
-      const safe = sanitizeAttachmentName(name);
-      expect(safe).not.toMatch(/[ ():#\\]/);
-      expect(safe.startsWith(".")).toBe(false);
-      expect(safe).not.toBe("");
+      const path = freeAttachmentPath(name, [], AUGUST);
+      // Transcribed from `validate_asset_path`: the refused characters, the
+      // hidden and dot segments, and the 256-byte ceiling.
+      expect(path).not.toMatch(/[ ():#\\]/);
+      for (const character of path) {
+        // No control character survives, checked by code point rather
+        // than by a regex holding literal control bytes.
+        const code = character.codePointAt(0) ?? 0;
+        expect(code).toBeGreaterThan(31);
+        expect(code).not.toBe(127);
+      }
+      expect(path.startsWith("assets/")).toBe(true);
+      for (const segment of path.split("/")) {
+        expect(segment).not.toBe("");
+        expect(segment).not.toBe(".");
+        expect(segment).not.toBe("..");
+        expect(segment.startsWith(".")).toBe(false);
+      }
+      expect(new TextEncoder().encode(path).length).toBeLessThanOrEqual(256);
     }
   });
 });

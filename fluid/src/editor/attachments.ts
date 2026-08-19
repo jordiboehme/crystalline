@@ -82,6 +82,16 @@ export interface UploadRequest {
 }
 
 /**
+ * Why something failed, in words: the server's own where the failure came from
+ * the API, and the thrown value's otherwise. `catch` binds `unknown`, and a
+ * cast would be a promise about what `api()` throws that this module is not
+ * the one to make.
+ */
+function reasonOf(cause: unknown): string {
+  return cause instanceof Error ? problemDetail(cause) : String(cause);
+}
+
+/**
  * Upload every file and insert one reference per stored file, at the cursor.
  *
  * The domain's listing is read once up front, because a free path has to be
@@ -89,6 +99,10 @@ export interface UploadRequest {
  * collision that went unnoticed would silently overwrite somebody's file. A
  * listing that cannot be read is therefore fatal to the batch rather than
  * treated as an empty domain.
+ *
+ * Everything that went wrong is reported once at the end rather than one call
+ * per failure: the screen holds a single line, so five dropped files with two
+ * refusals have to say both or the author only learns about the last.
  *
  * Resolves with how many references were inserted.
  */
@@ -100,36 +114,55 @@ export async function uploadAttachments(
   if (files.length === 0) {
     return 0;
   }
+  const problems: string[] = [];
   let taken: string[];
   try {
     taken = (await listAttachments(domain)).map((row) => row.path);
-  } catch (error) {
-    onError(problemDetail(error as Error));
+  } catch (cause) {
+    onError(reasonOf(cause));
     return 0;
   }
 
   const lines: string[] = [];
+  const stored: string[] = [];
   for (const file of files) {
     const refusal = refuseAttachment(file);
     if (refusal !== null) {
-      onError(refusal);
+      problems.push(refusal);
       continue;
     }
     // Against this batch as well as against the domain: two files of the same
     // name dropped together must not both claim one path.
     const path = freeAttachmentPath(file.name, taken, request.now);
     try {
-      const stored = await uploadAttachment(domain, path, file);
-      taken = [...taken, stored.path];
-      lines.push(attachmentMarkdown(file.name, stored.path));
-    } catch (error) {
-      onError(problemDetail(error as Error));
+      const uploaded = await uploadAttachment(domain, path, file);
+      taken = [...taken, uploaded.path];
+      stored.push(uploaded.path);
+      lines.push(attachmentMarkdown(file.name, uploaded.path));
+    } catch (cause) {
+      problems.push(reasonOf(cause));
     }
   }
-  if (lines.length > 0) {
-    insertBlock(view, lines);
+
+  let inserted = lines.length;
+  // The bytes are already stored by the time this runs, so a refused insertion
+  // is not a no-op the author can shrug off: it leaves a file in the domain
+  // that no engram references, which is the orphan the maintenance sweep would
+  // otherwise raise days later. `insertBlock` refuses over a folded
+  // frontmatter block, and a dispatch into a view that has been destroyed -
+  // the buffer was rebuilt while the upload was in flight - lands nowhere
+  // either. Both end here, naming the paths so they can be linked by hand or
+  // deleted.
+  if (lines.length > 0 && !insertBlock(view, lines)) {
+    inserted = 0;
+    problems.push(
+      `Uploaded to ${stored.join(", ")}, but the reference could not be inserted here: put the caret in the body and link it, or delete the file.`,
+    );
   }
-  return lines.length;
+  if (problems.length > 0) {
+    onError(problems.join(" "));
+  }
+  return inserted;
 }
 
 /**
