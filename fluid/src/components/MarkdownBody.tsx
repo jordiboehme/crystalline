@@ -38,8 +38,9 @@ import remarkGfm from "remark-gfm";
 
 import { attachmentUrl } from "../api/files";
 import {
+  assetPath,
+  decodeTarget,
   imageStyle,
-  isAssetTarget,
   parseImageFragment,
 } from "../editor/imageFormat";
 import { WIKILINK, referenceState } from "../wikilinks";
@@ -441,25 +442,20 @@ const components: Components = {
 };
 
 /**
- * The target as the author wrote it, out of the URL the renderer hands over.
+ * The files-route URL a target names, or null when it names no file of this
+ * domain - which includes every case where the caller has no domain to resolve
+ * against.
  *
- * micromark percent-encodes every link and image target on its way through -
- * a stray `%` becomes `%25`, a name written in Japanese becomes a row of UTF-8
- * escapes - so what arrives here is a URL rather than the stored path it was
- * written as. Encoding it again would produce `%2525` and a 404 on a file that
- * is sitting right there, and the fragment would arrive as `w=50%25`, which is
- * no width at all.
- *
- * A target that will not decode is handed back exactly as it came: it is then
- * not a path this app can resolve either way, and a thrown `URIError` inside a
- * render would take the whole document down over one malformed link.
+ * The single place the reading view turns a written target into an address,
+ * asked by the image and the anchor alike, and it asks {@link assetPath} the
+ * same question the rail asks so the two can never disagree about a file.
  */
-function storedTarget(target: string): string {
-  try {
-    return decodeURIComponent(target);
-  } catch {
-    return target;
+function assetHref(domain: string | undefined, target: string): string | null {
+  if (domain === undefined) {
+    return null;
   }
+  const path = assetPath(target);
+  return path === null ? null : attachmentUrl(domain, path);
 }
 
 /** The classes every link in a document wears, wherever it points. */
@@ -503,19 +499,14 @@ function MarkdownAnchor({
       </Link>
     );
   }
-  const target = typeof href === "string" ? storedTarget(href) : "";
-  if (domain !== undefined && isAssetTarget(target)) {
-    // The fragment is a view concern the file route never sees, so it is
-    // stripped here as well: a link carrying `#right` would be asking for a
-    // file by a name nobody stored.
-    const { path } = parseImageFragment(target);
+  // One question decides it, and the rail asks the same one: does this target
+  // name a file of this domain? A `./` prefix is stripped, the fragment is
+  // dropped - the files route never sees one - and an address that is somebody
+  // else's, or a path the core would refuse, answers null.
+  const file = assetHref(domain, href ?? "");
+  if (file !== null) {
     return (
-      <a
-        href={attachmentUrl(domain, path)}
-        target="_blank"
-        rel="noreferrer"
-        className={LINK_CLASSES}
-      >
+      <a href={file} target="_blank" rel="noreferrer" className={LINK_CLASSES}>
         {children}
       </a>
     );
@@ -555,19 +546,21 @@ function MarkdownImage({
   domain?: string;
 }) {
   const written = typeof src === "string" ? src : "";
-  const target = storedTarget(written);
-  const ours = domain !== undefined && isAssetTarget(target);
-  const { path, format } = parseImageFragment(target);
+  const file = assetHref(domain, written);
+  // The directives are read off the decoded target for the same reason the
+  // path is: micromark hands `w=50%` over as `w=50%25`, which is no width at
+  // all. Decoding happens once, here and in `assetPath`, never in sequence.
+  const { format } = parseImageFragment(decodeTarget(written));
   return (
     <img
       // Ours is rebuilt from the decoded path, which re-encodes exactly once;
       // anything else keeps the URL the renderer produced, escapes and all.
-      src={ours ? attachmentUrl(domain, path) : written}
+      src={file ?? written}
       // Never null: react-markdown hands the alt text through as written, and
       // an image with no alt at all is one a screen reader cannot skip.
       alt={alt ?? ""}
       loading="lazy"
-      style={imageStyle(ours ? format : { align: "center" })}
+      style={imageStyle(file === null ? { align: "center" } : format)}
     />
   );
 }

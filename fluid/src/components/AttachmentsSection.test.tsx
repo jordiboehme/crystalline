@@ -100,6 +100,28 @@ describe("the rail's attachments", () => {
     expect(link).toHaveAttribute("target", "_blank");
   });
 
+  it("resolves a percent-encoded reference the way the page draws it", async () => {
+    // The rail reads the raw source and the reading view is handed a
+    // micromark-normalized URL; both go through the one decode, so a
+    // hand-written escape lists as the file it draws rather than as missing.
+    apiMock.mockResolvedValue(listing(["assets/2026/08/設計.png"]));
+    draw("![Shot](assets/2026/08/%E8%A8%AD%E8%A8%88.png)");
+    expect(await screen.findByText("2.0 KiB")).toBeInTheDocument();
+    expect(screen.getByText("設計.png")).toBeInTheDocument();
+    expect(screen.queryByText("missing")).toBeNull();
+  });
+
+  it("lists a reference written with a leading ./ as the file it names", async () => {
+    apiMock.mockResolvedValue(listing(["assets/2026/08/shot.png"]));
+    draw("![Shot](./assets/2026/08/shot.png#right)");
+    expect(await screen.findByText("2.0 KiB")).toBeInTheDocument();
+    expect(screen.queryByText("missing")).toBeNull();
+    expect(screen.getByRole("link", { name: /shot\.png/ })).toHaveAttribute(
+      "href",
+      "/api/v1/domains/eng/files/assets/2026/08/shot.png",
+    );
+  });
+
   it("says a referenced file is missing rather than pretending it is there", async () => {
     apiMock.mockResolvedValue(listing(["assets/2026/08/shot.png"]));
     draw();

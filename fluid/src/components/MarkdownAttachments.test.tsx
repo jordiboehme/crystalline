@@ -108,6 +108,47 @@ describe("attachments in the reading view", () => {
     expect(link).toHaveAttribute("rel", "noreferrer");
   });
 
+  it("resolves a reference written with a leading ./ , image and link alike", async () => {
+    // The core scanner strips the `./` before it tests the prefix, so such a
+    // reference IS a reference to the engine: it dangling-checks, it is swept
+    // by evolve, and a reading view that left it alone would draw a broken
+    // image beside a rail row that says the file is there.
+    const { container } = await renderMarkdown(
+      "![Shot](./assets/2026/08/shot.png#right)\n\n[The deck](./assets/deck.pdf)",
+      DOMAIN,
+    );
+    expect(image(container).getAttribute("src")).toBe(
+      "/api/v1/domains/eng/files/assets/2026/08/shot.png",
+    );
+    expect(image(container).style.float).toBe("right");
+    expect(screen.getByRole("link", { name: "The deck" })).toHaveAttribute(
+      "href",
+      "/api/v1/domains/eng/files/assets/deck.pdf",
+    );
+  });
+
+  it("strips the fragment from a document link too, which the route never sees", async () => {
+    await renderMarkdown("[The deck](assets/deck.pdf#right)", DOMAIN);
+    expect(screen.getByRole("link", { name: "The deck" })).toHaveAttribute(
+      "href",
+      "/api/v1/domains/eng/files/assets/deck.pdf",
+    );
+  });
+
+  it("builds no URL at all for a target carrying a dot segment", async () => {
+    // The core validator refuses `..` outright, so no file can be stored under
+    // one and this app must never ask for the address it would resolve to.
+    const { container } = await renderMarkdown(
+      "![x](assets/../../evil.png)\n\n[y](assets/../secret.pdf)",
+      DOMAIN,
+    );
+    expect(image(container).getAttribute("src")).toBe("assets/../../evil.png");
+    expect(screen.getByRole("link", { name: "y" })).toHaveAttribute(
+      "href",
+      "assets/../secret.pdf",
+    );
+  });
+
   it("leaves an external image and an absolute one exactly as written", async () => {
     const external = await renderMarkdown(
       "![x](https://example.com/a.png)",

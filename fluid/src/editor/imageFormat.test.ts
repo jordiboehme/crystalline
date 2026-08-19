@@ -12,6 +12,7 @@
 import { describe, expect, test } from "vitest";
 
 import {
+  assetPath,
   assetRefsIn,
   buildImageTarget,
   imageRefsIn,
@@ -131,12 +132,55 @@ describe("isAssetTarget", () => {
   test("only a relative path under the reserved prefix is one of ours", () => {
     expect(isAssetTarget("assets/a.png")).toBe(true);
     expect(isAssetTarget("assets/2026/08/a.png#right")).toBe(true);
+    // The core scanner strips a leading "./" before it tests the prefix, so a
+    // reference written that way IS a reference and has to resolve here too.
+    expect(isAssetTarget("./assets/a.png")).toBe(true);
     // Absolute and external targets belong to whoever wrote them.
     expect(isAssetTarget("/assets/a.png")).toBe(false);
     expect(isAssetTarget("https://example.com/assets/a.png")).toBe(false);
     expect(isAssetTarget("//cdn.example.com/assets/a.png")).toBe(false);
     expect(isAssetTarget("notes/assets/a.png")).toBe(false);
     expect(isAssetTarget("")).toBe(false);
+  });
+
+  test("a path that names no file is not a target either", () => {
+    // The prefix alone, and the prefix with nothing but a fragment after it:
+    // the core drops both, because neither names a file.
+    expect(isAssetTarget("assets/")).toBe(false);
+    expect(isAssetTarget("assets/#left")).toBe(false);
+  });
+
+  test("a dot segment resolves to nothing, because the core would refuse it", () => {
+    // `validate_asset_path` refuses `.` and `..` segments outright, so no such
+    // path can be stored - and a URL built from one would ask the browser for
+    // a different address than the one written.
+    expect(isAssetTarget("assets/../../evil.png")).toBe(false);
+    expect(isAssetTarget("assets/2026/../08/a.png")).toBe(false);
+    expect(isAssetTarget("assets/./a.png")).toBe(false);
+  });
+});
+
+describe("assetPath", () => {
+  test("hands back the stored path a target names, or nothing", () => {
+    expect(assetPath("./assets/a.png#right,w=50%")).toBe("assets/a.png");
+    expect(assetPath("assets/2026/08/deck.pdf")).toBe(
+      "assets/2026/08/deck.pdf",
+    );
+    expect(assetPath("https://example.com/assets/a.png")).toBeNull();
+  });
+
+  test("decodes once, so a written escape and a rendered one are one file", () => {
+    // The reading view is handed a micromark-normalized URL and the rail is
+    // handed the raw source; both come through here, so both have to answer
+    // the same path for the same file.
+    expect(assetPath("assets/2026/08/%E8%A8%AD%E8%A8%88.png")).toBe(
+      "assets/2026/08/設計.png",
+    );
+    expect(assetPath("assets/2026/08/設計.png")).toBe(
+      "assets/2026/08/設計.png",
+    );
+    // A stray percent is not an escape: it survives rather than throwing.
+    expect(assetPath("assets/a%b.png")).toBe("assets/a%b.png");
   });
 });
 
@@ -165,6 +209,40 @@ describe("imageRefsIn", () => {
     expect(imageRefsIn("[deck](assets/deck.pdf)")).toEqual([]);
     // An image reference to a non-image attachment carries no preview either.
     expect(imageRefsIn("![deck](assets/deck.pdf)")).toEqual([]);
+  });
+
+  test("a reference written with a leading ./ is the same reference", () => {
+    const line = "![Shot](./assets/a.png#left)";
+    const [ref] = imageRefsIn(line);
+    expect(ref?.path).toBe("assets/a.png");
+    // What the author wrote is what a rewrite has to put back: the ./ is
+    // theirs, and normalizing it away would be an edit nobody asked for.
+    expect(ref?.written).toBe("./assets/a.png");
+    expect(line.slice(ref?.targetFrom ?? 0, ref?.targetTo ?? 0)).toBe(
+      "./assets/a.png#left",
+    );
+  });
+
+  test("a title clause after the target is dropped, as the core drops it", () => {
+    const line = '![Shot](assets/a.png#right "Q3 deck")';
+    const [ref] = imageRefsIn(line);
+    expect(ref?.path).toBe("assets/a.png");
+    expect(ref?.format).toEqual({ align: "right" });
+    // The span is the target token alone, so a rewrite leaves the title in
+    // place rather than eating it.
+    expect(line.slice(ref?.targetFrom ?? 0, ref?.targetTo ?? 0)).toBe(
+      "assets/a.png#right",
+    );
+  });
+
+  test("brackets inside the alt text do not hide the reference", () => {
+    expect(imageRefsIn("![a [b] c](assets/a.png)").map((r) => r.path)).toEqual([
+      "assets/a.png",
+    ]);
+  });
+
+  test("a dot segment is no picture to draw", () => {
+    expect(imageRefsIn("![x](assets/../../evil.png)")).toEqual([]);
   });
 
   test("the alt text may be empty, which is what an upload writes for a blank name", () => {
@@ -209,6 +287,44 @@ describe("assetRefsIn", () => {
     expect(
       assetRefsIn(["```", "~~~", "![a](assets/a.png)", "```"].join("\n")),
     ).toEqual([]);
+  });
+
+  test("a leading ./ is stripped, so both spellings are one file", () => {
+    expect(assetRefsIn("![a](./assets/a.png) and [b](assets/a.png)")).toEqual([
+      "assets/a.png",
+    ]);
+  });
+
+  test("a title clause after the target is not part of the path", () => {
+    expect(assetRefsIn('[deck](assets/deck.pdf "Q3 deck")')).toEqual([
+      "assets/deck.pdf",
+    ]);
+  });
+
+  test("brackets inside the label do not hide the reference", () => {
+    expect(assetRefsIn("![a [b] c](assets/a.png)")).toEqual(["assets/a.png"]);
+  });
+
+  test("balanced parentheses inside a destination close at the right one", () => {
+    // The core walks to the depth-zero `)`, so a destination carrying a
+    // balanced pair is read whole rather than cut at the first one.
+    expect(assetRefsIn("[x](assets/a(1).png)")).toEqual(["assets/a(1).png"]);
+  });
+
+  test("a closing fence carrying an info string does not close the fence", () => {
+    // The core requires the remainder of a closing fence line to be empty, so
+    // this whole block is code and neither reference counts.
+    expect(
+      assetRefsIn(
+        ["```", "![a](assets/a.png)", "```js", "[b](assets/b.pdf)", "```"].join(
+          "\n",
+        ),
+      ),
+    ).toEqual([]);
+  });
+
+  test("a target that names no file is dropped", () => {
+    expect(assetRefsIn("![x](assets/#left) [y](assets/)")).toEqual([]);
   });
 
   test("external and absolute targets are somebody else's", () => {

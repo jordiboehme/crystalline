@@ -17,6 +17,7 @@ import { parsedState } from "../test/parse";
 import {
   clearImageFormat,
   imageContextAt,
+  imageContextListener,
   setImageAlign,
   setImageWidth,
 } from "./imageVerbs";
@@ -115,6 +116,24 @@ describe("the format verbs", () => {
     view.destroy();
   });
 
+  it("keeps the ./ the author wrote rather than normalizing it away", () => {
+    const doc = "![Shot](./assets/a.png)\n";
+    const view = editor(doc, inside(doc, "![Shot]"));
+    expect(setImageAlign(view, "right")).toBe(true);
+    expect(view.state.doc.toString()).toBe("![Shot](./assets/a.png#right)\n");
+    view.destroy();
+  });
+
+  it("leaves a title clause standing beside the target it rewrites", () => {
+    const doc = '![Shot](assets/a.png "Q3 deck")\n';
+    const view = editor(doc, inside(doc, "![Shot]"));
+    expect(setImageAlign(view, "left")).toBe(true);
+    expect(view.state.doc.toString()).toBe(
+      '![Shot](assets/a.png#left "Q3 deck")\n',
+    );
+    view.destroy();
+  });
+
   it("refuses where there is no image to format", () => {
     const view = editor("plain prose\n", 3);
     expect(setImageAlign(view, "left")).toBe(false);
@@ -146,6 +165,53 @@ describe("the format verbs", () => {
     expect(view.state.doc.toString()).toBe(
       "![a](assets/a.png) ![b](assets/b.png#left)\n",
     );
+    view.destroy();
+  });
+});
+
+describe("imageContextListener", () => {
+  /** A buffer built with the listener on it, reporting into `seen`. */
+  function watched(doc: string, at: number, seen: boolean[]): EditorView {
+    return new EditorView({
+      state: parsedState(
+        EditorState.create({
+          doc,
+          selection: EditorSelection.cursor(at),
+          extensions: [
+            ...baseExtensions(false),
+            imageContextListener((onImage) => seen.push(onImage)),
+          ],
+        }),
+      ),
+      parent: document.body,
+    });
+  }
+
+  it("answers for the state the buffer mounted in, before anything moves", () => {
+    // A buffer can open with the caret already inside a reference, and a menu
+    // that waited for a keystroke to notice would simply not be there.
+    const doc = "![Shot](assets/a.png)\n";
+    const seen: boolean[] = [];
+    const view = watched(doc, doc.indexOf("![Shot]") + 2, seen);
+    expect(seen).toEqual([true]);
+    view.destroy();
+  });
+
+  it("says nothing at mount when the caret is in prose", () => {
+    const seen: boolean[] = [];
+    const view = watched("plain prose\n", 3, seen);
+    expect(seen).toEqual([false]);
+    view.destroy();
+  });
+
+  it("reports crossings only, not every move", () => {
+    const doc = "![Shot](assets/a.png) and prose\n";
+    const seen: boolean[] = [];
+    const view = watched(doc, 2, seen);
+    view.dispatch({ selection: { anchor: doc.length - 4 } });
+    view.dispatch({ selection: { anchor: doc.length - 6 } });
+    view.dispatch({ selection: { anchor: 3 } });
+    expect(seen).toEqual([true, false, true]);
     view.destroy();
   });
 });

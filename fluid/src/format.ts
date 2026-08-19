@@ -49,17 +49,22 @@ const SIZE_UNITS = ["B", "KiB", "MiB"] as const;
  * the same quantity. A round-numbered fraction keeps one decimal only while it
  * says something: `1.2 MiB` is worth the digit, `45.0 KiB` is not, so anything
  * from ten up is stated whole.
+ *
+ * The unit is chosen against the ROUNDED figure rather than the exact one,
+ * which is the whole difference between `1.0 MiB` and `1024 KiB`: one byte
+ * under a megabyte rounds up to the next unit's own boundary, and a size that
+ * reads as a full 1024 of anything is a size stated in the wrong unit.
  */
 export function formatBytes(bytes: number): string {
+  const render = (value: number, unit: number) =>
+    unit === 0 || value >= 10 ? Math.round(value).toString() : value.toFixed(1);
   let value = Math.max(bytes, 0);
   let unit = 0;
-  while (value >= 1024 && unit < SIZE_UNITS.length - 1) {
+  while (unit < SIZE_UNITS.length - 1 && Number(render(value, unit)) >= 1024) {
     value /= 1024;
     unit += 1;
   }
-  const shown =
-    unit === 0 || value >= 10 ? Math.round(value).toString() : value.toFixed(1);
-  return `${shown} ${SIZE_UNITS[unit] ?? "B"}`;
+  return `${render(value, unit)} ${SIZE_UNITS[unit] ?? "B"}`;
 }
 
 /** `n thing` or `n things`, for the counts that appear all over the screens. */

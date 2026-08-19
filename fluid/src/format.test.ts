@@ -58,4 +58,14 @@ describe("a byte count, as a reader reads it", () => {
   it("stops at the unit the ceiling is stated in", () => {
     expect(formatBytes(10 * 1024 * 1024)).toBe("10 MiB");
   });
+
+  it("never states a full 1024 of a unit it has a name above", () => {
+    // One byte under a megabyte rounds up to the next unit's own boundary, so
+    // the unit is picked against the rounded figure rather than the exact one.
+    expect(formatBytes(1024 * 1024 - 1)).toBe("1.0 MiB");
+    // A figure that genuinely rounds to 1023 is 1023, not a coy megabyte.
+    expect(formatBytes(1024 * 1024 - 600)).toBe("1023 KiB");
+    // The top unit has nothing above it, so it keeps counting.
+    expect(formatBytes(2048 * 1024 * 1024)).toBe("2048 MiB");
+  });
 });

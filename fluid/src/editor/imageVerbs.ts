@@ -22,7 +22,7 @@
 import { syntaxTree } from "@codemirror/language";
 import type { EditorState, Extension } from "@codemirror/state";
 import type { EditorView } from "@codemirror/view";
-import { EditorView as View } from "@codemirror/view";
+import { EditorView as View, ViewPlugin } from "@codemirror/view";
 import type { SyntaxNode } from "@lezer/common";
 
 import type { ImageAlign, ImageFormat, ImageRef } from "./imageFormat";
@@ -76,6 +76,7 @@ export function imageContextAt(state: EditorState): ImageContext | null {
     to: node.from + ref.to,
     targetFrom: node.from + ref.targetFrom,
     targetTo: node.from + ref.targetTo,
+    written: ref.written,
     path: ref.path,
     format: ref.format,
   };
@@ -99,7 +100,10 @@ function rewrite(
   if (context === null) {
     return false;
   }
-  const target = buildImageTarget(context.path, next(context.format));
+  // Rebuilt on the path AS WRITTEN rather than on the resolved one: a
+  // reference spelled `./assets/a.png` resolves to the same file and is the
+  // author's spelling, so a placement change must not quietly normalize it.
+  const target = buildImageTarget(context.written, next(context.format));
   if (
     target === view.state.doc.sliceString(context.targetFrom, context.targetTo)
   ) {
@@ -160,23 +164,38 @@ export function imageContextListener(
   onChange: (onImage: boolean) => void,
 ): Extension {
   let last: boolean | null = null;
-  return View.updateListener.of((update) => {
-    // A parse pass is the third reason to re-derive, beside a moved caret and
-    // an edited document: on a document big enough to parse in the
-    // background, the tree that first says "this is an image" arrives in an
-    // update that changed neither of the other two.
-    if (
-      !update.selectionSet &&
-      !update.docChanged &&
-      syntaxTree(update.startState) === syntaxTree(update.state)
-    ) {
-      return;
-    }
-    const now = imageContextAt(update.state) !== null;
+  /** The crossing watch itself, shared by the plugin and the listener below. */
+  const cross = (state: EditorState) => {
+    const now = imageContextAt(state) !== null;
     if (now === last) {
       return;
     }
     last = now;
     onChange(now);
-  });
+  };
+  return [
+    // A buffer can MOUNT with the caret already on an image - a screen that
+    // restores a position, an editor reopened where it was left - and an
+    // update listener is told about changes rather than about the state it
+    // started in, so the menu would stay hidden until something moved. The
+    // plugin's own construction is the one place that state is seen.
+    ViewPlugin.define((view) => {
+      cross(view.state);
+      return {};
+    }),
+    View.updateListener.of((update) => {
+      // A parse pass is the third reason to re-derive, beside a moved caret and
+      // an edited document: on a document big enough to parse in the
+      // background, the tree that first says "this is an image" arrives in an
+      // update that changed neither of the other two.
+      if (
+        !update.selectionSet &&
+        !update.docChanged &&
+        syntaxTree(update.startState) === syntaxTree(update.state)
+      ) {
+        return;
+      }
+      cross(update.state);
+    }),
+  ];
 }

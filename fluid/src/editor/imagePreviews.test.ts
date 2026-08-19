@@ -64,6 +64,14 @@ describe("the editor's attachment previews", () => {
     view.destroy();
   });
 
+  it("previews a reference written with a leading ./", () => {
+    const view = editor("![Shot](./assets/a.png)\n");
+    expect(previews(view)[0]?.getAttribute("src")).toBe(
+      "/api/v1/domains/eng/files/assets/a.png",
+    );
+    view.destroy();
+  });
+
   it("previews every attachment image on a line", () => {
     const view = editor("![a](assets/a.png) ![b](assets/b.png)\n");
     expect(previews(view)).toHaveLength(2);
