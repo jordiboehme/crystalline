@@ -798,3 +798,164 @@ async fn an_unscoped_run_settles_the_whole_backlog_including_a_ghost() {
         "an empty backlog carries no age to nudge about"
     );
 }
+
+// --- attachments -------------------------------------------------------------
+
+/// A domain whose attachments are the point: one file an engram shows but
+/// nobody captured, one an engram claims with the hash it had when it was read
+/// (now wrong), one reference to a file that is not there and one file nothing
+/// mentions at all.
+///
+/// Its own fixture rather than four more files in the one above, because the
+/// grace period on `V007` and `V108` is measured against the file's mtime and
+/// a file written by a test is always modified today: the two dates below are
+/// what moves the sweep to either side of that, and mixing them into the
+/// catalog fixture would make its every-rule assertion depend on the clock.
+async fn attachment_fixture() -> (tempfile::TempDir, Arc<Engine>) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let dir = root.join("att");
+    std::fs::create_dir_all(dir.join("assets")).unwrap();
+
+    let files: Vec<(&str, String)> = vec![
+        (
+            "MANIFEST.md",
+            "---\ntype: manifest\ntitle: att\npermalink: manifest\ntags:\n  - manifest\nstatus: stable\nrecorded_at: 2026-07-25\n---\n\n# att\n\n## Scope\n\n- Everything with a file attached\n\n## When to Use\n\n- Route here for the attachment rules\n".to_string(),
+        ),
+        // V007: shown to a reader, claimed by nobody.
+        (
+            "shows-deck.md",
+            "---\ntype: engram\ntitle: Shows the deck\npermalink: shows-deck\ntags:\n  - decks\nstatus: stable\nrecorded_at: 2026-07-25\n---\n\nThe quarter's numbers are in the deck below.\n\n![Deck](assets/deck.png)\n\n- [context] the deck came out of the review\n".to_string(),
+        ),
+        // V008: a claim in the frontmatter carrying the hash the file had when
+        // it was read. The file's real hash is different, and reading the claim
+        // at all is what proves the sweep sees a file domain's frontmatter.
+        (
+            "captured-shot.md",
+            "---\ntype: engram\ntitle: What the shot shows\npermalink: captured-shot\ntags:\n  - decks\nstatus: stable\nrecorded_at: 2026-07-25\nanalyzes: assets/shot.png\nanalyzed_hash: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n---\n\nThe screenshot shows the queue draining after the restart.\n\n- [context] read out of the incident channel\n- [lesson] the drain is not instant\n".to_string(),
+        ),
+        // V107: a body reference to a file the domain does not hold.
+        (
+            "ghost-ref.md",
+            "---\ntype: engram\ntitle: Points at a ghost\npermalink: ghost-ref\ntags:\n  - decks\nstatus: stable\nrecorded_at: 2026-07-25\n---\n\nThe diagram used to live beside this text.\n\n[Diagram](assets/gone.png)\n\n- [context] the file left with a folder move\n".to_string(),
+        ),
+    ];
+    for (rel, body) in files {
+        std::fs::write(dir.join(rel), body).unwrap();
+    }
+    for name in ["deck.png", "shot.png", "stray.png"] {
+        std::fs::write(
+            dir.join("assets").join(name),
+            format!("PNG bytes of {name}"),
+        )
+        .unwrap();
+    }
+
+    let mut cfg = GlobalConfig::default();
+    cfg.domains
+        .insert("att".to_string(), DomainEntry::file(dir));
+    let config_path = root.join("config.yaml");
+    crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
+
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let engine = Arc::new(Engine::new(
+        Arc::new(Mutex::new(store)),
+        cfg,
+        None,
+        Some(config_path),
+    ));
+    engine.sync(None).await.unwrap();
+    (tmp, engine)
+}
+
+/// The four attachment rules over a real file domain: the rows come from the
+/// walker, the claims come from the frontmatter on disk and the grace period
+/// comes from the files' own mtimes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_attachment_rules_fire_over_a_real_domain() {
+    let (_tmp, engine) = attachment_fixture().await;
+    let attachment_rules = vec![
+        "V007".to_string(),
+        "V008".to_string(),
+        "V107".to_string(),
+        "V108".to_string(),
+    ];
+
+    // Long after the files were written, so both grace periods have passed.
+    let v = sweep(
+        &engine,
+        "2099-01-01",
+        EvolveParams {
+            domains: vec!["att".to_string()],
+            rules: attachment_rules.clone(),
+            limit: Some(100),
+            ..EvolveParams::default()
+        },
+    )
+    .await;
+
+    let by_rule = |rule: &str| -> Value {
+        v["queue"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["rule"] == rule)
+            .cloned()
+            .unwrap_or_else(|| panic!("no {rule} in {:?}", rules(&v)))
+    };
+    assert_eq!(v["total"], 4, "one of each: {:?}", rules(&v));
+
+    assert_eq!(by_rule("V007")["permalink"], "shows-deck");
+    assert!(
+        by_rule("V007")["evidence"]
+            .as_str()
+            .unwrap()
+            .starts_with("assets/deck.png; image/png, "),
+        "{}",
+        by_rule("V007")["evidence"]
+    );
+    assert!(
+        by_rule("V007")["evidence"]
+            .as_str()
+            .unwrap()
+            .ends_with("no engram claims it via analyzes")
+    );
+
+    // The claim and its hash were read off the file's frontmatter, which the
+    // index never stores for a file domain.
+    assert_eq!(by_rule("V008")["permalink"], "captured-shot");
+    assert!(
+        by_rule("V008")["evidence"].as_str().unwrap().starts_with(
+            "analyzes assets/shot.png; analyzed_hash 01234567.. but the attachment is now "
+        ),
+        "{}",
+        by_rule("V008")["evidence"]
+    );
+
+    assert_eq!(by_rule("V107")["permalink"], "ghost-ref");
+    assert_eq!(by_rule("V107")["fix"], "assets/gone.png");
+
+    // The orphan carries the path as its subject and no engram address, so
+    // nothing renders it as a link to knowledge that does not exist.
+    assert_eq!(by_rule("V108")["permalink"], "");
+    assert_eq!(by_rule("V108")["title"], "assets/stray.png");
+    assert_eq!(by_rule("V108")["class"], "judgment");
+
+    // Evaluated before the files existed, the two rules with a grace period go
+    // quiet and the two without it do not - the same reproducibility the other
+    // temporal rules get from `today`.
+    let early = sweep(
+        &engine,
+        "2020-01-01",
+        EvolveParams {
+            domains: vec!["att".to_string()],
+            rules: attachment_rules,
+            limit: Some(100),
+            ..EvolveParams::default()
+        },
+    )
+    .await;
+    let mut fired = rules(&early);
+    fired.sort();
+    assert_eq!(fired, vec!["V008", "V107"]);
+}

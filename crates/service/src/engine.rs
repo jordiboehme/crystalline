@@ -4869,7 +4869,7 @@ impl Engine {
     /// shapes the merged result. Nothing is written and nothing is remembered,
     /// so "what is left" is re-derived by calling again with the same scope.
     ///
-    /// Five details of the assembly are load-bearing, each guarding a class of
+    /// Six details of the assembly are load-bearing, each guarding a class of
     /// silently wrong finding:
     ///
     /// - the resolved degrees are counted over the **merged** graph slices, so
@@ -4888,7 +4888,17 @@ impl Engine {
     /// - `known_domains` is every registered domain, so `V102` can tell an
     ///   unregistered target domain apart from a target that does not exist,
     ///   and the graph is taken at depth 1 so cross-domain targets carry a
-    ///   status for `V101` to read.
+    ///   status for `V101` to read;
+    /// - the attachment facts (`analyzes`, `analyzed_hash`, `asset_refs`) are
+    ///   read off the **parsed engram** [`Engine::load_engram`] returns - the
+    ///   file for a file domain, the stored source for a virtual one - and
+    ///   never off the index's `content` column, which for a file domain holds
+    ///   the body alone. A claim lives in the frontmatter, so counting it off
+    ///   the index would make every file domain look as if it claimed nothing
+    ///   and would report claimed attachments as orphans. This is the same
+    ///   split [`Engine::peer_engram_text`] makes for the move's referent
+    ///   count, and the two agree on what a reference is: an `assets/` link in
+    ///   the body or the `analyzes` key, compared as exact paths.
     pub async fn evolve_detect(&self, p: &EvolveParams) -> Result<Value> {
         let today = match p.today.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
             Some(s) => NaiveDate::parse_from_str(s, "%Y-%m-%d").map_err(|_| {
@@ -4950,6 +4960,9 @@ impl Engine {
             let store = self.store.lock().await;
             let unresolved = store.unresolved_refs(domain_id).await?;
             let vocab = store.vocabulary(Some(name)).await?;
+            // Metadata only, one query: the attachment rules compare paths,
+            // sizes and hashes and never read a byte of any file.
+            let attachments = store.list_attachments(domain_id).await?;
             drop(store);
 
             let verify_config = domain_verify_config(&source);
@@ -4999,6 +5012,15 @@ impl Engine {
                     inbound: inbound.get(&d.id.0).copied().unwrap_or(0),
                     outbound: outbound.get(&d.id.0).copied().unwrap_or(0),
                     generated_by: fm.generated.as_ref().map(|g| g.by.clone()),
+                    analyzes: asset_claim(fm),
+                    analyzed_hash: fm
+                        .extra
+                        .get("analyzed_hash")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|h| !h.is_empty())
+                        .map(str::to_string),
+                    asset_refs: crystalline_core::find_asset_refs(&engram.body),
                     body: engram.body,
                 });
             }
@@ -5012,6 +5034,7 @@ impl Engine {
                 tags: vocab.tags,
                 tag_aliases: vocab.aliases,
                 known_domains: known_domains.clone(),
+                attachments,
                 options: SweepOptions::default(),
             };
             let report = detect(&input);
