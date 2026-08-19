@@ -1699,6 +1699,10 @@ fn detect_attachments(input: &SweepInput, report: &mut SweepReport) {
                 missing.entry(path.as_str()).or_default().0 = true;
             }
         }
+        // A claim on its own counts, not only a claim beside a body reference:
+        // an `analyzes` pointing at nothing is a promise the engram cannot
+        // keep, and the evidence below names the claim as where the missing
+        // path was written, which is what tells the two cases apart.
         if let Some(claim) = claim
             && !rows.contains_key(claim)
         {
@@ -1713,16 +1717,21 @@ fn detect_attachments(input: &SweepInput, report: &mut SweepReport) {
                 };
                 format!("{path} {how}")
             }));
+            let (found, held) = if missing.len() == 1 {
+                (
+                    "points at an attachment that is not there".to_string(),
+                    format!("nothing in {} holds that path", fact.domain),
+                )
+            } else {
+                (
+                    format!("points at {} attachments that are not there", missing.len()),
+                    format!("nothing in {} holds those paths", fact.domain),
+                )
+            };
             report.findings.push(Finding::about("V107", fact).with(
                 Class::Judgment,
-                format!(
-                    "names {} attachment(s) the domain does not hold",
-                    missing.len()
-                ),
-                format!(
-                    "{listed}; nothing under assets/ in {} holds them",
-                    fact.domain
-                ),
+                found,
+                format!("{listed}; {held}"),
                 join_semis(missing.keys()),
             ));
         }

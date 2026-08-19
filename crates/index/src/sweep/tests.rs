@@ -1108,16 +1108,21 @@ fn v107_names_the_missing_path_and_how_it_is_referenced() {
     };
     assert_eq!(of("shows-a-ghost").priority, 45);
     assert_eq!(of("shows-a-ghost").family, Family::Structure);
-    assert!(
-        of("shows-a-ghost")
-            .evidence
-            .starts_with("assets/gone.png referenced in the body")
+    assert_eq!(
+        of("shows-a-ghost").finding,
+        "points at an attachment that is not there"
+    );
+    assert_eq!(
+        of("shows-a-ghost").evidence,
+        "assets/gone.png referenced in the body; nothing in engineering holds that path"
     );
     assert_eq!(of("shows-a-ghost").fix, "assets/gone.png");
-    assert!(
-        of("claims-a-ghost")
-            .evidence
-            .starts_with("assets/also-gone.pdf claimed by analyzes")
+
+    // A claim on its own is the same finding, and the evidence says the claim
+    // is where the missing path was written.
+    assert_eq!(
+        of("claims-a-ghost").evidence,
+        "assets/also-gone.pdf claimed by analyzes; nothing in engineering holds that path"
     );
     assert!(
         of("shows-and-claims")
@@ -1138,7 +1143,14 @@ fn v107_reports_one_finding_per_engram_with_its_paths_sorted() {
     let finding = only(&report, "V107");
     assert_eq!(
         finding.finding,
-        "names 2 attachment(s) the domain does not hold"
+        "points at 2 attachments that are not there"
+    );
+    assert!(
+        finding
+            .evidence
+            .ends_with("nothing in engineering holds those paths"),
+        "{}",
+        finding.evidence
     );
     assert_eq!(finding.fix, "assets/a-first.png; assets/z-last.png");
 }
