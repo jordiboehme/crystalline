@@ -1066,3 +1066,112 @@ async fn a_move_between_domain_kinds_carries_the_bytes_both_ways() {
         PNG
     );
 }
+
+#[tokio::test]
+async fn a_case_variant_claim_in_the_source_still_forces_a_copy() {
+    let (_tmp, engine, from, _into, _scratch) = move_fixture().await;
+    engine
+        .restore_engram(
+            "from",
+            "note.md",
+            &engram_source("Note", "note", "", "![shot](assets/shot.png)"),
+        )
+        .await
+        .unwrap();
+    // The claim names the reserved folder in another case, which is the same
+    // folder on APFS and NTFS and is folded to one spelling when the claim is
+    // read. Whatever screens the engrams before that reading has to be at
+    // least as wide, or a live claim loses its file.
+    engine
+        .restore_engram(
+            "from",
+            "claimer.md",
+            &engram_source(
+                "Claimer",
+                "claimer",
+                "analyzes: Assets/shot.png\n",
+                "What the shot showed.",
+            ),
+        )
+        .await
+        .unwrap();
+    engine
+        .attachment_write("from", "assets/shot.png", PNG.to_vec())
+        .await
+        .unwrap();
+
+    engine
+        .move_engram(&move_params("from", "note", "note.md", Some("into")))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        engine.attachment_list("from").await.unwrap().len(),
+        1,
+        "the claim that stayed behind still owns the file"
+    );
+    assert_eq!(
+        std::fs::read(from.join("assets").join("shot.png")).unwrap(),
+        PNG
+    );
+    assert_eq!(engine.attachment_list("into").await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_collision_on_a_path_at_the_length_cap_lands_on_a_valid_name() {
+    let (_tmp, engine, _from, into, _scratch) = move_fixture().await;
+    // Exactly at the 256 byte ceiling, spread over folders because a single
+    // filename has its own (shorter) limit on every real filesystem:
+    // `assets/` + 100 + `/` + 100 + `/` + 43 + `.png`. Appending `-2` would
+    // push the suffixed path past the ceiling, so the name that lands has to
+    // be shortened rather than refused, or the rewritten reference would point
+    // at a path no write will ever accept.
+    let folders = format!("{}/{}", "d".repeat(100), "e".repeat(100));
+    let long_path = format!("assets/{folders}/{}.png", "a".repeat(43));
+    assert_eq!(long_path.len(), 256);
+    let expected = format!("assets/{folders}/{}-2.png", "a".repeat(41));
+    assert_eq!(expected.len(), 256);
+
+    engine
+        .restore_engram(
+            "from",
+            "note.md",
+            &engram_source("Note", "note", "", &format!("![shot]({long_path})")),
+        )
+        .await
+        .unwrap();
+    engine
+        .attachment_write("from", &long_path, PNG.to_vec())
+        .await
+        .unwrap();
+    engine
+        .attachment_write("into", &long_path, OTHER_PNG.to_vec())
+        .await
+        .unwrap();
+
+    engine
+        .move_engram(&move_params("from", "note", "note.md", Some("into")))
+        .await
+        .unwrap();
+
+    let landed = engine.attachment_list("into").await.unwrap();
+    let paths: Vec<&str> = landed.iter().map(|row| row.path.as_str()).collect();
+    assert!(
+        paths.contains(&expected.as_str()),
+        "the carried file needs a name that fits: {paths:?}"
+    );
+    assert_eq!(
+        engine.attachment_read("into", &expected).await.unwrap().0,
+        PNG
+    );
+    assert_eq!(
+        std::fs::read(into.join(&long_path)).unwrap(),
+        OTHER_PNG,
+        "the destination's own file is untouched"
+    );
+    let text = moved_text(&into, "note.md");
+    assert!(
+        text.contains(&format!("![shot]({expected})")),
+        "the reference follows the shortened name: {text}"
+    );
+}

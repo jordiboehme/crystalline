@@ -2140,7 +2140,10 @@ impl Engine {
             match self.attachment_read(&src.domain, &path).await {
                 Ok((_, row)) => present.push((path, row.sha256)),
                 Err(e) => {
-                    tracing::debug!(
+                    // Loud enough to answer "why did my screenshot not
+                    // travel": the move went through, but something the engram
+                    // points at did not come with it.
+                    tracing::warn!(
                         "attachment '{path}' referenced by '{}' is not in '{}' ({e}); the move carries nothing for it",
                         src.permalink,
                         src.domain
@@ -2175,30 +2178,56 @@ impl Engine {
     }
 
     /// The attachment paths another engram in the source domain still
-    /// references or claims.
+    /// references or claims, with every failure resolved the safe way by
+    /// [`resolve_shared`].
     ///
     /// Counted across live and retired engrams alike, the way the
     /// consolidation sweep counts referents: a deprecated engram showing a
     /// screenshot needs the file exactly as much as a current one does, so its
     /// reference is what turns a move into a copy.
-    ///
-    /// Bodies are read one at a time rather than in one batch, because a
-    /// domain can hold multi-megabyte engrams and this runs on an ordinary
-    /// move; the substring screen keeps the parse to the engrams that could
-    /// possibly match, and the scan stops as soon as every candidate is
-    /// accounted for.
     async fn shared_asset_paths(
         &self,
         src: &EngramDescriptor,
         candidates: &[String],
     ) -> HashSet<String> {
+        resolve_shared(
+            self.count_shared_asset_paths(src, candidates).await,
+            candidates,
+        )
+    }
+
+    /// The counting itself: which candidates another engram in `src`'s domain
+    /// still references or claims, or the first failure that stopped the count
+    /// from answering.
+    ///
+    /// Engrams are read one at a time rather than in one batch, because a
+    /// domain can hold multi-megabyte engrams and this runs on an ordinary
+    /// move; the screen keeps the parse to the engrams that could possibly
+    /// match, and the scan stops as soon as every candidate is accounted for.
+    ///
+    /// The screen tests the path *below* the reserved folder (`shot.png` for
+    /// `assets/shot.png`) rather than the whole path, which makes it strictly
+    /// wider than the decision it protects: a body reference must spell the
+    /// folder as `assets/` to be a reference at all, and a claim is folded to
+    /// that spelling when it is read, so an engram claiming `Assets/shot.png`
+    /// (the same folder on APFS and NTFS) is screened in and then decided
+    /// exactly. A narrower screen would let a live claim lose its file.
+    ///
+    /// Nothing here answers "not referenced" on a failure. A store error is
+    /// returned, and text that will not parse marks every candidate the screen
+    /// matched in it as referenced: the engram plainly mentions the path and
+    /// the only reading that cannot delete something in use is that it uses
+    /// it.
+    async fn count_shared_asset_paths(
+        &self,
+        src: &EngramDescriptor,
+        candidates: &[String],
+    ) -> Result<HashSet<String>> {
         let mut shared: HashSet<String> = HashSet::new();
+        let source = self.content_source(&src.domain)?;
         let others = {
             let store = self.store.lock().await;
-            store
-                .list_engrams(&src.domain, None, None)
-                .await
-                .unwrap_or_default()
+            store.list_engrams(&src.domain, None, None).await?
         };
         for other in others {
             if shared.len() == candidates.len() {
@@ -2207,30 +2236,83 @@ impl Engine {
             if other.path == src.path {
                 continue;
             }
-            let text = {
-                let store = self.store.lock().await;
-                store
-                    .engram_content(src.domain_id, &other.path)
-                    .await
-                    .ok()
-                    .flatten()
+            let Some(text) = self
+                .peer_engram_text(&source, src.domain_id, &other.path)
+                .await?
+            else {
+                // Whatever the listing knew about, its text is not there any
+                // more, and text that is gone references nothing. Only a real
+                // read failure counts as not knowing, and that is an `Err`.
+                continue;
             };
-            let Some(text) = text else { continue };
-            if !candidates.iter().any(|path| text.contains(path.as_str())) {
+            let screened: Vec<&String> = candidates
+                .iter()
+                .filter(|path| text.contains(asset_tail(path)))
+                .collect();
+            if screened.is_empty() {
                 continue;
             }
             let Ok(engram) = parse_engram(&text) else {
+                for candidate in screened {
+                    shared.insert(candidate.clone());
+                }
                 continue;
             };
             let refs = crystalline_core::find_asset_refs(&engram.body);
             let claim = asset_claim(&engram.frontmatter);
-            for candidate in candidates {
+            for candidate in screened {
                 if refs.contains(candidate) || claim.as_deref() == Some(candidate.as_str()) {
                     shared.insert(candidate.clone());
                 }
             }
         }
-        shared
+        Ok(shared)
+    }
+
+    /// One peer engram's whole text, frontmatter included, for the referent
+    /// count.
+    ///
+    /// Deliberately not [`Store::engram_content`] alone. The index keeps only
+    /// the *body* for a file domain (`EngramRecord::from_engram` sets
+    /// `content` to `engram.body`; the virtual write path is the one that
+    /// stores the whole source), and an `analyzes` claim lives in the
+    /// frontmatter - so counting off the index alone would never see a claim
+    /// in a file domain and would delete a claimed attachment out from under
+    /// the engram that claimed it. A file domain is therefore read from its
+    /// files, which is where its frontmatter actually is, and a virtual domain
+    /// from the database, which is where its whole engram actually is.
+    ///
+    /// That is one file read per engram in the source domain on a
+    /// cross-domain move that carries attachments. It is the price of counting
+    /// claims at all, and the verb is rare.
+    ///
+    /// `None` when the text is genuinely absent (a row the index still lists
+    /// for a file that is gone): text that is not there references nothing. A
+    /// read that fails for any other reason is an `Err`, which
+    /// [`resolve_shared`] turns into "still referenced".
+    async fn peer_engram_text(
+        &self,
+        source: &ContentSource,
+        domain_id: DomainId,
+        path: &str,
+    ) -> Result<Option<String>> {
+        match source {
+            ContentSource::File { root } => {
+                let abs = join_rel(root, path);
+                match std::fs::read_to_string(&abs) {
+                    Ok(text) => Ok(Some(text)),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                    Err(source) => Err(EngineError::Io {
+                        path: abs.display().to_string(),
+                        source,
+                    }),
+                }
+            }
+            ContentSource::Virtual => {
+                let store = self.store.lock().await;
+                Ok(store.engram_content(domain_id, path).await?)
+            }
+        }
     }
 
     /// The path an attachment takes at the destination, and whether the
@@ -2240,9 +2322,20 @@ impl Engine {
     /// when the file already there has the same sha256 (same name, same bytes,
     /// same file); `name-2.ext`, `name-3.ext` and so on when something
     /// different holds it, since a move must never overwrite a file the
-    /// destination domain already had. `None` when no free name could be
-    /// settled or the destination could not be inspected, which leaves the
-    /// attachment where it is rather than guessing.
+    /// destination domain already had. Every suffixed name is put back through
+    /// [`crystalline_core::validate_asset_path`], so the name the engram's
+    /// references are rewritten to is always a name a write will accept.
+    ///
+    /// `None` when no free, valid name could be settled or the destination
+    /// could not be inspected. That is the fallback that keeps everything
+    /// referenced: the attachment is simply not carried, so nothing is written
+    /// at the destination, nothing is deleted at the source and the moving
+    /// engram's references keep the spelling they had. The whole file stays in
+    /// the source domain under the name that still addresses it there, and the
+    /// destination is left with a plain dangling reference for the sweep to
+    /// report - the same outcome an already-missing attachment produces, and
+    /// the one thing that cannot happen is a reference rewritten to a name
+    /// nothing will ever accept.
     async fn free_asset_destination(
         &self,
         dest_domain: &str,
@@ -2254,7 +2347,10 @@ impl Engine {
             let candidate = if attempt == 1 {
                 path.to_string()
             } else {
-                suffixed_asset_path(path, attempt)
+                // A stem that cannot be shortened into a valid name at all
+                // cannot be shortened into a valid longer-suffixed one either,
+                // so this ends the search rather than skipping an attempt.
+                suffixed_asset_path(path, attempt)?
             };
             // A name another attachment in this same move already took is
             // occupied even though nothing is written there yet.
@@ -2266,7 +2362,10 @@ impl Engine {
                 Ok(_) => {}
                 Err(EngineError::NotFound(_)) => return Some((candidate, false)),
                 Err(e) => {
-                    tracing::warn!(
+                    // The attachment stays whole where it is, so this is a
+                    // note for whoever is reading the trace rather than
+                    // something the user lost.
+                    tracing::debug!(
                         "'{candidate}' in '{dest_domain}' could not be inspected ({e}); '{path}' stays where it is"
                     );
                     return None;
@@ -9256,6 +9355,35 @@ struct AttachmentCarry {
     shared: bool,
 }
 
+/// The counting's verdict, resolved so that not knowing can only point the
+/// safe way.
+///
+/// A failure to count means "we do not know whether anything else in the
+/// domain still uses these files", and the only reading of not knowing that
+/// cannot destroy something is that something does: an unknown resolves to
+/// shared, which copies the attachment and leaves the source copy where it is.
+/// The opposite default would let a store hiccup authorize a delete, and a
+/// delete is the one step of a move that cannot be taken back.
+fn resolve_shared(counted: Result<HashSet<String>>, candidates: &[String]) -> HashSet<String> {
+    match counted {
+        Ok(shared) => shared,
+        Err(e) => {
+            tracing::warn!(
+                "the referents of the attachments being moved could not be counted ({e}); each one is copied rather than moved, so nothing is removed from the source"
+            );
+            candidates.iter().cloned().collect()
+        }
+    }
+}
+
+/// The part of an attachment path below the reserved folder (`notes/shot.png`
+/// for `assets/notes/shot.png`), which is the part every spelling of a
+/// reference to it shares.
+fn asset_tail(path: &str) -> &str {
+    path.strip_prefix(crystalline_core::ASSETS_PREFIX)
+        .unwrap_or(path)
+}
+
 /// The `assets/` path an engram's `analyzes` claim names, or `None` when it
 /// claims nothing under the folder.
 ///
@@ -9273,15 +9401,41 @@ fn asset_claim(fm: &Frontmatter) -> Option<String> {
 /// when the destination already holds a different file under its own.
 ///
 /// The counter goes before the extension rather than after it, so the file
-/// keeps the extension its mime and its allowlist decision rest on.
-fn suffixed_asset_path(path: &str, attempt: usize) -> String {
+/// keeps the extension its mime and its allowlist decision rest on, and the
+/// stem is shortened as far as it has to be for the result to pass
+/// [`crystalline_core::validate_asset_path`]. A path already at the length
+/// ceiling would otherwise grow past it, and since this name is what the
+/// moving engram's references are rewritten to, an invalid one would be a
+/// reference rewritten to a path no write can ever accept. `None` when no
+/// valid name can be built even with the stem gone, which leaves the
+/// attachment uncarried rather than renamed into nowhere.
+fn suffixed_asset_path(path: &str, attempt: usize) -> Option<String> {
     let (dir, name) = match path.rsplit_once('/') {
         Some((dir, name)) => (format!("{dir}/"), name),
         None => (String::new(), path),
     };
-    match name.rsplit_once('.') {
-        Some((stem, extension)) => format!("{dir}{stem}-{attempt}.{extension}"),
-        None => format!("{dir}{name}-{attempt}"),
+    let (stem, extension) = match name.rsplit_once('.') {
+        Some((stem, extension)) => (stem, Some(extension)),
+        None => (name, None),
+    };
+    let mut keep = stem.len();
+    loop {
+        let candidate = match extension {
+            Some(extension) => format!("{dir}{}-{attempt}.{extension}", &stem[..keep]),
+            None => format!("{dir}{}-{attempt}", &stem[..keep]),
+        };
+        if crystalline_core::validate_asset_path(&candidate).is_ok() {
+            return Some(candidate);
+        }
+        if keep == 0 {
+            return None;
+        }
+        // One character at a time, never one byte: a stem cut through a
+        // multi-byte character would not be a string at all.
+        keep -= 1;
+        while keep > 0 && !stem.is_char_boundary(keep) {
+            keep -= 1;
+        }
     }
 }
 
@@ -10178,5 +10332,95 @@ mod lock_tests {
             theirs,
             "and the other writer's version is still the one on disk"
         );
+    }
+}
+
+#[cfg(test)]
+mod attachment_carry_tests {
+    use super::*;
+
+    fn candidates() -> Vec<String> {
+        vec![
+            "assets/shot.png".to_string(),
+            "assets/notes/deck.pptx".to_string(),
+        ]
+    }
+
+    /// The safe default is structural: whatever went wrong while counting
+    /// referents, every candidate comes back shared, which copies it and
+    /// leaves the source copy in place. An error must never point in the
+    /// deleting direction.
+    #[test]
+    fn a_counting_failure_resolves_to_shared() {
+        let candidates = candidates();
+        for failure in [
+            EngineError::Invalid("broken".into()),
+            EngineError::NotFound("gone".into()),
+            EngineError::Conflict("busy".into()),
+        ] {
+            let resolved = resolve_shared(Err(failure), &candidates);
+            assert_eq!(
+                resolved,
+                candidates.iter().cloned().collect::<HashSet<String>>(),
+                "a failure to count has to read as 'still in use'"
+            );
+        }
+    }
+
+    /// And a successful count is passed through exactly, so the safe default
+    /// costs nothing when the counting worked.
+    #[test]
+    fn a_successful_count_passes_through() {
+        let candidates = candidates();
+        let counted: HashSet<String> = std::iter::once(candidates[0].clone()).collect();
+        assert_eq!(resolve_shared(Ok(counted.clone()), &candidates), counted);
+        assert!(resolve_shared(Ok(HashSet::new()), &candidates).is_empty());
+    }
+
+    #[test]
+    fn the_screen_matches_every_spelling_of_a_reference() {
+        assert_eq!(asset_tail("assets/shot.png"), "shot.png");
+        assert_eq!(asset_tail("assets/notes/deck.pptx"), "notes/deck.pptx");
+        // A claim may name the folder in another case; the part below it is
+        // what both spellings share, which is why the screen tests that.
+        assert!("analyzes: Assets/shot.png".contains(asset_tail("assets/shot.png")));
+        assert!("![x](./assets/shot.png#right)".contains(asset_tail("assets/shot.png")));
+    }
+
+    #[test]
+    fn a_suffixed_name_stays_a_valid_attachment_path() {
+        assert_eq!(
+            suffixed_asset_path("assets/shot.png", 2).unwrap(),
+            "assets/shot-2.png"
+        );
+        assert_eq!(
+            suffixed_asset_path("assets/notes/deck.pptx", 3).unwrap(),
+            "assets/notes/deck-3.pptx"
+        );
+
+        // At the 256 byte ceiling the stem gives way, never the extension:
+        // the name has to stay one a write will accept, because the engram's
+        // references are rewritten to it.
+        let at_cap = format!("assets/{}.png", "a".repeat(245));
+        assert_eq!(at_cap.len(), 256);
+        let suffixed = suffixed_asset_path(&at_cap, 2).unwrap();
+        assert_eq!(suffixed, format!("assets/{}-2.png", "a".repeat(243)));
+        assert!(crystalline_core::validate_asset_path(&suffixed).is_ok());
+        let long_suffix = suffixed_asset_path(&at_cap, 100).unwrap();
+        assert!(crystalline_core::validate_asset_path(&long_suffix).is_ok());
+
+        // A multi-byte stem is cut on character boundaries, not byte ones:
+        // 255 bytes of path with a two-byte stem character, where `-2` no
+        // longer fits and exactly one character has to go.
+        let wide = format!("assets/{}.png", "é".repeat(122));
+        assert_eq!(wide.len(), 255);
+        let cut = suffixed_asset_path(&wide, 2).unwrap();
+        assert!(crystalline_core::validate_asset_path(&cut).is_ok());
+        assert_eq!(cut, format!("assets/{}-2.png", "é".repeat(121)));
+
+        // And a path with no room left at all is refused rather than
+        // rewritten into something no write would take.
+        let hopeless = format!("assets/{}/x.png", "d".repeat(246));
+        assert!(suffixed_asset_path(&hopeless, 2).is_none());
     }
 }
