@@ -1941,12 +1941,13 @@ impl ServerHandler for McpServer {
     /// client holding a uri from an earlier listing gets the bytes rather than
     /// a puzzle.
     ///
-    /// An attachment uri is anything [`CrystallineUrl::asset_path`] recognizes,
-    /// and the bytes come back the way the file is read rather than the way it
-    /// was asked for: a text mime as `TextResourceContents`, everything else
-    /// base64 in `BlobResourceContents`. This is the one place base64 is ever
-    /// emitted - a tool result carries links, never bytes - so a model spends
-    /// the context on an image or a deck only when it decided to open it.
+    /// An attachment uri is anything [`CrystallineUrl::asset_path`] recognizes
+    /// once its path has been percent-decoded (see [`decoded_uri_path`]), and
+    /// the bytes come back the way the file is read rather than the way it was
+    /// asked for: a text mime as `TextResourceContents`, everything else base64
+    /// in `BlobResourceContents`. This is the one place base64 is ever emitted
+    /// - a tool result carries links, never bytes - so a model spends the
+    /// context on an image or a deck only when it decided to open it.
     async fn read_resource(
         &self,
         request: ReadResourceRequestParams,
@@ -1959,21 +1960,25 @@ impl ServerHandler for McpServer {
             .with_cache_hints(&context)
             .into());
         }
-        if let Some(url) = CrystallineUrl::parse(&request.uri)
-            && let Some(path) = url.asset_path()
-        {
-            let (bytes, row) = self
-                .engine
-                .attachment_read(&url.domain, path)
-                .await
-                .map_err(to_error)?;
-            return Ok(ReadResourceResult::new(vec![attachment_contents(
-                &request.uri,
-                bytes,
-                &row.mime,
-            )])
-            .with_cache_hints(&context)
-            .into());
+        if let Some(url) = CrystallineUrl::parse(&request.uri) {
+            let url = CrystallineUrl {
+                permalink: decoded_uri_path(&url.permalink)?,
+                ..url
+            };
+            if let Some(path) = url.asset_path() {
+                let (bytes, row) = self
+                    .engine
+                    .attachment_read(&url.domain, path)
+                    .await
+                    .map_err(to_error)?;
+                return Ok(ReadResourceResult::new(vec![attachment_contents(
+                    &request.uri,
+                    bytes,
+                    &row.mime,
+                )])
+                .with_cache_hints(&context)
+                .into());
+            }
         }
         Err(ErrorData::invalid_params(
             format!(
@@ -2018,6 +2023,40 @@ impl ServerHandler for McpServer {
             ))
             .await
     }
+}
+
+/// The percent-decoded path of a `crystalline://` resource uri.
+///
+/// RFC 3986 lets a path carry only a restricted set of characters, so a
+/// conforming client percent-encodes the rest before sending a uri back - every
+/// non-ASCII letter in a filename a human chose, for a start. The REST file
+/// route gets this step for free from axum's `Path` extractor, which decodes
+/// before the handler runs (`crate::rest::files`); the MCP surface has no
+/// extractor in front of it, so it decodes here. Without it a browser and an
+/// agent following the same link reach different answers on the same file.
+///
+/// Decoding is not lenient. A sequence that is not valid UTF-8 once decoded is
+/// refused, and so is a decoded control character:
+/// [`crystalline_core::validate_asset_path`] refuses control characters too,
+/// but a NUL reaching a filesystem call truncates the name it is part of, so
+/// the guarantee is made here rather than borrowed. A path with nothing to
+/// decode comes back unchanged.
+fn decoded_uri_path(path: &str) -> Result<String, ErrorData> {
+    let decoded = percent_encoding::percent_decode_str(path)
+        .decode_utf8()
+        .map_err(|e| {
+            ErrorData::invalid_params(
+                format!("resource uri path '{path}' is not valid UTF-8 once percent-decoded: {e}"),
+                None,
+            )
+        })?;
+    if decoded.chars().any(char::is_control) {
+        return Err(ErrorData::invalid_params(
+            format!("resource uri path '{path}' percent-decodes to a control character"),
+            None,
+        ));
+    }
+    Ok(decoded.into_owned())
 }
 
 /// One attachment's bytes as resource contents, in the shape its mime asks

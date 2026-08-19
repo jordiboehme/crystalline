@@ -126,8 +126,11 @@ pub enum AssetPathError {
     /// A segment starts with `.`, which would hide the file from sync.
     #[error("an attachment path must not hold a segment starting with `.`")]
     HiddenSegment,
-    /// The path holds a backslash, a colon, a `#` or a control character.
-    #[error("an attachment path must not hold a backslash, a colon, a `#` or a control character")]
+    /// The path holds a backslash, a colon, a `#`, a space, a parenthesis or a
+    /// control character.
+    #[error(
+        "an attachment path must not hold a backslash, a colon, a `#`, a space, a parenthesis or a control character"
+    )]
     BadCharacter,
     /// The path is longer than 256 bytes.
     #[error("an attachment path must be at most 256 bytes")]
@@ -142,9 +145,9 @@ pub enum AssetPathError {
 /// Asset paths are never slugified - a filename a human recognizes is the
 /// point - so validation carries the whole burden: the path starts with
 /// `assets/`, uses forward slashes only, holds no empty, `.`, `..` or
-/// dot-leading segment, holds no backslash, colon, `#` or control character,
-/// is at most 256 bytes, and its final segment carries an allowlisted
-/// extension.
+/// dot-leading segment, holds no backslash, colon, `#`, space, parenthesis or
+/// control character, is at most 256 bytes, and its final segment carries an
+/// allowlisted extension.
 ///
 /// A colon is refused because it is a path separator on some platforms and a
 /// drive designator on Windows, so a segment shaped like `C:` would reach the
@@ -152,6 +155,11 @@ pub enum AssetPathError {
 /// `#` is refused because it opens the image formatting fragment a body target
 /// may carry; keeping it out of stored paths is what makes that fragment
 /// unambiguous.
+///
+/// A space and a parenthesis are refused because a markdown link target cannot
+/// carry them reliably - a space ends the target and an unbalanced `)` closes
+/// the link - so a file named that way risks being unreferenceable, and an
+/// attachment no engram can reference must not exist.
 pub fn validate_asset_path(path: &str) -> Result<(), AssetPathError> {
     let Some(rest) = path.strip_prefix(ASSETS_PREFIX) else {
         return Err(AssetPathError::NotUnderAssets);
@@ -162,6 +170,9 @@ pub fn validate_asset_path(path: &str) -> Result<(), AssetPathError> {
     if path.contains('\\')
         || path.contains(':')
         || path.contains('#')
+        || path.contains(' ')
+        || path.contains('(')
+        || path.contains(')')
         || path.chars().any(char::is_control)
     {
         return Err(AssetPathError::BadCharacter);
@@ -514,6 +525,49 @@ Again: ![d](assets/flow.png)\n\
             validate_asset_path("assets/a#b.png"),
             Err(AssetPathError::BadCharacter)
         );
+    }
+
+    /// A space and a parenthesis are refused because a markdown link target
+    /// cannot carry them reliably, so a file named that way risks being
+    /// unreferenceable - and the specification's invariant is that an
+    /// attachment no engram can reference must not exist.
+    ///
+    /// The scanner assertions below are the evidence rather than decoration:
+    /// they show what the reference to such a file actually resolves to, which
+    /// in both cases is a different path that does not exist. The parenthesis
+    /// class is refused whole rather than by half - [`find_asset_refs`] does
+    /// track balanced pairs, so `shot(1).png` happens to survive - because a
+    /// rule a person can hold ("no parentheses") beats one that depends on
+    /// whether the other one is there.
+    #[test]
+    fn a_space_or_a_parenthesis_in_a_path_is_refused() {
+        assert_eq!(
+            validate_asset_path("assets/Q3 report.pdf"),
+            Err(AssetPathError::BadCharacter)
+        );
+        assert_eq!(
+            validate_asset_path("assets/shot(1).png"),
+            Err(AssetPathError::BadCharacter)
+        );
+        assert_eq!(
+            validate_asset_path("assets/deck).pdf"),
+            Err(AssetPathError::BadCharacter)
+        );
+
+        // A space ends the target, so a reference to `assets/Q3 report.pdf`
+        // resolves as `assets/Q3`; an unbalanced `)` closes the link, so a
+        // reference to `assets/deck).pdf` resolves as `assets/deck`. Neither
+        // names the file, and neither would validate.
+        assert_eq!(
+            find_asset_refs("[q](assets/Q3 report.pdf)"),
+            vec!["assets/Q3".to_string()]
+        );
+        assert_eq!(
+            find_asset_refs("[d](assets/deck).pdf)"),
+            vec!["assets/deck".to_string()]
+        );
+        assert!(validate_asset_path("assets/Q3").is_err());
+        assert!(validate_asset_path("assets/deck").is_err());
     }
 
     #[test]

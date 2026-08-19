@@ -109,6 +109,10 @@ keyring = { version = "4.1.6", default-features = false, features = ["v1"] }
 tar = "0.4.46"
 flate2 = "1.1.9"
 base64 = "0.23.1"
+# Percent-decoding for the MCP `resources/read` uri (crates/service). Already
+# in the graph through axum and url; named directly because the MCP surface
+# decodes an attachment uri itself, with no extractor doing it on the way in.
+percent-encoding = "2.3.2"
 # Password hashing for the REST auth store (crates/service). Default features
 # already pull `password-hash` and its `rand_core`, so the salt and the session
 # token both draw from `password_hash::rand_core::OsRng` and no separate `rand`

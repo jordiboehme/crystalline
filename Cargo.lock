@@ -1305,6 +1305,7 @@ dependencies = [
  "interprocess",
  "libc",
  "notify",
+ "percent-encoding",
  "reqwest 0.13.4",
  "rmcp",
  "rust-embed",
